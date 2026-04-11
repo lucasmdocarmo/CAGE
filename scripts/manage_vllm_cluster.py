@@ -331,6 +331,8 @@ def start_cluster(
                     str(replica["port"]),
                     "--enable-prefix-caching",
                     "--enable-prompt-tokens-details",
+                    "--max-model-len",
+                    "2048",
                 ],
                 log_path,
             )
