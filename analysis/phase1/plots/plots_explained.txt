@@ -1,0 +1,23 @@
+Plot explanations
+=================
+
+- qps_by_baseline.png: Average queries/sec per baseline (bar chart).
+- ttft_by_baseline.png: Average time-to-first-token per baseline (bar chart).
+- latency_by_baseline.png: Average end-to-end latency per baseline (bar chart).
+- tokens_per_sec_by_baseline.png: Average tokens/sec per baseline (bar chart).
+- bertscore_by_baseline.png: Average completeness (BERTScore) per baseline (bar chart).
+- tradeoff_latency_vs_bertscore.png: Scatter of latency vs quality to show tradeoff.
+- tokens_per_sec_share_pie.png: Pie (pizza) chart of tokens/sec share by baseline.
+- tokens_per_sec_pareto.png: Pareto-like chart: tokens/sec by baseline + cumulative share.
+- radar_performance_profile.png: Radar/spider chart showing multi-dimensional performance profile for each baseline. Latency metrics are inverted so outer = better for all axes.
+- heatmap_all_metrics.png: Heatmap of normalized metrics (0-1) across baselines. Green = better, red = worse.
+- latency_breakdown_stacked.png: Stacked bar showing TTFT (prefill) vs generation (decode) time breakdown.
+- quality_metrics_grouped.png: Grouped bar chart comparing all quality metrics (faithfulness, relevance, BERTScore, ROUGE-L) side by side.
+- efficiency_bubble_chart.png: Bubble chart: X=latency, Y=quality, bubble size=throughput. Shows 3D efficiency frontier.
+- speedup_vs_no_cache.png: Speedup factor relative to no_cache baseline. Green = faster, red = slower.
+- ranking_table.png: Visual ranking table showing which baseline ranks #1, #2, etc. for each metric.
+- throughput_metrics_grouped.png: Grouped comparison of throughput metrics (QPS, tokens/sec).
+- pareto_latency_vs_quality.png: Multi-objective Pareto frontier showing optimal tradeoffs between latency and quality. Red stars are Pareto-optimal baselines (no other baseline is better in both dimensions).
+- pareto_ttft_vs_quality.png: Pareto frontier for time-to-first-token vs quality tradeoff.
+- pareto_throughput_vs_faithfulness.png: Pareto frontier for throughput vs faithfulness. Note: higher is better for both axes.
+- pareto_latency_vs_relevance.png: Pareto frontier for latency vs relevance tradeoff.

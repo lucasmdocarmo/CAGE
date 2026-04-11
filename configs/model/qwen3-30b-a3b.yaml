@@ -1,0 +1,27 @@
+# Model configuration for Qwen/Qwen3-30B-A3B
+# MoE model - only 3B active parameters, efficient inference
+
+name: Qwen/Qwen3-30B-A3B
+description: "Qwen3 30B-A3B MoE - 30B total params, 3B active (efficient inference)"
+
+# Model parameters
+max_tokens: 512
+temperature: 0.7
+top_p: 0.95
+
+# Hardware requirements (CPU mode - MoE is memory-heavy but compute-light)
+requires_gpu: false
+ram_gb: 48.0  # Approximate RAM for full model weights
+context_length: 131072  # 128K tokens
+
+# vLLM configuration (CPU)
+dtype: bfloat16
+enable_prefix_caching: true
+cpu_offload: true  # Recommended for machines with <64GB RAM
+
+# Experiment tiers
+tier: production
+
+# MoE specifics
+moe_experts: 128
+moe_active_experts: 8

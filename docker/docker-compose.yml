@@ -1,0 +1,48 @@
+version: "3.9"
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  vllm-replica-1:
+    image: public.ecr.aws/q9t5s3a7/vllm-arm64-cpu-release-repo:latest
+    command: ["Qwen/Qwen3-4B", "--port", "8001", "--enable-prefix-caching", "--enable-prompt-tokens-details"]
+    environment:
+      # Keep this small on laptops so multiple replicas can coexist.
+      - VLLM_CPU_KVCACHE_SPACE=1
+    ports:
+      - "8001:8001"
+
+  vllm-replica-2:
+    image: public.ecr.aws/q9t5s3a7/vllm-arm64-cpu-release-repo:latest
+    command: ["Qwen/Qwen3-4B", "--port", "8002", "--enable-prefix-caching", "--enable-prompt-tokens-details"]
+    environment:
+      # Keep this small on laptops so multiple replicas can coexist.
+      - VLLM_CPU_KVCACHE_SPACE=1
+    ports:
+      - "8002:8002"
+
+  vllm-replica-3:
+    image: public.ecr.aws/q9t5s3a7/vllm-arm64-cpu-release-repo:latest
+    command: ["Qwen/Qwen3-4B", "--port", "8003", "--enable-prefix-caching", "--enable-prompt-tokens-details"]
+    environment:
+      # Keep this small on laptops so multiple replicas can coexist.
+      - VLLM_CPU_KVCACHE_SPACE=1
+    ports:
+      - "8003:8003"
+
+  router:
+    build:
+      context: .
+      dockerfile: docker/router.Dockerfile
+    environment:
+      - PYTHONUNBUFFERED=1
+      # Use Docker Compose service DNS names for intra-network routing.
+      - ROUTER_REPLICAS=replica-1=http://vllm-replica-1:8001,replica-2=http://vllm-replica-2:8002,replica-3=http://vllm-replica-3:8003
+    depends_on:
+      - vllm-replica-1
+      - vllm-replica-2
+      - vllm-replica-3
+    ports:
+      - "9000:9000"

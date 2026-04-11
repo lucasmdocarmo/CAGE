@@ -1,0 +1,30 @@
+# CAGE Framework - GCP Terraform Variables
+# Copy this file to terraform.tfvars and fill in your values
+
+# Required
+project_id = "your-gcp-project-id"
+
+# Optional - defaults shown
+region       = "us-central1"
+zone         = "us-central1-a"
+num_replicas = 3
+
+# GPU Configuration
+# Options: nvidia-tesla-a100, nvidia-l4, nvidia-tesla-t4
+gpu_type  = "nvidia-l4"
+gpu_count = 1
+
+# Machine type (must match GPU type)
+# For L4: g2-standard-8 (8 vCPUs, 32GB RAM)
+# For A100: a2-highgpu-1g (12 vCPUs, 85GB RAM)
+# For T4: n1-standard-8 + T4 accelerator
+machine_type = "g2-standard-8"
+
+# Model to serve
+model_name = "Qwen/Qwen3-4B"
+
+# Disk size (needs space for model weights)
+disk_size_gb = 200
+
+# HuggingFace token (for gated models like Llama)
+# hf_token = "hf_xxxxxxxxxxxxxxxxxxxx"

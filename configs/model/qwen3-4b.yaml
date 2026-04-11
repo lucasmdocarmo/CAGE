@@ -1,0 +1,23 @@
+# Model configuration for Qwen/Qwen3-4B
+# Small model for fast iteration and debugging
+
+name: Qwen/Qwen3-4B
+description: "Qwen3 4B - Small model for rapid prototyping (256K context)"
+
+# Model parameters
+max_tokens: 512
+temperature: 0.7
+top_p: 0.95
+
+# Hardware requirements (CPU mode)
+requires_gpu: false
+ram_gb: 8.0  # Approximate RAM needed for CPU inference
+context_length: 262144  # 256K tokens
+
+# vLLM configuration (CPU)
+dtype: bfloat16
+enable_prefix_caching: true
+cpu_offload: false
+
+# Experiment tiers
+tier: small

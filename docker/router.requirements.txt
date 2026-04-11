@@ -1,0 +1,7 @@
+# Minimal dependencies for running the CAGE router container
+# Keep this small to speed up docker builds (no torch/transformers/etc.)
+
+fastapi>=0.108.0
+uvicorn>=0.25.0
+aiohttp>=3.9.0
+prometheus-client>=0.19.0

@@ -1,0 +1,14 @@
+# Dataset configuration for HotpotQA
+
+name: hotpotqa
+description: "HotpotQA - multi-hop reasoning questions"
+
+# Dataset parameters
+split: validation
+max_examples: 100
+seed: 42
+
+# Dataset characteristics
+has_context: true
+task_type: multi_hop_reasoning
+avg_context_length: 300  # tokens, approximate

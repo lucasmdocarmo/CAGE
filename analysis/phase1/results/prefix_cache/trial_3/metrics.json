@@ -1,0 +1,168 @@
+{
+  "experiment": {
+    "baseline": "prefix_cache",
+    "baseline_family": "prefix_cache",
+    "model": "Qwen/Qwen3-4B",
+    "dataset": "squad_v2",
+    "dataset_split": "validation",
+    "num_queries": 50,
+    "num_measured_requests": 50,
+    "num_warmup_requests": 0,
+    "max_tokens": 100,
+    "timestamp": "20260319_184342",
+    "seed": 44,
+    "backend": "vllm",
+    "api_base": "http://localhost:8000"
+  },
+  "workload": {
+    "repeat_queries": 1,
+    "warmup_queries": 0,
+    "mode": "single",
+    "batch_size": 4,
+    "multi_turn_length": 3
+  },
+  "prompt_truncation": {
+    "truncate_prompt_tokens": null,
+    "max_context_chars": null,
+    "max_context_docs": null
+  },
+  "run_metadata": {
+    "git_commit": null,
+    "git_branch": null,
+    "git_dirty": null,
+    "git_repository_present": false,
+    "git_root": null,
+    "git_error": "fatal: not a git repository (or any of the parent directories): .git",
+    "backend": {
+      "backend": "vllm",
+      "api_base": "http://localhost:8000",
+      "requested_model": "Qwen/Qwen3-4B",
+      "mode": "api",
+      "client_library_version": null,
+      "server_version": "0.14.0rc1.dev119+g09dc7c690",
+      "loaded_model": "Qwen/Qwen3-4B",
+      "loaded_models": [
+        "Qwen/Qwen3-4B"
+      ]
+    },
+    "cli_args": [
+      "scripts/run_experiment.py",
+      "--baseline",
+      "prefix_cache",
+      "--baseline-label",
+      "prefix_cache",
+      "--model",
+      "Qwen/Qwen3-4B",
+      "--dataset",
+      "squad_v2",
+      "--num-queries",
+      "50",
+      "--num-trials",
+      "3",
+      "--seed",
+      "42",
+      "--output-dir",
+      "/Users/lucasmariano/projects/cag-llm-kvcache/analysis/phase1/results/prefix_cache"
+    ]
+  },
+  "system": {
+    "snapshot": {
+      "platform": "macOS-26.3-arm64-arm-64bit-Mach-O",
+      "python_version": "3.13.7",
+      "cpu_count_logical": 12,
+      "cpu_count_physical": 12,
+      "memory_total_gb": 24.0,
+      "cpu_freq_mhz": 4
+    },
+    "env": {
+      "VLLM_CPU_KVCACHE_SPACE": "10",
+      "VLLM_CPU_OMP_THREADS_BIND": "auto"
+    },
+    "backend_versions": {
+      "backend": "vllm",
+      "api_base": "http://localhost:8000",
+      "requested_model": "Qwen/Qwen3-4B",
+      "mode": "api",
+      "client_library_version": null,
+      "server_version": "0.14.0rc1.dev119+g09dc7c690",
+      "loaded_model": "Qwen/Qwen3-4B",
+      "loaded_models": [
+        "Qwen/Qwen3-4B"
+      ]
+    }
+  },
+  "baseline_config": {
+    "baseline_type": "prefix_cache",
+    "description": "Single-node prefix caching enabled",
+    "enable_prefix_caching": true,
+    "api_base": "http://localhost:8000",
+    "redis_host": "localhost",
+    "redis_port": 6379,
+    "redis_db": 0,
+    "redis_key_prefix": "cage",
+    "use_faiss": false,
+    "embedding_model": "intfloat/e5-large-v2",
+    "top_k_retrieval": 3,
+    "ir_index_dir": "./experiments/ir_index",
+    "ir_rebuild": false,
+    "reranker_model": "BAAI/bge-reranker-large",
+    "reranker_top_k": 3,
+    "cache_threshold": 0.8,
+    "speculative_model": null,
+    "num_speculative_tokens": 5,
+    "speculative_method": "draft_model",
+    "metadata": {}
+  },
+  "performance": {
+    "queries_per_second": 0.0849949919814233,
+    "tokens_per_second": 8.49949919814233,
+    "avg_ttft_ms": 2314.5687198638916,
+    "p50_ttft_ms": 2351.575493812561,
+    "p95_ttft_ms": 4466.775965690613,
+    "p99_ttft_ms": 4535.198633670807,
+    "avg_tpot_ms": 89.49956703186035,
+    "p50_tpot_ms": 78.95119547843933,
+    "p95_tpot_ms": 128.41107439994812,
+    "p99_tpot_ms": 140.23218972682952,
+    "avg_latency_ms": 11264.525423049927,
+    "p50_latency_ms": 10564.258456230164,
+    "p95_latency_ms": 15278.062343597412,
+    "p99_latency_ms": 16950.34063100815,
+    "avg_cpu_percent": 65.05714285714286,
+    "avg_memory_mb": 1006.8392857142857,
+    "peak_memory_mb": 1116.15625,
+    "total_requests": 50,
+    "total_tokens": 5000,
+    "total_time_seconds": 588.2699537277222,
+    "error_count": 0
+  },
+  "cache_telemetry": {
+    "local_hit_ratio": 1.0,
+    "remote_hit_ratio": 0.0,
+    "miss_ratio": 0.0,
+    "total_hit_ratio": 1.0,
+    "avg_remote_fetch_ms": 0.0,
+    "total_transfer_mb": 0.0
+  },
+  "distributed": null,
+  "quality": {
+    "faithfulness": 0.5121969354152679,
+    "relevance": 0.5050981903076172,
+    "completeness_bertscore": 0.32870174288749693,
+    "completeness_rouge_l": 0.019344054307891375
+  },
+  "retrieval": null,
+  "prompt_cache": {
+    "avg_prompt_tokens": 219.28,
+    "avg_cached_prompt_tokens": 151.04,
+    "overall_cached_prompt_ratio": 0.6887997081357169,
+    "cached_request_rate": 1.0,
+    "num_requests_with_usage": 50
+  },
+  "warmup": {
+    "num_queries": 0,
+    "num_requests": 0,
+    "included_in_metrics": false
+  },
+  "repeat_passes": null
+}

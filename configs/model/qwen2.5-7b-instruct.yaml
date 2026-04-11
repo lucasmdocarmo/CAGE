@@ -1,0 +1,23 @@
+# Model configuration for Qwen/Qwen2.5-7B-Instruct
+# Fits in 24GB RAM - ideal for Phase 4 on limited hardware
+
+name: Qwen/Qwen2.5-7B-Instruct
+description: "Qwen2.5 7B Instruct - Large model for 24GB RAM machines (128K context)"
+
+# Model parameters
+max_tokens: 512
+temperature: 0.7
+top_p: 0.95
+
+# Hardware requirements (CPU mode)
+requires_gpu: false
+ram_gb: 20.0  # ~14GB model + KV cache overhead
+context_length: 131072  # 128K tokens
+
+# vLLM configuration (CPU)
+dtype: bfloat16
+enable_prefix_caching: true
+cpu_offload: false
+
+# Experiment tiers
+tier: large

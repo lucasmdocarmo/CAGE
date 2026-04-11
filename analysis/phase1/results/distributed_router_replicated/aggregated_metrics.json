@@ -1,0 +1,444 @@
+{
+  "num_trials": 3,
+  "performance": {
+    "queries_per_second": {
+      "mean": 0.05248468348566693,
+      "std": 0.0010971687885030295,
+      "min": 0.051237113345365064,
+      "max": 0.05390743387701034,
+      "values": [
+        0.051237113345365064,
+        0.05390743387701034,
+        0.05230950323462538
+      ]
+    },
+    "tokens_per_second": {
+      "mean": 5.248468348566693,
+      "std": 0.10971687885030294,
+      "min": 5.123711334536506,
+      "max": 5.390743387701034,
+      "values": [
+        5.123711334536506,
+        5.390743387701034,
+        5.2309503234625385
+      ]
+    },
+    "avg_ttft_ms": {
+      "mean": 5278.737047513326,
+      "std": 638.2465080990374,
+      "min": 4672.704820632935,
+      "max": 6161.047224998474,
+      "values": [
+        6161.047224998474,
+        4672.704820632935,
+        5002.459096908569
+      ]
+    },
+    "p50_ttft_ms": {
+      "mean": 2875.621557235718,
+      "std": 137.0056804784756,
+      "min": 2741.0378456115723,
+      "max": 3063.624858856201,
+      "values": [
+        2822.20196723938,
+        2741.0378456115723,
+        3063.624858856201
+      ]
+    },
+    "p95_ttft_ms": {
+      "mean": 21896.40105565389,
+      "std": 2021.8511955258562,
+      "min": 19676.86591148376,
+      "max": 24567.280793190002,
+      "values": [
+        24567.280793190002,
+        19676.86591148376,
+        21445.0564622879
+      ]
+    },
+    "p99_ttft_ms": {
+      "mean": 25744.99239524205,
+      "std": 4811.207476386116,
+      "min": 21621.72663927078,
+      "max": 32493.904409408555,
+      "values": [
+        32493.904409408555,
+        21621.72663927078,
+        23119.346137046814
+      ]
+    },
+    "avg_tpot_ms": {
+      "mean": 132.13028270403547,
+      "std": 3.4928237052098132,
+      "min": 127.3935839176178,
+      "max": 135.71209392547607,
+      "values": [
+        127.3935839176178,
+        133.28517026901244,
+        135.71209392547607
+      ]
+    },
+    "p50_tpot_ms": {
+      "mean": 106.14926099777222,
+      "std": 2.3014764774948913,
+      "min": 102.94107437133789,
+      "max": 108.22858572006226,
+      "values": [
+        102.94107437133789,
+        107.2781229019165,
+        108.22858572006226
+      ]
+    },
+    "p95_tpot_ms": {
+      "mean": 264.03134802977235,
+      "std": 21.553585022486573,
+      "min": 240.59134280681596,
+      "max": 292.62618863582605,
+      "values": [
+        292.62618863582605,
+        240.59134280681596,
+        258.87651264667505
+      ]
+    },
+    "p99_tpot_ms": {
+      "mean": 337.5567685445149,
+      "std": 3.8167738814863057,
+      "min": 334.36264877319314,
+      "max": 342.92209639549253,
+      "values": [
+        342.92209639549253,
+        334.36264877319314,
+        335.38556046485894
+      ]
+    },
+    "avg_latency_ms": {
+      "mean": 18491.76531791687,
+      "std": 371.63060498390087,
+      "min": 18001.22184753418,
+      "max": 18900.405616760254,
+      "values": [
+        18900.405616760254,
+        18001.22184753418,
+        18573.668489456177
+      ]
+    },
+    "p50_latency_ms": {
+      "mean": 14269.604841868082,
+      "std": 9.280782267153404,
+      "min": 14260.5459690094,
+      "max": 14282.35936164856,
+      "values": [
+        14260.5459690094,
+        14265.909194946289,
+        14282.35936164856
+      ]
+    },
+    "p95_latency_ms": {
+      "mean": 41384.74560578663,
+      "std": 2257.249998781183,
+      "min": 38263.21519613265,
+      "max": 43524.131810665116,
+      "values": [
+        42366.889810562105,
+        38263.21519613265,
+        43524.131810665116
+      ]
+    },
+    "p99_latency_ms": {
+      "mean": 50861.23731454211,
+      "std": 752.1402935361226,
+      "min": 50104.48894500728,
+      "max": 51886.96878910063,
+      "values": [
+        51886.96878910063,
+        50104.48894500728,
+        50592.25420951841
+      ]
+    }
+  },
+  "quality": {
+    "faithfulness": {
+      "mean": 0.6359199074904124,
+      "std": 0.07752403524250177,
+      "min": 0.5512607806921005,
+      "max": 0.7385784709453582,
+      "values": [
+        0.5512607806921005,
+        0.7385784709453582,
+        0.6179204708337784
+      ]
+    },
+    "relevance": {
+      "mean": 0.5050981903076172,
+      "std": 0.0,
+      "min": 0.5050981903076172,
+      "max": 0.5050981903076172,
+      "values": [
+        0.5050981903076172,
+        0.5050981903076172,
+        0.5050981903076172
+      ]
+    },
+    "completeness_bertscore": {
+      "mean": 0.3267390028635661,
+      "std": 0.00050584664493609,
+      "min": 0.3260313045978546,
+      "max": 0.32718337059020997,
+      "values": [
+        0.3270023334026337,
+        0.32718337059020997,
+        0.3260313045978546
+      ]
+    },
+    "completeness_rouge_l": {
+      "mean": 0.018298708606143344,
+      "std": 0.0008966502374847743,
+      "min": 0.01743786180158466,
+      "max": 0.01953546913201497,
+      "values": [
+        0.01953546913201497,
+        0.01743786180158466,
+        0.017922794884830406
+      ]
+    }
+  },
+  "cache_telemetry": {
+    "local_hit_ratio": {
+      "mean": 0.94,
+      "std": 0.08485281374238572,
+      "min": 0.82,
+      "max": 1.0,
+      "values": [
+        0.82,
+        1.0,
+        1.0
+      ]
+    },
+    "remote_hit_ratio": {
+      "mean": 0.0,
+      "std": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "values": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "miss_ratio": {
+      "mean": 0.06,
+      "std": 0.0848528137423857,
+      "min": 0.0,
+      "max": 0.18,
+      "values": [
+        0.18,
+        0.0,
+        0.0
+      ]
+    },
+    "total_hit_ratio": {
+      "mean": 0.94,
+      "std": 0.08485281374238572,
+      "min": 0.82,
+      "max": 1.0,
+      "values": [
+        0.82,
+        1.0,
+        1.0
+      ]
+    },
+    "avg_remote_fetch_ms": {
+      "mean": 0.0,
+      "std": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "values": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "total_transfer_mb": {
+      "mean": 0.0,
+      "std": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "values": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    }
+  },
+  "retrieval": {},
+  "prompt_cache": {
+    "avg_prompt_tokens": {
+      "mean": 220.1947967479675,
+      "std": 1.293717967790414,
+      "min": 219.28,
+      "max": 222.02439024390245,
+      "values": [
+        222.02439024390245,
+        219.28,
+        219.28
+      ]
+    },
+    "avg_cached_prompt_tokens": {
+      "mean": 150.64455284552844,
+      "std": 0.5592467290555073,
+      "min": 149.85365853658536,
+      "max": 151.04,
+      "values": [
+        149.85365853658536,
+        151.04,
+        151.04
+      ]
+    },
+    "overall_cached_prompt_ratio": {
+      "mean": 0.684180580992305,
+      "std": 0.006532432252538558,
+      "min": 0.6749423267054817,
+      "max": 0.6887997081357169,
+      "values": [
+        0.6749423267054817,
+        0.6887997081357169,
+        0.6887997081357169
+      ]
+    },
+    "cached_request_rate": {
+      "mean": 1.0,
+      "std": 0.0,
+      "min": 1.0,
+      "max": 1.0,
+      "values": [
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    "num_requests_with_usage": {
+      "mean": 47.0,
+      "std": 4.242640687119285,
+      "min": 41.0,
+      "max": 50.0,
+      "values": [
+        41.0,
+        50.0,
+        50.0
+      ]
+    }
+  },
+  "experiment": {
+    "baseline": "distributed_router_replicated",
+    "baseline_family": "distributed",
+    "model": "Qwen/Qwen3-4B",
+    "dataset": "squad_v2",
+    "dataset_split": "validation",
+    "num_queries": 50,
+    "num_measured_requests": 50,
+    "num_warmup_requests": 0,
+    "max_tokens": 100,
+    "timestamp": "20260319_210831",
+    "seed": 42,
+    "backend": "vllm",
+    "api_base": "http://localhost:9000"
+  },
+  "baseline_config": {
+    "baseline_type": "distributed",
+    "description": "Router-mediated multi-replica prefix-routed baseline (replicated routing is real; simulated transfer policies are experimental only)",
+    "enable_prefix_caching": true,
+    "api_base": "http://localhost:9000",
+    "redis_host": "localhost",
+    "redis_port": 6379,
+    "redis_db": 0,
+    "redis_key_prefix": "cage",
+    "use_faiss": false,
+    "embedding_model": "intfloat/e5-large-v2",
+    "top_k_retrieval": 3,
+    "ir_index_dir": "./experiments/ir_index",
+    "ir_rebuild": false,
+    "reranker_model": "BAAI/bge-reranker-large",
+    "reranker_top_k": 3,
+    "cache_threshold": 0.8,
+    "speculative_model": null,
+    "num_speculative_tokens": 5,
+    "speculative_method": "draft_model",
+    "metadata": {
+      "supports_real_replicated_cluster": true,
+      "supports_sharded_context_simulation": true,
+      "prefers_gpu": true
+    }
+  },
+  "workload": {
+    "repeat_queries": 1,
+    "warmup_queries": 0,
+    "mode": "single",
+    "batch_size": 4,
+    "multi_turn_length": 3
+  },
+  "warmup": {
+    "num_queries": 0,
+    "num_requests": 0,
+    "included_in_metrics": false
+  },
+  "distributed": {
+    "sharding_policy": "replicated",
+    "router_snapshot": {
+      "stats": {
+        "status_code": 200,
+        "body": {
+          "total_requests": 50,
+          "replica_distribution": {
+            "replica-1": 13,
+            "replica-2": 15,
+            "replica-3": 22
+          },
+          "num_replicas": 3,
+          "strategy": "hash",
+          "sharding_policy": "replicated",
+          "tokenizer_name": "Qwen/Qwen3-4B",
+          "tokenization_mode": "model_tokenizer",
+          "tokenizer_error": null,
+          "distinct_api_bases": 3,
+          "replicas": [
+            {
+              "replica_id": "replica-1",
+              "api_base": "http://localhost:8001",
+              "weight": 1.0
+            },
+            {
+              "replica_id": "replica-2",
+              "api_base": "http://localhost:8002",
+              "weight": 1.0
+            },
+            {
+              "replica_id": "replica-3",
+              "api_base": "http://localhost:8003",
+              "weight": 1.0
+            }
+          ]
+        }
+      },
+      "health": {
+        "status_code": 200,
+        "body": {
+          "status": "healthy",
+          "router_initialized": true
+        }
+      }
+    },
+    "nonempty_routed_replica": 50,
+    "distinct_routed_replicas": [
+      "replica-1",
+      "replica-2",
+      "replica-3"
+    ],
+    "nonempty_kv_transfer_params": 50,
+    "transfer_required_count": 0,
+    "positive_transfer_latency_count": 0,
+    "positive_transfer_bytes_count": 0,
+    "topology": "isolated_replicas",
+    "distinct_api_bases": 3
+  },
+  "repeat_passes": null
+}

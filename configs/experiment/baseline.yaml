@@ -1,0 +1,33 @@
+# Baseline experiment configuration
+
+defaults:
+  - /model: opt-125m
+  - /dataset: squad_v2
+
+# Experiment metadata
+name: baseline_experiment
+description: "CAGE baseline comparison"
+
+# Baseline configuration
+baseline:
+  type: prefix_cache  # no_cache, prefix_cache, redis, rag, distributed, hybrid
+  api_base: http://localhost:8000
+
+# Execution parameters
+num_queries: 500  # Keep equal across baselines within a phase for comparable results
+batch_size: 1
+timeout_seconds: 300
+
+# Evaluation settings
+evaluate_quality: true
+evaluate_performance: true
+monitor_resources: true
+
+# Output configuration
+output_dir: ./experiments/results
+save_results: true
+save_metrics: true
+save_logs: true
+
+# Reproducibility
+seed: 42
