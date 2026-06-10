@@ -1,30 +1,45 @@
 # CAGE Framework - GCP Terraform Variables
-# Copy this file to terraform.tfvars and fill in your values
+# Copy this file to terraform.tfvars and fill in your values.
 
 # Required
 project_id = "your-gcp-project-id"
 
 # Optional - defaults shown
 region       = "us-central1"
-zone         = "us-central1-a"
+zone         = "us-central1-a" # verify the chosen GPU exists in this zone
 num_replicas = 3
 
-# GPU Configuration
-# Options: nvidia-tesla-a100, nvidia-l4, nvidia-tesla-t4
-gpu_type  = "nvidia-l4"
-gpu_count = 1
+# --- Model (MUST match the --model passed to run_experiment.py) ---
+model_name = "Qwen/Qwen3-8B"
+# Pin a concrete tag for reproducibility once a known-good version is chosen:
+vllm_image             = "vllm/vllm-openai:latest"
+gpu_memory_utilization = 0.9
 
-# Machine type (must match GPU type)
-# For L4: g2-standard-8 (8 vCPUs, 32GB RAM)
-# For A100: a2-highgpu-1g (12 vCPUs, 85GB RAM)
-# For T4: n1-standard-8 + T4 accelerator
-machine_type = "g2-standard-8"
+# --- Code delivery ---
+# If set, the router auto-clones the repo into /opt/cage (no manual SCP needed).
+# Leave empty to push manually with `terraform output upload_code_command`.
+repo_url = "" # e.g. "https://github.com/<you>/cage.git"
 
-# Model to serve
-model_name = "Qwen/Qwen3-4B"
-
-# Disk size (needs space for model weights)
+# ===========================================================================
+# PHASE 2 (default): NVIDIA L4
+# ===========================================================================
+gpu_type     = "nvidia-l4"
+gpu_count    = 1
+machine_type = "g2-standard-8" # 8 vCPUs, 32GB RAM
+nic_type     = "VIRTIO_NET"
+network_mtu  = 1460
 disk_size_gb = 200
 
-# HuggingFace token (for gated models like Llama)
+# ===========================================================================
+# PHASE 3: NVIDIA A100 + high-performance networking (uncomment to switch)
+# ===========================================================================
+# gpu_type     = "nvidia-tesla-a100"
+# machine_type = "a2-highgpu-1g"  # 12 vCPUs, 85GB RAM
+# nic_type     = "GVNIC"          # ~100 Gbps for cross-node KV transfer
+# network_mtu  = 8896             # jumbo frames
+
+# --- Security: lock SSH to your IP in production ---
+# ssh_source_ranges = ["YOUR.IP.ADDR.0/24"]
+
+# --- HuggingFace token (for gated models) ---
 # hf_token = "hf_xxxxxxxxxxxxxxxxxxxx"

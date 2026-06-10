@@ -2,6 +2,12 @@
 
 A comprehensive benchmarking framework for evaluating Cache-Augmented Generation (CAG) systems with distributed KV cache management.
 
+> 📖 **Start here:** [`docs/RUNBOOK.md`](docs/RUNBOOK.md) (setup / deploy / run) ·
+> [`docs/KNOWLEDGE_BASE.md`](docs/KNOWLEDGE_BASE.md) (project reference) ·
+> [`docs/README.md`](docs/README.md) (doc index). The repo is a single-level tree at the
+> project root; some sections below predate the June 2026 reorg — trust the docs above for
+> current commands and paths.
+
 ## Overview
 
 CAGE is the first framework dedicated to holistically benchmarking CAG systems, measuring trade-offs between system performance and semantic quality in distributed environments. Unlike RAG evaluation tools, CAGE specifically evaluates how cache distribution policies, network placement, and memory tiering impact both retrieval correctness and generated output quality.

@@ -97,7 +97,7 @@ def test_router_metrics_endpoint(router_test_api_base: str, router_available: bo
     assert "cage_router_request_latency_seconds" in text
 
 
-def test_router_completions_non_streaming(router_test_api_base: str, router_available: bool):
+def test_router_completions_non_streaming(router_test_api_base: str, router_available: bool, vllm_test_model: str):
     """Router should proxy a non-streaming /v1/completions request and set x-router-replica."""
     if not router_available:
         pytest.skip(f"router not reachable at {router_test_api_base}")
@@ -105,7 +105,7 @@ def test_router_completions_non_streaming(router_test_api_base: str, router_avai
     import requests
 
     payload: Dict[str, Any] = {
-        "model": "Qwen/Qwen3-4B",
+        "model": vllm_test_model,
         "prompt": "The capital of France is",
         "max_tokens": 8,
         "temperature": 0.0,
@@ -122,7 +122,7 @@ def test_router_completions_non_streaming(router_test_api_base: str, router_avai
     assert "choices" in body
 
 
-def test_router_streaming_passthrough_sse(router_test_api_base: str, router_available: bool):
+def test_router_streaming_passthrough_sse(router_test_api_base: str, router_available: bool, vllm_test_model: str):
     """Router should proxy SSE and terminate with [DONE]."""
     if not router_available:
         pytest.skip(f"router not reachable at {router_test_api_base}")
@@ -130,7 +130,7 @@ def test_router_streaming_passthrough_sse(router_test_api_base: str, router_avai
     import requests
 
     payload: Dict[str, Any] = {
-        "model": "Qwen/Qwen3-4B",
+        "model": vllm_test_model,
         "prompt": "The capital of France is",
         "max_tokens": 8,
         "temperature": 0.0,

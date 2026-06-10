@@ -83,10 +83,22 @@ class FaissIRIndex:
         self.normalize_embeddings = normalize_embeddings
         self.device = device
 
+        # E5 / BGE-style models REQUIRE asymmetric "query:"/"passage:" prefixes.
+        # Omitting them runs the encoder out-of-distribution and silently degrades
+        # retrieval (depressed Hit@k). Auto-enable for the model families that need it.
+        model_lc = embedding_model.lower()
+        self.uses_e5_prefixes = ("e5" in model_lc) or ("bge" in model_lc and "reranker" not in model_lc)
+
         self._st_model = None
         self._faiss = None
         self._index = None
         self._documents: list[IRDocument] = []
+
+    def _format_passage(self, text: str) -> str:
+        return f"passage: {text}" if self.uses_e5_prefixes else text
+
+    def _format_query(self, text: str) -> str:
+        return f"query: {text}" if self.uses_e5_prefixes else text
 
     def _ensure_deps(self) -> None:
         if self._st_model is None:
@@ -110,7 +122,7 @@ class FaissIRIndex:
             raise ValueError("No documents provided to build IR index")
 
         self._documents = list(documents)
-        texts = [d.text for d in self._documents]
+        texts = [self._format_passage(d.text) for d in self._documents]
 
         # SentenceTransformers returns np.ndarray if convert_to_numpy=True
         embeddings = self._st_model.encode(
@@ -139,7 +151,7 @@ class FaissIRIndex:
             raise ValueError("IR index not built/loaded")
 
         q_emb = self._st_model.encode(
-            [query],
+            [self._format_query(query)],
             convert_to_numpy=True,
             normalize_embeddings=self.normalize_embeddings,
         ).astype("float32")
@@ -178,6 +190,7 @@ class FaissIRIndex:
             "embedding_model": self.embedding_model,
             "normalize_embeddings": self.normalize_embeddings,
             "num_documents": len(self._documents),
+            "uses_e5_prefixes": self.uses_e5_prefixes,
         }
         (directory / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
@@ -209,6 +222,10 @@ class FaissIRIndex:
             normalize_embeddings=bool(meta["normalize_embeddings"]),
             device=device,
         )
+        # Respect how THIS index was built. Indices built before the e5-prefix fix
+        # have no flag -> default False so queries match the (un-prefixed) passages.
+        # Rebuild with --rebuild-ir-index to get the corrected, prefixed retrieval.
+        inst.uses_e5_prefixes = bool(meta.get("uses_e5_prefixes", False))
         inst._ensure_deps()
 
         # Documents

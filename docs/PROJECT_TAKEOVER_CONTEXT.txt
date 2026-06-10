@@ -1,0 +1,109 @@
+### CAGE-DOC-STATUS ###
+*** STATUS: SUPERSEDED / HISTORICAL (2026-06-09). Kept for history only. ***
+*** Authoritative docs: KNOWLEDGE_BASE.md, RUNBOOK.md, VALIDATION_AND_SOTA_REVIEW.md. ***
+*** See README.md for the doc index. ***
+
+CAGE PROJECT TAKEOVER CONTEXT
+Last Updated: 2026-04-08
+
+PURPOSE
+This file provides essential context for another AI or engineer to continue the CAGE project.
+For the comprehensive version, read PROJECT_OVERVIEW.md at the repository root.
+
+======================================================================
+1. PROJECT IDENTITY
+======================================================================
+
+Repository: cag-llm-kvcache
+Full name: CAGE (Cache-Augmented Generation Evaluation)
+Author: Lucas Mariano do Carmo (PUC Minas)
+Contact: lucas.mariano.carmo@gmail.com
+
+CAGE is a benchmarking/evaluation framework for comparing cache-based LLM serving
+strategies against retrieval-based (RAG) approaches. It is NOT a serving engine.
+vLLM is the serving engine. CAGE orchestrates experiments, measures metrics, and
+evaluates quality via HTTP communication with vLLM.
+
+======================================================================
+2. CURRENT STATUS
+======================================================================
+
+Phase 1: COMPLETE
+- 7 baselines run on CPU (Apple M4 Pro, Qwen3-4B, SQuAD v2)
+- 50 queries × 3 trials × 7 baselines = 1,050 measured queries
+- All data in analysis/phase1/results/*/aggregated_metrics.json
+- Paper draft at analysis/Articles/main-12page.tex (SBC format)
+- 16 publication plots in analysis/phase1/images/
+
+Phase 2: NOT STARTED (requires GPU)
+- GPU validation, model scaling (8B/14B), 10+ trials, additional datasets
+
+Phase 3: FUTURE (requires multi-node GCP)
+- Real cross-node KV transfer, disaggregated prefill, speculative decoding
+
+======================================================================
+3. FILES TO READ FIRST
+======================================================================
+
+1. PROJECT_OVERVIEW.md (root) — complete project context, all validated numbers
+2. TECHNICAL_ARCHITECTURE.md (root) — how each code module works
+3. PROJECT_ROADMAP.md (root) — detailed task breakdown for Phase 2 and 3
+4. analysis/phase1/results/*/aggregated_metrics.json — source of truth for metrics
+
+======================================================================
+4. CRITICAL FACTS
+======================================================================
+
+- CAGE communicates with vLLM only via HTTP API. It does NOT import vLLM Python code.
+- The vLLM/ directory is vendored for reference only. The experiment runner ignores it.
+- All experiment data is self-contained in analysis/phase1/results/.
+- The paper uses SBC template format (sbc-template.sty). Do not override template settings.
+- Prefix Cache and No Cache share identical quality metrics (both use gold passages).
+- BERTScore is non-discriminative (0.324-0.328). Faithfulness is the primary quality metric.
+- The Distributed baseline had 0 actual KV transfers — it only tests prefix-hash routing.
+
+======================================================================
+5. KEY VALIDATED NUMBERS (Phase 1)
+======================================================================
+
+Performance vs No Cache baseline:
+- Prefix Cache: -37.4% latency, -65.7% TTFT, +58.3% QPS
+- RAG: +70.4% latency, +171.4% TTFT, -45.1% QPS
+- Hybrid Warm: -17.1% latency, -59.7% TTFT
+- Distributed: -23.7% TTFT, +15.5% latency overhead, 7.6x p95/p50 TTFT spread
+
+Quality:
+- No Cache / Prefix Cache faithfulness: 0.570 (identical)
+- RAG faithfulness: 0.504 (-11.6%)
+- Distributed faithfulness: 0.636 (highest but high variance)
+- Prompt-cached ratio: Prefix Cache 68.4%, Hybrid Warm 89.2%
+
+======================================================================
+6. WHAT TO DO NEXT
+======================================================================
+
+If continuing benchmark roadmap:
+1. Provision GPU VM (A100 recommended)
+2. Start vLLM with GPU
+3. Run scripts/run_experiment.py with --trials 10 --queries 100
+4. Compare relative rankings against Phase 1
+5. Scale to Qwen3-8B and Qwen3-14B
+
+If improving paper:
+1. Read analysis/Articles/main-12page.tex
+2. Known issues listed in documentation/PAPER_ARTIFACTS.md
+3. Figures are in analysis/Articles/Publish/images/plots/phase1/
+
+======================================================================
+7. TAKEOVER PROMPT FOR ANOTHER AI
+======================================================================
+
+Resume the CAGE project. Read these files in order:
+1. PROJECT_OVERVIEW.md
+2. TECHNICAL_ARCHITECTURE.md
+3. PROJECT_ROADMAP.md
+
+Phase 1 is complete. All 7 baselines have validated data in
+analysis/phase1/results/. The next step is Phase 2 (GPU validation).
+The code at scripts/run_experiment.py works unchanged with a GPU-backed
+vLLM server. Do not rerun Phase 1 on cloud unless specifically asked.

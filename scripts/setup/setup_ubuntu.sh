@@ -7,15 +7,16 @@ echo "============================================="
 
 # 1. System Dependencies
 echo "[1] Installing OS-level Dependencies..."
-sudo apt update
-sudo apt install -y python3.12 python3.12-venv python3.12-dev python3-pip build-essential cmake
-sudo apt install -y htop wget git patch
+# sudo apt update
+# sudo apt install -y python3.12 python3.12-venv python3.12-dev python3-pip build-essential cmake
+# sudo apt install -y htop wget git patch
 
 # 2. Virtual Environment
 echo "[2] Creating isolated Python environment 'cage-env'..."
-python3.12 -m venv cage-env
-source cage-env/bin/activate
-pip install --upgrade pip setuptools wheel
+python3.12 -m venv /tmp/cage-env-vllm --without-pip
+source /tmp/cage-env-vllm/bin/activate
+python3.12 get-pip.py --ignore-installed
+pip install --upgrade pip setuptools wheel cmake ninja
 
 # 3. Core PyTorch (CPU-only to save space on Parallels)
 echo "[3] Installing PyTorch..."
@@ -23,10 +24,11 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 
 # 4. vLLM Engine
 echo "[4] Installing vLLM and locking dependencies..."
-# If pip finds the wheel for your architecture it will download it.
-# Otherwise, it builds the CPU backend natively via CMake.
 export VLLM_TARGET_DEVICE="cpu"
-pip install vllm==0.8.3
+export SETUPTOOLS_SCM_PRETEND_VERSION="0.8.3"
+export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM="0.8.3"
+pip install setuptools_scm
+pip install -e ../vllm-main --no-build-isolation
 pip install transformers==4.46.1
 
 # 5. CAGE Project Requirements

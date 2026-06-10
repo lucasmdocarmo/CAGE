@@ -1295,18 +1295,33 @@ def run_experiment(
     def mean_or_none(metric_key: str) -> Optional[float]:
         values = [r[metric_key] for r in results if r.get(metric_key) is not None]
         return float(np.mean(values)) if values else None
+    # Aggregate every quality key (keys match quality_keys so cross-trial
+    # aggregation downstream picks them all up; None values are excluded).
     avg_quality = {
+        "grounding_score": mean_or_none("grounding_score"),
+        "hallucination_detected": mean_or_none("hallucination_detected"),  # -> hallucination RATE
+        "hallucinated_span_ratio": mean_or_none("hallucinated_span_ratio"),
         "faithfulness": mean_or_none("faithfulness"),
+        "supported_claim_ratio": mean_or_none("supported_claim_ratio"),
+        "context_relevance": mean_or_none("context_relevance"),
         "relevance": mean_or_none("relevance"),
         "completeness_bertscore": mean_or_none("completeness_bertscore"),
         "completeness_rouge_l": mean_or_none("completeness_rouge_l"),
+        "f1_score": mean_or_none("f1_score"),
+        "precision": mean_or_none("precision"),
+        "recall": mean_or_none("recall"),
+        "exact_match": mean_or_none("exact_match"),
     }
-    
+
     print("\n" + "=" * 70)
     print("QUALITY METRICS (Average)")
     print("=" * 70)
-    print(f"Faithfulness: {format_metric(avg_quality['faithfulness'])}")
-    print(f"Relevance: {format_metric(avg_quality['relevance'])}")
+    print(f"Grounding (LettuceDetect): {format_metric(avg_quality['grounding_score'])}")
+    print(f"Hallucination rate: {format_metric(avg_quality['hallucination_detected'])}")
+    print(f"Faithfulness (NLI claim-level): {format_metric(avg_quality['faithfulness'])}")
+    print(f"Supported-claim ratio: {format_metric(avg_quality['supported_claim_ratio'])}")
+    print(f"Context relevance (retriever diagnostic): {format_metric(avg_quality['context_relevance'])}")
+    print(f"F1 / EM: {format_metric(avg_quality['f1_score'])} / {format_metric(avg_quality['exact_match'])}")
     print(f"Completeness (BERTScore): {format_metric(avg_quality['completeness_bertscore'])}")
     print(f"Completeness (ROUGE-L): {format_metric(avg_quality['completeness_rouge_l'])}")
 
@@ -1916,7 +1931,10 @@ def main():
         ]
         
         quality_keys = [
-            "faithfulness", "relevance", "completeness_bertscore", "completeness_rouge_l",
+            "grounding_score", "hallucination_detected", "hallucinated_span_ratio",
+            "faithfulness", "supported_claim_ratio",
+            "context_relevance", "relevance",
+            "completeness_bertscore", "completeness_rouge_l",
             "f1_score", "precision", "recall", "exact_match",
         ]
 

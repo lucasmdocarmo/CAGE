@@ -22,7 +22,7 @@ def vllm_test_api_base() -> str:
 
 @pytest.fixture(scope="session")
 def vllm_test_model() -> str:
-    return os.getenv("VLLM_TEST_MODEL", "Qwen/Qwen3-4B")
+    return os.environ.get("VLLM_TEST_MODEL", "Qwen/Qwen2.5-Coder-0.5B-Instruct")
 
 
 @pytest.fixture(scope="session")

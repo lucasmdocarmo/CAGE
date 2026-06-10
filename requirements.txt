@@ -12,6 +12,10 @@ bert-score>=0.3.13
 rouge-score>=0.1.2
 ragas>=0.1.0
 evaluate>=0.4.1
+# Primary grounding/hallucination detector (token/span-level, ModernBERT/RAGTruth).
+# Pulls a recent transformers; if it conflicts with the pinned stack, install in a
+# dedicated env or set CAGE_DISABLE_LETTUCEDETECT=1 to fall back to NLI faithfulness.
+lettucedetect>=0.1.0
 
 # Framework & Orchestration
 mlflow>=2.9.0

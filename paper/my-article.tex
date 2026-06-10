@@ -1,0 +1,388 @@
+
+\documentclass[12pt,a4paper]{article}
+\usepackage{float}
+\usepackage[section]{placeins}
+\usepackage{sbc-template}
+\usepackage[english]{babel}
+\usepackage{times}
+\usepackage{courier}
+\usepackage[scaled]{helvet}
+\usepackage{array}
+\usepackage{enumitem}
+\hbadness=10000
+\vbadness=10000
+\setlength{\emergencystretch}{3em}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{url}
+\usepackage[authoryear]{natbib}
+\bibpunct{[}{]}{;}{a}{ }{,}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{hyperref}
+\let\cite\citep
+\usepackage{longtable}
+\usepackage{booktabs}
+\usepackage{setspace}
+\usepackage{subcaption}
+\usepackage{multirow}
+\usepackage{xcolor}
+
+\renewcommand{\topfraction}{0.9}
+\renewcommand{\bottomfraction}{0.8}
+\renewcommand{\textfraction}{0.07}
+\renewcommand{\floatpagefraction}{0.8}
+
+\title{CAGE: An Evaluation Framework for Cache-Augmented Generation Models}
+\author{Lucas Mariano do Carmo\inst{1}, Wladmir Cardoso Brandão\inst{1}, Henrique Cota de Freitas\inst{1}}
+\address{Pontifícia Universidade Católica de Minas Gerais (PUC Minas), Belo Horizonte, Brazil \email{lucas.mariano@sga.pucminas.br, wladmir@pucminas.br, cota@pucminas.br}}
+\date{}
+
+
+\begin{document}
+\singlespacing
+%\raggedbottom
+\maketitle
+\begin{abstract}
+Cache-Augmented Generation (CAG) is an emerging design for reducing the cost of repeated prompt processing by reusing previously processed context, yet it still lacks a standard for evaluation.
+We present CAGE, a framework that combines serving metrics and semantic quality analysis across baselines in cache-aware AI systems. CAGE integrates features from vLLM’s native prefix caching and evaluates latency, TTFT, throughput, and semantic metrics. In our results, native prefix caching reduced latency of 37.4\% and TTFT by 65.7\% with no loss in faithfulness, whereas RAG increased latency by 70.4\% and reduced faithfulness by 11.6\%. These results validate the usefulness of CAGE as an approach for evaluating cache-aware LLM systems.
+\end{abstract}
+
+%===============================================================================
+% PART I: THEORETICAL FOUNDATIONS AND FRAMEWORK DESIGN
+%===============================================================================
+
+\section{Introduction}
+
+Large Language Models (LLMs) are used widely nowadays in systems that must answer questions, explain technical outputs, summarize documents, and generate code. In these settings, answer quality depends not only on the model itself, but also on how context is supplied during inference. Retrieval-Augmented Generation (RAG) has become the standard approach for grounding responses in external knowledge, but it adds latency, retrieval error, and pipeline complexity ~\cite{lewis2020retrieval}.
+
+However, the design space is shifting from pure single-turn retrieval, towards dynamic, context-persistent, multi-turn reasoning, that reuse stable context across requests. In this work, we use Cache-Augmented Generation (CAG) to refer to approaches that improve inference efficiency by reusing previously processed context or cached model states when relevant context is stable or repeatedly used, while treating retrieval-backed hybrids as a separate comparison family ~\cite{yu2024dontdorag, chen2024turborag}.
+
+Despite growing interest in CAG, evaluation practice and research has been primarily on the RAG literature. Frameworks such as RAGAS, ARES, BERGEN and RAGBench are useful for retrieval-based systems, but they were not designed to measure locality, cache hit ratios, time-to-first-token (TTFT) behavior, or the quality implications of reusing internal context representations ~\cite{espejel2023ragas, li2024ragbench,ares2024,bergen2024}. As a result, one important question is raised: how should cache-aware systems be evaluated when latency, reuse behavior, and answer quality must be analyzed together?  
+
+The goal of this paper is to propose and analyze a modular CAG Evaluation (CAGE) framework that combines cache and retrieval telemetry with semantic quality analysis in a single approach. The main contributions are the systematic comparison of cache-backed, retrieval-backed, hybrid, and distributed baselines under common conditions, surfacing the trade-offs between reuse efficiency, serving latency, and answer quality, which compose the CAGE features.
+
+This work is organized as follows: Section~2 discusses the Key-Value cache as the foundational concept behind cache-aware inference and reviews related work. Section~3 presents the framework architecture, baseline definitions, and experimental setup. Section~4 reports the experimental results across serving performance, tail latency, quality, and cache telemetry. Section~5 discusses the overall findings, and Section~6 presents the conclusions and directions for future work.
+
+\section{Understanding Key-Value Cache as the System-Level Core}
+
+The Key-Value (KV) Cache is the central mechanism that makes autoregressive generation with Transformer models computationally feasible for long sequences~\cite{kwon2023efficient}. It is the technological backbone of the CAG paradigm, transforming a compute-bound problem into one dominated by memory bandwidth.
+
+While solving a computational problem, the KV Cache introduces a massive memory problem; Its size grows linearly with sequence length and batch size, often consuming more GPU VRAM than the model weights themselves. For a large model like Llama 3.1 70B with a 128K context window, the cache for a single sequence can reach 40 GB. The recognition of the KV Cache as a primary bottleneck has spurred significant research ~\cite{li2024kvsurvey}. These strategies can be categorized into single-node and distributed techniques.
+
+Single-node KV cache optimization focuses on reducing the memory pressure imposed by long-context inference within a single accelerator or a single machine. These techniques do not distribute the cache across devices; instead, they improve how memory is represented, allocated, and retained locally ~\cite{javidnia2025kvccompress}. Distributed KV cache strategies leverage multiple GPUs or nodes to store and process a much larger shared cache. Rather than only compressing or managing the cache locally, these approaches distribute its storage and associated attention computation across devices. ~\cite{qin2024mooncake}.
+
+Understanding these KV cache strategies is essential to CAGE's design, as the framework must measure how each strategy affects not only latency and throughput, but also the quality of generated answers. The present validation covers single-node prefix caching and retrieval-backed baselines, establishing the metrics and architecture, while subsequent phases will extend to distributed KV transfer and disaggregated serving, where trade-offs between memory management, transfer cost, and answer quality become significantly more complex.
+
+\subsection{Related Work}
+A fundamental limitation of Large Language Models (LLMs) is their reliance on static, parametric knowledge acquired during their extensive pre-training phase. This knowledge is inherently frozen in time and lacks domain-specificity, leading to challenges such as  inaccuracies ("hallucinations"), and an inability to reason over proprietary or real-time data ~\cite{zhang2024siren, phillips2024seven}.
+
+Cache-aware inference changes the unit of optimization from raw model execution to memory reuse. vLLM ~\cite{kwon2023efficient} uses memory management techniques like PagedAttention to reduce fragmentation and support efficient prefix reuse. This systems view is the minimal background needed for CAGE, because it explains why metrics such as TTFT, latency, throughput, and reuse rate matter alongside answer quality. From an evaluation perspective, this changes the nature of the bottleneck, as generation becomes less about raw model execution in isolation and more about how memory and context are managed across requests.
+
+RAGAs ~\cite{espejel2023ragas} is a reference-free evaluation framework for retrieval-augmented pipelines. Its contribution is a metric design for context relevance, faithfulness, and answer relevance, but it does not measure cache locality, reuse ratio, or the serving-time effects of cache-aware execution.
+
+RAGBench~\cite{li2024ragbench} is a benchmark for retrieval-grounded systems that formalizes the TRACe evaluation framework. It is highly relevant on the benchmarking side, but it remains centered on retriever-generator behavior rather than on the trade-offs that arise when knowledge is reused from cache instead of being retrieved online.
+
+Chan et al. ~\cite{yu2024dontdorag} argued that cache-augmented generation can replace or complement retrieval when the knowledge base is limited and stable enough to be loaded in advance. Their results motivate CAG as a serious alternative to retrieval-heavy pipelines, but the paper does not define a general approach for measuring latency, reuse behavior, and semantic quality across multiple cache-aware baselines 
+
+TurboRAG ~\cite{chen2024turborag} moved closer to the systems side by precomputing document KV states offline and reusing them during retrieval-time inference. This work shows that retrieval and cache reuse can be combined, yet its contribution is a serving method rather than an evaluation framework for comparing cache policies and semantic outcomes under common workloads.
+
+DistServe ~\cite{zhong2024distserve} study disaggregated prefill and decode serving, treating TTFT and per-token latency as separate systems objectives and assigning the two phases to different GPUs. Their work is foundational for the multi-node setting targeted by CAGE, but it optimizes serving goodput rather than jointly evaluating serving behavior and answer quality.
+
+Self-Route ~\cite{li2024selfroute} compared retrieval-based and long-context processing to propose how to choose between them based on model self-reflection. This work is also relevant to CAGE's hybrid evaluation direction and it frames routing as a cost-quality trade-off, but it does not measure cache telemetry, locality, or distributed reuse effects.
+
+As shown in Table~\ref{tab:related_work}, related work typically targets one axis at a time. CAGE (Figure~\ref{fig:cage_architecture}) differs by jointly evaluating performance, cache telemetry, and semantic quality across cache-backed and retrieval-backed baselines under a common approach.
+
+
+\begin{table}[H]
+\centering
+\caption{Comparison with adjacent work.}
+\label{tab:related_work}
+\footnotesize
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+\textbf{Work} & \textbf{Semantic quality} & \textbf{Systems metrics} & {\textbf{Cache reuse}} & \textbf{Distributed} \\
+\midrule
+RAGAS~\cite{espejel2023ragas} & Yes & No & No & No \\
+RAGBench~\cite{li2024ragbench} & Yes & No & No & No \\
+TurboRAG~\cite{chen2024turborag} & Partial & Yes & Yes & No \\
+DistServe~\cite{zhong2024distserve} & No & Yes & No & Yes \\
+SelfRoute~\cite{li2024selfroute} & Partial & Limited & No & No \\
+This Work & Yes & Yes & Yes & Yes \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{CAGE Framework Architecture - System Design}
+The framework was designed as a layered testbed (Figure~\ref{fig:cage_architecture}) with a workload layer that generates requests from a controlled dataset split, while an orchestration layer selects the baseline, manages run configuration, and enforces consistent experimental conditions across trials. A telemetry layer records system behavior during execution, including latency, TTFT, TPOT, throughput, and cache or retrieval signals. The quality layer scores generated answers against references and supporting context using metrics such as faithfulness, relevance, BERTScore, and ROUGE-L. Finally, the analysis layer aggregates trial outputs into summary tables and plots.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.95\textwidth]{Publish/images/cage_architecture_flow.png}
+\caption{The CAGE Framework Architecture Diagram, illustrated step-by-step.}
+\label{fig:cage_architecture}
+\end{figure}
+
+This separation is important because it prevents system and model or dataset changes, it also keeps the framework modular, so that new components or pipelines can be introduced without changing the evaluation logic itself. Redis~\cite{redisDocumentation} is used in CAGE as an optional centralized retrieval-cache baseline and in hybrid retrieval experiments, not as the primary KV-cache mechanism of the architecture.
+
+\subsection{Baseline Setting}
+
+Our initial validation was designed with seven baselines that vary both context source and reuse policy.
+
+\textit{No Cache} uses the gold SQuAD passage and recomputes every request from scratch. One clarification is that, \textit{No Cache} does not mean \textit{No Content}, it means \textit{No Reuse}. It serves as the gold-context recomputation control, but it isolates the cost of recomputation while keeping the best available evidence in the prompt.
+
+\textit{Prefix Cache} uses the same gold passage but enables native vLLM prefix reuse. It is the simplest single-node caching baseline and measures the benefit of reuse without external cache infrastructure. 
+
+\textit{RAG} replaces the gold passage path with retrieved passages obtained through dense retrieval and reranking. It represents the standard retrieval-based design and provides the main comparison point for systems that depend on external search rather than cache reuse.
+
+\textit{Redis Retrieval Cache Cold} relies on retrieved artifacts and stores them through a centralized Redis layer. The Redis cache is flushed before each run to ensure cold-start semantics. This baseline measures centralized retrieval-artifact reuse with external lookup overhead. Importantly, it does not store raw vLLM KV tensors in Redis; it evaluates centralized reuse within the retrieval layer.
+
+\textit{Hybrid Retrieval Cache Cold} combines retrieval with native prefix caching. The retrieval cache starts cold (flushed), but the vLLM prefix cache remains active. This baseline isolates the effect of prompt-prefix reuse on top of retrieval.
+
+\textit{Hybrid Retrieval Cache Warm} is the same hybrid design but with an explicit warmup phase. Fifty warmup queries are executed and excluded from measured metrics, ensuring both the retrieval cache and prompt cache are warm during evaluation.
+
+\textit{Distributed Router Replicated}  returns to the gold passage and evaluates a multi-replica routing design with real tokenized prefix hashing. The role is to demonstrate orchestration-level distributed routing rather than cross-node KV tensor transfer.
+
+\subsection{Local Setup and Initial configuration}
+Our usage of SQuADv2 is backed by Chan et al. ~\cite{yu2024dontdorag}, and Qwen/Qwen3-4B as a model that is feasible for controlled CPU-side evaluation. Therefore, initial validation can rely on a benchmark that is standard enough for comparison and controlled enough for baseline analysis.
+
+Each baseline was evaluated with 50 measured queries per trial across three sequential trials, yielding 1050 measured queries in total (7 baselines $\times$ 50 queries $\times$ 3 trials). For prefix-cache-enabled baselines, the server was restarted per baseline rather than per trial, so later trials may inherit warmed prompt-cache state and should not be interpreted as fully independent cold starts. The warm hybrid baseline also executes additional warmup queries that are excluded from reported metrics.
+
+Inference ran on the vLLM CPU backend (Apple M4 Pro, 24~GB unified memory, 12 cores) with a maximum of 100 output tokens and non-greedy decoding (temperature 0.7, top-p 0.95). Retrieval used intfloat/e5-large-v2 for embedding, BAAI/bge-reranker-large for reranking, and top-$k = 3$. The KV cache was allocated 10~GB via environment variable, sufficient to exercise reuse behavior within the available memory. The CPU-only setup with Qwen3-4B is an initial controlled constraint designed strictly to validate the mathematical and structural integrity of the CAGE orchestration logic. Because it does not induce the extreme KV-cache memory pressure that motivates CAG in production, the absolute latency values reported in this phase are not intended to be generalizable. Phase 2 of our framework transitions execution to cloud-provisioned A100/L4 GPUs, scaling to larger models (e.g., Qwen3-8B/14B) specifically to evaluate latency scaling and cache eviction behavior under representative memory pressure.
+
+
+\section{Experimental Results}
+
+This section reports the initial local validation of CAGE, designed to establish baseline results and verify the framework architecture. All seven baselines were evaluated on a single CPU node under the conditions described in Section~3.2.
+
+\subsection{Serving Performance}
+
+Table~\ref{tab:performance} summarizes the serving metrics across all seven baselines. Prefix Cache was the best overall baseline, achieving 37.4\% lower latency (10,015ms versus 16,006ms), 65.7\% lower TTFT (2376ms versus 6919ms), and 58.3\% higher throughput (0.096 QPS versus 0.061 QPS). This is due to the native prefix reuse in vLLM, which avoids redundant prompt processing without altering the context source.
+
+
+\begin{table}[H]
+\centering
+\caption{Performance Metrics (Mean $\pm$ Std Dev, n=50 queries, 3 trials)}
+\label{tab:performance}
+\footnotesize
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+\textbf{Baseline} & \textbf{QPS} & \textbf{Latency (ms)} & \textbf{TTFT (ms)} & \textbf{TPOT (ms)} & \textbf{Tok/s} \\
+\midrule
+No Cache & 0.061 $\pm$ 0.003 & 16,006 $\pm$ 711 & 6919 $\pm$ 112 & 90.9 $\pm$ 6.5 & 6.1 \\
+Prefix Cache & \textbf{0.096 $\pm$ 0.008} & \textbf{10,015 $\pm$ 884} & \textbf{2376 $\pm$ 275} & \textbf{76.4 $\pm$ 9.6} & \textbf{9.6} \\
+RAG & 0.033 $\pm$ 0.001 & 27,270 $\pm$ 283 & 18,775 $\pm$ 144 & 84.9 $\pm$ 1.5 & 3.3 \\
+Redis Cache Cold & 0.034 $\pm$ 0.000 & 26,853 $\pm$ 39 & 18,579 $\pm$ 37 & 82.7 $\pm$ 0.1 & 3.4 \\
+Hybrid Cache Cold & 0.059 $\pm$ 0.012 & 15,513 $\pm$ 4173 & 6001 $\pm$ 4290 & 95.1 $\pm$ 2.0 & 5.9 \\
+Hybrid Cache Warm & 0.067 $\pm$ 0.004 & 13,269 $\pm$ 893 & 2791 $\pm$ 66 & 104.8 $\pm$ 8.4 & 6.7 \\
+Distributed Replicated & 0.052 $\pm$ 0.001 & 18,492 $\pm$ 372 & 5279 $\pm$ 638 & 132.1 $\pm$ 3.5 & 5.2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The Distributed Replicated baseline improved TTFT by 23.7\% relative to No Cache (5279ms versus 6919ms), showing that multi-replica routing with prefix-aware hashing can improve responsiveness, although its total latency remains 15.5\% higher than No Cache due to routing overhead.
+
+RAG incurred 70.4\% higher latency than No Cache, driven by retrieval and reranking overhead. The hybrid baselines show that combining retrieval with prefix caching can recover part of this cost: Hybrid Cache Warm achieved 17.1\% lower latency than No Cache, though it still cannot match the pure Prefix Cache baseline.
+
+The TPOT column reveals that decode speed does not follow the same ranking as prefill. Prefix Cache achieved the lowest TPOT (76.4~ms/token) and the highest token throughput (9.6~tok/s), while Distributed Replicated has the highest TPOT (132.1~ms/token) despite its TTFT advantage. Among retrieval baselines, RAG and Redis Cache Cold show moderate TPOT (84.9 and 82.7~ms) but their total latency is dominated by the prefill phase rather than by decode cost.
+
+Figures~\ref{fig:latency_comparison} and~\ref{fig:throughput_comparison} visualize the serving-performance ranking from Table~\ref{tab:performance}.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{Publish/images/plots/phase1/01_latency_comparison.png}
+\caption{Average latency and TTFT across baselines (with standard deviation).}
+\label{fig:latency_comparison}
+\end{figure}
+
+
+Figure~\ref{fig:latency_comparison} makes visible the separation between cache-aware and retrieval-dominated baselines: the two retrieval settings are nearly $2.7\times$ slower than the control, whereas Prefix Cache reduces latency to $0.63\times$ of the control.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=\textwidth]{Publish/images/plots/phase1/new/02_throughput_comparison.png}
+\caption{Throughput comparison: (a) QPS and (b) TPS.}
+\label{fig:throughput_comparison}
+\end{figure}
+
+\subsection{Latency Decomposition and Variance}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{Publish/images/plots/phase1/04_latency_breakdown.png}
+\caption{Latency decomposition into TTFT (prefill) and generation time.}
+\label{fig:latency_breakdown}
+\end{figure}
+
+Figure~\ref{fig:latency_breakdown} decomposes total latency into prefill and generation components. The stacked bars confirm that Prefix Cache's advantage is concentrated in the prefill phase, while generation time remains comparable across baselines. 
+
+\begin{table}[H]
+\centering
+\caption{TTFT Distribution: Median vs Tail Latency (ms)}
+\label{tab:tail_latency}
+\footnotesize
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Baseline} & \textbf{p50} & \textbf{p95} & \textbf{Ratio} \\
+\midrule
+No Cache & 6467 & 10,435 & 1.6$\times$ \\
+Prefix Cache & 2300 & 4716 & 2.1$\times$ \\
+RAG & 18,871 & 23,895 & 1.3$\times$ \\
+Redis Cache Cold & 18,629 & 23,974 & 1.3$\times$ \\
+Hybrid Cache Cold & 5928 & 10,127 & 1.7$\times$ \\
+Hybrid Cache Warm & 2947 & 4462 & 1.5$\times$ \\
+Distributed Replicated & 2876 & 21,896 & \textbf{7.6$\times$} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:tail_latency} reveals that Distributed Replicated has a 7.6$\times$ p95/p50 TTFT spread (2876ms median vs 21,896ms tail), caused by cold replicas that have not yet warmed their local prefix cache. Hybrid Cache Cold shows a similar cold-start effect ($\pm$4290~ms TTFT std across trials), while RAG and Redis Cache Cold are consistently slow but stable (1.3$\times$ ratio).
+\subsection{Quality Results}
+
+Figure~\ref{fig:quality_comparison} shows that gold-context baselines (No Cache, Prefix Cache, Distributed) preserve the strongest faithfulness, while retrieval-backed settings are consistently weaker. This separation is consistent with~\citet{yu2024dontdorag}, who show that retrieved passages can weaken factual grounding when the gold context is already available.
+
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.95\textwidth]{Publish/images/plots/phase1/new/03_quality_comparison.png}
+\caption{Quality metrics comparison across baselines.}
+\label{fig:quality_comparison}
+\end{figure}
+
+Table~\ref{tab:quality} quantifies these differences. Prefix Cache has the lowest latency (Table~\ref{tab:performance}) but identical faithfulness to No Cache (0.570), confirming that native prefix caching preserves exact quality parity. While an absolute score of 0.570 might appear low for a baseline using the correct gold context, this is a direct result of how strict the evaluation metric is. SQuADv2 contains unanswerable questions where the text deliberately lacks the necessary information, and the smaller Qwen3-4B model tends to add conversational filler to its responses rather than answering concisely. Because the metric strictly grades every single phrase generated by the model for factual accuracy, this extra conversational text lowers the overall score.
+
+What is most important is the relative difference between the baselines. When the system is forced to rely on a search engine (RAG) instead of the perfect cache, its faithfulness score drops significantly to 0.504. This 11.6\% drop proves that the metric successfully catches the model making more factual errors when it reads retrieved, imperfect passages. Ultimately, moving from a cached context to a retrieved context directly degrades factual accuracy.
+
+To validate the assertions of recent LLM evaluation frameworks such as RAGAs~\cite{espejel2023ragas} and ARES~\cite{ares2024}, we explicitly included BERTScore as a traditional semantic similarity baseline. These frameworks argue that standard soft-matching metrics fail to detect subtle factual hallucinations introduced by retrieved contexts. Our empirical data corroborates this: BERTScore remained nearly constant across all baselines (0.324--0.328, with standard deviation below 0.001), despite massive architectural differences between caching and retrieval. Because token-level soft F1 captures structural and vocabulary similarity rather than factual grounding, it proved entirely non-discriminative in this scenario. Consequently, its inclusion serves as a negative empirical control, demonstrating exactly why CAGE must rely on strict NLI-based faithfulness to expose the factual degradation caused by retrieval mechanisms.
+
+\begin{table}[ht]
+\centering
+\caption{Quality Metrics and Latency-Faithfulness (Mean $\pm$ Std)}
+\label{tab:quality}
+\footnotesize
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Baseline} & \textbf{Latency (ms)} & \textbf{Faithfulness} & \textbf{BERTScore} & \textbf{Relevance} \\
+\midrule
+Prefix Cache & 10,015 & 0.570 $\pm$ 0.056 & 0.328 & 0.505 \\
+No Cache & 16,006 & 0.570 $\pm$ 0.056 & 0.328 & 0.505 \\
+Hybrid Cache Warm & 13,269 & 0.512 $\pm$ 0.027 & 0.324 & 0.525 \\
+Hybrid Cache Cold & 15,513 & 0.506 $\pm$ 0.022 & 0.324 & 0.525 \\
+Distributed Replicated & 18,492 & \textbf{0.636 $\pm$ 0.078} & 0.327 & 0.505 \\
+Redis Cache Cold & 26,853 & 0.550 $\pm$ 0.040 & 0.324 & 0.525 \\
+RAG & 27,270 & 0.504 $\pm$ 0.023 & 0.324 & 0.525 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Cache Telemetry}
+
+Table~\ref{tab:cache} shows that retrieval hit rate alone does not explain performance. To understand what drives TTFT improvement, this table combines retrieval signals, prompt-cache ratios, and the resulting TTFT reduction relative to No Cache.
+
+\begin{table}[H]
+\centering
+\caption{Cache and Retrieval Telemetry with TTFT Impact}
+\label{tab:cache}
+\footnotesize
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Baseline} & \textbf{Retr. Hit} & \textbf{Prompt Cached} & \textbf{Cache Hit (\%)} & \textbf{TTFT Reduction (\%)} \\
+\midrule
+No Cache & --- & --- & 0 & 0 (baseline) \\
+Prefix Cache & --- & 68.4\% & 94 & +65.7 \\
+RAG & 98\% & --- & 0 & $-$171.4 \\
+Redis Cache Cold & 98\% & --- & 0 & $-$168.5 \\
+Hybrid Cache Cold & 98\% & 75.6\% & 92 & +13.3 \\
+Hybrid Cache Warm & 98\% & 89.2\% & 100 & +59.7 \\
+Distributed Replicated & --- & 68.4\% & 94 & +23.7 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The retrieval-backed baselines all achieve 98\% retrieval hit rate, yet RAG and Redis Cache Cold remain the slowest settings with the largest TTFT increases. Both RAG and Redis Cache Cold have 0\% cache-hit rate (retrieval succeeded, but results were not reused), whereas Hybrid Cache Warm reached 100\% (retrieval was both correct and reused). Prefix Cache and Distributed Replicated report 68.4\% cached prompt ratio, Hybrid Cache Cold 75.6\%, and Hybrid Cache Warm 89.2\%. Prompt-cache ratios are computed over requests with vLLM prompt-usage telemetry (coverage: 47/50 for Prefix Cache and Distributed, 46/50 for Hybrid Cold, 50/50 for Hybrid Warm).
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=\textwidth]{Publish/images/plots/phase1/11_cache_hit_vs_ttft.png}
+\caption{Local cache-hit rate versus TTFT reduction relative to No Cache. }
+\label{fig:cache_ttft}
+\end{figure}
+
+Figure~\ref{fig:cache_ttft} Baselines cluster into two groups: those with high local cache-hit rates (Prefix Cache, Hybrid Warm, Distributed, Hybrid Cold) appear in the upper-right quadrant with positive TTFT reductions, while those without local reuse (RAG, Redis Cache Cold) fall to the lower-left with large TTFT penalties. This confirms that local prompt-cache reuse, not retrieval success, is the primary driver of TTFT improvement.
+
+These signals demonstrate why this framework recorded cache and retrieval metrics alongside serving performance. Without the cache hit and prompt-cached columns, a system reporting 98\% retrieval hit rate would appear healthy, but RAG and Redis Cache Cold show that retrieval success does not translate into serving efficiency. 
+
+%===============================================================================
+% CONCLUSION
+%===============================================================================
+
+\section{Conclusion and Three-Phase Roadmap}
+This paper presented CAGE, a comprehensive framework for evaluating Cache-Augmented Generation systems. The goal was to establish a unified methodology for assessing cache-aware LLMs where latency, retrieval behavior, and semantic quality must be considered together. To ensure systematic development, the CAGE framework is structured across a three-phase roadmap, with this paper fully validating Phase 1.
+
+\textbf{Phase 1: Local Validation (Completed)}
+This paper served as the structural validation of the CAGE orchestration logic and telemetry pipeline. Under controlled constraints, our results (Tables~\ref{tab:performance} and~\ref{tab:quality}) show that native prefix caching was the strongest baseline, reducing latency by 37.4\% and TTFT by 65.7\% with identical faithfulness (0.570). Conversely, RAG incurred a 70.4\% latency penalty and a 11.6\% drop in faithfulness. Additionally, tail latency analysis (Table~\ref{tab:tail_latency}) revealed a 7.6$\times$ p95/p50 TTFT spread in the Distributed Replicated baseline, proving that mean metrics alone are insufficient for cache-aware systems. Together, these Phase 1 results confirm that our telemetry accurately captures the trade-offs between cache reuse, retrieval overhead, and grounding.
+
+\textbf{Phase 2: GPU Validation and Model Scaling (Pending)}
+Building on this verified architecture, Phase 2 will transition the framework to Google Cloud Platform to push the system to its operational limits. We will utilize G2 instances (NVIDIA L4) for cost-effective baseline comparisons, and A2/A3 series instances (NVIDIA A100/H100) to evaluate caching under extreme memory pressure. By scaling to larger model footprints (8B to 14B parameters) and increasing dataset diversity, this phase will induce authentic KV-cache saturation. This will force cache eviction policies to trigger, capturing generalizable latency curves and throughput degradation boundaries under peak loads.
+
+\textbf{Phase 3: Distributed and HPC Evaluation (Future)}
+Following single-node memory saturation, Phase 3 will focus on distributed high-performance computing (HPC) limits. By deploying a multi-node GPU cluster on GCP—leveraging Google Virtual NIC (gVNIC) and optimized NCCL topologies for high-bandwidth, low-latency interconnects—we will evaluate the system's breaking points regarding real cross-node KV cache tensor transfer costs. This phase will also analyze speculative decoding interactions, dynamic retrieval-fallback policies, and integrate native telemetry on top of vLLM disaggregated prefilling~\cite{vllm2024disagg}.
+
+Ultimately, these three phases will establish CAGE as a rigorous, reproducible testbed for evaluating cache-aware serving policies from local structural design to distributed production scale.
+
+\bibliographystyle{sbc}
+\begin{thebibliography}{99}
+
+\bibitem[Chan et~al.(2025)]{yu2024dontdorag}
+B. J. Chan, C.-T. Chen, J.-H. Cheng, and H.-H. Huang. Don't Do RAG: When Cache-Augmented Generation is All You Need for Knowledge Tasks. In \textit{WWW (Companion Volume) 2025}, pages 893--897, 2025.
+
+\bibitem[Shahul Es et~al.(2024)]{espejel2023ragas}
+S. Es, J. James, L. Espinosa Anke, and S. Schockaert. RAGAs: Automated Evaluation of Retrieval Augmented Generation. In \textit{Proceedings of the 18th Conference of the European Chapter of the Association for Computational Linguistics: System Demonstrations}, pages 150--158, 2024.
+
+\bibitem[Lu et~al.(2025)]{chen2024turborag}
+S. Lu, H. Wang, Y. Rong, Z. Chen, and Y. Tang. TurboRAG: Accelerating Retrieval-Augmented Generation with Precomputed KV Caches for Chunked Text. In \textit{Proceedings of the 2025 Conference on Empirical Methods in Natural Language Processing}, pages 6588--6601, 2025.
+
+\bibitem[Lewis et~al.(2020)]{lewis2020retrieval}
+P. Lewis et al. Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks. In \textit{Advances in Neural Information Processing Systems (NeurIPS)}, 2020.
+
+\bibitem[Saad-Falcon et~al.(2024)]{ares2024}
+J. Saad-Falcon, O. Khattab, C. Potts, and M. Zaharia. ARES: An Automated Evaluation Framework for Retrieval-Augmented Generation Systems. In \textit{Proceedings of the 2024 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies (Volume 1)}, pages 338--354, 2024.
+
+\bibitem[Rau et~al.(2024)]{bergen2024}
+D. Rau, H. D{\'e}jean, N. Chirkova, T. Formal, S. Wang, S. Clinchant, and V. Nikoulina. BERGEN: A Benchmarking Library for Retrieval-Augmented Generation. In \textit{Findings of the Association for Computational Linguistics: EMNLP}, pages 7640--7663, 2024.
+
+\bibitem[Li et~al.(2024c)]{li2024selfroute}
+Z. Li, C. Li, M. Zhang, Q. Mei, and M. Bendersky. Retrieval Augmented Generation or Long-Context LLMs? A Comprehensive Study and Hybrid Approach. In \textit{Proceedings of the 2024 Conference on Empirical Methods in Natural Language Processing: Industry Track}, pages 881--893, 2024.
+
+\bibitem[Friel et~al.(2024)]{li2024ragbench}
+R. Friel et al. RAGBench: Explainable Benchmark for Retrieval-Augmented Generation Systems. \textit{arXiv preprint arXiv:2407.11005}, 2024.
+
+\bibitem[Kwon et~al.(2023)]{kwon2023efficient}
+W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. H. Yu, J. E. Gonzalez, H. Zhang, and I. Stoica. Efficient Memory Management for Large Language Model Serving with PagedAttention. In \textit{Proceedings of the 29th Symposium on Operating Systems Principles}, pages 611--626, 2023.
+
+\bibitem[Li et~al.(2024b)]{li2024kvsurvey}
+H. Li et al. A Survey on Large Language Model Acceleration based on KV Cache Management. \textit{arXiv preprint arXiv:2412.19442}, 2024.
+
+\bibitem[Barnett et~al.(2024)]{phillips2024seven}
+S. Barnett, S. Kurniawan, S. Thudumu, Z. Brannelly, and M. Abdelrazek. Seven Failure Points When Engineering a Retrieval Augmented Generation System. In \textit{CAIN 2024}, pages 194--199, 2024.
+
+\bibitem[Sahoo et~al.(2024)]{zhang2024siren}
+P. Sahoo, P. Meharia, A. Ghosh, S. Saha, V. Jain, and A. Chadha. A Comprehensive Survey of Hallucination in Large Language, Image, Video and Audio Foundation Models. In \textit{Findings of the Association for Computational Linguistics: EMNLP 2024}, pages 11709--11724, 2024.
+
+\bibitem[Zhong et~al.(2024)]{zhong2024distserve}
+Y. Zhong et al. DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving. In \textit{18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24)}, 2024.
+
+\bibitem[Javidnia et~al.(2025)]{javidnia2025kvccompress}
+N. Javidnia, B. Darvish Rouhani, and F. Koushanfar. Key, Value, Compress: A Systematic Exploration of KV Cache Compression Techniques. In \textit{IEEE CICC 2025}, 2025.
+
+\bibitem[Qin et~al.(2024)]{qin2024mooncake}
+R. Qin, Z. Li, W. He, M. Zhang, Y. Wu, W. Zheng, and X. Xu. Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving. \textit{arXiv:2407.00079}, 2024.
+
+\bibitem[vLLM Project(2024)]{vllm2024disagg}
+vLLM Project. Disaggregated Prefilling (experimental). \textit{vLLM Documentation}, 2024. Available at: \url{https://docs.vllm.ai/en/stable/features/disagg_prefill.html}.
+
+\bibitem[Redis(2025)]{redisDocumentation}
+Redis. Redis Documentation. \textit{Redis Official Documentation}, 2025. Available at: \url{https://redis.io/docs}.
+
+\end{thebibliography}
+\end{document}

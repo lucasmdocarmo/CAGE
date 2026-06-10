@@ -2,11 +2,25 @@
 Quality metrics for CAGE evaluation.
 
 Metrics:
-- Faithfulness: NLI-based entailment score
-- Relevance: Embedding similarity  
-- Completeness: BERTScore and ROUGE
-- F1-score: Token-level precision/recall (QA standard metric)
-- Cache Relevance: Proportion of cache blocks that contributed to the answer
+- Hallucination (PRIMARY): LettuceDetect token/span-level grounding detector.
+  Encoder (ModernBERT) trained on RAGTruth; flags answer spans not supported by
+  the context. Reports a span ratio and a derived faithfulness score.
+- Faithfulness (NLI): claim-level entailment. The answer is split into claims;
+  each claim's entailment probability is taken as the MAX over context documents
+  (a claim is faithful if supported by ANY provided context), then averaged over
+  claims (RAGAS-style). Premise/hypothesis are passed as a proper sentence PAIR
+  and the entailment class index is resolved from the model config (never hard
+  coded), so the score is comparable across NLI checkpoints.
+- Relevance (retriever diagnostic): question<->context embedding similarity.
+  NOTE: this characterises the retriever, NOT answer quality. Reported under the
+  ``context_relevance`` name; ``relevance`` is kept as an alias for back-compat.
+- Completeness: BERTScore (with baseline rescaling) and ROUGE-L.
+- F1-score: Token-level precision/recall (QA standard metric).
+- Cache Relevance: Proportion of cache blocks that contributed to the answer.
+
+Design intent for cloud/HPC + publication: every metric returns ``None`` (not a
+silent 0.5/0.0 sentinel) when its model is unavailable, so undisclosed model-load
+failures cannot contaminate reported means.
 """
 
 from dataclasses import dataclass
@@ -40,22 +54,35 @@ class CacheRelevanceMetrics:
 
 @dataclass
 class QualityMetrics:
-    """Quality evaluation results."""
-    
-    faithfulness: float  # 0-1, NLI entailment score
-    relevance: float  # 0-1, embedding similarity
-    completeness_bertscore: Optional[float]  # 0-1, BERTScore F1
+    """Quality evaluation results.
+
+    Faithfulness/quality fields are ``Optional``: ``None`` means "metric model
+    unavailable for this sample" and must be excluded from means, never treated
+    as a real score.
+    """
+
+    faithfulness: Optional[float]  # 0-1, claim-level NLI entailment (None if NLI unavailable)
+    relevance: Optional[float]  # 0-1, question<->context similarity (retriever diagnostic)
+    completeness_bertscore: Optional[float]  # 0-1, BERTScore F1 (baseline-rescaled)
     completeness_rouge_l: Optional[float]  # 0-1, ROUGE-L F1
     f1_score: float = 0.0  # 0-1, token-level F1 (QA standard metric)
     precision: float = 0.0  # 0-1, token-level precision
     recall: float = 0.0  # 0-1, token-level recall
     exact_match: float = 0.0  # 0 or 1, exact string match
     cache_relevance: Optional[float] = None  # 0-1, proportion of useful cache blocks
-    
+    # Hallucination (LettuceDetect, PRIMARY grounding signal)
+    grounding_score: Optional[float] = None  # 0-1, 1 - hallucinated_span_ratio (None if detector unavailable)
+    hallucination_detected: Optional[bool] = None  # True if any answer span is unsupported
+    hallucinated_span_ratio: Optional[float] = None  # 0-1, fraction of answer characters flagged unsupported
+    supported_claim_ratio: Optional[float] = None  # 0-1, fraction of claims with entailment >= 0.5
+    faithfulness_method: str = "nli_claim_max"  # provenance of the faithfulness number
+
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
-        result = {
+        """Convert to dictionary. Numeric fields are auto-aggregated downstream."""
+        result: Dict[str, Any] = {
             "faithfulness": self.faithfulness,
+            # Honest name for the retriever-diagnostic, plus a back-compat alias.
+            "context_relevance": self.relevance,
             "relevance": self.relevance,
             "completeness_bertscore": self.completeness_bertscore,
             "completeness_rouge_l": self.completeness_rouge_l,
@@ -63,7 +90,14 @@ class QualityMetrics:
             "precision": self.precision,
             "recall": self.recall,
             "exact_match": self.exact_match,
+            "grounding_score": self.grounding_score,
+            "hallucinated_span_ratio": self.hallucinated_span_ratio,
+            "supported_claim_ratio": self.supported_claim_ratio,
+            "faithfulness_method": self.faithfulness_method,
         }
+        if self.hallucination_detected is not None:
+            # Stored as 0/1 so it aggregates to a hallucination RATE across a run.
+            result["hallucination_detected"] = 1.0 if self.hallucination_detected else 0.0
         if self.cache_relevance is not None:
             result["cache_relevance"] = self.cache_relevance
         return result
@@ -78,16 +112,28 @@ class QualityEvaluator:
         use_embeddings: bool = True,
         use_bertscore: bool = True,
         use_rouge: bool = True,
+        use_lettucedetect: bool = True,
         device: str | int = "cpu",
         nli_model_name: Optional[str] = None,
         embedding_model_name: Optional[str] = None,
         bertscore_model_name: Optional[str] = None,
+        lettucedetect_model_name: Optional[str] = None,
+        bertscore_rescale_with_baseline: bool = True,
+        bertscore_lang: str = "en",
+        nli_max_length: int = 512,
     ):
         self.use_nli = use_nli
         self.use_embeddings = use_embeddings
         self.use_bertscore = use_bertscore
         self.use_rouge = use_rouge
+        # LettuceDetect can be force-disabled via env (e.g. CPU-only smoke tests).
+        self.use_lettucedetect = use_lettucedetect and os.getenv(
+            "CAGE_DISABLE_LETTUCEDETECT", ""
+        ).strip().lower() not in {"1", "true", "yes"}
         self.device = device
+        self.bertscore_rescale_with_baseline = bertscore_rescale_with_baseline
+        self.bertscore_lang = bertscore_lang
+        self.nli_max_length = nli_max_length
 
         # Allow override via env vars or constructor args.
         self.nli_model_name = (
@@ -115,14 +161,24 @@ class QualityEvaluator:
             ).split(",")
             if name.strip()
         ]
-        
+        self.lettucedetect_model_name = (
+            lettucedetect_model_name
+            or os.getenv(
+                "CAGE_LETTUCEDETECT_MODEL",
+                "KRLabsOrg/lettucedect-base-modernbert-en-v1",
+            )
+        )
+
         # Lazy loading of models
         self._nli_model = None
+        self._nli_entail_index = None  # resolved entailment class index for the loaded NLI model
         self._embedding_model = None
         self._bertscore_model = None
         self._bertscore_model_active_name = None
         self._rouge_scorer = None
         self._bertscore_disabled_reason = None
+        self._lettucedetect_model = None
+        self._lettucedetect_disabled_reason = None
     
     def _hf_pipeline_device(self) -> int:
         """Convert device setting to a value compatible with transformers.pipeline."""
@@ -222,10 +278,25 @@ class QualityEvaluator:
 
             for candidate in self._iter_bertscore_candidates(exclude=exclude):
                 try:
-                    scorer = BERTScorer(
-                        model_type=candidate,
-                        device=self.device,
-                    )
+                    # rescale_with_baseline is REQUIRED for discriminative scores:
+                    # raw RoBERTa F1 sits in a compressed ~0.3 band and is flat across
+                    # systems. Baseline rescaling restores dynamic range. lang selects
+                    # the correct baseline file.
+                    try:
+                        scorer = BERTScorer(
+                            model_type=candidate,
+                            device=self.device,
+                            lang=self.bertscore_lang,
+                            rescale_with_baseline=self.bertscore_rescale_with_baseline,
+                        )
+                    except Exception as baseline_err:
+                        # Some custom model_types have no published baseline file;
+                        # fall back to unrescaled rather than dropping the model.
+                        print(
+                            f"Warning: BERTScore baseline rescaling unavailable for "
+                            f"'{candidate}' ({baseline_err}); using unrescaled scores."
+                        )
+                        scorer = BERTScorer(model_type=candidate, device=self.device)
                     self._probe_bertscore_model(scorer)
                     self._bertscore_model = scorer
                     self._bertscore_model_active_name = candidate
@@ -255,76 +326,221 @@ class QualityEvaluator:
                 print(f"Warning: Failed to load ROUGE: {e}")
                 self._rouge_scorer = None
         return self._rouge_scorer
-    
+
+    @property
+    def lettucedetect_model(self):
+        """Lazy load the LettuceDetect hallucination detector (PRIMARY grounding signal)."""
+        if (
+            self._lettucedetect_model is None
+            and self.use_lettucedetect
+            and self._lettucedetect_disabled_reason is None
+        ):
+            try:
+                from lettucedetect.models.inference import HallucinationDetector
+
+                # device: HallucinationDetector accepts a torch-style device string.
+                device_str = "cpu"
+                d = str(self.device).lower()
+                if isinstance(self.device, int):
+                    device_str = f"cuda:{self.device}" if self.device >= 0 else "cpu"
+                elif d.startswith("cuda"):
+                    device_str = d
+                self._lettucedetect_model = HallucinationDetector(
+                    method="transformer",
+                    model_path=self.lettucedetect_model_name,
+                    device=device_str,
+                )
+            except Exception as e:
+                self._lettucedetect_disabled_reason = str(e)
+                print(
+                    f"Warning: LettuceDetect unavailable ({e}); "
+                    f"falling back to NLI faithfulness only."
+                )
+                self._lettucedetect_model = None
+        return self._lettucedetect_model
+
+    @staticmethod
+    def _split_claims(text: str) -> List[str]:
+        """Split an answer into atomic claims (sentence-level).
+
+        Dependency-free splitter: breaks on sentence terminators and newlines.
+        Short answers (no terminator) are returned as a single claim.
+        """
+        import re
+
+        if not text or not text.strip():
+            return []
+        # Split on ., !, ? followed by whitespace, and on newlines/semicolons.
+        parts = re.split(r"(?<=[.!?])\s+|\n+|;\s+", text.strip())
+        claims = [p.strip() for p in parts if p and p.strip()]
+        return claims or [text.strip()]
+
+    def _resolve_nli_entail_index(self) -> Optional[int]:
+        """Resolve the entailment class index from the loaded NLI model config.
+
+        Never hard-code LABEL_2: DeBERTa-mnli-fever-anli uses
+        {0: entailment, 1: neutral, 2: contradiction} whereas bart-large-mnli uses
+        the reverse. We read id2label and find the 'entailment' class.
+        """
+        if self._nli_entail_index is not None:
+            return self._nli_entail_index
+        try:
+            id2label = self.nli_model.model.config.id2label
+            for idx, label in id2label.items():
+                if "entail" in str(label).lower():
+                    self._nli_entail_index = int(idx)
+                    return self._nli_entail_index
+        except Exception:
+            pass
+        return None
+
+    def _nli_entailment_prob(self, premise: str, hypothesis: str) -> Optional[float]:
+        """P(entailment) for hypothesis given premise, as a proper sentence pair."""
+        try:
+            # Pass a PAIR (text/text_pair) so the model sees premise vs hypothesis
+            # with correct segment encoding. top_k=None returns all class scores.
+            result = self.nli_model(
+                {"text": premise, "text_pair": hypothesis},
+                top_k=None,
+                truncation=True,
+                max_length=self.nli_max_length,
+            )
+            # transformers may nest the result as [[...]] for a single pair.
+            if result and isinstance(result[0], list):
+                result = result[0]
+            if not result:
+                return None
+            by_label = {str(d.get("label", "")).lower(): float(d.get("score", 0.0)) for d in result}
+            # Prefer a named 'entailment' class.
+            for label, score in by_label.items():
+                if "entail" in label:
+                    return score
+            # Otherwise resolve LABEL_x via the model config.
+            idx = self._resolve_nli_entail_index()
+            if idx is not None:
+                return by_label.get(f"label_{idx}")
+            return None
+        except Exception as e:
+            print(f"Error in NLI entailment: {e}")
+            return None
+
     def evaluate_faithfulness(
         self, generated_text: str, context: List[str]
-    ) -> float:
+    ) -> Dict[str, Optional[float]]:
+        """Claim-level NLI faithfulness.
+
+        The answer is split into claims; each claim's entailment probability is the
+        MAX over context documents (faithful if supported by ANY context), then
+        averaged over claims. Returns ``{"faithfulness": <0-1 or None>,
+        "supported_claim_ratio": <0-1 or None>}``. ``None`` means NLI unavailable.
         """
-        Evaluate faithfulness using NLI.
-        
-        Checks if generated text is entailed by context.
-        Returns average entailment score across context documents.
-        """
-        if not self.nli_model or not context:
-            return 0.5  # Neutral score
-        
+        empty = {"faithfulness": None, "supported_claim_ratio": None}
+        if not self.use_nli or not self.nli_model:
+            return empty
+        nonempty_ctx = [c for c in (context or []) if c and str(c).strip()]
+        claims = self._split_claims(generated_text or "")
+        if not nonempty_ctx or not claims:
+            return empty
+
         try:
-            # Check entailment for each context document
-            scores = []
-            for ctx in context:
-                # NLI: premise=context, hypothesis=generated_text
-                result = self.nli_model(
-                    f"{ctx} [SEP] {generated_text}",
-                    top_k=1,
-                )
-                
-                # Extract entailment probability
-                label = str(result[0].get("label", "")).lower()
-                is_entailment = (
-                    "entail" in label or label in {"label_2"}  # common MNLI mapping
-                )
-                if result and is_entailment:
-                    scores.append(result[0]["score"])
-                else:
-                    scores.append(0.0)
-            
-            return float(np.mean(scores)) if scores else 0.5
-            
+            claim_scores: List[float] = []
+            for claim in claims:
+                best = 0.0
+                have_score = False
+                for ctx in nonempty_ctx:
+                    p = self._nli_entailment_prob(str(ctx), claim)
+                    if p is not None:
+                        best = max(best, p)
+                        have_score = True
+                if have_score:
+                    claim_scores.append(best)
+            if not claim_scores:
+                return empty
+            faithfulness = float(np.mean(claim_scores))
+            supported = float(np.mean([1.0 if s >= 0.5 else 0.0 for s in claim_scores]))
+            return {"faithfulness": faithfulness, "supported_claim_ratio": supported}
         except Exception as e:
             print(f"Error in faithfulness evaluation: {e}")
-            return 0.5
+            return empty
+
+    def evaluate_hallucination(
+        self, question: str, context: List[str], generated_text: str
+    ) -> Dict[str, Any]:
+        """Token/span-level hallucination detection via LettuceDetect (PRIMARY).
+
+        Returns ``{"grounding_score", "hallucination_detected",
+        "hallucinated_span_ratio"}``. All ``None`` if the detector is unavailable.
+        """
+        empty: Dict[str, Any] = {
+            "grounding_score": None,
+            "hallucination_detected": None,
+            "hallucinated_span_ratio": None,
+        }
+        detector = self.lettucedetect_model
+        answer = generated_text or ""
+        nonempty_ctx = [str(c) for c in (context or []) if c and str(c).strip()]
+        if detector is None or not nonempty_ctx or not answer.strip():
+            return empty
+        try:
+            spans = detector.predict(
+                context=nonempty_ctx,
+                question=question or "",
+                answer=answer,
+                output_format="spans",
+            )
+            # spans: list of dicts with 'start','end' (char offsets into the answer)
+            total = len(answer)
+            flagged = 0
+            for s in spans or []:
+                start = int(s.get("start", 0))
+                end = int(s.get("end", 0))
+                if end > start:
+                    flagged += min(end, total) - min(start, total)
+            ratio = (flagged / total) if total > 0 else 0.0
+            ratio = max(0.0, min(1.0, ratio))
+            return {
+                "grounding_score": 1.0 - ratio,
+                "hallucination_detected": bool(spans),
+                "hallucinated_span_ratio": ratio,
+            }
+        except Exception as e:
+            print(f"Error in LettuceDetect hallucination detection: {e}")
+            return empty
     
     def evaluate_relevance(
         self, question: str, context: List[str]
-    ) -> float:
+    ) -> Optional[float]:
         """
-        Evaluate relevance using embedding similarity.
-        
-        Computes cosine similarity between question and context.
-        Returns maximum similarity score across context documents.
+        Retriever diagnostic: question<->context embedding similarity.
+
+        NOTE: this is a property of the retriever + dataset and is INDEPENDENT of
+        the generated answer. It is NOT an answer-quality metric. Returns the max
+        cosine similarity across context documents, or ``None`` if the embedding
+        model is unavailable.
         """
-        if not self.embedding_model or not context:
-            return 0.5
-        
+        nonempty_ctx = [c for c in (context or []) if c and str(c).strip()]
+        if not self.embedding_model or not nonempty_ctx:
+            return None
+
         try:
             # Encode question and context
             question_emb = self.embedding_model.encode(
                 question, convert_to_tensor=True
             )
             context_embs = self.embedding_model.encode(
-                context, convert_to_tensor=True
+                nonempty_ctx, convert_to_tensor=True
             )
-            
+
             # Compute cosine similarities
             from sentence_transformers.util import cos_sim
             similarities = cos_sim(question_emb, context_embs)[0]
-            
+
             # Return max similarity
             return float(similarities.max().cpu().numpy())
-            
+
         except Exception as e:
             print(f"Error in relevance evaluation: {e}")
-            return 0.5
+            return None
     
     def evaluate_completeness(
         self, generated_text: str, reference_answer: str
@@ -337,7 +553,8 @@ class QualityEvaluator:
         """
         results: Dict[str, Optional[float]] = {"bertscore_f1": None, "rouge_l_f1": None}
         
-        # Handle empty generation gracefully to avoid BERTScore warnings
+        # Empty generation: a missing answer scores 0 on overlap metrics (this is a
+        # genuine 0, not a model-unavailable sentinel).
         if not generated_text or not generated_text.strip():
             if self.use_bertscore:
                 results["bertscore_f1"] = 0.0
@@ -468,13 +685,14 @@ class QualityEvaluator:
         Returns:
             QualityMetrics with all scores
         """
-        faithfulness = self.evaluate_faithfulness(generated_text, context)
+        faith = self.evaluate_faithfulness(generated_text, context)
+        halluc = self.evaluate_hallucination(question, context, generated_text)
         relevance = self.evaluate_relevance(question, context)
         completeness = self.evaluate_completeness(generated_text, reference_answer)
         f1_metrics = self.evaluate_f1_score(generated_text, reference_answer)
-        
+
         return QualityMetrics(
-            faithfulness=faithfulness,
+            faithfulness=faith["faithfulness"],
             relevance=relevance,
             completeness_bertscore=completeness["bertscore_f1"],
             completeness_rouge_l=completeness["rouge_l_f1"],
@@ -482,6 +700,10 @@ class QualityEvaluator:
             precision=f1_metrics["precision"],
             recall=f1_metrics["recall"],
             exact_match=f1_metrics["exact_match"],
+            grounding_score=halluc["grounding_score"],
+            hallucination_detected=halluc["hallucination_detected"],
+            hallucinated_span_ratio=halluc["hallucinated_span_ratio"],
+            supported_claim_ratio=faith["supported_claim_ratio"],
         )
     
     def batch_evaluate(
@@ -639,20 +861,30 @@ class QualityEvaluator:
             QualityMetrics with all scores including cache_relevance
         """
         # Base metrics
-        faithfulness = self.evaluate_faithfulness(generated_text, context)
+        faith = self.evaluate_faithfulness(generated_text, context)
+        halluc = self.evaluate_hallucination(question, context, generated_text)
         relevance = self.evaluate_relevance(question, context)
         completeness = self.evaluate_completeness(generated_text, reference_answer)
-        
+        f1_metrics = self.evaluate_f1_score(generated_text, reference_answer)
+
         # Cache relevance (use context as cache blocks if not provided)
         blocks_to_evaluate = cache_blocks if cache_blocks is not None else context
         cache_rel = self.evaluate_cache_relevance(
             generated_text, reference_answer, blocks_to_evaluate, relevance_threshold
         )
-        
+
         return QualityMetrics(
-            faithfulness=faithfulness,
+            faithfulness=faith["faithfulness"],
             relevance=relevance,
             completeness_bertscore=completeness["bertscore_f1"],
             completeness_rouge_l=completeness["rouge_l_f1"],
+            f1_score=f1_metrics["f1"],
+            precision=f1_metrics["precision"],
+            recall=f1_metrics["recall"],
+            exact_match=f1_metrics["exact_match"],
+            grounding_score=halluc["grounding_score"],
+            hallucination_detected=halluc["hallucination_detected"],
+            hallucinated_span_ratio=halluc["hallucinated_span_ratio"],
+            supported_claim_ratio=faith["supported_claim_ratio"],
             cache_relevance=cache_rel.cache_relevance,
         )

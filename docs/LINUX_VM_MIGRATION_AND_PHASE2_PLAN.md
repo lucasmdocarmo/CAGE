@@ -1,3 +1,11 @@
+> <!-- CAGE-DOC-STATUS -->
+> **⚠️ STATUS: SUPERSEDED / HISTORICAL (2026-06-09).** This document predates the
+> June 2026 reorganization and metric fixes. It is kept for history only and
+> contains stale paths, pre-fix metric numbers, and/or invalid CLI flags.
+> **Authoritative docs:** [`KNOWLEDGE_BASE.md`](KNOWLEDGE_BASE.md) (project reference),
+> [`RUNBOOK.md`](RUNBOOK.md) (setup/deploy/run), [`VALIDATION_AND_SOTA_REVIEW.md`](VALIDATION_AND_SOTA_REVIEW.md) (limitations).
+> See [`README.md`](README.md) for the doc index.
+
 # CAGE: Linux VM Migration & Master Project Roadmap
 
 **Last Updated:** 2026-04-11
