@@ -36,6 +36,16 @@ SYNC_INTERVAL="${SYNC_INTERVAL:-120}"
 # Single-GPU-safe default: skip the VRAM-hungry local distributed baseline.
 export ENABLE_DISTRIBUTED="${ENABLE_DISTRIBUTED:-0}"
 
+# vLLM telemetry via cage-stats: auto-capture on cloud (set VLLM_TELEMETRY=0 to disable).
+export VLLM_TELEMETRY="${VLLM_TELEMETRY:-1}"
+# Resolve cage-stats for the in-process telemetry path if it isn't pip-installed.
+if [ -z "${CAGE_STATS_HOME:-}" ] && [ -d "$PROJECT_DIR/../cage-stats/cage_stats" ]; then
+  export CAGE_STATS_HOME="$(cd "$PROJECT_DIR/../cage-stats" && pwd)"
+fi
+if [ "$VLLM_TELEMETRY" != "0" ]; then
+  echo "[cage] vLLM telemetry ON (cage-stats${CAGE_STATS_HOME:+ @ $CAGE_STATS_HOME}) -> per-baseline vllm_telemetry.json"
+fi
+
 echo "[cage] cloud_run: model=$MODEL queries=$NUM_QUERIES trials=$NUM_TRIALS distributed=$ENABLE_DISTRIBUTED"
 echo "[cage] mirroring $SYNC_DIR/ -> GCS every ${SYNC_INTERVAL}s (and at exit)"
 

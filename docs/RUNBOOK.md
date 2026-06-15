@@ -206,6 +206,27 @@ Per-query quality fields: `grounding_score`, `hallucination_detected`,
 (claim-level NLI); `context_relevance`; baseline-rescaled `completeness_bertscore`;
 `f1_score`/`exact_match`. `None` = metric model unavailable (excluded from means).
 
+### 7.1 vLLM serving telemetry (cage-stats)
+Capture what CAGE's own metrics don't expose — **spec-decode acceptance, KV-compression
+ratio/dtype, prompt-token source breakdown, prefix-cache hit rate, multi-vendor GPU** — and
+print a one-shot dashboard, via the standalone
+[cage-stats](https://github.com/lucasmdocarmo/cage-stats) package.
+
+**It's a git dependency in `requirements.txt`**, so `pip install -r requirements.txt` pulls it
+automatically (locally and on the cloud VM — no extra step). *Prerequisite:* the cage-stats
+repo must have the restructured package committed + pushed first; if it's private, ensure git
+creds on the install host. Local-dev alternative without installing: `export CAGE_STATS_HOME=/Users/lucasmariano/cage-stats`.
+
+Then add `--vllm-telemetry` to any run; a snapshot is saved to `<output-dir>/vllm_telemetry.json`
+and into `aggregated_metrics.json` under `vllm_telemetry`, and a dashboard prints to the terminal:
+```bash
+python3 scripts/run_experiment.py --baseline compressed_cag --model Qwen/Qwen3-8B \
+  --dataset squad_v2 --num-queries 50 --num-trials 3 --vllm-telemetry --api-base http://localhost:9000
+```
+Standalone (no CAGE): `cage-stats --url http://localhost:9000` (live TUI) ·
+`cage-stats --once` (static dashboard) · `cage-stats --once --json` (snapshot for scripting).
+Gracefully skips if cage-stats isn't installed.
+
 ---
 
 ## 8. Tests
@@ -262,9 +283,15 @@ nvidia-smi                                   # confirm the GPU is visible
 git clone <your-repo-url> cage && cd cage    # or scp your repo
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt && pip install vllm
+#   requirements.txt pulls cage-stats (git dependency) for --vllm-telemetry. If that
+#   repo is private, authenticate git on the VM first (e.g. `gh auth login` / a PAT),
+#   or install it explicitly:  pip install "cage-stats @ git+https://github.com/lucasmdocarmo/cage-stats.git"
+#   To run WITHOUT telemetry, comment the cage-stats line in requirements.txt (or VLLM_TELEMETRY=0 below).
 export HF_TOKEN=hf_xxx                        # if gated
 
 # 3. Run the suite + continuous GCS sync (nohup survives SSH drops):
+#    Telemetry is auto-captured (cloud_run.sh sets VLLM_TELEMETRY=1) ->
+#    each baseline writes <output>/vllm_telemetry.json, mirrored to GCS.
 nohup bash scripts/cloud_run.sh Qwen/Qwen3-8B 100 10 > run.log 2>&1 &
 tail -f run.log
 ```

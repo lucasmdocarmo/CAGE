@@ -60,3 +60,11 @@ pytest-asyncio>=0.21.0
 # Optional: Cloud SDK (uncomment if using GCP)
 # google-cloud-storage>=2.10.0
 # google-cloud-compute>=1.14.0
+
+# vLLM serving telemetry (--vllm-telemetry): spec-decode acceptance, KV-compression,
+# token-source, GPU — pulled from the standalone cage-stats repo as a git dependency.
+# NOTE: requires the cage-stats restructure to be committed + pushed to its remote first.
+# If that repo is private, ensure git credentials are available on the install host.
+# Telemetry is optional — comment this line out if you don't need it (CAGE still runs).
+cage-stats @ git+https://github.com/lucasmdocarmo/cage-stats.git
+# Local dev alternative (no install): set CAGE_STATS_HOME=/Users/lucasmariano/cage-stats

@@ -650,6 +650,8 @@ def run_experiment(
     compress_method: Optional[str] = None,
     compress_ratio: Optional[float] = None,
     kv_cache_dtype: Optional[str] = None,
+    # vLLM serving telemetry via cage-stats (one-shot snapshot + dashboard)
+    vllm_telemetry: bool = False,
 ) -> Dict[str, Any]:
     """
     Run a single baseline experiment.
@@ -1329,7 +1331,36 @@ def run_experiment(
     perf_metrics = performance_evaluator.compute_metrics()
     cache_metrics = cache_tracker.get_metrics()
     gpu_metrics = gpu_tracker.compute_metrics().to_dict() if gpu_monitoring else None
-    
+
+    # Optional vLLM serving telemetry via cage-stats — captures what CAGE's own
+    # metrics don't expose (spec-decode acceptance, KV-compression ratio/dtype,
+    # token-source breakdown, prefix-cache hit, multi-vendor GPU) and prints a
+    # one-shot dashboard. See src/monitoring/vllm_telemetry.py.
+    vllm_telemetry_snapshot = None
+    if vllm_telemetry:
+        try:
+            from src.monitoring.vllm_telemetry import available, capture
+            if available():
+                _mock = os.getenv("CAGE_TELEMETRY_MOCK", "").strip().lower() in {"1", "true", "yes"}
+                vllm_telemetry_snapshot, _dash = capture(api_base, mock=_mock)
+                if _dash:
+                    print("\n" + "=" * 70)
+                    print("vLLM TELEMETRY (cage-stats)")
+                    print("=" * 70)
+                    print(_dash)
+                # Save the snapshot as an explicit JSON artifact alongside the results.
+                if vllm_telemetry_snapshot is not None:
+                    os.makedirs(output_dir, exist_ok=True)
+                    _tpath = os.path.join(output_dir, "vllm_telemetry.json")
+                    with open(_tpath, "w") as _tf:
+                        json.dump(vllm_telemetry_snapshot, _tf, indent=2, default=str)
+                    print(f"[telemetry] saved -> {_tpath}")
+            else:
+                print("[telemetry] cage-stats unavailable "
+                      "(pip install -e <cage-stats> or set CAGE_STATS_HOME); skipping.")
+        except Exception as e:
+            print(f"[telemetry] skipped: {e}")
+
     print("\n" + "=" * 70)
     print("PERFORMANCE METRICS")
     print("=" * 70)
@@ -1593,6 +1624,7 @@ def run_experiment(
         "baseline_config": baseline_config.to_dict(),
         "performance": perf_metrics.to_dict(),
         "gpu": gpu_metrics,
+        "vllm_telemetry": vllm_telemetry_snapshot,
         "cache_telemetry": cache_metrics,
         "distributed": distributed_summary,
         "quality": avg_quality,
@@ -1727,6 +1759,13 @@ def main():
         action="store_true",
         help="Flush the vLLM prefix cache between trials (cold-start-per-trial). "
              "Requires the server started with VLLM_SERVER_DEV_MODE=1.",
+    )
+    parser.add_argument(
+        "--vllm-telemetry",
+        action="store_true",
+        help="Capture a vLLM /metrics snapshot via cage-stats (spec-decode acceptance, "
+             "KV-compression ratio, token-source, GPU) into results + print a dashboard. "
+             "Needs cage-stats (pip install -e <repo> or set CAGE_STATS_HOME).",
     )
 
     # Workload controls
@@ -1963,6 +2002,7 @@ def main():
             compress_method=args.compress_method,
             compress_ratio=args.compress_ratio,
             kv_cache_dtype=args.kv_cache_dtype,
+            vllm_telemetry=args.vllm_telemetry,
         )
 
     def _run_trials(top_k_value: int) -> None:
@@ -2033,6 +2073,7 @@ def main():
                 compress_method=args.compress_method,
                 compress_ratio=args.compress_ratio,
                 kv_cache_dtype=args.kv_cache_dtype,
+                vllm_telemetry=args.vllm_telemetry,
             )
             
             # Load trial results
@@ -2151,6 +2192,7 @@ def main():
             aggregated["warmup"] = trial_results[0].get("warmup", {})
             aggregated["distributed"] = trial_results[0].get("distributed", {})
             aggregated["repeat_passes"] = trial_results[0].get("repeat_passes", {})
+            aggregated["vllm_telemetry"] = trial_results[0].get("vllm_telemetry")
 
         aggregated["cache_telemetry"] = aggregate_numeric_section("cache_telemetry")
         aggregated["retrieval"] = aggregate_numeric_section("retrieval")
