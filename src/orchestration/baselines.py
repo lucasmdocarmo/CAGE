@@ -27,6 +27,9 @@ class BaselineType(Enum):
     DISTRIBUTED_CACHE = "distributed"
     HYBRID = "hybrid"
     SPECULATIVE = "speculative"
+    # Compression axis (Option 3 / 2x2: context source x compression)
+    COMPRESSED_RAG = "compressed_rag"  # retrieved docs text-compressed (LLMLingua)
+    COMPRESSED_CAG = "compressed_cag"  # cached context KV-compressed (fp8 KV / MLA)
 
 
 @dataclass
@@ -64,7 +67,12 @@ class BaselineConfig:
     speculative_model: Optional[str] = None  # Draft model for speculative decoding
     num_speculative_tokens: int = 5  # Number of tokens to speculate
     speculative_method: str = "draft_model"  # draft_model, ngram, suffix, medusa, eagle
-    
+
+    # Compression axis configuration
+    compress_method: Optional[str] = None      # text compressor: "llmlingua2" | "llmlingua" | None
+    compress_target_ratio: float = 0.5         # fraction of tokens to KEEP (0.5 = 2x compression)
+    kv_cache_dtype: Optional[str] = None        # server-side KV compression: "fp8" | None (compressed_cag)
+
     # Additional metadata
     metadata: Dict[str, Any] = None
     
@@ -90,6 +98,9 @@ class BaselineConfig:
             "speculative_model": self.speculative_model,
             "num_speculative_tokens": self.num_speculative_tokens,
             "speculative_method": self.speculative_method,
+            "compress_method": self.compress_method,
+            "compress_target_ratio": self.compress_target_ratio,
+            "kv_cache_dtype": self.kv_cache_dtype,
             "metadata": self.metadata or {},
         }
 
@@ -157,7 +168,10 @@ def get_baseline_config(baseline_name: str, **overrides) -> BaselineConfig:
         
         "speculative": BaselineConfig(
             baseline_type=BaselineType.SPECULATIVE,
-            description="Speculative baseline scaffold (configuration is captured, but backend decoding parameters are not fully wired into inference requests yet)",
+            description="Speculative decoding baseline. vLLM configures speculation at LAUNCH "
+                        "time (VLLM_SPECULATIVE_CONFIG='{\"method\":\"ngram\",\"num_speculative_tokens\":5}'); "
+                        "the experiment measures the resulting TTFT/TPOT/latency. Acceptance-rate "
+                        "telemetry requires scraping vLLM /metrics (follow-up).",
             enable_prefix_caching=True,  # Combine with prefix caching for CAG
             speculative_model=None,  # Must be set via override
             num_speculative_tokens=5,
@@ -166,6 +180,24 @@ def get_baseline_config(baseline_name: str, **overrides) -> BaselineConfig:
                 "supported_methods": ["draft_model", "ngram", "suffix", "medusa", "eagle"],
                 "requires_draft_model": True,
             },
+        ),
+
+        # --- Compression axis (Option 3) ---
+        "compressed_rag": BaselineConfig(
+            baseline_type=BaselineType.COMPRESSED_RAG,
+            description="RAG with TEXT compression of retrieved docs (LLMLingua-2) before prompting",
+            enable_prefix_caching=False,
+            use_faiss=True,
+            top_k_retrieval=3,
+            compress_method="llmlingua2",
+            compress_target_ratio=0.5,
+        ),
+        "compressed_cag": BaselineConfig(
+            baseline_type=BaselineType.COMPRESSED_CAG,
+            description="CAG with KV-cache compression (vLLM fp8 KV cache; or an MLA model). Server-side; pair with --kv-cache-dtype fp8.",
+            enable_prefix_caching=True,
+            kv_cache_dtype="fp8",
+            metadata={"server_side_kv_compression": True, "prefers_gpu": True},
         ),
     }
     

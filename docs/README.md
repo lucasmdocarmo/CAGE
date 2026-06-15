@@ -12,6 +12,10 @@ fixes). Start with the **canonical** docs; treat SUPERSEDED/STALE docs as histor
 | [VALIDATION_AND_SOTA_REVIEW.md](VALIDATION_AND_SOTA_REVIEW.md) | Strict validation, limitations (what's fixed vs still-open), SOTA review, prioritized fix list. |
 | [DATA_CARD.md](DATA_CARD.md) | Dataset sources, licenses, schema, FAISS index inventory. *(Rebuild e5 indices with `--rebuild-ir-index`.)* |
 | [KV_FORMAT_SPEC.md](KV_FORMAT_SPEC.md) | Forward-looking KV-cache serialization spec (for the not-yet-built real KV transfer). |
+| [RELATED_WORK_COMPRESSION.md](RELATED_WORK_COMPRESSION.md) | Compression-for-CAG/RAG literature (citable, bibtex) + design of the planned 2×2 compression axis. |
+| [COMPARISON_MATRIX.md](COMPARISON_MATRIX.md) | Expanded 8-axis comparison vs the literature + explicit novelty statement + bibtex (for Related Work). |
+| [FEATURE_MAP.md](FEATURE_MAP.md) | Every feature → objective / value / delivery status / what it compares to, + article-ready paragraphs. |
+| [DEV_BACKLOG.md](DEV_BACKLOG.md) | Prioritized "what's left to develop" from the codebase audit (P0/P1/P2 mostly ✅ done). |
 | [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md) | Deploy options overview. *(Caveat: the "distributed" baseline is simulated.)* |
 
 ## ⚠️ Partially stale — useful background, but verify against canonical
