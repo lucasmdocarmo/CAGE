@@ -20,6 +20,11 @@ CLUSTER_BASE_PORT=${CLUSTER_BASE_PORT:-8001}
 ROUTER_REPLICAS_COUNT=${ROUTER_REPLICAS_COUNT:-3}
 ROUTER_PORT=${ROUTER_PORT:-9000}
 ENABLE_DISTRIBUTED=${ENABLE_DISTRIBUTED:-1}
+# vLLM telemetry via cage-stats: VLLM_TELEMETRY=1 captures a /metrics snapshot
+# (spec-decode acceptance, KV-compression, token-source, GPU) into each baseline's
+# results + prints a dashboard. Auto-enabled by cloud_run.sh.
+TELEMETRY_FLAG=""
+if [ "${VLLM_TELEMETRY:-0}" != "0" ]; then TELEMETRY_FLAG="--vllm-telemetry"; fi
 _cleanup_ran=0
 echo "=============================================="
 echo "CAGE Phase 1 Strict Benchmarking: $MODEL on $DATASET"
@@ -82,6 +87,7 @@ run_baseline() {
         --num-trials "$NUM_TRIALS" \
         --seed "$SEED" \
         --output-dir "$OUTPUT_DIR/$baseline_label" \
+        $TELEMETRY_FLAG \
         "$@"
     echo "    Finished at: $(date)"
     echo "    Results saved to: $OUTPUT_DIR/$baseline_label"
@@ -105,7 +111,8 @@ run_distributed_variant() {
         --seed "$SEED" \
         --api-base "http://localhost:${ROUTER_PORT}" \
         --sharding-policy "$policy" \
-        --output-dir "$OUTPUT_DIR/$baseline_label"
+        --output-dir "$OUTPUT_DIR/$baseline_label" \
+        $TELEMETRY_FLAG
 
     echo "    Finished at: $(date)"
     echo "    Results saved to: $OUTPUT_DIR/$baseline_label"

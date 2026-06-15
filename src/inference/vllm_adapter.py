@@ -247,8 +247,10 @@ class VLLMAdapter(InferenceEngine):
                 else len(generated_text.split())
             )
 
-            # Heuristic TTFT estimate when not streaming; use stream=True for measured TTFT.
-            ttft_ms = total_time_ms * 0.2
+            # Non-streaming: TTFT is unobservable (full response arrives at once), so report
+            # it as the full response time rather than a fabricated fraction. Use stream=True
+            # for a real TTFT measurement.
+            ttft_ms = total_time_ms
 
             return InferenceResponse(
                 request_id=request.request_id,
@@ -331,8 +333,8 @@ class VLLMAdapter(InferenceEngine):
                         if isinstance(completion_tokens, int)
                         else len(generated_text.split())
                     )
-                    # Heuristic TTFT estimate when not streaming; use stream=True for measured TTFT.
-                    ttft_ms = total_time_ms * 0.2
+                    # Non-streaming: TTFT unobservable -> report full response time.
+                    ttft_ms = total_time_ms
 
                     return InferenceResponse(
                         request_id=request.request_id,
@@ -458,8 +460,8 @@ class VLLMOfflineAdapter(InferenceEngine):
             num_tokens = len(output.outputs[0].token_ids)
             finish_reason = output.outputs[0].finish_reason
             
-            # Estimate TTFT (vLLM offline doesn't provide this directly)
-            ttft_ms = total_time * 0.1  # Rough estimate
+            # vLLM offline non-streaming: TTFT unobservable -> report full response time.
+            ttft_ms = total_time
             
             return InferenceResponse(
                 request_id=request.request_id,
@@ -511,7 +513,7 @@ class VLLMOfflineAdapter(InferenceEngine):
                 responses.append(InferenceResponse(
                     request_id=request.request_id,
                     generated_text=generated_text,
-                    ttft_ms=elapsed * 0.1,
+                    ttft_ms=elapsed,  # non-streaming: TTFT unobservable -> full response time
                     total_time_ms=elapsed,
                     num_tokens=num_tokens,
                     model_name=self.model_name,

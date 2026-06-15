@@ -226,6 +226,15 @@ class FaissIRIndex:
         # have no flag -> default False so queries match the (un-prefixed) passages.
         # Rebuild with --rebuild-ir-index to get the corrected, prefixed retrieval.
         inst.uses_e5_prefixes = bool(meta.get("uses_e5_prefixes", False))
+        model_lc = str(meta.get("embedding_model", "")).lower()
+        wants_prefixes = ("e5" in model_lc) or ("bge" in model_lc and "reranker" not in model_lc)
+        if wants_prefixes and not inst.uses_e5_prefixes:
+            print(
+                f"WARNING: IR index at {directory} was built BEFORE the e5/bge "
+                f"query:/passage: prefix fix (model={meta.get('embedding_model')}). "
+                f"Retrieval is out-of-distribution and RAG/hybrid quality is degraded. "
+                f"Rebuild with --rebuild-ir-index."
+            )
         inst._ensure_deps()
 
         # Documents

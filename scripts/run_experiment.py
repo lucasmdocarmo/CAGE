@@ -641,6 +641,17 @@ def run_experiment(
     num_speculative_tokens: int = 5,
     speculative_method: str = "draft_model",
     baseline_label: Optional[str] = None,
+    # Context source equalization (removes the gold-vs-retrieved confound):
+    #   "auto"      = current behavior (CAG arms=gold, RAG arms=retrieved)
+    #   "gold"      = ALL baselines use the gold passage (isolates caching/serving)
+    #   "retrieved" = ALL baselines use retrieved docs (fair to RAG)
+    context_source: str = "auto",
+    # Compression axis overrides (None = use the baseline's own default)
+    compress_method: Optional[str] = None,
+    compress_ratio: Optional[float] = None,
+    kv_cache_dtype: Optional[str] = None,
+    # vLLM serving telemetry via cage-stats (one-shot snapshot + dashboard)
+    vllm_telemetry: bool = False,
 ) -> Dict[str, Any]:
     """
     Run a single baseline experiment.
@@ -733,6 +744,13 @@ def run_experiment(
         num_speculative_tokens=num_speculative_tokens,
         speculative_method=speculative_method,
     )
+    # CLI compression overrides (only when explicitly provided, to keep per-baseline defaults).
+    if compress_method is not None:
+        baseline_config.compress_method = None if compress_method == "none" else compress_method
+    if compress_ratio is not None:
+        baseline_config.compress_target_ratio = compress_ratio
+    if kv_cache_dtype is not None:
+        baseline_config.kv_cache_dtype = None if kv_cache_dtype == "none" else kv_cache_dtype
     print(f"\nBaseline config: {baseline_config.description}")
     
     # Validate speculative baseline requirements
@@ -778,10 +796,18 @@ def run_experiment(
         print("  docker run -d --name cage-redis -p 6379:6379 redis:alpine")
         sys.exit(1)
     
-    # Load dataset
+    # Load dataset. Pull a pool large enough to hold a DISJOINT warmup set so
+    # warmup queries never overlap the measured ones (fixes warm-hybrid leakage).
     print(f"\nLoading dataset '{dataset}'...")
     loader = get_loader(dataset, split=default_dataset_split(dataset), seed=seed)
-    base_examples = loader.load(max_examples=num_queries)
+    pool = loader.load(max_examples=num_queries + max(0, warmup_queries))
+    warmup_pool = pool[:warmup_queries] if warmup_queries > 0 else []
+    base_examples = pool[warmup_queries:warmup_queries + num_queries] if warmup_queries > 0 else pool
+    if warmup_queries > 0 and len(warmup_pool) < warmup_queries:
+        print(
+            f"Warning: dataset only yielded {len(pool)} examples; warmup set "
+            f"({len(warmup_pool)}) may overlap measured set."
+        )
     code_dataset = is_code_dataset(dataset, base_examples)
 
     if repeat_queries < 1:
@@ -811,8 +837,8 @@ def run_experiment(
         raise ValueError("workload_mode must be one of: single, batched, multi_turn")
 
     warmup_examples: List[CAGExample] = []
-    for idx in range(warmup_queries):
-        ex = base_examples[idx % len(base_examples)]
+    for idx in range(min(warmup_queries, len(warmup_pool))):
+        ex = warmup_pool[idx]  # disjoint from base_examples (measured set)
         warmup_examples.append(
             CAGExample(
                 id=f"{ex.id}__warmup{idx}",
@@ -845,10 +871,11 @@ def run_experiment(
     warmup_work_units = build_work_units(warmup_examples)
     work_units = build_work_units(measured_examples)
 
-    # IR index / retriever (for RAG/Redis/Hybrid baselines)
+    # IR index / retriever (for RAG/Redis/Hybrid baselines, or any baseline when
+    # context_source == "retrieved" so gold-context arms can be fed retrieved docs).
     ir_index = None
     corpus_docs = None
-    if baseline_config.use_faiss:
+    if baseline_config.use_faiss or context_source == "retrieved":
         print("\nBuilding/loading IR index (FAISS)...")
         base_dir = Path(baseline_config.ir_index_dir)
         index_dir = default_index_dir(
@@ -891,6 +918,14 @@ def run_experiment(
                 f"({deleted_keys} keys deleted)"
             )
         print("Redis cache connected")
+    # Optional text compressor (compressed_rag baseline / --compress-method)
+    context_compressor = None
+    if baseline_config.compress_method:
+        from src.orchestration.compression import ContextCompressor
+        context_compressor = ContextCompressor(method=baseline_config.compress_method, device="cpu")
+        print(f"Text compression enabled: {baseline_config.compress_method} "
+              f"(keep ratio {baseline_config.compress_target_ratio})")
+
     # Optional reranker
     reranker = None
     if baseline_config.use_faiss and reranker_model:
@@ -949,7 +984,13 @@ def run_experiment(
         retrieved_doc_ids: List[str] = []
         retrieval_reranked = False
 
-        if baseline_config.baseline_type.value in {"rag", "redis", "hybrid"}:
+        # Retrieve when the baseline is retrieval-backed OR when context_source forces
+        # retrieved context onto every arm (confound control).
+        do_retrieval = (
+            baseline_config.baseline_type.value in {"rag", "redis", "hybrid"}
+            or context_source == "retrieved"
+        )
+        if do_retrieval:
             if ir_index is None:
                 raise RuntimeError("IR index not initialized for retrieval-backed baseline")
 
@@ -1010,6 +1051,20 @@ def run_experiment(
         else:
             used_contexts = list(example.context or [])
 
+        # Confound control: force the gold passage onto every arm when requested
+        # (retrieval telemetry above is still recorded for the retrieval baselines).
+        if context_source == "gold":
+            used_contexts = list(example.context or [])
+
+        # Text compression (compressed_rag): compress the context before prompting.
+        compression_stats = None
+        if context_compressor is not None:
+            used_contexts, cstats = context_compressor.compress(
+                used_contexts, question=question,
+                target_ratio=baseline_config.compress_target_ratio,
+            )
+            compression_stats = cstats.to_dict()
+
         if max_context_chars is not None and max_context_chars > 0:
             used_contexts = [c[:max_context_chars] for c in used_contexts]
         if max_context_docs is not None and max_context_docs > 0:
@@ -1024,6 +1079,7 @@ def run_experiment(
             "retrieval_top1_score": retrieval_top1_score,
             "retrieved_doc_ids": retrieved_doc_ids,
             "retrieval_reranked": retrieval_reranked,
+            "compression_stats": compression_stats,
         }
 
     def record_result(
@@ -1151,6 +1207,8 @@ def run_experiment(
             "retrieval_cached": meta["retrieval_cached"],
             "retrieval_reranked": meta["retrieval_reranked"],
             "retrieved_doc_ids": ";".join(meta["retrieved_doc_ids"]) if meta["retrieved_doc_ids"] else "",
+            "compression_ratio": (meta.get("compression_stats") or {}).get("compression_ratio"),
+            "compression_applied": (meta.get("compression_stats") or {}).get("compression_applied"),
             **quality_metrics.to_dict(),
         }
         if code_metrics is not None:
@@ -1254,17 +1312,55 @@ def run_experiment(
         print("Warmup complete.")
         print("-" * 70)
 
+    # GPU telemetry (Phase-2+); no-op on non-NVIDIA hosts.
+    from src.evaluation.performance import GPUMetricsTracker
+    gpu_tracker = GPUMetricsTracker()
+    gpu_monitoring = gpu_tracker.start_monitoring()
+
     performance_evaluator.start()
     execute_work_units(work_units, collect_results=True, stage_name="Measured")
     performance_evaluator.stop()
-    
+
+    if gpu_monitoring:
+        gpu_tracker.stop_monitoring()
+
     print("-" * 70)
     print("Experiment complete!")
-    
+
     # Compute aggregate metrics
     perf_metrics = performance_evaluator.compute_metrics()
     cache_metrics = cache_tracker.get_metrics()
-    
+    gpu_metrics = gpu_tracker.compute_metrics().to_dict() if gpu_monitoring else None
+
+    # Optional vLLM serving telemetry via cage-stats — captures what CAGE's own
+    # metrics don't expose (spec-decode acceptance, KV-compression ratio/dtype,
+    # token-source breakdown, prefix-cache hit, multi-vendor GPU) and prints a
+    # one-shot dashboard. See src/monitoring/vllm_telemetry.py.
+    vllm_telemetry_snapshot = None
+    if vllm_telemetry:
+        try:
+            from src.monitoring.vllm_telemetry import available, capture
+            if available():
+                _mock = os.getenv("CAGE_TELEMETRY_MOCK", "").strip().lower() in {"1", "true", "yes"}
+                vllm_telemetry_snapshot, _dash = capture(api_base, mock=_mock)
+                if _dash:
+                    print("\n" + "=" * 70)
+                    print("vLLM TELEMETRY (cage-stats)")
+                    print("=" * 70)
+                    print(_dash)
+                # Save the snapshot as an explicit JSON artifact alongside the results.
+                if vllm_telemetry_snapshot is not None:
+                    os.makedirs(output_dir, exist_ok=True)
+                    _tpath = os.path.join(output_dir, "vllm_telemetry.json")
+                    with open(_tpath, "w") as _tf:
+                        json.dump(vllm_telemetry_snapshot, _tf, indent=2, default=str)
+                    print(f"[telemetry] saved -> {_tpath}")
+            else:
+                print("[telemetry] cage-stats unavailable "
+                      "(pip install -e <cage-stats> or set CAGE_STATS_HOME); skipping.")
+        except Exception as e:
+            print(f"[telemetry] skipped: {e}")
+
     print("\n" + "=" * 70)
     print("PERFORMANCE METRICS")
     print("=" * 70)
@@ -1499,6 +1595,7 @@ def run_experiment(
             "max_tokens": max_tokens,
             "timestamp": timestamp,
             "seed": seed,
+            "context_source": context_source,
             "backend": backend,
             "api_base": api_base,
         },
@@ -1526,6 +1623,8 @@ def run_experiment(
         },
         "baseline_config": baseline_config.to_dict(),
         "performance": perf_metrics.to_dict(),
+        "gpu": gpu_metrics,
+        "vllm_telemetry": vllm_telemetry_snapshot,
         "cache_telemetry": cache_metrics,
         "distributed": distributed_summary,
         "quality": avg_quality,
@@ -1564,7 +1663,7 @@ def main():
     parser.add_argument(
         "--baseline",
         required=True,
-        choices=["no_cache", "prefix_cache", "redis", "rag", "distributed", "hybrid", "speculative"],
+        choices=["no_cache", "prefix_cache", "redis", "rag", "distributed", "hybrid", "speculative", "compressed_rag", "compressed_cag"],
         help="Baseline to evaluate",
     )
     parser.add_argument(
@@ -1577,7 +1676,7 @@ def main():
     parser.add_argument(
         "--dataset",
         default="squad_v2",
-        choices=["hotpotqa", "qasper", "squad_v2", "trivia_qa", "humaneval", "mbpp", "hpc_code"],
+        choices=["hotpotqa", "qasper", "squad_v2", "trivia_qa", "natural_questions", "musique", "humaneval", "mbpp", "hpc_code"],
         help="Dataset to use",
     )
     parser.add_argument(
@@ -1623,6 +1722,50 @@ def main():
         type=int,
         default=42,
         help="Random seed for reproducibility",
+    )
+    parser.add_argument(
+        "--context-source",
+        choices=["auto", "gold", "retrieved"],
+        default="auto",
+        help=(
+            "Context fed to ALL baselines: 'auto' (CAG=gold, RAG=retrieved), "
+            "'gold' (everyone gets the gold passage — isolates caching), or "
+            "'retrieved' (everyone gets retrieved docs — fair to RAG). "
+            "Use gold/retrieved to remove the gold-vs-retrieved confound."
+        ),
+    )
+    # Compression axis
+    parser.add_argument(
+        "--compress-method",
+        choices=["none", "llmlingua2", "llmlingua"],
+        default=None,
+        help="Text compression of context (compressed_rag). Overrides the baseline default.",
+    )
+    parser.add_argument(
+        "--compress-ratio",
+        type=float,
+        default=None,
+        help="Fraction of tokens to KEEP when compressing (0.5 = 2x compression).",
+    )
+    parser.add_argument(
+        "--kv-cache-dtype",
+        choices=["none", "fp8"],
+        default=None,
+        help="Server-side KV-cache compression for compressed_cag (record-only here; "
+             "pass the same to vLLM via --kv-cache-dtype when launching the server).",
+    )
+    parser.add_argument(
+        "--reset-cache-between-trials",
+        action="store_true",
+        help="Flush the vLLM prefix cache between trials (cold-start-per-trial). "
+             "Requires the server started with VLLM_SERVER_DEV_MODE=1.",
+    )
+    parser.add_argument(
+        "--vllm-telemetry",
+        action="store_true",
+        help="Capture a vLLM /metrics snapshot via cage-stats (spec-decode acceptance, "
+             "KV-compression ratio, token-source, GPU) into results + print a dashboard. "
+             "Needs cage-stats (pip install -e <repo> or set CAGE_STATS_HOME).",
     )
 
     # Workload controls
@@ -1798,6 +1941,19 @@ def main():
     )
 
     args = parser.parse_args()
+
+    def _reset_prefix_cache(api_base: str) -> None:
+        """Flush the vLLM prefix cache (dev-mode endpoint) for cold-start-per-trial."""
+        import urllib.request
+        url = api_base.rstrip("/") + "/reset_prefix_cache"
+        try:
+            req = urllib.request.Request(url, method="POST")
+            urllib.request.urlopen(req, timeout=10)
+            print(f"[cache] reset prefix cache via {url}")
+        except Exception as e:
+            print(f"[cache] WARNING: could not reset prefix cache ({e}). "
+                  f"Start vLLM with VLLM_SERVER_DEV_MODE=1 to enable /reset_prefix_cache.")
+
     embedding_model = normalize_embedding_model(args.embedding_model)
     reranker_model = normalize_reranker_model(args.reranker_model)
     if reranker_model and str(reranker_model).lower() in {"none", "null", "false", "0"}:
@@ -1842,6 +1998,11 @@ def main():
             num_speculative_tokens=args.num_speculative_tokens,
             speculative_method=args.speculative_method,
             baseline_label=args.baseline_label,
+            context_source=args.context_source,
+            compress_method=args.compress_method,
+            compress_ratio=args.compress_ratio,
+            kv_cache_dtype=args.kv_cache_dtype,
+            vllm_telemetry=args.vllm_telemetry,
         )
 
     def _run_trials(top_k_value: int) -> None:
@@ -1860,10 +2021,16 @@ def main():
         
         for trial in range(1, args.num_trials + 1):
             print(f"\n--- Trial {trial}/{args.num_trials} (seed={args.seed + trial - 1}) ---\n")
-            
+
+            # Cold-start-per-trial: flush the vLLM prefix cache between trials so each
+            # trial measures from a known (empty) cache state. Requires the server to be
+            # started with VLLM_SERVER_DEV_MODE=1 (enables POST /reset_prefix_cache).
+            if args.reset_cache_between_trials and trial > 1:
+                _reset_prefix_cache(args.api_base)
+
             # Create trial-specific output directory
             trial_output_dir = os.path.join(args.output_dir, f"trial_{trial}")
-            
+
             # Run with different seed for each trial
             run_experiment(
                 baseline=args.baseline,
@@ -1902,6 +2069,11 @@ def main():
                 num_speculative_tokens=args.num_speculative_tokens,
                 speculative_method=args.speculative_method,
                 baseline_label=args.baseline_label,
+                context_source=args.context_source,
+                compress_method=args.compress_method,
+                compress_ratio=args.compress_ratio,
+                kv_cache_dtype=args.kv_cache_dtype,
+                vllm_telemetry=args.vllm_telemetry,
             )
             
             # Load trial results
@@ -2020,6 +2192,7 @@ def main():
             aggregated["warmup"] = trial_results[0].get("warmup", {})
             aggregated["distributed"] = trial_results[0].get("distributed", {})
             aggregated["repeat_passes"] = trial_results[0].get("repeat_passes", {})
+            aggregated["vllm_telemetry"] = trial_results[0].get("vllm_telemetry")
 
         aggregated["cache_telemetry"] = aggregate_numeric_section("cache_telemetry")
         aggregated["retrieval"] = aggregate_numeric_section("retrieval")

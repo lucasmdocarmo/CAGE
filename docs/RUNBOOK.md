@@ -148,10 +148,39 @@ CAGE_REQUIRE_DISTINCT_REPLICAS=1 python3 scripts/run_experiment.py \
 **Workload:** `--workload-mode {single,batched,multi_turn}`, `--batch-size`,
 `--multi-turn-length`, `--repeat-queries`, `--warmup-queries`.
 
-**Speculative:** `--speculative-model`, `--speculative-method {draft_model,ngram,suffix,medusa,eagle}`,
-`--num-speculative-tokens`.
+**Protocol controls (new):** `--context-source {auto,gold,retrieved}` (confound control),
+`--reset-cache-between-trials` (cold-start per trial; needs `VLLM_SERVER_DEV_MODE=1`).
+
+**Compression axis (new):** `--compress-method {none,llmlingua2,llmlingua}`, `--compress-ratio <keep>`
+(0.5 = 2× compression), `--kv-cache-dtype {none,fp8}` (record-only here; also pass to the server).
+
+**Speculative:** vLLM configures speculation at **launch** — start the server with
+`VLLM_SPECULATIVE_CONFIG='{"method":"ngram","num_speculative_tokens":5}'`, then run the
+`speculative` baseline. (The old `--speculative-model` flag is deprecated.)
 
 > No `--phase`, `--all-baselines`, `--trials`, `--queries`, or disagg-prefill flag.
+
+### 6.1 Compression axis (the 2×2)
+```bash
+# RAG with text compression of retrieved docs (needs: pip install llmlingua)
+python3 scripts/run_experiment.py --baseline compressed_rag --model Qwen/Qwen3-8B \
+  --dataset squad_v2 --num-queries 50 --num-trials 3 --compress-ratio 0.5 --rebuild-ir-index
+# CAG with KV-cache compression (GPU): launch the server with fp8 KV, then run:
+VLLM_KV_CACHE_DTYPE=fp8 ./scripts/manage_vllm_server.sh restart Qwen/Qwen3-8B
+python3 scripts/run_experiment.py --baseline compressed_cag --model Qwen/Qwen3-8B \
+  --dataset squad_v2 --num-queries 50 --num-trials 3 --kv-cache-dtype fp8
+# MLA arm (architectural KV compression): use configs/model/deepseek-v2-lite.yaml on a GPU.
+```
+
+### 6.2 Cache-state control for trials (resolves the per-trial flush question)
+There are **two legitimate measurement regimes** — declare which you're using:
+- **Cold-start per trial** (each trial starts from an empty cache): start the server with
+  `VLLM_SERVER_DEV_MODE=1` and add `--reset-cache-between-trials`. This flushes the vLLM prefix
+  cache via `POST /reset_prefix_cache` between trials — no model reload needed.
+- **Warm / steady-state** (cache pre-populated, the regime `hybrid_warm` targets): just run; the
+  seeded resampling now gives each trial *different* queries, so it's not a pure replay.
+Either is valid; what matters is that the regime is controlled and stated. For confound-free
+quality comparisons also pass `--context-source gold` (or `retrieved`).
 
 ---
 
@@ -176,6 +205,27 @@ Per-query quality fields: `grounding_score`, `hallucination_detected`,
 `hallucinated_span_ratio` (LettuceDetect); `faithfulness`, `supported_claim_ratio`
 (claim-level NLI); `context_relevance`; baseline-rescaled `completeness_bertscore`;
 `f1_score`/`exact_match`. `None` = metric model unavailable (excluded from means).
+
+### 7.1 vLLM serving telemetry (cage-stats)
+Capture what CAGE's own metrics don't expose — **spec-decode acceptance, KV-compression
+ratio/dtype, prompt-token source breakdown, prefix-cache hit rate, multi-vendor GPU** — and
+print a one-shot dashboard, via the standalone
+[cage-stats](https://github.com/lucasmdocarmo/cage-stats) package.
+
+**It's a git dependency in `requirements.txt`**, so `pip install -r requirements.txt` pulls it
+automatically (locally and on the cloud VM — no extra step). *Prerequisite:* the cage-stats
+repo must have the restructured package committed + pushed first; if it's private, ensure git
+creds on the install host. Local-dev alternative without installing: `export CAGE_STATS_HOME=/Users/lucasmariano/cage-stats`.
+
+Then add `--vllm-telemetry` to any run; a snapshot is saved to `<output-dir>/vllm_telemetry.json`
+and into `aggregated_metrics.json` under `vllm_telemetry`, and a dashboard prints to the terminal:
+```bash
+python3 scripts/run_experiment.py --baseline compressed_cag --model Qwen/Qwen3-8B \
+  --dataset squad_v2 --num-queries 50 --num-trials 3 --vllm-telemetry --api-base http://localhost:9000
+```
+Standalone (no CAGE): `cage-stats --url http://localhost:9000` (live TUI) ·
+`cage-stats --once` (static dashboard) · `cage-stats --once --json` (snapshot for scripting).
+Gracefully skips if cage-stats isn't installed.
 
 ---
 
@@ -233,9 +283,15 @@ nvidia-smi                                   # confirm the GPU is visible
 git clone <your-repo-url> cage && cd cage    # or scp your repo
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt && pip install vllm
+#   requirements.txt pulls cage-stats (git dependency) for --vllm-telemetry. If that
+#   repo is private, authenticate git on the VM first (e.g. `gh auth login` / a PAT),
+#   or install it explicitly:  pip install "cage-stats @ git+https://github.com/lucasmdocarmo/cage-stats.git"
+#   To run WITHOUT telemetry, comment the cage-stats line in requirements.txt (or VLLM_TELEMETRY=0 below).
 export HF_TOKEN=hf_xxx                        # if gated
 
 # 3. Run the suite + continuous GCS sync (nohup survives SSH drops):
+#    Telemetry is auto-captured (cloud_run.sh sets VLLM_TELEMETRY=1) ->
+#    each baseline writes <output>/vllm_telemetry.json, mirrored to GCS.
 nohup bash scripts/cloud_run.sh Qwen/Qwen3-8B 100 10 > run.log 2>&1 &
 tail -f run.log
 ```

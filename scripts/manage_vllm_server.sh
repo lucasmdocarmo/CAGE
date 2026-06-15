@@ -100,10 +100,32 @@ start_server() {
     local timestamp=$(date +%Y%m%d_%H%M%S)
     local log_file="$LOG_DIR/vllm_${model//\//_}_${timestamp}.log"
     
+    # Optional server-side KV-cache compression for the compressed_cag baseline:
+    #   VLLM_KV_CACHE_DTYPE=fp8 ./scripts/manage_vllm_server.sh restart <model>
+    local kv_dtype_flag=""
+    if [ -n "${VLLM_KV_CACHE_DTYPE:-}" ]; then
+        kv_dtype_flag="--kv-cache-dtype ${VLLM_KV_CACHE_DTYPE}"
+        echo "KV-cache compression enabled: --kv-cache-dtype ${VLLM_KV_CACHE_DTYPE}"
+    fi
+    # Set VLLM_SERVER_DEV_MODE=1 in the environment to enable POST /reset_prefix_cache
+    # (used by --reset-cache-between-trials for cold-start-per-trial measurement).
+
+    # Speculative decoding is a LAUNCH-time config in current vLLM (the old
+    # --speculative-model flag is deprecated). Pass a JSON via VLLM_SPECULATIVE_CONFIG, e.g.
+    #   VLLM_SPECULATIVE_CONFIG='{"method":"ngram","num_speculative_tokens":5}'
+    #   VLLM_SPECULATIVE_CONFIG='{"model":"Qwen/Qwen3-0.6B","num_speculative_tokens":5}'
+    local spec_flag=""
+    if [ -n "${VLLM_SPECULATIVE_CONFIG:-}" ]; then
+        spec_flag="--speculative-config ${VLLM_SPECULATIVE_CONFIG}"
+        echo "Speculative decoding enabled: --speculative-config ${VLLM_SPECULATIVE_CONFIG}"
+    fi
+
     echo "Starting vLLM server (logging to $log_file)..."
     nohup vllm serve "$model" \
         --port "$PORT" \
         $cache_flag \
+        $kv_dtype_flag \
+        $spec_flag \
         --enable-prompt-tokens-details \
         > "$log_file" 2>&1 &
     
