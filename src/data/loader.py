@@ -67,7 +67,10 @@ class HotpotQALoader(DatasetLoader):
         dataset = load_dataset("hotpotqa", "fullwiki", split=self.split)
         
         if max_examples:
-            dataset = dataset.select(range(min(max_examples, len(dataset))))
+            # Seeded shuffle BEFORE select so different seeds (per trial) draw
+            # different, reproducible samples — fixes the trial-independence bug
+            # where every trial saw the identical first-N examples.
+            dataset = dataset.shuffle(seed=self.seed).select(range(min(max_examples, len(dataset))))
         
         examples = []
         for item in dataset:
@@ -109,7 +112,10 @@ class QasperLoader(DatasetLoader):
         dataset = load_dataset("allenai/qasper", split=self.split)
         
         if max_examples:
-            dataset = dataset.select(range(min(max_examples, len(dataset))))
+            # Seeded shuffle BEFORE select so different seeds (per trial) draw
+            # different, reproducible samples — fixes the trial-independence bug
+            # where every trial saw the identical first-N examples.
+            dataset = dataset.shuffle(seed=self.seed).select(range(min(max_examples, len(dataset))))
         
         examples = []
         for item in dataset:
@@ -154,7 +160,10 @@ class SquadV2Loader(DatasetLoader):
         dataset = load_dataset("squad_v2", split=self.split)
         
         if max_examples:
-            dataset = dataset.select(range(min(max_examples, len(dataset))))
+            # Seeded shuffle BEFORE select so different seeds (per trial) draw
+            # different, reproducible samples — fixes the trial-independence bug
+            # where every trial saw the identical first-N examples.
+            dataset = dataset.shuffle(seed=self.seed).select(range(min(max_examples, len(dataset))))
         
         examples = []
         for item in dataset:
@@ -187,7 +196,10 @@ class TriviaQALoader(DatasetLoader):
         dataset = load_dataset("trivia_qa", "rc", split=self.split)
         
         if max_examples:
-            dataset = dataset.select(range(min(max_examples, len(dataset))))
+            # Seeded shuffle BEFORE select so different seeds (per trial) draw
+            # different, reproducible samples — fixes the trial-independence bug
+            # where every trial saw the identical first-N examples.
+            dataset = dataset.shuffle(seed=self.seed).select(range(min(max_examples, len(dataset))))
         
         examples = []
         for item in dataset:
@@ -233,7 +245,10 @@ class HumanEvalLoader(DatasetLoader):
         dataset = load_dataset("openai_humaneval", split=self.split)
         
         if max_examples:
-            dataset = dataset.select(range(min(max_examples, len(dataset))))
+            # Seeded shuffle BEFORE select so different seeds (per trial) draw
+            # different, reproducible samples — fixes the trial-independence bug
+            # where every trial saw the identical first-N examples.
+            dataset = dataset.shuffle(seed=self.seed).select(range(min(max_examples, len(dataset))))
         
         examples = []
         for item in dataset:
@@ -276,7 +291,10 @@ class MBPPLoader(DatasetLoader):
         dataset = load_dataset("mbpp", split=self.split)
         
         if max_examples:
-            dataset = dataset.select(range(min(max_examples, len(dataset))))
+            # Seeded shuffle BEFORE select so different seeds (per trial) draw
+            # different, reproducible samples — fixes the trial-independence bug
+            # where every trial saw the identical first-N examples.
+            dataset = dataset.shuffle(seed=self.seed).select(range(min(max_examples, len(dataset))))
         
         examples = []
         for item in dataset:
@@ -604,6 +622,57 @@ numpy_to_cuda<<<numBlocks, blockSize>>>(d_a, d_b, d_result, n);''',
         return [p for p in cls.HPC_PROMPTS if p["category"] == category]
 
 
+class NaturalQuestionsLoader(DatasetLoader):
+    """Loader for Natural Questions (open) — used by LongLLMLingua/RECOMP for RAG comparability."""
+
+    def __init__(self, split: str = "validation", seed: int = 42):
+        super().__init__("nq_open", split, seed)
+
+    def load(self, max_examples: Optional[int] = None) -> List[CAGExample]:
+        # nq_open has question + short answers; no gold passage shipped, so context is
+        # left empty and the retrieval path supplies documents (fair RAG setup).
+        dataset = load_dataset("nq_open", split=self.split)
+        if max_examples:
+            dataset = dataset.shuffle(seed=self.seed).select(range(min(max_examples, len(dataset))))
+        examples = []
+        for item in dataset:
+            answers = item.get("answer") or []
+            examples.append(CAGExample(
+                id=str(len(examples)),
+                question=item["question"],
+                context=[],  # open-domain: retrieval supplies context
+                answer=answers[0] if answers else "",
+                metadata={"all_answers": answers, "dataset": "nq_open"},
+            ))
+        return examples
+
+
+class MuSiQueLoader(DatasetLoader):
+    """Loader for MuSiQue multi-hop QA (used by CompAct/long-context compression work)."""
+
+    def __init__(self, split: str = "validation", seed: int = 42):
+        super().__init__("musique", split, seed)
+
+    def load(self, max_examples: Optional[int] = None) -> List[CAGExample]:
+        # dgslibisey/MuSiQue mirrors the answerable split with paragraphs + question + answer.
+        dataset = load_dataset("dgslibisey/MuSiQue", split=self.split)
+        if max_examples:
+            dataset = dataset.shuffle(seed=self.seed).select(range(min(max_examples, len(dataset))))
+        examples = []
+        for item in dataset:
+            paragraphs = item.get("paragraphs") or []
+            contexts = [p.get("paragraph_text", "") for p in paragraphs if isinstance(p, dict)] \
+                if paragraphs and isinstance(paragraphs[0], dict) else list(paragraphs)
+            examples.append(CAGExample(
+                id=str(item.get("id", len(examples))),
+                question=item.get("question", ""),
+                context=[c for c in contexts if c],
+                answer=item.get("answer", ""),
+                metadata={"dataset": "musique", "num_hops": item.get("question_decomposition")},
+            ))
+        return examples
+
+
 def get_loader(dataset_name: str, split: str = "validation", seed: int = 42) -> DatasetLoader:
     """Factory function to get appropriate dataset loader."""
     loaders = {
@@ -611,6 +680,8 @@ def get_loader(dataset_name: str, split: str = "validation", seed: int = 42) -> 
         "qasper": QasperLoader,
         "squad_v2": SquadV2Loader,
         "trivia_qa": TriviaQALoader,
+        "natural_questions": NaturalQuestionsLoader,
+        "musique": MuSiQueLoader,
         "humaneval": HumanEvalLoader,
         "mbpp": MBPPLoader,
         "hpc_code": HPCCodeLoader,

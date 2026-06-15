@@ -148,10 +148,39 @@ CAGE_REQUIRE_DISTINCT_REPLICAS=1 python3 scripts/run_experiment.py \
 **Workload:** `--workload-mode {single,batched,multi_turn}`, `--batch-size`,
 `--multi-turn-length`, `--repeat-queries`, `--warmup-queries`.
 
-**Speculative:** `--speculative-model`, `--speculative-method {draft_model,ngram,suffix,medusa,eagle}`,
-`--num-speculative-tokens`.
+**Protocol controls (new):** `--context-source {auto,gold,retrieved}` (confound control),
+`--reset-cache-between-trials` (cold-start per trial; needs `VLLM_SERVER_DEV_MODE=1`).
+
+**Compression axis (new):** `--compress-method {none,llmlingua2,llmlingua}`, `--compress-ratio <keep>`
+(0.5 = 2× compression), `--kv-cache-dtype {none,fp8}` (record-only here; also pass to the server).
+
+**Speculative:** vLLM configures speculation at **launch** — start the server with
+`VLLM_SPECULATIVE_CONFIG='{"method":"ngram","num_speculative_tokens":5}'`, then run the
+`speculative` baseline. (The old `--speculative-model` flag is deprecated.)
 
 > No `--phase`, `--all-baselines`, `--trials`, `--queries`, or disagg-prefill flag.
+
+### 6.1 Compression axis (the 2×2)
+```bash
+# RAG with text compression of retrieved docs (needs: pip install llmlingua)
+python3 scripts/run_experiment.py --baseline compressed_rag --model Qwen/Qwen3-8B \
+  --dataset squad_v2 --num-queries 50 --num-trials 3 --compress-ratio 0.5 --rebuild-ir-index
+# CAG with KV-cache compression (GPU): launch the server with fp8 KV, then run:
+VLLM_KV_CACHE_DTYPE=fp8 ./scripts/manage_vllm_server.sh restart Qwen/Qwen3-8B
+python3 scripts/run_experiment.py --baseline compressed_cag --model Qwen/Qwen3-8B \
+  --dataset squad_v2 --num-queries 50 --num-trials 3 --kv-cache-dtype fp8
+# MLA arm (architectural KV compression): use configs/model/deepseek-v2-lite.yaml on a GPU.
+```
+
+### 6.2 Cache-state control for trials (resolves the per-trial flush question)
+There are **two legitimate measurement regimes** — declare which you're using:
+- **Cold-start per trial** (each trial starts from an empty cache): start the server with
+  `VLLM_SERVER_DEV_MODE=1` and add `--reset-cache-between-trials`. This flushes the vLLM prefix
+  cache via `POST /reset_prefix_cache` between trials — no model reload needed.
+- **Warm / steady-state** (cache pre-populated, the regime `hybrid_warm` targets): just run; the
+  seeded resampling now gives each trial *different* queries, so it's not a pure replay.
+Either is valid; what matters is that the regime is controlled and stated. For confound-free
+quality comparisons also pass `--context-source gold` (or `retrieved`).
 
 ---
 

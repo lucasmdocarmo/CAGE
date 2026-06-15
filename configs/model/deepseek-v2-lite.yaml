@@ -1,0 +1,32 @@
+# Model configuration for deepseek-ai/DeepSeek-V2-Lite
+# MLA (Multi-head Latent Attention) model for the compressed_cag KV-compression arm.
+# MLA stores a single low-rank KV latent per token/layer instead of per-head K/V,
+# shrinking the KV cache ~7-14x vs MHA — the architectural form of KV compression.
+
+name: deepseek-ai/DeepSeek-V2-Lite
+description: "DeepSeek-V2-Lite - MLA model for the compressed_cag (low-rank KV) baseline"
+
+# Model parameters
+max_tokens: 512
+temperature: 0.7
+top_p: 0.95
+
+# Hardware requirements
+requires_gpu: true        # MLA kernels are GPU-targeted in vLLM
+ram_gb: 32.0
+context_length: 32768
+
+# vLLM configuration
+dtype: bfloat16
+enable_prefix_caching: true
+cpu_offload: false
+
+# KV-cache compression notes (server-side):
+#   - This model uses MLA (architectural low-rank KV compression).
+#   - Combine with fp8 KV quantization for additional savings (validate quality —
+#     fp8 KV on some MLA models has known issues; see VALIDATION_AND_SOTA_REVIEW.md Q5).
+kv_compression: mla
+attention: multi_head_latent_attention
+
+# Experiment tiers
+tier: compressed_cag

@@ -466,7 +466,7 @@ main-12page.tex → references analysis/Articles/Publish/images/plots/phase1/*.p
 ```bibtex
 @article{carmo2025cage,
   title={CAGE: A Framework for Holistic Evaluation of Cache-Augmented Generation Models},
-  author={Carmo, Lucas Mariano do},
+  author={Carmo, Lucas Mariano do Carmo do},
   year={2025},
   institution={Pontifícia Universidade Católica de Minas Gerais}
 }
