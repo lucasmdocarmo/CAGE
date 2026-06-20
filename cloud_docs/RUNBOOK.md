@@ -160,17 +160,61 @@ CAGE_REQUIRE_DISTINCT_REPLICAS=1 python3 scripts/run_experiment.py \
 
 > No `--phase`, `--all-baselines`, `--trials`, `--queries`, or disagg-prefill flag.
 
-### 6.1 Compression axis (the 2×2)
+### 6.1 Compression axis (the 2×2) — run it correctly
+
+The axis crosses **context source** (CAG vs RAG) with **compression** (full vs
+compressed). Run **all four cells with the same model, dataset, seed, and trials**
+so the cell is the only thing that varies:
+
 ```bash
-# RAG with text compression of retrieved docs (needs: pip install llmlingua)
-python3 scripts/run_experiment.py --baseline compressed_rag --model Qwen/Qwen3-8B \
-  --dataset squad_v2 --num-queries 50 --num-trials 3 --compress-ratio 0.5 --rebuild-ir-index
-# CAG with KV-cache compression (GPU): launch the server with fp8 KV, then run:
-VLLM_KV_CACHE_DTYPE=fp8 ./scripts/manage_vllm_server.sh restart Qwen/Qwen3-8B
-python3 scripts/run_experiment.py --baseline compressed_cag --model Qwen/Qwen3-8B \
-  --dataset squad_v2 --num-queries 50 --num-trials 3 --kv-cache-dtype fp8
-# MLA arm (architectural KV compression): use configs/model/deepseek-v2-lite.yaml on a GPU.
+MODEL=Qwen/Qwen3-8B; DS=squad_v2; N=100; T=10; SEED=42   # GPU-phase defaults
+
+# --- Full row (no compression) ---
+./scripts/manage_vllm_server.sh restart $MODEL                          # prefix caching ON
+python3 scripts/run_experiment.py --baseline prefix_cache --model $MODEL --dataset $DS \
+  --num-queries $N --num-trials $T --seed $SEED --context-source gold          # FULL CAG
+python3 scripts/run_experiment.py --baseline rag --model $MODEL --dataset $DS \
+  --num-queries $N --num-trials $T --seed $SEED --rebuild-ir-index             # FULL RAG
+
+# --- Compressed row (ratio-matched at ~2x) ---
+python3 scripts/run_experiment.py --baseline compressed_rag --model $MODEL --dataset $DS \
+  --num-queries $N --num-trials $T --seed $SEED \
+  --compress-method llmlingua2 --compress-ratio 0.5                            # COMPRESSED RAG (~2x tokens)
+VLLM_KV_CACHE_DTYPE=fp8 ./scripts/manage_vllm_server.sh restart $MODEL         # relaunch server with fp8 KV
+python3 scripts/run_experiment.py --baseline compressed_cag --model $MODEL --dataset $DS \
+  --num-queries $N --num-trials $T --seed $SEED --kv-cache-dtype fp8           # COMPRESSED CAG (~2x bytes)
+
+# MLA arm (optional, architectural KV compression — separate, more aggressive point):
+#   use configs/model/deepseek-v2-lite.yaml on a GPU; no --kv-cache-dtype needed.
 ```
+
+**Fairness — match the ratio, not the algorithm.** Text and KV tensors are
+different objects, so the arms necessarily use different compressors (LLMLingua‑2 vs
+FP8); that is not a confound. Fairness comes from (a) identical
+model/dataset/seed/trials, (b) identical quality metrics, and (c) a **matched
+compression ratio** — pin the KV arm to **FP8 (~2×)** so it matches **LLMLingua‑2
+keep‑0.5 (~2×)**. Read the 2×2 *down* the columns (CAG vs RAG) or *across* the rows
+(full vs compressed within a paradigm) — **never diagonally** (LLMLingua vs FP8).
+MLA (~7–14×) is reported separately, not as the matched comparator.
+
+**Pre‑flight (or the cell is invalid):**
+- `pip install llmlingua` must be present — else `compressed_rag` silently runs with
+  **no** compression (ratio 1.0) and the result is meaningless.
+- `compressed_cag` needs a **GPU** and the server **relaunched** with
+  `VLLM_KV_CACHE_DTYPE=fp8`. The runner's `--kv-cache-dtype` only *labels* the run; it
+  does **not** reconfigure a live server.
+- CAG arms keep **prefix caching ON**; RAG arms rebuild the IR index once
+  (`--rebuild-ir-index`).
+
+**Post‑flight (confirm it actually ran compressed):**
+- `compressed_rag`: results carry `compression_stats` with an achieved ratio < 1.0.
+  If it is 1.0, llmlingua did not load — re-install and re-run.
+- `compressed_cag`: add `--vllm-telemetry`; `vllm_telemetry.json` / the cage‑stats KV
+  panel must show `kv_cache_dtype = fp8` and a reduced KV footprint.
+
+> **On the cloud (Path A, §9):** this 2×2 is **not** part of `cloud_run.sh`. Run the
+> block above on the GPU VM after the standard suite — install `llmlingua` and do the
+> fp8 server relaunch first; results then sync to GCS like any other baseline.
 
 ### 6.2 Cache-state control for trials (resolves the per-trial flush question)
 There are **two legitimate measurement regimes** — declare which you're using:

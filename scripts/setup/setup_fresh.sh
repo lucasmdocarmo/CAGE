@@ -1,7 +1,7 @@
 #!/bin/bash
 # LEGACY: local CPU-only env that BUILDS vLLM 0.8.3 from source (slow).
 # Only needed on platforms without a working vLLM wheel (e.g. macOS/ARM CPU).
-# For cloud/GPU use the official wheel/image — see docs/RUNBOOK.md.
+# For cloud/GPU use the official wheel/image — see cloud_docs/RUNBOOK.md.
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"

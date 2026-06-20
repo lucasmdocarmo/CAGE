@@ -1,6 +1,6 @@
 #!/bin/bash
 # LEGACY: local CPU-only env without sudo (pinned, older vLLM 0.8.3).
-# For the supported setup (local + cloud/GPU) see docs/RUNBOOK.md.
+# For the supported setup (local + cloud/GPU) see cloud_docs/RUNBOOK.md.
 # Assumes an already-activated Python env on PATH.
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

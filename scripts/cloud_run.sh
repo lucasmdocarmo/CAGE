@@ -4,7 +4,7 @@
 # IMPORTANT: run this ON A GPU VM (it starts a local vLLM server via run_phase1.sh).
 # Do NOT run it on the CPU router of the multi-VM Terraform cluster. For the *distributed*
 # baseline against that cluster, use run_experiment.py + sync_results_to_gcs.sh instead
-# (see docs/RUNBOOK.md §9, Path B).
+# (see cloud_docs/RUNBOOK.md §9, Path B).
 #
 # Results are mirrored to the durable GCS bucket every SYNC_INTERVAL seconds (and at exit),
 # so an SSH drop, VM preemption, or VM delete cannot lose a finished baseline. Pair with

@@ -2,8 +2,8 @@
 
 A comprehensive benchmarking framework for evaluating Cache-Augmented Generation (CAG) systems with distributed KV cache management.
 
-> 📖 **Start here:** [`docs/RUNBOOK.md`](docs/RUNBOOK.md) (setup / deploy / run) ·
-> [`docs/KNOWLEDGE_BASE.md`](docs/KNOWLEDGE_BASE.md) (project reference) ·
+> 📖 **Start here:** [`cloud_docs/RUNBOOK.md`](cloud_docs/RUNBOOK.md) (setup / deploy / run) ·
+> [`cloud_docs/KNOWLEDGE_BASE.md`](cloud_docs/KNOWLEDGE_BASE.md) (project reference) ·
 > [`docs/README.md`](docs/README.md) (doc index). The repo is a single-level tree at the
 > project root; some sections below predate the June 2026 reorg — trust the docs above for
 > current commands and paths.
