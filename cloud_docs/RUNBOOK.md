@@ -164,7 +164,10 @@ CAGE_REQUIRE_DISTINCT_REPLICAS=1 python3 scripts/run_experiment.py \
 
 The axis crosses **context source** (CAG vs RAG) with **compression** (full vs
 compressed). Run **all four cells with the same model, dataset, seed, and trials**
-so the cell is the only thing that varies:
+so the cell is the only thing that varies.
+
+**Scripted (recommended):** `bash scripts/run_compression.sh <model>` runs all four cells
+through the launch-lever and runs the FP8×prefix-caching gate first. The manual equivalent:
 
 ```bash
 MODEL=Qwen/Qwen3-8B; DS=squad_v2; N=100; T=10; SEED=42   # GPU-phase defaults
@@ -450,3 +453,28 @@ open issues (full detail in [`VALIDATION_AND_SOTA_REVIEW.md`](VALIDATION_AND_SOT
 | Significance tests | `python3 scripts/statistical_tests.py --results-dir analysis/phase1/results` |
 | Provision cloud | `cd terraform/gcp && terraform apply -var=project_id=… -var=hf_token=…` |
 | Tear down (keep results) | `cd terraform/gcp && terraform destroy -var=project_id=… -var=hf_token=…` |
+| Compression 2×2 (GPU) | `bash scripts/run_compression.sh Qwen/Qwen3-8B` |
+| Speculative (GPU) | `bash scripts/run_phase5.sh` |
+| FP8×prefix-cache gate | `bash scripts/check_fp8_prefix_cache.sh Qwen/Qwen3-8B` |
+
+---
+
+## 16. vLLM version pin & launch-time levers
+Deploy images are **pinned** to `vllm/vllm-openai:v0.11.0` (terraform, GPU compose,
+`deploy_cluster.sh`) — do **not** chase `:latest`; a renamed flag breaks a run. Spec, flag
+matrix, and the compatibility gate: [`VLLM_COMPATIBILITY.md`](VLLM_COMPATIBILITY.md). Bump
+deliberately, then re-gate.
+
+Levers are applied by (re)starting the server through `manage_vllm_server.sh`:
+
+| Lever | How | Baseline |
+|---|---|---|
+| FP8 KV cache | `VLLM_KV_CACHE_DTYPE=fp8 ./scripts/manage_vllm_server.sh restart <model>` | `compressed_cag` |
+| Speculative | `VLLM_SPECULATIVE_CONFIG='{"model":"Qwen/Qwen3-0.6B","num_speculative_tokens":5}' ./scripts/manage_vllm_server.sh restart <model>` | `speculative` |
+| Cluster (terraform) | `-var=vllm_extra_args='--kv-cache-dtype fp8'` | cloud replicas |
+
+`run_compression.sh` and `run_phase5.sh` drive these levers and capture `/metrics` telemetry;
+the compression script runs the FP8×prefix-caching gate first (else `compressed_cag` is
+confounded — VLLM_COMPATIBILITY.md §4). FP8 and speculative are **GPU-meaningful** → Phase 2.
+Speculative decoding is output-preserving, so it is a throughput baseline, not part of the
+efficiency-vs-quality axis.

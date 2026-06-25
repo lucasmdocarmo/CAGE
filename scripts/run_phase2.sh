@@ -19,7 +19,13 @@ VLLM_PORT=${VLLM_PORT:-8000}
 CLUSTER_BASE_PORT=${CLUSTER_BASE_PORT:-8001}
 ROUTER_REPLICAS_COUNT=${ROUTER_REPLICAS_COUNT:-3}
 ROUTER_PORT=${ROUTER_PORT:-9000}
-ENABLE_DISTRIBUTED=${ENABLE_DISTRIBUTED:-1}
+# Single-node-safe default: distributed (Phase 3) baseline OFF (3x VRAM, OOMs a 24GB L4).
+# Set ENABLE_DISTRIBUTED=1 only on a big-VRAM box or the multi-replica cluster.
+ENABLE_DISTRIBUTED=${ENABLE_DISTRIBUTED:-0}
+# vLLM serving telemetry (cage-stats + /metrics spec-decode) on by default.
+VLLM_TELEMETRY=${VLLM_TELEMETRY:-1}
+TELEMETRY_FLAG=""
+[ "$VLLM_TELEMETRY" != "0" ] && TELEMETRY_FLAG="--vllm-telemetry"
 _cleanup_ran=0
 
 echo "=============================================="
@@ -84,6 +90,7 @@ run_baseline() {
         --num-trials "$NUM_TRIALS" \
         --seed "$SEED" \
         --output-dir "$OUTPUT_DIR/$baseline_label" \
+        $TELEMETRY_FLAG \
         "$@"
 
     echo "    Finished at: $(date)"
@@ -108,6 +115,7 @@ run_distributed_variant() {
         --seed "$SEED" \
         --api-base "http://localhost:${ROUTER_PORT}" \
         --sharding-policy "$policy" \
+        $TELEMETRY_FLAG \
         --output-dir "$OUTPUT_DIR/$baseline_label"
 
     echo "    Finished at: $(date)"

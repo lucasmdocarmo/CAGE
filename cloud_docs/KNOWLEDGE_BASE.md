@@ -5,6 +5,14 @@
 > **Scope.** Generated 2026-06-09 from a deep read of all docs, source code under `src/`, scripts, configs, Docker/Terraform/K8s infra, Phase 1 result files, and the LaTeX paper draft `paper/my-article.tex`. **Reconciled 2026-06-09** to the flattened single-level repo (the old triple-nested `CAGE/CAGE/CAGE` layout and the vendored `vllm-main/` copy were removed).
 >
 > **Repository root (host machine).** `/Users/lucasmariano/CAGE/` — this IS the project root (single level; git repo lives here). Docs are under `docs/`; links below are relative to the repo root.
+>
+> **⚠️ PHASE 2/3 OPERATIONS — READ THIS FIRST.** For *running* Phase 2 or 3 on GCP, the authoritative,
+> current procedures are [`PHASE2_CHECKLIST.md`](PHASE2_CHECKLIST.md), [`PHASE3_PLAN.md`](PHASE3_PLAN.md),
+> [`RUNBOOK.md`](RUNBOOK.md), and [`VLLM_COMPATIBILITY.md`](VLLM_COMPATIBILITY.md). Phase 2 runs on a
+> **single L4** (not a cluster). Some inline run commands further down in this file predate the
+> launch-lever wiring and reference flags that no longer exist (`--phase`, `--all-baselines`,
+> `--speculative-model`, `--enable-disagg-prefill`); trust the dedicated docs and
+> `python scripts/run_experiment.py --help` over those historical snippets.
 
 ---
 
@@ -161,7 +169,7 @@ This guarantees identical-prefix requests land on the same replica → maximises
 | 6 | `hybrid_retrieval_cache_warm` | retrieved | ✅ | ✅ warm (100 % hit, pre-warmed with 50 excluded queries) | vLLM :8000 | Production-realistic warm-start |
 | 7 | `distributed_router_replicated` | gold passage | ✅ | — | router :9000 → 3× vLLM | Multi-replica prefix-hash routing |
 
-Defined in `src/orchestration/baselines.py`. Selected via `--baseline <name>` on the master runner. The `--all-baselines` flag iterates over all of them. Additional baselines exist in the enum but were not used in Phase 1: `speculative` (n-gram, suffix, medusa, eagle, draft-model variants), `distributed_sharded` (Phase 3 target).
+Defined in `src/orchestration/baselines.py`. Selected via `--baseline <name>` on the master runner (the suite scripts loop over them; there is no `--all-baselines` flag). Additional baselines exist in the enum but were not used in Phase 1: `speculative` (n-gram, suffix, medusa, eagle, draft-model variants), `distributed_sharded` (Phase 3 target).
 
 ---
 
@@ -229,7 +237,7 @@ Indices are persisted as `faiss.index` + `documents.jsonl` + `meta.json`. Rebuil
 ### 7.1 CLI surface (grouped)
 **Required:** `--baseline {no_cache|prefix_cache|rag|redis|hybrid|distributed|speculative}`, `--model <HF id>`.
 
-**Workload:** `--dataset {hotpotqa|squad_v2|qasper|trivia_qa|humaneval|mbpp|hpc_code}`, `--num-queries`, `--max-tokens`, `--trials`, `--repeat-queries`, `--workload-mode {single|batched|multi_turn}`, `--batch-size`, `--multi-turn-length`, `--phase {1|2|3}`, `--all-baselines`.
+**Workload:** `--dataset {hotpotqa|squad_v2|qasper|trivia_qa|humaneval|mbpp|hpc_code}`, `--num-queries`, `--max-tokens`, `--num-trials`, `--repeat-queries`, `--workload-mode {single|batched|multi_turn}`, `--batch-size`, `--multi-turn-length` (no `--phase`/`--all-baselines`; phases are driven by the suite scripts).
 
 **Inference backend:** `--api-base` (default `http://localhost:8000`), `--backend {vllm|gemini|ollama}`, `--offline` (in-process vLLM).
 
@@ -359,7 +367,7 @@ CLI flags on the master runner override Hydra config values.
 |---|---|---|
 | `router.Dockerfile` | Build the router image (`cage-router:latest`). | Installs Python deps, ENTRYPOINT runs `python -m src.orchestration.router`. |
 | `docker-compose.yml` (CPU) | Local laptop (ARM64 / x86 CPU). | 3× vLLM replicas using `public.ecr.aws/q9t5s3a7/vllm-arm64-cpu-release-repo:latest` on `Qwen/Qwen3-4B`, ports 8001/8002/8003, `VLLM_CPU_KVCACHE_SPACE=1`. `redis:7-alpine` on 6379. Router on 9000 with `ROUTER_REPLICAS=replica-1=http://vllm-replica-1:8001,replica-2=…,replica-3=…`. |
-| `docker-compose.gpu.yml` (GPU) | GCP / on-prem GPU. | Same 3 replicas using `vllm/vllm-openai:latest` on `Qwen/Qwen3-8B`, NVIDIA GPU device request `capabilities: [gpu]`, env `VLLM_TENSOR_PARALLEL_SIZE=1`, `VLLM_GPU_MEMORY_UTILIZATION=0.9`, `HF_TOKEN=${HF_TOKEN}`. Identical Redis + router. |
+| `docker-compose.gpu.yml` (GPU) | GCP / on-prem GPU. | Same 3 replicas using `vllm/vllm-openai:v0.11.0` on `Qwen/Qwen3-8B`, NVIDIA GPU device request `capabilities: [gpu]`, env `VLLM_TENSOR_PARALLEL_SIZE=1`, `VLLM_GPU_MEMORY_UTILIZATION=0.9`, `HF_TOKEN=${HF_TOKEN}`. Identical Redis + router. |
 
 All replicas run with `--enable-prefix-caching --enable-prompt-tokens-details`.
 
@@ -367,7 +375,7 @@ All replicas run with `--enable-prefix-caching --enable-prompt-tokens-details`.
 | Manifest | Resources |
 |---|---|
 | `router.yaml` | `Deployment` `cage-router` (replicas=1, image `cage-router:latest`, port 9000, env `ROUTER_REPLICAS=…`); `Service` NodePort 9000 → 30090. |
-| `vllm-replica.yaml` | Three Deployment+Service pairs (`vllm-replica-1/-2/-3`), image `vllm/vllm-openai:latest`, args include model + port + prefix-caching flags. GPU `resources.limits` commented out — uncomment for cloud GPU. ClusterIP services on 8001/8002/8003. |
+| `vllm-replica.yaml` | Three Deployment+Service pairs (`vllm-replica-1/-2/-3`), image `vllm/vllm-openai:v0.11.0`, args include model + port + prefix-caching flags. GPU `resources.limits` commented out — uncomment for cloud GPU. ClusterIP services on 8001/8002/8003. |
 | `redis.yaml` | `Deployment` `cage-redis` (image `redis:7-alpine`, port 6379); ClusterIP Service named `redis`. |
 
 ### 11.3 Terraform — `terraform/gcp/main.tf`
@@ -379,8 +387,8 @@ All replicas run with `--enable-prefix-caching --enable-prompt-tokens-details`.
   * GPU `nvidia-l4` × 1 (configurable to `nvidia-tesla-a100` or `nvidia-tesla-t4`)
   * Boot disk 200 GB pd-ssd, image `deeplearning-platform-release/common-cu121-v20240128-debian-11`
   * Tag `cage-vllm`; ephemeral public IP + internal private IP
-  * Scheduling: `on_host_maintenance = TERMINATE`, `automatic_restart = true`
-  * **Startup script** (metadata): installs Docker + NVIDIA Container Toolkit; pulls `vllm/vllm-openai:latest`; runs container on dynamic port (8002–8004) with `--model Qwen/Qwen3-8B --enable-prefix-caching --enable-prompt-tokens-details --gpu-memory-utilization 0.9`; injects `HF_TOKEN`.
+  * Scheduling: `on_host_maintenance = TERMINATE`; on-demand by default (`automatic_restart = true`), or Spot when `var.preemptible = true` (`provisioning_model = SPOT`, `automatic_restart = false`)
+  * **Startup script** (metadata): installs Docker + NVIDIA Container Toolkit; pulls `vllm/vllm-openai:v0.11.0` (the pinned `var.vllm_image`); runs container on dynamic port (8002–8004) with `--model Qwen/Qwen3-8B --enable-prefix-caching --enable-prompt-tokens-details --gpu-memory-utilization 0.9`; injects `HF_TOKEN`.
 * **Router (`cage-router`):** Machine `e2-standard-4` (4 vCPU, 16 GB), 50 GB pd-standard, Debian 11. **Startup script** installs Docker, runs Redis 7-alpine on 6379, queries replica IPs via `gcloud`, builds `ROUTER_REPLICAS` env var, waits for code upload to `/opt/cage`, installs `requirements.txt`, launches `python3 -m src.orchestration.router`.
 
 **Variables (`variable {}` blocks):**
@@ -612,12 +620,13 @@ gcloud compute scp --recurse . cage-router:/opt/cage --zone=us-central1-a
 gcloud compute ssh cage-router --zone=us-central1-a
 cd /opt/cage
 
-python3 scripts/run_experiment.py \
-  --phase 2 --all-baselines --trials 10 --queries 100 \
-  --model Qwen/Qwen3-8B --api-base http://localhost:9000
+# Phase 2 is a SINGLE L4 (not the router cluster). See cloud_docs/PHASE2_CHECKLIST.md.
+bash scripts/setup/setup_gpu_cloud.sh
+nohup bash scripts/cloud_run.sh Qwen/Qwen3-8B 100 10 > run.log 2>&1 &   # 7 baselines + telemetry + GCS sync
+bash scripts/run_compression.sh Qwen/Qwen3-8B   # FP8 2x2 axis (gates FP8 x prefix-cache)
+bash scripts/run_phase5.sh                      # speculative decoding
 
-python3 scripts/verify_results.py
-python3 scripts/statistical_tests.py --results-dir analysis/phase2/results/
+python3 scripts/statistical_tests.py --results-dir analysis/phase1/results/
 
 gcloud compute scp --recurse cage-router:/opt/cage/analysis/ ./analysis_cloud_backup/ --zone=us-central1-a
 
@@ -633,11 +642,11 @@ terraform destroy -var="project_id=$(gcloud config get-value project)" -var="hf_
    * Add `nic_type = "GVNIC"` on replica `network_interface`.
 3. `terraform apply` again, push code, then:
 ```bash
-python3 scripts/run_experiment.py --phase 3 --baseline distributed \
-    --model Qwen/Qwen3-14B --enable-disagg-prefill
-
-python3 scripts/run_experiment.py --phase 3 --baseline hybrid_cache_warm \
-    --model Qwen/Qwen3-14B --speculative-model Qwen/Qwen3-1B
+# Phase 3 distributed runs against the router. See cloud_docs/PHASE3_PLAN.md for the
+# real-KV-connector path. FP8/speculative are launch-time levers (run_compression.sh / run_phase5.sh),
+# not run_experiment.py flags.
+python3 scripts/run_experiment.py --baseline distributed \
+    --model Qwen/Qwen3-8B --api-base http://<router>:9000 --vllm-telemetry
 ```
 
 ### 14.5 Tests
@@ -673,7 +682,7 @@ ROUTER_TEST_API_BASE=http://localhost:9000 pytest -m integration   # router live
 1. **Capture provenance fixes** in `metadata.json` — git commit, backend version, model id were null in some Phase 1 outputs.
 2. **Author `scripts/statistical_tests.py`** — Wilcoxon rank-sum + bootstrap CI generator, output formatted LaTeX tables to `analysis/phase2/tables/`.
 3. **Provision Phase 2 GCP cluster** ([GCP_DEPLOYMENT_RUNBOOK.md](CAGE/GCP_DEPLOYMENT_RUNBOOK.md) §3) — apply Terraform with default L4 settings.
-4. **Run full Phase 2 sweep:** `python3 scripts/run_experiment.py --phase 2 --all-baselines --trials 10 --queries 100 --model Qwen/Qwen3-8B`.
+4. **Run full Phase 2 sweep:** `bash scripts/cloud_run.sh Qwen/Qwen3-8B 100 10` then `bash scripts/run_compression.sh Qwen/Qwen3-8B` + `bash scripts/run_phase5.sh`. See [PHASE2_CHECKLIST.md](PHASE2_CHECKLIST.md).
 5. **Scaling sweep:** repeat at `--model Qwen/Qwen3-4B` and `Qwen/Qwen3-14B` to produce model-size curves.
 6. **Add TriviaQA** to the workload via `--dataset trivia_qa` — index already prebuilt under `experiments/ir_index/ir_trivia_qa_intfloat_e5-large-v2/`.
 7. **Restart vLLM between trials** in the experiment driver (fix the cold-start carry-over caveat).

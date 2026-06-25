@@ -2,62 +2,66 @@
 # =============================================================================
 # Phase 5: Speculative Decoding Evaluation
 # =============================================================================
-# Estimated time: ~1-2 hours
-# Draft Model: Qwen/Qwen3-0.6B (small, fast)
-# Target Model: Qwen/Qwen3-4B
-# Dataset: squad_v2
-# Queries: 500
-# Trials: 3
+# Speculative decoding is a vLLM LAUNCH-TIME setting (--speculative-config), so this
+# script (re)starts the server WITH speculation, then runs the baseline against it.
+# This is the same "launch-lever" pattern compressed_cag uses for --kv-cache-dtype fp8.
+#
+# It is GPU-meaningful: on a CPU backend the draft+target overhead usually cancels the
+# benefit. Speculative decoding is output-distribution-preserving, so it does NOT change
+# answer quality -- treat it as a serving-throughput (TPOT) baseline.
+#
+# Draft Model: Qwen/Qwen3-0.6B   Target: Qwen/Qwen3-4B   Dataset: squad_v2
 # =============================================================================
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-PHASE_DIR="$PROJECT_DIR/analysis/phase5"
-OUTPUT_DIR="$PHASE_DIR/results"
+OUTPUT_DIR="$PROJECT_DIR/analysis/phase5/results"
 
-# Speculative decoding uses draft + target model
-DRAFT_MODEL="Qwen/Qwen3-0.6B"
-TARGET_MODEL="Qwen/Qwen3-4B"
-DATASET="squad_v2"
-NUM_QUERIES=500
-NUM_TRIALS=3
-SEED=42
+DRAFT_MODEL="${DRAFT_MODEL:-Qwen/Qwen3-0.6B}"
+TARGET_MODEL="${TARGET_MODEL:-Qwen/Qwen3-4B}"
+DATASET="${DATASET:-squad_v2}"
+NUM_QUERIES="${NUM_QUERIES:-500}"
+NUM_TRIALS="${NUM_TRIALS:-3}"
+SEED="${SEED:-42}"
+
+# Launch-time speculative config (CURRENT vLLM API; the old --speculative-model is deprecated).
+# draft_model method points at a small draft model. For a model-free run instead use:
+#   export VLLM_SPECULATIVE_CONFIG='{"method":"ngram","num_speculative_tokens":5}'
+export VLLM_SPECULATIVE_CONFIG="${VLLM_SPECULATIVE_CONFIG:-{\"model\":\"${DRAFT_MODEL}\",\"num_speculative_tokens\":5}}"
 
 echo "=============================================="
 echo "CAGE Phase 5: Speculative Decoding"
 echo "=============================================="
-echo "Draft model: $DRAFT_MODEL"
-echo "Target model: $TARGET_MODEL"
-echo "Dataset: $DATASET"
-echo "Output directory: $OUTPUT_DIR"
-echo "Queries: $NUM_QUERIES"
-echo "Trials: $NUM_TRIALS"
+echo "Target model:  $TARGET_MODEL"
+echo "Spec config:   $VLLM_SPECULATIVE_CONFIG"
+echo "Dataset:       $DATASET   Queries: $NUM_QUERIES   Trials: $NUM_TRIALS"
+echo "Output:        $OUTPUT_DIR/speculative"
 echo "=============================================="
 
 cd "$PROJECT_DIR"
 mkdir -p "$OUTPUT_DIR"
 
-echo ""
-echo ">>> Running speculative decoding baseline"
-echo "    Started at: $(date)"
+# 1) Bring the server up WITH speculative decoding enabled (the launch-lever).
+echo ">>> Restarting vLLM with speculative decoding enabled"
+VLLM_SPECULATIVE_CONFIG="$VLLM_SPECULATIVE_CONFIG" \
+    "$SCRIPT_DIR/manage_vllm_server.sh" restart "$TARGET_MODEL"
 
+# 2) Run the speculative baseline, capturing the /metrics acceptance rate via telemetry.
+echo ">>> Running speculative decoding baseline   ($(date))"
 python3 scripts/run_experiment.py \
     --baseline "speculative" \
     --model "$TARGET_MODEL" \
-    --speculative-model "$DRAFT_MODEL" \
     --dataset "$DATASET" \
     --num-queries "$NUM_QUERIES" \
     --num-trials "$NUM_TRIALS" \
     --seed "$SEED" \
+    --vllm-telemetry \
     --output-dir "$OUTPUT_DIR/speculative"
 
-echo "    Finished at: $(date)"
-echo "    Results saved to: $OUTPUT_DIR/speculative"
-
-echo ""
-echo "=============================================="
-echo "Phase 5 Complete!"
-echo "Results in: $OUTPUT_DIR"
+echo ">>> Finished   ($(date))"
+echo "    Results:   $OUTPUT_DIR/speculative"
+echo "    Acceptance rate is in the vLLM telemetry snapshot:"
+echo "      vllm:spec_decode_num_accepted_tokens_total / vllm:spec_decode_num_draft_tokens_total"
 echo "=============================================="

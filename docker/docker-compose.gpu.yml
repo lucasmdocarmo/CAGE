@@ -5,7 +5,7 @@ version: "3.9"
 # Pass HF_TOKEN in the environment for gated models.
 
 x-vllm-common: &vllm-common
-  image: vllm/vllm-openai:latest # pin a concrete tag for reproducibility
+  image: vllm/vllm-openai:v0.11.0 # pinned for reproducibility (see cloud_docs/VLLM_COMPATIBILITY.md)
   deploy:
     resources:
       reservations:

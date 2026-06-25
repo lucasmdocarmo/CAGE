@@ -6,7 +6,10 @@
 > (novelty), [`DEV_BACKLOG.md`](DEV_BACKLOG.md) (what's left), [`RELATED_WORK_COMPRESSION.md`](RELATED_WORK_COMPRESSION.md).
 >
 > Status legend: ✅ done & verified · ◐ partial · ⏳ cluster-validate (GPU-only) · ○ planned.
-> Updated 2026-06-09 after the P0/P1/P2 implementation pass.
+> Updated 2026-06-09 after the P0/P1/P2 pass; 2026-06-23 added the vLLM version pin (v0.11.0),
+> launch-lever wiring (`compressed_cag` FP8 + `speculative` via `manage_vllm_server.sh`), the
+> FP8×prefix-caching gate, and `/metrics` acceptance-rate capture — see
+> [`VLLM_COMPATIBILITY.md`](VLLM_COMPATIBILITY.md).
 
 ---
 

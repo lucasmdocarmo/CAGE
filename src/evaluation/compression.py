@@ -75,3 +75,61 @@ def transfer_bytes_for(
         return 0.0
     fr = fraction_remote if fraction_remote is not None else (num_nodes - 1) / num_nodes
     return float(kv_bytes) * float(fr)
+
+
+def analytical_kv_footprint(
+    model_name: str,
+    num_tokens: int,
+    *,
+    dtype: str = "bf16",
+    baseline_dtype: str = "bf16",
+) -> Optional[dict]:
+    """Best-effort analytical KV-cache footprint for a HF model at ``num_tokens``.
+
+    Bridges the model architecture (layers, KV heads, head dim) read from the HF config
+    into :func:`kv_cache_bytes`, so the compression axis carries an analytical estimate
+    alongside the empirical footprint from GPUMetricsTracker. Compares the configured
+    KV dtype (e.g. ``fp8`` for ``compressed_cag``) against a ``bf16`` baseline.
+
+    Returns ``None`` if the config cannot be read (never raises), so it is safe to call
+    from the run summary on any host.
+    """
+    try:
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.from_pretrained(model_name)
+        num_layers = getattr(cfg, "num_hidden_layers", None)
+        num_heads = getattr(cfg, "num_attention_heads", None)
+        num_kv_heads = getattr(cfg, "num_key_value_heads", None) or num_heads
+        hidden = getattr(cfg, "hidden_size", None)
+        head_dim = getattr(cfg, "head_dim", None) or (
+            int(hidden // num_heads) if hidden and num_heads else None
+        )
+        if not (num_layers and num_kv_heads and head_dim and num_tokens):
+            return None
+
+        comp = kv_cache_bytes(
+            num_tokens, num_layers=num_layers, num_kv_heads=num_kv_heads,
+            head_dim=head_dim, dtype=dtype,
+        )
+        base = kv_cache_bytes(
+            num_tokens, num_layers=num_layers, num_kv_heads=num_kv_heads,
+            head_dim=head_dim, dtype=baseline_dtype,
+        )
+        return {
+            "model": model_name,
+            "num_tokens": int(num_tokens),
+            "kv_cache_dtype": dtype,
+            "num_layers": int(num_layers),
+            "num_kv_heads": int(num_kv_heads),
+            "head_dim": int(head_dim),
+            "kv_bytes_per_token": kv_bytes_per_token(
+                num_layers=num_layers, num_kv_heads=num_kv_heads,
+                head_dim=head_dim, dtype=dtype,
+            ),
+            "kv_cache_bytes": comp,
+            "kv_cache_bytes_baseline_bf16": base,
+            "kv_compression_ratio": (comp / base) if base else None,
+        }
+    except Exception:
+        return None

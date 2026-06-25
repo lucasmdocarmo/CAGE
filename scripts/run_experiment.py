@@ -756,14 +756,13 @@ def run_experiment(
     # Validate speculative baseline requirements
     if baseline == "speculative":
         print(
-            "Warning: speculative baseline settings are recorded in the experiment config, "
-            "but the current inference path does not yet forward speculative decoding "
-            "parameters to the backend adapter."
+            "Note: speculative decoding is a vLLM LAUNCH-time setting, not a per-request "
+            "parameter. Enable it by (re)starting the server with the VLLM_SPECULATIVE_CONFIG "
+            "JSON (see scripts/run_phase5.sh and scripts/manage_vllm_server.sh). Acceptance "
+            "rate is captured from /metrics via --vllm-telemetry; this baseline measures the "
+            "resulting TTFT/TPOT/throughput, and since speculative decoding is output-preserving "
+            "it does not change answer quality."
         )
-        if speculative_method == "draft_model" and not speculative_model:
-            print("Warning: speculative baseline with method=draft_model requires --speculative-model")
-            print("Hint: For Qwen3-4B, try --speculative-model Qwen/Qwen3-0.6B")
-            print("      For ngram method, no draft model needed: --speculative-method ngram")
     
     # Check requirements
     requirements = check_baseline_requirements(baseline_config)
@@ -1581,6 +1580,21 @@ def run_experiment(
     
     print(f"\nResults saved to: {results_file}")
     
+    # Analytical KV-cache footprint estimate (compression axis): bridge the model
+    # architecture to kv_cache_bytes() so fp8 (compressed_cag) can be compared against a
+    # bf16 baseline. The empirical footprint still comes from GPUMetricsTracker; this is
+    # the analytical estimate the dissertation describes. Never raises.
+    try:
+        from src.evaluation.compression import analytical_kv_footprint
+        _kv_dtype = baseline_config.kv_cache_dtype or "bf16"
+        _avg_prompt_toks = (cache_summary or {}).get("avg_prompt_tokens")
+        compression_analytical = (
+            analytical_kv_footprint(model, int(_avg_prompt_toks), dtype=_kv_dtype)
+            if _avg_prompt_toks else None
+        )
+    except Exception:
+        compression_analytical = None
+
     # Save aggregate metrics as JSON
     experiment_summary = {
         "experiment": {
@@ -1630,6 +1644,7 @@ def run_experiment(
         "quality": avg_quality,
         "retrieval": retrieval_summary,
         "prompt_cache": cache_summary,
+        "compression_analytical": compression_analytical,
         "warmup": {
             "num_queries": warmup_queries,
             "num_requests": len(warmup_examples),

@@ -22,6 +22,12 @@
 #     SYNC_DIR            local dir to mirror (default: analysis)
 #     SYNC_INTERVAL       seconds between background syncs (default: 120)
 #     CAGE_RESULTS_BUCKET override bucket (default: gs://<project>-cage-results)
+#
+# Launch-time levers (compressed_cag FP8 / speculative) need a server relaunch with an env var,
+# so run those via their own scripts instead of this suite:
+#     compression 2x2:  bash scripts/run_compression.sh $MODEL   (gates FP8 x prefix-caching)
+#     speculative:      bash scripts/run_phase5.sh
+# The vLLM image is pinned to v0.11.0 — see cloud_docs/VLLM_COMPATIBILITY.md.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

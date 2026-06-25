@@ -1,6 +1,7 @@
 # Dissertation / paper sources + docs (kept local, not uploaded)
 paper/
 docs/
+my-article/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -184,3 +185,12 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Terraform local state, provider cache, and env-specific vars (generated this session).
+# terraform.tfvars.example (template) and .terraform.lock.hcl stay tracked; ignore the rest.
+.terraform/
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+crash.log
+*.tfplan

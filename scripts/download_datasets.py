@@ -7,6 +7,8 @@ Datasets downloaded:
 - allenai/qasper (scientific papers)
 - squad_v2 (reading comprehension)
 - trivia_qa (multi-evidence questions)
+- nq_open (Natural Questions, open-domain; Phase 2)
+- dgslibisey/MuSiQue (multi-hop, for compression comparability; Phase 2)
 """
 
 from datasets import load_dataset
@@ -39,7 +41,7 @@ def main():
     )
     parser.add_argument(
         "--dataset",
-        choices=["hotpotqa", "qasper", "squad_v2", "trivia_qa", "all"],
+        choices=["hotpotqa", "qasper", "squad_v2", "trivia_qa", "natural_questions", "musique", "all"],
         default="all",
         help="Specific dataset to download (default: all)",
     )
@@ -50,6 +52,8 @@ def main():
         "qasper": ("allenai/qasper", None),
         "squad_v2": ("squad_v2", None),
         "trivia_qa": ("trivia_qa", "rc"),
+        "natural_questions": ("nq_open", None),
+        "musique": ("dgslibisey/MuSiQue", None),
     }
 
     if args.dataset == "all":

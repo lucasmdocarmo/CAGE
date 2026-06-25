@@ -74,13 +74,19 @@ variable "model_name" {
 variable "vllm_image" {
   description = "vLLM serving image. Pin a concrete tag for reproducibility."
   type        = string
-  default     = "vllm/vllm-openai:latest"
+  default     = "vllm/vllm-openai:v0.11.0"
+}
+
+variable "vllm_extra_args" {
+  description = "Extra flags appended to the vLLM launch, e.g. '--kv-cache-dtype fp8' (compressed_cag) or a --speculative-config JSON. Empty by default. See cloud_docs/VLLM_COMPATIBILITY.md."
+  type        = string
+  default     = ""
 }
 
 variable "gpu_memory_utilization" {
-  description = "vLLM --gpu-memory-utilization"
+  description = "vLLM --gpu-memory-utilization. 0.85 leaves KV/draft headroom on a 24GB L4; for Qwen3-8B + FP8 + speculative, lower further or use Qwen3-4B for those arms (see cloud_docs/PHASE2_CHECKLIST.md)."
   type        = number
-  default     = 0.9
+  default     = 0.85
 }
 
 variable "disk_size_gb" {
@@ -118,6 +124,12 @@ variable "hf_token" {
   type        = string
   default     = ""
   sensitive   = true
+}
+
+variable "preemptible" {
+  description = "Use Spot/preemptible VMs for the GPU replicas. Set true for Phase 2 single-node baseline sweeps (cheap and interruptible; results sync to GCS, so a preemption costs at most one in-flight baseline). Keep false for the Phase 3 coordinated cluster, where all replicas must stay up together."
+  type        = bool
+  default     = false
 }
 
 # ---------------------------------------------------------------------------
@@ -257,7 +269,10 @@ resource "google_compute_instance" "vllm_replica" {
 
   scheduling {
     on_host_maintenance = "TERMINATE"
-    automatic_restart   = true
+    # Spot/preemptible (var.preemptible=true) requires automatic_restart=false.
+    automatic_restart  = var.preemptible ? false : true
+    preemptible        = var.preemptible
+    provisioning_model = var.preemptible ? "SPOT" : "STANDARD"
   }
 
   network_interface {
@@ -317,7 +332,8 @@ resource "google_compute_instance" "vllm_replica" {
         --port $REPLICA_PORT \
         --enable-prefix-caching \
         --enable-prompt-tokens-details \
-        --gpu-memory-utilization ${var.gpu_memory_utilization}
+        --gpu-memory-utilization ${var.gpu_memory_utilization} \
+        ${var.vllm_extra_args}
 
       echo "[cage] vLLM replica ${count.index + 1} started on port $REPLICA_PORT"
     EOF

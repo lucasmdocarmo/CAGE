@@ -74,7 +74,9 @@ def capture_snapshot(
             print(f"[telemetry] cage-stats CLI returned {res.returncode}: {res.stderr.strip()[:160]}")
         except Exception as e:
             print(f"[telemetry] cage-stats subprocess failed: {e}")
-    return None
+    # Dependency-free fallback: at minimum capture speculative-decode acceptance from /metrics.
+    spec = scrape_spec_decode(url, metrics_path=metrics_path)
+    return {"spec_decode": spec} if spec else None
 
 
 def dashboard_text(
@@ -135,6 +137,55 @@ def capture(
         capture_snapshot(url, metrics_path=metrics_path, api_key=api_key, interval=interval, mock=mock),
         dashboard_text(url, metrics_path=metrics_path, api_key=api_key, interval=interval, mock=mock),
     )
+
+
+def scrape_spec_decode(
+    url: str, *, metrics_path: str = "/metrics", timeout: float = 10.0
+) -> Optional[dict]:
+    """Directly scrape vLLM's Prometheus ``/metrics`` for speculative-decode acceptance.
+
+    Dependency-free (stdlib ``urllib``) fallback so the ``speculative`` baseline records an
+    acceptance rate even when cage-stats is not installed. Sums each counter across label
+    sets and returns
+    ``{accepted, draft, acceptance_rate, num_drafts, mean_accept_len}`` — or ``None`` if the
+    server is unreachable or speculation is not enabled (the metrics are absent).
+
+    acceptance_rate = accepted / draft  (per the vLLM metrics design).
+    """
+    import urllib.request
+
+    base = url.rstrip("/")
+    endpoint = base if base.endswith(metrics_path) else base + metrics_path
+    try:
+        with urllib.request.urlopen(endpoint, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8", "replace")
+    except Exception as e:  # unreachable / no metrics endpoint
+        print(f"[telemetry] /metrics scrape failed: {e}")
+        return None
+
+    def _sum(metric: str) -> Optional[float]:
+        total = None
+        for line in text.splitlines():
+            if line.startswith("#") or not line.startswith(metric):
+                continue
+            try:
+                total = (total or 0.0) + float(line.rsplit(" ", 1)[1])
+            except (ValueError, IndexError):
+                continue
+        return total
+
+    accepted = _sum("vllm:spec_decode_num_accepted_tokens_total")
+    draft = _sum("vllm:spec_decode_num_draft_tokens_total")
+    num_drafts = _sum("vllm:spec_decode_num_drafts")
+    if accepted is None and draft is None:
+        return None  # speculation not enabled, or metric not exposed by this vLLM version
+    return {
+        "spec_decode_accepted_tokens": accepted,
+        "spec_decode_draft_tokens": draft,
+        "spec_decode_acceptance_rate": (accepted / draft) if (accepted is not None and draft) else None,
+        "spec_decode_num_drafts": num_drafts,
+        "spec_decode_mean_accept_len": (accepted / num_drafts) if (accepted is not None and num_drafts) else None,
+    }
 
 
 def available() -> bool:
