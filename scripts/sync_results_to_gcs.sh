@@ -2,10 +2,13 @@
 # Mirror a local results directory to the durable CAGE GCS bucket.
 #
 # Usage:
-#   scripts/sync_results_to_gcs.sh [LOCAL_DIR] [BUCKET]
-#     LOCAL_DIR  directory to sync (default: analysis)
-#     BUCKET     gs://bucket or bucket name (default: $CAGE_RESULTS_BUCKET, else
-#                gs://<project>-cage-results derived from the GCP project)
+#   scripts/sync_results_to_gcs.sh [LOCAL_DIR] [BUCKET] [REMOTE_SUBPATH]
+#     LOCAL_DIR       directory to sync (default: analysis)
+#     BUCKET          gs://bucket or bucket name (default: $CAGE_RESULTS_BUCKET, else
+#                     gs://<project>-cage-results derived from the GCP project)
+#     REMOTE_SUBPATH  path under the bucket to mirror into (default: LOCAL_DIR). Lets
+#                     collect_logs.sh sync logs/ to vm_logs/<hostname>/ so multiple VMs
+#                     do not collide on log filenames.
 #
 # The bucket is created by terraform/gcp (versioned, force_destroy=false) and the
 # VM's default service account is granted roles/storage.objectAdmin on it.
@@ -13,6 +16,7 @@ set -euo pipefail
 
 LOCAL_DIR="${1:-analysis}"
 BUCKET="${2:-${CAGE_RESULTS_BUCKET:-}}"
+REMOTE_SUBPATH="${3:-$LOCAL_DIR}"
 
 if [ -z "$BUCKET" ]; then
   # Derive the project id: env var, then GCE metadata server, then gcloud config.
@@ -36,5 +40,7 @@ if [ ! -d "$LOCAL_DIR" ]; then
   echo "[cage] nothing to sync yet (no $LOCAL_DIR/)"; exit 0
 fi
 
-echo "[cage] syncing $LOCAL_DIR -> $BUCKET/$LOCAL_DIR"
-gsutil -m rsync -r "$LOCAL_DIR" "$BUCKET/$LOCAL_DIR"
+echo "[cage] syncing $LOCAL_DIR -> $BUCKET/$REMOTE_SUBPATH"
+# -c: compare by checksum, not just size+mtime, so a file that was truncated mid-write on
+# a prior pass gets re-uploaded once complete (avoids a partial upload becoming permanent).
+gsutil -m rsync -c -r "$LOCAL_DIR" "$BUCKET/$REMOTE_SUBPATH"

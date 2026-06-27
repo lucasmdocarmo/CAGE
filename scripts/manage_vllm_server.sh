@@ -13,8 +13,14 @@
 
 set -euo pipefail
 
+# Anchor paths to the repo root so vLLM logs ALWAYS land in <repo>/logs/vllm/ where
+# collect_logs.sh looks, regardless of the caller's working directory.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+cd "$PROJECT_DIR"
+
 PORT=${VLLM_PORT:-8000}
-LOG_DIR="logs/vllm"
+LOG_DIR="$PROJECT_DIR/logs/vllm"
 
 # Colors
 RED='\033[0;31m'
@@ -25,7 +31,10 @@ NC='\033[0m' # No Color
 mkdir -p "$LOG_DIR"
 
 get_vllm_pid() {
-    pgrep -f "vllm serve" || true
+    # head -n1: pgrep -f can match multiple PIDs (a lingering serve plus workers).
+    # Callers store this in a scalar and run `ps -p "$pid"`, which errors on a
+    # multiline value (breaking the prefix-cache-mode check and forcing needless restarts).
+    pgrep -f "vllm serve" | head -n1 || true
 }
 
 get_loaded_model() {
@@ -100,11 +109,14 @@ start_server() {
     local timestamp=$(date +%Y%m%d_%H%M%S)
     local log_file="$LOG_DIR/vllm_${model//\//_}_${timestamp}.log"
     
+    # Build the server argv as an ARRAY so values with internal whitespace (notably the
+    # JSON speculative config) are passed as a single token and never word-split.
+    local -a vllm_args=( --port "$PORT" "$cache_flag" )
+
     # Optional server-side KV-cache compression for the compressed_cag baseline:
     #   VLLM_KV_CACHE_DTYPE=fp8 ./scripts/manage_vllm_server.sh restart <model>
-    local kv_dtype_flag=""
     if [ -n "${VLLM_KV_CACHE_DTYPE:-}" ]; then
-        kv_dtype_flag="--kv-cache-dtype ${VLLM_KV_CACHE_DTYPE}"
+        vllm_args+=( --kv-cache-dtype "${VLLM_KV_CACHE_DTYPE}" )
         echo "KV-cache compression enabled: --kv-cache-dtype ${VLLM_KV_CACHE_DTYPE}"
     fi
     # Set VLLM_SERVER_DEV_MODE=1 in the environment to enable POST /reset_prefix_cache
@@ -114,9 +126,9 @@ start_server() {
     # --speculative-model flag is deprecated). Pass a JSON via VLLM_SPECULATIVE_CONFIG, e.g.
     #   VLLM_SPECULATIVE_CONFIG='{"method":"ngram","num_speculative_tokens":5}'
     #   VLLM_SPECULATIVE_CONFIG='{"model":"Qwen/Qwen3-0.6B","num_speculative_tokens":5}'
-    local spec_flag=""
+    # The array form keeps the JSON intact even if it contains spaces.
     if [ -n "${VLLM_SPECULATIVE_CONFIG:-}" ]; then
-        spec_flag="--speculative-config ${VLLM_SPECULATIVE_CONFIG}"
+        vllm_args+=( --speculative-config "${VLLM_SPECULATIVE_CONFIG}" )
         echo "Speculative decoding enabled: --speculative-config ${VLLM_SPECULATIVE_CONFIG}"
     fi
 
@@ -125,30 +137,21 @@ start_server() {
     # Cap context length (override via VLLM_MAX_MODEL_LEN) and raise memory
     # utilization (override via VLLM_GPU_MEMORY_UTILIZATION). CAGE prompts are a few
     # thousand tokens, so 8192 is ample headroom.
-    local max_len_flag="--max-model-len ${VLLM_MAX_MODEL_LEN:-8192}"
-    local gpu_mem_flag="--gpu-memory-utilization ${VLLM_GPU_MEMORY_UTILIZATION:-0.92}"
+    vllm_args+=( --max-model-len "${VLLM_MAX_MODEL_LEN:-8192}" )
+    vllm_args+=( --gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION:-0.92}" )
     # Optional eager mode: skip torch.compile + CUDA-graph capture for much faster,
     # more reliable startup (esp. on smaller GPUs like the L4, where compile takes
     # 2-3 min and recompiles per prefix-cache config). Serving is uniform across all
     # baselines, so CAGE's *comparative* metrics stay valid. Set VLLM_ENFORCE_EAGER=1.
-    local eager_flag=""
     if [ "${VLLM_ENFORCE_EAGER:-0}" = "1" ]; then
-        eager_flag="--enforce-eager"
+        vllm_args+=( --enforce-eager )
         echo "Eager mode ON: --enforce-eager"
     fi
-    echo "Context/memory caps: $max_len_flag $gpu_mem_flag $eager_flag"
+    vllm_args+=( --enable-prompt-tokens-details )
+    echo "Server args: vllm serve $model ${vllm_args[*]}"
 
     echo "Starting vLLM server (logging to $log_file)..."
-    nohup vllm serve "$model" \
-        --port "$PORT" \
-        $cache_flag \
-        $kv_dtype_flag \
-        $spec_flag \
-        $max_len_flag \
-        $gpu_mem_flag \
-        $eager_flag \
-        --enable-prompt-tokens-details \
-        > "$log_file" 2>&1 &
+    nohup vllm serve "$model" "${vllm_args[@]}" > "$log_file" 2>&1 &
     
     local server_pid=$!
     echo "Server PID: $server_pid"

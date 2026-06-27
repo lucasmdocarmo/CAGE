@@ -194,3 +194,11 @@ cython_debug/
 terraform.tfvars
 crash.log
 *.tfplan
+
+# Phase-2 results pulled from GCS for local analysis (data, not code).
+phase2_archive/
+/analysis/
+/evidence/
+
+# Runtime logs collected on the VM (vLLM server, run stdout, forensics). Mirrored to GCS.
+/logs/

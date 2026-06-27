@@ -1251,7 +1251,7 @@ def run_experiment(
                         top_p=0.95,
                         request_id=example.id,
                         truncate_prompt_tokens=truncate_prompt_tokens,
-                        stop=["\n\n", "\nContext", "\nQuestion:"],
+                        stop=["\n"],
                     )
                     stream_flag = backend in {"vllm", "ollama"}
                     response = engine.generate(request, stream=stream_flag)
@@ -1278,7 +1278,7 @@ def run_experiment(
                         top_p=0.95,
                         request_id=example.id,
                         truncate_prompt_tokens=truncate_prompt_tokens,
-                        stop=["\n\n", "\nContext", "\nQuestion:"],
+                        stop=["\n"],
                     )
                     metas.append(meta)
                     requests.append(request)

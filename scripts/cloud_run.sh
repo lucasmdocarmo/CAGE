@@ -65,20 +65,30 @@ if ! curl -s localhost:6379 >/dev/null 2>&1 && ! (exec 3<>/dev/tcp/localhost/637
   fi
 fi
 
-# Background periodic sync.
+# Background periodic sync (results + logs, so an SSH drop or preemption loses neither).
 (
   while true; do
     bash "$SCRIPT_DIR/sync_results_to_gcs.sh" "$SYNC_DIR" >/dev/null 2>&1 || true
+    bash "$SCRIPT_DIR/collect_logs.sh" --light >/dev/null 2>&1 || true
     sleep "$SYNC_INTERVAL"
   done
 ) &
 SYNC_PID=$!
 
 cleanup() {
+  # Stop the periodic syncer and WAIT for its in-flight rsync to finish, so it does not
+  # race this final sync to the same destination.
   kill "$SYNC_PID" 2>/dev/null || true
-  echo "[cage] final sync..."
+  wait "$SYNC_PID" 2>/dev/null || true
+  echo "[cage] final sync (results + full logs + forensics)..."
   bash "$SCRIPT_DIR/sync_results_to_gcs.sh" "$SYNC_DIR" || true
+  bash "$SCRIPT_DIR/collect_logs.sh" || true
 }
+# EXIT covers normal/error exits; INT/TERM cover Ctrl-C and (best-effort) the SIGTERM a
+# GCP spot preemption raises. The on_signal handler just exits, which fires the EXIT trap
+# once (so cleanup runs exactly once and collects the full forensic snapshot before death).
+on_signal() { echo "[cage] signal received -> collecting logs before exit"; exit 1; }
+trap on_signal INT TERM
 trap cleanup EXIT
 
 # Run the validated suite (handles prefix-cache on/off + warmup; distributed gated above).

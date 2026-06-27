@@ -16,6 +16,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 OUTPUT_DIR="$PROJECT_DIR/analysis/compression/results"
+# Continuous log+results mirror to GCS + full collect on exit (this script has no sync loop).
+source "$SCRIPT_DIR/_log_guard.sh"
 
 MODEL="${1:-Qwen/Qwen3-4B}"
 DATASET="${DATASET:-squad_v2}"
