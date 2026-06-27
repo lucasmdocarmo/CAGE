@@ -21,8 +21,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import statistics
 import subprocess
 import sys
+import threading
+import time
 from typing import Optional
 
 
@@ -77,6 +80,91 @@ def capture_snapshot(
     # Dependency-free fallback: at minimum capture speculative-decode acceptance from /metrics.
     spec = scrape_spec_decode(url, metrics_path=metrics_path)
     return {"spec_decode": spec} if spec else None
+
+
+class VllmTelemetrySampler:
+    """Threaded sampler that polls vLLM telemetry DURING a workload, then aggregates.
+
+    A single ``capture_snapshot()`` taken after a run reads the server at idle, so the
+    instantaneous rates (gen/prompt tps, running, kv_usage) come back ~0. This samples
+    every ``interval`` seconds across the workload and summarizes peak + mean rates plus
+    the final cumulative counters, so ``vllm_telemetry.json`` reflects the ACTIVE run.
+
+    Usage:
+        s = VllmTelemetrySampler(url).start()
+        ... run workload ...
+        s.stop()
+        agg = s.aggregate()   # dict, or None if nothing was captured
+    """
+
+    # gauges/rates -> peak + mean; counters -> final (max, they are monotonic);
+    # structural/last-value fields -> taken from the final sample.
+    _GAUGES = ("gen_tps", "prompt_tps", "req_rate", "running", "waiting",
+               "kv_usage", "kv_used_tokens", "tokens_per_iter", "preempt_rate")
+    _COUNTERS = ("cached_tokens_total", "recomputed_tokens_total",
+                 "session_gen_tokens", "session_prompt_tokens", "session_requests")
+    _LAST = ("connected", "model_names", "engine_count", "kv_capacity_tokens",
+             "kv_dtype", "kv_ratio", "prefix_hit_lifetime", "prefix_hit_window",
+             "src_compute", "src_cache_hit", "src_external", "spec_decode")
+
+    def __init__(self, url: str, *, interval: float = 1.0, mock: bool = False,
+                 metrics_path: str = "/metrics"):
+        self.url = url
+        self.interval = max(0.25, float(interval))
+        self.mock = mock
+        self.metrics_path = metrics_path
+        self._samples: list = []
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> "VllmTelemetrySampler":
+        if self._thread is not None:
+            return self
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="vllm-telemetry-sampler", daemon=True)
+        self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            t0 = time.time()
+            try:
+                snap = capture_snapshot(self.url, metrics_path=self.metrics_path, mock=self.mock)
+                if snap:
+                    self._samples.append(snap)
+            except Exception:
+                pass
+            dt = self.interval - (time.time() - t0)
+            if dt > 0:
+                self._stop.wait(dt)
+
+    def stop(self) -> "VllmTelemetrySampler":
+        if self._thread is not None:
+            self._stop.set()
+            self._thread.join(timeout=self.interval + 5)
+            self._thread = None
+        return self
+
+    def aggregate(self) -> Optional[dict]:
+        samples = [s for s in self._samples if isinstance(s, dict)]
+        if not samples:
+            return None
+        agg: dict = {"sampled": True, "num_samples": len(samples)}
+        for k in self._GAUGES:
+            vals = [s.get(k) for s in samples if isinstance(s.get(k), (int, float))]
+            if vals:
+                agg[f"{k}_peak"] = round(max(vals), 4)
+                agg[f"{k}_avg"] = round(statistics.fmean(vals), 4)
+        for k in self._COUNTERS:
+            vals = [s.get(k) for s in samples if isinstance(s.get(k), (int, float))]
+            if vals:
+                agg[k] = max(vals)  # monotonic counters: final value
+        last = samples[-1]
+        for k in self._LAST:
+            if last.get(k) is not None:
+                agg[k] = last[k]
+        agg["final_snapshot"] = last
+        return agg
 
 
 def dashboard_text(

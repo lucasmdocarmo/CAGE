@@ -120,21 +120,44 @@ start_server() {
         echo "Speculative decoding enabled: --speculative-config ${VLLM_SPECULATIVE_CONFIG}"
     fi
 
+    # A 24GB L4 cannot hold Qwen3-8B's default max_model_len (40960) KV cache after
+    # the ~15GB of weights (vLLM aborts: "needed 5.62 GiB > available 3.12 GiB").
+    # Cap context length (override via VLLM_MAX_MODEL_LEN) and raise memory
+    # utilization (override via VLLM_GPU_MEMORY_UTILIZATION). CAGE prompts are a few
+    # thousand tokens, so 8192 is ample headroom.
+    local max_len_flag="--max-model-len ${VLLM_MAX_MODEL_LEN:-8192}"
+    local gpu_mem_flag="--gpu-memory-utilization ${VLLM_GPU_MEMORY_UTILIZATION:-0.92}"
+    # Optional eager mode: skip torch.compile + CUDA-graph capture for much faster,
+    # more reliable startup (esp. on smaller GPUs like the L4, where compile takes
+    # 2-3 min and recompiles per prefix-cache config). Serving is uniform across all
+    # baselines, so CAGE's *comparative* metrics stay valid. Set VLLM_ENFORCE_EAGER=1.
+    local eager_flag=""
+    if [ "${VLLM_ENFORCE_EAGER:-0}" = "1" ]; then
+        eager_flag="--enforce-eager"
+        echo "Eager mode ON: --enforce-eager"
+    fi
+    echo "Context/memory caps: $max_len_flag $gpu_mem_flag $eager_flag"
+
     echo "Starting vLLM server (logging to $log_file)..."
     nohup vllm serve "$model" \
         --port "$PORT" \
         $cache_flag \
         $kv_dtype_flag \
         $spec_flag \
+        $max_len_flag \
+        $gpu_mem_flag \
+        $eager_flag \
         --enable-prompt-tokens-details \
         > "$log_file" 2>&1 &
     
     local server_pid=$!
     echo "Server PID: $server_pid"
     
-    # Wait for server to be ready
+    # Wait for server to be ready. vLLM's torch.compile + CUDA-graph capture can take
+    # 2-3 min on smaller GPUs (e.g. L4), so 60s is too short and aborts the suite under
+    # set -e. Allow 5 min by default; override with VLLM_START_TIMEOUT.
     echo "Waiting for server to start..."
-    local max_wait=60
+    local max_wait=${VLLM_START_TIMEOUT:-300}
     local waited=0
     while [ $waited -lt $max_wait ]; do
         if curl -s http://localhost:${PORT}/health > /dev/null 2>&1; then
@@ -157,32 +180,29 @@ start_server() {
 
 stop_server() {
     echo -e "${YELLOW}Stopping vLLM server...${NC}"
-    
-    local pid=$(get_vllm_pid)
-    if [ -z "$pid" ]; then
-        echo -e "${YELLOW}No vLLM server running${NC}"
-        return 0
-    fi
-    
-    echo "Killing PID: $pid"
-    pkill -f "vllm serve" || true
-    
-    # Wait for shutdown
-    local max_wait=10
-    local waited=0
-    while [ $waited -lt $max_wait ]; do
-        if [ -z "$(get_vllm_pid)" ]; then
-            echo -e "${GREEN}✓ Server stopped${NC}"
-            return 0
-        fi
-        sleep 1
-        waited=$((waited + 1))
-    done
-    
-    # Force kill if still running
-    echo -e "${YELLOW}Force killing...${NC}"
-    pkill -9 -f "vllm serve" || true
-    echo -e "${GREEN}✓ Server killed${NC}"
+
+    # vLLM v1 spawns the engine in a SEPARATE process named "VLLM::EngineCore" that
+    # is NOT matched by "vllm serve". The old code only killed "vllm serve", so each
+    # restart ORPHANED the EngineCore worker, which kept ~all of the GPU memory and
+    # made the next start fail ("Engine core initialization failed"). Kill the whole
+    # vLLM process group AND anything still holding the GPU.
+    pkill -f "vllm serve"          2>/dev/null || true
+    pkill -f "VLLM::EngineCore"    2>/dev/null || true
+    pkill -f "vllm.v1.engine.core" 2>/dev/null || true
+    sleep 2
+    pkill -9 -f "vllm serve"          2>/dev/null || true
+    pkill -9 -f "VLLM::EngineCore"    2>/dev/null || true
+    pkill -9 -f "vllm.v1.engine.core" 2>/dev/null || true
+
+    # Belt-and-suspenders: kill any remaining process still holding the GPU.
+    local held
+    held=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null)
+    for p in $held; do kill -9 "$p" 2>/dev/null || true; done
+    sleep 2
+
+    local gpu_mem
+    gpu_mem=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null)
+    echo -e "${GREEN}✓ Server stopped${NC} (GPU mem used: ${gpu_mem:-n/a})"
 }
 
 status_server() {

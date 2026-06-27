@@ -38,6 +38,15 @@ if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null 2>&1; then
 fi
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader || true
 
+# 0b. System packages the DLVM's MINIMAL system python lacks. Without these the run
+#     fails in non-obvious ways: no python3.10-venv -> can't create the venv;
+#     no python3.10-dev/build-essential -> vLLM's Triton/torch.compile gcc step fails
+#     ("InductorError: cuda_utils.c"); no redis-server -> redis/hybrid baselines fail.
+echo "[cage] [0b] installing system packages (python3.10-venv/-dev, build-essential, redis)..."
+sudo apt-get update -qq || true
+sudo apt-get install -y python3.10-venv python3.10-dev build-essential redis-server || true
+sudo systemctl enable --now redis-server 2>/dev/null || redis-server --daemonize yes 2>/dev/null || true
+
 # 1. Isolated virtual environment.
 echo "[cage] [1/5] creating venv cage-env..."
 python3 -m venv cage-env
@@ -53,6 +62,13 @@ pip install "vllm==${VLLM_VERSION}"
 #    transformers, FAISS, the metric stack, etc.
 echo "[cage] [3/5] installing CAGE requirements..."
 pip install -r requirements.txt
+
+# 3b. vLLM 0.11.0 needs openai>=2 (it imports ResponsePrompt), but lettucedetect pins
+#     openai==1.66.3, so the requirements install leaves the old one and vLLM then
+#     CRASHES on startup. Force-upgrade (safe: CAGE talks to vLLM over raw HTTP, and
+#     lettucedetect's core ModernBERT grounding detector works fine with openai 2.x).
+echo "[cage] [3b] reconciling openai for vLLM 0.11.0..."
+pip install -U "openai>=2.0"
 
 # 4. Stage the Phase-2 datasets so they are not lazy-downloaded mid-run.
 echo "[cage] [4/5] staging datasets (squad_v2, natural_questions, musique)..."

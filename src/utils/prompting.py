@@ -14,6 +14,7 @@ from typing import Iterable, Sequence
 
 DEFAULT_SYSTEM_PREFIX = (
     "You are a helpful assistant. Answer the question using ONLY the provided context. "
+    "Give a SHORT, direct answer with no explanation or step-by-step reasoning. "
     "If the context is insufficient, say you don't know.\n\n"
 )
 

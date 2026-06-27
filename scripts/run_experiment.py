@@ -1247,10 +1247,11 @@ def run_experiment(
                     request = InferenceRequest(
                         prompt=prompt,
                         max_tokens=max_tokens,
-                        temperature=0.7,
+                        temperature=0.0,
                         top_p=0.95,
                         request_id=example.id,
                         truncate_prompt_tokens=truncate_prompt_tokens,
+                        stop=["\n\n", "\nContext", "\nQuestion:"],
                     )
                     stream_flag = backend in {"vllm", "ollama"}
                     response = engine.generate(request, stream=stream_flag)
@@ -1273,10 +1274,11 @@ def run_experiment(
                     request = InferenceRequest(
                         prompt=prompt,
                         max_tokens=max_tokens,
-                        temperature=0.7,
+                        temperature=0.0,
                         top_p=0.95,
                         request_id=example.id,
                         truncate_prompt_tokens=truncate_prompt_tokens,
+                        stop=["\n\n", "\nContext", "\nQuestion:"],
                     )
                     metas.append(meta)
                     requests.append(request)
@@ -1316,12 +1318,26 @@ def run_experiment(
     gpu_tracker = GPUMetricsTracker()
     gpu_monitoring = gpu_tracker.start_monitoring()
 
+    # cage-stats serving telemetry sampled DURING the workload (not one-shot at idle),
+    # so throughput / KV-usage / prefix-hit reflect the ACTIVE run.
+    vllm_sampler = None
+    if vllm_telemetry:
+        try:
+            from src.monitoring.vllm_telemetry import available as _tel_avail, VllmTelemetrySampler
+            if _tel_avail():
+                _mock = os.getenv("CAGE_TELEMETRY_MOCK", "").strip().lower() in {"1", "true", "yes"}
+                vllm_sampler = VllmTelemetrySampler(api_base, interval=1.0, mock=_mock).start()
+        except Exception as e:
+            print(f"[telemetry] sampler not started: {e}")
+
     performance_evaluator.start()
     execute_work_units(work_units, collect_results=True, stage_name="Measured")
     performance_evaluator.stop()
 
     if gpu_monitoring:
         gpu_tracker.stop_monitoring()
+    if vllm_sampler is not None:
+        vllm_sampler.stop()
 
     print("-" * 70)
     print("Experiment complete!")
@@ -1338,10 +1354,15 @@ def run_experiment(
     vllm_telemetry_snapshot = None
     if vllm_telemetry:
         try:
-            from src.monitoring.vllm_telemetry import available, capture
+            from src.monitoring.vllm_telemetry import available, capture, dashboard_text
             if available():
                 _mock = os.getenv("CAGE_TELEMETRY_MOCK", "").strip().lower() in {"1", "true", "yes"}
-                vllm_telemetry_snapshot, _dash = capture(api_base, mock=_mock)
+                # Prefer the workload-sampled aggregate; fall back to a one-shot snapshot.
+                if vllm_sampler is not None:
+                    vllm_telemetry_snapshot = vllm_sampler.aggregate()
+                if vllm_telemetry_snapshot is None:
+                    vllm_telemetry_snapshot, _ = capture(api_base, mock=_mock)
+                _dash = dashboard_text(api_base, mock=_mock)
                 if _dash:
                     print("\n" + "=" * 70)
                     print("vLLM TELEMETRY (cage-stats)")
