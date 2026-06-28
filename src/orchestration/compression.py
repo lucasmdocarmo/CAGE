@@ -61,6 +61,11 @@ class ContextCompressor:
         self._disabled_reason: Optional[str] = None
         if os.getenv("CAGE_DISABLE_COMPRESSION", "").strip().lower() in {"1", "true", "yes"}:
             self._disabled_reason = "CAGE_DISABLE_COMPRESSION set"
+        # Strict mode: refuse to silently no-op. In Phase 2 a missing llmlingua package
+        # made compressed_rag fall through to ratio 1.0 (compression_applied=False) for
+        # all 100 rows, silently invalidating the baseline. Set CAGE_REQUIRE_COMPRESSION=1
+        # so a missing/failed compressor RAISES instead.
+        self._strict = os.getenv("CAGE_REQUIRE_COMPRESSION", "").strip().lower() in {"1", "true", "yes"}
 
     @property
     def compressor(self):
@@ -75,10 +80,13 @@ class ContextCompressor:
                 )
             except Exception as e:  # missing package or model
                 self._disabled_reason = str(e)
-                print(
-                    f"Warning: LLMLingua unavailable ({e}); compressed_rag falls back to "
-                    f"NO compression (ratio 1.0). `pip install llmlingua` to enable."
+                msg = (
+                    f"LLMLingua unavailable ({e}); compressed_rag would fall back to NO "
+                    f"compression (ratio 1.0). `pip install llmlingua` to enable."
                 )
+                if self._strict:
+                    raise RuntimeError(f"CAGE_REQUIRE_COMPRESSION=1 but {msg}") from e
+                print(f"Warning: {msg}")
         return self._compressor
 
     @staticmethod
@@ -102,6 +110,11 @@ class ContextCompressor:
 
         comp = self.compressor
         if comp is None:
+            if self._strict:
+                raise RuntimeError(
+                    f"CAGE_REQUIRE_COMPRESSION=1 but compressor unavailable: "
+                    f"{self._disabled_reason or 'unknown'}"
+                )
             return list(contexts), CompressionStats(
                 self.method, target_ratio, original_tokens, original_tokens,
                 applied=False, note=self._disabled_reason or "compressor unavailable",
@@ -122,6 +135,8 @@ class ContextCompressor:
                 self.method, target_ratio, original_tokens, compressed_tokens, applied=True,
             )
         except Exception as e:
+            if self._strict:
+                raise RuntimeError(f"CAGE_REQUIRE_COMPRESSION=1 but compression failed: {e}") from e
             print(f"Warning: compression failed ({e}); using original context.")
             return list(contexts), CompressionStats(
                 self.method, target_ratio, original_tokens, original_tokens,

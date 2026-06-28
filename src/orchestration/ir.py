@@ -322,13 +322,37 @@ def ensure_ir_index(
     return idx
 
 
+def _normalize_passage(text: str) -> str:
+    """Lowercase + whitespace-collapse for robust passage-text comparison."""
+    return " ".join(text.lower().split())
+
+
 def retrieval_hit_rate(
     *,
     gold_doc_ids: Sequence[str],
     retrieved_doc_ids: Sequence[str],
+    gold_texts: Optional[Sequence[str]] = None,
+    retrieved_texts: Optional[Sequence[str]] = None,
 ) -> float:
-    """Compute a simple hit indicator (1.0 if any gold doc is retrieved, else 0.0)."""
+    """Hit indicator: 1.0 if a gold passage was retrieved, else 0.0.
+
+    Primary check is an exact doc-id match. A normalized-TEXT fallback runs when the ids
+    do not match but texts are supplied, because the corpus passage and the gold passage
+    can hash to different stable_text_id values if they differ only in whitespace or
+    encoding. In Phase 2 this made the metric a false 0.0 for every row even when top-1
+    similarity was ~0.99; the text fallback fixes that. Returns 0.0 if gold is unknown.
+    """
     gold = set(gold_doc_ids)
-    if not gold:
-        return 0.0
-    return 1.0 if any(d in gold for d in retrieved_doc_ids) else 0.0
+    if gold and any(d in gold for d in retrieved_doc_ids):
+        return 1.0
+    if gold_texts and retrieved_texts:
+        gold_norm = {_normalize_passage(t) for t in gold_texts if t and t.strip()}
+        if gold_norm:
+            for r in retrieved_texts:
+                rn = _normalize_passage(r)
+                if not rn:
+                    continue
+                if rn in gold_norm or any(g in rn or rn in g for g in gold_norm):
+                    return 1.0
+            return 0.0
+    return 0.0

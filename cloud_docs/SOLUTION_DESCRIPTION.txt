@@ -1,0 +1,140 @@
+### CAGE-DOC-STATUS ###
+*** STATUS: SUPERSEDED / HISTORICAL (2026-06-09). Kept for history only. ***
+*** Authoritative docs: KNOWLEDGE_BASE.md, RUNBOOK.md, VALIDATION_AND_SOTA_REVIEW.md. ***
+*** See README.md for the doc index. ***
+
+================================================================================
+CAGE FRAMEWORK — SOLUTION DESCRIPTION
+================================================================================
+Last Updated: 2026-04-08
+
+================================================================================
+1. WHAT IS CAGE?
+================================================================================
+
+CAGE (Cache-Augmented Generation Evaluation) is a benchmarking framework for
+evaluating LLM serving systems that use KV cache management strategies. It
+compares Cache-Augmented Generation (CAG) against Retrieval-Augmented Generation
+(RAG) by measuring both serving performance and semantic output quality.
+
+Author: Lucas Mariano do Carmo
+Institution: Pontifícia Universidade Católica de Minas Gerais (PUC Minas)
+Contact: lucas.mariano.carmo@gmail.com
+
+================================================================================
+2. ARCHITECTURE
+================================================================================
+
+CAGE is the orchestration/evaluation layer. vLLM is the inference engine.
+Communication is exclusively via HTTP (OpenAI-compatible /v1/completions API).
+
+Data flow:
+  Workload Generator → CAGE Orchestrator → [vLLM Server(s)] → Quality Evaluator
+       (CLI)          (baselines.py)       (HTTP API)         (quality.py)
+
+Key components:
+- src/data/loader.py         : Dataset loading (SQuADv2, HotpotQA, TriviaQA, etc.)
+- src/inference/vllm_adapter.py : HTTP client with streaming TTFT measurement
+- src/evaluation/quality.py  : Faithfulness (NLI), relevance, BERTScore, ROUGE-L
+- src/evaluation/performance.py : Latency, throughput, cache metrics aggregation
+- src/orchestration/baselines.py : 7 baseline type definitions
+- src/orchestration/router.py : FastAPI prefix-hash router for distributed mode
+- src/orchestration/ir.py    : FAISS dense retrieval + reranking for RAG baselines
+- src/orchestration/redis_cache.py : Redis retrieval-artifact cache
+- scripts/run_experiment.py  : Main experiment runner (CLI entry point)
+
+================================================================================
+3. THE 7 BASELINES
+================================================================================
+
+1. NO_CACHE
+   Gold passage, no prefix caching. Full prefill recomputation every request.
+   vLLM at :8000, --enable-prefix-caching OFF.
+
+2. PREFIX_CACHE
+   Gold passage, vLLM prefix caching ON. Shared prompt prefixes reuse KV blocks.
+   vLLM at :8000, --enable-prefix-caching ON.
+
+3. RAG
+   FAISS dense retrieval + BGE reranking. Gold passage NOT used.
+   No prefix caching. Retrieval overhead (~12s on CPU) dominates TTFT.
+
+4. REDIS_RETRIEVAL_CACHE_COLD
+   Same as RAG but retrieval results cached in Redis. Cold start (Redis flushed).
+   Effectively identical to RAG in Phase 1 (0% cache rate).
+
+5. HYBRID_RETRIEVAL_CACHE_COLD
+   Retrieval + prefix caching + Redis (cold). Trial 1 suffers cold-start.
+   Trials 2-3 benefit from warmed vLLM prefix cache. High variance.
+
+6. HYBRID_RETRIEVAL_CACHE_WARM
+   Same as Hybrid Cold but with 50 warmup queries excluded from metrics.
+   Both Redis (100% rate) and vLLM prefix cache are warm. Best retrieval baseline.
+
+7. DISTRIBUTED_ROUTER_REPLICATED
+   3 vLLM replicas (8001/8002/8003) + FastAPI router (9000).
+   Prefix-hash routing. Gold passage. 0 KV transfers (routing only in Phase 1).
+
+================================================================================
+4. METRICS
+================================================================================
+
+Performance:
+- QPS (queries/sec), TPS (tokens/sec)
+- TTFT (time to first token) — avg, p50, p95, p99
+- TPOT (time per output token) — avg, p50, p95, p99
+- End-to-end latency — avg, p50, p95, p99
+
+Quality:
+- Faithfulness: NLI-based entailment (0-1)
+- Relevance: Embedding cosine similarity (0-1)
+- BERTScore: Token-level soft F1 (0-1)
+- ROUGE-L: Longest common subsequence F1 (0-1)
+
+Cache:
+- Prompt-cached ratio (from vLLM usage telemetry)
+- Local/remote hit ratios
+- Retrieval hit rate and cache rate
+
+================================================================================
+5. PHASE 1 RESULTS (VALIDATED)
+================================================================================
+
+Setup: Qwen3-4B, SQuADv2, CPU (Apple M4 Pro), 50 queries × 3 trials
+
+vs No Cache:
+- Prefix Cache: -37.4% latency, -65.7% TTFT, +58.3% QPS, equal faithfulness
+- RAG:          +70.4% latency, +171.4% TTFT, -11.6% faithfulness
+- Hybrid Warm:  -17.1% latency, -59.7% TTFT
+- Distributed:  -23.7% TTFT, +15.5% latency, 7.6x p95/p50 TTFT spread
+
+Prompt-cached ratio: Prefix Cache 68.4%, Hybrid Cold 75.6%, Hybrid Warm 89.2%
+BERTScore: 0.324-0.328 (non-discriminative across all baselines)
+
+Data: analysis/phase1/results/*/aggregated_metrics.json
+
+================================================================================
+6. TECH STACK
+================================================================================
+
+- Inference: vLLM (OpenAI-compatible HTTP API)
+- Model: Qwen/Qwen3-4B (CPU); configs for 8B, 14B, Qwen2.5-7B-Instruct
+- Retrieval: FAISS (IndexFlatIP) + intfloat/e5-large-v2 + BAAI/bge-reranker-large
+- Caching: Redis (retrieval artifacts) + vLLM built-in prefix cache (KV blocks)
+- Routing: FastAPI prefix-hash router
+- Quality: RAGAS-style NLI faithfulness, Sentence-BERT relevance, BERTScore
+- Infrastructure: Docker Compose, Kubernetes, Terraform (GCP)
+- Python 3.12, torch, transformers, datasets, sentence-transformers, faiss-cpu
+
+================================================================================
+7. NEXT STEPS
+================================================================================
+
+Phase 2 (pending): GPU validation, model scaling, statistical rigor, datasets
+Phase 3 (future): Real KV transfer, disaggregated prefill, speculative decoding
+
+For full details, see PROJECT_OVERVIEW.md at the repository root.
+
+================================================================================
+END OF DOCUMENT
+================================================================================

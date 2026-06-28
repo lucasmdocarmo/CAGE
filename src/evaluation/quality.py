@@ -553,6 +553,14 @@ class QualityEvaluator:
         """
         results: Dict[str, Optional[float]] = {"bertscore_f1": None, "rouge_l_f1": None}
         
+        # Empty/blank reference (e.g. SQuAD v2 unanswerable items, ~52% of the set):
+        # completeness is UNDEFINED against a non-existent reference. Return None so these
+        # rows are EXCLUDED from the aggregate (mean_or_none skips None) rather than
+        # averaging in BERTScore's large-negative baseline-rescaled value (a misleading
+        # sentinel near -4.4) that dragged the Phase-2 aggregate to an implausible ~-2.0.
+        if not reference_answer or not reference_answer.strip():
+            return results
+
         # Empty generation: a missing answer scores 0 on overlap metrics (this is a
         # genuine 0, not a model-unavailable sentinel).
         if not generated_text or not generated_text.strip():

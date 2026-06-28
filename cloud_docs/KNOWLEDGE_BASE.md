@@ -34,12 +34,12 @@ There is **no standard evaluation framework** that compares CAG, RAG, hybrid, an
 ### 1.3 Academic thesis (claim to prove)
 > A distributed **contextual prefix cache** is strictly superior to RAG for static / semi-static knowledge bases — achieving significantly lower **Time-To-First-Token (TTFT)** while maintaining or improving **NLI-Faithfulness** — and CAGE is the first framework that can demonstrate this rigorously.
 
-### 1.4 Status (June 2026)
+### 1.4 Status (updated 2026-06-28)
 | Phase | State | Hardware | Outcome |
 |---|---|---|---|
-| **Phase 1** — Local CPU validation | ✅ COMPLETE | Apple M4 Pro, vLLM CPU | Thesis structurally validated. 7 baselines benchmarked. |
-| **Phase 2** — GPU validation & scaling | ⏳ NEXT | GCP L4 (g2-standard-8) | Reproduce Phase 1 on Qwen3-8B with 10 trials × 100 queries. |
-| **Phase 3** — Distributed HPC | 🔮 FUTURE | GCP A100 (a2-highgpu-1g) | Real cross-node KV transfer, disagg prefill, speculative decoding. |
+| **Phase 1** — Local CPU validation | ✅ COMPLETE | Apple M4 Pro, vLLM CPU | Thesis structurally validated. 7 baselines benchmarked (Qwen3-4B, 50q × 3 trials). CPU latencies non-generalizable. |
+| **Phase 2** — Single-GPU validation | ✅ COMPLETE (2026-06-27) | GCP **single L4** (g2-standard-8) | Qwen3-8B, vLLM 0.11.0, SQuAD v2, **100q × 1 trial**, **14 baseline result sets across 8 of 9 families** (6 core + compression 2×2 + speculative 2×2; `distributed` deferred to Phase 3). Cost ~$3.1. **ALL infra torn down to $0 (VM + GCS bucket deleted); data local at `phase2_archive/`** (`PHASE2_ANALYSIS.md`, `DATA_INVENTORY.md`). Findings: prefix-cache TTFT −3.3% lossless; FP8 KV (compressed_cag) lossless on grounding; RAG faithfulness −24.7% / TTFT +87%; EAGLE-3 speculative TPOT −41% / latency −32.5% lossless. PRIMARY quality metric = **LettuceDetect grounding**. Caveats: `compressed_rag` invalid (LLMLingua never fired, fixed in code, rerun in P3); `hybrid_warm` unpaired stats; `retrieval_hit` + `completeness_bertscore` metric bugs fixed post-run. |
+| **Phase 3** — Distributed HPC | 🔮 NEXT | GCP A100 (a2-highgpu-1g) + GVNIC | Real cross-node KV transfer (LMCache/NIXL; currently SIMULATED/analytic), disagg prefill, broader speculative (MTP). Rerun `compressed_rag`; add multi-trial CIs; RAG-favorable dataset. |
 
 ---
 

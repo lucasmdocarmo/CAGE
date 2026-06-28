@@ -1035,6 +1035,11 @@ def run_experiment(
             retrieval_hit = retrieval_hit_rate(
                 gold_doc_ids=gold_doc_ids,
                 retrieved_doc_ids=retrieved_doc_ids,
+                # Text fallback: doc-id hashes can diverge from the corpus even when the
+                # gold passage IS retrieved (whitespace/encoding), which zeroed the metric
+                # in Phase 2. used_contexts here is the retrieved passage text.
+                gold_texts=list(example.context or []),
+                retrieved_texts=used_contexts,
             )
             if baseline_config.baseline_type.value == "redis":
                 baseline_mode = (

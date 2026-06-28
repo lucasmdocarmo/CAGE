@@ -12,6 +12,11 @@ bert-score>=0.3.13
 rouge-score>=0.1.2
 ragas>=0.1.0
 evaluate>=0.4.1
+# Context/prompt compression for the compressed_rag baseline (LLMLingua-2, client-side).
+# REQUIRED for that baseline: without it ContextCompressor silently no-ops (ratio 1.0),
+# which invalidated compressed_rag in Phase 2. Run with CAGE_REQUIRE_COMPRESSION=1 to
+# make a missing/failed compressor raise instead of pass through.
+llmlingua>=0.2.2
 # Primary grounding/hallucination detector (token/span-level, ModernBERT/RAGTruth).
 # Pulls a recent transformers; if it conflicts with the pinned stack, install in a
 # dedicated env or set CAGE_DISABLE_LETTUCEDETECT=1 to fall back to NLI faithfulness.

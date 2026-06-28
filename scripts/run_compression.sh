@@ -54,12 +54,22 @@ if [ "$SKIP_GATE" != "1" ]; then
     fi
 fi
 
+# Pre-flight: compressed_rag needs LLMLingua-2 or it silently no-ops (Phase-2 bug:
+# compression_applied=False, ratio=1.0 for all rows -> the arm measured plain RAG).
+if ! python3 -c "import llmlingua" 2>/dev/null; then
+    echo "GATE FAILED -> 'llmlingua' not importable; compressed_rag would NO-OP (ratio 1.0)."
+    echo "Run: pip install llmlingua   (or SKIP_GATE=1 to override and accept an invalid arm)."
+    [ "$SKIP_GATE" = "1" ] || exit 1
+fi
+
 # --- Full row + compressed_rag (full-precision server, prefix caching ON) ---
 echo ">>> Server: full precision, prefix caching ON"
 ./scripts/manage_vllm_server.sh restart "$MODEL"; sleep 10
 run_baseline prefix_cache   cag_full
 run_baseline rag            rag_full
+export CAGE_REQUIRE_COMPRESSION=1   # raise (not silent no-op) if LLMLingua can't compress
 run_baseline compressed_rag compressed_rag      # LLMLingua-2, client-side text compression
+unset CAGE_REQUIRE_COMPRESSION
 
 # --- compressed_cag (FP8 KV — the same launch-lever speculative uses) ---
 echo ">>> Server: FP8 KV cache ON (compressed_cag)"
