@@ -120,7 +120,8 @@ nvidia-smi          # should print a GPU table. If "command not found", wait 1 m
 ```bash
 sudo apt-get update -y && sudo apt-get install -y git python3-venv
 git clone https://github.com/lucasmdocarmo/CAGE.git cage && cd cage
-python3 -m venv .venv && source .venv/bin/activate
+# cage-env (NOT .venv): the run scripts hard-source cage-env on the VM under set -e.
+python3 -m venv cage-env && source cage-env/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt        # pulls cage-stats too (telemetry)
 pip install vllm
@@ -151,7 +152,7 @@ tail -f run.log
 ### 2.6 Validate — check + statistics
 When `run.log` prints "Phase 1 Complete" (or all 6 baseline folders exist), in the SSH terminal:
 ```bash
-cd ~/cage && source .venv/bin/activate
+cd ~/cage && source cage-env/bin/activate
 python3 scripts/verify_results.py                       # integrity: no truncated/errored trials
 python3 scripts/statistical_tests.py --results-dir analysis/phase1/results --reference no_cache
 ```

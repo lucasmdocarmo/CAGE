@@ -92,7 +92,12 @@ start_server() {
             has_prefix_cache=false
         fi
 
-        if [ "$loaded_model" = "$model" ] && [ "$has_prefix_cache" = "$want_prefix_cache" ]; then
+        # Reuse the running server ONLY when no serving lever is requested. The running
+        # check cannot read back the live --speculative-config / --kv-cache-dtype, so if
+        # either is set we force a restart rather than risk reusing a server with different
+        # levers and mislabeling the arm's serving data.
+        if [ "$loaded_model" = "$model" ] && [ "$has_prefix_cache" = "$want_prefix_cache" ] \
+           && [ -z "${VLLM_SPECULATIVE_CONFIG:-}" ] && [ -z "${VLLM_KV_CACHE_DTYPE:-}" ]; then
             echo -e "${GREEN}✓ Server already running with correct model and cache mode ($model)${NC}"
             return 0
         else
@@ -197,10 +202,24 @@ stop_server() {
     pkill -9 -f "VLLM::EngineCore"    2>/dev/null || true
     pkill -9 -f "vllm.v1.engine.core" 2>/dev/null || true
 
-    # Belt-and-suspenders: kill any remaining process still holding the GPU.
+    # Belt-and-suspenders: kill any remaining vLLM process still holding the GPU, but do
+    # NOT kill co-resident GPU users (LettuceDetect / BERTScore metric models or a
+    # cage-stats GPU exporter sharing the L4) -- match the vLLM cmdline before kill -9.
+    # Set CAGE_VLLM_KILL_ALL_GPU=1 to fall back to the old unconditional kill.
     local held
     held=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null)
-    for p in $held; do kill -9 "$p" 2>/dev/null || true; done
+    for p in $held; do
+        if [ "${CAGE_VLLM_KILL_ALL_GPU:-0}" = "1" ]; then
+            kill -9 "$p" 2>/dev/null || true
+            continue
+        fi
+        local cmd
+        cmd=$(ps -p "$p" -o args= 2>/dev/null || true)
+        case "$cmd" in
+            *vllm*|*VLLM*|*EngineCore*) kill -9 "$p" 2>/dev/null || true ;;
+            *) [ -n "$cmd" ] && echo "  (left non-vLLM GPU process $p alive: ${cmd:0:60})" ;;
+        esac
+    done
     sleep 2
 
     local gpu_mem

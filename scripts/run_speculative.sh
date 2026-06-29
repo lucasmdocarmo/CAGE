@@ -8,6 +8,11 @@
 set -uo pipefail
 cd "$HOME/CAGE"
 source cage-env/bin/activate
+# Continuous log+results mirror to GCS + full collect on exit (this script + run_phase5.sh
+# have no built-in sync loop). NOTE: run_speculative_matrix.sh is the comprehensive
+# speculative path (both models, ngram + native draft, with per-cell sentinels); this
+# script is the ngram-only quick path.
+source scripts/_log_guard.sh
 
 echo "[spec] waiting for any in-flight run to finish..."
 while pgrep -f run_compression.sh >/dev/null 2>&1; do sleep 20; done

@@ -19,7 +19,10 @@ VLLM_PORT=${VLLM_PORT:-8000}
 CLUSTER_BASE_PORT=${CLUSTER_BASE_PORT:-8001}
 ROUTER_REPLICAS_COUNT=${ROUTER_REPLICAS_COUNT:-3}
 ROUTER_PORT=${ROUTER_PORT:-9000}
-ENABLE_DISTRIBUTED=${ENABLE_DISTRIBUTED:-1}
+# Default OFF on a single L4: the distributed (3-replica router) family is a Phase-3
+# baseline that OOMs a 24GB L4 (~3x VRAM). cloud_run.sh sets this explicitly; a DIRECT
+# `bash scripts/run_phase1.sh ...` must not silently launch it. Opt in with ENABLE_DISTRIBUTED=1.
+ENABLE_DISTRIBUTED=${ENABLE_DISTRIBUTED:-0}
 # vLLM telemetry via cage-stats: VLLM_TELEMETRY=1 captures a /metrics snapshot
 # (spec-decode acceptance, KV-compression, token-source, GPU) into each baseline's
 # results + prints a dashboard. Auto-enabled by cloud_run.sh.
@@ -33,10 +36,17 @@ echo "=============================================="
 cd "$PROJECT_DIR"
 mkdir -p "$PROJECT_DIR/logs" "$OUTPUT_DIR"
 
-if [ -d ".venv" ]; then
-    echo "Activating virtual environment..."
-    source .venv/bin/activate
-fi
+# Activate the project venv regardless of its name (.venv locally, cage-env on the GPU VM).
+# Without this a fresh shell / automation falls back to system python -> ImportError on
+# vllm/llmlingua/cage-stats for every baseline.
+for _v in .venv cage-env ../cage-env; do
+    if [ -f "$_v/bin/activate" ]; then
+        echo "Activating virtual environment: $_v"
+        # shellcheck disable=SC1090
+        source "$_v/bin/activate"
+        break
+    fi
+done
 
 echo "Cleaning previous Phase 1 result artifacts to prevent contamination..."
 rm -rf "$OUTPUT_DIR"/* || true

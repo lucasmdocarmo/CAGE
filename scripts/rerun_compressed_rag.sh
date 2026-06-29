@@ -3,6 +3,11 @@
 # confound (it had used gold context via --context-source auto, making it
 # "CAG+compression" instead of "RAG+compression"). This makes the 2x2 RAG row valid.
 #
+# NOTE: run_compression.sh now passes --context-source retrieved for compressed_rag
+# directly, so a fresh 2x2 no longer needs this rerun. Keep it only to repair an OLD
+# confounded compressed_rag tree in place. It MUST purge the stale trial_*/ dirs first
+# (see below) or statistical_tests.py keeps reading them with precedence.
+#
 # Self-sequencing: waits for any in-flight compression run to finish first (avoids a
 # vLLM port / GPU conflict), restarts vLLM full-precision (no FP8), then reruns just
 # compressed_rag with --context-source retrieved and syncs to GCS.
@@ -27,6 +32,14 @@ if ! python3 -c "import llmlingua" 2>/dev/null; then
     echo "Run: pip install llmlingua   then re-run this script."
     exit 1
 fi
+
+# Purge stale confounded trial_*/ dirs FIRST: statistical_tests.load_baseline_per_example
+# reads trial_*/results.csv with PRECEDENCE and only falls back to the top-level
+# results.csv when NO trial_*/ exist. The old run_compression.sh wrote trial_1/2/3
+# (gold/confounded); without this purge the corrected single-trial top-level CSV below is
+# shadowed and the rerun silently does nothing.
+echo "[rerun] purging stale trial_*/ dirs so the corrected results.csv is not shadowed..."
+rm -rf "$HOME/CAGE/analysis/compression/results/compressed_rag/trial_"* 2>/dev/null || true
 
 echo "[rerun] running compressed_rag with --context-source retrieved (strict compression)..."
 CAGE_REQUIRE_COMPRESSION=1 python3 scripts/run_experiment.py \

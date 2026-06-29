@@ -219,7 +219,10 @@ Requires scipy. Phase-2 output: `phase2_archive/analysis/all_results/phase2_stat
   to delete the VM if it is missing** (fail-closed; `--force` overrides). This exists because Phase-2's
   first teardown lost VM-only logs.
 - **`scripts/log_sync_daemon.sh`** / **`scripts/_log_guard.sh`** continuously mirror logs+results during a
-  run; **`scripts/gcp_shutdown_hook.sh`** collects on spot-preemption / ACPI shutdown.
+  run; **`scripts/gcp_shutdown_hook.sh`** collects on spot-preemption / ACPI shutdown, but ONLY if it is
+  explicitly wired at VM creation (`gcloud ... --metadata-from-file shutdown-script=scripts/gcp_shutdown_hook.sh`);
+  no setup script installs it automatically. On an **on-demand** L4 torn down via `teardown_vm.sh` it is not
+  needed (the EXIT-trap collect + fail-closed teardown cover it); wire it only for **spot** instances.
 - **`scripts/cloud_run.sh`** orchestrates the core suite and syncs results + logs every interval and on
   exit (EXIT + SIGTERM traps).
 

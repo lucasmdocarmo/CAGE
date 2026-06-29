@@ -16,6 +16,15 @@ for d in analysis/phase1/results/*/ analysis/compression/results/*/ analysis/spe
 done
 echo "consolidated baselines:"; ls "$ALL" | tr '\n' ' '; echo
 
+# The Wilcoxon reference is no_cache, produced ONLY by the core suite (cloud_run.sh ->
+# run_phase1.sh). If it is absent, fail LOUDLY here instead of letting statistical_tests.py
+# error into the swallowed `|| echo STATS_FAILED` (which leaves no output but looks done).
+if [ ! -d "$ALL/no_cache" ]; then
+  echo "ERROR: reference baseline 'no_cache' is missing from $ALL." >&2
+  echo "       Run the core suite (cloud_run.sh -> run_phase1.sh) before phase-2 stats." >&2
+  exit 1
+fi
+
 python3 scripts/statistical_tests.py --results-dir "$ALL" --reference no_cache \
     --metrics grounding_score faithfulness context_relevance ttft_ms latency_ms f1_score \
     --output "$ALL/phase2_stats.json" --latex-out "$ALL/phase2_stats.tex" 2>&1 | tail -50 \

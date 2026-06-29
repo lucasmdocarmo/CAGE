@@ -86,10 +86,14 @@ try:
 except Exception as e:
     print(f"[cage]   WARNING: pynvml not working -> GPU metrics will be null: {e}")
 try:
-    import cage_stats  # noqa: F401
-    print("[cage]   cage_stats import OK -> serving telemetry available")
+    # Import the API path CAGE actually uses (pulls in httpx + prometheus_client), NOT just
+    # the bare package, so a missing telemetry dep is caught HERE at setup rather than
+    # silently zeroing speculative-acceptance / KV telemetry during the real run.
+    from cage_stats.api import snapshot_dict  # noqa: F401
+    print("[cage]   cage_stats.api import OK -> serving telemetry available")
 except Exception as e:
-    print(f"[cage]   NOTE: cage_stats not importable ({e}); set CAGE_STATS_HOME or telemetry is skipped")
+    print(f"[cage]   NOTE: cage_stats.api not importable ({e}); set CAGE_STATS_HOME / "
+          "pip install httpx prometheus-client, or telemetry is skipped")
 PY
 
 echo

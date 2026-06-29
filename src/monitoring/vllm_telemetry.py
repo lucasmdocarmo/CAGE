@@ -103,9 +103,16 @@ class VllmTelemetrySampler:
                "kv_usage", "kv_used_tokens", "tokens_per_iter", "preempt_rate")
     _COUNTERS = ("cached_tokens_total", "recomputed_tokens_total",
                  "session_gen_tokens", "session_prompt_tokens", "session_requests")
+    # Speculative-decode acceptance reaches us under TWO schemas depending on the path:
+    # the cage-stats in-process/CLI path emits FLAT keys (spec_active/spec_acceptance/
+    # spec_accepted_per_draft); the dependency-free stdlib fallback emits a nested
+    # "spec_decode" dict. Whitelist BOTH so acceptance is promoted to the top level of
+    # vllm_telemetry.json (Phase-2 bug: only "spec_decode" was listed, so the flat
+    # cage-stats acceptance was silently dropped -> "None for every speculative cell").
     _LAST = ("connected", "model_names", "engine_count", "kv_capacity_tokens",
              "kv_dtype", "kv_ratio", "prefix_hit_lifetime", "prefix_hit_window",
-             "src_compute", "src_cache_hit", "src_external", "spec_decode")
+             "src_compute", "src_cache_hit", "src_external",
+             "spec_decode", "spec_active", "spec_acceptance", "spec_accepted_per_draft")
 
     def __init__(self, url: str, *, interval: float = 1.0, mock: bool = False,
                  metrics_path: str = "/metrics"):
@@ -163,6 +170,15 @@ class VllmTelemetrySampler:
         for k in self._LAST:
             if last.get(k) is not None:
                 agg[k] = last[k]
+        # Normalize ONE canonical top-level acceptance rate regardless of which path
+        # produced the samples, so downstream readers/plots have a single stable field.
+        # Counters are monotonic, so the LAST sample carries the cumulative acceptance.
+        if agg.get("spec_acceptance") is not None:
+            agg["spec_decode_acceptance_rate"] = agg["spec_acceptance"]
+        elif isinstance(agg.get("spec_decode"), dict):
+            rate = agg["spec_decode"].get("spec_decode_acceptance_rate")
+            if rate is not None:
+                agg["spec_decode_acceptance_rate"] = rate
         agg["final_snapshot"] = last
         return agg
 

@@ -171,7 +171,9 @@ class VLLMAdapter(InferenceEngine):
                         if isinstance(choice, dict)
                         else finish_reason
                     )
-        except requests.exceptions.RequestException as e:
+        except (requests.exceptions.RequestException, ValueError) as e:
+            # ValueError covers a malformed/truncated streamed chunk (json parse) so a bad
+            # response becomes a recorded error row, not a run-ending crash.
             total_time = (time.time() - start_time) * 1000
             return InferenceResponse(
                 request_id=request.request_id,
@@ -266,7 +268,10 @@ class VLLMAdapter(InferenceEngine):
                 kv_transfer_params=kv_transfer_params,
             )
 
-        except requests.exceptions.RequestException as e:
+        except (requests.exceptions.RequestException, ValueError) as e:
+            # ValueError covers an HTTP-200 truncated/malformed body (resp.json() raises
+            # json.JSONDecodeError, a ValueError) so it becomes a recorded error row rather
+            # than propagating out of the unguarded measured loop and aborting the baseline.
             total_time_ms = (time.time() - start_time) * 1000
             return InferenceResponse(
                 request_id=request.request_id,
@@ -278,7 +283,7 @@ class VLLMAdapter(InferenceEngine):
                 finish_reason="error",
                 error=str(e),
             )
-    
+
     def batch_generate(self, requests: List[InferenceRequest]) -> List[InferenceResponse]:
         """Generate responses for batch of requests (sequential for now)."""
         # vLLM handles batching internally, so we can send requests sequentially

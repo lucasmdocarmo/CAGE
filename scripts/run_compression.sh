@@ -26,7 +26,21 @@ NUM_TRIALS="${NUM_TRIALS:-3}"
 SEED="${SEED:-42}"
 SKIP_GATE="${SKIP_GATE:-0}"
 
+# Reliable, fast, uniform startup on the 24GB L4 (parity with run_speculative_matrix.sh):
+# eager mode avoids the ~2-3 min torch.compile/CUDA-graph capture per relaunch and shrinks
+# the OOM/slow-start surface. Applied to EVERY cell (incl. the FP8 compressed_cag restart),
+# so serving stays uniform across the 2x2 and comparative metrics remain valid.
+export VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-1}"
+export VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-4096}"
+
 cd "$PROJECT_DIR"
+# Activate the project venv if the caller has not already (cage-env on the VM, .venv locally),
+# so a standalone `nohup bash scripts/run_compression.sh` does not fall back to system python.
+if [ -z "${VIRTUAL_ENV:-}" ]; then
+  for _v in cage-env .venv ../cage-env; do
+    [ -f "$_v/bin/activate" ] && { echo "Activating venv: $_v"; source "$_v/bin/activate"; break; }
+  done
+fi
 mkdir -p "$OUTPUT_DIR"
 
 run_baseline() {  # <baseline> <label> [extra args...]
@@ -68,7 +82,11 @@ echo ">>> Server: full precision, prefix caching ON"
 run_baseline prefix_cache   cag_full
 run_baseline rag            rag_full
 export CAGE_REQUIRE_COMPRESSION=1   # raise (not silent no-op) if LLMLingua can't compress
-run_baseline compressed_rag compressed_rag      # LLMLingua-2, client-side text compression
+# --context-source retrieved is REQUIRED: compressed_rag's family is not in the
+# retrieval set {rag,redis,hybrid}, so without it the arm compresses GOLD context
+# (CAG+compression) instead of RETRIEVED context (RAG+compression), breaking the
+# 2x2 ACROSS read (rag_full vs compressed_rag). This is the Phase-2 confound.
+run_baseline compressed_rag compressed_rag --context-source retrieved
 unset CAGE_REQUIRE_COMPRESSION
 
 # --- compressed_cag (FP8 KV — the same launch-lever speculative uses) ---

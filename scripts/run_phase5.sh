@@ -45,8 +45,13 @@ mkdir -p "$OUTPUT_DIR"
 
 # 1) Bring the server up WITH speculative decoding enabled (the launch-lever).
 echo ">>> Restarting vLLM with speculative decoding enabled"
-VLLM_SPECULATIVE_CONFIG="$VLLM_SPECULATIVE_CONFIG" \
-    "$SCRIPT_DIR/manage_vllm_server.sh" restart "$TARGET_MODEL"
+if ! VLLM_SPECULATIVE_CONFIG="$VLLM_SPECULATIVE_CONFIG" \
+        "$SCRIPT_DIR/manage_vllm_server.sh" restart "$TARGET_MODEL"; then
+    echo "ERROR: vLLM failed to start with speculative config: $VLLM_SPECULATIVE_CONFIG" >&2
+    echo "       (likely an OOM on the draft head, or an unsupported method on this vLLM)." >&2
+    echo "       Skipping the speculative arm; the log-guard EXIT trap will collect logs." >&2
+    exit 1
+fi
 
 # 2) Run the speculative baseline, capturing the /metrics acceptance rate via telemetry.
 echo ">>> Running speculative decoding baseline   ($(date))"

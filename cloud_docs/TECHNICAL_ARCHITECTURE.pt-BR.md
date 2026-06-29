@@ -226,7 +226,11 @@ Cliff** e ICs por **bootstrap**. Emite um resumo JSON (`--output`) e uma tabela 
   a excluir a VM se ele estiver ausente** (falha de forma segura; `--force` sobrescreve). Existe porque a
   primeira desativação da Fase 2 perdeu logs que só existiam na VM.
 - **`scripts/log_sync_daemon.sh`** / **`scripts/_log_guard.sh`** espelham logs+resultados continuamente
-  durante uma execução; **`scripts/gcp_shutdown_hook.sh`** coleta em preempção de spot / desligamento ACPI.
+  durante uma execução; **`scripts/gcp_shutdown_hook.sh`** coleta em preempção de spot / desligamento ACPI -
+  mas SOMENTE se for explicitamente conectado na criação da VM
+  (`gcloud ... --metadata-from-file shutdown-script=scripts/gcp_shutdown_hook.sh`); nenhum script de setup o
+  instala automaticamente. Em uma L4 **on-demand** desativada via `teardown_vm.sh` ele nao e necessario (o
+  collect do trap EXIT + o teardown fail-closed cobrem isso); conecte-o apenas para instancias **spot**.
 - **`scripts/cloud_run.sh`** orquestra a suíte principal e sincroniza resultados + logs a cada intervalo e na
   saída (traps de EXIT + SIGTERM).
 

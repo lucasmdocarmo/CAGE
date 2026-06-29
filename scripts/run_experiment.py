@@ -795,18 +795,19 @@ def run_experiment(
         print("  docker run -d --name cage-redis -p 6379:6379 redis:alpine")
         sys.exit(1)
     
-    # Load dataset. Pull a pool large enough to hold a DISJOINT warmup set so
-    # warmup queries never overlap the measured ones (fixes warm-hybrid leakage).
+    # Load the measured query set. It is IDENTICAL across all baselines (the same num_queries
+    # examples under the same seed), so every baseline shares the same example_ids and the
+    # per-query Wilcoxon can PAIR them against the reference. Warm baselines (warmup_queries > 0)
+    # prime the caches by running this same measured set once as a discarded warmup pass. This
+    # keeps the comparison paired (the Phase-2 warm hybrid fell back to unpaired Mann-Whitney
+    # because it measured a disjoint, shifted slice) and reflects the realistic repeated-query
+    # warm-cache scenario, where a warm cache helps precisely when the same prompts recur. The
+    # warmup count is treated as a flag: when positive, the full measured set is warmed.
     print(f"\nLoading dataset '{dataset}'...")
     loader = get_loader(dataset, split=default_dataset_split(dataset), seed=seed)
-    pool = loader.load(max_examples=num_queries + max(0, warmup_queries))
-    warmup_pool = pool[:warmup_queries] if warmup_queries > 0 else []
-    base_examples = pool[warmup_queries:warmup_queries + num_queries] if warmup_queries > 0 else pool
-    if warmup_queries > 0 and len(warmup_pool) < warmup_queries:
-        print(
-            f"Warning: dataset only yielded {len(pool)} examples; warmup set "
-            f"({len(warmup_pool)}) may overlap measured set."
-        )
+    pool = loader.load(max_examples=num_queries)
+    base_examples = pool
+    warmup_pool = list(base_examples) if warmup_queries > 0 else []
     code_dataset = is_code_dataset(dataset, base_examples)
 
     if repeat_queries < 1:
@@ -836,8 +837,7 @@ def run_experiment(
         raise ValueError("workload_mode must be one of: single, batched, multi_turn")
 
     warmup_examples: List[CAGExample] = []
-    for idx in range(min(warmup_queries, len(warmup_pool))):
-        ex = warmup_pool[idx]  # disjoint from base_examples (measured set)
+    for idx, ex in enumerate(warmup_pool):  # SAME queries as the measured set; primes the caches
         warmup_examples.append(
             CAGExample(
                 id=f"{ex.id}__warmup{idx}",
@@ -1204,6 +1204,9 @@ def run_experiment(
             "cached_prompt_ratio": cached_ratio,
             "finish_reason": response.finish_reason,
             "error": response.error,
+            # Flag degenerate empty answers (e.g. a leading newline under stop=["\n"]) so a
+            # systematic empty-output regression is visible, not silently scored as a valid 0.
+            "empty_generation": (not response.error) and not (response.generated_text or "").strip(),
             "kv_transfer_params": kv_transfer_params_str,
             "routed_replica": response.router_replica or "",
             "retrieval_top1_score": meta["retrieval_top1_score"],
@@ -1243,28 +1246,33 @@ def run_experiment(
                 history: List[Tuple[str, str]] = []
                 for turn_idx, example in enumerate(unit):
                     maybe_reshuffle_router(sent_requests)
-                    meta = prepare_example(example)
-                    prompt = format_multi_turn_prompt(
-                        meta["question"],
-                        meta["used_contexts"],
-                        history=history,
-                    )
-                    request = InferenceRequest(
-                        prompt=prompt,
-                        max_tokens=max_tokens,
-                        temperature=0.0,
-                        top_p=0.95,
-                        request_id=example.id,
-                        truncate_prompt_tokens=truncate_prompt_tokens,
-                        stop=["\n"],
-                    )
-                    stream_flag = backend in {"vllm", "ollama"}
-                    response = engine.generate(request, stream=stream_flag)
-                    if collect_results:
-                        record_result(example, meta, response, batch_id=batch_id, turn_index=turn_idx)
-                    elif response.error:
-                        print(f"[warmup] Request {example.id} failed: {response.error}")
-                    history.append((meta["question"], response.generated_text or ""))
+                    # Per-query guard (B4): a single failing turn (retrieval / rerank /
+                    # compression / metric-eval / OOM) must not abort the whole baseline.
+                    try:
+                        meta = prepare_example(example)
+                        prompt = format_multi_turn_prompt(
+                            meta["question"],
+                            meta["used_contexts"],
+                            history=history,
+                        )
+                        request = InferenceRequest(
+                            prompt=prompt,
+                            max_tokens=max_tokens,
+                            temperature=0.0,
+                            top_p=0.95,
+                            request_id=example.id,
+                            truncate_prompt_tokens=truncate_prompt_tokens,
+                            stop=["\n"],
+                        )
+                        stream_flag = backend in {"vllm", "ollama"}
+                        response = engine.generate(request, stream=stream_flag)
+                        if collect_results:
+                            record_result(example, meta, response, batch_id=batch_id, turn_index=turn_idx)
+                        elif response.error:
+                            print(f"[warmup] Request {example.id} failed: {response.error}")
+                        history.append((meta["question"], response.generated_text or ""))
+                    except Exception as _ex:
+                        print(f"[{stage_name}] {example.id} failed: {_ex}; skipping this turn")
                     sent_requests += 1
                     stage_processed += 1
                     if collect_results:
@@ -1272,21 +1280,32 @@ def run_experiment(
             else:
                 metas: List[Dict[str, Any]] = []
                 requests: List[InferenceRequest] = []
+                kept: List[CAGExample] = []  # examples whose prepare_example() succeeded
                 for example in unit:
                     maybe_reshuffle_router(sent_requests)
-                    meta = prepare_example(example)
-                    prompt = format_qa_prompt(meta["question"], meta["used_contexts"])
-                    request = InferenceRequest(
-                        prompt=prompt,
-                        max_tokens=max_tokens,
-                        temperature=0.0,
-                        top_p=0.95,
-                        request_id=example.id,
-                        truncate_prompt_tokens=truncate_prompt_tokens,
-                        stop=["\n"],
-                    )
+                    # Per-query guard (B4): a failed prepare (retrieval / rerank /
+                    # compression) skips just this example instead of aborting the baseline.
+                    try:
+                        meta = prepare_example(example)
+                        prompt = format_qa_prompt(meta["question"], meta["used_contexts"])
+                        request = InferenceRequest(
+                            prompt=prompt,
+                            max_tokens=max_tokens,
+                            temperature=0.0,
+                            top_p=0.95,
+                            request_id=example.id,
+                            truncate_prompt_tokens=truncate_prompt_tokens,
+                            stop=["\n"],
+                        )
+                    except Exception as _ex:
+                        print(f"[{stage_name}] prepare failed for {example.id}: {_ex}; skipping")
+                        continue
                     metas.append(meta)
                     requests.append(request)
+                    kept.append(example)
+
+                if not requests:
+                    continue  # whole unit failed to prepare; nothing to send
 
                 if len(requests) == 1:
                     stream_flag = backend in {"vllm", "ollama"}
@@ -1294,11 +1313,16 @@ def run_experiment(
                 else:
                     responses = engine.batch_generate(requests)
 
-                for example, meta, response in zip(unit, metas, responses):
-                    if collect_results:
-                        record_result(example, meta, response, batch_id=batch_id, turn_index=0)
-                    elif response.error:
-                        print(f"[warmup] Request {example.id} failed: {response.error}")
+                for example, meta, response in zip(kept, metas, responses):
+                    # Per-query guard (B4): a failed record (metric-eval / OOM) drops one
+                    # row, not the whole baseline's already-collected results.
+                    try:
+                        if collect_results:
+                            record_result(example, meta, response, batch_id=batch_id, turn_index=0)
+                        elif response.error:
+                            print(f"[warmup] Request {example.id} failed: {response.error}")
+                    except Exception as _ex:
+                        print(f"[{stage_name}] record failed for {example.id}: {_ex}; skipping row")
                     sent_requests += 1
                     stage_processed += 1
                     if collect_results:
@@ -1328,16 +1352,36 @@ def run_experiment(
     vllm_sampler = None
     if vllm_telemetry:
         try:
-            from src.monitoring.vllm_telemetry import available as _tel_avail, VllmTelemetrySampler
-            if _tel_avail():
-                _mock = os.getenv("CAGE_TELEMETRY_MOCK", "").strip().lower() in {"1", "true", "yes"}
-                vllm_sampler = VllmTelemetrySampler(api_base, interval=1.0, mock=_mock).start()
+            from src.monitoring.vllm_telemetry import VllmTelemetrySampler
+            # Start the sampler whenever telemetry is requested -- NOT gated on cage-stats.
+            # capture_snapshot() falls back to a dependency-free /metrics scraper, so
+            # speculative-decode acceptance is sampled even when cage-stats is absent
+            # (Phase-2 gap: the cage-stats gate skipped the scraper -> acceptance was None).
+            _mock = os.getenv("CAGE_TELEMETRY_MOCK", "").strip().lower() in {"1", "true", "yes"}
+            vllm_sampler = VllmTelemetrySampler(api_base, interval=1.0, mock=_mock).start()
         except Exception as e:
             print(f"[telemetry] sampler not started: {e}")
 
     performance_evaluator.start()
-    execute_work_units(work_units, collect_results=True, stage_name="Measured")
-    performance_evaluator.stop()
+    try:
+        execute_work_units(work_units, collect_results=True, stage_name="Measured")
+    except Exception:
+        # A crash escaped the per-query guards (e.g. the server died mid-stage). Persist
+        # whatever rows were already collected so the baseline is not lost, then re-raise.
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            _pp = os.path.join(output_dir, "results.partial.csv")
+            if results:
+                with open(_pp, "w", newline="") as _pf:
+                    _w = csv.DictWriter(_pf, fieldnames=results[0].keys())
+                    _w.writeheader()
+                    _w.writerows(results)
+                print(f"[recovery] stage crashed; flushed {len(results)} partial rows -> {_pp}")
+        except Exception as _flush_exc:
+            print(f"[recovery] failed to flush partial results: {_flush_exc}")
+        raise
+    finally:
+        performance_evaluator.stop()
 
     if gpu_monitoring:
         gpu_tracker.stop_monitoring()
@@ -1359,12 +1403,14 @@ def run_experiment(
     vllm_telemetry_snapshot = None
     if vllm_telemetry:
         try:
-            from src.monitoring.vllm_telemetry import available, capture, dashboard_text
+            from src.monitoring.vllm_telemetry import available, capture, dashboard_text, scrape_spec_decode
+            _mock = os.getenv("CAGE_TELEMETRY_MOCK", "").strip().lower() in {"1", "true", "yes"}
+            # Prefer the workload-sampled aggregate (works even without cage-stats: the
+            # sampler falls back to the stdlib /metrics scraper for spec-decode acceptance).
+            if vllm_sampler is not None:
+                vllm_telemetry_snapshot = vllm_sampler.aggregate()
+            # If cage-stats is present, enrich with a one-shot snapshot + print the dashboard.
             if available():
-                _mock = os.getenv("CAGE_TELEMETRY_MOCK", "").strip().lower() in {"1", "true", "yes"}
-                # Prefer the workload-sampled aggregate; fall back to a one-shot snapshot.
-                if vllm_sampler is not None:
-                    vllm_telemetry_snapshot = vllm_sampler.aggregate()
                 if vllm_telemetry_snapshot is None:
                     vllm_telemetry_snapshot, _ = capture(api_base, mock=_mock)
                 _dash = dashboard_text(api_base, mock=_mock)
@@ -1373,16 +1419,35 @@ def run_experiment(
                     print("vLLM TELEMETRY (cage-stats)")
                     print("=" * 70)
                     print(_dash)
-                # Save the snapshot as an explicit JSON artifact alongside the results.
-                if vllm_telemetry_snapshot is not None:
-                    os.makedirs(output_dir, exist_ok=True)
-                    _tpath = os.path.join(output_dir, "vllm_telemetry.json")
-                    with open(_tpath, "w") as _tf:
-                        json.dump(vllm_telemetry_snapshot, _tf, indent=2, default=str)
-                    print(f"[telemetry] saved -> {_tpath}")
-            else:
-                print("[telemetry] cage-stats unavailable "
-                      "(pip install -e <cage-stats> or set CAGE_STATS_HOME); skipping.")
+            # Dependency-free backstop: ALWAYS ensure spec-decode acceptance is captured from
+            # /metrics, even when cage-stats is absent or sampling missed the spec counters.
+            if not _mock and (
+                vllm_telemetry_snapshot is None
+                or vllm_telemetry_snapshot.get("spec_decode_acceptance_rate") is None
+            ):
+                _spec = scrape_spec_decode(api_base)
+                if _spec:
+                    vllm_telemetry_snapshot = vllm_telemetry_snapshot or {}
+                    vllm_telemetry_snapshot.setdefault("spec_decode", _spec)
+                    if _spec.get("spec_decode_acceptance_rate") is not None:
+                        vllm_telemetry_snapshot["spec_decode_acceptance_rate"] = _spec["spec_decode_acceptance_rate"]
+            # Warn loudly if a speculative baseline produced no acceptance number.
+            if baseline_config.baseline_type.value == "speculative":
+                _acc = (vllm_telemetry_snapshot or {}).get("spec_decode_acceptance_rate")
+                if _acc is None:
+                    print("[telemetry] WARNING: speculative baseline but spec_decode_acceptance_rate "
+                          "is None -- check the server has speculation enabled and /metrics exposes "
+                          "vllm:spec_decode_* counters.")
+            # Save the snapshot as an explicit JSON artifact alongside the results.
+            if vllm_telemetry_snapshot is not None:
+                os.makedirs(output_dir, exist_ok=True)
+                _tpath = os.path.join(output_dir, "vllm_telemetry.json")
+                with open(_tpath, "w") as _tf:
+                    json.dump(vllm_telemetry_snapshot, _tf, indent=2, default=str)
+                print(f"[telemetry] saved -> {_tpath}")
+            elif not available():
+                print("[telemetry] cage-stats unavailable and no /metrics spec-decode data "
+                      "(pip install -e <cage-stats> or set CAGE_STATS_HOME for full telemetry).")
         except Exception as e:
             print(f"[telemetry] skipped: {e}")
 
@@ -1406,10 +1471,25 @@ def run_experiment(
     print(f"Avg Remote Fetch: {cache_metrics['avg_remote_fetch_ms']:.2f} ms")
     print(f"Total Transfer: {cache_metrics['total_transfer_mb']:.2f} MB")
     
-    if any(r.get("completeness_bertscore") is None for r in results):
-        print("Warning: BERTScore was unavailable for part of this run; clearing completeness_bertscore for all rows.")
+    # Only clear completeness_bertscore globally when the BERTScore MODEL was unavailable,
+    # signalled by a None on a row that HAD a non-empty reference (an answerable item the
+    # model should have scored). Do NOT clear merely because unanswerable rows (empty
+    # reference, e.g. ~52% of SQuAD v2) legitimately return None -- that would null out the
+    # valid scores on every answerable row. mean_or_none already excludes the None rows.
+    if any(
+        r.get("completeness_bertscore") is None and (r.get("reference_answer") or "").strip()
+        for r in results
+    ):
+        print("Warning: BERTScore was unavailable for answerable rows; clearing completeness_bertscore for all rows.")
         for row in results:
             row["completeness_bertscore"] = None
+
+    # Surface a systematic empty-generation problem loudly (degenerate answers scored as 0).
+    _empty = sum(1 for r in results if r.get("empty_generation"))
+    if results and _empty / len(results) > 0.05:
+        print(f"[quality] WARNING: {_empty}/{len(results)} ({100.0 * _empty / len(results):.1f}%) "
+              "generations were EMPTY; their quality scores are degenerate. Check the stop "
+              "sequence / prompt (a leading newline under stop=['\\n'] is the usual cause).")
     # Compute average quality metrics
     import numpy as np
 

@@ -328,7 +328,10 @@ gcloud compute instances create cage-gpu \
 gcloud compute ssh cage-gpu --zone=us-central1-a
 nvidia-smi                                   # confirm the GPU is visible
 git clone <your-repo-url> cage && cd cage    # or scp your repo
-python3 -m venv .venv && source .venv/bin/activate
+# Use cage-env on the VM: setup_gpu_cloud.sh and the run scripts (run_compression.sh,
+# run_speculative_matrix.sh, run_phase2_stats.sh, ...) all source cage-env. A .venv here
+# would leave those scripts unable to activate it (they hard-source cage-env under set -e).
+python3 -m venv cage-env && source cage-env/bin/activate
 pip install -r requirements.txt && pip install vllm
 #   requirements.txt pulls cage-stats (git dependency) for --vllm-telemetry. If that
 #   repo is private, authenticate git on the VM first (e.g. `gh auth login` / a PAT),
