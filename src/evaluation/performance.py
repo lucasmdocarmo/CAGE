@@ -222,14 +222,16 @@ class PerformanceEvaluator:
         p95_ttft = float(np.percentile(ttfts, 95))
         p99_ttft = float(np.percentile(ttfts, 99))
         
-        # Compute TPOT (Time Per Output Token)
-        # TPOT = (total_time - ttft) / num_tokens for each request
+        # Compute TPOT (Time Per Output Token) = mean inter-token latency.
+        # TTFT already accounts for the FIRST token, so the time after the first token
+        # produced (num_tokens - 1) tokens -> divide by (num_tokens - 1), not num_tokens.
+        # Single-token outputs have no inter-token interval and are excluded (dividing by
+        # num_tokens=1 would fold a spurious ~0 into the distribution and understate TPOT).
         tpots = []
         for req in successful_requests:
-            if req.num_tokens > 0:
-                # Time spent generating tokens after first token
+            if req.num_tokens > 1:
                 generation_time_ms = req.total_time_ms - req.ttft_ms
-                tpot = generation_time_ms / req.num_tokens
+                tpot = generation_time_ms / (req.num_tokens - 1)
                 tpots.append(tpot)
         
         if tpots:

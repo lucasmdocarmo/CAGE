@@ -13,6 +13,7 @@ Datasets downloaded:
 
 from datasets import load_dataset
 import argparse
+import os
 import sys
 
 
@@ -41,7 +42,8 @@ def main():
     )
     parser.add_argument(
         "--dataset",
-        choices=["hotpotqa", "qasper", "squad_v2", "trivia_qa", "natural_questions", "musique", "all"],
+        choices=["hotpotqa", "qasper", "squad_v2", "trivia_qa", "natural_questions",
+                 "musique", "crag", "sharegpt", "all"],
         default="all",
         help="Specific dataset to download (default: all)",
     )
@@ -54,6 +56,10 @@ def main():
         "trivia_qa": ("trivia_qa", "rc"),
         "natural_questions": ("nq_open", None),
         "musique": ("dgslibisey/MuSiQue", None),
+        # CRAG + ShareGPT HF paths vary across mirrors; override with CAGE_CRAG_HF_PATH /
+        # CAGE_SHAREGPT_HF_PATH. Validate the exact schema with a 5-query smoke test.
+        "crag": (os.getenv("CAGE_CRAG_HF_PATH", "crag"), None),
+        "sharegpt": (os.getenv("CAGE_SHAREGPT_HF_PATH", "RyokoAI/ShareGPT52K"), None),
     }
 
     if args.dataset == "all":

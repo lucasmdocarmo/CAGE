@@ -61,11 +61,15 @@ class ContextCompressor:
         self._disabled_reason: Optional[str] = None
         if os.getenv("CAGE_DISABLE_COMPRESSION", "").strip().lower() in {"1", "true", "yes"}:
             self._disabled_reason = "CAGE_DISABLE_COMPRESSION set"
-        # Strict mode: refuse to silently no-op. In Phase 2 a missing llmlingua package
-        # made compressed_rag fall through to ratio 1.0 (compression_applied=False) for
-        # all 100 rows, silently invalidating the baseline. Set CAGE_REQUIRE_COMPRESSION=1
-        # so a missing/failed compressor RAISES instead.
-        self._strict = os.getenv("CAGE_REQUIRE_COMPRESSION", "").strip().lower() in {"1", "true", "yes"}
+        # Strict by DEFAULT: refuse to silently no-op. In Phase 2 a missing llmlingua package
+        # made compressed_rag fall through to ratio 1.0 (compression_applied=False) for all
+        # rows, silently invalidating the baseline. So a missing/failed compressor now RAISES
+        # unless the operator explicitly opts out with CAGE_ALLOW_NO_COMPRESSION=1 (e.g. a
+        # local dry-run). If compression was explicitly DISABLED, pass-through is intended, so
+        # strictness is moot. (CAGE_REQUIRE_COMPRESSION is kept only for back-compat and is now
+        # redundant with the strict default.)
+        _allow_noop = os.getenv("CAGE_ALLOW_NO_COMPRESSION", "").strip().lower() in {"1", "true", "yes"}
+        self._strict = (not _allow_noop) and (self._disabled_reason is None)
 
     @property
     def compressor(self):

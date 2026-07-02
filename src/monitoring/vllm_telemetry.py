@@ -52,25 +52,24 @@ def capture_snapshot(
     metrics_path: str = "/metrics",
     api_key: Optional[str] = None,
     interval: float = 1.0,
-    mock: bool = False,
 ) -> Optional[dict]:
     """Return the full vLLM telemetry snapshot as a dict, or None if unavailable.
 
-    ``mock=True`` uses cage-stats' synthetic data (no server needed) — handy for
-    dry-runs and tests.
+    Reads LIVE vLLM telemetry only. There is no synthetic/mock path: CAGE must never
+    record fabricated numbers, so an unavailable server yields None, never fake data.
     """
     api = _try_import_api()
     if api is not None:
         try:
             return api.snapshot_dict(
-                url, metrics_path=metrics_path, api_key=api_key, interval=interval, mock=mock
+                url, metrics_path=metrics_path, api_key=api_key, interval=interval
             )
         except Exception as e:
             print(f"[telemetry] cage_stats in-process capture failed: {e}")
     exe = shutil.which("cage-stats")
     if exe:
         try:
-            cmd = [exe, "--once", "--json", "--url", url] + (["--mock"] if mock else [])
+            cmd = [exe, "--once", "--json", "--url", url]
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             if res.returncode == 0 and res.stdout.strip():
                 return json.loads(res.stdout)
@@ -114,11 +113,10 @@ class VllmTelemetrySampler:
              "src_compute", "src_cache_hit", "src_external",
              "spec_decode", "spec_active", "spec_acceptance", "spec_accepted_per_draft")
 
-    def __init__(self, url: str, *, interval: float = 1.0, mock: bool = False,
+    def __init__(self, url: str, *, interval: float = 1.0,
                  metrics_path: str = "/metrics"):
         self.url = url
         self.interval = max(0.25, float(interval))
-        self.mock = mock
         self.metrics_path = metrics_path
         self._samples: list = []
         self._stop = threading.Event()
@@ -136,7 +134,7 @@ class VllmTelemetrySampler:
         while not self._stop.is_set():
             t0 = time.time()
             try:
-                snap = capture_snapshot(self.url, metrics_path=self.metrics_path, mock=self.mock)
+                snap = capture_snapshot(self.url, metrics_path=self.metrics_path)
                 if snap:
                     self._samples.append(snap)
             except Exception:
@@ -189,21 +187,20 @@ def dashboard_text(
     metrics_path: str = "/metrics",
     api_key: Optional[str] = None,
     interval: float = 1.0,
-    mock: bool = False,
 ) -> Optional[str]:
     """Return a one-shot static terminal dashboard string, or None if unavailable."""
     api = _try_import_api()
     if api is not None:
         try:
             return api.dashboard_text(
-                url, metrics_path=metrics_path, api_key=api_key, interval=interval, mock=mock
+                url, metrics_path=metrics_path, api_key=api_key, interval=interval
             )
         except Exception as e:
             print(f"[telemetry] cage_stats dashboard failed: {e}")
     exe = shutil.which("cage-stats")
     if exe:
         try:
-            cmd = [exe, "--once", "--url", url] + (["--mock"] if mock else [])
+            cmd = [exe, "--once", "--url", url]
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             if res.returncode == 0:
                 return res.stdout
@@ -218,7 +215,6 @@ def capture(
     metrics_path: str = "/metrics",
     api_key: Optional[str] = None,
     interval: float = 1.0,
-    mock: bool = False,
 ):
     """Return (snapshot_dict, dashboard_text). In-process this needs ONE poll for both.
 
@@ -231,15 +227,15 @@ def capture(
             from cage_stats.ui.text import render_dashboard
 
             snap = api.fetch_snapshot(
-                url, metrics_path=metrics_path, api_key=api_key, interval=interval, mock=mock
+                url, metrics_path=metrics_path, api_key=api_key, interval=interval
             )
             return snapshot_to_dict(snap), render_dashboard(snap, url=url, interval=interval)
         except Exception as e:
             print(f"[telemetry] cage_stats capture failed: {e}")
     # CLI fallback: two calls (json + text).
     return (
-        capture_snapshot(url, metrics_path=metrics_path, api_key=api_key, interval=interval, mock=mock),
-        dashboard_text(url, metrics_path=metrics_path, api_key=api_key, interval=interval, mock=mock),
+        capture_snapshot(url, metrics_path=metrics_path, api_key=api_key, interval=interval),
+        dashboard_text(url, metrics_path=metrics_path, api_key=api_key, interval=interval),
     )
 
 
@@ -268,9 +264,15 @@ def scrape_spec_decode(
         return None
 
     def _sum(metric: str) -> Optional[float]:
+        # Exact metric-name match. The Prometheus series name is everything before '{'
+        # (labels) or the first space (value). A prefix match would wrongly fold sibling
+        # series such as `<metric>_total`, `<metric>_bucket`, `<metric>_sum` into the sum.
         total = None
         for line in text.splitlines():
-            if line.startswith("#") or not line.startswith(metric):
+            if not line or line.startswith("#"):
+                continue
+            name = line.split("{", 1)[0].split(" ", 1)[0]
+            if name != metric:
                 continue
             try:
                 total = (total or 0.0) + float(line.rsplit(" ", 1)[1])
@@ -280,7 +282,7 @@ def scrape_spec_decode(
 
     accepted = _sum("vllm:spec_decode_num_accepted_tokens_total")
     draft = _sum("vllm:spec_decode_num_draft_tokens_total")
-    num_drafts = _sum("vllm:spec_decode_num_drafts")
+    num_drafts = _sum("vllm:spec_decode_num_drafts_total")
     if accepted is None and draft is None:
         return None  # speculation not enabled, or metric not exposed by this vLLM version
     return {

@@ -1162,12 +1162,23 @@ def run_experiment(
             generated_text=response.generated_text,
             reference_answer=example.answer,
         )
+        _quality_row = quality_metrics.to_dict()
 
         code_metrics = (
             code_evaluator.evaluate(response.generated_text)
             if code_evaluator is not None
             else None
         )
+
+        # Result-integrity guard: a serving error (generated_text == "") or a degenerate
+        # empty answer must NOT enter the quality columns as hard 0.0s, which would depress
+        # the PRIMARY grounding/F1 means and the per-query stats as if the model had produced
+        # a wrong answer. Null every quality field so such rows are treated as MISSING data,
+        # not as a scored zero, both here and downstream.
+        _empty_gen = (not response.error) and not (response.generated_text or "").strip()
+        if response.error or _empty_gen:
+            _quality_row = {k: None for k in _quality_row}
+            code_metrics = None
 
         kv_transfer_params_str = ""
         if response.kv_transfer_params is not None:
@@ -1216,7 +1227,7 @@ def run_experiment(
             "retrieved_doc_ids": ";".join(meta["retrieved_doc_ids"]) if meta["retrieved_doc_ids"] else "",
             "compression_ratio": (meta.get("compression_stats") or {}).get("compression_ratio"),
             "compression_applied": (meta.get("compression_stats") or {}).get("compression_applied"),
-            **quality_metrics.to_dict(),
+            **_quality_row,
         }
         if code_metrics is not None:
             result.update(
@@ -1357,8 +1368,7 @@ def run_experiment(
             # capture_snapshot() falls back to a dependency-free /metrics scraper, so
             # speculative-decode acceptance is sampled even when cage-stats is absent
             # (Phase-2 gap: the cage-stats gate skipped the scraper -> acceptance was None).
-            _mock = os.getenv("CAGE_TELEMETRY_MOCK", "").strip().lower() in {"1", "true", "yes"}
-            vllm_sampler = VllmTelemetrySampler(api_base, interval=1.0, mock=_mock).start()
+            vllm_sampler = VllmTelemetrySampler(api_base, interval=1.0).start()
         except Exception as e:
             print(f"[telemetry] sampler not started: {e}")
 
@@ -1404,7 +1414,6 @@ def run_experiment(
     if vllm_telemetry:
         try:
             from src.monitoring.vllm_telemetry import available, capture, dashboard_text, scrape_spec_decode
-            _mock = os.getenv("CAGE_TELEMETRY_MOCK", "").strip().lower() in {"1", "true", "yes"}
             # Prefer the workload-sampled aggregate (works even without cage-stats: the
             # sampler falls back to the stdlib /metrics scraper for spec-decode acceptance).
             if vllm_sampler is not None:
@@ -1412,8 +1421,8 @@ def run_experiment(
             # If cage-stats is present, enrich with a one-shot snapshot + print the dashboard.
             if available():
                 if vllm_telemetry_snapshot is None:
-                    vllm_telemetry_snapshot, _ = capture(api_base, mock=_mock)
-                _dash = dashboard_text(api_base, mock=_mock)
+                    vllm_telemetry_snapshot, _ = capture(api_base)
+                _dash = dashboard_text(api_base)
                 if _dash:
                     print("\n" + "=" * 70)
                     print("vLLM TELEMETRY (cage-stats)")
@@ -1421,7 +1430,7 @@ def run_experiment(
                     print(_dash)
             # Dependency-free backstop: ALWAYS ensure spec-decode acceptance is captured from
             # /metrics, even when cage-stats is absent or sampling missed the spec counters.
-            if not _mock and (
+            if (
                 vllm_telemetry_snapshot is None
                 or vllm_telemetry_snapshot.get("spec_decode_acceptance_rate") is None
             ):
@@ -1494,7 +1503,13 @@ def run_experiment(
     import numpy as np
 
     def mean_or_none(metric_key: str) -> Optional[float]:
-        values = [r[metric_key] for r in results if r.get(metric_key) is not None]
+        # Exclude errored and degenerate-empty rows: their quality fields are already
+        # nulled at record time, but guard here too so a stray scored 0.0 can never enter
+        # a PRIMARY quality mean.
+        values = [
+            r[metric_key] for r in results
+            if r.get(metric_key) is not None and not r.get("error") and not r.get("empty_generation")
+        ]
         return float(np.mean(values)) if values else None
     # Aggregate every quality key (keys match quality_keys so cross-trial
     # aggregation downstream picks them all up; None values are excluded).
@@ -1797,7 +1812,7 @@ def main():
     parser.add_argument(
         "--dataset",
         default="squad_v2",
-        choices=["hotpotqa", "qasper", "squad_v2", "trivia_qa", "natural_questions", "musique", "humaneval", "mbpp", "hpc_code"],
+        choices=["hotpotqa", "qasper", "squad_v2", "trivia_qa", "natural_questions", "musique", "crag", "sharegpt", "humaneval", "mbpp", "hpc_code"],
         help="Dataset to use",
     )
     parser.add_argument(

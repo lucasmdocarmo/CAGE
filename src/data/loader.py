@@ -14,6 +14,7 @@ Supports loading and formatting HuggingFace datasets:
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
 from datasets import load_dataset, Dataset
+import os
 import random
 
 
@@ -673,6 +674,131 @@ class MuSiQueLoader(DatasetLoader):
         return examples
 
 
+class CRAGLoader(DatasetLoader):
+    """Loader for CRAG (Comprehensive RAG Benchmark, Meta / KDD Cup 2024).
+
+    CRAG pairs a natural-language ``query`` with a gold ``answer`` and a set of retrieved
+    web ``search_results`` (the candidate context a RAG system must ground on), spanning
+    multiple domains and question types (simple, conditional, comparison, aggregation,
+    multi-hop, false-premise). This makes it a strong RAG-fairness + retrieval-quality
+    dataset for CAGE's rag / compressed_rag arms.
+
+    The HF distribution path is NOT fixed across mirrors, so it is configurable via the
+    ``hf_path`` argument or the ``CAGE_CRAG_HF_PATH`` env var. Field mapping is defensive
+    (query/question, answer, search_results/contexts). Run a 5-query smoke test to validate
+    the exact schema of your chosen mirror before a full run.
+    """
+
+    def __init__(self, split: str = "validation", seed: int = 42, hf_path: Optional[str] = None):
+        self.hf_path = hf_path or os.getenv("CAGE_CRAG_HF_PATH", "crag")
+        super().__init__(self.hf_path, split, seed)
+
+    def load(self, max_examples: Optional[int] = None) -> List[CAGExample]:
+        dataset = load_dataset(self.hf_path, split=self.split)
+        if max_examples:
+            dataset = dataset.shuffle(seed=self.seed).select(range(min(max_examples, len(dataset))))
+
+        examples = []
+        for item in dataset:
+            question = item.get("query") or item.get("question") or ""
+            answer = item.get("answer") or item.get("gold_answer") or ""
+            # search_results may be a list of dicts (page_snippet/page_result/text) or strings.
+            raw = item.get("search_results") or item.get("contexts") or item.get("context") or []
+            context_docs = []
+            if isinstance(raw, list):
+                for r in raw:
+                    if isinstance(r, dict):
+                        txt = (r.get("page_snippet") or r.get("page_result")
+                               or r.get("text") or r.get("snippet") or "")
+                    else:
+                        txt = str(r)
+                    if txt:
+                        context_docs.append(txt)
+            elif isinstance(raw, str) and raw:
+                context_docs = [raw]
+
+            if not question:
+                continue
+            examples.append(CAGExample(
+                id=str(item.get("interaction_id", item.get("id", len(examples)))),
+                question=question,
+                context=context_docs,
+                answer=answer,
+                metadata={
+                    "dataset": "crag",
+                    "question_type": item.get("question_type", ""),
+                    "static_or_dynamic": item.get("static_or_dynamic", ""),
+                    "domain": item.get("domain", ""),
+                },
+            ))
+        return examples
+
+
+class ShareGPTLoader(DatasetLoader):
+    """Loader for ShareGPT conversations as a realistic SERVING-WORKLOAD trace.
+
+    ShareGPT is a corpus of real user<->assistant conversations with highly variable prompt
+    lengths and turn counts. It has NO extractive gold answer, so CAGE uses it as a
+    serving-pressure / workload-shape trace (TTFT / TPOT / throughput / KV behaviour under
+    realistic, heterogeneous prompts), NOT as a QA quality benchmark. The first assistant
+    turn is kept as a REFERENCE response (similarity signal only), never as extractive gold;
+    quality metrics on this dataset are therefore diagnostic, not primary.
+
+    HF path is configurable (``hf_path`` / ``CAGE_SHAREGPT_HF_PATH``); the default is the
+    52K-conversation mirror. Validate with a 5-query smoke test before a full run.
+    """
+
+    def __init__(self, split: str = "train", seed: int = 42, hf_path: Optional[str] = None):
+        self.hf_path = hf_path or os.getenv("CAGE_SHAREGPT_HF_PATH", "RyokoAI/ShareGPT52K")
+        super().__init__(self.hf_path, split, seed)
+
+    @staticmethod
+    def _role(turn) -> str:
+        return (turn.get("from") or turn.get("role") or "") if isinstance(turn, dict) else ""
+
+    @staticmethod
+    def _text(turn) -> str:
+        return (turn.get("value") or turn.get("content") or "") if isinstance(turn, dict) else str(turn)
+
+    def load(self, max_examples: Optional[int] = None) -> List[CAGExample]:
+        dataset = load_dataset(self.hf_path, split=self.split)
+        if max_examples:
+            dataset = dataset.shuffle(seed=self.seed).select(range(min(max_examples, len(dataset))))
+
+        examples = []
+        for item in dataset:
+            convo = item.get("conversations") or item.get("conversation") or item.get("items") or []
+            if not isinstance(convo, list) or not convo:
+                continue
+            # First human/user turn is the question; first assistant/gpt turn is the reference.
+            question, reference = "", ""
+            for turn in convo:
+                role = self._role(turn).lower()
+                if not question and role in {"human", "user"}:
+                    question = self._text(turn)
+                elif question and not reference and role in {"gpt", "assistant"}:
+                    reference = self._text(turn)
+                    break
+            if not question:
+                # Some dumps open with a system/gpt turn; fall back to the first turn's text.
+                question = self._text(convo[0])
+            if not question:
+                continue
+            examples.append(CAGExample(
+                id=str(item.get("id", len(examples))),
+                question=question,
+                context=[],  # open conversation: no supplied gold context
+                answer=reference,  # reference response (similarity signal only, NOT gold)
+                metadata={
+                    "dataset": "sharegpt",
+                    "dataset_type": "conversation_trace",
+                    "no_gold_answer": True,
+                    "num_turns": len(convo),
+                },
+            ))
+        return examples
+
+
 def get_loader(dataset_name: str, split: str = "validation", seed: int = 42) -> DatasetLoader:
     """Factory function to get appropriate dataset loader."""
     loaders = {
@@ -682,6 +808,8 @@ def get_loader(dataset_name: str, split: str = "validation", seed: int = 42) -> 
         "trivia_qa": TriviaQALoader,
         "natural_questions": NaturalQuestionsLoader,
         "musique": MuSiQueLoader,
+        "crag": CRAGLoader,
+        "sharegpt": ShareGPTLoader,
         "humaneval": HumanEvalLoader,
         "mbpp": MBPPLoader,
         "hpc_code": HPCCodeLoader,
