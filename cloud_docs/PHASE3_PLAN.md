@@ -1,4 +1,4 @@
-# Phase 3 — Multi-Node HPC Cluster: Plan & Definition of Done
+# Phase 3 - Multi-Node HPC Cluster: Plan & Definition of Done
 
 > Phase 3 takes CAGE to the regime the title is about: the KV cache as a distributed object across
 > several GPU nodes. It builds on Phase 2 ([`PHASE2_CHECKLIST.md`](PHASE2_CHECKLIST.md)). Be precise
@@ -44,9 +44,11 @@
 |---|---|---|---|
 | SQuAD v2 | continuity baseline | standard extractive QA; ties Phase 3 to Phases 1-2; ~50% unanswerable = hallucination probe. BUT short passages -> no KV pressure on its own. | run in Phase 1-2 |
 | Qasper (`allenai/qasper`) | long-context / pressure / reuse | full scientific papers (~5-8k+ tokens) -> genuine KV-cache memory pressure; multiple questions per paper -> shared-context CAG reuse. **Best single fit for the Phase-3 goal.** | `QasperLoader` in `src/data/loader.py`; NOT yet validated end-to-end |
-| HotpotQA (fullwiki) or MuSiQue | RAG-fair / multi-hop | multi-hop, retrieval genuinely helps -> a FAIR RAG-vs-CAG comparison; fixes the SQuAD "retrieval too weak (top-1 0.113), so RAG lost" confound. | `HotpotQALoader` / MuSiQue loader present; NOT yet validated |
-| RULER (`hsieh2024ruler`) | pressure knob (optional) | synthetic, controllable length 4k-128k -> memory pressure as a DIALED independent variable (ideal for the sweep). | cited; loader NOT wired in `download_datasets.py`/`loader.py` |
-| SCBench (`li2025scbench`) | cache-centric peer (optional) | shared-context multi-request KV-cache lifecycle; the closest peer benchmark. | cited; loader NOT wired |
+| HotpotQA (fullwiki) or MuSiQue | RAG-fair / multi-hop | multi-hop, retrieval genuinely helps -> a FAIR RAG-vs-CAG comparison; fixes the SQuAD "retrieval too weak (top-1 0.113), so RAG lost" confound. | `HotpotQALoader` / MuSiQue loader present; NOT yet validated end-to-end |
+| CRAG (`yang2024crag`) | RAG-fair / retrieval-quality | Meta / KDD Cup 2024 benchmark; natural-language query + gold answer + retrieved web `search_results` across simple/conditional/comparison/aggregation/multi-hop/false-premise types -> a strong RAG-fairness input for the `rag` and `compressed_rag` arms. | **fully wired**: `CRAGLoader` (`loader.py:677-734`) + `get_loader` registry + `run_experiment.py --dataset` choices + `scripts/download_datasets.py --dataset` (HF path via `CAGE_CRAG_HF_PATH`, default `crag`); smoke-test the chosen mirror's schema before a full run |
+| ShareGPT (serving-trace) | production-realism / serving-load | real user<->assistant conversations with highly variable prompt lengths and turn counts; NO extractive gold answer (`no_gold_answer=True`), so it is a serving-workload / KV-pressure trace (TTFT/TPOT/throughput under heterogeneous prompts), NOT a QA quality benchmark. First assistant turn is a similarity-only reference, never gold. | **fully wired**: `ShareGPTLoader` (`loader.py:737-799`) + `get_loader` registry + `run_experiment.py --dataset` choices + `scripts/download_datasets.py --dataset` (HF path via `CAGE_SHAREGPT_HF_PATH`, default `RyokoAI/ShareGPT52K`); smoke-test before a full run |
+| RULER (`hsieh2024ruler`) | pressure knob (optional) | synthetic, controllable length 4k-128k -> memory pressure as a DIALED independent variable (ideal for the sweep). | cited; loader NOT wired in `download_datasets.py`/`loader.py` (re-confirmed 2026-07-02, no loader found) |
+| SCBench (`li2025scbench`) | cache-centric peer (optional) | shared-context multi-request KV-cache lifecycle; the closest peer benchmark (see the "SCBench Phase-3 comparison" subsection below). | cited; loader NOT wired (re-confirmed 2026-07-02); covered as a comparison PLAN, not an executed loader |
 
 **Recommended Phase-3 datasets:** SQuAD v2 (continuity) + **Qasper** (long-context/pressure/reuse) + **HotpotQA or MuSiQue** (RAG-fair). Optionally add **RULER** as the explicit pressure-sweep knob if a loader is wired.
 
@@ -54,7 +56,27 @@
 
 **Practical gate (validate-infra rule):** only SQuAD has flowed through the full pipeline. Qasper is the trickiest (answers can be extractive / abstractive / yes-no / unanswerable, and the "context" is a whole paper the retrieval corpus must chunk). SMOKE-TEST each new dataset loader (sensible question / gold-context / answer tuples + retrieval corpus build + metric scoring) before any Phase-3 run.
 
-**Genuine future phases (named, NOT executed here):** a real new phase needs a new QUESTION or REGIME, not a new dataset. Candidates for the conclusion's future-work section: (a) a production-realism phase on real request traces (ShareGPT / Azure LLM trace), a different WORKLOAD regime; (b) a cross-model generalization phase (does the trade-off hold across model families); (c) an energy / cost-per-token phase. These are future directions, not additional hardware runs in this dissertation.
+**Genuine future phases (named, NOT executed here):** a real new phase needs a new QUESTION or REGIME, not a new dataset. Candidates for the conclusion's future-work section: (a) a production-realism phase on real request traces. Note that the ShareGPT half of this is no longer a missing capability: the `ShareGPTLoader` is now fully wired (`loader.py:737-799`, CLI + download script), so a ShareGPT serving-trace run is available today; the remaining future-work piece is the Azure LLM inference trace and the production WORKLOAD framing around it. (b) a cross-model generalization phase (does the trade-off hold across model families); (c) an energy / cost-per-token phase. These are future directions, not additional hardware runs in this dissertation.
+
+## SCBench Phase-3 comparison (`li2025scbench`)
+
+**What SCBench is.** *SCBench: A KV Cache-Centric Analysis of Long-Context Methods* (a.k.a. "SharedContextBench"), published at **ICLR 2025** by **Microsoft Corporation and University of Surrey** (Yucheng Li is the University of Surrey author; the remaining authors are Microsoft), arXiv **2412.10319**. It evaluates efficient long-context methods from a **KV-cache-centric perspective across the full KV-cache lifecycle** (generation, compression, retrieval, loading), in scenarios where the context (KV cache) is **shared and reused across multiple requests/turns**. It is the first long-context benchmark to cover single-turn, multi-turn, and multi-request modes, with two shared-context modes (context cached within a session vs. the same context encoded once and reused across separate sessions). It spans 12 tasks in 4 capability categories (string retrieval, semantic retrieval, global information, multi-tasking) over 8 models and 8 method categories (13 concrete methods). Its headline finding is that sub-O(n)-memory methods degrade in multi-turn shared-context settings while O(n)-memory sparse-encoding methods stay robust.
+
+**How SCBench differs from CAGE.** SCBench's unit of analysis is a **long-context / compression method**, scored on task quality (accuracy / Pass@1 / ROUGE) under a memory/compute budget. CAGE's unit is a **serving policy** across the 9-family baseline taxonomy, and its defining move is to co-measure, on the SAME requests, serving metrics (latency, TTFT, TPOT, throughput, p50/p95 tails, cache/retrieval telemetry) TOGETHER with span-level answer grounding (LettuceDetect) plus NLI faithfulness. Two concrete gaps make SCBench complementary rather than overlapping:
+- **No grounding metric.** SCBench uses task-level correctness (accuracy / Pass@1 / ROUGE); it has no span-level hallucination / grounding signal. CAGE wires `grounding_score` / `hallucinated_span_ratio` next to TTFT / throughput.
+- **No per-method serving latency.** SCBench reports task-quality metrics only, with no per-method end-to-end serving-latency / TTFT tables. It is safe to state SCBench does not publish per-method serving latency, exactly the gap CAGE fills.
+
+**The concrete comparison plan (a DESIGN, not an executed result; no SCBench code was run).**
+1. **Adopt SCBench's shared-context workload as an external, reuse-native input.** Load `microsoft/SCBench` from HF and drive CAGE's harness with the shared `context` + `multi_turns` structure so the SAME long context is reused across turns/requests inside CAGE's serving pipeline. (Note: the HF artifact reports 922 rows; the paper describes 931 multi-turn sessions with 4,853 queries. Do NOT conflate the two counts.)
+2. **Select a grounding-clean task subset.** Use the semantic-retrieval group (Code.RepoQA, En.QA, Zh.QA) and En.Sum, which are free-text answers over a bounded gold context, what LettuceDetect / NLI grounding needs. Avoid pure string-retrieval tasks (Retr.KV etc.), whose exact-match accuracy carries little grounding signal.
+3. **Map SCBench methods onto CAGE baselines.** SCBench KV-dropping / quantization maps onto CAGE `compressed_cag` (FP8/MLA); SCBench KV-loading / retrieval (Quest, CacheBlend) onto CAGE `hybrid` / `distributed`; SCBench "full-cache" onto CAGE `prefix_cache`; add CAGE-only `rag` / `compressed_rag` rows for which SCBench has no equivalent.
+4. **Run each cell under CAGE's protocol** (greedy T=0, repeated trials, same-request logging) so every SCBench-derived request emits BOTH CAGE serving metrics AND grounding, in single-turn, multi-turn, and multi-request modes.
+
+The exact claim this supports: on Microsoft's SCBench shared-context, KV-cache-reuse workload (ICLR 2025), CAGE reproduces SCBench's method-level quality ranking AND additionally quantifies the paired serving-efficiency-vs-answer-grounding operating point of each cache policy on the same requests, revealing, for KV-compression and multi-request reuse, a grounding cost that SCBench's quality-only, method-centric lifecycle analysis does not expose. Mirror bib key `li2025scbench`.
+
+## KV-cache-store baseline (see `cloud_docs/RELATED_WORK_KVCACHE_STORES.md`)
+
+CAGE's current `redis` baseline caches only **retrieval artifacts** (query->doc-ids), NOT KV blocks (`src/orchestration/redis_cache.py`), so the serving half of the joint axis is not yet exercised by a real KV-block store. The recommended single addition is **LMCache** (`lmcache2024`): a de-facto-standard KV-cache layer with a first-class vLLM connector (`--kv-transfer-config` / `LMCacheConnector`), config-driven (no kernel work), that caches actual KV blocks (prefill reuse) and can use the existing Redis as a remote tier, giving a clean "Redis-as-retrieval-cache vs Redis-as-KV-tier-under-LMCache" narrative. CacheBlend (`cacheblend2025`) and CacheGen (`cachegen2024`, arXiv **2310.07240**) ship inside LMCache, providing quality-preserving KV-reuse and compressed-KV variants. **Mooncake** (`qin2024mooncake`) and the vLLM **NixlConnector** are the **disaggregation transport only if Phase 3 goes multi-node with real RDMA** (the committed A3-Ultra RoCE build); do NOT add Mooncake as a separate cache baseline, as it becomes a tier under LMCache. See `cloud_docs/RELATED_WORK_KVCACHE_STORES.md` for the full survey and go/no-go.
 
 ## What is real now (runs on GCP today)
 
@@ -64,7 +86,7 @@
   and reports the serving replica per request.
 - The `distributed` baseline runs end-to-end against this cluster (`--baseline distributed` against
   the router). Under the **replicated** policy every node holds the context, so the modeled
-  cross-node transfer cost is **zero** — the arm measures real prefix-affinity routing, not transfer.
+  cross-node transfer cost is **zero** - the arm measures real prefix-affinity routing, not transfer.
 - Terraform provisions the cluster (router + N GPU replicas + Redis + durable GCS bucket), with the
   high-bandwidth interconnect (GVNIC, MTU 8896) and tensor-parallel options provisioned but not yet
   exercised for real transfer.

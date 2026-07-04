@@ -1,6 +1,6 @@
 # CAGE Framework - Solution Description
 
-**Last updated:** 2026-06-28 · **Status:** CURRENT (Phase 1 + Phase 2 complete; Phase 3 next)
+**Last updated:** 2026-07-02 · **Status:** CURRENT (Phase 1 done; Phase 2 single-L4 clean re-run code-ready; Phase 3 deferred)
 **Author:** Lucas Mariano do Carmo · **Institution:** Pontifícia Universidade Católica de Minas Gerais (PUC Minas) · **Contact:** lucas.mariano.carmo@gmail.com
 
 > Companion deep-dive: [`TECHNICAL_ARCHITECTURE.md`](TECHNICAL_ARCHITECTURE.md). Authoritative
@@ -43,7 +43,7 @@ Workload (CLI)  →  CAGE Orchestrator  →  vLLM server(s)  →  Telemetry + Qu
 ```
 
 Key components (see `TECHNICAL_ARCHITECTURE.md` for the module-by-module deep dive):
-- `src/data/loader.py` - dataset loading (SQuAD v2, HotpotQA, TriviaQA, NQ, MuSiQue) into `CAGExample` objects.
+- `src/data/loader.py` - dataset loading into `CAGExample` objects. Eleven loaders: SQuAD v2, HotpotQA, Qasper, TriviaQA, Natural Questions, MuSiQue, CRAG, ShareGPT (QA/serving), plus HumanEval, MBPP, hpc_code (code). CRAG carries a gold answer alongside retrieved candidate docs (RAG-fair); ShareGPT is a serving-workload trace with no gold answer (reference-only, `no_gold_answer=True`).
 - `src/inference/vllm_adapter.py` - HTTP client with streaming TTFT measurement and usage telemetry. (Also `gemini_adapter.py`, `ollama_adapter.py` for alt backends.)
 - `src/orchestration/baselines.py` - baseline-family definitions and per-baseline config.
 - `src/orchestration/ir.py` - FAISS dense retrieval (e5-large-v2) + BGE reranker for RAG-family baselines.
@@ -95,6 +95,8 @@ reuse policy, plus orthogonal **compression** and **speculative** extensions.
 
 **Serving (via cage-stats + pynvml):** QPS, tokens/sec, TTFT, TPOT, end-to-end latency (avg + p50/p95/p99), prefix-hit ratio, KV-cache utilization, GPU memory/power/temperature, and (when speculative is on) acceptance rate.
 
+**Telemetry is live-only (hard guarantee).** The synthetic/mock telemetry path has been removed from the code. `capture_snapshot` resolves in this order: in-process `cage_stats.api`, then the `cage-stats --once --json` CLI, then a dependency-free stdlib `/metrics` scraper. If no vLLM server is reachable (or the scraped payload contains no `vllm:` series) the sampler returns `None`; it never fabricates zeros or synthetic values. This is an enforced invariant, not a convention.
+
 **Statistical layer (`scripts/statistical_tests.py`):** per-query **Wilcoxon** signed-rank tests vs a reference baseline, **Holm** multiple-comparison correction, **Cliff's delta** effect size, and **bootstrap** confidence intervals.
 
 ---
@@ -107,10 +109,15 @@ CPU latencies are not generalizable; rankings are. Prefix cache wins (−37.4% l
 TTFT, equal quality); RAG is slowest and loses faithfulness; distributed shows a 7.6× p95/p50
 tail spread; BERTScore is non-discriminative.
 
-### Phase 2 (single NVIDIA L4 GPU, the production-relevant baseline) - COMPLETE 2026-06-27
-Setup: **Qwen3-8B, vLLM 0.11.0, SQuAD v2, single L4 (24 GB), 100 queries × 1 trial**, 14 baseline
-result sets across 8 of 9 families (distributed deferred to Phase 3). All significance vs
-`no_cache`, Holm-corrected. Primary metric = grounding.
+### Phase 2 (single NVIDIA L4 GPU, the production-relevant baseline) - clean re-run CODE-READY
+Setup: **Qwen3-8B, vLLM 0.11.0, SQuAD v2, single L4 (24 GB), greedy (T=0)**, across 8 of 9
+families (distributed deferred to Phase 3). Significance vs `no_cache`, Holm-corrected. Primary
+metric = grounding.
+
+> **Result status:** the original Phase-2 run was superseded (invalid baselines) and a clean
+> re-run is code-ready but not yet re-executed, so the numbers below are directional from the
+> earlier run and must not be treated as final/validated until the re-run lands. **Query count is
+> locked at 500 × 3:** `scripts/run_phase2.sh` uses `NUM_QUERIES=500`, three trials.
 
 | Finding | Serving | Quality | Verdict |
 |---|---|---|---|
@@ -131,6 +138,7 @@ infra has been torn down to $0 and the data is archived locally.
 
 - **Inference:** vLLM 0.11.0 (pinned), OpenAI-compatible HTTP API; `--enforce-eager` on the L4.
 - **Models:** Qwen3-4B (Phase 1 CPU), Qwen3-8B (Phase 2); Phase-3 candidates Qwen3-14B/32B and DeepSeek-V2-Lite (for MTP). Configs in `configs/model/`.
+- **Datasets:** eleven loaders registered in `src/data/loader.py` - SQuAD v2, HotpotQA, Qasper, TriviaQA, Natural Questions, MuSiQue, CRAG, ShareGPT (QA/serving), plus HumanEval, MBPP, hpc_code (code). All QA loaders shuffle(seed) before select for trial-independence. CRAG (gold answer + retrieved candidate docs, RAG-fair) and ShareGPT (serving-workload trace, no gold answer) are wired end-to-end (registry + `run_experiment.py --dataset` + `scripts/download_datasets.py`).
 - **Retrieval:** FAISS `IndexFlatIP` + `intfloat/e5-large-v2` embeddings + `BAAI/bge-reranker-large`.
 - **Compression:** LLMLingua-2 (prompt, client-side) and FP8 KV-cache (server `--kv-cache-dtype fp8`).
 - **Speculative decoding:** ngram + EAGLE-3 (`AngelSlim/Qwen3-8B_eagle3`) via `--speculative-config`.
@@ -144,13 +152,28 @@ infra has been torn down to $0 and the data is archived locally.
 
 ## 7. Status and next steps
 
-- **Phase 1 (CPU): COMPLETE** - protocol validated.
-- **Phase 2 (single L4 GPU): COMPLETE (2026-06-27)** - quality + serving axes measured with statistics; four clean findings above; infra at $0, data local.
-- **Phase 3 (multi-node HPC): NEXT** - real cross-node KV-tensor transfer via a vLLM KV connector (LMCache/NIXL) with a sharded context policy (replacing today's analytic/simulated model), disaggregated prefilling, broader speculative decoding (MTP via DeepSeek-V2-Lite), a RAG-favorable dataset, and multi-trial confidence intervals. Plan: [`PHASE3_PLAN.md`](PHASE3_PLAN.md); models: `docs/PHASE3_MODELS.md`.
+- **Phase 1 (CPU): DONE** - protocol validated; this is the state the dissertation currently reports (stochastic decoding, temperature 0.7).
+- **Phase 2 (single L4 GPU): clean re-run CODE-READY** - greedy (T=0) quality + serving axes wired with statistics; the original run was superseded and the re-run is not yet re-executed, so its numbers are not final. Infra at $0, data local. Query count locked at 500 × 3.
+- **Phase 3 (multi-node HPC): DEFERRED** - real cross-node KV-tensor transfer via a vLLM KV connector (LMCache/NIXL) with a sharded context policy (replacing today's analytic/simulated model), disaggregated prefilling, broader speculative decoding (MTP via DeepSeek-V2-Lite), and multi-trial confidence intervals. A RAG-favorable dataset need is now partially met: **CRAG** (gold answer + retrieved candidate docs, RAG-fair) and **ShareGPT** (serving-workload trace) are wired end-to-end and available for the Phase-3 workload. Cross-node transfer stays analytic/simulated until real RDMA lands. Plan: [`PHASE3_PLAN.md`](PHASE3_PLAN.md); models: `docs/PHASE3_MODELS.md`.
 
 ### Recent changes and fixes (this cycle)
 - **Generation determinism:** temperature 0.0 + `stop=["\n"]` to stop Qwen3 chain-of-thought leakage.
 - **vLLM stability:** EngineCore GPU-leak kill on restart; array-built server args; FP8 × prefix-cache gate.
 - **Metric fixes:** `retrieval_hit` now uses a normalized-text fallback (was a false zero); `completeness_bertscore` returns None on empty references (was a negative sentinel).
-- **Compression validity:** `llmlingua` added to requirements + a strict `CAGE_REQUIRE_COMPRESSION=1` mode so the `compressed_rag` arm can never silently no-op again.
+- **Compression validity:** `llmlingua` added to requirements, and compression is now **strict by default** so the `compressed_rag` arm can never silently no-op again. If LLMLingua-2 is unavailable it raises rather than passing through. The live opt-out is `CAGE_ALLOW_NO_COMPRESSION`; `CAGE_DISABLE_COMPRESSION` disables compression entirely (pass-through).
 - **Operations:** a log-preservation suite (`collect_logs.sh`, `log_sync_daemon.sh`, `gcp_shutdown_hook.sh`) and a fail-closed `teardown_vm.sh` that verifies logs reached GCS before deleting a VM.
+
+---
+
+## 8. Credits / prior work
+
+CAGE builds on and positions against a body of prior work; the bib keys below (in `Main.bib`) credit that lineage.
+
+- **Serving engine instrumented:** vLLM / PagedAttention (`kwon2023efficient`). Related cache-aware serving that CAGE positions against: SGLang/RadixAttention (`zheng2024sglang`), DistServe (`zhong2024distserve`), Mooncake (`qin2024mooncake`), LMCache (`lmcache2024`), CacheBlend (`cacheblend2025`), CacheGen (`cachegen2024`, arXiv 2310.07240).
+- **Primary quality metric:** LettuceDetect span-level hallucination detection (`lettucedetect2025`).
+- **RAG-evaluation lineage** CAGE co-measures against: RAGAS (`espejel2023ragas`), ARES (`ares2024`), plus the CRAG factual-QA benchmark (`yang2024crag`).
+- **The "compression carries a measured quality cost" spine:** The Pitfalls of KV Cache Compression (`chen2025pitfalls`) and SCBench (`li2025scbench`, ICLR 2025, Microsoft and University of Surrey, arXiv 2412.10319), the closest cache-plus-quality prior work (no grounding metric, no per-method serving latency).
+- **The CAG-vs-RAG decision CAGE operationalizes:** "Don't Do RAG" / cache-augmented generation (`yu2024dontdorag`).
+- **Compression method run:** LLMLingua-2 for text-side prompt compression (`llmlingua2`).
+
+(Bib keys are mirrored verbatim from the dissertation's `Main.bib` for `\cite` compatibility; a few keys deliberately differ from the paper's first author and are kept unchanged.)

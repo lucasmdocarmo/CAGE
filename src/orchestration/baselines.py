@@ -1,14 +1,22 @@
 """
 Baseline configurations for CAGE benchmarking.
 
-Baselines:
-1. No caching - Full context reprocessing
-2. Prefix caching - Single-node prefix caching
-3. Redis cache - Redis-backed retrieval-artifact cache
-4. Standard RAG - FAISS vector store + retrieval
-5. Distributed cache - Router-mediated multi-replica routing
-6. Hybrid CAG↔RAG - Retrieval cache plus native prefix caching
-7. Speculative baseline scaffold - CLI/config present, backend wiring incomplete
+Nine measured families (the ``BaselineType`` enum below is the source of truth; keep this
+list in sync with it):
+1.  no_cache        - full context reprocessing (worst-case control)
+2.  prefix_cache    - vLLM native prefix caching (server launched with --enable-prefix-caching)
+3.  redis           - Redis-backed RETRIEVAL-ARTIFACT cache (query->doc-ids), NOT a KV cache
+4.  rag             - FAISS + SentenceTransformers dense retrieval
+5.  distributed     - router-mediated multi-replica routing (replicated = real; sharded_context = simulated transfer)
+6.  hybrid          - retrieval-artifact cache + native prefix caching (cold/warm are runtime labels)
+7.  speculative     - measures a server LAUNCHED with speculative decoding; runner records TTFT/TPOT + /metrics acceptance
+8.  compressed_rag  - RAG with LLMLingua-2 text compression of retrieved docs
+9.  compressed_cag  - measures a server LAUNCHED with fp8 KV cache; runner records an analytical footprint
+
+Staleness axis (serving path wired; run a live smoke pass before a full sweep; see
+cloud_docs/STALENESS_BASELINE_DESIGN.md):
+    staleness       - holds cache warmth fixed and sweeps a stale_fraction knob to plot the
+                      serving-win vs grounding-loss curve on CAGE's joint axis.
 """
 
 import importlib.util
@@ -30,6 +38,9 @@ class BaselineType(Enum):
     # Compression axis (Option 3 / 2x2: context source x compression)
     COMPRESSED_RAG = "compressed_rag"  # retrieved docs text-compressed (LLMLingua)
     COMPRESSED_CAG = "compressed_cag"  # cached context KV-compressed (fp8 KV / MLA)
+    # Staleness/freshness axis: sweeps cache-entry AGE at fixed warmth (gold evidence redacted
+    # for the stale fraction). See cloud_docs/STALENESS_BASELINE_DESIGN.md.
+    STALE = "staleness"
 
 
 @dataclass
@@ -73,6 +84,14 @@ class BaselineConfig:
     compress_target_ratio: float = 0.5         # fraction of tokens to KEEP (0.5 = 2x compression)
     kv_cache_dtype: Optional[str] = None        # server-side KV compression: "fp8" | None (compressed_cag)
 
+    # Staleness/freshness axis (scaffold; see cloud_docs/STALENESS_BASELINE_DESIGN.md).
+    # stale_fraction = fraction of served cache hits deliberately bound to an OUTDATED
+    # evidence version; warmth/hit-rate held constant so ONLY cache AGE varies.
+    stale_fraction: float = 0.0                 # 0.0 = all-fresh; 1.0 = all-stale
+    cache_ttl_seconds: Optional[int] = None     # TTL-mode alternative to stale_fraction
+    stale_evidence_mode: str = "version"        # "version" (v0/v1 tag) | "ttl"
+    evidence_version_field: str = "evidence_version"
+
     # Additional metadata
     metadata: Dict[str, Any] = None
     
@@ -101,6 +120,10 @@ class BaselineConfig:
             "compress_method": self.compress_method,
             "compress_target_ratio": self.compress_target_ratio,
             "kv_cache_dtype": self.kv_cache_dtype,
+            "stale_fraction": self.stale_fraction,
+            "cache_ttl_seconds": self.cache_ttl_seconds,
+            "stale_evidence_mode": self.stale_evidence_mode,
+            "evidence_version_field": self.evidence_version_field,
             "metadata": self.metadata or {},
         }
 
@@ -198,6 +221,24 @@ def get_baseline_config(baseline_name: str, **overrides) -> BaselineConfig:
             enable_prefix_caching=True,
             kv_cache_dtype="fp8",
             metadata={"server_side_kv_compression": True, "prefers_gpu": True},
+        ),
+
+        # --- Staleness/freshness axis (SCAFFOLD) ---
+        # Clones the warm hybrid serving path (identical model / decoding / retrieval) and
+        # only varies the AGE/validity of served cache entries via stale_fraction. The path
+        # that actually serves v0 (stale) vs v1 (fresh) evidence is NOT yet wired; the runner
+        # raises a clear NotImplementedError until the evidence-version corpus and the
+        # StaleServingPolicy land. See cloud_docs/STALENESS_BASELINE_DESIGN.md.
+        "staleness": BaselineConfig(
+            baseline_type=BaselineType.STALE,
+            description="Staleness/freshness baseline: warm cache held constant, stale_fraction "
+                        "sweeps cache-entry age (gold evidence redacted for the stale fraction) "
+                        "to plot serving-win vs grounding-loss. See STALENESS_BASELINE_DESIGN.md.",
+            enable_prefix_caching=True,
+            use_faiss=False,  # serves gold-context v0/v1 directly; no retrieval index needed
+            stale_fraction=0.0,
+            stale_evidence_mode="version",
+            metadata={"serving_path_wired": True},
         ),
     }
     

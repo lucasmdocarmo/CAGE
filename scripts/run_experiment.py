@@ -42,6 +42,7 @@ from src.orchestration.ir import (
     CrossEncoderReranker,
 )
 from src.orchestration.redis_cache import RedisConfig, RedisClient, RetrievalCache
+from src.evaluation.staleness import staleness_metrics, select_stale, make_stale_context
 from src.utils.prompting import format_qa_prompt, format_multi_turn_prompt
 from prometheus_client import Counter, Histogram, Gauge, CollectorRegistry, start_http_server
 import os
@@ -751,6 +752,17 @@ def run_experiment(
         baseline_config.compress_target_ratio = compress_ratio
     if kv_cache_dtype is not None:
         baseline_config.kv_cache_dtype = None if kv_cache_dtype == "none" else kv_cache_dtype
+    # Staleness/freshness baseline: the serving path is now WIRED. The v0 (stale) evidence is
+    # generated on the fly from the gold context (answer redacted), so no separate corpus
+    # artifact is needed. stale_fraction is swept via the CAGE_STALE_FRACTION env var (falls
+    # back to the preset default 0.0). NOTE: run a live 5-query smoke pass before a full sweep
+    # (validate-before-run). See cloud_docs/STALENESS_BASELINE_DESIGN.md.
+    if baseline_config.baseline_type.value == "staleness":
+        _sf = os.getenv("CAGE_STALE_FRACTION")
+        if _sf is not None and _sf.strip() != "":
+            baseline_config.stale_fraction = float(_sf)
+        print(f"[staleness] serving path active: stale_fraction={baseline_config.stale_fraction} "
+              f"(evidence_mode={baseline_config.stale_evidence_mode}); sweep via CAGE_STALE_FRACTION")
     print(f"\nBaseline config: {baseline_config.description}")
     
     # Validate speculative baseline requirements
@@ -982,6 +994,8 @@ def run_experiment(
         retrieval_top1_score = None
         retrieved_doc_ids: List[str] = []
         retrieval_reranked = False
+        evidence_version = None    # staleness baseline: "v0" (stale) | "v1" (fresh)
+        served_from_cache = None   # staleness baseline: warm-cache hit flag
 
         # Retrieve when the baseline is retrieval-backed OR when context_source forces
         # retrieved context onto every arm (confound control).
@@ -1060,6 +1074,20 @@ def run_experiment(
         if context_source == "gold":
             used_contexts = list(example.context or [])
 
+        # Staleness/freshness baseline (GATED): hold the warm served context fixed and make a
+        # deterministic fraction of served hits STALE (evidence redacted so it no longer
+        # supports the answer). Only entered for the staleness baseline, so it has zero effect
+        # on the other nine arms. See cloud_docs/STALENESS_BASELINE_DESIGN.md.
+        if baseline_config.baseline_type.value == "staleness":
+            served_from_cache = True  # warm-cache assumption: every query is a served hit
+            _fresh = list(example.context or [])
+            if select_stale(example.id, baseline_config.stale_fraction, seed):
+                evidence_version = "v0"
+                used_contexts = make_stale_context(_fresh, example.answer)
+            else:
+                evidence_version = "v1"
+                used_contexts = _fresh
+
         # Text compression (compressed_rag): compress the context before prompting.
         compression_stats = None
         if context_compressor is not None:
@@ -1084,6 +1112,8 @@ def run_experiment(
             "retrieved_doc_ids": retrieved_doc_ids,
             "retrieval_reranked": retrieval_reranked,
             "compression_stats": compression_stats,
+            "evidence_version": evidence_version,
+            "served_from_cache": served_from_cache,
         }
 
     def record_result(
@@ -1218,6 +1248,12 @@ def run_experiment(
             # Flag degenerate empty answers (e.g. a leading newline under stop=["\n"]) so a
             # systematic empty-output regression is visible, not silently scored as a valid 0.
             "empty_generation": (not response.error) and not (response.generated_text or "").strip(),
+            # Staleness baseline fields (None/False for the other arms): whether this query was
+            # a served cache hit, its evidence version, and whether the answer was grounded.
+            "served_from_cache": meta.get("served_from_cache"),
+            "evidence_version": meta.get("evidence_version"),
+            "grounded": (_quality_row.get("grounding_score") is not None
+                         and (_quality_row.get("grounding_score") or 0.0) >= 0.5),
             "kv_transfer_params": kv_transfer_params_str,
             "routed_replica": response.router_replica or "",
             "retrieval_top1_score": meta["retrieval_top1_score"],
@@ -1763,6 +1799,8 @@ def run_experiment(
         "cache_telemetry": cache_metrics,
         "distributed": distributed_summary,
         "quality": avg_quality,
+        "staleness": (staleness_metrics(results)
+                      if baseline_config.baseline_type.value == "staleness" else None),
         "retrieval": retrieval_summary,
         "prompt_cache": cache_summary,
         "compression_analytical": compression_analytical,
@@ -1799,8 +1837,8 @@ def main():
     parser.add_argument(
         "--baseline",
         required=True,
-        choices=["no_cache", "prefix_cache", "redis", "rag", "distributed", "hybrid", "speculative", "compressed_rag", "compressed_cag"],
-        help="Baseline to evaluate",
+        choices=["no_cache", "prefix_cache", "redis", "rag", "distributed", "hybrid", "speculative", "compressed_rag", "compressed_cag", "staleness"],
+        help="Baseline to evaluate (staleness is a scaffold: see cloud_docs/STALENESS_BASELINE_DESIGN.md)",
     )
     parser.add_argument(
         "--model",

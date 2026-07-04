@@ -1,6 +1,6 @@
 # CAGE Technical Architecture
 
-**Last updated:** 2026-06-28 · **Status:** CURRENT (reflects Phase 1 + Phase 2 code and results)
+**Last updated:** 2026-07-02 · **Status:** CURRENT (reflects Phase 1 + Phase 2 code and results, post-audit)
 
 > **Purpose:** deep technical reference for how the codebase works, how results are generated,
 > how vLLM is integrated, and how every component connects. Written for an AI or developer
@@ -73,7 +73,12 @@ class CAGExample:
     answer: str          # reference answer
     metadata: Dict[str, Any]
 ```
-Loaders: SQuAD v2, HotpotQA, TriviaQA, Natural Questions, MuSiQue (+ code datasets for `code_evaluator`).
+Registry (`get_loader`, `loader.py:802-821`) has **11 loaders**: SQuAD v2, Qasper, HotpotQA, TriviaQA,
+Natural Questions, MuSiQue, CRAG, ShareGPT (8 QA/serving) plus HumanEval, MBPP, `hpc_code` (3 code). The
+loader-header docstring and `download_datasets.py` still list only the older subset; trust the registry.
+- **CRAG** (`loader.py:677-734`): gold `answer` plus retrieved candidate web docs (`search_results`/`contexts`); a RAG-fair retrieval-quality dataset for the `rag`/`compressed_rag` arms (HF path configurable via `CAGE_CRAG_HF_PATH`).
+- **ShareGPT** (`loader.py:737-799`): serving-workload conversation trace with reference-only answers and no extractive gold (`no_gold_answer=True`); the first assistant turn is a similarity-only reference, so quality metrics here are diagnostic, not primary (HF path configurable via `CAGE_SHAREGPT_HF_PATH`).
+
 Gold-context baselines use `example.context`; retrieval baselines (and `--context-source retrieved`)
 ignore it and pull passages from the IR index.
 
@@ -106,10 +111,12 @@ The `compressed_rag` config sets `compress_method="llmlingua2"`, `compress_targe
 ### `src/orchestration/compression.py` - context/prompt compression
 `ContextCompressor` (method `llmlingua2`, lazy-loads `llmlingua.PromptCompressor`). `compress()` returns
 `(compressed_docs, CompressionStats)` with `compression_ratio`, `compression_applied`, token counts.
-**Strict mode (validity fix):** with `CAGE_REQUIRE_COMPRESSION=1`, a missing/failed compressor RAISES
-instead of silently passing through. In Phase 2 `llmlingua` was not installed, so this arm silently
-no-opped (ratio 1.0); `llmlingua` is now in `requirements.txt` and the compression scripts pre-flight
-`import llmlingua` and run strict.
+**Strict by default (validity fix):** a missing/failed compressor RAISES instead of silently passing
+through. The live opt-out is `CAGE_ALLOW_NO_COMPRESSION=1` (a dry-run escape hatch); `CAGE_DISABLE_COMPRESSION=1`
+disables compression entirely (intended pass-through, so strictness is moot). `CAGE_REQUIRE_COMPRESSION` is
+dead: it survives only inside the RuntimeError message strings and is not read anywhere, so do not treat it
+as the live control. In Phase 2 `llmlingua` was not installed, so this arm silently no-opped (ratio 1.0);
+`llmlingua` is now in `requirements.txt` and the compression scripts pre-flight `import llmlingua` and run strict.
 
 ### `src/evaluation/quality.py` - quality metrics
 - **Grounding (LettuceDetect, PRIMARY):** ModernBERT token/span hallucination detector; `grounding_score = 1 − hallucinated_span_ratio`. Disable with `CAGE_DISABLE_LETTUCEDETECT=1` (falls back to NLI).
@@ -131,6 +138,12 @@ can be compared against a full-precision baseline analytically (the compression-
 `VllmTelemetrySampler` is a threaded poller of cage-stats `capture_snapshot()` that runs for the duration
 of a baseline. `.aggregate()` returns peak/avg gauges (GPU util, memory, power, temperature, KV-cache
 utilization, prefix-hit) plus final counters, written to `vllm_telemetry.json`. Enabled with `--vllm-telemetry`.
+**No-mock invariant (hard code guarantee):** telemetry is live-only. The mock/synthetic path was removed;
+`capture_snapshot()` (docstring `vllm_telemetry.py:58-59`) resolves in-process `cage_stats.api` → the
+`cage-stats --once --json` CLI → a dependency-free stdlib `/metrics` scraper, and when no vLLM server is
+reachable it returns `None` rather than any fabricated numbers. On the cage-stats side, `api.py:69-73`
+raises if the scraped payload has no `vllm:` series, preventing an all-zero snapshot from being mistaken
+for real data. CAGE never records synthetic serving telemetry.
 
 ### `src/orchestration/router.py` - distributed router (FastAPI)
 Receives `/v1/completions`, hashes the prompt prefix (`sha256(prompt[:prefix_length])`), maps it to a
@@ -144,9 +157,22 @@ Flushed before cold baselines; warm baselines pre-populate it.
 
 ### `src/orchestration/cache_manager.py` - KV-cache distribution policies
 Defines the policy interface: `REPLICATED` (used now), `SHARDED_TENSOR`, `SHARDED_CONTEXT`, `OFFLOAD_CPU`,
-`OFFLOAD_NVME`. `SimulatedKVCacheManager` derives cross-node transfer bytes/latency analytically from the
-cache footprint and interconnect bandwidth (no tensors move). **Phase 3 replaces this with a real vLLM
-KV connector (LMCache/NIXL) under a sharded policy.** Until then, all transfer numbers are simulated.
+`OFFLOAD_NVME`. `SimulatedKVCacheManager` derives cross-node transfer bytes/latency analytically from a
+hard-coded Llama-3.2-1B KV geometry (`hidden_size 2048 × layers 16 × 2 × 2` bytes/token) and interconnect
+bandwidth, then `asyncio.sleep()`s that latency in the router (no tensors move; `replicated` routing is real
+with zero transfer cost). **Phase 3 replaces this with a real vLLM KV connector (LMCache/NIXL) under a sharded
+policy.** Until then, all `sharded_context` transfer numbers are simulated.
+
+**Planned future baselines (not yet wired; see `cloud_docs/`):**
+- **LMCache KV-store baseline** (`cloud_docs/RELATED_WORK_KVCACHE_STORES.md`): a config-driven KV-block cache
+  via vLLM's `--kv-transfer-config` / `LMCacheConnector`. Unlike CAGE's current Redis (which caches retrieval
+  doc-ids only, not KV), LMCache caches the KV blocks themselves (prefill reuse), and CacheBlend/CacheGen ship
+  inside it as compressed-KV variants; it is the recommended single addition to make the serving half of the
+  joint axis real, and can use the existing Redis as a remote tier.
+- **Staleness / freshness arm** (`cloud_docs/STALENESS_BASELINE_DESIGN.md`): clones the warm `hybrid` serving
+  path and sweeps a single `stale_fraction` (or TTL) knob, holding hit rate fixed while varying the *age* of
+  served cache entries, to plot the serving-win vs grounding-loss curve on a freshness axis no existing arm
+  covers.
 
 ### `src/utils/prompting.py` - prompt templates
 `format_qa_prompt(question, contexts, system_prefix=...)`. The system prefix is identical across requests
@@ -202,9 +228,15 @@ under each context strategy, a cross other frameworks do not measure.
 
 `scripts/statistical_tests.py` reads per-baseline `results.csv`, runs **per-query Wilcoxon** signed-rank
 tests vs a `--reference` baseline (paired by `example_id`; falls back to unpaired Mann-Whitney when shared
-ids are insufficient, e.g. hybrid_warm), applies **Holm** correction, and reports **Cliff's delta** and
+ids are insufficient), applies **Holm** correction, and reports **Cliff's delta** and
 **bootstrap** CIs. Emits a JSON summary (`--output`) and a paper-ready LaTeX table (`--latex-out`).
 Requires scipy. Phase-2 output: `phase2_archive/analysis/all_results/phase2_stats.{json,tex}`.
+
+**Warm-baseline pairing fix (`run_experiment.py:811-816`):** the runner now primes warm baselines by running
+the *same* measured query set once as a discarded warmup pass (`warmup_queries > 0`), so `hybrid_warm` shares
+`example_id`s with the reference and the per-query Wilcoxon stays **paired** instead of degrading to the
+unpaired Mann-Whitney fallback (the Phase-2 unpaired-`hybrid_warm` issue). Cold/warm are runtime labels
+derived from `warmup_queries`, not enum members.
 
 ---
 
@@ -242,8 +274,13 @@ Requires scipy. Phase-2 output: `phase2_archive/analysis/all_results/phase2_stat
 
 ## Configuration files
 - `configs/experiment/*.yaml` - baseline, num_queries, evaluation flags, output dir.
-- `configs/model/*.yaml` - qwen3-4b/8b/14b/30b-a3b, qwen2.5-7b-instruct (name, max_tokens, dtype, hardware).
-- `configs/dataset/*.yaml` - squad_v2, hotpotqa, and the additional loaders.
+- `configs/model/*.yaml` - qwen3-4b/8b/14b/30b-a3b, qwen2.5-7b-instruct, **deepseek-v2-lite** (the MLA/MTP
+  candidate) (name, max_tokens, dtype, hardware).
+- `configs/dataset/*.yaml` - only `squad_v2.yaml` and `hotpotqa.yaml` exist on disk. **The dataset-YAML set
+  lags the loader registry:** the code registry (`loader.py:802-821`) exposes 11 loaders (Qasper, CRAG,
+  ShareGPT, TriviaQA, NQ, MuSiQue, and the code sets included), but those extra datasets are loader-only and
+  are selected directly via `--dataset <name>`; they have no matching YAML. Do not infer the available
+  datasets from the `configs/dataset/` directory.
 
 ---
 

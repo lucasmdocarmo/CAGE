@@ -38,7 +38,7 @@ speculative per model), with the speculative axis doubled across the two models.
 - ONE on-demand GPU VM: `g2-standard-8` (8 vCPU / 32 GB) + 1x `nvidia-l4` (24 GB),
   zone `us-central1-a`, project `cage-framework`. This is Path A in the RUNBOOK.
 - T=0 greedy as the main decoding protocol (Section 2).
-- SQuAD v2 for Phase-2 continuity, 300 queries per baseline (locked count,
+- SQuAD v2 for Phase-2 continuity, 500 queries per baseline (locked count,
   `RERUN_DESIGN.md:13`).
 - LettuceDetect-primary metric hierarchy and the full statistics stack (Section 4).
 
@@ -95,22 +95,22 @@ OPEN DECISION (must be locked before the run): `RERUN_DESIGN.md:108-112` flags t
 `4_METHODOLOGY.tex:144` already writes it as settled. Confirm and lock so the design doc
 and methodology agree before launch.
 
-### The 300 x 3 count and where it lives
+### The 500 x 3 count and where it lives
 
-- 300 queries per baseline is the LOCKED design count (`RERUN_DESIGN.md:13`,
+- 500 queries per baseline is the LOCKED design count (`RERUN_DESIGN.md:13`,
   justified vs cited norms: RAGAS 50, ARES ~150, CacheBlend 150-200, under RULER 500).
 - 3 trials for the serving portion (per Section 2 above).
 
-CRITICAL SCALE DRIFT: no script defaults to 300 x 3. `cloud_run.sh:38-39` defaults
+CRITICAL SCALE DRIFT: no script defaults to 500 x 3. `cloud_run.sh:38-39` defaults
 100 queries / 10 trials; `run_compression.sh:24-25` 100/3; `run_speculative_matrix.sh:35-36`
 100/1; `run_phase1.sh:15-16` 50/3. The full design MUST be passed explicitly to every
-script (`NUM_QUERIES=300 NUM_TRIALS=3`, and positional `Qwen/Qwen3-8B 300 3` for
+script (`NUM_QUERIES=500 NUM_TRIALS=3`, and positional `Qwen/Qwen3-8B 500 3` for
 `cloud_run.sh`) or the re-run silently reproduces the prior under-powered counts. The
 `cloud_run.sh` 10-trial default is unusually high and would inflate cost if not overridden.
 
-MANUSCRIPT DRIFT (fix before integrating results): "300 queries x 3 trials" is stated
+MANUSCRIPT DRIFT (fix before integrating results): "500 queries x 3 trials" is stated
 only in `7_CONCLUSIONS.tex:14`, never in `4_METHODOLOGY.tex`; and `6_RESULTS.tex:41`
-still carries a stale "n=50 queries, 3 trials" Phase-1 caption. Reconcile both to 300.
+still carries a stale "n=50 queries, 3 trials" Phase-1 caption. Reconcile both to 500.
 
 ---
 
@@ -353,7 +353,7 @@ the bucket is kept after teardown, so it is not part of the run-cost estimate
 
 Full Phase-2 re-run projection (on-demand, conservative ~$1.20/hr all-in):
 ~7-12 hours wall-clock, ~$8-15 total; mid-point ~9-10 h / ~$11-12. At GPU-only
-~$0.85/hr the range is ~$6-10. Scaling logic from the ~$3.1 / ~2.6 h prior: 3x for 300
+~$0.85/hr the range is ~$6-10. Scaling logic from the ~$3.1 / ~2.6 h prior: 3x for 500
 queries (query count dominates wall-clock), the 3-trial serving CIs, a SECOND model
 (MiMo-7B-RL) for the speculative 2x2, the FP8 2x2 + per-cell speculative server
 relaunches, plus one-time model-load / index-build / setup overhead.
@@ -472,7 +472,7 @@ an open deliverable.
   - (e) NO mock anywhere: `CAGE_TELEMETRY_MOCK` unset/0.
   Abort the run if any of (a)-(e) fails.
 - GATE 3 (smoke run, small `num_queries` on the SAME L4): execute the suite end-to-end at
-  reduced scale and inspect artifacts before committing to 300x3. This single smoke pass
+  reduced scale and inspect artifacts before committing to 500x3. This single smoke pass
   carries gates 4-8.
 - GATE 4 (smoke - speculative acceptance non-null): a speculative cell's
   `vllm_telemetry.json` has a non-null `spec_decode_acceptance_rate` (M1/M2 +
@@ -500,7 +500,7 @@ an open deliverable.
   (B5/M8) - that is a HARD gate failure for the MiMo speculative 2x2, resolve before the
   full run. This is the single highest-risk unknown for Phase 2.
 - GATE 9 (proceed to full run only after gates 0-8 pass): run the core suite first, then
-  compression, then both speculative-matrix model runs, then stats, at 300 x 3.
+  compression, then both speculative-matrix model runs, then stats, at 500 x 3.
 
 ---
 
@@ -552,22 +552,22 @@ Steps run from the WORKSTATION unless marked (VM).
    and confirm the mtp cell does NOT write `STATUS=failed reason=server`. Capture the
    exact working spec JSON (or `MIMO_MTP_CONFIG` override) here.
 10. CORE SUITE (VM, full scale 300q x 3, nohup survives SSH drops, own sync loop):
-    `nohup bash scripts/cloud_run.sh Qwen/Qwen3-8B 300 3 > run.log 2>&1 &` ; `tail -f run.log`.
+    `nohup bash scripts/cloud_run.sh Qwen/Qwen3-8B 500 3 > run.log 2>&1 &` ; `tail -f run.log`.
     Produces `analysis/phase1/results/{no_cache,prefix_cache,rag,redis_retrieval_cache_cold,hybrid_retrieval_cache_cold,hybrid_retrieval_cache_warm}`.
     Wait for `[cage] suite complete`. (Canonical doc example is `100 10`; override to
-    `300 3` per this plan.)
+    `500 3` per this plan.)
 11. COMPRESSION 2x2 (VM, separate lever, FP8xprefix gate then llmlingua gate first;
     aborts if either fails):
-    `NUM_QUERIES=300 NUM_TRIALS=3 nohup bash scripts/run_compression.sh Qwen/Qwen3-8B > compression.log 2>&1 &`
+    `NUM_QUERIES=500 NUM_TRIALS=3 nohup bash scripts/run_compression.sh Qwen/Qwen3-8B > compression.log 2>&1 &`
     ; `tail -f compression.log`. Produces
     `analysis/compression/results/{cag_full,rag_full,compressed_rag,compressed_cag}`.
 12. SPECULATIVE MATRIX - Qwen3-8B (VM, each cell restarts the server):
-    `NUM_QUERIES=300 NUM_TRIALS=3 nohup bash scripts/run_speculative_matrix.sh Qwen/Qwen3-8B > spec_qwen.log 2>&1 &`
+    `NUM_QUERIES=500 NUM_TRIALS=3 nohup bash scripts/run_speculative_matrix.sh Qwen/Qwen3-8B > spec_qwen.log 2>&1 &`
     ; `tail -f spec_qwen.log`. Produces
     `analysis/speculative_matrix/spec_qwen8b_{ngram_cag,ngram_rag,eagle3_cag,eagle3_rag}`.
     Wait for `SPECULATIVE_MATRIX_DONE`.
 13. SPECULATIVE MATRIX - MiMo-7B-RL (VM, AFTER Qwen; full-scale `mimo_mtp` exercise):
-    `NUM_QUERIES=300 NUM_TRIALS=3 nohup bash scripts/run_speculative_matrix.sh XiaomiMiMo/MiMo-7B-RL > spec_mimo.log 2>&1 &`
+    `NUM_QUERIES=500 NUM_TRIALS=3 nohup bash scripts/run_speculative_matrix.sh XiaomiMiMo/MiMo-7B-RL > spec_mimo.log 2>&1 &`
     ; `tail -f spec_mimo.log`. Produces
     `analysis/speculative_matrix/spec_mimo7b_{ngram_cag,ngram_rag,mtp_cag,mtp_rag}`. A
     rejected mtp method writes `STATUS=failed` (loud), not a silent hole.
@@ -627,8 +627,8 @@ per-model output dir or a sequential model run with a results move.
 - Recreate `gs://cage-framework-cage-results` (mb + versioning) and grant the VM SA
   `roles/storage.objectAdmin` BEFORE any run; the bucket is currently absent (live 0
   buckets). Confirm `teardown_vm.sh`'s `COLLECT_OK` sentinel path points at it.
-- Lock the scale at 300 queries x 3 trials and pass it explicitly to `cloud_run.sh`
-  (positional `Qwen/Qwen3-8B 300 3`), `run_compression.sh`, and
+- Lock the scale at 500 queries x 3 trials and pass it explicitly to `cloud_run.sh`
+  (positional `Qwen/Qwen3-8B 500 3`), `run_compression.sh`, and
   `run_speculative_matrix.sh`. No script defaults to it.
 - Live-validate MiMo `mimo_mtp` on stock vLLM 0.11.0 during the smoke run (Gate 8) and
   capture the exact working spec JSON or the `MIMO_MTP_CONFIG` override before the full
@@ -661,7 +661,7 @@ per-model output dir or a sequential model run with a results move.
 - Author a single runnable live-infra preflight that asserts Gate 2 (a)-(e) together and
   exits non-zero on failure, codifying the user-mandated check.
 - Update `PHASE2_CHECKLIST.md` or mark it superseded: Spot -> on-demand (line 31),
-  100x10 -> 300x3 (line 45), nine baselines -> fourteen result sets (lines 16, 68).
+  100x10 -> 500x3 (line 45), nine baselines -> fourteen result sets (lines 16, 68).
 
 ### Manuscript deliverables (feeding the dissertation)
 
@@ -670,7 +670,7 @@ per-model output dir or a sequential model run with a results move.
 - Add `\cite{qwen3report}` and `\cite{mimo2025}` at the model introduction in
   `4_METHODOLOGY.tex:167`; add a LettuceDetect citation beside the primary grounding
   metric at `4_METHODOLOGY.tex:104-106`.
-- Add the explicit "300 queries x 3 trials" count to `4_METHODOLOGY.tex` (currently only
+- Add the explicit "500 queries x 3 trials" count to `4_METHODOLOGY.tex` (currently only
   `7_CONCLUSIONS.tex:14`) and fix the stale "n=50 queries" caption at `6_RESULTS.tex:41`.
 - Rebuild the bibliography once so the four newly added keys resolve
   (`RERUN_DESIGN.md:139-140`).
