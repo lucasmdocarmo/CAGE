@@ -758,6 +758,15 @@ def run_experiment(
     # back to the preset default 0.0). NOTE: run a live 5-query smoke pass before a full sweep
     # (validate-before-run). See cloud_docs/STALENESS_BASELINE_DESIGN.md.
     if baseline_config.baseline_type.value == "staleness":
+        # TTL mode is NOT IMPLEMENTED. The only wired staleness path is the deterministic
+        # version sweep (stale_fraction -> v0/v1). Fail loud rather than silently ignoring a
+        # ttl request and running version mode instead (a silent-mismatch validity bug).
+        if baseline_config.stale_evidence_mode == "ttl" or baseline_config.cache_ttl_seconds is not None:
+            raise NotImplementedError(
+                "staleness: stale_evidence_mode='ttl' / cache_ttl_seconds is not implemented. "
+                "The wired path is the deterministic version sweep driven by stale_fraction "
+                "(CAGE_STALE_FRACTION). Use stale_evidence_mode='version'."
+            )
         _sf = os.getenv("CAGE_STALE_FRACTION")
         if _sf is not None and _sf.strip() != "":
             baseline_config.stale_fraction = float(_sf)

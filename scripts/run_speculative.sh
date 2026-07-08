@@ -4,7 +4,7 @@
 # consistent at Qwen3-8B (a draft model would OOM alongside 8B on a 24GB L4).
 # Speculative decoding is output-lossless, so quality should match no_cache; the
 # payoff is in TTFT/throughput + the /metrics acceptance rate (via cage-stats).
-# 100 queries / 1 trial to match the rest of the Phase-2 run.
+# 500 queries / 3 trials to match the rest of the Phase-2 run.
 set -uo pipefail
 cd "$HOME/CAGE"
 source cage-env/bin/activate
@@ -18,8 +18,8 @@ echo "[spec] waiting for any in-flight run to finish..."
 while pgrep -f run_compression.sh >/dev/null 2>&1; do sleep 20; done
 while pgrep -f "baseline compressed" >/dev/null 2>&1; do sleep 20; done
 
-export NUM_QUERIES=100
-export NUM_TRIALS=1
+export NUM_QUERIES=500
+export NUM_TRIALS=3
 export SEED=42
 export TARGET_MODEL=Qwen/Qwen3-8B
 export DRAFT_MODEL=Qwen/Qwen3-8B   # unused with ngram; keep consistent

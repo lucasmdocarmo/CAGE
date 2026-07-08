@@ -42,7 +42,7 @@
   - use **Qwen3-4B** for the FP8 / speculative arms (`MODEL=Qwen/Qwen3-4B`).
 
 **3. Run the core suite (7 baselines, telemetry, continuous GCS sync).**
-- [ ] `nohup bash scripts/cloud_run.sh Qwen/Qwen3-8B 100 10 > run.log 2>&1 &`
+- [ ] `nohup bash scripts/cloud_run.sh Qwen/Qwen3-8B 500 3 > run.log 2>&1 &`
 - [ ] Confirm `analysis/phase1/...` fills with per-baseline `metrics.json` + `vllm_telemetry.json`, and that results mirror to `gs://<project>-cage-results`.
 
 **4. FP8 × prefix-cache gate (guards the compression confound).**

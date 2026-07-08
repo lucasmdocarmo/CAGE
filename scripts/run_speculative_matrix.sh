@@ -13,7 +13,8 @@
 #   MODEL defaults to Qwen/Qwen3-8B. Run ONCE PER MODEL to cover both speculative families:
 #     bash scripts/run_speculative_matrix.sh Qwen/Qwen3-8B
 #     bash scripts/run_speculative_matrix.sh XiaomiMiMo/MiMo-7B-RL
-#   Override counts for the full design:  NUM_QUERIES=300 NUM_TRIALS=3 bash ... <MODEL>
+#   Defaults to the full design (500 queries x 3 trials); override for a smoke, e.g.
+#     NUM_QUERIES=5 NUM_TRIALS=1 bash scripts/run_speculative_matrix.sh <MODEL>
 #
 # IMPORTANT: the MiMo MTP method string ("mimo_mtp") MUST be live-validated on vLLM 0.11.0
 # during the smoke run -- if vLLM rejects it, the server won't start and the cell is marked
@@ -32,8 +33,8 @@ mkdir -p "$OUT"
 
 MODEL="${1:-Qwen/Qwen3-8B}"
 DATASET="${DATASET:-squad_v2}"
-NUM_QUERIES="${NUM_QUERIES:-100}"
-NUM_TRIALS="${NUM_TRIALS:-1}"
+NUM_QUERIES="${NUM_QUERIES:-500}"
+NUM_TRIALS="${NUM_TRIALS:-3}"
 SEED="${SEED:-42}"
 
 export VLLM_ENFORCE_EAGER=1

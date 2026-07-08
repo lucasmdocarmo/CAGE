@@ -15,7 +15,7 @@
 #   bash scripts/setup/setup_gpu_cloud.sh
 # Then:
 #   source cage-env/bin/activate
-#   nohup bash scripts/cloud_run.sh Qwen/Qwen3-8B 100 10 > run.log 2>&1 &
+#   nohup bash scripts/cloud_run.sh Qwen/Qwen3-8B 500 3 > run.log 2>&1 &
 #
 # See cloud_docs/PHASE2_CHECKLIST.md for the full ordered procedure.
 # =============================================================================
@@ -100,7 +100,7 @@ echo
 echo "[cage] ============================================================"
 echo "[cage]  Bootstrap complete. Next:"
 echo "[cage]    source cage-env/bin/activate"
-echo "[cage]    nohup bash scripts/cloud_run.sh Qwen/Qwen3-8B 100 10 > run.log 2>&1 &"
+echo "[cage]    nohup bash scripts/cloud_run.sh Qwen/Qwen3-8B 500 3 > run.log 2>&1 &"
 echo "[cage]  Launch-time levers (run from their own scripts, they restart the server):"
 echo "[cage]    bash scripts/run_compression.sh Qwen/Qwen3-8B   # FP8 2x2 (gates FP8 x prefix-cache)"
 echo "[cage]    bash scripts/run_phase5.sh                      # speculative decoding"

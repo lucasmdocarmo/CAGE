@@ -136,7 +136,7 @@ rm -rf experiments/ir_index/ir_squad_v2_*
 ### 2.4 Run — start the suite (auto‑telemetry, auto‑GCS‑sync)
 Still in the same SSH terminal, inside `cage`:
 ```bash
-nohup bash scripts/cloud_run.sh Qwen/Qwen3-8B 100 10 > run.log 2>&1 &
+nohup bash scripts/cloud_run.sh Qwen/Qwen3-8B 500 3 > run.log 2>&1 &
 tail -f run.log
 ```
 - `nohup … &` keeps it running even if the SSH window closes.

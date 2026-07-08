@@ -342,7 +342,7 @@ export HF_TOKEN=hf_xxx                        # if gated
 # 3. Run the suite + continuous GCS sync (nohup survives SSH drops):
 #    Telemetry is auto-captured (cloud_run.sh sets VLLM_TELEMETRY=1) ->
 #    each baseline writes <output>/vllm_telemetry.json, mirrored to GCS.
-nohup bash scripts/cloud_run.sh Qwen/Qwen3-8B 100 10 > run.log 2>&1 &
+nohup bash scripts/cloud_run.sh Qwen/Qwen3-8B 500 3 > run.log 2>&1 &
 tail -f run.log
 ```
 `cloud_run.sh` starts Redis, runs the 6 single-server baselines on the local GPU vLLM, and
@@ -450,7 +450,7 @@ open issues (full detail in [`VALIDATION_AND_SOTA_REVIEW.md`](VALIDATION_AND_SOT
 | Local full Phase 1 | `bash scripts/run_phase1.sh` |
 | Bigger sweep | `NUM_QUERIES=100 NUM_TRIALS=10 bash scripts/run_phase1.sh Qwen/Qwen3-8B` |
 | Single baseline | `python3 scripts/run_experiment.py --baseline rag --model … --dataset squad_v2 --num-queries 50 --num-trials 3` |
-| Cloud run + persist | `nohup bash scripts/cloud_run.sh Qwen/Qwen3-8B 100 10 > run.log 2>&1 &` |
+| Cloud run + persist | `nohup bash scripts/cloud_run.sh Qwen/Qwen3-8B 500 3 > run.log 2>&1 &` |
 | Sync results to GCS | `bash scripts/sync_results_to_gcs.sh analysis` |
 | Pull results back | `gsutil -m cp -r gs://<project>-cage-results/analysis ./analysis` |
 | Significance tests | `python3 scripts/statistical_tests.py --results-dir analysis/phase1/results` |

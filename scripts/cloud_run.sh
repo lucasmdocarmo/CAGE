@@ -13,8 +13,8 @@
 # Usage:
 #   nohup bash scripts/cloud_run.sh [MODEL] [NUM_QUERIES] [NUM_TRIALS] > run.log 2>&1 &
 #     MODEL        HF model (default: Qwen/Qwen3-8B)
-#     NUM_QUERIES  queries per trial (default: 100)
-#     NUM_TRIALS   trials per baseline (default: 10)
+#     NUM_QUERIES  queries per trial (default: 500)
+#     NUM_TRIALS   trials per baseline (default: 3)
 #   env:
 #     ENABLE_DISTRIBUTED  0 = skip the local 3-replica distributed baseline (default; it
 #                         needs ~3x the VRAM and OOMs a single 24GB L4). Set 1 only on a
@@ -35,8 +35,8 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
 MODEL="${1:-Qwen/Qwen3-8B}"
-NUM_QUERIES="${2:-100}"
-NUM_TRIALS="${3:-10}"
+NUM_QUERIES="${2:-500}"
+NUM_TRIALS="${3:-3}"
 SYNC_DIR="${SYNC_DIR:-analysis}"
 SYNC_INTERVAL="${SYNC_INTERVAL:-120}"
 # Single-GPU-safe default: skip the VRAM-hungry local distributed baseline.

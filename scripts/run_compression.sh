@@ -21,7 +21,7 @@ source "$SCRIPT_DIR/_log_guard.sh"
 
 MODEL="${1:-Qwen/Qwen3-4B}"
 DATASET="${DATASET:-squad_v2}"
-NUM_QUERIES="${NUM_QUERIES:-100}"
+NUM_QUERIES="${NUM_QUERIES:-500}"
 NUM_TRIALS="${NUM_TRIALS:-3}"
 SEED="${SEED:-42}"
 SKIP_GATE="${SKIP_GATE:-0}"

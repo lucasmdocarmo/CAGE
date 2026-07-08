@@ -88,8 +88,8 @@ class BaselineConfig:
     # stale_fraction = fraction of served cache hits deliberately bound to an OUTDATED
     # evidence version; warmth/hit-rate held constant so ONLY cache AGE varies.
     stale_fraction: float = 0.0                 # 0.0 = all-fresh; 1.0 = all-stale
-    cache_ttl_seconds: Optional[int] = None     # TTL-mode alternative to stale_fraction
-    stale_evidence_mode: str = "version"        # "version" (v0/v1 tag) | "ttl"
+    cache_ttl_seconds: Optional[int] = None     # RESERVED / NOT IMPLEMENTED; wired path uses stale_fraction
+    stale_evidence_mode: str = "version"        # "version" (v0/v1 tag) is the ONLY wired mode; "ttl" NOT IMPLEMENTED (run_experiment raises)
     evidence_version_field: str = "evidence_version"
 
     # Additional metadata
@@ -223,12 +223,13 @@ def get_baseline_config(baseline_name: str, **overrides) -> BaselineConfig:
             metadata={"server_side_kv_compression": True, "prefers_gpu": True},
         ),
 
-        # --- Staleness/freshness axis (SCAFFOLD) ---
+        # --- Staleness/freshness axis (WIRED, version mode) ---
         # Clones the warm hybrid serving path (identical model / decoding / retrieval) and
-        # only varies the AGE/validity of served cache entries via stale_fraction. The path
-        # that actually serves v0 (stale) vs v1 (fresh) evidence is NOT yet wired; the runner
-        # raises a clear NotImplementedError until the evidence-version corpus and the
-        # StaleServingPolicy land. See cloud_docs/STALENESS_BASELINE_DESIGN.md.
+        # only varies the AGE/validity of served cache entries via stale_fraction. The path is
+        # WIRED: run_experiment serves v0 (stale, answer span redacted) vs v1 (fresh) evidence
+        # on the fly for the chosen stale_fraction (version mode). The "ttl" mode is NOT
+        # implemented (run_experiment raises). Run a live 5-query smoke before a full sweep.
+        # See cloud_docs/STALENESS_BASELINE_DESIGN.md.
         "staleness": BaselineConfig(
             baseline_type=BaselineType.STALE,
             description="Staleness/freshness baseline: warm cache held constant, stale_fraction "
