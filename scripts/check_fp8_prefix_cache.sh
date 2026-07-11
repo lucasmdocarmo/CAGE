@@ -9,7 +9,7 @@
 # This launches vLLM with fp8 + prefix caching, sends a long repeated prefix twice, and checks
 # that usage.prompt_tokens_details.cached_tokens > 0 on the second request.
 #   PASS (exit 0) = safe to run compressed_cag.   FAIL (exit 1) = do NOT trust compressed_cag.
-# GPU-only (FP8 KV needs a CUDA device). See cloud_docs/VLLM_COMPATIBILITY.md sec 4.
+# GPU-only (FP8 KV needs a CUDA device). See Cloud/VLLM_COMPATIBILITY.md sec 4.
 # =============================================================================
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -51,6 +51,6 @@ if [ "$RESULT" -gt 0 ]; then
     exit 0
 else
     echo ">>> [gate] FAIL — cached_tokens=0 under FP8: prefix caching is OFF, so compressed_cag would be confounded."
-    echo "          Pin a vLLM where they coexist (cloud_docs/VLLM_COMPATIBILITY.md sec 4)."
+    echo "          Pin a vLLM where they coexist (Cloud/VLLM_COMPATIBILITY.md sec 4)."
     exit 1
 fi

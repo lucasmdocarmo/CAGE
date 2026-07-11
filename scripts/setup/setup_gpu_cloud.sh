@@ -17,11 +17,11 @@
 #   source cage-env/bin/activate
 #   nohup bash scripts/cloud_run.sh Qwen/Qwen3-8B 500 3 > run.log 2>&1 &
 #
-# See cloud_docs/PHASE2_CHECKLIST.md for the full ordered procedure.
+# See Cloud/PHASE2_CHECKLIST.md for the full ordered procedure.
 # =============================================================================
 set -euo pipefail
 
-# Keep in sync with cloud_docs/VLLM_COMPATIBILITY.md (the single pinned version).
+# Keep in sync with Cloud/VLLM_COMPATIBILITY.md (the single pinned version).
 VLLM_VERSION="${VLLM_VERSION:-0.11.0}"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$PROJECT_DIR"
@@ -103,6 +103,6 @@ echo "[cage]    source cage-env/bin/activate"
 echo "[cage]    nohup bash scripts/cloud_run.sh Qwen/Qwen3-8B 500 3 > run.log 2>&1 &"
 echo "[cage]  Launch-time levers (run from their own scripts, they restart the server):"
 echo "[cage]    bash scripts/run_compression.sh Qwen/Qwen3-8B   # FP8 2x2 (gates FP8 x prefix-cache)"
-echo "[cage]    bash scripts/run_phase5.sh                      # speculative decoding"
-echo "[cage]  Full procedure + definition of done: cloud_docs/PHASE2_CHECKLIST.md"
+echo "[cage]    bash scripts/run_speculative_matrix.sh Qwen/Qwen3-8B   # speculative 2x2 (repeat for MiMo-7B-RL)"
+echo "[cage]  Full procedure + definition of done: Cloud/PHASE2_CHECKLIST.md"
 echo "[cage] ============================================================"

@@ -256,7 +256,7 @@ resource "google_compute_instance" "vllm_replica" {
 
   boot_disk {
     initialize_params {
-      image = "deeplearning-platform-release/common-cu121-v20240128-debian-11"
+      image = "deeplearning-platform-release/common-cu121-debian-11"
       size  = var.disk_size_gb
       type  = "pd-ssd"
     }
@@ -287,6 +287,11 @@ resource "google_compute_instance" "vllm_replica" {
     # CRITICAL: tells the DLVM image to install the NVIDIA kernel driver on first
     # boot. Without this, `docker run --gpus all` fails and vLLM never starts.
     install-nvidia-driver = "True"
+
+    # Sync results + logs to GCS on ACPI soft-off (SPOT preemption ~30s budget, or a normal
+    # instances delete/stop), so data is captured even when no operator is watching and the
+    # run-script EXIT trap never fires. See scripts/gcp_shutdown_hook.sh.
+    shutdown-script = file("${path.module}/../../scripts/gcp_shutdown_hook.sh")
 
     startup-script = <<-EOF
       #!/bin/bash

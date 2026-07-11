@@ -76,6 +76,10 @@ class QualityMetrics:
     hallucinated_span_ratio: Optional[float] = None  # 0-1, fraction of answer characters flagged unsupported
     supported_claim_ratio: Optional[float] = None  # 0-1, fraction of claims with entailment >= 0.5
     faithfulness_method: str = "nli_claim_max"  # provenance of the faithfulness number
+    # Evidence-only, NOT a metric: raw LettuceDetect answer spans flagged unsupported, for the
+    # per-query qa_evidence.jsonl. Deliberately EXCLUDED from to_dict() so it never becomes a
+    # CSV column or enters metric aggregation. None when the detector is unavailable.
+    hallucinated_spans: Optional[List[Dict[str, Any]]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary. Numeric fields are auto-aggregated downstream."""
@@ -475,6 +479,7 @@ class QualityEvaluator:
             "grounding_score": None,
             "hallucination_detected": None,
             "hallucinated_span_ratio": None,
+            "hallucinated_spans": None,
         }
         detector = self.lettucedetect_model
         answer = generated_text or ""
@@ -498,10 +503,16 @@ class QualityEvaluator:
                     flagged += min(end, total) - min(start, total)
             ratio = (flagged / total) if total > 0 else 0.0
             ratio = max(0.0, min(1.0, ratio))
+            norm_spans = [
+                {"start": int(s.get("start", 0)), "end": int(s.get("end", 0)),
+                 "text": s.get("text")}
+                for s in (spans or [])
+            ]
             return {
                 "grounding_score": 1.0 - ratio,
                 "hallucination_detected": bool(spans),
                 "hallucinated_span_ratio": ratio,
+                "hallucinated_spans": norm_spans,
             }
         except Exception as e:
             print(f"Error in LettuceDetect hallucination detection: {e}")
@@ -712,6 +723,7 @@ class QualityEvaluator:
             hallucination_detected=halluc["hallucination_detected"],
             hallucinated_span_ratio=halluc["hallucinated_span_ratio"],
             supported_claim_ratio=faith["supported_claim_ratio"],
+            hallucinated_spans=halluc.get("hallucinated_spans"),
         )
     
     def batch_evaluate(

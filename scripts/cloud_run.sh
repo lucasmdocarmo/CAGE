@@ -4,7 +4,7 @@
 # IMPORTANT: run this ON A GPU VM (it starts a local vLLM server via run_phase1.sh).
 # Do NOT run it on the CPU router of the multi-VM Terraform cluster. For the *distributed*
 # baseline against that cluster, use run_experiment.py + sync_results_to_gcs.sh instead
-# (see cloud_docs/RUNBOOK.md §9, Path B).
+# (see Cloud/RUNBOOK.md §9, Path B).
 #
 # Results are mirrored to the durable GCS bucket every SYNC_INTERVAL seconds (and at exit),
 # so an SSH drop, VM preemption, or VM delete cannot lose a finished baseline. Pair with
@@ -26,8 +26,8 @@
 # Launch-time levers (compressed_cag FP8 / speculative) need a server relaunch with an env var,
 # so run those via their own scripts instead of this suite:
 #     compression 2x2:  bash scripts/run_compression.sh $MODEL   (gates FP8 x prefix-caching)
-#     speculative:      bash scripts/run_phase5.sh
-# The vLLM image is pinned to v0.11.0 — see cloud_docs/VLLM_COMPATIBILITY.md.
+#     speculative:      bash scripts/run_speculative_matrix.sh $MODEL   (per model; gates native draft)
+# The vLLM image is pinned to v0.11.0 — see Cloud/VLLM_COMPATIBILITY.md.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,11 +44,22 @@ export ENABLE_DISTRIBUTED="${ENABLE_DISTRIBUTED:-0}"
 
 # vLLM telemetry via cage-stats: auto-capture on cloud (set VLLM_TELEMETRY=0 to disable).
 export VLLM_TELEMETRY="${VLLM_TELEMETRY:-1}"
-# Resolve cage-stats for the in-process telemetry path if it isn't pip-installed.
+# Resolve cage-stats for the in-process telemetry path if it isn't pip-installed, and put it on
+# PYTHONPATH so both the importability check below AND the run_experiment.py subprocess find it.
 if [ -z "${CAGE_STATS_HOME:-}" ] && [ -d "$PROJECT_DIR/../cage-stats/cage_stats" ]; then
   export CAGE_STATS_HOME="$(cd "$PROJECT_DIR/../cage-stats" && pwd)"
 fi
+[ -n "${CAGE_STATS_HOME:-}" ] && export PYTHONPATH="${CAGE_STATS_HOME}:${PYTHONPATH:-}"
 if [ "$VLLM_TELEMETRY" != "0" ]; then
+  # Fail loud rather than run the whole suite producing spec-decode-only telemetry we cannot
+  # use to build the cache/KV figures (rich fields come ONLY from an importable cage-stats).
+  if ! python3 -c "import cage_stats.api" 2>/dev/null; then
+    echo "[cage] FATAL: --vllm-telemetry is ON but 'cage_stats.api' is not importable." >&2
+    echo "[cage]   Rich vLLM telemetry (cached_tokens / prefix-hit / KV usage) would degrade to" >&2
+    echo "[cage]   spec-decode-only. Fix: pip install -e ../cage-stats (or set CAGE_STATS_HOME)," >&2
+    echo "[cage]   or rerun with VLLM_TELEMETRY=0." >&2
+    exit 1
+  fi
   echo "[cage] vLLM telemetry ON (cage-stats${CAGE_STATS_HOME:+ @ $CAGE_STATS_HOME}) -> per-baseline vllm_telemetry.json"
 fi
 

@@ -31,6 +31,10 @@ source scripts/_log_guard.sh
 OUT="$HOME/CAGE/analysis/speculative_matrix"
 mkdir -p "$OUT"
 
+# Stop the vLLM server on ANY exit so it does not linger holding ~all VRAM until teardown
+# (and so an early hard error does not orphan it). Matches run_phase1.sh's cleanup discipline.
+trap 'bash scripts/manage_vllm_server.sh stop >/dev/null 2>&1 || true' EXIT
+
 MODEL="${1:-Qwen/Qwen3-8B}"
 DATASET="${DATASET:-squad_v2}"
 NUM_QUERIES="${NUM_QUERIES:-500}"
@@ -74,7 +78,16 @@ FAILED=()
 
 run_cell() {  # <spec_json> <label> <context_source>
   local spec="$1" label="$2" ctx="$3"
-  echo "=== CELL $label  (ctx=$ctx)  $(date) ==="
+  # Record the TRUE mechanism in the manifest: parse method/tokens/draft-model from the spec
+  # JSON and pass them as flags, so baseline_config.speculative_method matches what the server
+  # actually launched (otherwise it defaults to 'draft_model' and the provenance is lost).
+  local method tokens draft_model
+  method=$(SPEC="$spec" python3 -c "import json,os;print(json.loads(os.environ['SPEC']).get('method','draft_model'))" 2>/dev/null || echo draft_model)
+  tokens=$(SPEC="$spec" python3 -c "import json,os;print(json.loads(os.environ['SPEC']).get('num_speculative_tokens',5))" 2>/dev/null || echo 5)
+  draft_model=$(SPEC="$spec" python3 -c "import json,os;print(json.loads(os.environ['SPEC']).get('model',''))" 2>/dev/null || echo "")
+  local spec_model_flag=()
+  [ -n "$draft_model" ] && spec_model_flag+=(--speculative-model "$draft_model")
+  echo "=== CELL $label  (ctx=$ctx)  method=$method tokens=$tokens  $(date) ==="
   # A failed launch / run writes a STATUS sentinel so a missing cell is LOUD in the stats
   # consolidation rather than silently absent (and the 2x2 reported as complete with a hole).
   if ! VLLM_SPECULATIVE_CONFIG="$spec" bash scripts/manage_vllm_server.sh restart "$MODEL"; then
@@ -87,6 +100,7 @@ run_cell() {  # <spec_json> <label> <context_source>
   sleep 10
   if ! python3 scripts/run_experiment.py --baseline speculative --baseline-label "$label" \
       --model "$MODEL" --dataset "$DATASET" --num-queries "$NUM_QUERIES" --num-trials "$NUM_TRIALS" --seed "$SEED" \
+      --speculative-method "$method" --num-speculative-tokens "$tokens" ${spec_model_flag[@]+"${spec_model_flag[@]}"} \
       --context-source "$ctx" --vllm-telemetry --output-dir "$OUT/$label"; then
     echo "CELL $label RUN-FAIL"
     mkdir -p "$OUT/$label"
@@ -99,8 +113,40 @@ run_cell() {  # <spec_json> <label> <context_source>
 
 run_cell "$NGRAM" "spec_${MTAG}_ngram_cag"          gold
 run_cell "$NGRAM" "spec_${MTAG}_ngram_rag"          retrieved
-run_cell "$DRAFT" "spec_${MTAG}_${DRAFT_LABEL}_cag" gold
-run_cell "$DRAFT" "spec_${MTAG}_${DRAFT_LABEL}_rag" retrieved
+
+# Pre-flight the model-native draft method BEFORE spending the sweep on it: vLLM can
+# SOFT-accept the config (server healthy) yet never speculate, yielding a "complete" cell
+# with null acceptance. This gate asserts vllm:spec_decode_num_draft_tokens_total > 0. The
+# ngram cells above are unaffected. SKIP_SPEC_GATE=1 overrides (accepts an unvalidated arm).
+SKIP_SPEC_GATE="${SKIP_SPEC_GATE:-0}"
+if [ "$SKIP_SPEC_GATE" = "1" ]; then
+  DRAFT_OK=1
+else
+  # exit 0 = PASS, 1 = real FAIL, 2 = INCONCLUSIVE (transient probe/timeout). Retry ONCE on 2
+  # so a network hiccup during the ~3 probe generations does not permanently drop a valid arm.
+  bash scripts/check_mtp_spec_decode.sh "$MODEL" "$DRAFT"; _grc=$?
+  if [ "$_grc" = "2" ]; then
+    echo "[matrix] native-draft gate INCONCLUSIVE (exit 2); retrying once..."
+    bash scripts/check_mtp_spec_decode.sh "$MODEL" "$DRAFT"; _grc=$?
+  fi
+  if [ "$_grc" = "0" ]; then
+    DRAFT_OK=1
+  else
+    DRAFT_OK=0
+    echo "[matrix] GATE FAILED (exit $_grc) -> native draft '$DRAFT_LABEL' does not engage on this vLLM."
+    echo "[matrix] skipping the 2 draft cells and marking them failed (ngram cells kept)."
+    for _lbl in "spec_${MTAG}_${DRAFT_LABEL}_cag" "spec_${MTAG}_${DRAFT_LABEL}_rag"; do
+      mkdir -p "$OUT/$_lbl"
+      echo "STATUS=failed reason=spec_gate model=$MODEL spec=$DRAFT $(date)" > "$OUT/$_lbl/STATUS"
+      FAILED+=("$_lbl(spec_gate)")
+    done
+  fi
+fi
+
+if [ "$DRAFT_OK" = "1" ]; then
+  run_cell "$DRAFT" "spec_${MTAG}_${DRAFT_LABEL}_cag" gold
+  run_cell "$DRAFT" "spec_${MTAG}_${DRAFT_LABEL}_rag" retrieved
+fi
 
 bash scripts/sync_results_to_gcs.sh analysis || true
 if [ "${#FAILED[@]}" -gt 0 ]; then

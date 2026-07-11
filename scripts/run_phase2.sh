@@ -43,6 +43,30 @@ fi
 echo "Cleaning previous Phase 2 result artifacts to prevent contamination..."
 rm -rf "$OUTPUT_DIR"/* || true
 
+# Pre-flight: with telemetry ON, cage-stats MUST be importable or the rich vLLM telemetry
+# (cached_tokens / prefix-hit / KV usage) silently degrades to spec-decode-only in
+# vllm_telemetry.json. Resolve a sibling checkout, then fail loud rather than run a sweep
+# that produces impoverished telemetry we cannot use to build the cache/KV figures.
+if [ "$VLLM_TELEMETRY" != "0" ]; then
+    if ! python3 -c "import cage_stats.api" 2>/dev/null; then
+        for _cs in "${CAGE_STATS_HOME:-}" "$PROJECT_DIR/../cage-stats" "$HOME/cage-stats"; do
+            if [ -n "$_cs" ] && [ -f "$_cs/cage_stats/api.py" ]; then
+                export CAGE_STATS_HOME="$_cs"
+                export PYTHONPATH="$_cs:${PYTHONPATH:-}"
+                break
+            fi
+        done
+    fi
+    if ! python3 -c "import cage_stats.api" 2>/dev/null; then
+        echo "GATE FAILED -> --vllm-telemetry is ON but 'cage_stats.api' is not importable."
+        echo "  Rich vLLM telemetry (cached_tokens / prefix-hit / KV usage) would silently"
+        echo "  degrade to spec-decode-only, breaking the cache/KV figures."
+        echo "  Fix: pip install -e ../cage-stats (or set CAGE_STATS_HOME), or run VLLM_TELEMETRY=0."
+        exit 1
+    fi
+    echo "[preflight] cage-stats importable -> full vLLM telemetry enabled."
+fi
+
 cleanup() {
     if [ "$_cleanup_ran" -eq 1 ]; then
         return

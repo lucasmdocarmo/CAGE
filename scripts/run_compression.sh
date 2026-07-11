@@ -10,7 +10,7 @@
 #
 # Read the 2x2 DOWN (CAG vs RAG) or ACROSS (full vs compressed), never on the diagonal.
 # FP8 KV is GPU-meaningful. A pre-flight gate verifies FP8 does NOT disable prefix caching
-# (else compressed_cag is confounded — see cloud_docs/VLLM_COMPATIBILITY.md sec 4).
+# (else compressed_cag is confounded — see Cloud/VLLM_COMPATIBILITY.md sec 4).
 # =============================================================================
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,12 +19,25 @@ OUTPUT_DIR="$PROJECT_DIR/analysis/compression/results"
 # Continuous log+results mirror to GCS + full collect on exit (this script has no sync loop).
 source "$SCRIPT_DIR/_log_guard.sh"
 
-MODEL="${1:-Qwen/Qwen3-4B}"
+MODEL="${1:-Qwen/Qwen3-8B}"
 DATASET="${DATASET:-squad_v2}"
 NUM_QUERIES="${NUM_QUERIES:-500}"
 NUM_TRIALS="${NUM_TRIALS:-3}"
 SEED="${SEED:-42}"
 SKIP_GATE="${SKIP_GATE:-0}"
+
+# Pre-flight: refuse to run the compression axis with the compression escape hatches set.
+# CAGE_DISABLE_COMPRESSION=1 makes the compressor a pass-through, and CAGE_ALLOW_NO_COMPRESSION=1
+# disables strict mode; either one left in the VM environment would silently turn compressed_rag /
+# compressed_cag into a NON-compressed arm (ratio 1.0) mislabeled as compressed. Fail loud.
+for _cvar in CAGE_DISABLE_COMPRESSION CAGE_ALLOW_NO_COMPRESSION; do
+    _cval="${!_cvar:-}"
+    if [ -n "$_cval" ] && [ "$_cval" != "0" ]; then
+        echo "ABORT: $_cvar is set (${_cvar}=${_cval}); the compression arm would be invalid."
+        echo "  unset $_cvar before running the compression sweep."
+        exit 1
+    fi
+done
 
 # Reliable, fast, uniform startup on the 24GB L4 (parity with run_speculative_matrix.sh):
 # eager mode avoids the ~2-3 min torch.compile/CUDA-graph capture per relaunch and shrinks
@@ -43,13 +56,19 @@ if [ -z "${VIRTUAL_ENV:-}" ]; then
 fi
 mkdir -p "$OUTPUT_DIR"
 
+# Model tag so a second model (MiMo) through the same 2x2 never collides with Qwen's dirs.
+case "$MODEL" in *MiMo*|*mimo*) MTAG="_mimo7b" ;; *) MTAG="" ;; esac
+
 run_baseline() {  # <baseline> <label> [extra args...]
-    local baseline=$1 label=$2; shift 2
+    local baseline=$1 label="$2${MTAG}"; shift 2
     echo ""; echo ">>> $label ($baseline)  $(date)"
+    # All 4 compression cells run on a prefix-caching-ON server, so cold-start each trial
+    # (vLLM /reset_prefix_cache) for independent trials, consistent with the core suite.
     python3 scripts/run_experiment.py \
         --baseline "$baseline" --baseline-label "$label" \
         --model "$MODEL" --dataset "$DATASET" \
         --num-queries "$NUM_QUERIES" --num-trials "$NUM_TRIALS" --seed "$SEED" \
+        --reset-cache-between-trials \
         --vllm-telemetry --output-dir "$OUTPUT_DIR/$label" "$@"
 }
 
@@ -63,7 +82,7 @@ if [ "$SKIP_GATE" != "1" ]; then
     echo ">>> Pre-flight: FP8 x prefix-caching gate"
     if ! bash "$SCRIPT_DIR/check_fp8_prefix_cache.sh" "$MODEL"; then
         echo "GATE FAILED -> compressed_cag would be 'no-reuse + compression'."
-        echo "Pin a compatible vLLM (cloud_docs/VLLM_COMPATIBILITY.md sec 4) or SKIP_GATE=1 to override."
+        echo "Pin a compatible vLLM (Cloud/VLLM_COMPATIBILITY.md sec 4) or SKIP_GATE=1 to override."
         exit 1
     fi
 fi

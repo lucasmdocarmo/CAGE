@@ -103,7 +103,7 @@ NUM_QUERIES=100 NUM_TRIALS=10 bash scripts/run_phase1.sh Qwen/Qwen3-8B
 ```
 Baseline labels produced: `no_cache`, `prefix_cache`, `rag`, `redis_retrieval_cache_cold`,
 `hybrid_retrieval_cache_cold`, `hybrid_retrieval_cache_warm`, `distributed_router_replicated`.
-Other runners: `scripts/run_phase2.sh` … `run_phase5.sh`, `scripts/run_all_phases.sh`.
+> **DEPRECATED — do NOT use for Phase 2** (not on the canonical path): `scripts/run_phase2.sh` (writes `analysis/phase2/`, which `run_phase2_stats.sh` ignores), `run_phase5.sh` (a single legacy speculative cell), `scripts/run_all_phases.sh` (the old multi-phase design). Canonical Phase-2 chain: `cloud_run.sh` → `run_compression.sh` → `run_speculative_matrix.sh` (×2 models) → `run_phase2_stats.sh`.
 
 ---
 
@@ -327,7 +327,7 @@ gcloud compute instances create cage-gpu \
 # 2. SSH in and set up:
 gcloud compute ssh cage-gpu --zone=us-central1-a
 nvidia-smi                                   # confirm the GPU is visible
-git clone <your-repo-url> cage && cd cage    # or scp your repo
+git clone <your-repo-url> CAGE && cd CAGE    # or scp your repo (dir MUST be CAGE: scripts hardcode $HOME/CAGE)
 # Use cage-env on the VM: setup_gpu_cloud.sh and the run scripts (run_compression.sh,
 # run_speculative_matrix.sh, run_phase2_stats.sh, ...) all source cage-env. A .venv here
 # would leave those scripts unable to activate it (they hard-source cage-env under set -e).
@@ -453,11 +453,11 @@ open issues (full detail in [`VALIDATION_AND_SOTA_REVIEW.md`](VALIDATION_AND_SOT
 | Cloud run + persist | `nohup bash scripts/cloud_run.sh Qwen/Qwen3-8B 500 3 > run.log 2>&1 &` |
 | Sync results to GCS | `bash scripts/sync_results_to_gcs.sh analysis` |
 | Pull results back | `gsutil -m cp -r gs://<project>-cage-results/analysis ./analysis` |
-| Significance tests | `python3 scripts/statistical_tests.py --results-dir analysis/phase1/results` |
+| Significance tests | `bash scripts/run_phase2_stats.sh` (consolidates all trees + runs Wilcoxon/Holm/bootstrap vs no_cache) |
 | Provision cloud | `cd terraform/gcp && terraform apply -var=project_id=… -var=hf_token=…` |
 | Tear down (keep results) | `cd terraform/gcp && terraform destroy -var=project_id=… -var=hf_token=…` |
 | Compression 2×2 (GPU) | `bash scripts/run_compression.sh Qwen/Qwen3-8B` |
-| Speculative (GPU) | `bash scripts/run_phase5.sh` |
+| Speculative (GPU) | `bash scripts/run_speculative_matrix.sh Qwen/Qwen3-8B` (then `… XiaomiMiMo/MiMo-7B-RL`) |
 | FP8×prefix-cache gate | `bash scripts/check_fp8_prefix_cache.sh Qwen/Qwen3-8B` |
 
 ---
@@ -476,7 +476,7 @@ Levers are applied by (re)starting the server through `manage_vllm_server.sh`:
 | Speculative | `VLLM_SPECULATIVE_CONFIG='{"model":"Qwen/Qwen3-0.6B","num_speculative_tokens":5}' ./scripts/manage_vllm_server.sh restart <model>` | `speculative` |
 | Cluster (terraform) | `-var=vllm_extra_args='--kv-cache-dtype fp8'` | cloud replicas |
 
-`run_compression.sh` and `run_phase5.sh` drive these levers and capture `/metrics` telemetry;
+`run_compression.sh` and `run_speculative_matrix.sh` drive these levers and capture `/metrics` telemetry;
 the compression script runs the FP8×prefix-caching gate first (else `compressed_cag` is
 confounded — VLLM_COMPATIBILITY.md §4). FP8 and speculative are **GPU-meaningful** → Phase 2.
 Speculative decoding is output-preserving, so it is a throughput baseline, not part of the

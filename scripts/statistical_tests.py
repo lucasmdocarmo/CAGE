@@ -66,6 +66,7 @@ METRIC_HIGHER_IS_BETTER: Dict[str, bool] = {
     "ttft_ms": False,
     "latency_ms": False,
     "avg_tpot_ms": False,
+    "tpot_ms": False,  # per-query time-per-output-token (results.csv column)
     "hallucinated_span_ratio": False,
     "hallucination_detected": False,
     # quality (higher better)

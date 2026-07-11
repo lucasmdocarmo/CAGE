@@ -312,9 +312,32 @@ def ensure_ir_index(
     rebuild: bool = False,
     device: str = "cpu",
 ) -> FaissIRIndex:
-    """Load an existing index if present, otherwise build and persist one."""
-    if (index_dir / "meta.json").exists() and not rebuild:
-        return FaissIRIndex.load(index_dir, device=device)
+    """Load an existing index if present AND current, otherwise build and persist one.
+
+    Staleness guard: the repo ships tiny STUB indices (e.g. 17 docs) and a committed index
+    can also lag the corpus. Loading such an index silently makes every RAG/redis/hybrid
+    baseline retrieve from the wrong corpus (invalid retrieval + quality metrics, no error).
+    So if the persisted meta.json's num_documents does not match the corpus actually being
+    indexed, REBUILD instead of loading (a rebuild also restores the correct e5 prefixes).
+    """
+    meta_path = index_dir / "meta.json"
+    if meta_path.exists() and not rebuild:
+        stale = False
+        try:
+            import json as _json
+            _n = _json.loads(meta_path.read_text()).get("num_documents")
+            # `documents` (truthy) also guards the empty-corpus case: an empty corpus must NOT
+            # trigger a rebuild (idx.build([]) raises); fall through to load the existing index.
+            if _n is not None and documents and int(_n) != len(documents):
+                print(
+                    f"[ir] index at {index_dir} has {_n} docs but the corpus has "
+                    f"{len(documents)}; rebuilding (stale/stub index)."
+                )
+                stale = True
+        except Exception:
+            stale = False  # unreadable meta -> fall through to load (prior behavior)
+        if not stale:
+            return FaissIRIndex.load(index_dir, device=device)
 
     idx = FaissIRIndex(embedding_model=embedding_model, device=device)
     idx.build(documents)

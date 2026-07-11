@@ -756,7 +756,7 @@ def run_experiment(
     # generated on the fly from the gold context (answer redacted), so no separate corpus
     # artifact is needed. stale_fraction is swept via the CAGE_STALE_FRACTION env var (falls
     # back to the preset default 0.0). NOTE: run a live 5-query smoke pass before a full sweep
-    # (validate-before-run). See cloud_docs/STALENESS_BASELINE_DESIGN.md.
+    # (validate-before-run). See Documentation/STALENESS_BASELINE_DESIGN.md.
     if baseline_config.baseline_type.value == "staleness":
         # TTL mode is NOT IMPLEMENTED. The only wired staleness path is the deterministic
         # version sweep (stale_fraction -> v0/v1). Fail loud rather than silently ignoring a
@@ -1086,7 +1086,7 @@ def run_experiment(
         # Staleness/freshness baseline (GATED): hold the warm served context fixed and make a
         # deterministic fraction of served hits STALE (evidence redacted so it no longer
         # supports the answer). Only entered for the staleness baseline, so it has zero effect
-        # on the other nine arms. See cloud_docs/STALENESS_BASELINE_DESIGN.md.
+        # on the other nine arms. See Documentation/STALENESS_BASELINE_DESIGN.md.
         if baseline_config.baseline_type.value == "staleness":
             served_from_cache = True  # warm-cache assumption: every query is a served hit
             _fresh = list(example.context or [])
@@ -1097,7 +1097,14 @@ def run_experiment(
                 evidence_version = "v1"
                 used_contexts = _fresh
 
-        # Text compression (compressed_rag): compress the context before prompting.
+        # Apply context caps before compression so the reported compression ratio is
+        # measured against the context actually served, not a pre-truncation superset.
+        if max_context_chars is not None and max_context_chars > 0:
+            used_contexts = [c[:max_context_chars] for c in used_contexts]
+        if max_context_docs is not None and max_context_docs > 0:
+            used_contexts = used_contexts[:max_context_docs]
+
+        # Text compression (compressed_rag): compress the already-capped context.
         compression_stats = None
         if context_compressor is not None:
             used_contexts, cstats = context_compressor.compress(
@@ -1105,11 +1112,6 @@ def run_experiment(
                 target_ratio=baseline_config.compress_target_ratio,
             )
             compression_stats = cstats.to_dict()
-
-        if max_context_chars is not None and max_context_chars > 0:
-            used_contexts = [c[:max_context_chars] for c in used_contexts]
-        if max_context_docs is not None and max_context_docs > 0:
-            used_contexts = used_contexts[:max_context_docs]
 
         return {
             "question": question,
@@ -1248,6 +1250,16 @@ def run_experiment(
             "generated_answer": response.generated_text,
             "ttft_ms": response.ttft_ms,
             "latency_ms": response.total_time_ms,
+            # Per-query time-per-output-token (decode speed after the first token). Persisted
+            # per row -- not just as a run aggregate -- so the speculative arm's discriminating
+            # serving metric is testable (statistical_tests.py) and plottable. None when there
+            # is <=1 output token or timing is missing.
+            "tpot_ms": (
+                (response.total_time_ms - response.ttft_ms) / (response.num_tokens - 1)
+                if (response.ttft_ms is not None and response.total_time_ms is not None
+                    and response.num_tokens and response.num_tokens > 1)
+                else None
+            ),
             "num_tokens": response.num_tokens,
             "prompt_tokens": response.prompt_tokens,
             "cached_prompt_tokens": response.cached_prompt_tokens,
@@ -1283,6 +1295,36 @@ def run_experiment(
                 }
             )
         results.append(result)
+
+        # Per-query evidence, appended INCREMENTALLY (one JSON line per query) so a mid-trial
+        # OOM/SIGKILL -- the exact memory-pressure failure this work studies -- still preserves
+        # completed rows, and so an analyst can reconstruct WHY an answer was (un)grounded and,
+        # for the staleness arm, WHICH served text was stale. The served context text and the
+        # LettuceDetect spans are otherwise computed then dropped (never in results.csv). Lands
+        # under output_dir (the per-trial dir) so it is already covered by the GCS sync.
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            _evidence = {
+                "example_id": example.id,
+                "baseline": experiment_label,
+                "repeat_index": repeat_index,
+                "turn_index": turn_index,
+                "batch_id": batch_id,
+                "question": question,
+                "reference_answer": example.answer,
+                "generated_answer": response.generated_text,
+                "used_contexts": used_contexts,
+                "served_from_cache": meta.get("served_from_cache"),
+                "evidence_version": meta.get("evidence_version"),
+                "grounding_score": _quality_row.get("grounding_score"),
+                "grounded": result.get("grounded"),
+                "hallucinated_spans": getattr(quality_metrics, "hallucinated_spans", None),
+                "retrieved_doc_ids": meta.get("retrieved_doc_ids") or [],
+            }
+            with open(os.path.join(output_dir, "qa_evidence.jsonl"), "a", encoding="utf-8") as _ef:
+                _ef.write(json.dumps(_evidence, default=str) + "\n")
+        except Exception as _ev_exc:
+            print(f"[evidence] could not append qa_evidence.jsonl: {_ev_exc}")
 
     def execute_work_units(
         units: List[List[CAGExample]],
@@ -1428,7 +1470,10 @@ def run_experiment(
             _pp = os.path.join(output_dir, "results.partial.csv")
             if results:
                 with open(_pp, "w", newline="") as _pf:
-                    _w = csv.DictWriter(_pf, fieldnames=results[0].keys())
+                    # Union of keys across ALL rows (not row 0): quality.to_dict() drops
+                    # hallucination_detected when None, so a narrow row-0 would otherwise
+                    # make DictWriter raise mid-write and lose the partial flush too.
+                    _w = csv.DictWriter(_pf, fieldnames=list(dict.fromkeys(k for r in results for k in r)))
                     _w.writeheader()
                     _w.writerows(results)
                 print(f"[recovery] stage crashed; flushed {len(results)} partial rows -> {_pp}")
@@ -1485,13 +1530,30 @@ def run_experiment(
                     vllm_telemetry_snapshot.setdefault("spec_decode", _spec)
                     if _spec.get("spec_decode_acceptance_rate") is not None:
                         vllm_telemetry_snapshot["spec_decode_acceptance_rate"] = _spec["spec_decode_acceptance_rate"]
-            # Warn loudly if a speculative baseline produced no acceptance number.
+            # A speculative baseline with no acceptance number is a SILENT no-op (server
+            # soft-accepted the config but speculation never engaged, or /metrics lacks the
+            # vllm:spec_decode_* counters). A stdout WARNING is easy to miss across a 500x3
+            # sweep, so ALSO persist a STATUS sentinel next to the results -- the same
+            # convention run_speculative_matrix.sh uses -- so the cell reads as DEGRADED,
+            # not silently DONE, in the stats consolidation.
             if baseline_config.baseline_type.value == "speculative":
                 _acc = (vllm_telemetry_snapshot or {}).get("spec_decode_acceptance_rate")
                 if _acc is None:
                     print("[telemetry] WARNING: speculative baseline but spec_decode_acceptance_rate "
-                          "is None -- check the server has speculation enabled and /metrics exposes "
-                          "vllm:spec_decode_* counters.")
+                          "is None -- speculation may not have engaged, or /metrics lacks "
+                          "vllm:spec_decode_* counters. Marking this cell DEGRADED.")
+                    try:
+                        # Write to the CELL root (parent of a trial_N subdir) so run_phase2_stats.sh,
+                        # which reads STATUS at the cell top-level, actually sees the degraded flag.
+                        _sent_dir = output_dir
+                        if os.path.basename(os.path.normpath(output_dir)).startswith("trial_"):
+                            _sent_dir = os.path.dirname(os.path.normpath(output_dir))
+                        os.makedirs(_sent_dir, exist_ok=True)
+                        _cell = os.path.basename(os.path.normpath(_sent_dir))
+                        with open(os.path.join(_sent_dir, "STATUS"), "w") as _sf:
+                            _sf.write(f"STATUS=degraded reason=no_spec_acceptance cell={_cell}\n")
+                    except Exception as _se:
+                        print(f"[telemetry] could not write DEGRADED sentinel: {_se}")
             # Save the snapshot as an explicit JSON artifact alongside the results.
             if vllm_telemetry_snapshot is not None:
                 os.makedirs(output_dir, exist_ok=True)
@@ -1731,16 +1793,21 @@ def run_experiment(
     stable_results_file = output_path / "results.csv"
     stable_metrics_file = output_path / "metrics.json"
     
-    # Save detailed results as CSV
+    # Save detailed results as CSV. Header = UNION of keys across ALL rows (not row 0's):
+    # quality.to_dict() omits hallucination_detected when it is None, so a narrow row-0
+    # (empty/errored/retrieval-miss query) followed by a full row would otherwise make
+    # DictWriter (default extrasaction='raise') throw mid-write and corrupt the whole
+    # trial's results.csv -- a silent whole-trial data loss on the primary grounding column.
+    _fieldnames = list(dict.fromkeys(k for r in results for k in r)) if results else []
     with open(results_file, "w", newline="") as f:
         if results:
-            writer = csv.DictWriter(f, fieldnames=results[0].keys())
+            writer = csv.DictWriter(f, fieldnames=_fieldnames)
             writer.writeheader()
             writer.writerows(results)
 
     with open(stable_results_file, "w", newline="") as f:
         if results:
-            writer = csv.DictWriter(f, fieldnames=results[0].keys())
+            writer = csv.DictWriter(f, fieldnames=_fieldnames)
             writer.writeheader()
             writer.writerows(results)
     
@@ -1847,7 +1914,7 @@ def main():
         "--baseline",
         required=True,
         choices=["no_cache", "prefix_cache", "redis", "rag", "distributed", "hybrid", "speculative", "compressed_rag", "compressed_cag", "staleness"],
-        help="Baseline to evaluate (staleness is a scaffold: see cloud_docs/STALENESS_BASELINE_DESIGN.md)",
+        help="Baseline to evaluate (staleness is a scaffold: see Documentation/STALENESS_BASELINE_DESIGN.md)",
     )
     parser.add_argument(
         "--model",
@@ -2105,8 +2172,9 @@ def main():
     parser.add_argument(
         "--speculative-method",
         default="draft_model",
-        choices=["draft_model", "ngram", "suffix", "medusa", "eagle"],
-        help="Speculative decoding method (default: draft_model)",
+        choices=["draft_model", "ngram", "suffix", "medusa", "eagle", "eagle3", "mimo_mtp", "mlp_speculator"],
+        help="Speculative decoding method recorded in the manifest (must match the launched "
+             "VLLM_SPECULATIVE_CONFIG method, e.g. eagle3 for Qwen3-8B, mimo_mtp for MiMo).",
     )
 
     # Statistical rigor options

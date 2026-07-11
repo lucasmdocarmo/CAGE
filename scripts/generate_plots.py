@@ -83,6 +83,9 @@ def load_latest_metrics(results_dir: Path) -> pd.DataFrame:
                 "ttft_ms": metric_value(perf, "avg_ttft_ms"),
                 "latency_ms": metric_value(perf, "avg_latency_ms"),
                 "tokens_per_sec": metric_value(perf, "tokens_per_second"),
+                # grounding_score is the PRIMARY quality metric (LettuceDetect span grounding);
+                # it must appear in the figures, not only the secondary metrics.
+                "grounding_score": metric_value(qual, "grounding_score"),
                 "faithfulness": metric_value(qual, "faithfulness"),
                 "relevance": metric_value(qual, "relevance"),
                 "bertscore": metric_value(qual, "completeness_bertscore"),
@@ -613,7 +616,7 @@ def plot_quality_comparison(
     Grouped bar chart of all quality metrics side by side.
     Essential for showing quality parity across approaches.
     """
-    quality_metrics = ["faithfulness", "relevance", "bertscore", "rouge_l"]
+    quality_metrics = ["grounding_score", "faithfulness", "relevance", "bertscore", "rouge_l"]
     available = [m for m in quality_metrics if m in df.columns and df[m].notna().any()]
     
     if not available:

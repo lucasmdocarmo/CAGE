@@ -155,6 +155,11 @@ start_server() {
     vllm_args+=( --enable-prompt-tokens-details )
     echo "Server args: vllm serve $model ${vllm_args[*]}"
 
+    # Enable vLLM's documented dev-only endpoint POST /reset_prefix_cache (gated by
+    # VLLM_SERVER_DEV_MODE per docs.vllm.ai env_vars) so --reset-cache-between-trials can
+    # cold-start each trial. Benchmark box only; vLLM marks these endpoints not-for-production.
+    export VLLM_SERVER_DEV_MODE="${VLLM_SERVER_DEV_MODE:-1}"
+
     echo "Starting vLLM server (logging to $log_file)..."
     nohup vllm serve "$model" "${vllm_args[@]}" > "$log_file" 2>&1 &
     
@@ -207,7 +212,9 @@ stop_server() {
     # cage-stats GPU exporter sharing the L4) -- match the vLLM cmdline before kill -9.
     # Set CAGE_VLLM_KILL_ALL_GPU=1 to fall back to the old unconditional kill.
     local held
-    held=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null)
+    # `|| true` inside the substitution so a transient nvidia-smi non-zero exit cannot trip
+    # set -e and abort stop_server mid-cleanup (which would orphan the EngineCore worker).
+    held=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null || true)
     for p in $held; do
         if [ "${CAGE_VLLM_KILL_ALL_GPU:-0}" = "1" ]; then
             kill -9 "$p" 2>/dev/null || true

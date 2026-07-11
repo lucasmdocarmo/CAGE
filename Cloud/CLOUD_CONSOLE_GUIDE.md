@@ -81,14 +81,20 @@ For each of these three, do: **☰ → APIs & Services → Library**, type the n
 9. Scroll down, click **CREATE**. ⏳ The VM boots in ~1–2 min. **(This click starts billing.)**
 
 **⌨️ Cloud Shell alternative (one command, most reliable):** click the **`>_` (Activate Cloud Shell)** icon top‑right, then paste:
+Run this **from the CAGE repo root** so `--metadata-from-file` can read the shutdown hook:
 ```bash
 PROJECT=$(gcloud config get-value project)
 gcloud compute instances create cage-gpu --zone=us-central1-a \
   --machine-type=g2-standard-8 --accelerator=type=nvidia-l4,count=1 \
   --maintenance-policy=TERMINATE --image-family=common-cu121-debian-11 \
   --image-project=deeplearning-platform-release --boot-disk-size=200GB \
-  --boot-disk-type=pd-ssd --scopes=cloud-platform --metadata=install-nvidia-driver=True
+  --boot-disk-type=pd-ssd --scopes=cloud-platform --metadata=install-nvidia-driver=True \
+  --metadata-from-file=shutdown-script=scripts/gcp_shutdown_hook.sh
 ```
+> The `shutdown-script` mirrors `analysis/` + logs to GCS on ACPI soft-off (a SPOT preemption
+> or `instances delete`/`stop`), so data survives even when no operator is watching. It is what
+> makes the "~30s notice" tolerance below real. Already created the VM? Add it live with
+> `gcloud compute instances add-metadata cage-gpu --zone=us-central1-a --metadata-from-file=shutdown-script=scripts/gcp_shutdown_hook.sh`.
 
 **💸 Cheaper: spot VM (~65% off — recommended for Phase 2).** Add two flags to the command above:
 ```bash
@@ -109,6 +115,7 @@ you at most the single in‑flight baseline (and even a full redo of a spot run 
 3. **Location type:** Region → `us-central1`. Click **CONTINUE** through the defaults → **CREATE**.
 4. On the bucket's page, **PROTECTION** (or **Configuration**) tab → enable **Object Versioning** (keeps every result).
    - ⌨️ Cloud Shell: `gsutil mb -l us-central1 gs://$(gcloud config get-value project)-cage-results && gsutil versioning set on gs://$(gcloud config get-value project)-cage-results`
+   - ⌨️ **Grant the VM's service account write access** (REQUIRED — on projects created after ~mid-2024 the default compute SA has no Editor role, so every `sync_results_to_gcs.sh` / shutdown-hook sync silently no-ops and you lose all results at teardown): `gsutil iam ch "serviceAccount:$(gcloud iam service-accounts list --filter='displayName:Compute Engine default' --format='value(email)')":roles/storage.objectAdmin gs://$(gcloud config get-value project)-cage-results`
 
 ### 2.3 Set up — open a terminal on the VM and install
 1. Back to **☰ → Compute Engine → VM instances**.
@@ -119,7 +126,7 @@ nvidia-smi          # should print a GPU table. If "command not found", wait 1 m
 ```
 ```bash
 sudo apt-get update -y && sudo apt-get install -y git python3-venv
-git clone https://github.com/lucasmdocarmo/CAGE.git cage && cd cage
+git clone https://github.com/lucasmdocarmo/CAGE.git CAGE && cd CAGE
 # cage-env (NOT .venv): the run scripts hard-source cage-env on the VM under set -e.
 python3 -m venv cage-env && source cage-env/bin/activate
 pip install --upgrade pip
@@ -141,7 +148,7 @@ tail -f run.log
 ```
 - `nohup … &` keeps it running even if the SSH window closes.
 - `cloud_run.sh` runs the 6 baselines, captures **cage-stats telemetry** per baseline, and **mirrors results to your bucket every 2 min**.
-- `tail -f run.log` shows live progress. Press **Ctrl‑C** to stop *watching* (the run keeps going). To re‑attach later: `tail -f ~/cage/run.log`.
+- `tail -f run.log` shows live progress. Press **Ctrl‑C** to stop *watching* (the run keeps going). To re‑attach later: `tail -f ~/CAGE/run.log`.
 
 ### 2.5 Check — is it healthy and progressing?
 - **In the SSH terminal:** the `run.log` should show baselines starting/finishing and a `vLLM TELEMETRY (cage-stats)` dashboard block.
@@ -152,7 +159,7 @@ tail -f run.log
 ### 2.6 Validate — check + statistics
 When `run.log` prints "Phase 1 Complete" (or all 6 baseline folders exist), in the SSH terminal:
 ```bash
-cd ~/cage && source cage-env/bin/activate
+cd ~/CAGE && source cage-env/bin/activate
 python3 scripts/verify_results.py                       # integrity: no truncated/errored trials
 python3 scripts/statistical_tests.py --results-dir analysis/phase1/results --reference no_cache
 ```
@@ -245,6 +252,6 @@ The extension can navigate the GCP console and click buttons. To make a run go s
 | `pip install` fails on `cage-stats` | The cage-stats repo must be reachable; it's public, so check the VM has internet. To skip telemetry: comment the `cage-stats` line in `requirements.txt`. |
 | RAG/hybrid scores look low | You skipped the index rebuild — `rm -rf experiments/ir_index/ir_squad_v2_*` and re‑run (§2.3). |
 | Bucket name "already taken" | Names are global — prefix with your project id (§2.2). |
-| Run died when SSH closed | Use `nohup … &` (§2.4); re‑attach with `tail -f ~/cage/run.log`. |
+| Run died when SSH closed | Use `nohup … &` (§2.4); re‑attach with `tail -f ~/CAGE/run.log`. |
 | Quota error on Create | GPU quota not approved yet (§1.4) — wait for the email. |
 | Still being billed | Delete the **VM** (§2.8); a stopped VM still bills disk. The bucket is cheap to keep. |

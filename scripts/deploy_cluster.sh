@@ -387,6 +387,12 @@ destroy_deployment() {
         gcp|all)
             if [[ -f "$PROJECT_ROOT/terraform/gcp/terraform.tfstate" ]]; then
                 cd "$PROJECT_ROOT/terraform/gcp"
+                log_info "Unconditional 'terraform destroy'. Data flush on destroy relies on each"
+                log_info "node's shutdown-script (metadata) syncing to GCS within its shutdown window."
+                log_info "For the single Phase-2 VM, prefer 'scripts/teardown_vm.sh <vm> <zone>', which"
+                log_info "verifies this run's GCS log sentinel BEFORE deleting (fail-closed)."
+                log_info "Destroying the cluster in 5s (Ctrl-C to abort)..."
+                sleep 5
                 terraform destroy -auto-approve
                 log_info "GCP deployment destroyed"
             fi

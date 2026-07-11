@@ -17,7 +17,7 @@ LOG=/var/log/cage_shutdown_hook.log
 echo "=== cage shutdown hook fired $(date -u) ===" >> "$LOG" 2>&1
 
 # Find the CAGE checkout (the run user's home, not root's).
-for d in /home/*/CAGE /root/CAGE; do
+for d in /home/*/CAGE /home/*/cage /root/CAGE /root/cage /opt/cage /opt/CAGE; do
   [ -d "$d" ] || continue
   USER_NAME="$(stat -c '%U' "$d" 2>/dev/null || echo root)"
   echo "[hook] using repo $d as $USER_NAME" >> "$LOG" 2>&1

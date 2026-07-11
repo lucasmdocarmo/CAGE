@@ -10,8 +10,11 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 PHASE_DIR="$PROJECT_DIR/analysis/phase1"
 OUTPUT_DIR="$PHASE_DIR/results"
 
-MODEL=${1:-"Qwen/Qwen3-4B"}
+MODEL=${1:-"Qwen/Qwen3-8B"}
 DATASET="squad_v2"
+# Model tag appended to baseline labels (see run_baseline) so MiMo core+compression never
+# collides with Qwen's result dirs. Qwen (primary) stays bare.
+case "$MODEL" in *MiMo*|*mimo*) MTAG="_mimo7b" ;; *) MTAG="" ;; esac
 NUM_QUERIES=${NUM_QUERIES:-50}
 NUM_TRIALS=${NUM_TRIALS:-3}
 SEED=${SEED:-42}
@@ -48,8 +51,11 @@ for _v in .venv cage-env ../cage-env; do
     fi
 done
 
-echo "Cleaning previous Phase 1 result artifacts to prevent contamination..."
-rm -rf "$OUTPUT_DIR"/* || true
+# Per-baseline cleanup is model-scoped inside run_baseline (removes only THIS model's own
+# baseline dirs), so a second model (MiMo) run through the same suite coexists under
+# analysis/phase1/results and never wipes the other model's already-collected core arms.
+# Do NOT blanket-wipe the shared parent here.
+echo "Phase 1 results dir: $OUTPUT_DIR (per-baseline dirs cleaned model-scoped in run_baseline)"
 
 cleanup() {
     if [ "$_cleanup_ran" -eq 1 ]; then
@@ -82,11 +88,17 @@ start_server_with_prefix_cache() {
 
 run_baseline() {
     local baseline=$1
-    local baseline_label=$2
+    # Append the model tag so a second model (e.g. MiMo) run through this same suite lands in
+    # its own dirs and never overwrites Qwen's. Qwen (primary) stays bare (MTAG="").
+    local baseline_label="${2}${MTAG:-}"
     shift 2
     echo ""
     echo ">>> Running baseline: $baseline_label"
     echo "    Started at: $(date)"
+
+    # Model-scoped clean: remove ONLY this baseline's own dir so re-running a model refreshes
+    # its arms without wiping the OTHER model's already-collected core results.
+    rm -rf "$OUTPUT_DIR/$baseline_label"
 
     python3 scripts/run_experiment.py \
         --baseline "$baseline" \
@@ -140,17 +152,19 @@ run_baseline "redis" "redis_retrieval_cache_cold" \
 # 2. Native prefix-cache baseline
 start_server_with_prefix_cache "[2/4] Starting Server WITH Prefix Caching..."
 
-run_baseline "prefix_cache" "prefix_cache"
+run_baseline "prefix_cache" "prefix_cache" --reset-cache-between-trials
 
 # 3. Hybrid cold baseline: empty retrieval cache + empty prefix cache
 start_server_with_prefix_cache "[3/4] Restarting Server WITH Prefix Caching for hybrid cold..."
 run_baseline "hybrid" "hybrid_retrieval_cache_cold" \
+    --reset-cache-between-trials \
     --flush-redis-namespace \
     --redis-key-prefix "$(redis_prefix_for hybrid_retrieval_cache_cold)"
 
 # 4. Hybrid warm baseline: explicit warmup excluded from measured metrics
 start_server_with_prefix_cache "[4/4] Restarting Server WITH Prefix Caching for hybrid warm..."
 run_baseline "hybrid" "hybrid_retrieval_cache_warm" \
+    --reset-cache-between-trials \
     --flush-redis-namespace \
     --redis-key-prefix "$(redis_prefix_for hybrid_retrieval_cache_warm)" \
     --warmup-queries "$NUM_QUERIES"

@@ -632,22 +632,22 @@ class GPUMetricsTracker:
                     gpu_utils.append(util.gpu)
                     mem_utils.append(util.memory)
                 except pynvml.NVMLError:
-                    gpu_utils.append(0.0)
-                    mem_utils.append(0.0)
+                    gpu_utils.append(None)
+                    mem_utils.append(None)
                 
                 # Memory usage
                 try:
                     mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
                     mem_used.append(mem_info.used / 1024 / 1024)  # MB
                 except pynvml.NVMLError:
-                    mem_used.append(0.0)
+                    mem_used.append(None)
                 
                 # Power draw
                 try:
                     power = pynvml.nvmlDeviceGetPowerUsage(handle)
                     powers.append(power / 1000)  # Convert mW to W
                 except pynvml.NVMLError:
-                    powers.append(0.0)
+                    powers.append(None)
                 
                 # Temperature
                 try:
@@ -656,7 +656,7 @@ class GPUMetricsTracker:
                     )
                     temps.append(temp)
                 except pynvml.NVMLError:
-                    temps.append(0.0)
+                    temps.append(None)
                 
                 # PCIe throughput
                 try:
@@ -669,8 +669,8 @@ class GPUMetricsTracker:
                     pcie_tx.append(tx)
                     pcie_rx.append(rx)
                 except pynvml.NVMLError:
-                    pcie_tx.append(0)
-                    pcie_rx.append(0)
+                    pcie_tx.append(None)
+                    pcie_rx.append(None)
             
             # Store samples
             self.gpu_util_samples.append(gpu_utils)
@@ -771,16 +771,16 @@ class GPUMetricsTracker:
                 pcie_rx_mb=0.0,
             )
         
-        # Flatten samples (aggregate across all GPUs and time)
-        all_gpu_utils = [u for sample in self.gpu_util_samples for u in sample]
-        all_mem_utils = [u for sample in self.memory_util_samples for u in sample]
-        all_mem_used = [m for sample in self.memory_used_samples for m in sample]
-        all_powers = [p for sample in self.power_samples for p in sample]
-        all_temps = [t for sample in self.temp_samples for t in sample]
-        
+        # Flatten samples, dropping None (a failed per-call NVML read, not a real zero).
+        all_gpu_utils = [u for sample in self.gpu_util_samples for u in sample if u is not None]
+        all_mem_utils = [u for sample in self.memory_util_samples for u in sample if u is not None]
+        all_mem_used = [m for sample in self.memory_used_samples for m in sample if m is not None]
+        all_powers = [p for sample in self.power_samples for p in sample if p is not None]
+        all_temps = [t for sample in self.temp_samples for t in sample if t is not None]
+
         # PCIe throughput (cumulative)
-        total_pcie_tx = sum(tx for sample in self.pcie_tx_samples for tx in sample)
-        total_pcie_rx = sum(rx for sample in self.pcie_rx_samples for rx in sample)
+        total_pcie_tx = sum(tx for sample in self.pcie_tx_samples for tx in sample if tx is not None)
+        total_pcie_rx = sum(rx for sample in self.pcie_rx_samples for rx in sample if rx is not None)
         
         # Compute statistics
         avg_gpu_util = float(np.mean(all_gpu_utils)) if all_gpu_utils else 0.0
