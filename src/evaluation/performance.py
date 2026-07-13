@@ -48,7 +48,8 @@ class PerformanceMetrics:
     # Additional stats
     total_requests: int
     total_tokens: int
-    total_time_seconds: float
+    total_time_seconds: float          # wall-clock span of the measured stage (incl. inline CPU scoring)
+    serving_time_seconds: float        # summed per-request serving time; denominator for throughput
     error_count: int = 0
     
     def to_dict(self) -> Dict[str, float]:
@@ -74,6 +75,7 @@ class PerformanceMetrics:
             "total_requests": self.total_requests,
             "total_tokens": self.total_tokens,
             "total_time_seconds": self.total_time_seconds,
+            "serving_time_seconds": self.serving_time_seconds,
             "error_count": self.error_count,
         }
 
@@ -199,6 +201,7 @@ class PerformanceEvaluator:
                 total_requests=len(self.request_metrics),
                 total_tokens=0,
                 total_time_seconds=total_time,
+                serving_time_seconds=0.0,
                 error_count=error_count,
             )
         
@@ -209,10 +212,16 @@ class PerformanceEvaluator:
         
         total_tokens = sum(tokens)
         total_requests = len(successful_requests)
-        
-        # Compute throughput
-        qps = total_requests / total_time if total_time > 0 else 0.0
-        tps = total_tokens / total_time if total_time > 0 else 0.0
+
+        # Compute throughput over the SUMMED per-request serving time, not the wall-clock
+        # window. The measured loop runs inline CPU quality scoring (LettuceDetect/NLI/BERTScore)
+        # after each generation, so wall-clock is dominated by evaluation + GPU idle between
+        # sequential requests and understates serving throughput by ~4x. Summing per-request
+        # latencies yields the true single-stream (back-to-back) serving rate, matching the
+        # parallel computation in run_experiment.py. Pure decode speed is 1000/avg_tpot_ms.
+        serving_time = sum(latencies) / 1000.0
+        qps = total_requests / serving_time if serving_time > 0 else 0.0
+        tps = total_tokens / serving_time if serving_time > 0 else 0.0
         
         # Compute latency percentiles
         import numpy as np
@@ -273,6 +282,7 @@ class PerformanceEvaluator:
             total_requests=total_requests + error_count,
             total_tokens=total_tokens,
             total_time_seconds=total_time,
+            serving_time_seconds=serving_time,
             error_count=error_count,
         )
     

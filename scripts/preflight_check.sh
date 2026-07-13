@@ -100,8 +100,11 @@ try:
     from src.orchestration.baselines import get_baseline_config
     emb = get_baseline_config("rag").embedding_model
     from sentence_transformers import SentenceTransformer
-    SentenceTransformer(emb)
-    pw(f"retrieval embedding model loads: {emb}")
+    # Load on CPU to mirror the real run: run_experiment.py builds the retriever with
+    # device="cpu" because vLLM reserves ~92% of the GPU (Qwen3-8B leaves only MiBs free),
+    # so a default-CUDA load here would OOM on a config the sweep never actually uses.
+    SentenceTransformer(emb, device="cpu")
+    pw(f"retrieval embedding model loads on cpu: {emb}")
 except Exception as e:
     pf(f"FAISS/retrieval error: {e}")
 
