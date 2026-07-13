@@ -493,14 +493,19 @@ class QualityEvaluator:
                 answer=answer,
                 output_format="spans",
             )
-            # spans: list of dicts with 'start','end' (char offsets into the answer)
+            # spans: list of dicts with 'start','end' (char offsets into the answer).
+            # Mark flagged characters in a boolean array so OVERLAPPING spans are counted
+            # ONCE: summing raw span lengths would double-count shared characters, inflate the
+            # ratio, and deflate the PRIMARY grounding_score. Identical to the old sum when
+            # spans are disjoint (the normal case).
             total = len(answer)
-            flagged = 0
+            flagged_chars = [False] * total
             for s in spans or []:
-                start = int(s.get("start", 0))
-                end = int(s.get("end", 0))
-                if end > start:
-                    flagged += min(end, total) - min(start, total)
+                start = max(0, min(int(s.get("start", 0)), total))
+                end = max(0, min(int(s.get("end", 0)), total))
+                for i in range(start, end):
+                    flagged_chars[i] = True
+            flagged = sum(flagged_chars)
             ratio = (flagged / total) if total > 0 else 0.0
             ratio = max(0.0, min(1.0, ratio))
             norm_spans = [
@@ -510,7 +515,9 @@ class QualityEvaluator:
             ]
             return {
                 "grounding_score": 1.0 - ratio,
-                "hallucination_detected": bool(spans),
+                # Flag a hallucination only when characters were actually flagged, not merely
+                # because the detector returned a (possibly zero-length) span.
+                "hallucination_detected": flagged > 0,
                 "hallucinated_span_ratio": ratio,
                 "hallucinated_spans": norm_spans,
             }

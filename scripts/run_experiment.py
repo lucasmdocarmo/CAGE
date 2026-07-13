@@ -1594,6 +1594,7 @@ def run_experiment(
     # valid scores on every answerable row. mean_or_none already excludes the None rows.
     if any(
         r.get("completeness_bertscore") is None and (r.get("reference_answer") or "").strip()
+        and not r.get("error") and not r.get("empty_generation")
         for r in results
     ):
         print("Warning: BERTScore was unavailable for answerable rows; clearing completeness_bertscore for all rows.")
@@ -1651,9 +1652,12 @@ def run_experiment(
     def summarize_subset(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if not rows:
             return None
-        latencies = [r["latency_ms"] for r in rows if r.get("latency_ms") is not None]
-        ttfts = [r["ttft_ms"] for r in rows if r.get("ttft_ms") is not None]
-        tokens = [r["num_tokens"] for r in rows if r.get("num_tokens") is not None]
+        # Exclude errored rows from the throughput/latency sums so this matches the primary
+        # PerformanceEvaluator (which computes serving_time over successful requests only).
+        good = [r for r in rows if not r.get("error")]
+        latencies = [r["latency_ms"] for r in good if r.get("latency_ms") is not None]
+        ttfts = [r["ttft_ms"] for r in good if r.get("ttft_ms") is not None]
+        tokens = [r["num_tokens"] for r in good if r.get("num_tokens") is not None]
         total_time_s = sum(latencies) / 1000.0 if latencies else 0.0
         total_tokens = sum(tokens) if tokens else 0
         error_rate = float(
