@@ -166,6 +166,12 @@ start_server() {
     # cold-start each trial. Benchmark box only; vLLM marks these endpoints not-for-production.
     export VLLM_SERVER_DEV_MODE="${VLLM_SERVER_DEV_MODE:-1}"
 
+    # Bound Hugging Face downloads so a dead socket during the first-load model download RAISES and
+    # resumes instead of hanging the start window forever (observed with MiMo-7B-RL on 2026-07-13:
+    # a stall at 12/15 GB with no timeout). Prefer prefetching in setup_gpu_cloud.sh step 4b; this
+    # is the belt-and-suspenders backstop for any un-prefetched model.
+    export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-30}"
+
     echo "Starting vLLM server (logging to $log_file)..."
     nohup vllm serve "$model" "${vllm_args[@]}" > "$log_file" 2>&1 &
     

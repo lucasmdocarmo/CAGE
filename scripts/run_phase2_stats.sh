@@ -26,15 +26,26 @@ done
 echo "Qwen baselines:"; ls "$ALL_Q" 2>/dev/null | tr '\n' ' '; echo
 echo "MiMo baselines:"; ls "$ALL_M" 2>/dev/null | tr '\n' ' '; echo
 
-# WARNING on serving metrics (ttft_ms, latency_ms, tpot_ms): the core suite runs non-eager /
-# max-len 8192 while the compression and speculative trees run --enforce-eager / max-len 4096.
-# Per PHASE2_PLAN_OF_RECORD.md, serving numbers are only comparable WITHIN a tree, so those rows
-# for compression/speculative arms vs the core no_cache mix the mechanism with the eager/context
-# serving difference -- interpret them within-tree only. Quality metrics (greedy T=0 -> identical
-# tokens regardless of serving config) ARE valid cross-tree.
-echo "[stats] NOTE: serving metrics (ttft/latency/tpot) are within-tree comparable only (core=non-eager/8192 vs compression&speculative=eager/4096)."
+# WARNING: deltas-vs-no_cache are confounded when the compared arm ran under a DIFFERENT serving
+# config, on TWO axes:
+#  (1) Serving metrics (ttft_ms, latency_ms, tpot_ms): the core suite runs non-eager / max-len 8192
+#      while the compression and speculative trees run --enforce-eager / max-len 4096, so those
+#      numbers are only comparable WITHIN a tree.
+#  (2) Quality metrics: greedy T=0 does NOT guarantee identical tokens across serving configs.
+#      vLLM prefix caching / eager-vs-compiled / context-length changes can flip near-tie argmaxes
+#      (FP non-associativity) -- empirically ~2/5 smoke queries diverged prefix_cache vs no_cache.
+#      A cross-config quality delta therefore MIXES the mechanism with token divergence; it is NOT a
+#      pure mechanism effect. Report the measured token-divergence rate (exact-match of
+#      generated_answer vs no_cache, per example_id) beside these rows, and read cross-tree quality
+#      as within-tree. Prior wording claimed quality was "identical tokens regardless of serving
+#      config" and was empirically FALSE; corrected here.
+echo "[stats] NOTE: BOTH serving (ttft/latency/tpot) AND quality deltas vs no_cache are confounded across serving configs (eager/context differ by tree; greedy tokens are near-lossless, NOT identical). Interpret cross-tree rows within-tree, with the token-divergence caveat."
 
-METRICS="grounding_score faithfulness context_relevance ttft_ms latency_ms tpot_ms f1_score exact_match hallucinated_span_ratio"
+# f1_answerable/exact_match_answerable/no_answer_correct are the SQuAD v2 no-answer
+# decomposition (fix #4): answerable-only extraction quality + abstention accuracy. They are
+# None on inapplicable rows, so statistical_tests.py subsets them automatically (and simply
+# skips them for datasets without unanswerable items, e.g. NQ/MuSiQue).
+METRICS="grounding_score faithfulness context_relevance ttft_ms latency_ms tpot_ms f1_score exact_match f1_answerable exact_match_answerable no_answer_correct hallucinated_span_ratio"
 
 # --- Qwen pass (reference no_cache) ---
 if [ ! -d "$ALL_Q/no_cache" ]; then
@@ -116,6 +127,17 @@ if rows:
 else:
     print("[spec] no speculative_matrix cells found; skipping acceptance summary.")
 PY
+
+# Token-divergence (near-lossless quantification, fix #6): how often each arm's greedy output
+# differs from the within-model no_cache reference. Backs the manuscript's "near-lossless" claim
+# with a measured number and bounds how much of a cross-config quality delta is token divergence
+# vs the mechanism. Non-fatal (a missing reference just skips).
+python3 scripts/token_divergence.py --results-dir "$ALL_Q" --reference no_cache \
+    --output "$ALL_Q/token_divergence.json" || echo "DIVERGENCE_FAILED (qwen)"
+if [ -d "$ALL_M/no_cache_mimo7b" ]; then
+  python3 scripts/token_divergence.py --results-dir "$ALL_M" --reference no_cache_mimo7b \
+      --output "$ALL_M/token_divergence.json" || echo "DIVERGENCE_FAILED (mimo)"
+fi
 
 bash scripts/sync_results_to_gcs.sh analysis || true
 echo "STATS_DONE"

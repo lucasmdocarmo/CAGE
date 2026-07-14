@@ -10,6 +10,12 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 PHASE_DIR="$PROJECT_DIR/analysis/phase1"
 OUTPUT_DIR="$PHASE_DIR/results"
 
+# Uniform serving config across ALL trees (Option A): non-eager / max_len 4096 / mem-util 0.90,
+# so the core 9 baselines are served under the SAME regime as the compression + speculative
+# trees and cross-mechanism comparisons are fair. (Previously the core suite ran max_len 8192 /
+# mem-util 0.92, which confounded cross-tree serving deltas.) mem-util is the swept axis.
+source "$SCRIPT_DIR/_serving_config.sh"
+
 MODEL=${1:-"Qwen/Qwen3-8B"}
 DATASET="squad_v2"
 # Model tag appended to baseline labels (see run_baseline) so MiMo core+compression never

@@ -41,9 +41,14 @@ NUM_QUERIES="${NUM_QUERIES:-500}"
 NUM_TRIALS="${NUM_TRIALS:-3}"
 SEED="${SEED:-42}"
 
-export VLLM_ENFORCE_EAGER=1
-export VLLM_MAX_MODEL_LEN=4096
-export VLLM_GPU_MEMORY_UTILIZATION=0.90
+# Uniform serving config across ALL trees (Option A): non-eager / max_len 4096 / mem-util 0.90
+# (single source of truth), so the speculative 2x2 matches the core + compression trees and
+# cross-mechanism comparisons are fair. The speculative tree is the TIGHTEST on VRAM under
+# non-eager (draft head + CUDA-graph capture over variable draft lengths); validate it in the
+# pre-flight, and if a cell OOMs, fall back for this tree only via
+# VLLM_ENFORCE_EAGER=1 bash scripts/run_speculative_matrix.sh <model> -- a recorded deviation
+# the run manifest captures. mem-util (0.90) is the swept memory-pressure axis.
+source scripts/_serving_config.sh
 
 # The universal draft-free method + the model-native draft method (+ a short model tag so
 # Qwen and MiMo cells never collide in $OUT or in the consolidated stats).

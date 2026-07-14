@@ -38,6 +38,7 @@ from src.orchestration.ir import (
     ensure_ir_index,
     default_index_dir,
     retrieval_hit_rate,
+    retrieval_rank_of_gold,
     stable_text_id,
     CrossEncoderReranker,
 )
@@ -1000,6 +1001,7 @@ def run_experiment(
 
         retrieval_cached = False
         retrieval_hit = None
+        retrieval_rank = None  # 1-based rank of the gold passage among retrieved; None = miss/unused (fix #5-C, MRR)
         retrieval_top1_score = None
         retrieved_doc_ids: List[str] = []
         retrieval_reranked = False
@@ -1064,6 +1066,15 @@ def run_experiment(
                 gold_texts=list(example.context or []),
                 retrieved_texts=used_contexts,
             )
+            # Graded companion (fix #5-C): 1-based rank of the gold passage -> MRR downstream.
+            # retrieved_doc_ids / used_contexts are already in retrieval-rank (score) order here,
+            # BEFORE the context caps below, so the rank reflects true retrieval position.
+            retrieval_rank = retrieval_rank_of_gold(
+                gold_doc_ids=gold_doc_ids,
+                retrieved_doc_ids=retrieved_doc_ids,
+                gold_texts=list(example.context or []),
+                retrieved_texts=used_contexts,
+            )
             if baseline_config.baseline_type.value == "redis":
                 baseline_mode = (
                     "redis_retrieval_cache_hit" if retrieval_cached else "redis_retrieval_cache_miss"
@@ -1119,6 +1130,7 @@ def run_experiment(
             "used_contexts": used_contexts,
             "retrieval_cached": retrieval_cached,
             "retrieval_hit": retrieval_hit,
+            "retrieval_rank": retrieval_rank,
             "retrieval_top1_score": retrieval_top1_score,
             "retrieved_doc_ids": retrieved_doc_ids,
             "retrieval_reranked": retrieval_reranked,
@@ -1279,6 +1291,7 @@ def run_experiment(
             "routed_replica": response.router_replica or "",
             "retrieval_top1_score": meta["retrieval_top1_score"],
             "retrieval_hit": meta["retrieval_hit"],
+            "retrieval_rank": meta.get("retrieval_rank"),  # graded rank for MRR (fix #5-C)
             "retrieval_cached": meta["retrieval_cached"],
             "retrieval_reranked": meta["retrieval_reranked"],
             "retrieved_doc_ids": ";".join(meta["retrieved_doc_ids"]) if meta["retrieved_doc_ids"] else "",
@@ -1635,6 +1648,16 @@ def run_experiment(
         "precision": mean_or_none("precision"),
         "recall": mean_or_none("recall"),
         "exact_match": mean_or_none("exact_match"),
+        # SQuAD v2 no-answer decomposition (fix #4). answerable-only variants average over
+        # answerable items only (None elsewhere); no_answer_correct averages over no-answer
+        # items only (== abstention accuracy); is_answerable/predicted_no_answer are the
+        # dataset/model abstention rates. mean_or_none already drops None, so each key is
+        # computed over exactly the right subset with no manual filtering.
+        "f1_answerable": mean_or_none("f1_answerable"),
+        "exact_match_answerable": mean_or_none("exact_match_answerable"),
+        "no_answer_correct": mean_or_none("no_answer_correct"),
+        "is_answerable": mean_or_none("is_answerable"),
+        "predicted_no_answer": mean_or_none("predicted_no_answer"),
     }
 
     print("\n" + "=" * 70)
@@ -1646,6 +1669,14 @@ def run_experiment(
     print(f"Supported-claim ratio: {format_metric(avg_quality['supported_claim_ratio'])}")
     print(f"Context relevance (retriever diagnostic): {format_metric(avg_quality['context_relevance'])}")
     print(f"F1 / EM: {format_metric(avg_quality['f1_score'])} / {format_metric(avg_quality['exact_match'])}")
+    # SQuAD v2 no-answer view (fix #4): answerable-only F1/EM isolate extraction quality;
+    # no_answer_correct is abstention accuracy on unanswerable items. Lines are n/a for
+    # datasets without unanswerable questions (NQ/MuSiQue) -- expected, not an error.
+    print(f"F1 / EM (answerable-only): {format_metric(avg_quality['f1_answerable'])} / "
+          f"{format_metric(avg_quality['exact_match_answerable'])}")
+    print(f"Abstention accuracy (no-answer items): {format_metric(avg_quality['no_answer_correct'])} "
+          f"| answerable frac: {format_metric(avg_quality['is_answerable'])} "
+          f"| model abstain rate: {format_metric(avg_quality['predicted_no_answer'])}")
     print(f"Completeness (BERTScore): {format_metric(avg_quality['completeness_bertscore'])}")
     print(f"Completeness (ROUGE-L): {format_metric(avg_quality['completeness_rouge_l'])}")
 
@@ -1703,9 +1734,20 @@ def run_experiment(
         cache_rate = float(
             np.mean([1.0 if r.get("retrieval_cached") else 0.0 for r in retrieval_rows])
         )
+        # Mean Reciprocal Rank (fix #5-C): graded retrieval quality that discriminates where the
+        # lenient hit@k saturates at 1.0. A miss (retrieval_rank None/0) contributes reciprocal 0.
+        avg_mrr = float(
+            np.mean(
+                [
+                    (1.0 / r["retrieval_rank"]) if r.get("retrieval_rank") else 0.0
+                    for r in retrieval_rows
+                ]
+            )
+        )
 
         retrieval_summary = {
             "avg_hit": avg_retrieval_hit,
+            "avg_mrr": avg_mrr,
             "avg_top1_score": avg_top1,
             "cache_rate": cache_rate,
             "top_k": baseline_config.top_k_retrieval,
@@ -1716,7 +1758,8 @@ def run_experiment(
         print("\n" + "=" * 70)
         print("RETRIEVAL METRICS (Average)")
         print("=" * 70)
-        print(f"Hit@{baseline_config.top_k_retrieval}: {avg_retrieval_hit:.3f}")
+        print(f"Hit@{baseline_config.top_k_retrieval} (lenient coverage): {avg_retrieval_hit:.3f}")
+        print(f"MRR (graded): {avg_mrr:.3f}")
         print(f"Top-1 score: {avg_top1:.3f}")
         if baseline_config.baseline_type.value in {"redis", "hybrid"}:
             print(f"Retrieval cache hit rate: {cache_rate:.3f}")

@@ -357,13 +357,21 @@ def retrieval_hit_rate(
     gold_texts: Optional[Sequence[str]] = None,
     retrieved_texts: Optional[Sequence[str]] = None,
 ) -> float:
-    """Hit indicator: 1.0 if a gold passage was retrieved, else 0.0.
+    """LENIENT hit@k coverage indicator: 1.0 if a gold passage is present anywhere in the
+    retrieved set, else 0.0.
 
     Primary check is an exact doc-id match. A normalized-TEXT fallback runs when the ids
     do not match but texts are supplied, because the corpus passage and the gold passage
     can hash to different stable_text_id values if they differ only in whitespace or
     encoding. In Phase 2 this made the metric a false 0.0 for every row even when top-1
     similarity was ~0.99; the text fallback fixes that. Returns 0.0 if gold is unknown.
+
+    Fix #5 (option B): this is intentionally a LENIENT presence check -- the bidirectional
+    substring fallback can rubber-stamp 1.0 on a closed corpus, so read it as "was a gold
+    passage present in the retrieved set", NOT as graded retrieval quality. The false-0.0 bug
+    the fallback fixes is a worse failure than a lenient 1.0, so the logic is kept as-is. For
+    a GRADED signal use retrieval_rank_of_gold (MRR, below) and the retrieval_top1_score the
+    runner already records; both discriminate where this binary indicator saturates.
     """
     gold = set(gold_doc_ids)
     if gold and any(d in gold for d in retrieved_doc_ids):
@@ -379,3 +387,44 @@ def retrieval_hit_rate(
                     return 1.0
             return 0.0
     return 0.0
+
+
+def retrieval_rank_of_gold(
+    *,
+    gold_doc_ids: Sequence[str],
+    retrieved_doc_ids: Sequence[str],
+    gold_texts: Optional[Sequence[str]] = None,
+    retrieved_texts: Optional[Sequence[str]] = None,
+) -> Optional[int]:
+    """1-based rank of the FIRST retrieved passage that matches gold, else None (miss).
+
+    Graded companion to retrieval_hit_rate (fix #5, option C). Where hit@k saturates at 1.0
+    on a closed corpus, the rank discriminates a top-1 retrieval from a rank-8 one, giving
+    Mean Reciprocal Rank (MRR = mean of 1/rank over queries; a miss contributes 0). It mirrors
+    the hit matcher exactly -- exact doc-id first, normalized-text fallback second -- but walks
+    ``retrieved_doc_ids`` / ``retrieved_texts`` IN ORDER so position is preserved. Both id and
+    text lists are assumed to be in retrieval-rank order (the runner passes them straight from
+    the scored hit list). Returns None when gold is unknown so callers can distinguish a miss
+    from an unmeasurable row.
+    """
+    gold = set(gold_doc_ids)
+    if not gold and not (gold_texts and any((t or "").strip() for t in gold_texts)):
+        return None  # gold unknown -> unmeasurable, not a miss
+
+    gold_norm = (
+        {_normalize_passage(t) for t in gold_texts if t and t.strip()}
+        if gold_texts
+        else set()
+    )
+    for rank, doc_id in enumerate(retrieved_doc_ids, start=1):
+        if doc_id in gold:
+            return rank
+    # Text fallback preserves rank: index into retrieved_texts positionally.
+    if gold_norm and retrieved_texts is not None:
+        for rank, r in enumerate(retrieved_texts, start=1):
+            rn = _normalize_passage(r)
+            if not rn:
+                continue
+            if rn in gold_norm or any(g in rn or rn in g for g in gold_norm):
+                return rank
+    return None  # a gold passage was defined but never retrieved -> reciprocal rank 0

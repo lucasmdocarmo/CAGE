@@ -39,12 +39,13 @@ for _cvar in CAGE_DISABLE_COMPRESSION CAGE_ALLOW_NO_COMPRESSION; do
     fi
 done
 
-# Reliable, fast, uniform startup on the 24GB L4 (parity with run_speculative_matrix.sh):
-# eager mode avoids the ~2-3 min torch.compile/CUDA-graph capture per relaunch and shrinks
-# the OOM/slow-start surface. Applied to EVERY cell (incl. the FP8 compressed_cag restart),
-# so serving stays uniform across the 2x2 and comparative metrics remain valid.
-export VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-1}"
-export VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-4096}"
+# Uniform serving config across ALL trees (Option A): non-eager / max_len 4096 / mem-util 0.90,
+# so the compression 2x2 is served under the SAME regime as the core suite and the speculative
+# tree, and cross-mechanism comparisons are fair. Non-eager now pays a ~2-3 min CUDA-graph
+# capture per per-cell restart (accepted for comparability); if a cell OOMs non-eager on the
+# 24GB L4, fall back for THIS tree only via VLLM_ENFORCE_EAGER=1 -- a recorded deviation the run
+# manifest captures. mem-util (0.90) is the swept memory-pressure axis.
+source "$SCRIPT_DIR/_serving_config.sh"
 
 cd "$PROJECT_DIR"
 # Activate the project venv if the caller has not already (cage-env on the VM, .venv locally),

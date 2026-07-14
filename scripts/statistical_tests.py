@@ -81,6 +81,12 @@ METRIC_HIGHER_IS_BETTER: Dict[str, bool] = {
     "exact_match": True,
     "precision": True,
     "recall": True,
+    # SQuAD v2 no-answer decomposition (fix #4): answerable-only F1/EM and abstention
+    # accuracy are all higher-better. Reported as separate comparison rows so a serving
+    # config that regresses abstention (starts hallucinating on no-answer items) is visible.
+    "f1_answerable": True,
+    "exact_match_answerable": True,
+    "no_answer_correct": True,
     "cached_prompt_ratio": True,
 }
 
@@ -92,6 +98,11 @@ DEFAULT_METRICS = [
     "hallucinated_span_ratio",
     "f1_score",
     "exact_match",
+    # SQuAD v2 no-answer decomposition (fix #4): None on inapplicable rows, so these
+    # subset automatically (answerable-only F1/EM; abstention accuracy on no-answer items).
+    "f1_answerable",
+    "exact_match_answerable",
+    "no_answer_correct",
     "completeness_rouge_l",
 ]
 

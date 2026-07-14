@@ -5,6 +5,9 @@ my-article/
 Documentation/
 MyDocs/
 
+# Local Claude Code harness config, skills, and settings (machine-local, not shared)
+.claude/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

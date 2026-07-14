@@ -48,6 +48,28 @@ def test_retrieval_hit_rate():
     assert retrieval_hit_rate(gold_doc_ids=gold, retrieved_doc_ids=["x", "b"]) == 1.0
 
 
+def test_retrieval_rank_of_gold():
+    # Graded companion (fix #5-C): returns the 1-based rank of the first gold match, or
+    # None on a miss / when gold is unknown. Powers MRR = mean(1/rank) downstream.
+    from src.orchestration.ir import retrieval_rank_of_gold
+
+    gold = ["a", "b"]
+    assert retrieval_rank_of_gold(gold_doc_ids=gold, retrieved_doc_ids=["a", "x"]) == 1
+    assert retrieval_rank_of_gold(gold_doc_ids=gold, retrieved_doc_ids=["x", "b", "a"]) == 2
+    assert retrieval_rank_of_gold(gold_doc_ids=gold, retrieved_doc_ids=["x", "y"]) is None  # miss
+    assert retrieval_rank_of_gold(gold_doc_ids=[], retrieved_doc_ids=["x"]) is None  # gold unknown
+    # Text fallback preserves order when ids do not match.
+    assert (
+        retrieval_rank_of_gold(
+            gold_doc_ids=["zzz"],
+            retrieved_doc_ids=["p", "q"],
+            gold_texts=["the sky is blue"],
+            retrieved_texts=["grass is green", "the sky is blue"],
+        )
+        == 2
+    )
+
+
 def test_format_qa_prompt_contains_context_and_question():
     prompt = format_qa_prompt("What?", ["ctx1", "ctx2"], system_prefix="SYS\n")
     assert "SYS" in prompt

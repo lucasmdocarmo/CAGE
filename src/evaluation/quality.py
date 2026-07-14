@@ -26,11 +26,63 @@ failures cannot contaminate reported means.
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
 import os
+import re
 import numpy as np
 import warnings
 
 # Suppress BERTScore warning about empty candidates
 warnings.filterwarnings("ignore", message=".*Empty candidate sentence detected.*")
+
+
+# --------------------------------------------------------------------------- #
+# SQuAD v2 no-answer (abstention) detection
+# --------------------------------------------------------------------------- #
+# SQuAD v2 is ~52% UNANSWERABLE: the gold reference is empty and the correct model
+# behaviour is to ABSTAIN ("the context does not answer this"). A vLLM model never emits
+# a null-answer token -- it emits prose -- so scoring abstention requires detecting a
+# no-answer PREDICTION from the generated text. This detector powers proper SQuAD v2
+# EM/F1 (a correct abstention on a no-answer item scores 1, not 0) in evaluate_f1_score.
+#
+# It is deliberately tuned to AVOID FALSE POSITIVES (misreading a real answer as an
+# abstention), because that is the dangerous direction -- it would wrongly credit a
+# hallucination. A missed verbose abstention (false negative) merely scores 0, which is
+# exactly the pre-fix behaviour, so the detector degrades gracefully and never regresses
+# a previously-correct score. Bare "no"/"yes" are VALID answers and are NOT matched.
+_NO_ANSWER_RE = re.compile(
+    r"\b("
+    r"no\s+answer|"
+    r"cannot\s+(be\s+)?answer(ed)?|can'?t\s+answer|unable\s+to\s+(answer|determine|find)|"
+    r"unanswerable|not\s+answerable|"
+    r"no\s+(information|mention|indication|answer)|"
+    r"insufficient\s+(information|context|detail)|"
+    r"not\s+(in|found\s+in|provided|mentioned|stated|specified|available|present|given)|"
+    r"does\s+not\s+(say|mention|provide|contain|specify|state|give|include)|"
+    r"doesn'?t\s+(say|mention|provide|contain|specify|state|give|include)|"
+    r"do(es)?\s+not\s+have\s+(the\s+)?answer|"
+    r"i\s+don'?t\s+know|i\s+do\s+not\s+know|"
+    r"the\s+(context|passage|text|document|article)\s+does\s+not"
+    r")",
+    re.IGNORECASE,
+)
+# Answers longer than this are assumed to be real content, not an abstention, even if they
+# happen to contain a matched phrase ("There is no doubt the answer is Paris"). SQuAD v2
+# abstention outputs are short; the cap trades a few verbose-abstention misses (safe: score
+# 0) for near-zero false positives (unsafe: falsely credited).
+_NO_ANSWER_MAX_WORDS = 20
+
+
+def is_no_answer_prediction(text: Optional[str]) -> bool:
+    """True if the generated text is a no-answer / abstention prediction (SQuAD v2).
+
+    Empty output counts as abstention. Otherwise, a SHORT response containing an explicit
+    abstention phrase counts. Conservative by design -- see _NO_ANSWER_RE note above.
+    """
+    t = (text or "").strip()
+    if not t:
+        return True
+    if len(t.split()) <= _NO_ANSWER_MAX_WORDS and _NO_ANSWER_RE.search(t):
+        return True
+    return False
 
 
 @dataclass
@@ -65,10 +117,18 @@ class QualityMetrics:
     relevance: Optional[float]  # 0-1, question<->context similarity (retriever diagnostic)
     completeness_bertscore: Optional[float]  # 0-1, BERTScore F1 (baseline-rescaled)
     completeness_rouge_l: Optional[float]  # 0-1, ROUGE-L F1
-    f1_score: float = 0.0  # 0-1, token-level F1 (QA standard metric)
+    f1_score: float = 0.0  # 0-1, token-level F1 (SQuAD v2 official: abstention-aware)
     precision: float = 0.0  # 0-1, token-level precision
     recall: float = 0.0  # 0-1, token-level recall
-    exact_match: float = 0.0  # 0 or 1, exact string match
+    exact_match: float = 0.0  # 0 or 1, exact match (SQuAD v2 official: abstention-aware)
+    # SQuAD v2 no-answer decomposition (fix #4). answerable-only variants are None on
+    # no-answer items so downstream None-exclusion reports F1/EM over the answerable subset;
+    # no_answer_correct is None on answerable items so its mean is abstention accuracy.
+    is_answerable: Optional[float] = None  # 1.0 answerable / 0.0 no-answer / None if not scored
+    predicted_no_answer: Optional[float] = None  # 1.0 if the model abstained
+    f1_answerable: Optional[float] = None  # token-F1 over answerable items only
+    exact_match_answerable: Optional[float] = None  # EM over answerable items only
+    no_answer_correct: Optional[float] = None  # 1.0/0.0 on no-answer items; abstention accuracy
     cache_relevance: Optional[float] = None  # 0-1, proportion of useful cache blocks
     # Hallucination (LettuceDetect, PRIMARY grounding signal)
     grounding_score: Optional[float] = None  # 0-1, 1 - hallucinated_span_ratio (None if detector unavailable)
@@ -94,6 +154,13 @@ class QualityMetrics:
             "precision": self.precision,
             "recall": self.recall,
             "exact_match": self.exact_match,
+            # SQuAD v2 no-answer decomposition (fix #4). Emitted unconditionally so the CSV
+            # columns are stable; None values are excluded from means / stats automatically.
+            "is_answerable": self.is_answerable,
+            "predicted_no_answer": self.predicted_no_answer,
+            "f1_answerable": self.f1_answerable,
+            "exact_match_answerable": self.exact_match_answerable,
+            "no_answer_correct": self.no_answer_correct,
             "grounding_score": self.grounding_score,
             "hallucinated_span_ratio": self.hallucinated_span_ratio,
             "supported_claim_ratio": self.supported_claim_ratio,
@@ -625,17 +692,25 @@ class QualityEvaluator:
         self, generated_text: str, reference_answer: str
     ) -> Dict[str, float]:
         """
-        Compute token-level F1 score (standard QA metric).
-        
-        F1 score is the harmonic mean of precision and recall at the token level.
-        This is the standard metric used in SQuAD, HotpotQA, and other QA benchmarks.
-        
+        Compute token-level F1 / EM with SQuAD v2 no-answer credit.
+
+        F1 is the harmonic mean of token-level precision and recall (SQuAD / HotpotQA
+        standard). This implementation also handles SQuAD v2 UNANSWERABLE items: a correct
+        abstention on a no-answer question scores 1 (not 0), and answerable-only variants are
+        emitted so extraction quality can be reported separately from abstention accuracy.
+
         Args:
             generated_text: Model's generated answer
-            reference_answer: Ground truth answer
-            
+            reference_answer: Ground truth answer ("" / blank == SQuAD v2 no-answer item)
+
         Returns:
-            Dict with f1, precision, recall, and exact_match scores
+            Dict with:
+              f1, precision, recall, exact_match       -- SQuAD v2 official (abstention-aware)
+              is_answerable                            -- 1.0 answerable / 0.0 no-answer item
+              predicted_no_answer                      -- 1.0 if the model abstained
+              f1_answerable, exact_match_answerable    -- None on no-answer items (answerable-only)
+              no_answer_correct                        -- None on answerable items; 1.0/0.0 on
+                                                          no-answer items (abstention accuracy)
         """
         import re
         import string
@@ -655,41 +730,81 @@ class QualityEvaluator:
             """Tokenize normalized text."""
             return normalize_text(text).split()
         
-        # Handle empty inputs
-        if not generated_text or not generated_text.strip():
-            return {"f1": 0.0, "precision": 0.0, "recall": 0.0, "exact_match": 0.0}
-        if not reference_answer or not reference_answer.strip():
-            return {"f1": 0.0, "precision": 0.0, "recall": 0.0, "exact_match": 0.0}
-        
-        # Exact match check
+        # ------------------------------------------------------------------ #
+        # SQuAD v2 scoring with no-answer credit  (fix #4, options A + B)
+        # ------------------------------------------------------------------ #
+        # gold_no_answer: this is an UNANSWERABLE item (empty reference). ~52% of SQuAD v2.
+        # pred_no_answer: the model produced an abstention (empty or an explicit phrase).
+        gold_no_answer = not (reference_answer or "").strip()
+        pred_no_answer = is_no_answer_prediction(generated_text)
+
+        # (A) Official SQuAD v2 semantics on the UNANSWERABLE half. Before this fix the
+        # function returned 0 unconditionally here, so a CORRECT abstention scored 0 and was
+        # indistinguishable from a hallucination -- deflating F1/EM and blinding them to the
+        # abstention behaviour that cache/serving configs can regress. Now: abstain -> 1, else 0.
+        # (B) f1_answerable / exact_match_answerable are None on no-answer items so the downstream
+        # None-exclusion computes the answerable-only F1/EM automatically. no_answer_correct is the
+        # abstention-accuracy signal (mean over no-answer rows).
+        if gold_no_answer:
+            correct = 1.0 if pred_no_answer else 0.0
+            return {
+                "f1": correct, "precision": correct, "recall": correct, "exact_match": correct,
+                "is_answerable": 0.0,
+                "predicted_no_answer": 1.0 if pred_no_answer else 0.0,
+                "f1_answerable": None, "exact_match_answerable": None,
+                "no_answer_correct": correct,
+            }
+
+        # ANSWERABLE item but the model abstained -> wrong (standard SQuAD v2: predicting
+        # no-answer when an answer exists scores 0). Kept explicit so the abstention diagnostics
+        # are populated and the answerable-only columns record the miss.
+        if pred_no_answer:
+            return {
+                "f1": 0.0, "precision": 0.0, "recall": 0.0, "exact_match": 0.0,
+                "is_answerable": 1.0, "predicted_no_answer": 1.0,
+                "f1_answerable": 0.0, "exact_match_answerable": 0.0,
+                "no_answer_correct": None,
+            }
+
+        # ANSWERABLE item, model attempted an answer: standard token-level F1 / EM.
         exact_match = 1.0 if normalize_text(generated_text) == normalize_text(reference_answer) else 0.0
-        
-        # Get token sets
         pred_tokens = get_tokens(generated_text)
         ref_tokens = get_tokens(reference_answer)
-        
+
         if not pred_tokens or not ref_tokens:
-            return {"f1": 0.0, "precision": 0.0, "recall": 0.0, "exact_match": exact_match}
-        
+            return {
+                "f1": 0.0, "precision": 0.0, "recall": 0.0, "exact_match": exact_match,
+                "is_answerable": 1.0, "predicted_no_answer": 0.0,
+                "f1_answerable": 0.0, "exact_match_answerable": exact_match,
+                "no_answer_correct": None,
+            }
+
         # Count common tokens
         common_tokens = set(pred_tokens) & set(ref_tokens)
         num_common = sum(min(pred_tokens.count(t), ref_tokens.count(t)) for t in common_tokens)
-        
+
         # Compute precision and recall
         precision = num_common / len(pred_tokens) if pred_tokens else 0.0
         recall = num_common / len(ref_tokens) if ref_tokens else 0.0
-        
+
         # Compute F1
         if precision + recall > 0:
             f1 = 2 * precision * recall / (precision + recall)
         else:
             f1 = 0.0
-        
+
         return {
             "f1": f1,
             "precision": precision,
             "recall": recall,
             "exact_match": exact_match,
+            # (B) answerable subset: these equal the headline metric here and are None on
+            # no-answer items, so mean(f1_answerable) is F1 over answerable questions only.
+            "is_answerable": 1.0,
+            "predicted_no_answer": 0.0,
+            "f1_answerable": f1,
+            "exact_match_answerable": exact_match,
+            "no_answer_correct": None,
         }
     
     def evaluate(
@@ -726,6 +841,11 @@ class QualityEvaluator:
             precision=f1_metrics["precision"],
             recall=f1_metrics["recall"],
             exact_match=f1_metrics["exact_match"],
+            is_answerable=f1_metrics.get("is_answerable"),
+            predicted_no_answer=f1_metrics.get("predicted_no_answer"),
+            f1_answerable=f1_metrics.get("f1_answerable"),
+            exact_match_answerable=f1_metrics.get("exact_match_answerable"),
+            no_answer_correct=f1_metrics.get("no_answer_correct"),
             grounding_score=halluc["grounding_score"],
             hallucination_detected=halluc["hallucination_detected"],
             hallucinated_span_ratio=halluc["hallucinated_span_ratio"],
@@ -909,6 +1029,11 @@ class QualityEvaluator:
             precision=f1_metrics["precision"],
             recall=f1_metrics["recall"],
             exact_match=f1_metrics["exact_match"],
+            is_answerable=f1_metrics.get("is_answerable"),
+            predicted_no_answer=f1_metrics.get("predicted_no_answer"),
+            f1_answerable=f1_metrics.get("f1_answerable"),
+            exact_match_answerable=f1_metrics.get("exact_match_answerable"),
+            no_answer_correct=f1_metrics.get("no_answer_correct"),
             grounding_score=halluc["grounding_score"],
             hallucination_detected=halluc["hallucination_detected"],
             hallucinated_span_ratio=halluc["hallucinated_span_ratio"],

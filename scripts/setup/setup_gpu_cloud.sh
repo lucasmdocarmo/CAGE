@@ -76,6 +76,37 @@ python scripts/download_datasets.py --dataset squad_v2 || true
 python scripts/download_datasets.py --dataset natural_questions || true
 python scripts/download_datasets.py --dataset musique || true
 
+# 4b. Prefetch model weights ROBUSTLY so a stalled Hugging Face connection cannot hang the timed
+#     vLLM server start mid-sweep. Observed 2026-07-13: a plain snapshot_download hung ~57 min at
+#     12/15 GB on a dead socket with no timeout, wasting GPU time. HF_HUB_DOWNLOAD_TIMEOUT makes a
+#     stalled read RAISE (then hf_hub resumes); the retry loop covers a shard that dies mid-transfer.
+#     Non-fatal by design: the server start is the backstop. Override PREFETCH_MODELS, or set
+#     SKIP_MODEL_PREFETCH=1 to bypass (e.g. a single-model run).
+export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-30}"
+PREFETCH_MODELS="${PREFETCH_MODELS:-Qwen/Qwen3-8B XiaomiMiMo/MiMo-7B-RL AngelSlim/Qwen3-8B_eagle3}"
+if [ "${SKIP_MODEL_PREFETCH:-0}" != "1" ]; then
+  echo "[cage] [4b] prefetching model weights (HF_HUB_DOWNLOAD_TIMEOUT=${HF_HUB_DOWNLOAD_TIMEOUT}s): ${PREFETCH_MODELS}"
+  for _m in ${PREFETCH_MODELS}; do
+    _ok=0
+    for _a in 1 2 3 4 5 6; do
+      if python - "$_m" <<'PY'
+import sys
+from huggingface_hub import snapshot_download
+snapshot_download(sys.argv[1], max_workers=8)
+PY
+      then _ok=1; break; fi
+      echo "[cage]   ${_m}: download attempt ${_a} stalled/failed; resuming in 5s..."; sleep 5
+    done
+    if [ "$_ok" = "1" ]; then
+      echo "[cage]   ${_m}: cached"
+    else
+      echo "[cage]   WARNING: ${_m} not fully prefetched after retries; the vLLM server start will retry (bounded by HF_HUB_DOWNLOAD_TIMEOUT)."
+    fi
+  done
+else
+  echo "[cage] [4b] model prefetch SKIPPED (SKIP_MODEL_PREFETCH=1)"
+fi
+
 # 5. Verify the telemetry stack the dissertation depends on.
 echo "[cage] [5/5] verifying telemetry stack..."
 python - <<'PY'

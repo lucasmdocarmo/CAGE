@@ -86,7 +86,36 @@ fi
 ) &
 SYNC_PID=$!
 
+# Load the uniform serving config (Option A) into THIS shell before the sidecar launches, so the
+# run manifest records the actual enforce_eager / max_model_len / gpu_memory_utilization. It is
+# idempotent (run_phase1.sh re-sources it) and only sets values not already in the env, so a
+# memory-pressure sweep that exports VLLM_GPU_MEMORY_UTILIZATION beforehand is preserved.
+source "$SCRIPT_DIR/_serving_config.sh"
+
+# Observability sidecar (provenance + snapshots): writes run_manifest.json, periodic GPU/
+# serving/progress JSON+PNG snapshots, and provenance hashes under $SYNC_DIR/observability/ --
+# which the periodic sync above already mirrors to GCS, so a laptop can watch live via
+# scripts/watch_run.sh. It observes from OUTSIDE the run (reads STATUS/results.csv), so it can
+# never perturb serving timings. Set OBSERVE=0 to disable.
+OBSERVE="${OBSERVE:-1}"
+OBSERVE_PID=""
+if [ "$OBSERVE" != "0" ]; then
+  mkdir -p logs
+  nohup python3 "$SCRIPT_DIR/observe_run.py" \
+    --run-dir "$SYNC_DIR" --model "$MODEL" \
+    --num-queries "$NUM_QUERIES" --num-trials "$NUM_TRIALS" \
+    --interval "${OBSERVE_INTERVAL:-30}" > logs/observe.log 2>&1 &
+  OBSERVE_PID=$!
+  echo "[cage] observability sidecar started (pid $OBSERVE_PID) -> $SYNC_DIR/observability/ (log: logs/observe.log)"
+fi
+
 cleanup() {
+  # Stop the observability sidecar FIRST and wait: SIGTERM makes it write a final snapshot +
+  # provenance.json, which must exist before the final GCS sync below carries them off-box.
+  if [ -n "$OBSERVE_PID" ]; then
+    kill "$OBSERVE_PID" 2>/dev/null || true
+    wait "$OBSERVE_PID" 2>/dev/null || true
+  fi
   # Stop the periodic syncer and WAIT for its in-flight rsync to finish, so it does not
   # race this final sync to the same destination.
   kill "$SYNC_PID" 2>/dev/null || true
