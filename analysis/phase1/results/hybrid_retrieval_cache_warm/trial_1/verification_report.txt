@@ -1,4 +1,0 @@
-Results dir: /Users/lucasmariano/projects/cag-llm-kvcache/analysis/phase1/results/hybrid_retrieval_cache_warm/trial_1
-Overall OK: True
-
-hybrid_retrieval_cache_warm | rows=50 expected=50 | ok=True

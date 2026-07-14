@@ -1,4 +1,0 @@
-Results dir: /Users/lucasmariano/projects/cag-llm-kvcache/analysis/phase1/results/no_cache/trial_1
-Overall OK: True
-
-no_cache | rows=50 expected=50 | ok=True

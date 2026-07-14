@@ -11,7 +11,7 @@ num_replicas = 3
 
 # --- Model (MUST match the --model passed to run_experiment.py) ---
 model_name = "Qwen/Qwen3-8B"
-# Pinned for reproducibility (see cloud_docs/VLLM_COMPATIBILITY.md); bump deliberately + re-gate.
+# Pinned for reproducibility (see cloud/VLLM_COMPATIBILITY.md); bump deliberately + re-gate.
 vllm_image             = "vllm/vllm-openai:v0.11.0"
 gpu_memory_utilization = 0.9
 

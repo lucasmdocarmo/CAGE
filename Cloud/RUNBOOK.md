@@ -17,14 +17,14 @@
 ---
 
 ## 0. Concepts (30 seconds)
-- `scripts/run_experiment.py` is the workload driver. It hits an OpenAI-compatible endpoint
+- `scripts/3_run/run_experiment.py` is the workload driver. It hits an OpenAI-compatible endpoint
   (`--api-base`) — a single vLLM server or the CAGE router — and writes results. **Where you
   run it is where results land.**
 - 7 baselines (`--baseline`): `no_cache`, `prefix_cache`, `rag`, `redis`, `hybrid`,
   `distributed`, `speculative`.
 - Output per baseline: `<output-dir>/aggregated_metrics.json` + `trial_N/results.csv` +
   `trial_N/metrics.json`. Schema is identical local and cloud.
-- On the cloud, `scripts/cloud_run.sh` mirrors results to a durable GCS bucket continuously,
+- On the cloud, `scripts/3_run/cloud_run.sh` mirrors results to a durable GCS bucket continuously,
   so teardown/SSH drops never lose completed work (§9).
 
 ---
@@ -56,8 +56,8 @@ becomes null). First run downloads `KRLabsOrg/lettucedect-base-modernbert-en-v1`
 ## 2. Data & retrieval indices
 
 ```bash
-# Download datasets (SQuAD v2 by default; extend in scripts/download_datasets.py)
-python3 scripts/download_datasets.py
+# Download datasets (SQuAD v2 by default; extend in scripts/1_setup/download_datasets.py)
+python3 scripts/1_setup/download_datasets.py
 ```
 **Rebuild the FAISS indices once.** The shipped indices under `experiments/ir_index/` predate
 the e5 `query:`/`passage:` prefix fix and default to un-prefixed retrieval. Add
@@ -72,15 +72,15 @@ CAGE talks to vLLM over HTTP. Two modes:
 
 ```bash
 # Single server (most baselines). Prefix caching ON:
-./scripts/manage_vllm_server.sh restart Qwen/Qwen3-4B
+./scripts/2_serving/manage_vllm_server.sh restart Qwen/Qwen3-4B
 # Prefix caching OFF (for no_cache / rag / redis-cold baselines):
-./scripts/manage_vllm_server.sh restart Qwen/Qwen3-4B --no-prefix-cache
-./scripts/manage_vllm_server.sh stop
+./scripts/2_serving/manage_vllm_server.sh restart Qwen/Qwen3-4B --no-prefix-cache
+./scripts/2_serving/manage_vllm_server.sh stop
 
 # Multi-replica + router (distributed baseline):
-python3 scripts/manage_vllm_cluster.py restart --model Qwen/Qwen3-4B \
+python3 scripts/2_serving/manage_vllm_cluster.py restart --model Qwen/Qwen3-4B \
   --replicas 3 --base-port 8001 --router-port 9000
-python3 scripts/manage_vllm_cluster.py stop
+python3 scripts/2_serving/manage_vllm_cluster.py stop
 ```
 Servers start with `--enable-prefix-caching --enable-prompt-tokens-details` (required for
 cache telemetry). Redis (retrieval-cache baselines): `docker run -d -p 6379:6379 --name cage-redis redis:7-alpine`.
@@ -94,16 +94,16 @@ namespacing, and the distributed cluster bring-up.
 
 ```bash
 # Full Phase-1 7-baseline suite on Qwen3-4B / SQuAD v2 (CPU-friendly defaults: 50 q, 3 trials)
-bash scripts/run_phase1.sh
+bash scripts/3_run/run_baselines.sh
 
 # Override scale via env vars (and model as $1):
-NUM_QUERIES=100 NUM_TRIALS=10 bash scripts/run_phase1.sh Qwen/Qwen3-8B
+NUM_QUERIES=100 NUM_TRIALS=10 bash scripts/3_run/run_baselines.sh Qwen/Qwen3-8B
 
-# Results land in analysis/phase1/results/<baseline_label>/
+# Results land in results/phase2/<run-id>/baselines/<baseline_label>/
 ```
 Baseline labels produced: `no_cache`, `prefix_cache`, `rag`, `redis_retrieval_cache_cold`,
 `hybrid_retrieval_cache_cold`, `hybrid_retrieval_cache_warm`, `distributed_router_replicated`.
-> **DEPRECATED — do NOT use for Phase 2** (not on the canonical path): `scripts/run_phase2.sh` (writes `analysis/phase2/`, which `run_phase2_stats.sh` ignores), `run_phase5.sh` (a single legacy speculative cell), `scripts/run_all_phases.sh` (the old multi-phase design). Canonical Phase-2 chain: `cloud_run.sh` → `run_compression.sh` → `run_speculative_matrix.sh` (×2 models) → `run_phase2_stats.sh`.
+> **DEPRECATED — do NOT use for Phase 2** (not on the canonical path): the deleted `run_phase2.sh` (was an orphan writing an ignored tree), the legacy single-cell speculative runners (now under `scripts/deprecated/`, superseded by `run_speculative_matrix.sh`), `scripts/deprecated/run_all_phases.sh` (the old multi-phase design). Canonical Phase-2 chain: `cloud_run.sh` → `run_compression.sh` → `run_speculative_matrix.sh` (×2 models) → `run_phase2_stats.sh`.
 
 ---
 
@@ -111,21 +111,21 @@ Baseline labels produced: `no_cache`, `prefix_cache`, `rag`, `redis_retrieval_ca
 
 ```bash
 # Make sure the matching server is up (§3), then:
-python3 scripts/run_experiment.py \
+python3 scripts/3_run/run_experiment.py \
   --baseline prefix_cache \           # one of: no_cache prefix_cache redis rag distributed hybrid speculative
   --baseline-label prefix_cache \
   --model Qwen/Qwen3-4B \
   --dataset squad_v2 \                # one of: squad_v2 hotpotqa trivia_qa qasper humaneval mbpp hpc_code
   --num-queries 50 --num-trials 3 --seed 42 \
   --api-base http://localhost:8000 \
-  --output-dir analysis/phase1/results/prefix_cache --rebuild-ir-index
+  --output-dir results/phase2/<run-id>/baselines/prefix_cache --rebuild-ir-index
 
 # Distributed baseline goes through the router:
-CAGE_REQUIRE_DISTINCT_REPLICAS=1 python3 scripts/run_experiment.py \
+CAGE_REQUIRE_DISTINCT_REPLICAS=1 python3 scripts/3_run/run_experiment.py \
   --baseline distributed --baseline-label distributed_router_replicated \
   --model Qwen/Qwen3-4B --dataset squad_v2 --num-queries 50 --num-trials 3 \
   --api-base http://localhost:9000 --sharding-policy replicated \
-  --output-dir analysis/phase1/results/distributed_router_replicated
+  --output-dir results/phase2/<run-id>/baselines/distributed_router_replicated
 ```
 
 ---
@@ -166,25 +166,25 @@ The axis crosses **context source** (CAG vs RAG) with **compression** (full vs
 compressed). Run **all four cells with the same model, dataset, seed, and trials**
 so the cell is the only thing that varies.
 
-**Scripted (recommended):** `bash scripts/run_compression.sh <model>` runs all four cells
+**Scripted (recommended):** `bash scripts/3_run/run_compression.sh <model>` runs all four cells
 through the launch-lever and runs the FP8×prefix-caching gate first. The manual equivalent:
 
 ```bash
 MODEL=Qwen/Qwen3-8B; DS=squad_v2; N=100; T=10; SEED=42   # GPU-phase defaults
 
 # --- Full row (no compression) ---
-./scripts/manage_vllm_server.sh restart $MODEL                          # prefix caching ON
-python3 scripts/run_experiment.py --baseline prefix_cache --model $MODEL --dataset $DS \
+./scripts/2_serving/manage_vllm_server.sh restart $MODEL                          # prefix caching ON
+python3 scripts/3_run/run_experiment.py --baseline prefix_cache --model $MODEL --dataset $DS \
   --num-queries $N --num-trials $T --seed $SEED --context-source gold          # FULL CAG
-python3 scripts/run_experiment.py --baseline rag --model $MODEL --dataset $DS \
+python3 scripts/3_run/run_experiment.py --baseline rag --model $MODEL --dataset $DS \
   --num-queries $N --num-trials $T --seed $SEED --rebuild-ir-index             # FULL RAG
 
 # --- Compressed row (ratio-matched at ~2x) ---
-python3 scripts/run_experiment.py --baseline compressed_rag --model $MODEL --dataset $DS \
+python3 scripts/3_run/run_experiment.py --baseline compressed_rag --model $MODEL --dataset $DS \
   --num-queries $N --num-trials $T --seed $SEED \
   --compress-method llmlingua2 --compress-ratio 0.5                            # COMPRESSED RAG (~2x tokens)
-VLLM_KV_CACHE_DTYPE=fp8 ./scripts/manage_vllm_server.sh restart $MODEL         # relaunch server with fp8 KV
-python3 scripts/run_experiment.py --baseline compressed_cag --model $MODEL --dataset $DS \
+VLLM_KV_CACHE_DTYPE=fp8 ./scripts/2_serving/manage_vllm_server.sh restart $MODEL         # relaunch server with fp8 KV
+python3 scripts/3_run/run_experiment.py --baseline compressed_cag --model $MODEL --dataset $DS \
   --num-queries $N --num-trials $T --seed $SEED --kv-cache-dtype fp8           # COMPRESSED CAG (~2x bytes)
 
 # MLA arm (optional, architectural KV compression — separate, more aggressive point):
@@ -235,18 +235,18 @@ quality comparisons also pass `--context-source gold` (or `retrieved`).
 
 ```bash
 # 7a. Integrity check (no truncated/erroring trials)
-python3 scripts/verify_results.py
+python3 scripts/4_analysis/verify_results.py
 
 # 7b. Per-query significance testing (Wilcoxon signed-rank, Holm-corrected, bootstrap CIs)
-python3 scripts/statistical_tests.py \
-  --results-dir analysis/phase1/results --reference no_cache \
+python3 scripts/4_analysis/statistical_tests.py \
+  --results-dir results/phase2/<run-id>/baselines --reference no_cache \
   --metrics ttft_ms latency_ms grounding_score faithfulness hallucinated_span_ratio f1_score \
-  --output analysis/phase1/stats.json --latex-out analysis/phase1/stats.tex
+  --output results/phase2/<run-id>/stats/stats.json --latex-out results/phase2/<run-id>/stats/stats.tex
 
 # 7c. Publication plots
-python3 scripts/generate_publication_plots.py \
-  --results-dir analysis/phase1/results --output-dir analysis/phase1/images
-python3 scripts/generate_compact_figures.py
+python3 scripts/deprecated/generate_publication_plots.py \
+  --results-dir results/phase2/<run-id>/baselines --output-dir results/phase2/<run-id>/plots
+python3 scripts/deprecated/generate_compact_figures.py
 ```
 Per-query quality fields: `grounding_score`, `hallucination_detected`,
 `hallucinated_span_ratio` (LettuceDetect); `faithfulness`, `supported_claim_ratio`
@@ -267,7 +267,7 @@ creds on the install host. Local-dev alternative without installing: `export CAG
 Then add `--vllm-telemetry` to any run; a snapshot is saved to `<output-dir>/vllm_telemetry.json`
 and into `aggregated_metrics.json` under `vllm_telemetry`, and a dashboard prints to the terminal:
 ```bash
-python3 scripts/run_experiment.py --baseline compressed_cag --model Qwen/Qwen3-8B \
+python3 scripts/3_run/run_experiment.py --baseline compressed_cag --model Qwen/Qwen3-8B \
   --dataset squad_v2 --num-queries 50 --num-trials 3 --vllm-telemetry --api-base http://localhost:9000
 ```
 Standalone (no CAGE): `cage-stats --url http://localhost:9000` (live TUI) ·
@@ -279,7 +279,7 @@ Gracefully skips if cage-stats isn't installed.
 ## 8. Tests
 
 ```bash
-bash scripts/run_tests.sh                                          # 1-replica cluster + pytest
+bash scripts/checks/run_tests.sh                                          # 1-replica cluster + pytest
 pytest -m vllm                                                     # adapter tests (live vLLM)
 ROUTER_TEST_API_BASE=http://localhost:9000 pytest -m integration  # router tests (live router)
 ```
@@ -294,10 +294,10 @@ ROUTER_TEST_API_BASE=http://localhost:9000 pytest -m integration  # router tests
 > |---|---|---|
 > | What | one GPU box runs vLLM **and** the experiment | 3 GPU replicas + 1 CPU router (Terraform) |
 > | Use for | the **6 single-server baselines** (Phase 2 suite) | the **`distributed` baseline** at real scale (Phase 3) |
-> | Runner | `scripts/cloud_run.sh` (wraps `run_phase1.sh`) | `run_experiment.py --baseline distributed` against the router |
-> | Why split | `run_phase1.sh` starts a **local** vLLM and toggles prefix-cache on/off — that needs a GPU on the box running it | the cluster's replicas are fixed/always-on; only the distributed baseline exercises the router |
+> | Runner | `scripts/3_run/cloud_run.sh` (wraps `run_baselines.sh`) | `run_experiment.py --baseline distributed` against the router |
+> | Why split | `run_baselines.sh` starts a **local** vLLM and toggles prefix-cache on/off — that needs a GPU on the box running it | the cluster's replicas are fixed/always-on; only the distributed baseline exercises the router |
 >
-> ❌ Do **not** run `cloud_run.sh`/`run_phase1.sh` on the cluster's CPU **router** — it has no GPU.
+> ❌ Do **not** run `cloud_run.sh`/`run_baselines.sh` on the cluster's CPU **router** — it has no GPU.
 
 ### 9.0 One-time GCP setup (both paths)
 ```bash
@@ -342,7 +342,7 @@ export HF_TOKEN=hf_xxx                        # if gated
 # 3. Run the suite + continuous GCS sync (nohup survives SSH drops):
 #    Telemetry is auto-captured (cloud_run.sh sets VLLM_TELEMETRY=1) ->
 #    each baseline writes <output>/vllm_telemetry.json, mirrored to GCS.
-nohup bash scripts/cloud_run.sh Qwen/Qwen3-8B 500 3 > run.log 2>&1 &
+nohup bash scripts/3_run/cloud_run.sh Qwen/Qwen3-8B 500 3 > run.log 2>&1 &
 tail -f run.log
 ```
 `cloud_run.sh` starts Redis, runs the 6 single-server baselines on the local GPU vLLM, and
@@ -366,12 +366,12 @@ curl -fsS http://$ROUTER_IP:9000/health && curl -fsS http://$ROUTER_IP:9000/stat
 # Run ONLY the distributed baseline against the router, then sync:
 gcloud compute ssh cage-router --zone=us-central1-a
 cd /opt/cage
-CAGE_REQUIRE_DISTINCT_REPLICAS=1 python3 scripts/run_experiment.py \
+CAGE_REQUIRE_DISTINCT_REPLICAS=1 python3 scripts/3_run/run_experiment.py \
   --baseline distributed --baseline-label distributed_router_replicated \
   --model Qwen/Qwen3-8B --dataset squad_v2 --num-queries 100 --num-trials 10 \
   --api-base http://localhost:9000 --sharding-policy replicated \
-  --output-dir analysis/phase1/results/distributed_router_replicated
-bash scripts/sync_results_to_gcs.sh analysis
+  --output-dir results/phase2/<run-id>/baselines/distributed_router_replicated
+bash scripts/5_observability/sync_results_to_gcs.sh results
 
 # Tear down GPUs (results stay safe in the versioned bucket):
 cd terraform/gcp && terraform destroy -var="project_id=$(gcloud config get-value project)" -var="hf_token=$HF_TOKEN"
@@ -382,10 +382,10 @@ bill continuously — destroy promptly.
 
 ### 9.5 Validate + analyze (either path)
 ```bash
-python3 scripts/statistical_tests.py --results-dir analysis/phase1/results \
-  --reference no_cache --output analysis/phase1/stats.json --latex-out analysis/phase1/stats.tex
-python3 scripts/generate_publication_plots.py \
-  --results-dir analysis/phase1/results --output-dir analysis/phase1/images
+python3 scripts/4_analysis/statistical_tests.py --results-dir results/phase2/<run-id>/baselines \
+  --reference no_cache --output results/phase2/<run-id>/stats/stats.json --latex-out results/phase2/<run-id>/stats/stats.tex
+python3 scripts/deprecated/generate_publication_plots.py \
+  --results-dir results/phase2/<run-id>/baselines --output-dir results/phase2/<run-id>/plots
 ```
 
 ---
@@ -447,18 +447,18 @@ open issues (full detail in [`VALIDATION_AND_SOTA_REVIEW.md`](VALIDATION_AND_SOT
 ## 15. Quick reference card
 | Goal | Command |
 |---|---|
-| Local full Phase 1 | `bash scripts/run_phase1.sh` |
-| Bigger sweep | `NUM_QUERIES=100 NUM_TRIALS=10 bash scripts/run_phase1.sh Qwen/Qwen3-8B` |
-| Single baseline | `python3 scripts/run_experiment.py --baseline rag --model … --dataset squad_v2 --num-queries 50 --num-trials 3` |
-| Cloud run + persist | `nohup bash scripts/cloud_run.sh Qwen/Qwen3-8B 500 3 > run.log 2>&1 &` |
-| Sync results to GCS | `bash scripts/sync_results_to_gcs.sh analysis` |
+| Local full Phase 1 | `bash scripts/3_run/run_baselines.sh` |
+| Bigger sweep | `NUM_QUERIES=100 NUM_TRIALS=10 bash scripts/3_run/run_baselines.sh Qwen/Qwen3-8B` |
+| Single baseline | `python3 scripts/3_run/run_experiment.py --baseline rag --model … --dataset squad_v2 --num-queries 50 --num-trials 3` |
+| Cloud run + persist | `nohup bash scripts/3_run/cloud_run.sh Qwen/Qwen3-8B 500 3 > run.log 2>&1 &` |
+| Sync results to GCS | `bash scripts/5_observability/sync_results_to_gcs.sh results` |
 | Pull results back | `gsutil -m cp -r gs://<project>-cage-results/analysis ./analysis` |
-| Significance tests | `bash scripts/run_phase2_stats.sh` (consolidates all trees + runs Wilcoxon/Holm/bootstrap vs no_cache) |
+| Significance tests | `bash scripts/4_analysis/run_phase2_stats.sh` (consolidates all trees + runs Wilcoxon/Holm/bootstrap vs no_cache) |
 | Provision cloud | `cd terraform/gcp && terraform apply -var=project_id=… -var=hf_token=…` |
 | Tear down (keep results) | `cd terraform/gcp && terraform destroy -var=project_id=… -var=hf_token=…` |
-| Compression 2×2 (GPU) | `bash scripts/run_compression.sh Qwen/Qwen3-8B` |
-| Speculative (GPU) | `bash scripts/run_speculative_matrix.sh Qwen/Qwen3-8B` (then `… XiaomiMiMo/MiMo-7B-RL`) |
-| FP8×prefix-cache gate | `bash scripts/check_fp8_prefix_cache.sh Qwen/Qwen3-8B` |
+| Compression 2×2 (GPU) | `bash scripts/3_run/run_compression.sh Qwen/Qwen3-8B` |
+| Speculative (GPU) | `bash scripts/3_run/run_speculative_matrix.sh Qwen/Qwen3-8B` (then `… XiaomiMiMo/MiMo-7B-RL`) |
+| FP8×prefix-cache gate | `bash scripts/checks/check_fp8_prefix_cache.sh Qwen/Qwen3-8B` |
 
 ---
 
@@ -472,8 +472,8 @@ Levers are applied by (re)starting the server through `manage_vllm_server.sh`:
 
 | Lever | How | Baseline |
 |---|---|---|
-| FP8 KV cache | `VLLM_KV_CACHE_DTYPE=fp8 ./scripts/manage_vllm_server.sh restart <model>` | `compressed_cag` |
-| Speculative | `VLLM_SPECULATIVE_CONFIG='{"model":"Qwen/Qwen3-0.6B","num_speculative_tokens":5}' ./scripts/manage_vllm_server.sh restart <model>` | `speculative` |
+| FP8 KV cache | `VLLM_KV_CACHE_DTYPE=fp8 ./scripts/2_serving/manage_vllm_server.sh restart <model>` | `compressed_cag` |
+| Speculative | `VLLM_SPECULATIVE_CONFIG='{"model":"Qwen/Qwen3-0.6B","num_speculative_tokens":5}' ./scripts/2_serving/manage_vllm_server.sh restart <model>` | `speculative` |
 | Cluster (terraform) | `-var=vllm_extra_args='--kv-cache-dtype fp8'` | cloud replicas |
 
 `run_compression.sh` and `run_speculative_matrix.sh` drive these levers and capture `/metrics` telemetry;

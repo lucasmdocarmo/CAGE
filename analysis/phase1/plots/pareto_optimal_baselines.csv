@@ -1,7 +1,0 @@
-tradeoff,baseline,latency_ms,bertscore,ttft_ms,qps,faithfulness,relevance
-latency_ms_vs_bertscore,prefix_cache,10015.438238779703,0.32785582542419434,,,,
-ttft_ms_vs_bertscore,prefix_cache,,0.32785582542419434,2375.603756904602,,,
-qps_vs_faithfulness,prefix_cache,,,,0.0959203122714621,0.5702537852525711,
-qps_vs_faithfulness,distributed_router_replicated,,,,0.05248468348566693,0.6359199074904124,
-latency_ms_vs_relevance,prefix_cache,10015.438238779703,,,,,0.5050981903076172
-latency_ms_vs_relevance,hybrid_retrieval_cache_warm,13268.585240046183,,,,,0.5250649079680443

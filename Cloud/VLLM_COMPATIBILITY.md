@@ -22,7 +22,7 @@ deploy a **single pinned version** everywhere, exposed as one knob:
 | `terraform/gcp/main.tf` (`vllm_image` default) | `vllm/vllm-openai:latest` | `vllm/vllm-openai:v0.11.0` |
 | `terraform/gcp/terraform.tfvars.example` | `:latest` | `:v0.11.0` |
 | `docker/docker-compose.gpu.yml` | `:latest` | `:v0.11.0` |
-| `scripts/deploy_cluster.sh` | `:latest` | `:v0.11.0` |
+| `scripts/2_serving/deploy_cluster.sh` | `:latest` | `:v0.11.0` |
 | `k8s/vllm-replica.yaml` (×3) | `vllm/vllm-openai:latest` | `vllm/vllm-openai:v0.11.0` ✅ pinned |
 | `docker/docker-compose.yml` (CPU ARM) | `public.ecr.aws/q9t5s3a7/vllm-arm64-cpu-release-repo:latest` | a dated tag from that repo (different registry — pin separately) |
 
@@ -77,7 +77,7 @@ the entire compression‑axis comparison (RQ5/H4)**. Record the verified behavio
 - **Config (launch‑time):** `--speculative-config` JSON. Methods on V1: `ngram` (no draft
   model), `eagle`/`eagle3`/`medusa`/`mtp`/`draft_model` (need a model). EAGLE ≈ 0.8 acceptance,
   2.5–2.8× decode speedup. `manage_vllm_server.sh` already uses `VLLM_SPECULATIVE_CONFIG →
-  --speculative-config` (current). `run_phase5.sh` now emits `--speculative-config` too; the old
+  --speculative-config` (current). `run_speculative_matrix.sh` now emits `--speculative-config` too; the old
   `--speculative-model` is deprecated and no longer used by any script.
 - **Acceptance metrics (`/metrics`, Prometheus):**
   `acceptance = vllm:spec_decode_num_accepted_tokens_total / vllm:spec_decode_num_draft_tokens_total`
@@ -92,7 +92,7 @@ Sources: [vLLM spec‑decode metrics](https://docs.vllm.ai/en/stable/api/vllm/v1
 ## 6. Status of the wiring (this change set)
 
 - [x] Pin the vLLM image across deploy paths (§1).
-- [x] `run_phase5.sh`: launch with `--speculative-config` (drop deprecated `--speculative-model`).
+- [x] `run_speculative_matrix.sh`: launch with `--speculative-config` (drop deprecated `--speculative-model`).
 - [x] Scrape `/metrics` spec‑decode acceptance into telemetry (`scrape_spec_decode`).
 - [x] Replace the "not wired" runner warning with the correct launch‑lever guidance.
 - [x] `run_compression.sh`: 2×2 axis through the FP8 launch‑lever (`compressed_cag`) + LLMLingua (`compressed_rag`).

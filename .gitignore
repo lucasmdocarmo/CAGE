@@ -200,9 +200,14 @@ terraform.tfvars
 crash.log
 *.tfplan
 
-# Phase-2 results pulled from GCS for local analysis (data, not code).
+# Run outputs are DATA, not code -- never tracked. The standardized run root is
+# results/<phase>/<run-id>/ (minted by cloud_run.sh, mirrored verbatim to GCS);
+# archive/ holds retired data moved out of the active tree. /analysis/ is the
+# legacy pre-standardization root, kept ignored for back-compat.
 phase2_archive/
 /analysis/
+/results/
+/archive/
 /evidence/
 
 # Runtime logs collected on the VM (vLLM server, run stdout, forensics). Mirrored to GCS.

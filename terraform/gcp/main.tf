@@ -78,13 +78,13 @@ variable "vllm_image" {
 }
 
 variable "vllm_extra_args" {
-  description = "Extra flags appended to the vLLM launch, e.g. '--kv-cache-dtype fp8' (compressed_cag) or a --speculative-config JSON. Empty by default. See cloud_docs/VLLM_COMPATIBILITY.md."
+  description = "Extra flags appended to the vLLM launch, e.g. '--kv-cache-dtype fp8' (compressed_cag) or a --speculative-config JSON. Empty by default. See cloud/VLLM_COMPATIBILITY.md."
   type        = string
   default     = ""
 }
 
 variable "gpu_memory_utilization" {
-  description = "vLLM --gpu-memory-utilization. 0.85 leaves KV/draft headroom on a 24GB L4; for Qwen3-8B + FP8 + speculative, lower further or use Qwen3-4B for those arms (see cloud_docs/PHASE2_CHECKLIST.md)."
+  description = "vLLM --gpu-memory-utilization. 0.85 leaves KV/draft headroom on a 24GB L4; for Qwen3-8B + FP8 + speculative, lower further or use Qwen3-4B for those arms (see documentation/PHASE2_CHECKLIST.md)."
   type        = number
   default     = 0.85
 }
@@ -290,8 +290,8 @@ resource "google_compute_instance" "vllm_replica" {
 
     # Sync results + logs to GCS on ACPI soft-off (SPOT preemption ~30s budget, or a normal
     # instances delete/stop), so data is captured even when no operator is watching and the
-    # run-script EXIT trap never fires. See scripts/gcp_shutdown_hook.sh.
-    shutdown-script = file("${path.module}/../../scripts/gcp_shutdown_hook.sh")
+    # run-script EXIT trap never fires. See scripts/5_observability/gcp_shutdown_hook.sh.
+    shutdown-script = file("${path.module}/../../scripts/5_observability/gcp_shutdown_hook.sh")
 
     startup-script = <<-EOF
       #!/bin/bash
@@ -480,7 +480,7 @@ output "upload_code_command" {
 
 output "experiment_command" {
   description = "Command to run experiments against the cluster"
-  value       = "python3 scripts/run_experiment.py --baseline distributed --model ${var.model_name} --api-base http://${google_compute_instance.cage_router.network_interface[0].access_config[0].nat_ip}:9000"
+  value       = "python3 scripts/3_run/run_experiment.py --baseline distributed --model ${var.model_name} --api-base http://${google_compute_instance.cage_router.network_interface[0].access_config[0].nat_ip}:9000"
 }
 
 output "results_bucket" {

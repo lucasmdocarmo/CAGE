@@ -1,4 +1,0 @@
-Results dir: /Users/lucasmariano/projects/cag-llm-kvcache/analysis/phase1/results/rag/trial_1
-Overall OK: True
-
-rag | rows=50 expected=50 | ok=True

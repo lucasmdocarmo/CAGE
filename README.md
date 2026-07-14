@@ -2,8 +2,8 @@
 
 A comprehensive benchmarking framework for evaluating Cache-Augmented Generation (CAG) systems with distributed KV cache management.
 
-> 📖 **Start here:** [`cloud_docs/RUNBOOK.md`](cloud_docs/RUNBOOK.md) (setup / deploy / run) ·
-> [`cloud_docs/KNOWLEDGE_BASE.md`](cloud_docs/KNOWLEDGE_BASE.md) (project reference) ·
+> 📖 **Start here:** [`cloud/RUNBOOK.md`](cloud/RUNBOOK.md) (setup / deploy / run) ·
+> [`documentation/KNOWLEDGE_BASE.md`](documentation/KNOWLEDGE_BASE.md) (project reference) ·
 > [`docs/README.md`](docs/README.md) (doc index). The repo is a single-level tree at the
 > project root; some sections below predate the June 2026 reorg — trust the docs above for
 > current commands and paths.
@@ -66,11 +66,11 @@ export VLLM_CPU_OMP_THREADS_BIND=auto
 
 ```bash
 # Download dataset
-python3 scripts/download_datasets.py
+python3 scripts/1_setup/download_datasets.py
 
 # Run baseline comparison
-python3 scripts/run_experiment.py --baseline no_cache --model Qwen/Qwen3-4B
-python3 scripts/run_experiment.py --baseline prefix_cache --model Qwen/Qwen3-4B
+python3 scripts/3_run/run_experiment.py --baseline no_cache --model Qwen/Qwen3-4B
+python3 scripts/3_run/run_experiment.py --baseline prefix_cache --model Qwen/Qwen3-4B
 
 # Analyze results
 jupyter notebook experiments/notebooks/analysis.ipynb
@@ -154,7 +154,7 @@ CAGE supports evaluating speculative decoding's impact on CAG systems:
 vllm serve Qwen/Qwen3-4B --port 8000 --enable-prefix-caching \
   --speculative_config '{"method": "ngram", "num_speculative_tokens": 5}'
 
-python3 scripts/run_experiment.py \
+python3 scripts/3_run/run_experiment.py \
   --model Qwen/Qwen3-4B \
   --baseline speculative \
   --speculative-method ngram \

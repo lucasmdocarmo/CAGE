@@ -89,12 +89,12 @@ gcloud compute instances create cage-gpu --zone=us-central1-a \
   --maintenance-policy=TERMINATE --image-family=common-cu121-debian-11 \
   --image-project=deeplearning-platform-release --boot-disk-size=200GB \
   --boot-disk-type=pd-ssd --scopes=cloud-platform --metadata=install-nvidia-driver=True \
-  --metadata-from-file=shutdown-script=scripts/gcp_shutdown_hook.sh
+  --metadata-from-file=shutdown-script=scripts/5_observability/gcp_shutdown_hook.sh
 ```
 > The `shutdown-script` mirrors `analysis/` + logs to GCS on ACPI soft-off (a SPOT preemption
 > or `instances delete`/`stop`), so data survives even when no operator is watching. It is what
 > makes the "~30s notice" tolerance below real. Already created the VM? Add it live with
-> `gcloud compute instances add-metadata cage-gpu --zone=us-central1-a --metadata-from-file=shutdown-script=scripts/gcp_shutdown_hook.sh`.
+> `gcloud compute instances add-metadata cage-gpu --zone=us-central1-a --metadata-from-file=shutdown-script=scripts/5_observability/gcp_shutdown_hook.sh`.
 
 **💸 Cheaper: spot VM (~65% off — recommended for Phase 2).** Add two flags to the command above:
 ```bash
@@ -143,7 +143,7 @@ rm -rf experiments/ir_index/ir_squad_v2_*
 ### 2.4 Run — start the suite (auto‑telemetry, auto‑GCS‑sync)
 Still in the same SSH terminal, inside `cage`:
 ```bash
-nohup bash scripts/cloud_run.sh Qwen/Qwen3-8B 500 3 > run.log 2>&1 &
+nohup bash scripts/3_run/cloud_run.sh Qwen/Qwen3-8B 500 3 > run.log 2>&1 &
 tail -f run.log
 ```
 - `nohup … &` keeps it running even if the SSH window closes.
@@ -152,7 +152,7 @@ tail -f run.log
 
 ### 2.5 Check — is it healthy and progressing?
 - **In the SSH terminal:** the `run.log` should show baselines starting/finishing and a `vLLM TELEMETRY (cage-stats)` dashboard block.
-- **In the console:** **☰ → Cloud Storage → Buckets → your bucket** → open `analysis/phase1/results/` — you should see baseline folders appearing and growing over time. That's the proof results are being saved.
+- **In the console:** **☰ → Cloud Storage → Buckets → your bucket** → open `results/phase2/<run-id>/baselines/` — you should see baseline folders appearing and growing over time. That's the proof results are being saved.
 - **GPU busy?** In SSH: `nvidia-smi` (run it again) → utilisation should be >0% while a baseline runs.
 - **Something stuck?** `tail -n 50 run.log` for the latest lines.
 
@@ -160,18 +160,18 @@ tail -f run.log
 When `run.log` prints "Phase 1 Complete" (or all 6 baseline folders exist), in the SSH terminal:
 ```bash
 cd ~/CAGE && source cage-env/bin/activate
-python3 scripts/verify_results.py                       # integrity: no truncated/errored trials
-python3 scripts/statistical_tests.py --results-dir analysis/phase1/results --reference no_cache
+python3 scripts/4_analysis/verify_results.py                       # integrity: no truncated/errored trials
+python3 scripts/4_analysis/statistical_tests.py --results-dir results/phase2/<run-id>/baselines --reference no_cache
 ```
 - `verify_results.py` should report all baselines OK.
 - `statistical_tests.py` prints a per‑metric table (Wilcoxon, Holm‑corrected). "sig=yes" means a real difference.
-- Telemetry sanity: `cat analysis/phase1/results/prefix_cache/vllm_telemetry.json | head` — you should see `spec_acceptance`, a `kv` block, etc.
+- Telemetry sanity: `cat results/phase2/<run-id>/baselines/prefix_cache/vllm_telemetry.json | head` — you should see `spec_acceptance`, a `kv` block, etc.
 
 ### 2.7 Gather — get the results off the cloud
 Everything is already in your bucket. To download:
 - **🖱️ Console:** **☰ → Cloud Storage → your bucket → `analysis/`** → tick the folder → **DOWNLOAD**. (For many files, the Cloud Shell line below is easier.)
 - **⌨️ Cloud Shell / your laptop:** `gsutil -m cp -r gs://$(gcloud config get-value project)-cage-results/analysis ./analysis`
-- The artifacts you care about: `aggregated_metrics.json` (per baseline), `vllm_telemetry.json` (per baseline), `stats.json` (if you saved it), and `analysis/phase1/images/` (plots, if generated).
+- The artifacts you care about: `aggregated_metrics.json` (per baseline), `vllm_telemetry.json` (per baseline), `stats.json` (if you saved it), and `results/phase2/<run-id>/plots/` (plots, if generated).
 
 ### 2.8 Tear down — STOP PAYING (do this!)
 1. **☰ → Compute Engine → VM instances**.
@@ -214,13 +214,13 @@ SSH into the router (console SSH button on `cage-router`, or `gcloud compute ssh
 ```bash
 cd /opt/cage
 # distributed baseline against the cluster, with telemetry:
-CAGE_REQUIRE_DISTINCT_REPLICAS=1 python3 scripts/run_experiment.py \
+CAGE_REQUIRE_DISTINCT_REPLICAS=1 python3 scripts/3_run/run_experiment.py \
   --baseline distributed --baseline-label distributed_router_replicated \
   --model Qwen/Qwen3-14B --dataset squad_v2 --num-queries 100 --num-trials 10 \
   --api-base http://localhost:9000 --sharding-policy replicated --vllm-telemetry \
-  --output-dir analysis/phase1/results/distributed_router_replicated
-bash scripts/sync_results_to_gcs.sh analysis      # push to bucket
-python3 scripts/statistical_tests.py --results-dir analysis/phase1/results
+  --output-dir results/phase2/<run-id>/baselines/distributed_router_replicated
+bash scripts/5_observability/sync_results_to_gcs.sh results      # push to bucket
+python3 scripts/4_analysis/statistical_tests.py --results-dir results/phase2/<run-id>/baselines
 ```
 
 ### 3.4 Tear down

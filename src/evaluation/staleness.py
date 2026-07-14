@@ -24,7 +24,7 @@ A per-query record is a mapping with (at least):
     evidence_version  : str    "v0" (stale) | "v1" (fresh) | None (no cache hit)
 
 This module is dependency-free (stdlib only) so it is unit-testable without model loads.
-Wiring into the run loop is pending; see cloud_docs/STALENESS_BASELINE_DESIGN.md.
+Wiring into the run loop is pending; see documentation/STALENESS_BASELINE_DESIGN.md.
 """
 
 from __future__ import annotations

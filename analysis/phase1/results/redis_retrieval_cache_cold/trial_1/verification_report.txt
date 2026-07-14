@@ -1,4 +1,0 @@
-Results dir: /Users/lucasmariano/projects/cag-llm-kvcache/analysis/phase1/results/redis_retrieval_cache_cold/trial_1
-Overall OK: True
-
-redis_retrieval_cache_cold | rows=50 expected=50 | ok=True
