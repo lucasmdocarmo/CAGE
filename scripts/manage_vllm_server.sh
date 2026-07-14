@@ -118,6 +118,12 @@ start_server() {
     # JSON speculative config) are passed as a single token and never word-split.
     local -a vllm_args=( --port "$PORT" "$cache_flag" )
 
+    # MiMo-7B-RL (and any repo shipping custom modeling code, incl. its MTP draft head)
+    # fails vLLM ModelConfig validation without this: "contains custom code which must be
+    # executed... pass trust_remote_code=True". Harmless for natively-supported models like
+    # Qwen3. This is a benchmark box running only known, vetted models.
+    vllm_args+=( --trust-remote-code )
+
     # Optional server-side KV-cache compression for the compressed_cag baseline:
     #   VLLM_KV_CACHE_DTYPE=fp8 ./scripts/manage_vllm_server.sh restart <model>
     if [ -n "${VLLM_KV_CACHE_DTYPE:-}" ]; then
