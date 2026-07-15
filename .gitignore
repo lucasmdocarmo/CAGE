@@ -210,5 +210,9 @@ phase2_archive/
 /archive/
 /evidence/
 
+# Agent/operator runtime state (scripts/ops): background-task PIDs, logs, state JSON, current zone.
+# Handles and logs, not code -- never tracked.
+/.agent/
+
 # Runtime logs collected on the VM (vLLM server, run stdout, forensics). Mirrored to GCS.
 /logs/
