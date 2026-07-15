@@ -42,10 +42,10 @@ USAGE
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import math
 import os
+import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -87,6 +87,7 @@ METRIC_HIGHER_IS_BETTER: Dict[str, bool] = {
     "f1_answerable": True,
     "exact_match_answerable": True,
     "no_answer_correct": True,
+    "abstention_precision": True,
     "cached_prompt_ratio": True,
 }
 
@@ -103,7 +104,12 @@ DEFAULT_METRICS = [
     "f1_answerable",
     "exact_match_answerable",
     "no_answer_correct",
+    "abstention_precision",
     "completeness_rouge_l",
+    # The most-plotted quality metric was never significance-tested (2026-07-15 audit).
+    # Signed (baseline-rescaled) and near-zero for short QA answers -- test it anyway so
+    # figures and tables come from the same set.
+    "completeness_bertscore",
 ]
 
 
@@ -130,61 +136,30 @@ class ComparisonResult:
 
 
 # --------------------------------------------------------------------------- #
-# Data loading
+# Data loading -- delegated to the canonical loader (2026-07-15 audit fix): one
+# parser + one validity rule shared with plots/verify, so figures and this table
+# derive from the same estimand. Behavior delta vs the legacy inline loader:
+# empty_generation rows are now excluded from serving metrics too (documented
+# canonical rule); quality metrics are unchanged (nulled at source on such rows).
 # --------------------------------------------------------------------------- #
-def _to_float(x: str) -> Optional[float]:
-    if x is None:
-        return None
-    x = x.strip()
-    if x == "" or x.lower() in {"none", "nan", "null"}:
-        return None
-    try:
-        return float(x)
-    except ValueError:
-        return None
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _results_loader import discover_cells, load_cell, per_example as _per_example_table  # noqa: E402
 
 
 def load_baseline_per_example(baseline_dir: Path, metrics: List[str]) -> Dict[str, Dict[str, float]]:
-    """Return {example_id: {metric: mean_over_trials_value}} for one baseline.
-
-    Reads every trial_*/results.csv, skips errored rows, and averages each
-    example's metric across trials so every question contributes a single value.
-    """
-    accum: Dict[str, Dict[str, List[float]]] = {}
-    csv_files = sorted(baseline_dir.glob("trial_*/results.csv"))
-    if not csv_files:
-        # Fall back to any results.csv directly under the baseline dir.
-        csv_files = sorted(baseline_dir.glob("results.csv"))
-
-    for csv_path in csv_files:
-        with csv_path.open("r", encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                ex_id = (row.get("example_id") or "").strip()
-                if not ex_id:
-                    continue
-                # Skip errored requests.
-                err = (row.get("error") or "").strip()
-                if err and err.lower() not in {"none", "false", "0"}:
-                    continue
-                bucket = accum.setdefault(ex_id, {})
-                for m in metrics:
-                    if m in row:
-                        v = _to_float(row[m])
-                        if v is not None:
-                            bucket.setdefault(m, []).append(v)
-
-    per_example: Dict[str, Dict[str, float]] = {}
-    for ex_id, mvals in accum.items():
-        per_example[ex_id] = {m: float(np.mean(vs)) for m, vs in mvals.items() if vs}
-    return per_example
+    """Return {example_id: {metric: mean_over_trials_value}} for one baseline."""
+    df = load_cell(Path(baseline_dir))
+    out: Dict[str, Dict[str, float]] = {}
+    for m in metrics:
+        for row in _per_example_table(df, m).itertuples(index=False):
+            ex_id = str(row.example_id).strip()
+            if ex_id:
+                out.setdefault(ex_id, {})[m] = float(row.value)
+    return out
 
 
 def discover_baselines(results_dir: Path) -> List[str]:
-    return sorted(
-        d.name for d in results_dir.iterdir()
-        if d.is_dir() and (list(d.glob("trial_*/results.csv")) or (d / "results.csv").exists())
-    )
+    return sorted(cell for _tree, cell, _dir in discover_cells(Path(results_dir)))
 
 
 # --------------------------------------------------------------------------- #
@@ -425,7 +400,8 @@ def run(args: argparse.Namespace) -> int:
         print(f"\nWrote JSON summary -> {args.output}")
     if args.latex_out:
         Path(args.latex_out).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.latex_out).write_text(_to_latex(results, reference), encoding="utf-8")
+        Path(args.latex_out).write_text(
+            _to_latex(results, reference, args.latex_label), encoding="utf-8")
         print(f"Wrote LaTeX table  -> {args.latex_out}")
     return 0
 
@@ -454,14 +430,20 @@ def _print_table(results: List[ComparisonResult], metrics: List[str]) -> None:
         print()
 
 
-def _to_latex(results: List[ComparisonResult], reference: str) -> str:
+def _to_latex(results: List[ComparisonResult], reference: str,
+              label: str = "tab:significance") -> str:
     lines = [
         "% Auto-generated by scripts/4_analysis/statistical_tests.py",
         "\\begin{table}[t]",
         "\\centering",
-        f"\\caption{{Per-query significance vs. \\texttt{{{reference}}} "
-        "(Wilcoxon signed-rank, Holm-corrected). $\\Delta$ is median baseline$-$reference.}}",
-        "\\label{tab:significance}",
+        # BOTH caption lines must be f-strings: a plain-string continuation leaves "}}" as
+        # two literal braces (unbalanced -> "Too many }'s") and the reference must be
+        # underscore-escaped or "no_cache" kills the compile ("Missing $ inserted").
+        f"\\caption{{Per-query significance vs. \\texttt{{{_latex_escape(reference)}}} "
+        f"(Wilcoxon signed-rank, Holm-corrected). $\\Delta$ is median baseline$-$reference.}}",
+        # Parameterized so the Qwen and MiMo tables can both be \input without a
+        # duplicate-\label clash.
+        f"\\label{{{label}}}",
         "\\begin{tabular}{llrrrrc}",
         "\\toprule",
         "Metric & Baseline & $n$ & Median $\\Delta$ & \\% chg & $p_{\\text{Holm}}$ & Sig. \\\\",
@@ -493,6 +475,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bootstrap-iters", type=int, default=10000, help="Bootstrap iterations for CIs.")
     p.add_argument("--output", default=None, help="Path to write JSON summary.")
     p.add_argument("--latex-out", default=None, help="Path to write a LaTeX significance table.")
+    p.add_argument("--latex-label", default="tab:significance",
+                   help="\\label for the LaTeX table (use a distinct label per model pass).")
     return p.parse_args()
 
 

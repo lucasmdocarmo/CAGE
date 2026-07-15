@@ -115,9 +115,13 @@ OBSERVE="${OBSERVE:-1}"
 OBSERVE_PID=""
 if [ "$OBSERVE" != "0" ]; then
   mkdir -p logs
+  # --seed/--dataset mirror run_experiment.py's defaults so the manifest records the real
+  # values instead of null (2026-07-15 audit: seed/dataset were null for the whole run).
+  # kv_cache_dtype/max_model_len/gpu_mem_util are read from the VLLM_* env by observe_run.
   nohup python3 "$SCRIPT_DIR/../5_observability/observe_run.py" \
     --run-dir "$SYNC_DIR" --run-id "$RUN_ID" --model "$MODEL" \
     --num-queries "$NUM_QUERIES" --num-trials "$NUM_TRIALS" \
+    --seed "${SEED:-42}" --dataset "${DATASET:-squad_v2}" \
     --interval "${OBSERVE_INTERVAL:-30}" > logs/observe.log 2>&1 &
   OBSERVE_PID=$!
   echo "[cage] observability sidecar started (pid $OBSERVE_PID) -> $SYNC_DIR/observability/ (log: logs/observe.log)"

@@ -827,8 +827,94 @@ def run_experiment(
     # warmup count is treated as a flag: when positive, the full measured set is warmed.
     print(f"\nLoading dataset '{dataset}'...")
     loader = get_loader(dataset, split=default_dataset_split(dataset), seed=seed)
-    pool = loader.load(max_examples=num_queries)
-    base_examples = pool
+    # Uniform-yardstick manifest (2026-07-15): when CAGE_QUERY_MANIFEST is set, the
+    # measured query set comes from ONE auditable, pre-drawn artifact shared by every
+    # cell/engine/model (scripts/1_setup/build_query_manifest.py), so per-query pairing
+    # holds universally and no script can drift to its own sample. The per-run seeded
+    # sampling below remains the non-manifest path.
+    _manifest_path = os.getenv("CAGE_QUERY_MANIFEST", "").strip()
+    _manifest = None
+    if _manifest_path:
+        from src.data.manifest import select_examples as _manifest_select
+        _manifest = json.loads(Path(_manifest_path).read_text(encoding="utf-8"))
+        if _manifest.get("dataset") and _manifest["dataset"] != dataset:
+            raise ValueError(
+                f"manifest is for dataset '{_manifest['dataset']}' but this run uses "
+                f"'{dataset}' -- refusing to serve a mismatched yardstick"
+            )
+        _trial_no = int(os.getenv("CAGE_MANIFEST_TRIAL", "1") or "1")
+        pool = loader.load(max_examples=None)  # full split; selection is by id
+        base_examples = _manifest_select(_manifest, _trial_no, pool)
+        print(f"MANIFEST workload: trial {_trial_no}, {len(base_examples)} queries "
+              f"from {_manifest_path} (pool={_manifest['stats']['pool_size']}, "
+              f"blocks={_manifest['stats']['n_blocks']})")
+    else:
+        pool = loader.load(max_examples=num_queries)
+        base_examples = pool
+
+    # cag_true corpus-as-prefix mode (2026-07-15, tasks #71/#82): pack gold paragraphs into
+    # ONE shared corpus block and serve it as every query's context, so all prompts share a
+    # long identical prefix -- the true-CAG layout (Chan et al., arXiv 2412.15605) that
+    # vLLM's prefix cache can actually reuse. (Single-workload SQuAD shares only the
+    # ~32-token system prefix across queries -> the honest -3.3% TTFT; this mode is the
+    # arm that measures the CAG mechanism itself.) Examples whose gold paragraph did not
+    # fit the budget are DROPPED (announced): cag_true cells answer in-corpus questions.
+    _corpus_budget = int(os.getenv("CAGE_CORPUS_PREFIX_BUDGET", "0") or "0")
+    if _corpus_budget > 0 and _manifest is not None:
+        # Manifest mode: every query is in-corpus BY CONSTRUCTION (corpus-first
+        # sampling), each using its manifest-assigned block. Queries run in block order
+        # so each block's KV stays resident while its questions run (true CAG per
+        # block within the L4's capacity); the ordering is identical in the paired
+        # cache-off cell, so the pair stays clean.
+        _blocks = _manifest["blocks"]
+        _q2b = _manifest["question_to_block"]
+        base_examples = [
+            CAGExample(
+                id=ex.id, question=ex.question,
+                context=[_blocks[_q2b[ex.id]]["text"]], answer=ex.answer,
+                metadata={**(ex.metadata or {}),
+                          "corpus_prefix": True,
+                          "corpus_block": _q2b[ex.id],
+                          "corpus_tokens": _blocks[_q2b[ex.id]]["token_count"],
+                          "gold_context": (ex.context or [None])[0]},
+            )
+            for ex in sorted(base_examples, key=lambda e: _q2b[e.id])
+        ]
+        print(f"CORPUS-PREFIX mode (manifest): {len(base_examples)} queries over "
+              f"{len(_blocks)} blocks, block-ordered")
+    elif _corpus_budget > 0:
+        from src.data.corpus import build_corpus_block
+        _block = build_corpus_block(base_examples, token_budget=_corpus_budget)
+        _in_corpus = set(_block.example_ids)
+        _n_dropped = sum(1 for ex in base_examples if ex.id not in _in_corpus)
+        base_examples = [
+            CAGExample(
+                id=ex.id, question=ex.question, context=[_block.text], answer=ex.answer,
+                metadata={**(ex.metadata or {}),
+                          "corpus_prefix": True,
+                          "corpus_tokens": _block.token_count,
+                          "gold_context": (ex.context or [None])[0]},
+            )
+            for ex in base_examples if ex.id in _in_corpus
+        ]
+        print(f"CORPUS-PREFIX mode: block={_block.token_count} tokens, "
+              f"{len(_block.paragraphs)} paragraphs; measuring {len(base_examples)} "
+              f"in-corpus queries (dropped {_n_dropped} out-of-corpus)")
+        if not base_examples:
+            raise ValueError("corpus-prefix budget too small: no example's context fits")
+
+    # Doc-grouped ordering (prefix_cache_grouped cell): same-paragraph questions become
+    # consecutive, so their shared [system prefix][paragraph] prompt prefix is cache-hot
+    # for queries 2..k of each group -- a realistic shared-document serving workload
+    # (TurboRAG/CacheWeaver setting) with zero prompt-layout change. Deterministic.
+    if os.getenv("CAGE_ORDER_BY_CONTEXT", "0").strip() == "1":
+        import hashlib as _hashlib
+        base_examples = sorted(
+            base_examples,
+            key=lambda ex: _hashlib.sha1("||".join(ex.context or []).encode()).hexdigest(),
+        )
+        print("DOC-GROUPED ordering: examples sorted by context hash (shared-prefix groups)")
+
     warmup_pool = list(base_examples) if warmup_queries > 0 else []
     code_dataset = is_code_dataset(dataset, base_examples)
 
@@ -961,7 +1047,22 @@ def run_experiment(
     
     # Setup evaluators
     print("\nInitializing evaluators...")
-    quality_evaluator = QualityEvaluator(device="cpu")
+    # Decoupled-scoring mode (2026-07-15): with CAGE_SKIP_QUALITY=1 (or --skip-quality),
+    # the serving loop uses a MODEL-FREE evaluator -- F1/EM/abstention are still computed
+    # inline (microseconds, no models), while LettuceDetect/NLI/BERTScore/embeddings are
+    # skipped so the GPU is never idled by inline CPU scoring (~90% of sweep wall-clock
+    # in the 2026-07-15 smoke). Model-based quality is then scored POST-serving from
+    # qa_evidence.jsonl: scripts/4_analysis/rescore_quality.py --full --device cuda --apply.
+    _skip_quality = os.getenv("CAGE_SKIP_QUALITY", "0").strip() == "1"
+    if _skip_quality:
+        print("DECOUPLED SCORING: inline model-based quality metrics OFF "
+              "(score post-serving via rescore_quality.py --full --apply)")
+        quality_evaluator = QualityEvaluator(
+            use_nli=False, use_embeddings=False, use_bertscore=False,
+            use_rouge=False, use_lettucedetect=False, device="cpu",
+        )
+    else:
+        quality_evaluator = QualityEvaluator(device="cpu")
     performance_evaluator = PerformanceEvaluator(monitor_resources=True)
     cache_tracker = CacheMetricsTracker()
     code_evaluator = CodeQualityEvaluator() if code_dataset else None
@@ -1285,8 +1386,11 @@ def run_experiment(
             # a served cache hit, its evidence version, and whether the answer was grounded.
             "served_from_cache": meta.get("served_from_cache"),
             "evidence_version": meta.get("evidence_version"),
-            "grounded": (_quality_row.get("grounding_score") is not None
-                         and (_quality_row.get("grounding_score") or 0.0) >= 0.5),
+            # None (not False) when grounding is N/A -- abstentions and unscored rows are
+            # MISSING data for this flag, not "ungrounded"; False would mislabel a correct
+            # "Don't know." as a grounding failure in the staleness curve.
+            "grounded": ((_quality_row.get("grounding_score") or 0.0) >= 0.5
+                         if _quality_row.get("grounding_score") is not None else None),
             "kv_transfer_params": kv_transfer_params_str,
             "routed_replica": response.router_replica or "",
             "retrieval_top1_score": meta["retrieval_top1_score"],
@@ -1985,8 +2089,37 @@ def main():
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=100,
+        default=256,
         help="Maximum tokens to generate per query",
+    )
+    parser.add_argument(
+        "--skip-quality",
+        action="store_true",
+        help="Decoupled scoring: skip inline model-based quality metrics (grounding/NLI/"
+             "BERTScore/relevance); F1/EM/abstention still computed. Score post-serving "
+             "with scripts/4_analysis/rescore_quality.py --full --apply. "
+             "Equivalent to CAGE_SKIP_QUALITY=1.",
+    )
+    parser.add_argument(
+        "--corpus-prefix-budget",
+        type=int,
+        default=0,
+        help="cag_true mode: pack gold paragraphs into one shared corpus block of at most "
+             "this many tokens and serve it as every query's context (true CAG, Chan et "
+             "al. 2412.15605). 0 = off. Equivalent to CAGE_CORPUS_PREFIX_BUDGET.",
+    )
+    parser.add_argument(
+        "--order-by-context",
+        action="store_true",
+        help="Order queries so same-context questions are consecutive (shared-document "
+             "workload; prefix_cache_grouped cell). Equivalent to CAGE_ORDER_BY_CONTEXT=1.",
+    )
+    parser.add_argument(
+        "--query-manifest",
+        default=None,
+        help="Path to the uniform query manifest (build_query_manifest.py). All trials "
+             "measure the manifest's pre-drawn query ids -- the fairness yardstick shared "
+             "by every cell/engine/model. Equivalent to CAGE_QUERY_MANIFEST.",
     )
     parser.add_argument(
         "--api-base",
@@ -2240,6 +2373,14 @@ def main():
     )
 
     args = parser.parse_args()
+    if args.skip_quality:
+        os.environ["CAGE_SKIP_QUALITY"] = "1"
+    if args.corpus_prefix_budget and args.corpus_prefix_budget > 0:
+        os.environ["CAGE_CORPUS_PREFIX_BUDGET"] = str(args.corpus_prefix_budget)
+    if args.order_by_context:
+        os.environ["CAGE_ORDER_BY_CONTEXT"] = "1"
+    if args.query_manifest:
+        os.environ["CAGE_QUERY_MANIFEST"] = args.query_manifest
 
     def _reset_prefix_cache(api_base: str) -> None:
         """Flush the vLLM prefix cache (dev-mode endpoint) for cold-start-per-trial."""
@@ -2320,6 +2461,9 @@ def main():
         
         for trial in range(1, args.num_trials + 1):
             print(f"\n--- Trial {trial}/{args.num_trials} (seed={args.seed + trial - 1}) ---\n")
+            # Manifest mode reads the trial's pre-drawn query ids by trial NUMBER (the
+            # seed offset stays for generation-side reproducibility).
+            os.environ["CAGE_MANIFEST_TRIAL"] = str(trial)
 
             # Cold-start-per-trial: flush the vLLM prefix cache between trials so each
             # trial measures from a known (empty) cache state. Requires the server to be

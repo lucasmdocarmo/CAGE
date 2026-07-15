@@ -53,17 +53,27 @@ _NO_ANSWER_RE = re.compile(
     r"no\s+answer|"
     r"cannot\s+(be\s+)?answer(ed)?|can'?t\s+answer|unable\s+to\s+(answer|determine|find)|"
     r"unanswerable|not\s+answerable|"
-    r"no\s+(information|mention|indication|answer)|"
+    r"no\s+(information|mention|indication|answer|idea)|"
     r"insufficient\s+(information|context|detail)|"
-    r"not\s+(in|found\s+in|provided|mentioned|stated|specified|available|present|given)|"
+    r"not\s+enough\s+(information|context|details?)|"
+    r"not\s+(in|found\s+in|provided|mentioned|stated|specified|available|present|given|sure)|"
     r"does\s+not\s+(say|mention|provide|contain|specify|state|give|include)|"
     r"doesn'?t\s+(say|mention|provide|contain|specify|state|give|include)|"
     r"do(es)?\s+not\s+have\s+(the\s+)?answer|"
-    r"i\s+don'?t\s+know|i\s+do\s+not\s+know|"
+    # Leading "I" is OPTIONAL: the system prompt instructs "say you don't know", and models
+    # emit the bare form ("Don't know.") as often as the first-person one. Requiring the "i"
+    # scored those correct abstentions as attempted answers (2026-07-15 audit: 12/12 missed).
+    r"(i\s+)?don'?t\s+know|(i\s+)?do\s+not\s+know|"
+    r"cannot\s+(be\s+)?(determined?|found)|can'?t\s+(be\s+)?(determined?|found)|"
     r"the\s+(context|passage|text|document|article)\s+does\s+not"
     r")",
     re.IGNORECASE,
 )
+# Whole-answer abstention tokens. These words appear inside legitimate answers ("Unknown
+# Pleasures"), so they only count as abstention when they ARE the entire answer. Bare
+# "none"/"NA" are deliberately excluded: both occur as real SQuAD gold spans ("none",
+# sodium's symbol), and a false positive here wrongly zeroes a correct answer.
+_NO_ANSWER_EXACT_RE = re.compile(r"^\W*(unknown|n/a|no\s+idea|not\s+sure)[\s.!?]*$", re.IGNORECASE)
 # Answers longer than this are assumed to be real content, not an abstention, even if they
 # happen to contain a matched phrase ("There is no doubt the answer is Paris"). SQuAD v2
 # abstention outputs are short; the cap trades a few verbose-abstention misses (safe: score
@@ -79,6 +89,8 @@ def is_no_answer_prediction(text: Optional[str]) -> bool:
     """
     t = (text or "").strip()
     if not t:
+        return True
+    if _NO_ANSWER_EXACT_RE.match(t):
         return True
     if len(t.split()) <= _NO_ANSWER_MAX_WORDS and _NO_ANSWER_RE.search(t):
         return True
@@ -129,6 +141,7 @@ class QualityMetrics:
     f1_answerable: Optional[float] = None  # token-F1 over answerable items only
     exact_match_answerable: Optional[float] = None  # EM over answerable items only
     no_answer_correct: Optional[float] = None  # 1.0/0.0 on no-answer items; abstention accuracy
+    abstention_precision: Optional[float] = None  # 1.0/0.0 on abstained rows only; mean = precision
     cache_relevance: Optional[float] = None  # 0-1, proportion of useful cache blocks
     # Hallucination (LettuceDetect, PRIMARY grounding signal)
     grounding_score: Optional[float] = None  # 0-1, 1 - hallucinated_span_ratio (None if detector unavailable)
@@ -161,6 +174,7 @@ class QualityMetrics:
             "f1_answerable": self.f1_answerable,
             "exact_match_answerable": self.exact_match_answerable,
             "no_answer_correct": self.no_answer_correct,
+            "abstention_precision": self.abstention_precision,
             "grounding_score": self.grounding_score,
             "hallucinated_span_ratio": self.hallucinated_span_ratio,
             "supported_claim_ratio": self.supported_claim_ratio,
@@ -753,6 +767,10 @@ class QualityEvaluator:
                 "predicted_no_answer": 1.0 if pred_no_answer else 0.0,
                 "f1_answerable": None, "exact_match_answerable": None,
                 "no_answer_correct": correct,
+                # Per-row indicator whose None-excluded mean IS abstention precision: defined
+                # only on rows where the model abstained; 1.0 = the abstention was right
+                # (item truly unanswerable). Recall over unanswerable rows is mean(no_answer_correct).
+                "abstention_precision": 1.0 if pred_no_answer else None,
             }
 
         # ANSWERABLE item but the model abstained -> wrong (standard SQuAD v2: predicting
@@ -764,6 +782,7 @@ class QualityEvaluator:
                 "is_answerable": 1.0, "predicted_no_answer": 1.0,
                 "f1_answerable": 0.0, "exact_match_answerable": 0.0,
                 "no_answer_correct": None,
+                "abstention_precision": 0.0,  # abstained on an answerable item: wrong abstention
             }
 
         # ANSWERABLE item, model attempted an answer: standard token-level F1 / EM.
@@ -777,6 +796,7 @@ class QualityEvaluator:
                 "is_answerable": 1.0, "predicted_no_answer": 0.0,
                 "f1_answerable": 0.0, "exact_match_answerable": exact_match,
                 "no_answer_correct": None,
+                "abstention_precision": None,
             }
 
         # Count common tokens
@@ -805,6 +825,7 @@ class QualityEvaluator:
             "f1_answerable": f1,
             "exact_match_answerable": exact_match,
             "no_answer_correct": None,
+            "abstention_precision": None,
         }
     
     def evaluate(
@@ -826,11 +847,31 @@ class QualityEvaluator:
         Returns:
             QualityMetrics with all scores
         """
-        faith = self.evaluate_faithfulness(generated_text, context)
-        halluc = self.evaluate_hallucination(question, context, generated_text)
-        relevance = self.evaluate_relevance(question, context)
-        completeness = self.evaluate_completeness(generated_text, reference_answer)
         f1_metrics = self.evaluate_f1_score(generated_text, reference_answer)
+        relevance = self.evaluate_relevance(question, context)
+
+        # Abstention-aware grounding/faithfulness (2026-07-15 audit): an abstention like
+        # "Don't know." is by construction unsupported by the context, so LettuceDetect and
+        # NLI mathematically MUST flag it -- scoring a CORRECT abstention as a hallucination
+        # and penalizing whichever arm abstains more (~52% of SQuAD v2 is unanswerable).
+        # An abstention is neither grounded nor hallucinated: those metrics are N/A (None,
+        # excluded from means), and abstention correctness is scored by evaluate_f1_score
+        # (no_answer_correct / abstention_precision). Completeness (reference similarity)
+        # is equally meaningless for an abstention phrase. Relevance is question<->context
+        # only, so it stays.
+        if is_no_answer_prediction(generated_text):
+            faith = {"faithfulness": None, "supported_claim_ratio": None}
+            halluc = {
+                "grounding_score": None,
+                "hallucination_detected": None,
+                "hallucinated_span_ratio": None,
+                "hallucinated_spans": None,
+            }
+            completeness = {"bertscore_f1": None, "rouge_l_f1": None}
+        else:
+            faith = self.evaluate_faithfulness(generated_text, context)
+            halluc = self.evaluate_hallucination(question, context, generated_text)
+            completeness = self.evaluate_completeness(generated_text, reference_answer)
 
         return QualityMetrics(
             faithfulness=faith["faithfulness"],
@@ -846,6 +887,7 @@ class QualityEvaluator:
             f1_answerable=f1_metrics.get("f1_answerable"),
             exact_match_answerable=f1_metrics.get("exact_match_answerable"),
             no_answer_correct=f1_metrics.get("no_answer_correct"),
+            abstention_precision=f1_metrics.get("abstention_precision"),
             grounding_score=halluc["grounding_score"],
             hallucination_detected=halluc["hallucination_detected"],
             hallucinated_span_ratio=halluc["hallucinated_span_ratio"],

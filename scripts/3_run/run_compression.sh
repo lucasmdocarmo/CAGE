@@ -12,7 +12,9 @@
 # FP8 KV is GPU-meaningful. A pre-flight gate verifies FP8 does NOT disable prefix caching
 # (else compressed_cag is confounded — see Cloud/VLLM_COMPATIBILITY.md sec 4).
 # =============================================================================
-set -euo pipefail
+# No -e: one failed cell must NOT abort the 2x2. Cells write a STATUS sentinel on failure,
+# are recorded in FAILED, and the script exits nonzero at the END (after attempting all).
+set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 MODEL="${1:-Qwen/Qwen3-8B}"
@@ -73,17 +75,82 @@ mkdir -p "$OUTPUT_DIR"
 # Model tag so a second model (MiMo) through the same 2x2 never collides with Qwen's dirs.
 case "$MODEL" in *MiMo*|*mimo*) MTAG="_mimo7b" ;; *) MTAG="" ;; esac
 
+# ---------------------------------------------------------------------------
+# Fault tolerance + resume (mirrors run_speculative_matrix.sh's sentinel pattern):
+# complete cells (all trial_1..NUM_TRIALS metrics.json) are skipped unless CAGE_FORCE_RERUN=1;
+# a failed cell/server writes STATUS=failed and the 2x2 continues; exit nonzero at the end.
+# ---------------------------------------------------------------------------
+FAILED=()
+
+cell_complete() {  # <cell_dir> -> 0 iff trial_1..NUM_TRIALS all have metrics.json
+    local dir="$1" t
+    for ((t = 1; t <= NUM_TRIALS; t++)); do
+        [ -f "$dir/trial_${t}/metrics.json" ] || return 1
+    done
+    return 0
+}
+
+prepare_cell() {  # <full label> -> 0 = run it (stale dir wiped), 1 = skip (already complete)
+    local label="$1" dir="$OUTPUT_DIR/$1"
+    if [ "${CAGE_FORCE_RERUN:-0}" = "1" ]; then
+        [ -d "$dir" ] && echo "    FORCE RERUN (CAGE_FORCE_RERUN=1): wiping $label"
+        rm -rf "$dir"
+        return 0
+    fi
+    if cell_complete "$dir"; then
+        echo "SKIP (complete): $label"
+        return 1
+    fi
+    if [ -d "$dir" ]; then
+        echo "    PARTIAL: wiping incomplete $label and re-running"
+        rm -rf "$dir"
+    fi
+    return 0
+}
+
+group_complete() {  # <bare-label...> -> 0 iff every cell is complete (server start unnecessary)
+    [ "${CAGE_FORCE_RERUN:-0}" = "1" ] && return 1
+    local lbl
+    for lbl in "$@"; do
+        cell_complete "$OUTPUT_DIR/${lbl}${MTAG}" || return 1
+    done
+    return 0
+}
+
+skip_group() {  # <bare-label...> announce each already-complete cell
+    local lbl
+    for lbl in "$@"; do echo "SKIP (complete): ${lbl}${MTAG}"; done
+}
+
+mark_cells_failed() {  # <reason> <bare-label...> sentinel the cells a dead server orphaned
+    local reason="$1" lbl full; shift
+    for lbl in "$@"; do
+        full="${lbl}${MTAG}"
+        cell_complete "$OUTPUT_DIR/$full" && continue  # keep a previously-complete cell
+        mkdir -p "$OUTPUT_DIR/$full"
+        echo "STATUS=failed reason=$reason model=$MODEL $(date)" > "$OUTPUT_DIR/$full/STATUS"
+        FAILED+=("$full($reason)")
+    done
+}
+
 run_baseline() {  # <baseline> <label> [extra args...]
     local baseline=$1 label="$2${MTAG}"; shift 2
     echo ""; echo ">>> $label ($baseline)  $(date)"
+    prepare_cell "$label" || return 0
     # All 4 compression cells run on a prefix-caching-ON server, so cold-start each trial
     # (vLLM /reset_prefix_cache) for independent trials, consistent with the core suite.
-    python3 scripts/3_run/run_experiment.py \
+    if ! python3 scripts/3_run/run_experiment.py \
         --baseline "$baseline" --baseline-label "$label" \
         --model "$MODEL" --dataset "$DATASET" \
         --num-queries "$NUM_QUERIES" --num-trials "$NUM_TRIALS" --seed "$SEED" \
         --reset-cache-between-trials \
-        --vllm-telemetry --output-dir "$OUTPUT_DIR/$label" "$@"
+        --vllm-telemetry --output-dir "$OUTPUT_DIR/$label" "$@"; then
+        echo "    CELL $label RUN-FAIL"
+        mkdir -p "$OUTPUT_DIR/$label"
+        echo "STATUS=failed reason=run model=$MODEL baseline=$baseline $(date)" > "$OUTPUT_DIR/$label/STATUS"
+        FAILED+=("$label(run)")
+        return 0
+    fi
 }
 
 echo "=============================================="
@@ -110,25 +177,45 @@ if ! python3 -c "import llmlingua" 2>/dev/null; then
 fi
 
 # --- Full row + compressed_rag (full-precision server, prefix caching ON) ---
-echo ">>> Server: full precision, prefix caching ON"
-./scripts/2_serving/manage_vllm_server.sh restart "$MODEL"; sleep 10
-run_baseline prefix_cache   cag_full
-run_baseline rag            rag_full
-export CAGE_REQUIRE_COMPRESSION=1   # raise (not silent no-op) if LLMLingua can't compress
-# --context-source retrieved is REQUIRED: compressed_rag's family is not in the
-# retrieval set {rag,redis,hybrid}, so without it the arm compresses GOLD context
-# (CAG+compression) instead of RETRIEVED context (RAG+compression), breaking the
-# 2x2 ACROSS read (rag_full vs compressed_rag). This is the Phase-2 confound.
-run_baseline compressed_rag compressed_rag --context-source retrieved
-unset CAGE_REQUIRE_COMPRESSION
+if group_complete cag_full rag_full compressed_rag; then
+    echo ">>> all full-precision cells complete -- skipping server start"
+    skip_group cag_full rag_full compressed_rag
+elif { echo ">>> Server: full precision, prefix caching ON"; ./scripts/2_serving/manage_vllm_server.sh restart "$MODEL"; }; then
+    sleep 10
+    run_baseline prefix_cache   cag_full
+    run_baseline rag            rag_full
+    export CAGE_REQUIRE_COMPRESSION=1   # raise (not silent no-op) if LLMLingua can't compress
+    # --context-source retrieved is REQUIRED: compressed_rag's family is not in the
+    # retrieval set {rag,redis,hybrid}, so without it the arm compresses GOLD context
+    # (CAG+compression) instead of RETRIEVED context (RAG+compression), breaking the
+    # 2x2 ACROSS read (rag_full vs compressed_rag). This is the Phase-2 confound.
+    run_baseline compressed_rag compressed_rag --context-source retrieved
+    unset CAGE_REQUIRE_COMPRESSION
+else
+    echo ">>> SERVER-FAIL (full precision) -> marking dependent cells failed and continuing"
+    mark_cells_failed server cag_full rag_full compressed_rag
+fi
 
 # --- compressed_cag (FP8 KV — the same launch-lever speculative uses) ---
-echo ">>> Server: FP8 KV cache ON (compressed_cag)"
-VLLM_KV_CACHE_DTYPE=fp8 ./scripts/2_serving/manage_vllm_server.sh restart "$MODEL"; sleep 10
-run_baseline compressed_cag compressed_cag
+if group_complete compressed_cag; then
+    echo ">>> compressed_cag complete -- skipping FP8 server start"
+    skip_group compressed_cag
+elif { echo ">>> Server: FP8 KV cache ON (compressed_cag)"; VLLM_KV_CACHE_DTYPE=fp8 ./scripts/2_serving/manage_vllm_server.sh restart "$MODEL"; }; then
+    sleep 10
+    run_baseline compressed_cag compressed_cag
+else
+    echo ">>> SERVER-FAIL (FP8 KV) -> marking compressed_cag failed"
+    mark_cells_failed server compressed_cag
+fi
 
 ./scripts/2_serving/manage_vllm_server.sh stop || true
 echo ""; echo "=============================================="
+if [ "${#FAILED[@]}" -gt 0 ]; then
+    echo "Compression 2x2 INCOMPLETE: ${#FAILED[@]} cell(s) failed: ${FAILED[*]} -> $OUTPUT_DIR"
+    echo "(failed cells carry a STATUS sentinel; re-run with the same CAGE_RUN_ID to resume)"
+    echo "=============================================="
+    exit 1
+fi
 echo "Compression 2x2 complete -> $OUTPUT_DIR"
 echo "Read DOWN (CAG vs RAG) or ACROSS (full vs compressed), not diagonally."
 echo "=============================================="

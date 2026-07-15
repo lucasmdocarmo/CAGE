@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -133,9 +134,28 @@ class SnapshotRecorder:
             )
         except OSError as exc:  # pragma: no cover
             logger.warning("snapshotter: cannot write %s: %s", path, exc)
+        self._prune_snapshots()
         if self.render_png:
             self._render(self.snap_dir / "latest.png")
         return sample
+
+    def _prune_snapshots(self) -> None:
+        """Ring buffer: keep only the newest ``CAGE_SNAPSHOT_KEEP`` (default 2000)
+        ``snapshot_*.json`` files so a multi-day run (7,200+ frames at 30s over 60h) cannot
+        grow ``snapshots/`` without bound. ``latest.json``/``latest.png`` are untouched.
+        Set ``CAGE_SNAPSHOT_KEEP=0`` (or negative) to disable pruning entirely."""
+        try:
+            keep = int(os.environ.get("CAGE_SNAPSHOT_KEEP", "2000"))
+        except (TypeError, ValueError):
+            keep = 2000
+        if keep <= 0:
+            return
+        try:
+            snaps = sorted(self.snap_dir.glob("snapshot_*.json"))
+            for old in snaps[: max(0, len(snaps) - keep)]:
+                old.unlink()
+        except OSError as exc:  # pragma: no cover - racing deletes / dir vanished
+            logger.warning("snapshotter: snapshot prune failed: %s", exc)
 
     def _sample(self, label: Optional[str]) -> Dict[str, Any]:
         return {

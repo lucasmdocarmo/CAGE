@@ -124,6 +124,13 @@ start_server() {
     # Qwen3. This is a benchmark box running only known, vetted models.
     vllm_args+=( --trust-remote-code )
 
+    # Per-request logging is unbounded over a multi-day sweep (the dominant boot-disk-fill
+    # vector: one multi-line log block per request x 500 queries x 3 trials x ~14 cells).
+    # Default OFF; set VLLM_DISABLE_LOG_REQUESTS=0 to keep per-request logs for debugging.
+    if [ "${VLLM_DISABLE_LOG_REQUESTS:-1}" != "0" ]; then
+        vllm_args+=( --disable-log-requests )
+    fi
+
     # Optional server-side KV-cache compression for the compressed_cag baseline:
     #   VLLM_KV_CACHE_DTYPE=fp8 ./scripts/2_serving/manage_vllm_server.sh restart <model>
     if [ -n "${VLLM_KV_CACHE_DTYPE:-}" ]; then
@@ -143,13 +150,25 @@ start_server() {
         echo "Speculative decoding enabled: --speculative-config ${VLLM_SPECULATIVE_CONFIG}"
     fi
 
+    # KV-connector (LMCache/CacheBlend kv_store family, task #83): LAUNCH-time config,
+    # JSON via VLLM_KV_TRANSFER_CONFIG -- array form keeps the JSON intact, e.g.
+    #   VLLM_KV_TRANSFER_CONFIG='{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'
+    # Requires the connector package (pip install lmcache) on the serving box; the
+    # run_kv_store.sh gate verifies importability before restarting the server with this.
+    if [ -n "${VLLM_KV_TRANSFER_CONFIG:-}" ]; then
+        vllm_args+=( --kv-transfer-config "${VLLM_KV_TRANSFER_CONFIG}" )
+        echo "KV connector enabled: --kv-transfer-config ${VLLM_KV_TRANSFER_CONFIG}"
+    fi
+
     # A 24GB L4 cannot hold Qwen3-8B's default max_model_len (40960) KV cache after
     # the ~15GB of weights (vLLM aborts: "needed 5.62 GiB > available 3.12 GiB").
-    # Cap context length (override via VLLM_MAX_MODEL_LEN) and raise memory
-    # utilization (override via VLLM_GPU_MEMORY_UTILIZATION). CAGE prompts are a few
-    # thousand tokens, so 8192 is ample headroom.
-    vllm_args+=( --max-model-len "${VLLM_MAX_MODEL_LEN:-8192}" )
-    vllm_args+=( --gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION:-0.92}" )
+    # Cap context length (override via VLLM_MAX_MODEL_LEN) and set memory utilization
+    # (override via VLLM_GPU_MEMORY_UTILIZATION). Fallbacks MIRROR the Option-A source
+    # of truth (scripts/lib/_serving_config.sh: 4096 / 0.90) so a shell that forgot to
+    # source the config still serves the uniform regime -- the old 8192/0.92 fallbacks
+    # silently diverged on manual restarts (2026-07-15 audit, serving-uniformity gap).
+    vllm_args+=( --max-model-len "${VLLM_MAX_MODEL_LEN:-4096}" )
+    vllm_args+=( --gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION:-0.90}" )
     # Optional eager mode: skip torch.compile + CUDA-graph capture for much faster,
     # more reliable startup (esp. on smaller GPUs like the L4, where compile takes
     # 2-3 min and recompiles per prefix-cache config). Serving is uniform across all

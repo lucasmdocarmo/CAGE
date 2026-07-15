@@ -6,7 +6,10 @@
 # Outputs go under the run root: results/<phase>/<run-id>/baselines/.
 # =============================================================================
 
-set -euo pipefail
+# No -e: one failed cell must NOT abort the whole multi-hour suite. Each cell is wrapped in
+# fault-tolerant helpers below (STATUS sentinel + FAILED summary + skip-completed resume),
+# mirroring run_speculative_matrix.sh's sentinel pattern.
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -93,6 +96,69 @@ redis_prefix_for() {
     printf "cage:%s:%s" "$DATASET" "$1"
 }
 
+# ---------------------------------------------------------------------------
+# Fault tolerance + resume (mirrors run_speculative_matrix.sh's sentinel pattern):
+#   - a cell is COMPLETE when trial_1..NUM_TRIALS/metrics.json all exist; complete cells
+#     are SKIPPED on re-run (resume) unless CAGE_FORCE_RERUN=1;
+#   - a failed cell writes a STATUS sentinel and is recorded in FAILED instead of aborting;
+#   - a failed server restart marks its DEPENDENT cells failed and the suite continues to
+#     the next server config;
+#   - the suite exits nonzero at the END if any cell failed (after attempting all).
+# ---------------------------------------------------------------------------
+FAILED=()
+
+cell_complete() {  # <cell_dir> -> 0 iff trial_1..NUM_TRIALS all have metrics.json
+    local dir="$1" t
+    for ((t = 1; t <= NUM_TRIALS; t++)); do
+        [ -f "$dir/trial_${t}/metrics.json" ] || return 1
+    done
+    return 0
+}
+
+prepare_cell() {  # <full label> -> 0 = run it (stale dir wiped), 1 = skip (already complete)
+    local label="$1" dir="$OUTPUT_DIR/$1"
+    if [ "${CAGE_FORCE_RERUN:-0}" = "1" ]; then
+        [ -d "$dir" ] && echo "    FORCE RERUN (CAGE_FORCE_RERUN=1): wiping $label"
+        rm -rf "$dir"
+        return 0
+    fi
+    if cell_complete "$dir"; then
+        echo "SKIP (complete): $label"
+        return 1
+    fi
+    if [ -d "$dir" ]; then
+        echo "    PARTIAL: wiping incomplete $label and re-running"
+        rm -rf "$dir"
+    fi
+    return 0
+}
+
+group_complete() {  # <bare-label...> -> 0 iff every cell is complete (server start unnecessary)
+    [ "${CAGE_FORCE_RERUN:-0}" = "1" ] && return 1
+    local lbl
+    for lbl in "$@"; do
+        cell_complete "$OUTPUT_DIR/${lbl}${MTAG:-}" || return 1
+    done
+    return 0
+}
+
+skip_group() {  # <bare-label...> announce each already-complete cell
+    local lbl
+    for lbl in "$@"; do echo "SKIP (complete): ${lbl}${MTAG:-}"; done
+}
+
+mark_cells_failed() {  # <reason> <bare-label...> sentinel the cells a dead server orphaned
+    local reason="$1" lbl full; shift
+    for lbl in "$@"; do
+        full="${lbl}${MTAG:-}"
+        # never clobber a cell already complete from a previous (resumed) run
+        cell_complete "$OUTPUT_DIR/$full" && continue
+        mkdir -p "$OUTPUT_DIR/$full"
+        echo "STATUS=failed reason=$reason model=$MODEL $(date)" > "$OUTPUT_DIR/$full/STATUS"
+        FAILED+=("$full($reason)")
+    done
+}
+
 start_server_without_prefix_cache() {
     echo "[1/4] Starting Server WITHOUT Prefix Caching..."
     ./scripts/2_serving/manage_vllm_server.sh restart "$MODEL" --no-prefix-cache
@@ -117,11 +183,11 @@ run_baseline() {
     echo ">>> Running baseline: $baseline_label"
     echo "    Started at: $(date)"
 
-    # Model-scoped clean: remove ONLY this baseline's own dir so re-running a model refreshes
-    # its arms without wiping the OTHER model's already-collected core results.
-    rm -rf "$OUTPUT_DIR/$baseline_label"
+    # Skip-completed resume, else model-scoped clean: remove ONLY this baseline's own dir so
+    # re-running a model refreshes its arms without wiping the OTHER model's core results.
+    prepare_cell "$baseline_label" || return 0
 
-    python3 scripts/3_run/run_experiment.py \
+    if ! python3 scripts/3_run/run_experiment.py \
         --baseline "$baseline" \
         --baseline-label "$baseline_label" \
         --model "$MODEL" \
@@ -131,7 +197,13 @@ run_baseline() {
         --seed "$SEED" \
         --output-dir "$OUTPUT_DIR/$baseline_label" \
         $TELEMETRY_FLAG \
-        "$@"
+        "$@"; then
+        echo "    CELL $baseline_label RUN-FAIL"
+        mkdir -p "$OUTPUT_DIR/$baseline_label"
+        echo "STATUS=failed reason=run model=$MODEL baseline=$baseline $(date)" > "$OUTPUT_DIR/$baseline_label/STATUS"
+        FAILED+=("$baseline_label(run)")
+        return 0
+    fi
     echo "    Finished at: $(date)"
     echo "    Results saved to: $OUTPUT_DIR/$baseline_label"
 }
@@ -144,7 +216,10 @@ run_distributed_variant() {
     echo ">>> Running distributed variant: $baseline_label"
     echo "    Started at: $(date)"
 
-    CAGE_REQUIRE_DISTINCT_REPLICAS=1 python3 scripts/3_run/run_experiment.py \
+    # NOTE: distributed labels are used verbatim (no MTAG), matching prior behavior.
+    prepare_cell "$baseline_label" || return 0
+
+    if ! CAGE_REQUIRE_DISTINCT_REPLICAS=1 python3 scripts/3_run/run_experiment.py \
         --baseline distributed \
         --baseline-label "$baseline_label" \
         --model "$MODEL" \
@@ -155,51 +230,94 @@ run_distributed_variant() {
         --api-base "http://localhost:${ROUTER_PORT}" \
         --sharding-policy "$policy" \
         --output-dir "$OUTPUT_DIR/$baseline_label" \
-        $TELEMETRY_FLAG
+        $TELEMETRY_FLAG; then
+        echo "    CELL $baseline_label RUN-FAIL"
+        mkdir -p "$OUTPUT_DIR/$baseline_label"
+        echo "STATUS=failed reason=run model=$MODEL baseline=distributed $(date)" > "$OUTPUT_DIR/$baseline_label/STATUS"
+        FAILED+=("$baseline_label(run)")
+        return 0
+    fi
 
     echo "    Finished at: $(date)"
     echo "    Results saved to: $OUTPUT_DIR/$baseline_label"
 }
 
 # 1. No Cache, RAG, and Redis retrieval-cache cold baseline
-start_server_without_prefix_cache
-
-run_baseline "no_cache" "no_cache"
-run_baseline "rag" "rag"
-run_baseline "redis" "redis_retrieval_cache_cold" \
-    --flush-redis-namespace \
-    --redis-key-prefix "$(redis_prefix_for redis_retrieval_cache_cold)"
+if group_complete no_cache rag redis_retrieval_cache_cold; then
+    echo "[1/4] all cells complete -- skipping server start"
+    skip_group no_cache rag redis_retrieval_cache_cold
+elif start_server_without_prefix_cache; then
+    run_baseline "no_cache" "no_cache"
+    run_baseline "rag" "rag"
+    run_baseline "redis" "redis_retrieval_cache_cold" \
+        --flush-redis-namespace \
+        --redis-key-prefix "$(redis_prefix_for redis_retrieval_cache_cold)"
+else
+    echo "[1/4] SERVER-FAIL -> marking dependent cells failed and continuing"
+    mark_cells_failed server no_cache rag redis_retrieval_cache_cold
+fi
 
 # 2. Native prefix-cache baseline
-start_server_with_prefix_cache "[2/4] Starting Server WITH Prefix Caching..."
-
-run_baseline "prefix_cache" "prefix_cache" --reset-cache-between-trials
+if group_complete prefix_cache; then
+    echo "[2/4] all cells complete -- skipping server start"
+    skip_group prefix_cache
+elif start_server_with_prefix_cache "[2/4] Starting Server WITH Prefix Caching..."; then
+    run_baseline "prefix_cache" "prefix_cache" --reset-cache-between-trials
+else
+    echo "[2/4] SERVER-FAIL -> marking dependent cells failed and continuing"
+    mark_cells_failed server prefix_cache
+fi
 
 # 3. Hybrid cold baseline: empty retrieval cache + empty prefix cache
-start_server_with_prefix_cache "[3/4] Restarting Server WITH Prefix Caching for hybrid cold..."
-run_baseline "hybrid" "hybrid_retrieval_cache_cold" \
-    --reset-cache-between-trials \
-    --flush-redis-namespace \
-    --redis-key-prefix "$(redis_prefix_for hybrid_retrieval_cache_cold)"
+if group_complete hybrid_retrieval_cache_cold; then
+    echo "[3/4] all cells complete -- skipping server start"
+    skip_group hybrid_retrieval_cache_cold
+elif start_server_with_prefix_cache "[3/4] Restarting Server WITH Prefix Caching for hybrid cold..."; then
+    run_baseline "hybrid" "hybrid_retrieval_cache_cold" \
+        --reset-cache-between-trials \
+        --flush-redis-namespace \
+        --redis-key-prefix "$(redis_prefix_for hybrid_retrieval_cache_cold)"
+else
+    echo "[3/4] SERVER-FAIL -> marking dependent cells failed and continuing"
+    mark_cells_failed server hybrid_retrieval_cache_cold
+fi
 
 # 4. Hybrid warm baseline: explicit warmup excluded from measured metrics
-start_server_with_prefix_cache "[4/4] Restarting Server WITH Prefix Caching for hybrid warm..."
-run_baseline "hybrid" "hybrid_retrieval_cache_warm" \
-    --reset-cache-between-trials \
-    --flush-redis-namespace \
-    --redis-key-prefix "$(redis_prefix_for hybrid_retrieval_cache_warm)" \
-    --warmup-queries "$NUM_QUERIES"
+if group_complete hybrid_retrieval_cache_warm; then
+    echo "[4/4] all cells complete -- skipping server start"
+    skip_group hybrid_retrieval_cache_warm
+elif start_server_with_prefix_cache "[4/4] Restarting Server WITH Prefix Caching for hybrid warm..."; then
+    run_baseline "hybrid" "hybrid_retrieval_cache_warm" \
+        --reset-cache-between-trials \
+        --flush-redis-namespace \
+        --redis-key-prefix "$(redis_prefix_for hybrid_retrieval_cache_warm)" \
+        --warmup-queries "$NUM_QUERIES"
+else
+    echo "[4/4] SERVER-FAIL -> marking dependent cells failed and continuing"
+    mark_cells_failed server hybrid_retrieval_cache_warm
+fi
 
 if [ "$ENABLE_DISTRIBUTED" != "0" ]; then
     # 5. Distributed replicated router baseline (no simulated sharded core variant)
-    echo "[5/5] Starting isolated distributed cluster..."
-    ./scripts/2_serving/manage_vllm_server.sh stop
-    python3 scripts/2_serving/manage_vllm_cluster.py restart \
-        --model "$MODEL" \
-        --replicas "$ROUTER_REPLICAS_COUNT" \
-        --base-port "$CLUSTER_BASE_PORT" \
-        --router-port "$ROUTER_PORT"
-    run_distributed_variant "distributed_router_replicated" "replicated"
+    # (label used verbatim -- no MTAG -- so the sentinel path below matches run_distributed_variant)
+    if [ "${CAGE_FORCE_RERUN:-0}" != "1" ] && cell_complete "$OUTPUT_DIR/distributed_router_replicated"; then
+        echo "[5/5] SKIP (complete): distributed_router_replicated"
+    else
+        echo "[5/5] Starting isolated distributed cluster..."
+        ./scripts/2_serving/manage_vllm_server.sh stop || true
+        if python3 scripts/2_serving/manage_vllm_cluster.py restart \
+            --model "$MODEL" \
+            --replicas "$ROUTER_REPLICAS_COUNT" \
+            --base-port "$CLUSTER_BASE_PORT" \
+            --router-port "$ROUTER_PORT"; then
+            run_distributed_variant "distributed_router_replicated" "replicated"
+        else
+            echo "[5/5] CLUSTER-FAIL -> marking distributed cell failed and continuing"
+            mkdir -p "$OUTPUT_DIR/distributed_router_replicated"
+            echo "STATUS=failed reason=server model=$MODEL $(date)" > "$OUTPUT_DIR/distributed_router_replicated/STATUS"
+            FAILED+=("distributed_router_replicated(server)")
+        fi
+    fi
 fi
 
 # Cleanup
@@ -209,6 +327,13 @@ trap - EXIT
 
 echo ""
 echo "=============================================="
+if [ "${#FAILED[@]}" -gt 0 ]; then
+    echo "Core baseline suite INCOMPLETE: ${#FAILED[@]} cell(s) failed: ${FAILED[*]}"
+    echo "Results in: $OUTPUT_DIR (failed cells carry a STATUS sentinel;"
+    echo "re-run this script with the same CAGE_RUN_ID to resume -- complete cells are skipped)"
+    echo "=============================================="
+    exit 1
+fi
 echo "Core baseline suite complete."
 echo "Results in: $OUTPUT_DIR"
 echo "=============================================="

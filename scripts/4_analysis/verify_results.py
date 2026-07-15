@@ -67,6 +67,37 @@ def verify_dir(results_dir: Path) -> dict:
         if not check["ok"]:
             report["ok"] = False
 
+    # Metric-coverage section (2026-07-15 audit): per cell x key metric, how many valid
+    # rows actually carry a value, split by trial. Makes coverage pathologies visible
+    # (e.g. the fixture's bertscore 1/3/1 rows per trial, silently averaged before) so a
+    # sparse metric can't masquerade as a well-estimated one. Advisory: never flips ok.
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from _results_loader import load_results_long, metric_values, valid_rows
+
+        cov_metrics = ["grounding_score", "faithfulness", "completeness_bertscore",
+                       "completeness_rouge_l", "ttft_ms", "abstention_precision"]
+        long_df = load_results_long(results_dir)
+        v = valid_rows(long_df)
+        coverage = []
+        for cell, df_cell in v.groupby("cell", sort=True):
+            for metric in cov_metrics:
+                scored = metric_values(df_cell, metric).notna()
+                by_trial = {int(t): int(scored[df_cell["trial"] == t].sum())
+                            for t in sorted(df_cell["trial"].unique())}
+                coverage.append({
+                    "cell": cell, "metric": metric,
+                    "n_valid_rows": int(len(df_cell)),
+                    "n_scored": int(scored.sum()),
+                    "per_trial_scored": by_trial,
+                })
+        report["metric_coverage"] = coverage
+    except SystemExit:
+        pass  # no results.csv trees under this dir (e.g. bare metrics check) -- skip
+    except Exception as exc:  # advisory section must never break verification
+        report["metric_coverage_error"] = f"{type(exc).__name__}: {exc}"
+
     return report
 
 
@@ -93,6 +124,13 @@ def main() -> None:
             )
             if check["errors"]:
                 f.write(f"  errors: {', '.join(check['errors'])}\n")
+        for cov in report.get("metric_coverage", []):
+            if cov["n_scored"] < cov["n_valid_rows"]:
+                f.write(
+                    f"COVERAGE {cov['cell']} {cov['metric']}: "
+                    f"{cov['n_scored']}/{cov['n_valid_rows']} rows scored "
+                    f"(per-trial {cov['per_trial_scored']})\n"
+                )
 
     print(f"Wrote {report_path}")
     print(f"Wrote {txt_path}")

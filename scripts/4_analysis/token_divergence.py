@@ -41,8 +41,11 @@ def _normalize(text: str) -> str:
 
 
 def _is_error(row: Dict[str, str]) -> bool:
-    err = (row.get("error") or "").strip().lower()
-    return err not in {"", "none", "false", "0"}
+    # Shared predicate from the canonical loader (2026-07-15): one error-semantics
+    # definition across all analysis tools. Divergence deliberately keeps its
+    # error-only skip (an empty generation is a legitimate divergence outcome).
+    from _results_loader import is_error
+    return is_error(row.get("error"))
 
 
 def _load_answers(baseline_dir: Path) -> Dict[Tuple[str, str], str]:

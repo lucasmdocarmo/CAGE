@@ -6,8 +6,9 @@
 # run_compression.sh (compression 2x2), run_speculative_matrix.sh (speculative 2x2) --
 # so all three trees serve under IDENTICAL conditions and cross-mechanism comparisons are
 # FAIR. Consumed by scripts/2_serving/manage_vllm_server.sh, which reads these env vars when it launches
-# vLLM. (The phase3 cluster path, manage_vllm_cluster.py, does NOT yet source this -- a known
-# serving-uniformity gap tracked for phase3 bring-up.)
+# vLLM. The phase3 cluster path (manage_vllm_cluster.py) consumes the SAME VLLM_* env via
+# build_serve_args() with fallbacks mirroring this file -- gap closed 2026-07-15 (task #63);
+# source this file before cluster bring-up so overrides propagate.
 #
 # WHY THIS EXISTS (Option A, 2026-07-14): previously the trees diverged --
 #   core:        non-eager, max_len 8192, gpu-mem-util 0.92

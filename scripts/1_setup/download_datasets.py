@@ -3,7 +3,7 @@
 Download HuggingFace datasets for CAGE benchmarking.
 
 Datasets downloaded:
-- hotpotqa (primary, multi-hop reasoning)
+- hotpot_qa, distractor config (primary, multi-hop reasoning; gold + distractor paragraphs)
 - allenai/qasper (scientific papers)
 - squad_v2 (reading comprehension)
 - trivia_qa (multi-evidence questions)
@@ -50,7 +50,9 @@ def main():
     args = parser.parse_args()
 
     datasets_to_download = {
-        "hotpotqa": ("hotpotqa", "fullwiki"),
+        # Distractor config matches HotpotQALoader: 10 paragraphs/item (2 gold + 8
+        # distractors) so retrieval arms have a real selection job.
+        "hotpotqa": ("hotpot_qa", "distractor"),
         "qasper": ("allenai/qasper", None),
         "squad_v2": ("squad_v2", None),
         "trivia_qa": ("trivia_qa", "rc"),

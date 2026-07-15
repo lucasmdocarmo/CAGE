@@ -104,8 +104,28 @@ sleep 5
 
 FAILED=()
 
+cell_complete() {  # <cell_dir> -> 0 iff trial_1..NUM_TRIALS all have metrics.json
+  local dir="$1" t
+  for ((t = 1; t <= NUM_TRIALS; t++)); do
+    [ -f "$dir/trial_${t}/metrics.json" ] || return 1
+  done
+  return 0
+}
+
 run_cell() {  # <spec_json> <label> <context_source>
   local spec="$1" label="$2" ctx="$3"
+  # Skip-completed (resume): a cell with all trial metrics.json present is done -- don't
+  # burn a server restart + N queries re-measuring it. CAGE_FORCE_RERUN=1 overrides.
+  if [ "${CAGE_FORCE_RERUN:-0}" != "1" ] && cell_complete "$OUT/$label"; then
+    echo "SKIP (complete): $label"
+    return
+  fi
+  # Wipe a stale cell (partial data or an old STATUS sentinel, or CAGE_FORCE_RERUN=1)
+  # so the re-run starts clean and a later success cannot coexist with STATUS=failed.
+  if [ -d "$OUT/$label" ]; then
+    echo "[matrix] wiping stale cell $label (partial or CAGE_FORCE_RERUN=1) before re-run"
+    rm -rf "$OUT/$label"
+  fi
   # Record the TRUE mechanism in the manifest: parse method/tokens/draft-model from the spec
   # JSON and pass them as flags, so baseline_config.speculative_method matches what the server
   # actually launched (otherwise it defaults to 'draft_model' and the provenance is lost).
@@ -126,6 +146,15 @@ run_cell() {  # <spec_json> <label> <context_source>
     return
   fi
   sleep 10
+  # 1-query warmup: the FIRST request after each spec-server restart pays a 5-6x TTFT spike
+  # (505-619ms vs ~110ms steady-state) from lazy CUDA-graph/kernel warm paths. One throwaway
+  # generation absorbs it OUTSIDE the measured window. Deliberately NOT run_experiment.py's
+  # --warmup-queries: that flag treats any N>0 as "replay the FULL measured set" (a
+  # cache-priming flag, not a count), which would pre-warm the prefix cache and add ~NUM_QUERIES
+  # extra generations per cell -- distorting the very cold-start serving read this 2x2 measures.
+  curl -s -m 90 "http://localhost:${VLLM_PORT:-8000}/v1/completions" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$MODEL\",\"prompt\":\"warmup\",\"max_tokens\":8}" >/dev/null 2>&1 || true
   if ! python3 scripts/3_run/run_experiment.py --baseline speculative --baseline-label "$label" \
       --model "$MODEL" --dataset "$DATASET" --num-queries "$NUM_QUERIES" --num-trials "$NUM_TRIALS" --seed "$SEED" \
       --speculative-method "$method" --num-speculative-tokens "$tokens" ${spec_model_flag[@]+"${spec_model_flag[@]}"} \
@@ -149,6 +178,13 @@ run_cell "$NGRAM" "spec_${MTAG}_ngram_rag"          retrieved
 SKIP_SPEC_GATE="${SKIP_SPEC_GATE:-0}"
 if [ "$SKIP_SPEC_GATE" = "1" ]; then
   DRAFT_OK=1
+elif [ "${CAGE_FORCE_RERUN:-0}" != "1" ] \
+    && cell_complete "$OUT/spec_${MTAG}_${DRAFT_LABEL}_cag" \
+    && cell_complete "$OUT/spec_${MTAG}_${DRAFT_LABEL}_rag"; then
+  # Resume: both draft cells already complete -- the gate's server restart would be wasted,
+  # and run_cell will skip both cells anyway.
+  echo "[matrix] both native-draft cells complete -- skipping the spec-decode gate"
+  DRAFT_OK=1
 else
   # exit 0 = PASS, 1 = real FAIL, 2 = INCONCLUSIVE (transient probe/timeout). Retry ONCE on 2
   # so a network hiccup during the ~3 probe generations does not permanently drop a valid arm.
@@ -164,6 +200,11 @@ else
     echo "[matrix] GATE FAILED (exit $_grc) -> native draft '$DRAFT_LABEL' does not engage on this vLLM."
     echo "[matrix] skipping the 2 draft cells and marking them failed (ngram cells kept)."
     for _lbl in "spec_${MTAG}_${DRAFT_LABEL}_cag" "spec_${MTAG}_${DRAFT_LABEL}_rag"; do
+      # Resume-safe: never stamp STATUS=failed over a cell already complete from a prior run.
+      if [ "${CAGE_FORCE_RERUN:-0}" != "1" ] && cell_complete "$OUT/$_lbl"; then
+        echo "[matrix] $_lbl already complete from a previous run -- keeping it despite gate failure"
+        continue
+      fi
       mkdir -p "$OUT/$_lbl"
       echo "STATUS=failed reason=spec_gate model=$MODEL spec=$DRAFT $(date)" > "$OUT/$_lbl/STATUS"
       FAILED+=("$_lbl(spec_gate)")
@@ -179,5 +220,9 @@ fi
 bash scripts/5_observability/sync_results_to_gcs.sh "$CAGE_SYNC_DIR" || true
 if [ "${#FAILED[@]}" -gt 0 ]; then
   echo "MATRIX INCOMPLETE: ${#FAILED[@]} cell(s) failed: ${FAILED[*]}"
+  echo "SPECULATIVE_MATRIX_DONE (model=$MODEL)"
+  # Nonzero so an orchestrator (run_full_sweep.sh) records this tree as FAILED; all cells
+  # were still attempted, and a re-run with the same CAGE_RUN_ID resumes only the failures.
+  exit 1
 fi
 echo "SPECULATIVE_MATRIX_DONE (model=$MODEL)"

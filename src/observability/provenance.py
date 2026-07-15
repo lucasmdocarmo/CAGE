@@ -42,17 +42,43 @@ def _run_cmd(args: List[str], cwd: Optional[str] = None, timeout: float = 5.0) -
         return None
 
 
+def _build_info(repo_dir: str) -> Dict[str, str]:
+    """Parse <repo>/BUILD_INFO (written by scripts/ops/package_repo.sh at packaging time).
+
+    The GPU VM receives the repo as a tarball, NOT a git clone -- `git rev-parse` fails
+    there ("fatal: not a git repository", observed in the 2026-07-15 smoke manifest), so
+    the SHA must travel WITH the code. Format: one `key=value` per line (sha, dirty,
+    packaged_at). Empty dict when absent/unreadable.
+    """
+    try:
+        text = (Path(repo_dir) / "BUILD_INFO").read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    out: Dict[str, str] = {}
+    for line in text.splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            out[k.strip()] = v.strip()
+    return out
+
+
 def git_sha(repo_dir: str) -> Optional[str]:
-    """Full commit SHA of ``repo_dir`` (None if not a git repo / git absent)."""
-    return _run_cmd(["git", "rev-parse", "HEAD"], cwd=repo_dir)
+    """Full commit SHA of ``repo_dir`` (BUILD_INFO fallback for tarball deploys)."""
+    sha = _run_cmd(["git", "rev-parse", "HEAD"], cwd=repo_dir)
+    if sha:
+        return sha
+    return _build_info(repo_dir).get("sha") or None
 
 
 def git_dirty(repo_dir: str) -> Optional[bool]:
     """True if ``repo_dir`` has uncommitted changes -- flags a non-reproducible run."""
     out = _run_cmd(["git", "status", "--porcelain"], cwd=repo_dir)
-    if out is None:
-        return None
-    return bool(out.strip())
+    if out is not None:
+        return bool(out.strip())
+    dirty = _build_info(repo_dir).get("dirty")
+    if dirty in ("0", "1"):
+        return dirty == "1"
+    return None
 
 
 def vllm_version() -> Optional[str]:

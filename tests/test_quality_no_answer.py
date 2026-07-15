@@ -29,6 +29,23 @@ def _f1(generated: str, reference: str) -> dict:
         "I don't know.",
         "Not stated in the passage.",
         "There is insufficient information to answer.",
+        # 2026-07-15 audit: the leading "I" must be OPTIONAL. The system prompt says
+        # "say you don't know" and models emit the bare form -- 12/12 real abstentions
+        # in the smoke run were exactly "Don't know." and every one was missed.
+        "Don't know.",
+        "don't know",
+        "Do not know.",
+        "I do not know.",
+        # families the audit found missing entirely
+        "Unknown",
+        "unknown.",
+        "N/A",
+        "Not sure.",
+        "No idea.",
+        "Not enough information.",
+        "Cannot be determined.",
+        "This can't be determined from the passage.",
+        "The answer cannot be found in the context.",
     ],
 )
 def test_abstention_detector_positive(text: str) -> None:
@@ -44,6 +61,12 @@ def test_abstention_detector_positive(text: str) -> None:
         "The Eiffel Tower is located in Paris, France.",
         # long answer that merely contains "no" must not trip the detector
         "There is no doubt the answer is Barack Obama who served two terms as president",
+        # whole-answer-only tokens must NOT fire when part of a real answer
+        "Unknown Pleasures",
+        "The Great Unknown",
+        # bare "none"/"Na" are deliberately NOT abstentions: both occur as real gold spans
+        "None",
+        "Na",
     ],
 )
 def test_abstention_detector_negative(text: str) -> None:
@@ -89,3 +112,22 @@ def test_answerable_item_partial_overlap() -> None:
     assert 0.0 < r["f1"] <= 1.0
     assert r["is_answerable"] == 1.0
     assert r["exact_match"] == 0.0                           # not an exact string match
+
+
+# --------------------------------------------------------------------------- #
+# Abstention precision indicator (mean over non-None rows == abstention precision)
+# --------------------------------------------------------------------------- #
+def test_abstention_precision_correct_abstention() -> None:
+    r = _f1("Don't know.", "")
+    assert r["abstention_precision"] == 1.0                  # abstained AND truly unanswerable
+    assert r["no_answer_correct"] == 1.0                     # recall indicator agrees
+
+
+def test_abstention_precision_wrong_abstention() -> None:
+    r = _f1("Don't know.", "Paris")
+    assert r["abstention_precision"] == 0.0                  # abstained on an answerable item
+
+
+def test_abstention_precision_none_when_not_abstained() -> None:
+    assert _f1("Paris", "Paris")["abstention_precision"] is None
+    assert _f1("Paris", "")["abstention_precision"] is None  # hallucinated, no abstention predicted

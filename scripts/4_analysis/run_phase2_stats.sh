@@ -67,7 +67,10 @@ echo "[stats] NOTE: BOTH serving (ttft/latency/tpot) AND quality deltas vs no_ca
 # decomposition (fix #4): answerable-only extraction quality + abstention accuracy. They are
 # None on inapplicable rows, so statistical_tests.py subsets them automatically (and simply
 # skips them for datasets without unanswerable items, e.g. NQ/MuSiQue).
-METRICS="grounding_score faithfulness context_relevance ttft_ms latency_ms tpot_ms f1_score exact_match f1_answerable exact_match_answerable no_answer_correct hallucinated_span_ratio"
+# completeness_bertscore/rouge_l added 2026-07-15: the most-plotted quality metric was never
+# significance-tested. abstention_precision pairs with no_answer_correct (recall) so the
+# abstention behaviour is testable as a classifier, not just an accuracy.
+METRICS="grounding_score faithfulness context_relevance ttft_ms latency_ms tpot_ms f1_score exact_match f1_answerable exact_match_answerable no_answer_correct abstention_precision hallucinated_span_ratio completeness_bertscore completeness_rouge_l"
 
 # --- Qwen pass (reference no_cache) ---
 if [ ! -d "$ALL_Q/no_cache" ]; then
@@ -85,7 +88,7 @@ python3 scripts/4_analysis/statistical_tests.py --results-dir "$ALL_Q" --referen
 # speculative-only, there is no valid within-model reference: skip loudly rather than mis-compare.
 if [ -d "$ALL_M/no_cache_mimo7b" ]; then
   python3 scripts/4_analysis/statistical_tests.py --results-dir "$ALL_M" --reference no_cache_mimo7b \
-      --metrics $METRICS \
+      --metrics $METRICS --latex-label tab:significance-mimo \
       --output "$ALL_M/phase2_stats.json" --latex-out "$ALL_M/phase2_stats.tex" 2>&1 | tail -50 \
       || echo "STATS_FAILED (mimo)"
 elif [ -n "$(ls -A "$ALL_M" 2>/dev/null)" ]; then
@@ -162,6 +165,11 @@ if [ -d "$ALL_M/no_cache_mimo7b" ]; then
   python3 scripts/4_analysis/token_divergence.py --results-dir "$ALL_M" --reference no_cache_mimo7b \
       --output "$ALL_M/token_divergence.json" || echo "DIVERGENCE_FAILED (mimo)"
 fi
+
+# Regenerate the run's figures from the SAME canonical loader/estimand as the stats
+# (pooled per-example medians + trial-level throughput), so plots and tables cannot
+# disagree in sign. Also renders delta_vs_no_cache_forest.png from phase2_stats.json.
+python3 scripts/4_analysis/generate_plots.py --results-dir "$RUN_ROOT" --plots-dir "$RUN_ROOT/plots" || echo "PLOTS_FAILED"
 
 bash scripts/5_observability/sync_results_to_gcs.sh "$CAGE_SYNC_DIR" || true
 echo "STATS_DONE"

@@ -13,9 +13,12 @@ Supports loading and formatting HuggingFace datasets:
 
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
-from datasets import load_dataset, Dataset
 import os
 import random
+
+# NOTE: `datasets` is imported lazily inside each loader's load() so this module
+# (CAGExample, get_loader, registry) stays importable in environments without the
+# HuggingFace `datasets` package (e.g. the local analysis venv running unit tests).
 
 
 @dataclass
@@ -58,47 +61,67 @@ class DatasetLoader:
 
 
 class HotpotQALoader(DatasetLoader):
-    """Loader for HotpotQA dataset."""
-    
+    """Loader for HotpotQA multi-hop QA (distractor setting).
+
+    Emits ALL 10 paragraphs (2 gold + 8 distractors) as title-prefixed context
+    strings so the retrieval arms have a real selection job; gold paragraphs are
+    recoverable via metadata["supporting_titles"] (titles from supporting_facts).
+    Every HotpotQA item is answerable (there is no unanswerable half), so — like
+    MuSiQue/NQ and unlike SQuAD v2 — the gold answer is always non-empty and no
+    is_impossible flag is emitted (SQuAD v2 signals unanswerable via empty answer
+    + metadata["is_impossible"]).
+    """
+
     def __init__(self, split: str = "validation", seed: int = 42):
         super().__init__("hotpotqa", split, seed)
-    
+
     def load(self, max_examples: Optional[int] = None) -> List[CAGExample]:
-        """Load HotpotQA dataset."""
-        dataset = load_dataset("hotpotqa", "fullwiki", split=self.split)
-        
+        """Load HotpotQA (distractor) dataset."""
+        from datasets import load_dataset  # lazy: see module-level note
+
+        dataset = load_dataset("hotpot_qa", "distractor", split=self.split)
+
         if max_examples:
             # Seeded shuffle BEFORE select so different seeds (per trial) draw
             # different, reproducible samples — fixes the trial-independence bug
             # where every trial saw the identical first-N examples.
             dataset = dataset.shuffle(seed=self.seed).select(range(min(max_examples, len(dataset))))
-        
+
         examples = []
         for item in dataset:
-            # HotpotQA provides context as list of (title, sentences) tuples
+            # context = {"title": [...], "sentences": [[...], ...]} -> one
+            # "<title>: <concatenated sentences>" paragraph per title. HotpotQA
+            # sentences carry their own leading whitespace, so plain "".join is
+            # the canonical concatenation. Keep ALL paragraphs (gold + distractors).
             context_docs = []
-            if "context" in item and item["context"] is not None:
-                ctx = item["context"]
-                titles = ctx.get("title") if isinstance(ctx, dict) else None
-                sentences_list = ctx.get("sentences") if isinstance(ctx, dict) else None
+            ctx = item.get("context") or {}
+            titles = ctx.get("title") if isinstance(ctx, dict) else None
+            sentences_list = ctx.get("sentences") if isinstance(ctx, dict) else None
+            if titles and sentences_list:
+                for title, sentences in zip(titles, sentences_list):
+                    doc_text = "".join(sentences) if isinstance(sentences, list) else str(sentences)
+                    context_docs.append(f"{title}: {doc_text}")
 
-                if titles and sentences_list:
-                    for title, sentences in zip(titles, sentences_list):
-                        # Join sentences for each document
-                        doc_text = " ".join(sentences) if isinstance(sentences, list) else str(sentences)
-                        context_docs.append(f"{title}: {doc_text}")
-            
+            # supporting_facts = {"title": [...], "sent_id": [...]}; dedupe the
+            # titles (one gold paragraph can contribute several sentences) so
+            # corpus/gold selection can find the gold paragraphs by title prefix.
+            sf = item.get("supporting_facts") or {}
+            sf_titles = sf.get("title") if isinstance(sf, dict) else []
+            supporting_titles = list(dict.fromkeys(sf_titles or []))
+
             examples.append(CAGExample(
-                id=item.get("id", str(len(examples))),
+                id=str(item.get("id", len(examples))),
                 question=item["question"],
                 context=context_docs,
-                answer=item["answer"],
+                answer=item["answer"],  # always non-empty: all items answerable
                 metadata={
+                    "dataset": "hotpotqa",
                     "type": item.get("type", "unknown"),
                     "level": item.get("level", "unknown"),
-                }
+                    "supporting_titles": supporting_titles,
+                },
             ))
-        
+
         return examples
 
 
@@ -110,6 +133,8 @@ class QasperLoader(DatasetLoader):
     
     def load(self, max_examples: Optional[int] = None) -> List[CAGExample]:
         """Load QASPER dataset."""
+        from datasets import load_dataset  # lazy: see module-level note
+
         dataset = load_dataset("allenai/qasper", split=self.split)
         
         if max_examples:
@@ -158,6 +183,8 @@ class SquadV2Loader(DatasetLoader):
     
     def load(self, max_examples: Optional[int] = None) -> List[CAGExample]:
         """Load SQuAD v2 dataset."""
+        from datasets import load_dataset  # lazy: see module-level note
+
         dataset = load_dataset("squad_v2", split=self.split)
         
         if max_examples:
@@ -194,6 +221,8 @@ class TriviaQALoader(DatasetLoader):
     
     def load(self, max_examples: Optional[int] = None) -> List[CAGExample]:
         """Load TriviaQA dataset."""
+        from datasets import load_dataset  # lazy: see module-level note
+
         dataset = load_dataset("trivia_qa", "rc", split=self.split)
         
         if max_examples:
@@ -243,6 +272,8 @@ class HumanEvalLoader(DatasetLoader):
     
     def load(self, max_examples: Optional[int] = None) -> List[CAGExample]:
         """Load HumanEval dataset."""
+        from datasets import load_dataset  # lazy: see module-level note
+
         dataset = load_dataset("openai_humaneval", split=self.split)
         
         if max_examples:
@@ -289,6 +320,8 @@ class MBPPLoader(DatasetLoader):
     
     def load(self, max_examples: Optional[int] = None) -> List[CAGExample]:
         """Load MBPP dataset."""
+        from datasets import load_dataset  # lazy: see module-level note
+
         dataset = load_dataset("mbpp", split=self.split)
         
         if max_examples:
@@ -630,6 +663,8 @@ class NaturalQuestionsLoader(DatasetLoader):
         super().__init__("nq_open", split, seed)
 
     def load(self, max_examples: Optional[int] = None) -> List[CAGExample]:
+        from datasets import load_dataset  # lazy: see module-level note
+
         # nq_open has question + short answers; no gold passage shipped, so context is
         # left empty and the retrieval path supplies documents (fair RAG setup).
         dataset = load_dataset("nq_open", split=self.split)
@@ -655,21 +690,50 @@ class MuSiQueLoader(DatasetLoader):
         super().__init__("musique", split, seed)
 
     def load(self, max_examples: Optional[int] = None) -> List[CAGExample]:
-        # dgslibisey/MuSiQue mirrors the answerable split with paragraphs + question + answer.
+        from datasets import load_dataset  # lazy: see module-level note
+
+        # dgslibisey/MuSiQue mirrors the answerable split with paragraphs + question + answer,
+        # so — like HotpotQA/NQ and unlike SQuAD v2 — the gold answer is always non-empty and
+        # no is_impossible flag is emitted.
         dataset = load_dataset("dgslibisey/MuSiQue", split=self.split)
         if max_examples:
+            # Seeded shuffle BEFORE select so different seeds (per trial) draw
+            # different, reproducible samples — fixes the trial-independence bug
+            # where every trial saw the identical first-N examples.
             dataset = dataset.shuffle(seed=self.seed).select(range(min(max_examples, len(dataset))))
         examples = []
         for item in dataset:
+            # paragraphs = [{"idx", "title", "paragraph_text", "is_supporting"}, ...] ->
+            # title-prefixed paragraph strings (same convention as HotpotQA/TriviaQA).
+            # Keep ALL paragraphs (gold + distractors); gold paragraphs are recoverable
+            # via metadata["supporting_titles"] (is_supporting=True).
             paragraphs = item.get("paragraphs") or []
-            contexts = [p.get("paragraph_text", "") for p in paragraphs if isinstance(p, dict)] \
-                if paragraphs and isinstance(paragraphs[0], dict) else list(paragraphs)
+            contexts: List[str] = []
+            supporting_titles: List[str] = []
+            for p in paragraphs:
+                if isinstance(p, dict):
+                    text = p.get("paragraph_text", "") or ""
+                    title = p.get("title", "") or ""
+                    doc = f"{title}: {text}" if title else text
+                    if doc:
+                        contexts.append(doc)
+                    if p.get("is_supporting") and title:
+                        supporting_titles.append(title)
+                elif p:
+                    contexts.append(str(p))
+            decomposition = item.get("question_decomposition") or []
             examples.append(CAGExample(
                 id=str(item.get("id", len(examples))),
                 question=item.get("question", ""),
-                context=[c for c in contexts if c],
-                answer=item.get("answer", ""),
-                metadata={"dataset": "musique", "num_hops": item.get("question_decomposition")},
+                context=contexts,
+                answer=item.get("answer", ""),  # answerable split: gold always populated
+                metadata={
+                    "dataset": "musique",
+                    # Hop COUNT (was: the raw question_decomposition list stored
+                    # under a count-named key).
+                    "num_hops": len(decomposition) if isinstance(decomposition, list) else None,
+                    "supporting_titles": list(dict.fromkeys(supporting_titles)),
+                },
             ))
         return examples
 
@@ -694,6 +758,8 @@ class CRAGLoader(DatasetLoader):
         super().__init__(self.hf_path, split, seed)
 
     def load(self, max_examples: Optional[int] = None) -> List[CAGExample]:
+        from datasets import load_dataset  # lazy: see module-level note
+
         dataset = load_dataset(self.hf_path, split=self.split)
         if max_examples:
             dataset = dataset.shuffle(seed=self.seed).select(range(min(max_examples, len(dataset))))
@@ -761,6 +827,8 @@ class ShareGPTLoader(DatasetLoader):
         return (turn.get("value") or turn.get("content") or "") if isinstance(turn, dict) else str(turn)
 
     def load(self, max_examples: Optional[int] = None) -> List[CAGExample]:
+        from datasets import load_dataset  # lazy: see module-level note
+
         dataset = load_dataset(self.hf_path, split=self.split)
         if max_examples:
             dataset = dataset.shuffle(seed=self.seed).select(range(min(max_examples, len(dataset))))

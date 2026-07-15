@@ -29,6 +29,34 @@ LOG_DIR = PROJECT_DIR / "logs" / "cluster"
 STATE_FILE = LOG_DIR / "cluster_state.json"
 
 
+def build_serve_args(model: str, port: int) -> List[str]:
+    """vLLM serve argv honoring the Option-A serving contract (lib/_serving_config.sh).
+
+    The cluster path previously hardcoded --max-model-len 2048 with no gpu-mem-util and
+    no --trust-remote-code (blocks MiMo), silently diverging from the single-node path --
+    a serving-uniformity confound for any distributed-vs-single comparison (2026-07-15
+    audit). Values come from the VLLM_* env exported by scripts/lib/_serving_config.sh;
+    the fallbacks here mirror that file so an unsourced shell still gets Option A.
+    """
+    args = [
+        "vllm", "serve", model,
+        "--port", str(port),
+        "--enable-prefix-caching",
+        "--enable-prompt-tokens-details",
+        "--trust-remote-code",
+        "--max-model-len", os.environ.get("VLLM_MAX_MODEL_LEN", "4096"),
+        "--gpu-memory-utilization", os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.90"),
+    ]
+    if os.environ.get("VLLM_ENFORCE_EAGER", "0") == "1":
+        args.append("--enforce-eager")
+    kv_dtype = (os.environ.get("VLLM_KV_CACHE_DTYPE") or "").strip()
+    if kv_dtype:
+        args += ["--kv-cache-dtype", kv_dtype]
+    if os.environ.get("VLLM_DISABLE_LOG_REQUESTS", "1") == "1":
+        args.append("--disable-log-requests")
+    return args
+
+
 def build_replica_configs(replica_count: int, base_port: int) -> List[Dict[str, Any]]:
     return [
         {
@@ -323,17 +351,7 @@ def start_cluster(
         for replica in replicas:
             log_path = LOG_DIR / f"vllm_{model_slug}_{replica['replica_id']}_{replica['port']}.log"
             pid = launch_process(
-                [
-                    "vllm",
-                    "serve",
-                    model,
-                    "--port",
-                    str(replica["port"]),
-                    "--enable-prefix-caching",
-                    "--enable-prompt-tokens-details",
-                    "--max-model-len",
-                    "2048",
-                ],
+                build_serve_args(model, replica["port"]),
                 log_path,
             )
             replica["pid"] = pid

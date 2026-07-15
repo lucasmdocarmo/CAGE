@@ -74,22 +74,36 @@ try:
 except Exception as e:
     pf(f"cage_stats.api NOT importable: {e}")
 
-# (b) quality layer: LettuceDetect grounding + NLI faithfulness score a real pair
+# (b) quality layer: DISCRIMINATION gate (2026-07-15, task #59). Non-None alone would
+# pass a scorer stuck at a constant (always 1.0), silently nulling the PRIMARY metric
+# for a multi-day run. A grounded and a deliberately UNGROUNDED answer on the same
+# context must separate by >= 0.3 on grounding AND faithfulness.
 try:
     from src.evaluation.quality import QualityEvaluator
     qe = QualityEvaluator(device="cpu")
     q = "What color is the sky on a clear day?"
     ctx = ["On a clear day the sky appears blue because of Rayleigh scattering."]
-    m = qe.evaluate(question=q, context=ctx, generated_text="The sky is blue.", reference_answer="blue")
-    d = m.to_dict()
-    if d.get("grounding_score") is None:
+    good = qe.evaluate(question=q, context=ctx,
+                       generated_text="The sky is blue.", reference_answer="blue").to_dict()
+    # NOT an abstention phrase (abstentions short-circuit grounding to None by design).
+    bad = qe.evaluate(question=q, context=ctx,
+                      generated_text="The sky is bright green because of chlorophyll in the air.",
+                      reference_answer="blue").to_dict()
+    g_good, g_bad = good.get("grounding_score"), bad.get("grounding_score")
+    if g_good is None or g_bad is None:
         pf("grounding_score is None -- LettuceDetect did not load (PRIMARY metric would be null all run)")
+    elif (g_good - g_bad) < 0.3:
+        pf(f"grounding does NOT discriminate: grounded={g_good:.3f} ungrounded={g_bad:.3f} "
+           f"(separation < 0.3 -- constant/broken scorer)")
     else:
-        pw(f"LettuceDetect grounding_score={d['grounding_score']:.3f}")
-    if d.get("faithfulness") is None:
+        pw(f"grounding discriminates: grounded={g_good:.3f} vs ungrounded={g_bad:.3f}")
+    f_good, f_bad = good.get("faithfulness"), bad.get("faithfulness")
+    if f_good is None or f_bad is None:
         pf("faithfulness is None -- NLI model did not load")
+    elif (f_good - f_bad) < 0.3:
+        pf(f"faithfulness does NOT discriminate: {f_good:.3f} vs {f_bad:.3f} (separation < 0.3)")
     else:
-        pw(f"NLI faithfulness={d['faithfulness']:.3f}")
+        pw(f"NLI discriminates: faithful={f_good:.3f} vs unfaithful={f_bad:.3f}")
 except Exception as e:
     pf(f"quality layer error: {e}")
 
@@ -111,6 +125,24 @@ except Exception as e:
 sys.exit(0 if ok else 1)
 PY
 [ $? -ne 0 ] && FAILED=1
+
+# (f) boot-disk free space: a multi-day sweep writes vLLM logs, observability snapshots and
+# per-trial results continuously; a full boot disk kills the run hours in. Gate on the
+# filesystem under $HOME (the boot disk on the GPU VM), falling back to /.
+echo "(f) boot-disk free space"
+MIN_FREE_GB="${CAGE_MIN_FREE_GB:-20}"
+_free_kb="$(df -Pk "${HOME:-/}" 2>/dev/null | awk 'NR==2 {print $4}')"
+[ -z "$_free_kb" ] && _free_kb="$(df -Pk / 2>/dev/null | awk 'NR==2 {print $4}')"
+if [ -z "$_free_kb" ]; then
+    fail "could not determine free disk space (df failed)"
+else
+    _free_gb=$(( _free_kb / 1024 / 1024 ))
+    if [ "$_free_gb" -lt "$MIN_FREE_GB" ]; then
+        fail "free disk ${_free_gb}GB < ${MIN_FREE_GB}GB (CAGE_MIN_FREE_GB) -- a multi-day sweep would fill the disk"
+    else
+        pass "free disk ${_free_gb}GB >= ${MIN_FREE_GB}GB (threshold: CAGE_MIN_FREE_GB)"
+    fi
+fi
 
 echo "=============================================="
 if [ "$FAILED" -eq 0 ]; then
