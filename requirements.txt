@@ -78,5 +78,7 @@ pytest-asyncio>=0.21.0
 # NOTE: requires the cage-stats restructure to be committed + pushed to its remote first.
 # If that repo is private, ensure git credentials are available on the install host.
 # Telemetry is optional — comment this line out if you don't need it (CAGE still runs).
-cage-stats @ git+https://github.com/lucasmdocarmo/cage-stats.git
+# PINNED to an exact commit (2026-07-15): an unpinned git dep installs whatever main is
+# at setup time, making two runs weeks apart silently non-comparable. Bump deliberately.
+cage-stats @ git+https://github.com/lucasmdocarmo/cage-stats.git@0c1152d4ccd38e4efd9b829da2cb08abfa52a7f3
 # Local dev alternative (no install): set CAGE_STATS_HOME=/Users/lucasmariano/cage-stats

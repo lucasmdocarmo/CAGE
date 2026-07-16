@@ -109,7 +109,10 @@ for cell in sorted(glob.glob(os.path.join(root, "*"))):
         continue
     name = os.path.basename(cell)
     accs, tpots, method = [], [], None
-    for tj in glob.glob(os.path.join(cell, "**", "vllm_telemetry.json"), recursive=True):
+    # sorted() -> trial order (trial_1 < trial_2 < ...): acceptance counters are
+    # CUMULATIVE-since-server-start (one server serves warmup + all trials of an arm),
+    # so the LAST trial's value is the whole-arm acceptance (2026-07-15 review, B2).
+    for tj in sorted(glob.glob(os.path.join(cell, "**", "vllm_telemetry.json"), recursive=True)):
         try:
             j = json.load(open(tj))
         except Exception:
@@ -136,7 +139,12 @@ for cell in sorted(glob.glob(os.path.join(root, "*"))):
         "cell": name,
         "method": method or "",
         "n_with_acceptance": len(accs),
-        "acceptance_rate_mean": round(statistics.fmean(accs), 4) if accs else None,
+        # LAST trial = cumulative over the whole arm. Averaging the three nested
+        # cumulative ratios (the old acceptance_rate_mean) double-counted early
+        # traffic and was statistically meaningless -- the per-trial values are not
+        # independent (2026-07-15 review, B2). tpot means stay: those are client-side
+        # per-trial measurements, legitimately independent.
+        "acceptance_rate_cumulative": round(accs[-1], 4) if accs else None,
         "avg_tpot_ms_mean": round(statistics.fmean(tpots), 3) if tpots else None,
         "status": status,
     })

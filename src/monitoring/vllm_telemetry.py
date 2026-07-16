@@ -98,10 +98,14 @@ class VllmTelemetrySampler:
 
     # gauges/rates -> peak + mean; counters -> final (max, they are monotonic);
     # structural/last-value fields -> taken from the final sample.
+    # session_* are NOT counters (2026-07-15 review, M2): each sampler tick builds a
+    # fresh engine, so they are ~1s per-tick DELTAS -- "max" made the busiest single
+    # tick masquerade as a trial total (the audit's "session_gen_tokens 12-49" was a
+    # tick, not the trial). As gauges they honestly report peak/avg PER-TICK activity.
     _GAUGES = ("gen_tps", "prompt_tps", "req_rate", "running", "waiting",
-               "kv_usage", "kv_used_tokens", "tokens_per_iter", "preempt_rate")
-    _COUNTERS = ("cached_tokens_total", "recomputed_tokens_total",
-                 "session_gen_tokens", "session_prompt_tokens", "session_requests")
+               "kv_usage", "kv_used_tokens", "tokens_per_iter", "preempt_rate",
+               "session_gen_tokens", "session_prompt_tokens", "session_requests")
+    _COUNTERS = ("cached_tokens_total", "recomputed_tokens_total")
     # Speculative-decode acceptance reaches us under TWO schemas depending on the path:
     # the cage-stats in-process/CLI path emits FLAT keys (spec_active/spec_acceptance/
     # spec_accepted_per_draft); the dependency-free stdlib fallback emits a nested
@@ -109,7 +113,8 @@ class VllmTelemetrySampler:
     # vllm_telemetry.json (Phase-2 bug: only "spec_decode" was listed, so the flat
     # cage-stats acceptance was silently dropped -> "None for every speculative cell").
     _LAST = ("connected", "model_names", "engine_count", "kv_capacity_tokens",
-             "kv_dtype", "kv_ratio", "prefix_hit_lifetime", "prefix_hit_window",
+             "kv_dtype", "kv_ratio", "kv_ratio_kind",
+             "prefix_hit_lifetime", "prefix_hit_window",
              "src_compute", "src_cache_hit", "src_external",
              "spec_decode", "spec_active", "spec_acceptance", "spec_accepted_per_draft")
 

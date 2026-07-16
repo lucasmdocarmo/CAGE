@@ -81,6 +81,26 @@ def git_dirty(repo_dir: str) -> Optional[bool]:
     return None
 
 
+def installed_package_commit(dist_name: str) -> Optional[str]:
+    """Commit id of a pip VCS-installed package (pip records it in direct_url.json).
+
+    Fallback for code that exists on the box only as an installed package: the VM
+    installs cage-stats from git (requirements.txt git dep), so there is no clone to
+    rev-parse -- the 2026-07-15 smoke manifest recorded cage_stats_git_sha=null for
+    exactly this reason.
+    """
+    try:
+        from importlib import metadata
+
+        raw = metadata.distribution(dist_name).read_text("direct_url.json")
+        if not raw:
+            return None
+        info = json.loads(raw)
+        return (info.get("vcs_info") or {}).get("commit_id")
+    except Exception:  # pragma: no cover - absent package / non-VCS install
+        return None
+
+
 def vllm_version() -> Optional[str]:
     """Installed vLLM version (the serving stack under test), or None if not importable."""
     try:
@@ -218,7 +238,10 @@ def build_manifest(
         created_at=created_at,
         cage_git_sha=git_sha(cage_repo_dir),
         cage_git_dirty=git_dirty(cage_repo_dir),
-        cage_stats_git_sha=git_sha(cage_stats_repo_dir) if cage_stats_repo_dir else None,
+        cage_stats_git_sha=(
+            (git_sha(cage_stats_repo_dir) if cage_stats_repo_dir else None)
+            or installed_package_commit("cage-stats")
+        ),
         vllm_version=vllm_version(),
         torch_version=_torch_version(),
         model=model,
