@@ -57,18 +57,22 @@ def parse_args() -> argparse.Namespace:
 
 
 # Model-free fields: recomputed identically in fast and full mode, always safe to apply.
+# sanitized_answer (B4) is model-free: the scaffold-strip/truncation regexes run everywhere.
 _MODEL_FREE_FIELDS = [
     "f1_score", "precision", "recall", "exact_match", "is_answerable",
     "predicted_no_answer", "f1_answerable", "exact_match_answerable",
-    "no_answer_correct", "abstention_precision",
+    "no_answer_correct", "abstention_precision", "sanitized_answer",
 ]
 # Model-based fields: in fast mode these are None because the models are OFF, which must
 # NOT clobber real values -- applied only on abstained rows (the short-circuit fix) unless
-# --full recomputed them for real.
+# --full recomputed them for real. faithfulness_premise_mode (B2) and the *_source dual
+# scores (B3d, vs pre-compression originals) ride with the model-based group.
 _MODEL_FIELDS = [
     "grounding_score", "hallucination_detected", "hallucinated_span_ratio",
-    "supported_claim_ratio", "faithfulness", "context_relevance", "relevance",
+    "supported_claim_ratio", "faithfulness", "faithfulness_premise_mode",
+    "context_relevance", "relevance",
     "completeness_bertscore", "completeness_rouge_l",
+    "faithfulness_source", "grounding_source",
 ]
 
 
@@ -143,7 +147,11 @@ def main() -> int:
 
     # Import late so fast mode works in a lean analysis venv (quality.py's top level
     # only needs numpy; the model stacks load lazily and only in --full mode).
-    from src.evaluation.quality import QualityEvaluator, is_no_answer_prediction
+    from src.evaluation.quality import (
+        QualityEvaluator,
+        is_no_answer_prediction,
+        sanitize_answer,
+    )
 
     evaluator = QualityEvaluator(
         use_nli=args.full,
@@ -189,7 +197,38 @@ def main() -> int:
                 all_answers=all_answers,
             ).to_dict()
 
-            abstained = is_no_answer_prediction(generated)
+            # B4: abstention is judged on the SANITIZED text ("A: I don't know." must
+            # count), matching evaluate()'s internal gate. sanitized_answer also lands
+            # in metrics via QualityMetrics.to_dict(); generated_answer stays raw.
+            sanitized = sanitize_answer(generated)
+            abstained = is_no_answer_prediction(sanitized)
+
+            # B3d dual scoring: when the evidence row carries the PRE-COMPRESSION docs
+            # ('original_contexts', written by the serving side for compressed arms),
+            # score faithfulness/grounding against those originals ALONGSIDE the
+            # served-context scores. Separates "the answer contradicts the source" from
+            # "compression destroyed the evidence the answer relied on". Columns are
+            # ALWAYS emitted; empty when the field is absent, the row abstained, or the
+            # metric models are off (fast mode).
+            faithfulness_source = None
+            grounding_source = None
+            original_contexts = rec.get("original_contexts")
+            if isinstance(original_contexts, str):
+                try:
+                    original_contexts = json.loads(original_contexts)
+                except json.JSONDecodeError:
+                    original_contexts = [original_contexts]
+            if (
+                isinstance(original_contexts, list)
+                and any(c and str(c).strip() for c in original_contexts)
+                and not abstained
+            ):
+                src_ctx = [str(c) for c in original_contexts if c and str(c).strip()]
+                faith_src = evaluator.evaluate_faithfulness(sanitized, src_ctx)
+                faithfulness_source = faith_src.get("faithfulness")
+                halluc_src = evaluator.evaluate_hallucination(question, src_ctx, sanitized)
+                grounding_source = halluc_src.get("grounding_score")
+
             old_g = rec.get("grounding_score")
             old_g = None if old_g in (None, "", "None") else float(old_g)
             total_rows += 1
@@ -213,6 +252,9 @@ def main() -> int:
                 "abstained": abstained,
                 "old_grounding_score": old_g,
                 **metrics,
+                # B3d: scores vs the PRE-compression originals ("" when unavailable).
+                "faithfulness_source": faithfulness_source,
+                "grounding_source": grounding_source,
             })
 
         if rows_out:

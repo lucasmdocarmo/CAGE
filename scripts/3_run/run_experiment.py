@@ -33,6 +33,7 @@ from src.evaluation.performance import PerformanceEvaluator, CacheMetricsTracker
 from src.evaluation.code_evaluator import CodeQualityEvaluator
 from src.orchestration.baselines import get_baseline_config, check_baseline_requirements
 from src.orchestration.ir import (
+    IRDocument,
     IRHit,
     build_corpus_from_contexts,
     ensure_ir_index,
@@ -44,7 +45,15 @@ from src.orchestration.ir import (
 )
 from src.orchestration.redis_cache import RedisConfig, RedisClient, RetrievalCache
 from src.evaluation.staleness import staleness_metrics, select_stale, make_stale_context
-from src.utils.prompting import format_qa_prompt, format_multi_turn_prompt
+from src.utils.prompting import (
+    format_qa_prompt,
+    format_multi_turn_prompt,
+    format_qa_messages,
+    format_multi_turn_messages,
+    messages_to_fallback_prompt,
+    prompt_mode,
+    select_distractor_texts,
+)
 from prometheus_client import Counter, Histogram, Gauge, CollectorRegistry, start_http_server
 import os
 import psutil
@@ -991,6 +1000,46 @@ def run_experiment(
             embedding_model=baseline_config.embedding_model,
         )
         corpus_docs = build_corpus_from_contexts(base_examples, dataset_name=dataset)
+        # Decision 3B (approved pre-run package, 2026-07-16): widen the retrieval corpus
+        # with a deterministic distractor pool so retrieval is a real search problem, not
+        # a near-oracle lookup over only the trial's own gold paragraphs. Manifest mode
+        # only (the uniform-yardstick path): `pool` above is already the FULL split loaded
+        # in stable order, so distractor selection is seed-stable by construction. The
+        # first CAGE_DISTRACTOR_DOCS (default 1000) content-deduped paragraphs are added,
+        # EXCLUDING the trial's gold paragraphs (both ex.context and the corpus-mode
+        # metadata gold_context). 0 disables (old behavior). The IR index content-hash
+        # (src/orchestration/ir.py corpus_doc_ids_sha1, checked by ensure_ir_index)
+        # triggers the rebuild automatically when the corpus changes.
+        _n_distractors = int(os.getenv("CAGE_DISTRACTOR_DOCS", "1000") or "0")
+        if _manifest is not None and _n_distractors > 0:
+            _gold_texts: List[str] = [
+                c for ex in base_examples for c in (ex.context or []) if c
+            ]
+            _gold_texts += [
+                (ex.metadata or {}).get("gold_context")
+                for ex in base_examples
+                if (ex.metadata or {}).get("gold_context")
+            ]
+            _distractor_texts = select_distractor_texts(pool, _gold_texts, _n_distractors)
+            _existing_ids = {d.doc_id for d in corpus_docs}
+            _added = 0
+            for _dt in _distractor_texts:
+                _did = stable_text_id(_dt)
+                if _did in _existing_ids:
+                    continue
+                corpus_docs.append(
+                    IRDocument(
+                        doc_id=_did,
+                        text=_dt,
+                        metadata={"dataset": dataset, "source": "distractor"},
+                    )
+                )
+                _existing_ids.add(_did)
+                _added += 1
+            print(
+                f"DISTRACTOR corpus (Decision 3B): +{_added} distractor paragraphs "
+                f"(requested {_n_distractors}, gold excluded, content-deduped)"
+            )
         print(f"IR corpus documents: {len(corpus_docs)}")
         ir_index = ensure_ir_index(
             index_dir=index_dir,
@@ -1041,6 +1090,30 @@ def run_experiment(
             print(f"Reranker enabled: {reranker_model}")
         except Exception as e:
             print(f"Warning: failed to initialize reranker {reranker_model}: {e}")
+
+    # Decision 1B (approved pre-run package, 2026-07-16): serve via the model's chat
+    # template by default (vLLM /v1/chat/completions with the system message carrying
+    # the task+abstention instruction, Qwen3 thinking disabled via
+    # chat_template_kwargs {"enable_thinking": false}); CAGE_PROMPT_MODE=raw is the
+    # escape hatch that reproduces the legacy raw-completions path byte-for-byte.
+    _prompt_mode = prompt_mode()
+    print(f"PROMPT MODE: {_prompt_mode} "
+          f"({'chat template via /v1/chat/completions' if _prompt_mode == 'chat' else 'legacy raw completions'})")
+
+    # B5 (2026-07-16 audit): a ~35-60ms host-side TTFT constant was traced to host-side
+    # scheduling/GC jitter bleeding into the timed window. A short monotonic-clock settle
+    # immediately before each timed request lets that jitter drain; the ACTUAL settle
+    # duration is recorded per row (settle_ms) so it is auditable, and it is never part
+    # of the timed window itself. CAGE_REQUEST_SETTLE_MS=0 disables.
+    _settle_ms_cfg = float(os.getenv("CAGE_REQUEST_SETTLE_MS", "150") or "0")
+
+    def settle_before_request() -> float:
+        """Sleep the configured settle window; return the measured settle in ms."""
+        if _settle_ms_cfg <= 0:
+            return 0.0
+        _t0 = time.monotonic()
+        time.sleep(_settle_ms_cfg / 1000.0)
+        return (time.monotonic() - _t0) * 1000.0
 
     # Setup inference engine
     engine = setup_inference_engine(model, baseline_config, backend=backend, use_offline=use_offline)
@@ -1216,9 +1289,28 @@ def run_experiment(
         if max_context_docs is not None and max_context_docs > 0:
             used_contexts = used_contexts[:max_context_docs]
 
+        # gold_position_in_prompt (pre-run package small-logging field): 0-based index of
+        # the gold doc among the SERVED contexts (prompt order), -1 if absent. Computed on
+        # the capped, PRE-compression list (compression rewrites text, which would break
+        # the match; list positions are what the prompt layout uses). Matching is exact
+        # text OR containment (corpus-prefix blocks CONTAIN the gold paragraph).
+        _gold_texts = [c for c in (example.context or []) if c]
+        _meta_gold = (example.metadata or {}).get("gold_context") if isinstance(example.metadata, dict) else None
+        if _meta_gold:
+            _gold_texts.append(_meta_gold)
+        gold_position_in_prompt = -1
+        for _pos, _doc in enumerate(used_contexts):
+            if _doc and any(_g == _doc or (_g in _doc) for _g in _gold_texts):
+                gold_position_in_prompt = _pos
+                break
+
         # Text compression (compressed_rag): compress the already-capped context.
+        # The PRE-compression served docs are preserved as original_contexts -- the
+        # qa_evidence.jsonl contract field the offline scorer reads for compression arms.
         compression_stats = None
+        original_contexts: Optional[List[str]] = None
         if context_compressor is not None:
+            original_contexts = list(used_contexts)
             used_contexts, cstats = context_compressor.compress(
                 used_contexts, question=question,
                 target_ratio=baseline_config.compress_target_ratio,
@@ -1229,6 +1321,8 @@ def run_experiment(
             "question": question,
             "baseline_mode": baseline_mode,
             "used_contexts": used_contexts,
+            "original_contexts": original_contexts,
+            "gold_position_in_prompt": gold_position_in_prompt,
             "retrieval_cached": retrieval_cached,
             "retrieval_hit": retrieval_hit,
             "retrieval_rank": retrieval_rank,
@@ -1247,6 +1341,7 @@ def run_experiment(
         *,
         batch_id: int,
         turn_index: int,
+        settle_ms: float = 0.0,
     ) -> None:
 
         question = meta["question"]
@@ -1352,6 +1447,23 @@ def run_experiment(
         if isinstance(example.metadata, dict):
             repeat_index = example.metadata.get("repeat_index")
 
+        # group_id (pre-run package small-logging field): the manifest corpus-block id.
+        # Corpus-prefix runs stamp it into metadata; otherwise resolve via the manifest's
+        # question_to_block keyed by the base example id (repeat/warmup suffixes
+        # stripped). None outside manifest runs.
+        _base_id = example.id.split("__rep")[0].split("__warmup")[0]
+        group_id = (
+            example.metadata.get("corpus_block") if isinstance(example.metadata, dict) else None
+        )
+        if group_id is None and _manifest is not None:
+            group_id = (_manifest.get("question_to_block") or {}).get(_base_id)
+
+        # Task 5 (logprobs): mean/sum logprob of the GENERATED tokens, attached by the
+        # vLLM adapter as plain attributes (None on error rows / non-chat backends).
+        # Powers the abstention risk-coverage curves downstream.
+        mean_token_logprob = getattr(response, "mean_token_logprob", None)
+        sum_token_logprob = getattr(response, "sum_token_logprob", None)
+
         result = {
             "example_id": example.id,
             "baseline": experiment_label,
@@ -1361,6 +1473,13 @@ def run_experiment(
             "batch_id": batch_id,
             "turn_index": turn_index,
             "repeat_index": repeat_index,
+            "group_id": group_id,
+            "gold_position_in_prompt": meta.get("gold_position_in_prompt"),
+            # B5: measured pre-request settle (monotonic clock), for auditability of the
+            # 2026-07-16 ~35-60ms host-side TTFT constant finding. Never inside the
+            # timed window.
+            "settle_ms": settle_ms,
+            "prompt_mode": _prompt_mode,
             "question": question,
             "reference_answer": example.answer,
             "generated_answer": response.generated_text,
@@ -1380,6 +1499,8 @@ def run_experiment(
             "prompt_tokens": response.prompt_tokens,
             "cached_prompt_tokens": response.cached_prompt_tokens,
             "cached_prompt_ratio": cached_ratio,
+            "mean_token_logprob": mean_token_logprob,
+            "sum_token_logprob": sum_token_logprob,
             "finish_reason": response.finish_reason,
             "error": response.error,
             # Flag degenerate empty answers (e.g. a leading newline under stop=["\n"]) so a
@@ -1404,6 +1525,9 @@ def run_experiment(
             "retrieved_doc_ids": ";".join(meta["retrieved_doc_ids"]) if meta["retrieved_doc_ids"] else "",
             "compression_ratio": (meta.get("compression_stats") or {}).get("compression_ratio"),
             "compression_applied": (meta.get("compression_stats") or {}).get("compression_applied"),
+            # Audit fix B3b (2026-07-16): per-query compression CPU time -- LLMLingua-2's own
+            # speedup claims INCLUDE it, so e2e comparisons must be able to add it back.
+            "compression_latency_ms": (meta.get("compression_stats") or {}).get("compression_latency_ms"),
             **_quality_row,
         }
         if code_metrics is not None:
@@ -1430,6 +1554,9 @@ def run_experiment(
                 "repeat_index": repeat_index,
                 "turn_index": turn_index,
                 "batch_id": batch_id,
+                "group_id": group_id,
+                "gold_position_in_prompt": meta.get("gold_position_in_prompt"),
+                "prompt_mode": _prompt_mode,
                 "question": question,
                 "reference_answer": example.answer,
                 # ALL gold answers (audit 2026-07-16 M5) so rescore_quality.py can apply
@@ -1437,6 +1564,12 @@ def run_experiment(
                 "all_answers": (example.metadata or {}).get("all_answers"),
                 "generated_answer": response.generated_text,
                 "used_contexts": used_contexts,
+                # CONTRACT field (pre-run package task 6): for compression arms this is
+                # the PRE-compression served docs (list[str]); None for the other arms.
+                # The offline scorer (rescore_quality.py) consumes this exact field name.
+                "original_contexts": meta.get("original_contexts"),
+                "mean_token_logprob": mean_token_logprob,
+                "sum_token_logprob": sum_token_logprob,
                 "served_from_cache": meta.get("served_from_cache"),
                 "evidence_version": meta.get("evidence_version"),
                 "grounding_score": _quality_row.get("grounding_score"),
@@ -1471,11 +1604,23 @@ def run_experiment(
                     # compression / metric-eval / OOM) must not abort the whole baseline.
                     try:
                         meta = prepare_example(example)
-                        prompt = format_multi_turn_prompt(
-                            meta["question"],
-                            meta["used_contexts"],
-                            history=history,
-                        )
+                        messages = None
+                        if _prompt_mode == "chat":
+                            # Decision 1B: chat-template serving; system carries the
+                            # task+abstention instruction, history becomes proper
+                            # alternating turns, current context+question last.
+                            messages = format_multi_turn_messages(
+                                meta["question"],
+                                meta["used_contexts"],
+                                history=history,
+                            )
+                            prompt = messages_to_fallback_prompt(messages)
+                        else:
+                            prompt = format_multi_turn_prompt(
+                                meta["question"],
+                                meta["used_contexts"],
+                                history=history,
+                            )
                         request = InferenceRequest(
                             prompt=prompt,
                             max_tokens=max_tokens,
@@ -1485,10 +1630,16 @@ def run_experiment(
                             truncate_prompt_tokens=truncate_prompt_tokens,
                             stop=["\n"],
                         )
+                        if messages is not None:
+                            # Plain attribute consumed by VLLMAdapter -> /v1/chat/completions.
+                            request.messages = messages
                         stream_flag = backend in {"vllm", "ollama"}
+                        # B5: settle immediately before the TIMED request only.
+                        settle_ms = settle_before_request() if collect_results else 0.0
                         response = engine.generate(request, stream=stream_flag)
                         if collect_results:
-                            record_result(example, meta, response, batch_id=batch_id, turn_index=turn_idx)
+                            record_result(example, meta, response, batch_id=batch_id,
+                                          turn_index=turn_idx, settle_ms=settle_ms)
                         elif response.error:
                             print(f"[warmup] Request {example.id} failed: {response.error}")
                         history.append((meta["question"], response.generated_text or ""))
@@ -1508,7 +1659,15 @@ def run_experiment(
                     # compression) skips just this example instead of aborting the baseline.
                     try:
                         meta = prepare_example(example)
-                        prompt = format_qa_prompt(meta["question"], meta["used_contexts"])
+                        messages = None
+                        if _prompt_mode == "chat":
+                            # Decision 1B: chat-template serving; context first,
+                            # question last inside the user message (prefix sharing
+                            # preserved), abstention instruction in the system message.
+                            messages = format_qa_messages(meta["question"], meta["used_contexts"])
+                            prompt = messages_to_fallback_prompt(messages)
+                        else:
+                            prompt = format_qa_prompt(meta["question"], meta["used_contexts"])
                         request = InferenceRequest(
                             prompt=prompt,
                             max_tokens=max_tokens,
@@ -1518,6 +1677,9 @@ def run_experiment(
                             truncate_prompt_tokens=truncate_prompt_tokens,
                             stop=["\n"],
                         )
+                        if messages is not None:
+                            # Plain attribute consumed by VLLMAdapter -> /v1/chat/completions.
+                            request.messages = messages
                     except Exception as _ex:
                         print(f"[{stage_name}] prepare failed for {example.id}: {_ex}; skipping")
                         continue
@@ -1528,6 +1690,10 @@ def run_experiment(
                 if not requests:
                     continue  # whole unit failed to prepare; nothing to send
 
+                # B5: settle immediately before the TIMED request/batch only. For a
+                # batched unit the single settle precedes the batch send; each of the
+                # unit's rows records the same measured value.
+                settle_ms = settle_before_request() if collect_results else 0.0
                 if len(requests) == 1:
                     stream_flag = backend in {"vllm", "ollama"}
                     responses = [engine.generate(requests[0], stream=stream_flag)]
@@ -1539,7 +1705,8 @@ def run_experiment(
                     # row, not the whole baseline's already-collected results.
                     try:
                         if collect_results:
-                            record_result(example, meta, response, batch_id=batch_id, turn_index=0)
+                            record_result(example, meta, response, batch_id=batch_id,
+                                          turn_index=0, settle_ms=settle_ms)
                         elif response.error:
                             print(f"[warmup] Request {example.id} failed: {response.error}")
                     except Exception as _ex:
@@ -1631,6 +1798,16 @@ def run_experiment(
             # sampler falls back to the stdlib /metrics scraper for spec-decode acceptance).
             if vllm_sampler is not None:
                 vllm_telemetry_snapshot = vllm_sampler.aggregate()
+                # Full per-tick time series next to vllm_telemetry.json: the aggregate
+                # collapses trajectories (eviction onset, KV shrink) that the
+                # memory-pressure sweep reads offline.
+                try:
+                    os.makedirs(output_dir, exist_ok=True)
+                    _series_path = os.path.join(output_dir, "telemetry_series.jsonl")
+                    if vllm_sampler.save_series(_series_path):
+                        print(f"[telemetry] series saved -> {_series_path}")
+                except Exception as _series_exc:
+                    print(f"[telemetry] series save failed: {_series_exc}")
             # If cage-stats is present, enrich with a one-shot snapshot + print the dashboard.
             if available():
                 if vllm_telemetry_snapshot is None:
@@ -2002,6 +2179,12 @@ def run_experiment(
             "context_source": context_source,
             "backend": backend,
             "api_base": api_base,
+            # Pre-run package provenance (2026-07-16): chat-template serving mode
+            # (Decision 1B; "raw" = legacy escape hatch), B5 settle window, and the
+            # Decision 3B distractor-corpus knob as resolved for this run.
+            "prompt_mode": _prompt_mode,
+            "request_settle_ms": _settle_ms_cfg,
+            "distractor_docs": int(os.getenv("CAGE_DISTRACTOR_DOCS", "1000") or "0"),
         },
         "workload": {
             "repeat_queries": repeat_queries,

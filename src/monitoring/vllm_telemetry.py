@@ -105,7 +105,17 @@ class VllmTelemetrySampler:
     _GAUGES = ("gen_tps", "prompt_tps", "req_rate", "running", "waiting",
                "kv_usage", "kv_used_tokens", "tokens_per_iter", "preempt_rate",
                "session_gen_tokens", "session_prompt_tokens", "session_requests")
-    _COUNTERS = ("cached_tokens_total", "recomputed_tokens_total")
+    # Phase-time SUM/COUNT pairs (vllm:request_{prefill,decode,inference,queue}_
+    # time_seconds) and the raw preemption counter are MONOTONIC cumulative values:
+    # "final value" aggregation keeps them diff-able, so the memory-pressure sweep can
+    # compute per-trial phase-time deltas (prefill growth under prefix-cache eviction)
+    # downstream from consecutive trials or from telemetry_series.jsonl.
+    _COUNTERS = ("cached_tokens_total", "recomputed_tokens_total",
+                 "prefill_time_sum", "prefill_time_count",
+                 "decode_time_sum", "decode_time_count",
+                 "inference_time_sum", "inference_time_count",
+                 "queue_time_sum", "queue_time_count",
+                 "preemptions_total")
     # Speculative-decode acceptance reaches us under TWO schemas depending on the path:
     # the cage-stats in-process/CLI path emits FLAT keys (spec_active/spec_acceptance/
     # spec_accepted_per_draft); the dependency-free stdlib fallback emits a nested
@@ -124,8 +134,32 @@ class VllmTelemetrySampler:
         self.interval = max(0.25, float(interval))
         self.metrics_path = metrics_path
         self._samples: list = []
+        self._sample_ts: list = []  # wall-clock capture time, parallel to _samples
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._nvml_handle = None
+        self._nvml_failed = False
+
+    def _read_energy_mj(self) -> Optional[float]:
+        """Cumulative GPU energy (millijoules) via NVML, or None when unavailable.
+
+        Reads ``pynvml.nvmlDeviceGetTotalEnergyConsumption`` (mJ since driver load)
+        once per sampler tick so ``aggregate()`` can emit ``energy_delta_mj`` and
+        J/token = delta / 1000 / tokens is computable offline. ImportError (pynvml
+        absent) or NVMLError (e.g. NotSupported on this GPU/driver) permanently
+        disables the probe for this sampler -> None, never a fabricated number.
+        """
+        if self._nvml_failed:
+            return None
+        try:
+            import pynvml
+            if self._nvml_handle is None:
+                pynvml.nvmlInit()
+                self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            return float(pynvml.nvmlDeviceGetTotalEnergyConsumption(self._nvml_handle))
+        except Exception:
+            self._nvml_failed = True
+            return None
 
     def start(self) -> "VllmTelemetrySampler":
         if self._thread is not None:
@@ -141,7 +175,10 @@ class VllmTelemetrySampler:
             try:
                 snap = capture_snapshot(self.url, metrics_path=self.metrics_path)
                 if snap:
+                    # Once per tick: cumulative NVML energy (mJ), None if unsupported.
+                    snap["energy_mj"] = self._read_energy_mj()
                     self._samples.append(snap)
+                    self._sample_ts.append(t0)
             except Exception:
                 pass
             dt = self.interval - (time.time() - t0)
@@ -155,11 +192,34 @@ class VllmTelemetrySampler:
             self._thread = None
         return self
 
+    def save_series(self, path: str) -> Optional[str]:
+        """Persist EVERY raw per-tick sample as timestamped JSONL; return path or None.
+
+        ``aggregate()`` collapses the time dimension into peak/mean/final scalars,
+        which is exactly the wrong shape for the memory-pressure sweep: eviction
+        onset, KV-capacity shrink, and prefill-time growth are trajectories. One
+        JSON object per line, ``{"ts": <epoch seconds>, ...full snapshot dict...}``,
+        written next to vllm_telemetry.json by run_experiment as
+        telemetry_series.jsonl. Returns None (writes nothing) when no samples exist,
+        so an empty run never leaves a misleading empty artifact.
+        """
+        pairs = [(ts, s) for ts, s in zip(self._sample_ts, self._samples)
+                 if isinstance(s, dict)]
+        if not pairs:
+            return None
+        with open(path, "w") as fh:
+            for ts, snap in pairs:
+                rec = {"ts": round(ts, 3)}
+                rec.update(snap)
+                fh.write(json.dumps(rec, default=str) + "\n")
+        return path
+
     def aggregate(self) -> Optional[dict]:
         samples = [s for s in self._samples if isinstance(s, dict)]
         if not samples:
             return None
-        agg: dict = {"sampled": True, "num_samples": len(samples)}
+        agg: dict = {"sampled": True, "num_samples": len(samples),
+                     "series_len": len(samples)}
         for k in self._GAUGES:
             vals = [s.get(k) for s in samples if isinstance(s.get(k), (int, float))]
             if vals:
@@ -169,6 +229,13 @@ class VllmTelemetrySampler:
             vals = [s.get(k) for s in samples if isinstance(s.get(k), (int, float))]
             if vals:
                 agg[k] = max(vals)  # monotonic counters: final value
+        # NVML energy: last-first of the cumulative mJ counter across the workload,
+        # so J/token = energy_delta_mj / 1000 / tokens is computable offline. Absent
+        # (pynvml missing / unsupported GPU) -> no key, never a fabricated zero.
+        energies = [s.get("energy_mj") for s in samples
+                    if isinstance(s.get("energy_mj"), (int, float))]
+        if len(energies) >= 2:
+            agg["energy_delta_mj"] = round(energies[-1] - energies[0], 3)
         last = samples[-1]
         for k in self._LAST:
             if last.get(k) is not None:

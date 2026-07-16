@@ -97,6 +97,40 @@ def is_no_answer_prediction(text: Optional[str]) -> bool:
     return False
 
 
+# --------------------------------------------------------------------------- #
+# Answer sanitizer (B4 scoring side, 2026-07-16 pre-run package)
+# --------------------------------------------------------------------------- #
+# Few-shot / QA-formatted prompts make models emit a scaffold prefix ("A: Paris",
+# "Answer: Paris") and, on runaway generations, a fabricated continuation of the prompt
+# template ("...\nQuestion 2: ..." / "Context: ..."). Both are prompt-format artifacts,
+# not answer content: the prefix deflates EM/token-F1 against short gold spans, and the
+# fabricated continuation is un-grounded text that LettuceDetect/NLI correctly flag --
+# penalizing the SERVING arm for a PROMPT artifact. Scoring therefore runs on the
+# sanitized text; the raw generation is never overwritten (stored separately as
+# generated_answer, with sanitized_answer alongside).
+_ANSWER_SCAFFOLD_PREFIX_RE = re.compile(r"^\s*(A|Answer)\s*[:.]\s*")
+_FABRICATED_CONTINUATION_RE = re.compile(r"\n?\s*(Context|Question)\s*\d*\s*:")
+
+
+def sanitize_answer(text: Optional[str]) -> str:
+    """Strip a leading answer-scaffold token and truncate fabricated continuations.
+
+    1. Removes ONE leading scaffold token ('A:', 'Answer:', 'A.', 'Answer.').
+    2. Truncates at the first fabricated prompt-template continuation
+       ('Context:', 'Question 2:', ...), which is model runaway, not answer text.
+
+    Never applied destructively: callers keep the raw generation and store this result
+    as ``sanitized_answer`` alongside it. ALL quality scoring (grounding, NLI,
+    completeness, F1/EM, abstention detection) runs on the sanitized text.
+    """
+    t = text or ""
+    t = _ANSWER_SCAFFOLD_PREFIX_RE.sub("", t, count=1)
+    m = _FABRICATED_CONTINUATION_RE.search(t)
+    if m:
+        t = t[: m.start()]
+    return t.strip()
+
+
 @dataclass
 class CacheRelevanceMetrics:
     """Cache relevance evaluation results."""
@@ -149,6 +183,13 @@ class QualityMetrics:
     hallucinated_span_ratio: Optional[float] = None  # 0-1, fraction of answer characters flagged unsupported
     supported_claim_ratio: Optional[float] = None  # 0-1, fraction of claims with entailment >= 0.5
     faithfulness_method: str = "nli_claim_max"  # provenance of the faithfulness number
+    # B2 (2026-07-16 audit): 'direct' = every context doc fit the NLI premise budget as-is;
+    # 'windowed' = at least one doc was split into sentence-aligned <=400-token windows and
+    # scored max-over-windows. None when faithfulness was not scored (abstention/unavailable).
+    faithfulness_premise_mode: Optional[str] = None
+    # B4: the scaffold-stripped / continuation-truncated text ALL quality scoring ran on.
+    # generated_answer (the raw text) is never overwritten; this column sits alongside it.
+    sanitized_answer: Optional[str] = None
     # Evidence-only, NOT a metric: raw LettuceDetect answer spans flagged unsupported, for the
     # per-query qa_evidence.jsonl. Deliberately EXCLUDED from to_dict() so it never becomes a
     # CSV column or enters metric aggregation. None when the detector is unavailable.
@@ -179,6 +220,8 @@ class QualityMetrics:
             "hallucinated_span_ratio": self.hallucinated_span_ratio,
             "supported_claim_ratio": self.supported_claim_ratio,
             "faithfulness_method": self.faithfulness_method,
+            "faithfulness_premise_mode": self.faithfulness_premise_mode,
+            "sanitized_answer": self.sanitized_answer,
         }
         if self.hallucination_detected is not None:
             # Stored as 0/1 so it aggregates to a hallucination RATE across a run.
@@ -509,17 +552,111 @@ class QualityEvaluator:
             print(f"Error in NLI entailment: {e}")
             return None
 
+    # B2 (2026-07-16 audit): premise budget for a single NLI window, in NLI-tokenizer
+    # (DeBERTa) tokens. Any context doc longer than this is split into sentence-aligned
+    # windows of <= this many tokens with ~50% overlap; entailment is the MAX over
+    # windows (and, as before, over docs). Kept below nli_max_length=512 so the
+    # premise+hypothesis pair never hits pipeline truncation.
+    NLI_PREMISE_WINDOW_TOKENS = 400
+
+    def _nli_tokenizer(self):
+        """The loaded NLI pipeline's tokenizer, or None if unavailable."""
+        try:
+            return getattr(self.nli_model, "tokenizer", None)
+        except Exception:
+            return None
+
+    def _split_premise_windows(self, doc: str) -> List[str]:
+        """Split one context doc into sentence-aligned NLI premise windows.
+
+        B2 fix (2026-07-16 audit): cag_true concatenates its corpus into a ~2.8k-token
+        block; passed whole as the NLI premise it is TRUNCATED to the first
+        ``nli_max_length`` tokens, so evidence past the truncation horizon can never
+        entail a claim -- faithfulness collapsed to 0.107 even for in-window evidence.
+        The premise must be shortened (paragraph-sized windows, max over windows), not
+        the model window enlarged.
+
+        Windows are <= NLI_PREMISE_WINDOW_TOKENS DeBERTa tokens with ~50% overlap
+        (consecutive windows share roughly half their token mass so no evidence
+        straddles a boundary unseen). Each sentence is tokenized ONCE; counts are
+        reused when building every window. Docs that already fit are returned whole
+        (premise_mode 'direct').
+        """
+        text = (doc or "").strip()
+        if not text:
+            return []
+        sentences = self._split_claims(text)
+        tokenizer = self._nli_tokenizer()
+        counts: List[int]
+        if tokenizer is not None:
+            try:
+                # ONE tokenizer call for the whole doc's sentences (tokenize once).
+                enc = tokenizer(list(sentences), add_special_tokens=False)
+                counts = [len(ids) for ids in enc["input_ids"]]
+            except Exception:
+                counts = [len(s.split()) for s in sentences]
+        else:
+            # No tokenizer available: whitespace count is a conservative proxy
+            # (DeBERTa subword count >= word count, so windows only get smaller
+            # when the real tokenizer is present).
+            counts = [len(s.split()) for s in sentences]
+
+        max_tokens = self.NLI_PREMISE_WINDOW_TOKENS
+        if sum(counts) <= max_tokens or len(sentences) == 1:
+            return [text]
+
+        windows: List[str] = []
+        start = 0
+        n = len(sentences)
+        while start < n:
+            end = start
+            tok_sum = 0
+            # Always include at least one sentence so an oversized single sentence
+            # still forms a window (pipeline truncation then caps it safely).
+            while end < n and (end == start or tok_sum + counts[end] <= max_tokens):
+                tok_sum += counts[end]
+                end += 1
+            windows.append(" ".join(sentences[start:end]))
+            if end >= n:
+                break
+            # ~50% overlap: advance the start until at least half of THIS window's
+            # token mass has been dropped, always by >=1 sentence (progress guarantee).
+            dropped = 0
+            new_start = start
+            while new_start < end - 1 and dropped < tok_sum / 2:
+                dropped += counts[new_start]
+                new_start += 1
+            start = max(new_start, start + 1)
+        return windows
+
+    def _build_premises(self, contexts: List[str]) -> tuple[List[str], bool]:
+        """Expand context docs into NLI premises. Returns (premises, any_windowed)."""
+        premises: List[str] = []
+        windowed = False
+        for ctx in contexts:
+            wins = self._split_premise_windows(str(ctx))
+            if len(wins) > 1:
+                windowed = True
+            premises.extend(wins)
+        return premises, windowed
+
     def evaluate_faithfulness(
         self, generated_text: str, context: List[str]
-    ) -> Dict[str, Optional[float]]:
-        """Claim-level NLI faithfulness.
+    ) -> Dict[str, Any]:
+        """Claim-level NLI faithfulness with paragraph-sized premises (B2).
 
-        The answer is split into claims; each claim's entailment probability is the
-        MAX over context documents (faithful if supported by ANY context), then
-        averaged over claims. Returns ``{"faithfulness": <0-1 or None>,
-        "supported_claim_ratio": <0-1 or None>}``. ``None`` means NLI unavailable.
+        The answer is split into claims. Each context doc longer than
+        NLI_PREMISE_WINDOW_TOKENS DeBERTa tokens is split into sentence-aligned
+        ~50%-overlap windows (see _split_premise_windows); each claim's entailment
+        probability is the MAX over windows AND over docs (faithful if supported by
+        ANY provided premise -- consistent with the existing max-over-docs rule),
+        then averaged over claims. Returns ``{"faithfulness": <0-1 or None>,
+        "supported_claim_ratio": <0-1 or None>, "premise_mode":
+        'direct'|'windowed'|None}``. ``None`` means NLI unavailable.
         """
-        empty = {"faithfulness": None, "supported_claim_ratio": None}
+        empty: Dict[str, Any] = {
+            "faithfulness": None, "supported_claim_ratio": None, "premise_mode": None,
+        }
         if not self.use_nli or not self.nli_model:
             return empty
         nonempty_ctx = [c for c in (context or []) if c and str(c).strip()]
@@ -528,12 +665,15 @@ class QualityEvaluator:
             return empty
 
         try:
+            premises, windowed = self._build_premises(nonempty_ctx)
+            if not premises:
+                return empty
             claim_scores: List[float] = []
             for claim in claims:
                 best = 0.0
                 have_score = False
-                for ctx in nonempty_ctx:
-                    p = self._nli_entailment_prob(str(ctx), claim)
+                for premise in premises:
+                    p = self._nli_entailment_prob(premise, claim)
                     if p is not None:
                         best = max(best, p)
                         have_score = True
@@ -543,7 +683,11 @@ class QualityEvaluator:
                 return empty
             faithfulness = float(np.mean(claim_scores))
             supported = float(np.mean([1.0 if s >= 0.5 else 0.0 for s in claim_scores]))
-            return {"faithfulness": faithfulness, "supported_claim_ratio": supported}
+            return {
+                "faithfulness": faithfulness,
+                "supported_claim_ratio": supported,
+                "premise_mode": "windowed" if windowed else "direct",
+            }
         except Exception as e:
             print(f"Error in faithfulness evaluation: {e}")
             return empty
@@ -880,7 +1024,14 @@ class QualityEvaluator:
         Returns:
             QualityMetrics with all scores
         """
-        f1_metrics = self.evaluate_f1_score(generated_text, reference_answer, all_answers)
+        # B4 sanitizer (2026-07-16 pre-run package): ALL quality scoring -- F1/EM,
+        # abstention detection, grounding, NLI, completeness -- runs on the sanitized
+        # text (scaffold prefix stripped, fabricated prompt-continuation truncated).
+        # The raw generation is NEVER overwritten: callers keep generated_answer and
+        # this result carries sanitized_answer alongside. NOTE: hallucinated_spans
+        # char offsets refer to the SANITIZED text.
+        sanitized_text = sanitize_answer(generated_text)
+        f1_metrics = self.evaluate_f1_score(sanitized_text, reference_answer, all_answers)
         relevance = self.evaluate_relevance(question, context)
 
         # Abstention-aware grounding/faithfulness (2026-07-15 audit): an abstention like
@@ -892,8 +1043,10 @@ class QualityEvaluator:
         # (no_answer_correct / abstention_precision). Completeness (reference similarity)
         # is equally meaningless for an abstention phrase. Relevance is question<->context
         # only, so it stays.
-        if is_no_answer_prediction(generated_text):
-            faith = {"faithfulness": None, "supported_claim_ratio": None}
+        if is_no_answer_prediction(sanitized_text):
+            faith: Dict[str, Any] = {
+                "faithfulness": None, "supported_claim_ratio": None, "premise_mode": None,
+            }
             halluc = {
                 "grounding_score": None,
                 "hallucination_detected": None,
@@ -902,9 +1055,9 @@ class QualityEvaluator:
             }
             completeness = {"bertscore_f1": None, "rouge_l_f1": None}
         else:
-            faith = self.evaluate_faithfulness(generated_text, context)
-            halluc = self.evaluate_hallucination(question, context, generated_text)
-            completeness = self.evaluate_completeness(generated_text, reference_answer)
+            faith = self.evaluate_faithfulness(sanitized_text, context)
+            halluc = self.evaluate_hallucination(question, context, sanitized_text)
+            completeness = self.evaluate_completeness(sanitized_text, reference_answer)
 
         return QualityMetrics(
             faithfulness=faith["faithfulness"],
@@ -925,6 +1078,8 @@ class QualityEvaluator:
             hallucination_detected=halluc["hallucination_detected"],
             hallucinated_span_ratio=halluc["hallucinated_span_ratio"],
             supported_claim_ratio=faith["supported_claim_ratio"],
+            faithfulness_premise_mode=faith.get("premise_mode"),
+            sanitized_answer=sanitized_text,
             hallucinated_spans=halluc.get("hallucinated_spans"),
         )
     

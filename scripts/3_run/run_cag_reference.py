@@ -24,9 +24,17 @@ repo's raw-completion vLLM path (src.utils.prompting.format_qa_prompt):
     "\\n\\nQuestion: {q}\\nAnswer:"                              <- per query
 
 i.e. the corpus block sits exactly where the per-query context blocks go in
-the vLLM arms, and each query appends after the cached prefix. If the
-tokenizer ships a chat template we deliberately DO NOT use it: the vLLM arms
-serve raw completions, so the reference engine must too (a note is printed).
+the vLLM arms, and each query appends after the cached prefix.
+
+Prompt mode (Decision 1B, 2026-07-16): by DEFAULT the runner now serves via
+the tokenizer's CHAT TEMPLATE (tokenizer.apply_chat_template with
+enable_thinking=False -- Qwen3 thinking off), rendering the SAME message
+layout as the vLLM chat arms (src.utils.prompting.format_qa_messages: system
+= task + abstention instruction; user = corpus block first, question last).
+The cacheable prefix is the rendered template up to the corpus/question
+boundary; each query appends its templated suffix after the cached KV.
+CAGE_PROMPT_MODE=raw is the escape hatch that reproduces the legacy raw
+layout above byte-for-byte.
 
 Uniform query manifest (--query-manifest / CAGE_QUERY_MANIFEST): when set, the
 measured query set comes from ONE pre-drawn, auditable artifact
@@ -70,7 +78,11 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from src.data.corpus import CorpusBlock, build_corpus_block  # noqa: E402  (dependency-free)
 from src.data.manifest import ManifestError, select_examples  # noqa: E402  (pure stdlib)
-from src.utils.prompting import DEFAULT_SYSTEM_PREFIX  # noqa: E402  (pure)
+from src.utils.prompting import (  # noqa: E402  (pure)
+    DEFAULT_SYSTEM_PREFIX,
+    format_qa_messages,
+    prompt_mode,
+)
 
 BASELINE = "cag_reference"
 ENGINE = "hf_reference"
@@ -119,6 +131,56 @@ def build_corpus_prompt(block_text: str) -> str:
     comparable with the vLLM raw-completion arms.
     """
     return DEFAULT_SYSTEM_PREFIX.rstrip() + "\n" + block_text
+
+
+# --------------------------------------------------------------------------
+# Chat-template seams (Decision 1B) -- pure logic, torch-free
+# --------------------------------------------------------------------------
+
+def chat_messages_for_block(block_text: str, question: str) -> List[Dict[str, str]]:
+    """Chat messages for one corpus-block query.
+
+    Delegates to src.utils.prompting.format_qa_messages with the corpus block
+    as the single context doc, so the reference engine renders EXACTLY the
+    same message content the vLLM chat arms serve (system = task + abstention
+    instruction; user = "Context 1: <block>\\n\\nQuestion: <q>").
+    """
+    return format_qa_messages(question, [block_text])
+
+
+def compute_chat_prefix(render_full) -> str:
+    """The cacheable shared prefix of the chat-templated corpus prompt.
+
+    ``render_full(question) -> str`` renders the FULL templated prompt for a
+    question (tokenizer.apply_chat_template, add_generation_prompt=True).
+    Probing with two sentinel questions and trimming the common prefix back to
+    just before the "\\n\\nQuestion:" marker yields everything the template
+    renders up to and including the corpus block -- the exact same
+    corpus/question boundary the raw path caches at. Template-agnostic.
+    """
+    common = os.path.commonprefix([render_full("A?"), render_full("B?")])
+    cut = common.rfind("\n\nQuestion:")
+    if cut == -1:
+        raise ValueError(
+            "chat template did not preserve the corpus-block/question layout; "
+            "cannot derive a cacheable corpus prefix (use CAGE_PROMPT_MODE=raw)"
+        )
+    return common[:cut]
+
+
+def chat_query_suffix(full_prompt: str, corpus_prefix: str) -> str:
+    """Per-query text appended after the cached chat-mode corpus prefix.
+
+    Includes the question, the user-turn close, and the generation header the
+    template emits (for Qwen3 with enable_thinking=False that header carries
+    the empty <think> block -- prompt tokens, never generated ones).
+    """
+    if not full_prompt.startswith(corpus_prefix):
+        raise ValueError(
+            "templated prompt does not share the computed corpus prefix; "
+            "chat-template rendering is not prefix-stable for this block"
+        )
+    return full_prompt[len(corpus_prefix):]
 
 
 def default_dataset_split(dataset_name: str) -> str:
@@ -314,6 +376,7 @@ def run_trial(
     trial: int,
     trial_dir: Path,
     max_new_tokens: int,
+    serving_prompt_mode: str = "raw",
 ) -> dict:
     """One trial: per corpus block, prefill its KV once, answer the block's
     queries (crop after each), release the cache, move to the next block.
@@ -335,10 +398,29 @@ def run_trial(
     block_records: List[dict] = []
 
     for block in blocks:
-        corpus_prompt = build_corpus_prompt(block.text)
-        # Corpus tokenized exactly as served: default special-token handling for
-        # the sequence start; query suffixes are appended with add_special_tokens=False.
-        enc = tok(corpus_prompt, return_tensors="pt").to(model.device)
+        if serving_prompt_mode == "chat":
+            # Decision 1B: SAME chat-template layout as the vLLM chat arms, rendered
+            # through tokenizer.apply_chat_template with enable_thinking=False (the
+            # template kwarg Qwen3 reads; other templates ignore the unused variable).
+            # The cacheable prefix is everything up to the corpus/question boundary.
+            def _render_full(question: str, _text: str = block.text) -> str:
+                return tok.apply_chat_template(
+                    chat_messages_for_block(_text, question),
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+
+            corpus_prompt = compute_chat_prefix(_render_full)
+            # The rendered template already CONTAINS the special tokens as text
+            # (<|im_start|> etc.), so nothing extra may be prepended.
+            enc = tok(corpus_prompt, return_tensors="pt",
+                      add_special_tokens=False).to(model.device)
+        else:
+            corpus_prompt = build_corpus_prompt(block.text)
+            # Corpus tokenized exactly as served: default special-token handling for
+            # the sequence start; query suffixes are appended with add_special_tokens=False.
+            enc = tok(corpus_prompt, return_tensors="pt").to(model.device)
 
         cache = DynamicCache()
         _sync()
@@ -353,7 +435,11 @@ def run_trial(
               f"(prefill {corpus_prefill_ms:.1f} ms), {len(block.examples)} queries")
 
         for example in block.examples:
-            q_enc = tok(build_query_suffix(example.question), return_tensors="pt",
+            if serving_prompt_mode == "chat":
+                suffix_text = chat_query_suffix(_render_full(example.question), corpus_prompt)
+            else:
+                suffix_text = build_query_suffix(example.question)
+            q_enc = tok(suffix_text, return_tensors="pt",
                         add_special_tokens=False).to(model.device)
             q_len = int(q_enc.input_ids.shape[1])
             # Attention mask must cover cached corpus + new query tokens.
@@ -412,6 +498,10 @@ def run_trial(
                 "engine": ENGINE,
                 "trial": trial,
                 "corpus_block": block.block_id,
+                # group_id mirrors run_experiment.py's qa_evidence contract field
+                # (the manifest block id); prompt_mode records Decision 1B provenance.
+                "group_id": block.block_id,
+                "prompt_mode": serving_prompt_mode,
                 "question": example.question,
                 "reference_answer": example.answer,
                 "generated_answer": answer,
@@ -522,12 +612,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     model.to(device)
     model.eval()
 
-    if getattr(tok, "chat_template", None):
-        print("NOTE: tokenizer ships a chat template; deliberately NOT used. The vLLM "
-              "arms serve raw completions (src.utils.prompting.format_qa_prompt), so the "
-              "reference engine uses the same raw layout: the corpus prompt (system "
-              "prefix + corpus block) is built EXACTLY once and KV-cached; every query "
-              "appends '\\n\\nQuestion: ...\\nAnswer:' after it.")
+    # Decision 1B: chat-template serving by default, matching the vLLM chat arms
+    # (system = task + abstention instruction, user = corpus block + question,
+    # enable_thinking=False). CAGE_PROMPT_MODE=raw reproduces the legacy raw layout.
+    serving_prompt_mode = prompt_mode()
+    if serving_prompt_mode == "chat":
+        if not getattr(tok, "chat_template", None):
+            print(f"ERROR: CAGE_PROMPT_MODE=chat but {args.model} ships no chat "
+                  "template. Re-run with CAGE_PROMPT_MODE=raw.", file=sys.stderr)
+            return 2
+        print("PROMPT MODE: chat -- tokenizer.apply_chat_template(enable_thinking="
+              "False); the cacheable prefix is the rendered template up to the "
+              "corpus/question boundary, every query appends its templated suffix "
+              "after the cached KV. Same message layout as the vLLM chat arms.")
+    else:
+        print("PROMPT MODE: raw (escape hatch) -- chat template deliberately NOT "
+              "used; legacy layout: the corpus prompt (system prefix + corpus block) "
+              "is built EXACTLY once and KV-cached; every query appends "
+              "'\\n\\nQuestion: ...\\nAnswer:' after it.")
 
     # Budget under the REAL served tokenizer: corpus tokenized exactly as served.
     def count_tokens(text: str) -> int:
@@ -579,6 +681,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             trial=trial,
             trial_dir=output_dir / f"trial_{trial}",
             max_new_tokens=args.max_new_tokens,
+            serving_prompt_mode=serving_prompt_mode,
         ))
 
     (output_dir / "run_config.json").write_text(
@@ -596,6 +699,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "max_new_tokens": args.max_new_tokens,
                 "device": device,
                 "dtype": args.dtype,
+                "prompt_mode": serving_prompt_mode,
                 "query_manifest": manifest_path,
                 "manifest_stats": (manifest or {}).get("stats"),
                 "trials": trial_summaries,

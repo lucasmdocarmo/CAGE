@@ -7,7 +7,11 @@ from __future__ import annotations
 
 import pytest
 
-from src.evaluation.quality import QualityEvaluator, is_no_answer_prediction
+from src.evaluation.quality import (
+    QualityEvaluator,
+    is_no_answer_prediction,
+    sanitize_answer,
+)
 
 
 def _f1(generated: str, reference: str, all_answers: list | None = None) -> dict:
@@ -172,3 +176,76 @@ def test_all_answers_abstention_on_answerable_stays_zero() -> None:
     assert r["f1"] == 0.0 and r["exact_match"] == 0.0
     assert r["predicted_no_answer"] == 1.0
     assert r["abstention_precision"] == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Answer sanitizer (B4 scoring side, 2026-07-16 pre-run package): scaffold prefix
+# strip + fabricated prompt-continuation truncation. Scoring runs on the sanitized
+# text; generated_answer is never overwritten.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("A: Paris", "Paris"),
+        ("Answer: Paris", "Paris"),
+        ("  A:   Paris", "Paris"),
+        ("Answer. Paris", "Paris"),
+        # fabricated continuation truncation (with and without a newline, numbered or not)
+        ("Paris\nQuestion 2: Where is the Louvre?", "Paris"),
+        ("Paris\nContext: The Eiffel Tower is in Paris.", "Paris"),
+        ("Paris Context 3: more fabricated prompt", "Paris"),
+        # combined scaffold + fabrication
+        ("A: Paris\nQuestion: next one", "Paris"),
+        # untouched answers
+        ("Paris", "Paris"),
+        ("The Eiffel Tower is located in Paris.", "The Eiffel Tower is located in Paris."),
+        # 'Answers:' is NOT the scaffold token (requires A/Answer then [:.])
+        ("Answers: Paris", "Answers: Paris"),
+        ("", ""),
+        (None, ""),
+    ],
+)
+def test_sanitize_answer(raw, expected) -> None:
+    assert sanitize_answer(raw) == expected
+
+
+def _model_free_evaluator() -> QualityEvaluator:
+    # Every model stack OFF: evaluate() exercises the sanitizer + model-free scoring
+    # only (relevance/faithfulness/grounding/completeness come back None).
+    return QualityEvaluator(
+        use_nli=False, use_embeddings=False, use_bertscore=False,
+        use_rouge=False, use_lettucedetect=False,
+    )
+
+
+def test_evaluate_scores_on_sanitized_text() -> None:
+    m = _model_free_evaluator().evaluate(
+        question="What is the capital of France?",
+        context=["France's capital is Paris."],
+        generated_text="A: Paris\nQuestion 2: What is the capital of Spain?",
+        reference_answer="Paris",
+    )
+    # Scaffold+fabrication removed BEFORE F1/EM: exact match on the gold span.
+    assert m.exact_match == 1.0 and m.f1_score == 1.0
+    assert m.sanitized_answer == "Paris"
+
+
+def test_evaluate_abstention_detected_on_sanitized_text() -> None:
+    # 'A: I don't know.' must be credited as a correct abstention on a no-answer item.
+    m = _model_free_evaluator().evaluate(
+        question="q", context=["ctx"],
+        generated_text="A: I don't know.", reference_answer="",
+    )
+    assert m.predicted_no_answer == 1.0
+    assert m.exact_match == 1.0 and m.f1_score == 1.0
+    assert m.no_answer_correct == 1.0
+
+
+def test_sanitized_answer_and_premise_mode_in_to_dict() -> None:
+    d = _model_free_evaluator().evaluate(
+        question="q", context=["ctx"],
+        generated_text="Answer: Paris", reference_answer="Paris",
+    ).to_dict()
+    assert d["sanitized_answer"] == "Paris"          # alongside, never overwriting
+    assert "faithfulness_premise_mode" in d          # B2 column always present
+    assert d["faithfulness_premise_mode"] is None    # NLI off -> not scored
