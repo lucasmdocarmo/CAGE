@@ -79,11 +79,27 @@ class VLLMAdapter(InferenceEngine):
         if isinstance(details, dict):
             cached_prompt_tokens = details.get("cached_tokens")
 
-        return (
-            int(prompt_tokens) if isinstance(prompt_tokens, (int, float)) else None,
+        prompt_tokens_out = (
+            int(prompt_tokens) if isinstance(prompt_tokens, (int, float)) else None
+        )
+        cached_out = (
             int(cached_prompt_tokens)
             if isinstance(cached_prompt_tokens, (int, float))
-            else None,
+            else None
+        )
+        # Audit 2026-07-16 M6 (cached-zero-recorded-as-missing): vLLM 0.11.0 OMITS
+        # usage.prompt_tokens_details whenever num_cached_tokens is falsy (cold request),
+        # even with --enable-prompt-tokens-details. Recording those rows as None made every
+        # cached_prompt_tokens/cached_prompt_ratio statistic silently conditional-on-hit
+        # and left no_cache-family arms with no cache telemetry at all. When the usage
+        # object itself is present (prompt_tokens parsed), an absent details block means
+        # cached == 0, not missing. None is kept only when usage is missing entirely.
+        if cached_out is None and prompt_tokens_out is not None:
+            cached_out = 0
+
+        return (
+            prompt_tokens_out,
+            cached_out,
             int(completion_tokens) if isinstance(completion_tokens, (int, float)) else None,
         )
 

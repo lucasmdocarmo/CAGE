@@ -37,7 +37,9 @@ rm -rf "$ALL_Q" "$ALL_M"; mkdir -p "$ALL_Q" "$ALL_M"
 # MiMo arms (labels contain 'mimo') go to ALL_M; everything else (Qwen, the primary) to ALL_Q.
 # Speculative decoding is output-lossless, so a MiMo spec arm's quality equals MiMo's -- it must
 # be tested against the MiMo no_cache, never the Qwen one (that would report a model artifact).
-for d in "$RUN_ROOT"/baselines/*/ "$RUN_ROOT"/compression/*/ "$RUN_ROOT"/speculative/*/; do
+# envelope + kv_store added 2026-07-16 (audit fix M4): they were silently excluded, so the
+# run's cag_true and lmcache deltas carried no significance testing at all.
+for d in "$RUN_ROOT"/baselines/*/ "$RUN_ROOT"/compression/*/ "$RUN_ROOT"/speculative/*/ "$RUN_ROOT"/envelope/*/ "$RUN_ROOT"/kv_store/*/; do
   [ -d "$d" ] || continue
   _b="$(basename "$d")"
   case "$_b" in
@@ -48,20 +50,21 @@ done
 echo "Qwen baselines:"; ls "$ALL_Q" 2>/dev/null | tr '\n' ' '; echo
 echo "MiMo baselines:"; ls "$ALL_M" 2>/dev/null | tr '\n' ' '; echo
 
-# WARNING: deltas-vs-no_cache are confounded when the compared arm ran under a DIFFERENT serving
-# config, on TWO axes:
-#  (1) Serving metrics (ttft_ms, latency_ms, tpot_ms): the core suite runs non-eager / max-len 8192
-#      while the compression and speculative trees run --enforce-eager / max-len 4096, so those
-#      numbers are only comparable WITHIN a tree.
-#  (2) Quality metrics: greedy T=0 does NOT guarantee identical tokens across serving configs.
-#      vLLM prefix caching / eager-vs-compiled / context-length changes can flip near-tie argmaxes
-#      (FP non-associativity) -- empirically ~2/5 smoke queries diverged prefix_cache vs no_cache.
-#      A cross-config quality delta therefore MIXES the mechanism with token divergence; it is NOT a
-#      pure mechanism effect. Report the measured token-divergence rate (exact-match of
-#      generated_answer vs no_cache, per example_id) beside these rows, and read cross-tree quality
-#      as within-tree. Prior wording claimed quality was "identical tokens regardless of serving
-#      config" and was empirically FALSE; corrected here.
-echo "[stats] NOTE: BOTH serving (ttft/latency/tpot) AND quality deltas vs no_cache are confounded across serving configs (eager/context differ by tree; greedy tokens are near-lossless, NOT identical). Interpret cross-tree rows within-tree, with the token-divergence caveat."
+# WARNING (rewritten 2026-07-16, audit S8 -- the old text described a cross-tree
+# eager/max-len split that no longer exists): the serving config is UNIFORM across ALL
+# trees as of 2026-07-15 (Option A, single source of truth scripts/lib/_serving_config.sh:
+# non-eager, max_model_len=4096, gpu_memory_utilization=0.90; verified in the 100x3 run by
+# identical kv_capacity_tokens across baselines and compression cells). Per-arm launch
+# levers (fp8 KV, speculative config, connector) are captured per (re)start under
+# observability/serving_configs/. Remaining caveats when reading deltas vs no_cache:
+#  (1) Greedy T=0 is near-lossless, NOT identical: FP non-associativity (prefix-cache
+#      reuse, CUDA-graph capture, fp8 KV) can flip near-tie argmaxes -- the measured
+#      same-config token-divergence floor is ~11%. Quality deltas near that floor are not
+#      attributable to the mechanism; read them beside token_divergence.json.
+#  (2) Retrieval-context differences: rag/compressed/multiturn/corpus-prefix arms feed
+#      DIFFERENT prompts than no_cache, so their quality deltas mix input effects with the
+#      mechanism (see the input_effect flag in token_divergence.json).
+echo "[stats] NOTE: serving config is uniform across trees (lib/_serving_config.sh, 2026-07-15). Remaining caveats vs no_cache: greedy near-losslessness (~11% same-config divergence floor) + retrieval-context (input-effect) differences -- see token_divergence.json."
 
 # f1_answerable/exact_match_answerable/no_answer_correct are the SQuAD v2 no-answer
 # decomposition (fix #4): answerable-only extraction quality + abstention accuracy. They are
@@ -83,6 +86,19 @@ python3 scripts/4_analysis/statistical_tests.py --results-dir "$ALL_Q" --referen
     --output "$ALL_Q/phase2_stats.json" --latex-out "$ALL_Q/phase2_stats.tex" 2>&1 | tail -50 \
     || echo "STATS_FAILED (qwen)"
 
+# --- cag_true paired mechanism pass (audit fix M4): on vs off, the run's cleanest pair,
+# previously asserted "identical quality" with zero significance testing. Reference = off.
+if [ -d "$RUN_ROOT/envelope/cag_true_on" ] && [ -d "$RUN_ROOT/envelope/cag_true_off" ]; then
+  ALL_CT="$RUN_ROOT/stats/all_results_cagtrue"
+  rm -rf "$ALL_CT"; mkdir -p "$ALL_CT"
+  ln -sfn "$(cd "$RUN_ROOT/envelope/cag_true_on" && pwd)"  "$ALL_CT/cag_true_on"
+  ln -sfn "$(cd "$RUN_ROOT/envelope/cag_true_off" && pwd)" "$ALL_CT/cag_true_off"
+  python3 scripts/4_analysis/statistical_tests.py --results-dir "$ALL_CT" --reference cag_true_off \
+      --metrics $METRICS --latex-label tab:significance-cagtrue \
+      --output "$ALL_CT/cagtrue_stats.json" --latex-out "$ALL_CT/cagtrue_stats.tex" 2>&1 | tail -25 \
+      || echo "STATS_FAILED (cag_true pair)"
+fi
+
 # --- MiMo pass (WITHIN-model reference no_cache_mimo7b) ---
 # Only runs if MiMo was taken through the core suite (so a MiMo no_cache exists). If MiMo was
 # speculative-only, there is no valid within-model reference: skip loudly rather than mis-compare.
@@ -101,18 +117,30 @@ fi
 export CAGE_SPEC_ROOT="$RUN_ROOT/speculative"
 export CAGE_SPEC_OUT="$ALL_Q/spec_acceptance_summary.csv"
 python3 - <<'PY'
-import glob, json, os, csv, statistics
+import glob, json, os, csv, re, statistics
 root = os.environ["CAGE_SPEC_ROOT"]
 rows = []
+
+
+def _trial_key(path):
+    # NUMERIC trial sort (audit 2026-07-16 S10): the old lexicographic path sort breaks
+    # at trial_10+ (trial_10 < trial_2), silently picking the wrong "last" trial.
+    m = re.search(r"trial_(\d+)", path)
+    return (int(m.group(1)) if m else 0, path)
+
+
 for cell in sorted(glob.glob(os.path.join(root, "*"))):
     if not os.path.isdir(cell):
         continue
     name = os.path.basename(cell)
     accs, tpots, method = [], [], None
-    # sorted() -> trial order (trial_1 < trial_2 < ...): acceptance counters are
+    # Numeric trial order (trial_1 < trial_2 < ... < trial_10): acceptance counters are
     # CUMULATIVE-since-server-start (one server serves warmup + all trials of an arm),
     # so the LAST trial's value is the whole-arm acceptance (2026-07-15 review, B2).
-    for tj in sorted(glob.glob(os.path.join(cell, "**", "vllm_telemetry.json"), recursive=True)):
+    # CAVEAT (audit 2026-07-16 S10): cumulative-since-server-start means the figure
+    # INCLUDES warmup-traffic drafts (the post-restart warmup request), not only the
+    # measured queries; snapshot-and-subtract before trial_1 would remove it.
+    for tj in sorted(glob.glob(os.path.join(cell, "**", "vllm_telemetry.json"), recursive=True), key=_trial_key):
         try:
             j = json.load(open(tj))
         except Exception:

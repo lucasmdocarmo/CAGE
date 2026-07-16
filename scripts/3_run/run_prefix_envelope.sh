@@ -124,9 +124,21 @@ for c in "${ON_CELLS[@]}"; do cell_complete "$OUTPUT_DIR/$c" || all_on_complete=
 if [ "$all_on_complete" = "1" ] && [ "${CAGE_FORCE_RERUN:-0}" != "1" ]; then
     for c in "${ON_CELLS[@]}"; do echo "SKIP (complete): $c"; done
 elif server_or_fail "[2/2] server WITH prefix caching"; then
-    # True CAG: corpus KV computed once (first request), reused by every later query and
-    # trial -- deliberately NO cache reset between trials; persistence IS the mechanism.
-    run_cell cag_true_on prefix_cache --corpus-prefix-budget "$CORPUS_BUDGET"
+    # True CAG: corpus KV computed once (first request), reused by every later query.
+    # --reset-cache-between-trials: audit 2026-07-16 M1 -- without it, trial 1 measured a
+    # cold corpus build inside the measured window while trials 2/3 started warm (a
+    # different condition than every comparator, which reset). With the reset, all three
+    # trials measure the SAME cold-build->reuse trajectory; within-trial persistence (the
+    # CAG mechanism) is untouched.
+    # TODO(audit-2026-07-16 M1): additionally issue a DISCARDED corpus-preload request
+    # after each reset so all trials measure the warm-corpus condition instead. The
+    # runner has no such hook today: the corpus block is composed inside
+    # run_experiment.py's run_experiment() (src/data/corpus.build_corpus_block /
+    # manifest blocks), not at the reset site in _run_trials, and --warmup-queries
+    # replays the FULL measured set (cache priming, distorts the cell). Needs a small
+    # runner feature (e.g. --corpus-preload sending one max_tokens=1 request with the
+    # corpus prompt after each reset) -- not half-implemented here.
+    run_cell cag_true_on prefix_cache --corpus-prefix-budget "$CORPUS_BUDGET" --reset-cache-between-trials
     # Shared-document workload: reuse within same-paragraph groups. Reset between trials
     # so each trial measures the same cold->grouped-warm trajectory.
     run_cell prefix_cache_grouped prefix_cache --order-by-context --reset-cache-between-trials

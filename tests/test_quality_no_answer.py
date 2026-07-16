@@ -10,9 +10,9 @@ import pytest
 from src.evaluation.quality import QualityEvaluator, is_no_answer_prediction
 
 
-def _f1(generated: str, reference: str) -> dict:
+def _f1(generated: str, reference: str, all_answers: list | None = None) -> dict:
     # Unbound call: the method uses no ``self`` attributes, so this avoids model init.
-    return QualityEvaluator.evaluate_f1_score(None, generated, reference)
+    return QualityEvaluator.evaluate_f1_score(None, generated, reference, all_answers)
 
 
 # --------------------------------------------------------------------------- #
@@ -131,3 +131,44 @@ def test_abstention_precision_wrong_abstention() -> None:
 def test_abstention_precision_none_when_not_abstained() -> None:
     assert _f1("Paris", "Paris")["abstention_precision"] is None
     assert _f1("Paris", "")["abstention_precision"] is None  # hallucinated, no abstention predicted
+
+
+# --------------------------------------------------------------------------- #
+# Max over ALL gold answers (audit 2026-07-16 M5): official SQuAD v2 takes
+# metric_max_over_ground_truths; only text[0] was scored before, understating
+# answerable F1 ~5pp / EM ~10pp.
+# --------------------------------------------------------------------------- #
+def test_all_answers_max_over_golds() -> None:
+    # reference (text[0]) misses, but a later gold matches exactly -> max wins.
+    r = _f1("Paris", "London", all_answers=["London", "Paris"])
+    assert r["f1"] == 1.0 and r["exact_match"] == 1.0
+    assert r["precision"] == 1.0 and r["recall"] == 1.0  # from the F1-maximizing gold
+    assert r["f1_answerable"] == 1.0 and r["exact_match_answerable"] == 1.0
+
+
+def test_all_answers_em_and_f1_maximized_independently() -> None:
+    # gold 1 gives partial F1 overlap and no EM; gold 2 gives nothing.
+    r = _f1("x", "x y", all_answers=["x y", "z"])
+    assert r["exact_match"] == 0.0
+    assert r["f1"] == pytest.approx(2 * 1.0 * 0.5 / 1.5)
+    assert r["f1_answerable"] == r["f1"]
+
+
+def test_all_answers_none_falls_back_to_single_reference() -> None:
+    # None (older evidence files / non-SQuAD datasets) must behave exactly as before.
+    assert _f1("Paris", "London", all_answers=None) == _f1("Paris", "London")
+
+
+def test_all_answers_empty_list_means_unanswerable() -> None:
+    # Official SQuAD v2 semantics: empty gold list == no-answer item.
+    r = _f1("Don't know.", "", all_answers=[])
+    assert r["is_answerable"] == 0.0
+    assert r["f1"] == 1.0 and r["exact_match"] == 1.0
+    assert r["no_answer_correct"] == 1.0
+
+
+def test_all_answers_abstention_on_answerable_stays_zero() -> None:
+    r = _f1("I don't know.", "Paris", all_answers=["Paris", "the Paris"])
+    assert r["f1"] == 0.0 and r["exact_match"] == 0.0
+    assert r["predicted_no_answer"] == 1.0
+    assert r["abstention_precision"] == 0.0

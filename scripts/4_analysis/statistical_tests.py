@@ -122,16 +122,26 @@ class ComparisonResult:
     n_pairs: int
     median_reference: Optional[float]
     median_baseline: Optional[float]
-    median_diff: Optional[float]        # baseline - reference
-    pct_change: Optional[float]         # signed % change baseline vs reference
+    median_diff: Optional[float]        # MEDIAN OF per-example paired diffs (baseline - reference)
+    # % change OF MEDIANS: (median_baseline - median_reference) / median_reference.
+    # 2026-07-16 audit fix (B1): this was previously median_diff/median_reference -- a hybrid
+    # (paired-shift numerator over a marginal denominator) that matched neither the medians
+    # nor the means quoted beside it (compressed_rag faithfulness: hybrid -34%, medians -80%,
+    # means -48%). Now it is the plain, labelable percent change of medians.
+    pct_change: Optional[float]
     improvement: Optional[bool]         # True if baseline is better than reference
-    effect_size: Optional[float]        # rank-biserial correlation
+    effect_size: Optional[float]        # rank-biserial correlation (zero-diff pairs DROPPED)
     cliffs_delta: Optional[float]
     ci95_low: Optional[float]           # bootstrap CI of mean(baseline-reference)
     ci95_high: Optional[float]
     p_value: Optional[float]
     p_value_holm: Optional[float] = None
     significant: Optional[bool] = None  # at adjusted alpha
+    # 2026-07-16 audit fix (M8): rank-biserial drops zero diffs, so on saturated metrics it
+    # can report a huge effect from a handful of discordant pairs (grounding: 0.5 from 15/289).
+    # n_nonzero makes that visible; cliffs_delta is the citable effect size when n_nonzero is
+    # small relative to n_pairs.
+    n_nonzero: Optional[int] = None
     note: str = ""
 
 
@@ -301,6 +311,10 @@ def compare_pair(
         ex for ex in baseline_pe
         if ex in reference_pe and metric in baseline_pe[ex] and metric in reference_pe[ex]
     ]
+    # Canonical pair order (2026-07-16 audit fix S6): dict insertion order varies with the
+    # --metrics list, and the seeded bootstrap resamples by index -- unsorted pairs made CIs
+    # irreproducible across invocations with the same seed and identical data.
+    shared.sort()
     if len(shared) < 3:
         # Not enough pairs -> try unpaired Mann-Whitney on whatever exists.
         a = np.array([d[metric] for d in baseline_pe.values() if metric in d], dtype=float)
@@ -338,11 +352,12 @@ def compare_pair(
         metric=metric, baseline=baseline_name, reference=reference_name,
         test="wilcoxon", n_pairs=len(shared),
         median_reference=med_r, median_baseline=med_b, median_diff=median_diff,
-        pct_change=(median_diff / med_r * 100.0) if med_r else None,
+        pct_change=((med_b - med_r) / med_r * 100.0) if med_r else None,
         improvement=improvement,
         effect_size=_rank_biserial_paired(diffs),
         cliffs_delta=_cliffs_delta(b_vals, r_vals),
         ci95_low=ci_low, ci95_high=ci_high, p_value=p,
+        n_nonzero=int(np.count_nonzero(diffs)),
     )
 
 
@@ -378,8 +393,25 @@ def run(args: argparse.Namespace) -> int:
             res = compare_pair(metric, b, reference, per_example[b], per_example[reference], args.bootstrap_iters)
             if res is not None:
                 metric_results.append(res)
+        # Audit 2026-07-16 S7: abstention_precision is doubly selected (defined only on
+        # items where BOTH arms abstained), so its paired Wilcoxon routinely runs on
+        # n=6-10 pairs -- structurally incapable of reaching significance (minimum
+        # two-sided p at n=6 is ~0.03 BEFORE the x-comparisons Holm factor). Mark such
+        # rows descriptive (significant=None) and keep their p-values OUT of the Holm
+        # family so they neither pad the results table nor inflate the correction m.
+        holm_pvals: List[Optional[float]] = []
+        for r in metric_results:
+            if (
+                metric == "abstention_precision"
+                and r.test == "wilcoxon"
+                and r.n_pairs < 20
+            ):
+                r.note = "underpowered (n<20); descriptive only"
+                holm_pvals.append(None)
+            else:
+                holm_pvals.append(r.p_value)
         # Holm-Bonferroni within each metric across the baseline comparisons.
-        adj, sig = _holm_bonferroni([r.p_value for r in metric_results], alpha=args.alpha)
+        adj, sig = _holm_bonferroni(holm_pvals, alpha=args.alpha)
         for r, a, s in zip(metric_results, adj, sig):
             r.p_value_holm = a
             r.significant = s
@@ -440,7 +472,8 @@ def _to_latex(results: List[ComparisonResult], reference: str,
         # two literal braces (unbalanced -> "Too many }'s") and the reference must be
         # underscore-escaped or "no_cache" kills the compile ("Missing $ inserted").
         f"\\caption{{Per-query significance vs. \\texttt{{{_latex_escape(reference)}}} "
-        f"(Wilcoxon signed-rank, Holm-corrected). $\\Delta$ is median baseline$-$reference.}}",
+        f"(Wilcoxon signed-rank, Holm-corrected). $\\Delta$ = median of per-example paired "
+        f"differences (baseline$-$reference); \\% chg = percent change of medians.}}",
         # Parameterized so the Qwen and MiMo tables can both be \input without a
         # duplicate-\label clash.
         f"\\label{{{label}}}",

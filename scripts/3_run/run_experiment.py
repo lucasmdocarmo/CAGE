@@ -1315,6 +1315,9 @@ def run_experiment(
             context=used_contexts,
             generated_text=response.generated_text,
             reference_answer=example.answer,
+            # Audit 2026-07-16 M5: official SQuAD v2 F1/EM = max over ALL gold answers;
+            # loaders that provide them store the deduplicated list in metadata.
+            all_answers=(example.metadata or {}).get("all_answers"),
         )
         _quality_row = quality_metrics.to_dict()
 
@@ -1429,6 +1432,9 @@ def run_experiment(
                 "batch_id": batch_id,
                 "question": question,
                 "reference_answer": example.answer,
+                # ALL gold answers (audit 2026-07-16 M5) so rescore_quality.py can apply
+                # the official max-over-golds F1/EM; absent for datasets without the field.
+                "all_answers": (example.metadata or {}).get("all_answers"),
                 "generated_answer": response.generated_text,
                 "used_contexts": used_contexts,
                 "served_from_cache": meta.get("served_from_cache"),

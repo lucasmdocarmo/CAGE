@@ -174,12 +174,19 @@ def main() -> int:
                     contexts = [contexts]
             generated = rec.get("generated_answer") or ""
             reference = rec.get("reference_answer") or ""
+            # ALL gold answers (audit 2026-07-16 M5): newer qa_evidence rows carry the
+            # deduplicated gold list so F1/EM use the official max-over-golds; older
+            # evidence files lack the field -> None -> single-reference fallback.
+            all_answers = rec.get("all_answers")
+            if not isinstance(all_answers, list):
+                all_answers = None
 
             metrics = evaluator.evaluate(
                 question=question,
                 context=list(contexts),
                 generated_text=generated,
                 reference_answer=reference,
+                all_answers=all_answers,
             ).to_dict()
 
             abstained = is_no_answer_prediction(generated)
@@ -210,8 +217,19 @@ def main() -> int:
 
         if rows_out:
             out_path = ev_path.parent / args.out_name
+            # Header = union of keys across ALL rows (first-seen order), not row 0's keys:
+            # QualityMetrics.to_dict() is row-dependent (hallucination_detected appears only
+            # when LettuceDetect returns a verdict), so row 0 under-specifies the header.
+            # Live failure 2026-07-16: "dict contains fields not in fieldnames".
+            fieldnames = list(rows_out[0].keys())
+            _seen = set(fieldnames)
+            for _r in rows_out[1:]:
+                for _k in _r.keys():
+                    if _k not in _seen:
+                        _seen.add(_k)
+                        fieldnames.append(_k)
             with out_path.open("w", newline="", encoding="utf-8") as fh:
-                writer = csv.DictWriter(fh, fieldnames=list(rows_out[0].keys()))
+                writer = csv.DictWriter(fh, fieldnames=fieldnames, restval="")
                 writer.writeheader()
                 writer.writerows(rows_out)
             if args.apply:

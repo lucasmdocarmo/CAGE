@@ -47,6 +47,19 @@ else
     fail "POST /reset_prefix_cache failed -> serve with VLLM_SERVER_DEV_MODE=1, else cold-start-per-trial silently no-ops"
 fi
 
+# (g) vllm serve ENTRYPOINT importable (2026-07-16 live finding): the sweep RESTARTS the
+# server per tree, so gate (a) -- which probes the ALREADY-RUNNING server -- passes even
+# when the venv is broken, and then every tree boot dies. Concretely: any lettucedetect
+# (re)install pins openai==1.66.3, which lacks openai.types.responses.ResponsePrompt, and
+# `vllm` cannot even import. This is a venv-level import check of the exact CLI path the
+# restarts use.
+echo "(g) vllm CLI entrypoint importable (venv-level, catches pip resolver drift)"
+if python3 -c "from vllm.entrypoints.cli.main import main" 2>/dev/null; then
+    pass "vllm CLI import OK"
+else
+    fail "vllm CLI import FAILED -- pip resolver drift (check openai/transformers: reinstalling lettucedetect downgrades openai below what vllm needs)"
+fi
+
 # (e) no mock / disable escape hatches (checked in-shell so it is loud even if python is skipped)
 echo "(e) no mock / no disable escape hatches"
 for _v in CAGE_TELEMETRY_MOCK CAGE_DISABLE_LETTUCEDETECT CAGE_DISABLE_COMPRESSION CAGE_ALLOW_NO_COMPRESSION; do
@@ -81,14 +94,29 @@ except Exception as e:
 try:
     from src.evaluation.quality import QualityEvaluator
     qe = QualityEvaluator(device="cpu")
-    q = "What color is the sky on a clear day?"
-    ctx = ["On a clear day the sky appears blue because of Rayleigh scattering."]
+    # PROBE MUST USE A PARAGRAPH-LENGTH CONTEXT (2026-07-16 live finding): LettuceDetect is
+    # RAGTruth-trained; against a one-line toy context it over-flags EVERYTHING (both probes
+    # -> 0.000, false "constant scorer" gate failure). A realistic SQuAD-style paragraph
+    # discriminates 0.00 vs 1.00 on the same stack.
+    q = "In what country is Normandy located?"
+    ctx = ["The Normans (Norman: Nourmands; French: Normands) were the people who in the 10th "
+           "and 11th centuries gave their name to Normandy, a region in France. They were "
+           "descended from Norse ('Norman' comes from 'Norseman') raiders and pirates from "
+           "Denmark, Iceland and Norway who, under their leader Rollo, agreed to swear fealty "
+           "to King Charles III of West Francia. Through generations of assimilation and "
+           "mixing with the native Frankish and Roman-Gaulish populations, their descendants "
+           "would gradually merge with the Carolingian-based cultures of West Francia. The "
+           "distinct cultural and ethnic identity of the Normans emerged initially in the "
+           "first half of the 10th century, and it continued to evolve over the succeeding "
+           "centuries."]
     good = qe.evaluate(question=q, context=ctx,
-                       generated_text="The sky is blue.", reference_answer="blue").to_dict()
+                       generated_text="Normandy is located in France.",
+                       reference_answer="France").to_dict()
     # NOT an abstention phrase (abstentions short-circuit grounding to None by design).
     bad = qe.evaluate(question=q, context=ctx,
-                      generated_text="The sky is bright green because of chlorophyll in the air.",
-                      reference_answer="blue").to_dict()
+                      generated_text="Normandy is located in Portugal and was founded by "
+                                     "the Romans in 3 BC.",
+                      reference_answer="France").to_dict()
     g_good, g_bad = good.get("grounding_score"), bad.get("grounding_score")
     if g_good is None or g_bad is None:
         pf("grounding_score is None -- LettuceDetect did not load (PRIMARY metric would be null all run)")

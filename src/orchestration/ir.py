@@ -40,6 +40,15 @@ def stable_text_id(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
 
+def corpus_doc_ids_sha1(documents: Sequence["IRDocument"]) -> str:
+    """sha1 over the SORTED doc ids -- the corpus content fingerprint persisted in
+    meta.json and checked by ensure_ir_index (audit 2026-07-16 M2). Doc ids are
+    stable_text_id hashes of the passage text, so this fingerprints content, not order.
+    """
+    joined = "\n".join(sorted(d.doc_id for d in documents))
+    return hashlib.sha1(joined.encode("utf-8")).hexdigest()
+
+
 def build_corpus_from_contexts(
     examples: Sequence[Any],
     *,
@@ -190,6 +199,10 @@ class FaissIRIndex:
             "embedding_model": self.embedding_model,
             "normalize_embeddings": self.normalize_embeddings,
             "num_documents": len(self._documents),
+            # Content-hash staleness guard (audit 2026-07-16 M2): sha1 over the SORTED
+            # doc ids, so ensure_ir_index can detect same-COUNT/different-CONTENT corpora
+            # (two trials with equal-size corpora previously reused the wrong index).
+            "doc_ids_sha1": corpus_doc_ids_sha1(self._documents),
             "uses_e5_prefixes": self.uses_e5_prefixes,
         }
         (directory / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -317,15 +330,20 @@ def ensure_ir_index(
     Staleness guard: the repo ships tiny STUB indices (e.g. 17 docs) and a committed index
     can also lag the corpus. Loading such an index silently makes every RAG/redis/hybrid
     baseline retrieve from the wrong corpus (invalid retrieval + quality metrics, no error).
-    So if the persisted meta.json's num_documents does not match the corpus actually being
-    indexed, REBUILD instead of loading (a rebuild also restores the correct e5 prefixes).
+    Guarded by CONTENT (audit 2026-07-16 M2): meta.json stores doc_ids_sha1 (sha1 of the
+    sorted doc ids) at build time; a hash mismatch REBUILDS. The count-only check that
+    preceded it let two same-size/different-content trial corpora silently share an index
+    (the 100x3 run escaped only because its per-trial corpora were 31/30/32 docs).
+    Backward compat: an old meta.json without doc_ids_sha1 triggers ONE rebuild, which
+    persists the hash (a rebuild also restores the correct e5 prefixes).
     """
     meta_path = index_dir / "meta.json"
     if meta_path.exists() and not rebuild:
         stale = False
         try:
             import json as _json
-            _n = _json.loads(meta_path.read_text()).get("num_documents")
+            _meta = _json.loads(meta_path.read_text())
+            _n = _meta.get("num_documents")
             # `documents` (truthy) also guards the empty-corpus case: an empty corpus must NOT
             # trigger a rebuild (idx.build([]) raises); fall through to load the existing index.
             if _n is not None and documents and int(_n) != len(documents):
@@ -334,6 +352,22 @@ def ensure_ir_index(
                     f"{len(documents)}; rebuilding (stale/stub index)."
                 )
                 stale = True
+            elif documents:
+                _stored_sha = _meta.get("doc_ids_sha1")
+                _corpus_sha = corpus_doc_ids_sha1(documents)
+                if _stored_sha is None:
+                    print(
+                        f"[ir] index at {index_dir} predates the content-hash guard "
+                        f"(no doc_ids_sha1 in meta.json); rebuilding once to stamp it."
+                    )
+                    stale = True
+                elif _stored_sha != _corpus_sha:
+                    print(
+                        f"[ir] index at {index_dir} content hash {_stored_sha[:12]} != "
+                        f"corpus {_corpus_sha[:12]} (same count, different documents); "
+                        f"rebuilding (stale index)."
+                    )
+                    stale = True
         except Exception:
             stale = False  # unreadable meta -> fall through to load (prior behavior)
         if not stale:

@@ -12,7 +12,9 @@
 # STATUS: EXPERIMENTAL until live-validated. The LMCache<->vLLM 0.11.0 pairing is
 # verified by the gates below at run time (import + server health with the connector),
 # NOT assumed. First live validation: the 100x3 validation-run preflight.
-# Install on the VM first:  pip install lmcache   (not in requirements.txt on purpose --
+# Install on the VM first:  pip install lmcache "transformers>=4.36,<5"
+#   (re-assert the transformers pin IN THE SAME CALL: lmcache alone pulls transformers 5.x,
+#   which breaks vLLM 0.11.0's tokenizer path. Not in requirements.txt on purpose --
 # optional heavy dep; setup_gpu_cloud.sh stays lean).
 #
 # Outputs: $CAGE_RUN_ROOT/kv_store/lmcache_rag/trial_*/  (tree "kv_store" in _results_loader)
@@ -87,6 +89,9 @@ sleep 5
 # The arm: standard RAG serving; the KV reuse happens server-side in the connector.
 # Compare against the plain `rag` cell -- same retrieval, same prompts; the connector
 # is the only serving delta. cached_prompt_tokens + TTFT tell the reuse story.
+# --reset-cache-between-trials: audit 2026-07-16 M1 -- lmcache_rag ran without it, so
+# trials 2/3 started warm while the `rag` comparator started cold (trial independence
+# broken). All arms now reset between trials.
 if ! python3 scripts/3_run/run_experiment.py \
     --baseline rag \
     --baseline-label "$LABEL" \
@@ -95,6 +100,7 @@ if ! python3 scripts/3_run/run_experiment.py \
     --num-queries "$NUM_QUERIES" \
     --num-trials "$NUM_TRIALS" \
     --seed "$SEED" \
+    --reset-cache-between-trials \
     --output-dir "$OUTPUT_DIR/$LABEL" \
     $TELEMETRY_FLAG; then
     fail_cell run_experiment

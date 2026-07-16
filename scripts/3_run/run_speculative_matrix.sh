@@ -89,7 +89,10 @@ case "$MODEL" in
   *)
     MTAG="qwen8b"
     DRAFT_LABEL="eagle3"
-    DRAFT='{"method":"eagle3","model":"AngelSlim/Qwen3-8B_eagle3","num_speculative_tokens":5}'
+    # num_speculative_tokens=2: audit 2026-07-16 SANITY-4 -- the AngelSlim/Qwen3-8B_eagle3
+    # head's own vLLM benchmark operating point is k=2; at k=5 the 100x3 run showed accept
+    # length ~2.29, wasting ~74% of draft compute. ngram stays at 5 (3.05 accepted/draft).
+    DRAFT='{"method":"eagle3","model":"AngelSlim/Qwen3-8B_eagle3","num_speculative_tokens":2}'
     ;;
 esac
 
@@ -155,9 +158,13 @@ run_cell() {  # <spec_json> <label> <context_source>
   curl -s -m 90 "http://localhost:${VLLM_PORT:-8000}/v1/completions" \
     -H 'Content-Type: application/json' \
     -d "{\"model\":\"$MODEL\",\"prompt\":\"warmup\",\"max_tokens\":8}" >/dev/null 2>&1 || true
+  # --reset-cache-between-trials: audit 2026-07-16 M1 -- the four speculative arms ran
+  # WITHOUT it (trials 2/3 started warm while their prefix_cache/cag_full/rag_full
+  # comparators started cold, breaking trial independence). All arms now reset.
   if ! python3 scripts/3_run/run_experiment.py --baseline speculative --baseline-label "$label" \
       --model "$MODEL" --dataset "$DATASET" --num-queries "$NUM_QUERIES" --num-trials "$NUM_TRIALS" --seed "$SEED" \
       --speculative-method "$method" --num-speculative-tokens "$tokens" ${spec_model_flag[@]+"${spec_model_flag[@]}"} \
+      --reset-cache-between-trials \
       --context-source "$ctx" --vllm-telemetry --output-dir "$OUT/$label"; then
     echo "CELL $label RUN-FAIL"
     mkdir -p "$OUT/$label"

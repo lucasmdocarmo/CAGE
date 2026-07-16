@@ -4,10 +4,16 @@
 Greedy (T=0) decoding is NEAR-lossless, not identical, across serving configs: floating-point
 non-associativity (prefix-cache reuse, eager-vs-compiled kernels, context-length changes) can
 flip a near-tie argmax. This tool QUANTIFIES that -- for each baseline arm it compares the
-generated answer to the reference arm's answer for the same (example_id, trial) and reports the
-fraction that differ. That number is what lets the write-up say "prefix caching is near-lossless
-(diverged on X% of queries)" instead of an unquantified "lossless", and it bounds how much of any
-cross-config quality delta is token divergence rather than the mechanism.
+generated answer to the reference arm's answer for the same (example_id, trial, repeat_index)
+and reports the fraction that differ. That number is what lets the write-up say "prefix caching
+is near-lossless (diverged on X% of queries)" instead of an unquantified "lossless", and it
+bounds how much of any cross-config quality delta is token divergence rather than the mechanism.
+
+Input-effect labeling (audit 2026-07-16 S5): arms whose PROMPTS differ from the reference's
+(e.g. rag's retrieved 3-doc context vs no_cache's gold paragraph) are flagged
+``"input_effect": true`` -- their divergence measures different *inputs*, not engine
+nondeterminism, and must not be read as a losslessness number. The flag is derived from the
+loaded rows: same_prompt iff the arm's median prompt_tokens is within 5% of the reference's.
 
 Interface mirrors statistical_tests.py:
     python scripts/4_analysis/token_divergence.py --results-dir results/<phase>/<run-id>/stats/all_results --reference no_cache \
@@ -23,10 +29,11 @@ import argparse
 import csv
 import json
 import re
+import statistics
 import string
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 csv.field_size_limit(min(sys.maxsize, 2**31 - 1))  # generated answers can be long
 
@@ -48,19 +55,34 @@ def _is_error(row: Dict[str, str]) -> bool:
     return is_error(row.get("error"))
 
 
-def _load_answers(baseline_dir: Path) -> Dict[Tuple[str, str], str]:
-    """Map (example_id, repeat_index) -> generated_answer across all trial CSVs (skip errors)."""
-    out: Dict[Tuple[str, str], str] = {}
+def _load_answers(baseline_dir: Path) -> Dict[Tuple[str, str, str], Tuple[str, Optional[float]]]:
+    """Map (example_id, trial, repeat_index) -> (generated_answer, prompt_tokens) across all
+    trial CSVs (skip errors).
+
+    Keying includes the TRIAL (audit 2026-07-16 S5): the previous (example_id, repeat_index)
+    key with first-occurrence-wins was correct only because the 100x3 manifest draws DISJOINT
+    per-trial query blocks (0 example_id overlap verified); under a manifest that repeats
+    queries across trials it would silently discard 2 of 3 trials. prompt_tokens is carried
+    for the per-arm input-effect flag.
+    """
+    out: Dict[Tuple[str, str, str], Tuple[str, Optional[float]]] = {}
     csv_files = sorted(baseline_dir.glob("trial_*/results.csv")) or sorted(baseline_dir.glob("results.csv"))
     for csv_path in csv_files:
+        parent = csv_path.parent.name
+        trial = parent if parent.startswith("trial_") else "trial_1"
         with csv_path.open("r", encoding="utf-8", newline="") as f:
             for row in csv.DictReader(f):
                 ex = (row.get("example_id") or "").strip()
                 if not ex or _is_error(row):
                     continue
                 rep = (row.get("repeat_index") or "0").strip() or "0"
+                pt_raw = (row.get("prompt_tokens") or "").strip()
+                try:
+                    pt: Optional[float] = float(pt_raw) if pt_raw else None
+                except ValueError:
+                    pt = None
                 # First non-error occurrence wins (stable if a trial was re-run).
-                out.setdefault((ex, rep), row.get("generated_answer") or "")
+                out.setdefault((ex, trial, rep), (row.get("generated_answer") or "", pt))
     return out
 
 
@@ -79,20 +101,41 @@ def compute_divergence(results_dir: str, reference: str) -> Dict[str, object]:
         if arm == reference:
             continue
         ans = _load_answers(arm_dir)
-        keys = set(ans) & set(ref)  # compare only matched (example_id, trial) pairs
+        keys = set(ans) & set(ref)  # compare only matched (example_id, trial, repeat_index)
         if not keys:
             continue
-        raw_div = sum(1 for k in keys if (ans[k].strip() != ref[k].strip()))
-        norm_div = sum(1 for k in keys if _normalize(ans[k]) != _normalize(ref[k]))
+        raw_div = sum(1 for k in keys if (ans[k][0].strip() != ref[k][0].strip()))
+        norm_div = sum(1 for k in keys if _normalize(ans[k][0]) != _normalize(ref[k][0]))
         n = len(keys)
-        rows.append({
+        # Input-effect flag (audit 2026-07-16 S5): same_prompt iff the arm's median
+        # prompt_tokens is within 5% of the reference's over the matched keys. Arms that
+        # fail it (rag/compressed/multiturn/corpus-prefix families) feed DIFFERENT prompts
+        # to the model, so their divergence measures input change, not engine
+        # nondeterminism -- flag them so the JSON cannot be misread as a losslessness row.
+        arm_pts = [ans[k][1] for k in keys if ans[k][1] is not None]
+        ref_pts = [ref[k][1] for k in keys if ref[k][1] is not None]
+        arm_med = statistics.median(arm_pts) if arm_pts else None
+        ref_med = statistics.median(ref_pts) if ref_pts else None
+        input_effect: Optional[bool] = None
+        if arm_med is not None and ref_med is not None and ref_med > 0:
+            input_effect = abs(arm_med - ref_med) > 0.05 * ref_med
+        entry: Dict[str, object] = {
             "arm": arm,
             "n_compared": n,
             "raw_divergent": raw_div,
             "raw_divergence_rate": round(raw_div / n, 4),
             "normalized_divergent": norm_div,
             "normalized_divergence_rate": round(norm_div / n, 4),
-        })
+            "median_prompt_tokens": arm_med,
+            "reference_median_prompt_tokens": ref_med,
+            "input_effect": input_effect,
+        }
+        if input_effect:
+            entry["note"] = (
+                "input-effect arm: median prompt_tokens differs from the reference by >5%; "
+                "divergence reflects different prompt contexts, not engine nondeterminism"
+            )
+        rows.append(entry)
     return {"reference": reference, "results_dir": str(root), "arms": rows}
 
 

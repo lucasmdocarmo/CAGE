@@ -180,6 +180,64 @@ start_server() {
     vllm_args+=( --enable-prompt-tokens-details )
     echo "Server args: vllm serve $model ${vllm_args[*]}"
 
+    # Per-(re)start serving-config capture (audit 2026-07-16 M7 / COMP-5):
+    # run_manifest.json is built ONCE at sidecar start, so per-tree server restarts with
+    # different launch levers were never recorded -- the 100x3 manifest said
+    # kv_cache_dtype=null / speculative_config=null while compressed_cag served fp8 and
+    # the speculative tree served eagle3/ngram. Persist the ACTUAL config of every
+    # (re)start under the run root. Skipped silently when CAGE_RUN_ROOT is unset
+    # (ad-hoc/local starts outside a run); never fatal to server startup.
+    if [ -n "${CAGE_RUN_ROOT:-}" ]; then
+        local cfg_dir="$CAGE_RUN_ROOT/observability/serving_configs"
+        local model_slug cfg_file
+        model_slug=$(printf '%s' "$model" | tr '[:upper:]' '[:lower:]' | sed -E 's|.*/||; s|[^a-z0-9]+|-|g; s|^-+||; s|-+$||')
+        cfg_file="$cfg_dir/$(date -u +%Y%m%dT%H%M%SZ)_${model_slug}.json"
+        mkdir -p "$cfg_dir" 2>/dev/null || true
+        SC_MODEL="$model" \
+        SC_KV_DTYPE="${VLLM_KV_CACHE_DTYPE:-auto}" \
+        SC_SPEC="${VLLM_SPECULATIVE_CONFIG:-}" \
+        SC_KV_TRANSFER="${VLLM_KV_TRANSFER_CONFIG:-}" \
+        SC_PREFIX="$want_prefix_cache" \
+        SC_MAX_LEN="${VLLM_MAX_MODEL_LEN:-4096}" \
+        SC_MEM_UTIL="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}" \
+        SC_EAGER="${VLLM_ENFORCE_EAGER:-0}" \
+        SC_ARGS="vllm serve $model ${vllm_args[*]}" \
+        SC_FILE="$cfg_file" \
+        python3 - <<'PYEOF' || echo "  (serving-config capture failed; non-fatal)"
+import datetime
+import json
+import os
+
+
+def _maybe_json(raw):
+    """Speculative/KV-transfer configs are themselves JSON strings; embed parsed."""
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return raw  # keep the raw string rather than dropping provenance
+
+
+cfg = {
+    "utc_timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "model": os.environ["SC_MODEL"],
+    "kv_cache_dtype": os.environ.get("SC_KV_DTYPE") or "auto",
+    "speculative_config": _maybe_json(os.environ.get("SC_SPEC", "")),
+    "kv_transfer_config": _maybe_json(os.environ.get("SC_KV_TRANSFER", "")),
+    "enable_prefix_caching": os.environ.get("SC_PREFIX") == "true",
+    "max_model_len": int(os.environ.get("SC_MAX_LEN", "4096")),
+    "gpu_memory_utilization": float(os.environ.get("SC_MEM_UTIL", "0.90")),
+    "enforce_eager": os.environ.get("SC_EAGER") == "1",
+    "args": os.environ["SC_ARGS"],
+}
+with open(os.environ["SC_FILE"], "w", encoding="utf-8") as fh:
+    json.dump(cfg, fh, indent=2)
+    fh.write("\n")
+PYEOF
+        echo "  Serving config captured: $cfg_file"
+    fi
+
     # Enable vLLM's documented dev-only endpoint POST /reset_prefix_cache (gated by
     # VLLM_SERVER_DEV_MODE per docs.vllm.ai env_vars) so --reset-cache-between-trials can
     # cold-start each trial. Benchmark box only; vLLM marks these endpoints not-for-production.

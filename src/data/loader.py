@@ -198,7 +198,12 @@ class SquadV2Loader(DatasetLoader):
             # SQuAD v2 has context paragraph + question + answers
             answers = item.get("answers", {})
             answer_text = answers.get("text", [""])[0] if answers.get("text") else ""
-            
+            # ALL gold answers, deduplicated order-preserving (audit 2026-07-16 M5):
+            # official SQuAD v2 F1/EM take the MAX over every gold answer; keeping only
+            # text[0] understated answerable F1 ~5pp / EM ~10pp. Empty list = unanswerable
+            # (official SQuAD semantics). Consumed by evaluation/quality.py.
+            all_answers = list(dict.fromkeys(t for t in (answers.get("text") or []) if t))
+
             examples.append(CAGExample(
                 id=item.get("id", str(len(examples))),
                 question=item["question"],
@@ -207,9 +212,10 @@ class SquadV2Loader(DatasetLoader):
                 metadata={
                     "title": item.get("title", ""),
                     "is_impossible": item.get("is_impossible", False),
+                    "all_answers": all_answers,
                 }
             ))
-        
+
         return examples
 
 

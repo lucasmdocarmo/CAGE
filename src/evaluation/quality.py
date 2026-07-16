@@ -703,7 +703,8 @@ class QualityEvaluator:
         return results
     
     def evaluate_f1_score(
-        self, generated_text: str, reference_answer: str
+        self, generated_text: str, reference_answer: str,
+        all_answers: Optional[List[str]] = None,
     ) -> Dict[str, float]:
         """
         Compute token-level F1 / EM with SQuAD v2 no-answer credit.
@@ -716,6 +717,13 @@ class QualityEvaluator:
         Args:
             generated_text: Model's generated answer
             reference_answer: Ground truth answer ("" / blank == SQuAD v2 no-answer item)
+            all_answers: Optional list of ALL gold answers (audit 2026-07-16 M5): the
+                official SQuAD v2 metric is the MAX over every gold answer
+                (metric_max_over_ground_truths); scoring only text[0] understated
+                answerable F1 ~5pp / EM ~10pp. Sourced from
+                CAGExample.metadata["all_answers"]. Empty list = unanswerable item
+                (official semantics); None falls back to the single reference_answer
+                (older evidence files / datasets without the field).
 
         Returns:
             Dict with:
@@ -726,9 +734,31 @@ class QualityEvaluator:
               no_answer_correct                        -- None on answerable items; 1.0/0.0 on
                                                           no-answer items (abstention accuracy)
         """
+        # Max over ALL gold answers (audit 2026-07-16 M5). Explicit class calls keep the
+        # method free of instance state (tests invoke it unbound with self=None).
+        if all_answers is not None:
+            golds = [a for a in all_answers if (a or "").strip()]
+            if not golds:
+                # Official SQuAD v2 semantics: no gold answers == unanswerable item.
+                return QualityEvaluator.evaluate_f1_score(self, generated_text, "")
+            per_gold = [
+                QualityEvaluator.evaluate_f1_score(self, generated_text, g) for g in golds
+            ]
+            # EM and F1 are maximized INDEPENDENTLY (official semantics); precision/recall
+            # accompany the F1-maximizing gold so the P/R/F1 triplet stays coherent. The
+            # abstention fields are identical across golds (they depend only on the
+            # prediction and answerability), so any per-gold copy is correct.
+            merged = dict(max(per_gold, key=lambda r: r["f1"]))
+            merged["exact_match"] = max(r["exact_match"] for r in per_gold)
+            if merged.get("f1_answerable") is not None:
+                merged["f1_answerable"] = merged["f1"]
+            if merged.get("exact_match_answerable") is not None:
+                merged["exact_match_answerable"] = merged["exact_match"]
+            return merged
+
         import re
         import string
-        
+
         def normalize_text(text: str) -> str:
             """Normalize text for comparison (lowercase, remove punctuation/articles)."""
             text = text.lower()
@@ -834,20 +864,23 @@ class QualityEvaluator:
         context: List[str],
         generated_text: str,
         reference_answer: str,
+        all_answers: Optional[List[str]] = None,
     ) -> QualityMetrics:
         """
         Perform full quality evaluation.
-        
+
         Args:
             question: The input question
             context: List of context documents
             generated_text: Model's generated answer
             reference_answer: Ground truth answer
-        
+            all_answers: Optional list of ALL gold answers for max-over-golds F1/EM
+                (audit 2026-07-16 M5); see evaluate_f1_score.
+
         Returns:
             QualityMetrics with all scores
         """
-        f1_metrics = self.evaluate_f1_score(generated_text, reference_answer)
+        f1_metrics = self.evaluate_f1_score(generated_text, reference_answer, all_answers)
         relevance = self.evaluate_relevance(question, context)
 
         # Abstention-aware grounding/faithfulness (2026-07-15 audit): an abstention like
@@ -1033,10 +1066,17 @@ class QualityEvaluator:
         reference_answer: str,
         cache_blocks: Optional[List[str]] = None,
         relevance_threshold: float = 0.3,
+        all_answers: Optional[List[str]] = None,
     ) -> QualityMetrics:
         """
         Full quality evaluation including cache relevance.
-        
+
+        Refactored (audit 2026-07-16 DEAD-EVAL-PATH): this used to duplicate the
+        evaluate() pipeline WITHOUT the abstention short-circuit, so any future caller
+        would reintroduce the "correct abstention scored as hallucination" bug. It now
+        delegates to evaluate() (abstention guard, abstention_precision, max-over-golds
+        F1/EM included) and attaches cache_relevance to the result.
+
         Args:
             question: The input question
             context: List of context documents (for faithfulness/relevance)
@@ -1045,40 +1085,19 @@ class QualityEvaluator:
             cache_blocks: Optional list of cache block contents to evaluate.
                           If None, uses context as cache blocks.
             relevance_threshold: Threshold for considering a block "relevant"
-        
+            all_answers: Optional list of ALL gold answers (see evaluate_f1_score)
+
         Returns:
             QualityMetrics with all scores including cache_relevance
         """
-        # Base metrics
-        faith = self.evaluate_faithfulness(generated_text, context)
-        halluc = self.evaluate_hallucination(question, context, generated_text)
-        relevance = self.evaluate_relevance(question, context)
-        completeness = self.evaluate_completeness(generated_text, reference_answer)
-        f1_metrics = self.evaluate_f1_score(generated_text, reference_answer)
+        metrics = self.evaluate(
+            question, context, generated_text, reference_answer, all_answers=all_answers
+        )
 
         # Cache relevance (use context as cache blocks if not provided)
         blocks_to_evaluate = cache_blocks if cache_blocks is not None else context
         cache_rel = self.evaluate_cache_relevance(
             generated_text, reference_answer, blocks_to_evaluate, relevance_threshold
         )
-
-        return QualityMetrics(
-            faithfulness=faith["faithfulness"],
-            relevance=relevance,
-            completeness_bertscore=completeness["bertscore_f1"],
-            completeness_rouge_l=completeness["rouge_l_f1"],
-            f1_score=f1_metrics["f1"],
-            precision=f1_metrics["precision"],
-            recall=f1_metrics["recall"],
-            exact_match=f1_metrics["exact_match"],
-            is_answerable=f1_metrics.get("is_answerable"),
-            predicted_no_answer=f1_metrics.get("predicted_no_answer"),
-            f1_answerable=f1_metrics.get("f1_answerable"),
-            exact_match_answerable=f1_metrics.get("exact_match_answerable"),
-            no_answer_correct=f1_metrics.get("no_answer_correct"),
-            grounding_score=halluc["grounding_score"],
-            hallucination_detected=halluc["hallucination_detected"],
-            hallucinated_span_ratio=halluc["hallucinated_span_ratio"],
-            supported_claim_ratio=faith["supported_claim_ratio"],
-            cache_relevance=cache_rel.cache_relevance,
-        )
+        metrics.cache_relevance = cache_rel.cache_relevance
+        return metrics

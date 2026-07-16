@@ -99,7 +99,9 @@ run_tree speculative bash scripts/3_run/run_speculative_matrix.sh "$MODEL"
 run_tree envelope bash scripts/3_run/run_prefix_envelope.sh "$MODEL"
 
 # 4b. OPT-IN: LMCache/CacheBlend kv_store arm (EXPERIMENTAL until its live gates pass;
-#     needs `pip install lmcache` on the VM). Enable with CAGE_ENABLE_LMCACHE=1.
+#     needs `pip install lmcache "transformers>=4.36,<5"` on the VM -- the pin re-assert
+#     stops lmcache dragging in transformers 5.x, which breaks vLLM 0.11.0's tokenizer
+#     path). Enable with CAGE_ENABLE_LMCACHE=1.
 if [ "${CAGE_ENABLE_LMCACHE:-0}" = "1" ]; then
     run_tree kv_store bash scripts/3_run/run_kv_store.sh "$MODEL"
 fi
