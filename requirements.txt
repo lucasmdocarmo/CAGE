@@ -80,5 +80,5 @@ pytest-asyncio>=0.21.0
 # Telemetry is optional — comment this line out if you don't need it (CAGE still runs).
 # PINNED to an exact commit (2026-07-15): an unpinned git dep installs whatever main is
 # at setup time, making two runs weeks apart silently non-comparable. Bump deliberately.
-cage-stats @ git+https://github.com/lucasmdocarmo/cage-stats.git@0c1152d4ccd38e4efd9b829da2cb08abfa52a7f3
+cage-stats @ git+https://github.com/lucasmdocarmo/cage-stats.git@cbb7db0c045e31729c4e34b25eb4965834adc828
 # Local dev alternative (no install): set CAGE_STATS_HOME=/Users/lucasmariano/cage-stats
