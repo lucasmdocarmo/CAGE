@@ -56,6 +56,12 @@ PORT=${VLLM_PORT:-8000}
 OUTPUT_DIR="${CAGE_RUN_ROOT:-results/phase2/local}/memory_sweep"
 mkdir -p "$OUTPUT_DIR"
 
+# Redundant cloud backup of the whole results/<phase>/ tree for the memory sweep's
+# duration too (mirrors the full-sweep behavior). LOUD no-op if CAGE_RESULTS_BUCKET unset.
+_MS_PHASE="${CAGE_PHASE:-phase2}"
+bash scripts/5_observability/gcs_backup_daemon.sh start "results/${_MS_PHASE}" || true
+trap 'bash scripts/5_observability/gcs_backup_daemon.sh stop "results/'"${_MS_PHASE}"'" >/dev/null 2>&1 || true' EXIT
+
 # Telemetry defaults ON here (unlike the baseline trees): the phase-time counters,
 # preemptions_total, and telemetry_series.jsonl ARE this sweep's readout.
 TELEMETRY_FLAG=""

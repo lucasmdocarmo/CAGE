@@ -51,6 +51,14 @@ export CAGE_RUN_ID="${CAGE_RUN_ID:-$(date +%Y-%m-%d_%H%M)_${_model_slug}_${NUM_Q
 export CAGE_RUN_ROOT="$PROJECT_DIR/results/${PHASE}/${CAGE_RUN_ID}"
 mkdir -p "$CAGE_RUN_ROOT"
 
+# Redundant cloud backup of the WHOLE results/<phase>/ tree (every run-id + every tree,
+# including the lever trees / scoring / stats that cloud_run.sh's core-only syncer misses).
+# Runs for the entire sweep; final sync + stop on exit. LOUD no-op if CAGE_RESULTS_BUCKET
+# is unset (set it to this run's bucket). Concurrent with cloud_run.sh's syncer is safe
+# (no --delete anywhere).
+bash "$SCRIPT_DIR/../5_observability/gcs_backup_daemon.sh" start "results/${PHASE}" || true
+trap 'bash "$SCRIPT_DIR/../5_observability/gcs_backup_daemon.sh" stop "results/'"${PHASE}"'" >/dev/null 2>&1 || true' EXIT
+
 echo "=============================================="
 echo "CAGE FULL SWEEP  model=$MODEL  Q=$NUM_QUERIES  trials=$NUM_TRIALS"
 echo "run-id:   $CAGE_RUN_ID"
