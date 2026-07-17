@@ -60,9 +60,14 @@ case "$ACTION" in
     fi
     # Idempotent: replace any prior daemon.
     if [ -f "$PIDF" ]; then kill "$(cat "$PIDF")" 2>/dev/null || true; rm -f "$PIDF"; fi
-    ( while true; do sync_once >>"$LOGF" 2>&1 || true; sleep "$INTERVAL"; done ) &
-    echo $! > "$PIDF"
-    echo "[gcs-backup] daemon up (pid $(cat "$PIDF")): $PHASE_DIR -> $BUCKET/$PHASE_DIR every ${INTERVAL}s"
+    # setsid detaches the loop into its OWN session so it survives the parent shell exiting.
+    # A plain `( ) &` gets SIGHUP-killed the moment its parent returns -- e.g. when this script
+    # is invoked via `ssh --command=...` (the session closes) the loop dies silently. The loop
+    # writes its own PID to PIDF so `stop` can find it.
+    SYNC_SH="$SCRIPT_DIR/sync_results_to_gcs.sh"
+    setsid bash -c "echo \$\$ > '$PIDF'; while true; do bash '$SYNC_SH' '$PHASE_DIR' '$BUCKET' '$PHASE_DIR' >>'$LOGF' 2>&1 || true; sleep '$INTERVAL'; done" >/dev/null 2>&1 &
+    sleep 1
+    echo "[gcs-backup] daemon up (pid $(cat "$PIDF" 2>/dev/null)): $PHASE_DIR -> $BUCKET/$PHASE_DIR every ${INTERVAL}s"
     ;;
   stop)
     if [ -f "$PIDF" ]; then kill "$(cat "$PIDF")" 2>/dev/null || true; rm -f "$PIDF"; fi
