@@ -21,7 +21,10 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 source "$SCRIPT_DIR/../lib/_serving_config.sh"
 
 MODEL=${1:-"Qwen/Qwen3-8B"}
-DATASET="squad_v2"
+# Honor an exported DATASET (multi-dataset sweeps set it per run); default to squad_v2 for a
+# bare direct invocation. Hardcoding this broke musique/hotpotqa sweeps: the manifest env var
+# propagated but --dataset stayed squad_v2, tripping the run_experiment.py manifest guard.
+DATASET="${DATASET:-squad_v2}"
 # Model tag appended to baseline labels (see run_baseline) so MiMo core+compression never
 # collides with Qwen's result dirs. Qwen (primary) stays bare.
 case "$MODEL" in *MiMo*|*mimo*) MTAG="_mimo7b" ;; *) MTAG="" ;; esac
