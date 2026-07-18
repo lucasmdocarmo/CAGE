@@ -50,6 +50,15 @@ DATASET="${DATASET:-squad_v2}"
 NUM_QUERIES=${NUM_QUERIES:-100}
 NUM_TRIALS=${NUM_TRIALS:-3}
 SEED=${SEED:-42}
+# DECOUPLED SCORING (default ON, like run_full_sweep.sh): this sweep's axis is the
+# memory-pressure SERVING/TELEMETRY readout (TTFT, preemptions, kv_capacity, phase-time
+# counters), NOT model-based quality. Running the CPU quality models (LettuceDetect/NLI/
+# BERTScore) INLINE per query made the long-context arms (cag_true_on, lmcache_rag) take
+# ~90 min/trial vs ~4 min for short-context arms -- a ~15-18x slowdown for metrics this
+# sweep does not need (squad_v2 quality is already scored in the main run). F1/EM/abstention
+# stay inline (model-free). Set CAGE_SKIP_QUALITY=0 to restore inline model scoring; quality
+# under pressure can be rescored offline from qa_evidence.jsonl if ever wanted.
+export CAGE_SKIP_QUALITY="${CAGE_SKIP_QUALITY:-1}"
 CORPUS_BUDGET=${CORPUS_BUDGET:-2800}
 MEM_UTILS=${MEM_UTILS:-"0.90 0.84 0.815"}
 PORT=${VLLM_PORT:-8000}
