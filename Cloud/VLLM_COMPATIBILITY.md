@@ -12,6 +12,35 @@
 
 ---
 
+## 0. PIN BUMP 2026-07-26: v0.19.1 is the Phase-3 pin (v0.11.0 frozen as the Phase-2 anchor)
+
+**Decision.** The project pin moved `v0.11.0 → v0.19.1` (latest PyPI release, 2026-04-18) for all
+FUTURE runs (Phase 3). Already updated: `scripts/1_setup/setup_gpu_cloud.sh` (default
+`VLLM_VERSION`), `scripts/2_serving/deploy_cluster.sh` (image tag), `scripts/3_run/cloud_run.sh`
+(header). **v0.11.0 stays the frozen anchor for every published Phase-2 number** — never re-run
+Phase-2 cells on a newer pin and mix tables; `export VLLM_VERSION=0.11.0` reproduces that era.
+
+**Known cross-pin comparability break:** v0.19.0 enabled the **async scheduler by default**
+(scheduling/execution overlap), which shifts TTFT distributions. State the scheduler regime in the
+methodology; never compare TTFT across pins.
+
+**Migration gate (re-run §3 under v0.19.1 at the next GPU preflight — every row below was a
+0.11-era fact until re-verified):**
+- [ ] `--kv-transfer-config` / NixlConnector schema (Phase-3 load-bearing path)
+- [ ] `--speculative-config` schema; **EAGLE-3 early-EOS re-test** (0.11 bug forced quality
+      exclusion; 0.12+ EAGLE fixes may allow un-excluding — re-decide with data)
+- [ ] ngram speculative: 0.18 added a GPU NGram path — record which implementation runs
+- [ ] `/reset_prefix_cache` dev endpoint under `VLLM_SERVER_DEV_MODE=1` (cold-start-per-trial)
+- [ ] `--enable-prompt-tokens-details` → `usage.prompt_tokens_details.cached_tokens` (the
+      locality-gradient column)
+- [ ] cage-stats `/metrics` name parity (Prometheus metric names drift between versions)
+- [ ] dependency dances: openai>=2 reconcile, lmcache↔vLLM pairing, `transformers<5` pin —
+      all three were 0.11-era workarounds; re-verify or remove
+- [ ] torch/CUDA floor of the v0.19.1 wheel vs the DLVM image
+- [ ] §2 flag matrix + §4 FP8×prefix-caching gate re-validated and this file's tables updated
+
+---
+
 ## 1. The rule: pin, don't chase `latest`
 
 vLLM's own docs recommend pinning a versioned tag for reproducible deployments. CAGE should

@@ -29,7 +29,7 @@
 # so run those via their own scripts instead of this suite:
 #     compression 2x2:  bash scripts/3_run/run_compression.sh $MODEL   (gates FP8 x prefix-caching)
 #     speculative:      bash scripts/3_run/run_speculative_matrix.sh $MODEL   (per model; gates native draft)
-# The vLLM image is pinned to v0.11.0 — see Cloud/VLLM_COMPATIBILITY.md.
+# The vLLM pin is v0.19.1 (Phase-3; Phase-2 ran v0.11.0) — see Cloud/VLLM_COMPATIBILITY.md.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

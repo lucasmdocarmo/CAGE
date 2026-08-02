@@ -51,10 +51,13 @@ echo "=== SAFE TEARDOWN: $VM ($ZONE) | project=$PROJECT | bucket=$BUCKET ==="
 echo "    success token: $TOKEN"
 
 echo "[1/6] final results sync (results/) ..."
-ssh_vm 'cd ~/CAGE && bash scripts/5_observability/sync_results_to_gcs.sh results' | tail -3 || true
+# Forward CAGE_RESULTS_BUCKET into the SSH shell: a non-login `ssh --command` does NOT inherit
+# the run's env, so without this the VM-side scripts fall back to the project-default bucket
+# (gs://<project>-cage-results) which may not exist -> silent 404 -> sentinel never written.
+ssh_vm "cd ~/CAGE && CAGE_RESULTS_BUCKET='$BUCKET' bash scripts/5_observability/sync_results_to_gcs.sh results" | tail -3 || true
 
 echo "[2/6] collecting ALL logs + forensics -> GCS (writes success sentinel) ..."
-ssh_vm "cd ~/CAGE && CAGE_COLLECT_TOKEN='$TOKEN' bash scripts/5_observability/collect_logs.sh" | tail -6 || true
+ssh_vm "cd ~/CAGE && CAGE_RESULTS_BUCKET='$BUCKET' CAGE_COLLECT_TOKEN='$TOKEN' bash scripts/5_observability/collect_logs.sh" | tail -6 || true
 
 echo "[3/6] verifying THIS run's sentinel in GCS (SSH stdout is not trusted) ..."
 HITS=$(num "$(gcloud storage ls -r "$BUCKET/vm_logs/**" 2>/dev/null | grep -c "COLLECT_OK_${TOKEN}\$")")

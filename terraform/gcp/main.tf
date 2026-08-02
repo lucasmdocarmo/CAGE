@@ -74,7 +74,7 @@ variable "model_name" {
 variable "vllm_image" {
   description = "vLLM serving image. Pin a concrete tag for reproducibility."
   type        = string
-  default     = "vllm/vllm-openai:v0.11.0"
+  default     = "vllm/vllm-openai:v0.19.1"
 }
 
 variable "vllm_extra_args" {

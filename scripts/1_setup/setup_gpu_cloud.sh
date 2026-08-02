@@ -22,7 +22,10 @@
 set -euo pipefail
 
 # Keep in sync with Cloud/VLLM_COMPATIBILITY.md (the single pinned version).
-VLLM_VERSION="${VLLM_VERSION:-0.11.0}"
+# 0.19.1 is the Phase-3 pin (2026-07-26). Phase-2 numbers were measured under 0.11.0
+# and are NOT comparable across pins (0.19.0 turned the async scheduler on by default).
+# Export VLLM_VERSION=0.11.0 to reproduce the Phase-2 environment.
+VLLM_VERSION="${VLLM_VERSION:-0.19.1}"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$PROJECT_DIR"
 
@@ -63,11 +66,13 @@ pip install "vllm==${VLLM_VERSION}"
 echo "[cage] [3/5] installing CAGE requirements..."
 pip install -r requirements.txt
 
-# 3b. vLLM 0.11.0 needs openai>=2 (it imports ResponsePrompt), but lettucedetect pins
+# 3b. vLLM (>=0.11) needs openai>=2 (it imports ResponsePrompt), but lettucedetect pins
 #     openai==1.66.3, so the requirements install leaves the old one and vLLM then
 #     CRASHES on startup. Force-upgrade (safe: CAGE talks to vLLM over raw HTTP, and
 #     lettucedetect's core ModernBERT grounding detector works fine with openai 2.x).
-echo "[cage] [3b] reconciling openai for vLLM 0.11.0..."
+#     MIGRATION NOTE (0.19.1): re-verify this reconcile plus the lmcache<->vLLM pairing
+#     and the transformers<5 pin at the next preflight; all three were 0.11-era fixes.
+echo "[cage] [3b] reconciling openai for vLLM ${VLLM_VERSION}..."
 pip install -U "openai>=2.0"
 
 # 4. Stage the Phase-2 datasets so they are not lazy-downloaded mid-run.

@@ -129,7 +129,7 @@ EOF
         local port=$((8000 + i))
         cat >> "$compose_file" << EOF
   vllm-replica-$i:
-    image: vllm/vllm-openai:v0.11.0
+    image: vllm/vllm-openai:v0.19.1
 EOF
         if $GPU_ENABLED; then
             cat >> "$compose_file" << EOF
