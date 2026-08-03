@@ -1,5 +1,11 @@
 #!/bin/bash
-# KV-store family (task #83, per Documentation/RELATED_WORK_KVCACHE_STORES.md verdict:
+# =============================================================================
+# PILOT HARNESS — drives the retired 9-name taxonomy via the alias map; the
+# campaign harness (CellSpec-native, D6 open-loop) lands at tranche P1; use for
+# pilot re-scoring only.
+# =============================================================================
+# KV-store family (task #83, per the pilot-era RELATED_WORK_KVCACHE_STORES.md verdict
+# [doc since removed; design now governed by MyDocs/PUBLICATION.md]:
 # "add exactly ONE real KV-block store: LMCache (with CacheBlend)").
 #
 #   lmcache_rag   RAG serving with prefill KV served from LMCache via vLLM's
@@ -23,7 +29,11 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR/../.."
+# No -e in this script (fault-tolerant cells), so an unguarded cd failing would leave
+# every relative path below running in the WRONG directory. Guard it.
+cd "$SCRIPT_DIR/../.." || exit 1
+# shellcheck source=scripts/lib/_common.sh
+source scripts/lib/_common.sh
 source scripts/lib/_serving_config.sh
 
 MODEL=${1:-"Qwen/Qwen3-8B"}
@@ -35,8 +45,9 @@ OUTPUT_DIR="${CAGE_RUN_ROOT:-results/phase2/local}/kv_store"
 LABEL="lmcache_rag"
 mkdir -p "$OUTPUT_DIR"
 
-TELEMETRY_FLAG=""
-if [ "${VLLM_TELEMETRY:-0}" != "0" ]; then TELEMETRY_FLAG="--vllm-telemetry"; fi
+# Array so the empty case expands to zero argv words (safe under set -u via ${arr[@]+...}).
+TELEMETRY_FLAG=()
+if [ "${VLLM_TELEMETRY:-0}" != "0" ]; then TELEMETRY_FLAG=(--vllm-telemetry); fi
 
 cleanup() { ./scripts/2_serving/manage_vllm_server.sh stop >/dev/null 2>&1 || true; }
 trap cleanup EXIT
@@ -61,7 +72,7 @@ if cell_complete && [ "${CAGE_FORCE_RERUN:-0}" != "1" ]; then
     echo "KV_STORE_DONE"
     exit 0
 fi
-[ -d "$OUTPUT_DIR/$LABEL" ] && { echo "wiping partial $LABEL"; rm -rf "$OUTPUT_DIR/$LABEL"; }
+[ -d "$OUTPUT_DIR/$LABEL" ] && { echo "wiping partial $LABEL"; rm -rf "${OUTPUT_DIR:?}/${LABEL:?}"; }
 
 # Gate 1: connector package importable in the serving interpreter (version pairing is
 # exactly what this catches -- fail loud, never serve a silently-connectorless arm).
@@ -102,7 +113,7 @@ if ! python3 scripts/3_run/run_experiment.py \
     --seed "$SEED" \
     --reset-cache-between-trials \
     --output-dir "$OUTPUT_DIR/$LABEL" \
-    $TELEMETRY_FLAG; then
+    ${TELEMETRY_FLAG[@]+"${TELEMETRY_FLAG[@]}"}; then
     fail_cell run_experiment
 fi
 

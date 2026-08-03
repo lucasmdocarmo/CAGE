@@ -1,0 +1,25 @@
+# Copy to terraform.tfvars (gitignored) and fill in. Session shape comes from
+# sessions/group-{a,b,cd}.tfvars — pass BOTH files:
+#
+#   terraform plan \
+#     -var-file=sessions/group-a.tfvars \
+#     -var-file=terraform.tfvars
+#
+# APPLY IS GATED BY EXPLICIT USER APPROVAL — plan freely, apply never
+# automatically (quote cost + ETA first; see estimated_hourly_cost output).
+
+project_id         = "my-cage-project"          # clean-room project for this run
+region             = "us-central1"
+zone               = "us-central1-a"            # [VERIFY-AT-APPLY] machine-type + quota in zone
+billing_account_id = "000000-000000-000000"     # for the run budget
+alert_email        = "you@example.com"          # budget + runaway-uptime alerts
+
+# Run identity — RESULTS_LAYOUT.md §1 grammar: lowercase [a-z0-9-] ONLY,
+# YYYYMMDD-hhmm-<session>-<model-slug>. It names the GCS bucket cage-<run_id>
+# VERBATIM (the node exports CAGE_RESULTS_BUCKET=gs://cage-<run_id>, RUNBOOK
+# §4.4), plus the SA id and the agent-run label the orphan sweep keys on.
+# NO underscores/dots/uppercase — validation rejects them (a slugged bucket
+# name would silently diverge from the documented gs:// URL).
+run_id = "20260802-0000-a-smoke"
+
+# budget_amount_usd = 500                       # default; raise per-session if approved

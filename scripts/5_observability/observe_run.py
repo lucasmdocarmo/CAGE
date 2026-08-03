@@ -184,24 +184,49 @@ def main() -> int:
 
     _install_signal_handlers()
     stop_file = out_dir / "OBSERVE_STOP"
-    logger.info("observing run_dir=%s -> out_dir=%s (interval=%.0fs). SIGTERM or touch %s to stop.",
-                run_dir, out_dir, args.interval, stop_file)
+    pid_file = out_dir / "observe.pid"
+    try:  # pidfile lets watchers/ops find the sidecar; best-effort (never blocks observing)
+        pid_file.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    except OSError as exc:
+        logger.warning("could not write pidfile %s: %s", pid_file, exc)
+    logger.info("observing run_dir=%s -> out_dir=%s (interval=%.0fs, pid %d). SIGTERM or touch %s to stop.",
+                run_dir, out_dir, args.interval, os.getpid(), stop_file)
 
-    # 3) Idle until stopped (the recorder thread does the work).
-    while not _STOP.wait(2.0):
-        if stop_file.exists():
-            logger.info("stop sentinel found -> finalising")
-            break
-
-    # 4) Finalise: last snapshot + hash every result file.
-    trace.event("observe_stop")
-    recorder.stop(final=True)
-    prov = write_provenance(
-        str(run_dir), str(out_dir / "provenance.json"),
-        created_at=datetime.now(timezone.utc).isoformat(),
-    )
-    logger.info("finalised: %d result files hashed -> provenance.json", prov.get("file_count", 0))
-    return 0
+    # 3) Idle until stopped (the recorder thread does the work), then 4) finalise.
+    # try/finally: the final snapshot + provenance hashes MUST land even if the idle
+    # loop dies unexpectedly -- a crashed sidecar that also skipped finalisation would
+    # silently cost the run its provenance record.
+    rc = 0
+    try:
+        while not _STOP.wait(2.0):
+            try:
+                if stop_file.exists():
+                    logger.info("stop sentinel found -> finalising")
+                    break
+            except OSError as exc:  # transient FS error must not kill the sidecar
+                logger.warning("stop-sentinel check failed (%s); continuing", exc)
+    except BaseException:
+        logger.exception("observe loop died unexpectedly -> finalising anyway")
+        rc = 1
+    finally:
+        # 4) Finalise: last snapshot + hash every result file.
+        try:
+            trace.event("observe_stop")
+            recorder.stop(final=True)
+            prov = write_provenance(
+                str(run_dir), str(out_dir / "provenance.json"),
+                created_at=datetime.now(timezone.utc).isoformat(),
+            )
+            logger.info("finalised: %d result files hashed -> provenance.json",
+                        prov.get("file_count", 0))
+        except Exception:
+            logger.exception("finalisation FAILED -- provenance/last snapshot may be incomplete")
+            rc = 1
+        try:
+            pid_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return rc
 
 
 if __name__ == "__main__":

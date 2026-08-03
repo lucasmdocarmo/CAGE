@@ -1,10 +1,13 @@
 #!/bin/bash
+# shellcheck shell=bash
 # =============================================================================
-# CAGE uniform serving configuration  (single source of truth)
+# CAGE uniform serving configuration  (single source of truth; SOURCEABLE --
+# deliberately no set -e/-u here: this file must never change the caller's options)
 # =============================================================================
 # Sourced by EVERY single-node baseline-tree driver -- run_baselines.sh (core baselines),
-# run_compression.sh (compression 2x2), run_speculative_matrix.sh (speculative 2x2) --
-# so all three trees serve under IDENTICAL conditions and cross-mechanism comparisons are
+# run_compression.sh (compression 2x2), and historically the retired
+# scripts/deprecated/run_speculative_matrix.sh (speculative 2x2, charter §7.5) --
+# so all trees serve under IDENTICAL conditions and cross-mechanism comparisons are
 # FAIR. Consumed by scripts/2_serving/manage_vllm_server.sh, which reads these env vars when it launches
 # vLLM. The phase3 cluster path (manage_vllm_cluster.py) consumes the SAME VLLM_* env via
 # build_serve_args() with fallbacks mirroring this file -- gap closed 2026-07-15 (task #63);
@@ -33,8 +36,8 @@
 #   Holding eager + max_len fixed means the pressure sweep varies ONLY memory, cleanly.
 #
 # Every value is overridable (:-default), so the pre-flight can fall back to eager for a single
-# tree if a cell OOMs non-eager on the 24GB L4 (e.g. the speculative tree):
-#   VLLM_ENFORCE_EAGER=1 bash scripts/3_run/run_speculative_matrix.sh <model>
+# tree if a cell OOMs non-eager on the 24GB L4:
+#   VLLM_ENFORCE_EAGER=1 bash scripts/3_run/run_compression.sh <model>
 # Such a fallback is a DELIBERATE, RECORDED deviation -- the run manifest captures the actual
 # enforce_eager/max_model_len used, so any non-uniform cell is visible in provenance.
 # =============================================================================
@@ -43,4 +46,5 @@ export VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-0}"
 export VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-4096}"
 export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
 
-echo "[cage] serving config: enforce_eager=${VLLM_ENFORCE_EAGER} max_model_len=${VLLM_MAX_MODEL_LEN} gpu_mem_util=${VLLM_GPU_MEMORY_UTILIZATION} (uniform across trees; mem-util is the swept axis)"
+printf '[cage] serving config: enforce_eager=%s max_model_len=%s gpu_mem_util=%s (uniform across trees; mem-util is the swept axis)\n' \
+  "$VLLM_ENFORCE_EAGER" "$VLLM_MAX_MODEL_LEN" "$VLLM_GPU_MEMORY_UTILIZATION"

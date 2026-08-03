@@ -2,6 +2,13 @@
 """
 Statistical significance testing for CAGE experiments.
 
+.. deprecated:: 2026-08-02
+    LEGACY — superseded by ``src/analysis/stats/`` (the D9 engine: registered
+    family map, gatekeeping, conditional TOST, McNemar, batch-means, and a
+    CORRECTLY PAIRED Cliff's delta — this script's delta is computed unpaired
+    on paired data and MUST NOT be cited). Kept runnable only so pre-charter
+    pilot reports can be regenerated. New analyses import ``src.analysis.stats``.
+
 WHY THIS EXISTS
 ---------------
 Reporting mean +/- std over n=3 trials (the old approach) cannot support any

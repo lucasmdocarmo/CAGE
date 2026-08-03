@@ -18,10 +18,19 @@ Metrics:
 - F1-score: Token-level precision/recall (QA standard metric).
 - Cache Relevance: Proportion of cache blocks that contributed to the answer.
 
-Design intent for cloud/HPC + publication: every metric returns ``None`` (not a
-silent 0.5/0.0 sentinel) when its model is unavailable, so undisclosed model-load
-failures cannot contaminate reported means.
+Design intent for cloud/HPC + publication (P0-5 fail-closed, audit 2026-08-02):
+instruments are PINNED. An instrument that cannot load or score is NEVER silently
+replaced by a fallback model scoring under the same column name -- a mid-run
+instrument swap voids the D8/D9 predicate symmetry behind Y (serving yield). In
+strict mode (the D8 default) any load/score failure raises
+``InstrumentUnavailableError``; in non-strict mode (long-run harness survival)
+the row records score=``None`` plus an ``instrument_status`` token such as
+``nli:unavailable:<model>``. The only substitution retained is the explicitly
+labeled cache-relevance DIAGNOSTIC (lexical Jaccard), which writes its method
+into the row (``cache_relevance_method``).
 """
+
+from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
@@ -32,6 +41,23 @@ import warnings
 
 # Suppress BERTScore warning about empty candidates
 warnings.filterwarnings("ignore", message=".*Empty candidate sentence detected.*")
+
+
+class InstrumentUnavailableError(RuntimeError):
+    """A pinned quality instrument failed to load or score.
+
+    Raised in strict mode (the D8 default) INSTEAD of substituting a fallback
+    model: a substitute would score later rows with a DIFFERENT model under the
+    same column name, voiding predicate symmetry across cells (audit P0-5).
+    """
+
+    def __init__(self, instrument: str, model: str, cause: str) -> None:
+        self.instrument = instrument
+        self.model = model
+        self.cause = cause
+        super().__init__(
+            f"quality instrument '{instrument}' ({model}) unavailable: {cause}"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -134,12 +160,17 @@ def sanitize_answer(text: Optional[str]) -> str:
 @dataclass
 class CacheRelevanceMetrics:
     """Cache relevance evaluation results."""
-    
+
     cache_relevance: float  # 0-1, proportion of cache blocks that contributed
     relevant_block_count: int  # Number of blocks that contributed
     total_block_count: int  # Total number of cache blocks accessed
     per_block_scores: List[float]  # Relevance score for each block
-    
+    # P0-5: which scorer produced the numbers -- 'embedding:<model>' or the
+    # explicitly-labeled 'lexical_jaccard' substitute ('none' when no blocks).
+    # This diagnostic keeps its fallback ONLY because the method is written
+    # into the row; the score never masquerades as the embedding scorer's.
+    method: str = "embedding"
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         return {
@@ -147,6 +178,7 @@ class CacheRelevanceMetrics:
             "relevant_block_count": self.relevant_block_count,
             "total_block_count": self.total_block_count,
             "per_block_scores": self.per_block_scores,
+            "cache_relevance_method": self.method,
         }
 
 
@@ -190,6 +222,12 @@ class QualityMetrics:
     # B4: the scaffold-stripped / continuation-truncated text ALL quality scoring ran on.
     # generated_answer (the raw text) is never overwritten; this column sits alongside it.
     sanitized_answer: Optional[str] = None
+    # P0-5 fail-closed: 'ok', or ';'-joined tokens ('nli:unavailable:<model>',
+    # 'bertscore:error:<ExcType>') for every pinned instrument consulted on THIS row
+    # that failed to produce a score. A missing score is never a substitute's score.
+    instrument_status: str = "ok"
+    # Labeled diagnostic provenance for cache_relevance (see CacheRelevanceMetrics.method).
+    cache_relevance_method: Optional[str] = None
     # Evidence-only, NOT a metric: raw LettuceDetect answer spans flagged unsupported, for the
     # per-query qa_evidence.jsonl. Deliberately EXCLUDED from to_dict() so it never becomes a
     # CSV column or enters metric aggregation. None when the detector is unavailable.
@@ -222,12 +260,16 @@ class QualityMetrics:
             "faithfulness_method": self.faithfulness_method,
             "faithfulness_premise_mode": self.faithfulness_premise_mode,
             "sanitized_answer": self.sanitized_answer,
+            # Emitted unconditionally so the CSV column is stable across rows/runs.
+            "instrument_status": self.instrument_status,
         }
         if self.hallucination_detected is not None:
             # Stored as 0/1 so it aggregates to a hallucination RATE across a run.
             result["hallucination_detected"] = 1.0 if self.hallucination_detected else 0.0
         if self.cache_relevance is not None:
             result["cache_relevance"] = self.cache_relevance
+            if self.cache_relevance_method is not None:
+                result["cache_relevance_method"] = self.cache_relevance_method
         return result
 
 
@@ -249,7 +291,17 @@ class QualityEvaluator:
         bertscore_rescale_with_baseline: bool = True,
         bertscore_lang: str = "en",
         nli_max_length: int = 512,
-    ):
+        strict: Optional[bool] = None,
+    ) -> None:
+        # P0-5 fail-closed switch (D8 default: strict). strict=None reads
+        # CAGE_QUALITY_STRICT (unset/"1" -> True). Strict raises
+        # InstrumentUnavailableError on any instrument load/score failure;
+        # non-strict records score=None + an instrument_status token instead.
+        if strict is None:
+            strict = os.getenv("CAGE_QUALITY_STRICT", "1").strip().lower() not in {
+                "0", "false", "no",
+            }
+        self.strict = strict
         self.use_nli = use_nli
         self.use_embeddings = use_embeddings
         self.use_bertscore = use_bertscore
@@ -268,11 +320,16 @@ class QualityEvaluator:
             nli_model_name
             or os.getenv("CAGE_NLI_MODEL", "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli")
         )
-        self.nli_model_fallbacks = [
-            name.strip()
-            for name in os.getenv("CAGE_NLI_FALLBACKS", "facebook/bart-large-mnli").split(",")
-            if name.strip()
-        ]
+        # P0-5: fallback SUBSTITUTION is removed -- the attributes survive for API
+        # compat but are never consulted. A configured fallback env var gets a loud
+        # warning so operators learn the chain is gone before a multi-day run.
+        for _env_key in ("CAGE_NLI_FALLBACKS", "CAGE_BERTSCORE_FALLBACKS"):
+            if os.getenv(_env_key, "").strip():
+                print(
+                    f"Warning: {_env_key} is set but fallback substitution was removed "
+                    f"(P0-5 fail-closed); pin the instrument via its primary env var."
+                )
+        self.nli_model_fallbacks: List[str] = []
         self.embedding_model_name = (
             embedding_model_name
             or os.getenv("CAGE_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
@@ -281,14 +338,7 @@ class QualityEvaluator:
             bertscore_model_name
             or os.getenv("CAGE_BERTSCORE_MODEL", "roberta-base")
         )
-        self.bertscore_model_fallbacks = [
-            name.strip()
-            for name in os.getenv(
-                "CAGE_BERTSCORE_FALLBACKS",
-                "distilbert-base-uncased,distilroberta-base,microsoft/deberta-base-mnli",
-            ).split(",")
-            if name.strip()
-        ]
+        self.bertscore_model_fallbacks: List[str] = []
         self.lettucedetect_model_name = (
             lettucedetect_model_name
             or os.getenv(
@@ -302,12 +352,47 @@ class QualityEvaluator:
         self._nli_entail_index = None  # resolved entailment class index for the loaded NLI model
         self._embedding_model = None
         self._bertscore_model = None
-        self._bertscore_model_active_name = None
         self._rouge_scorer = None
-        self._bertscore_disabled_reason = None
         self._lettucedetect_model = None
-        self._lettucedetect_disabled_reason = None
-    
+        # P0-5 sticky unavailability: instrument -> pinned model that failed to load.
+        # Short-circuits reload attempts (the old code retried the full model load on
+        # EVERY row) and drives the 'unavailable:' row-status tokens.
+        self._instrument_unavailable: Dict[str, str] = {}
+        # Per-row status tokens; reset at the top of evaluate().
+        self._row_status_tokens: List[str] = []
+
+    # ------------------------------------------------------------------ #
+    # P0-5 fail-closed plumbing
+    # ------------------------------------------------------------------ #
+    def _mark_unavailable(self, instrument: str, model: str, cause: Exception) -> None:
+        """Register a permanent instrument LOAD failure (strict mode: raise)."""
+        if self.strict:
+            raise InstrumentUnavailableError(instrument, model, str(cause)) from cause
+        if instrument not in self._instrument_unavailable:
+            print(
+                f"Warning: quality instrument '{instrument}' ({model}) unavailable: {cause}. "
+                f"Rows will carry instrument_status '{instrument}:unavailable:{model}' with "
+                f"score=None -- never a substitute model's score."
+            )
+            self._instrument_unavailable[instrument] = model
+
+    def _note_row_status(self, instrument: str, kind: str, detail: str) -> None:
+        self._row_status_tokens.append(f"{instrument}:{kind}:{detail}")
+
+    def _note_unavailable_row(self, instrument: str) -> None:
+        self._note_row_status(
+            instrument, "unavailable", self._instrument_unavailable[instrument]
+        )
+
+    def _scoring_failure(self, instrument: str, model: str, exc: Exception) -> None:
+        """Per-row SCORING failure: strict raises, non-strict labels the row."""
+        if self.strict:
+            raise InstrumentUnavailableError(
+                instrument, model, f"scoring failed: {exc}"
+            ) from exc
+        print(f"Error in {instrument} scoring ({model}): {exc}")
+        self._note_row_status(instrument, "error", type(exc).__name__)
+
     def _hf_pipeline_device(self) -> int:
         """Convert device setting to a value compatible with transformers.pipeline."""
         if isinstance(self.device, int):
@@ -327,141 +412,111 @@ class QualityEvaluator:
         return -1
 
     @property
-    def nli_model(self):
-        """Lazy load NLI model for faithfulness."""
-        if self._nli_model is None and self.use_nli:
+    def nli_model(self) -> Optional[Any]:
+        """Lazy load the PINNED NLI model (no fallback substitution -- P0-5)."""
+        if (
+            self._nli_model is None
+            and self.use_nli
+            and "nli" not in self._instrument_unavailable
+        ):
             try:
                 from transformers import pipeline
-                tried = []
-                for candidate in [self.nli_model_name, *self.nli_model_fallbacks]:
-                    if not candidate or candidate in tried:
-                        continue
-                    tried.append(candidate)
-                    try:
-                        self._nli_model = pipeline(
-                            "text-classification",
-                            model=candidate,
-                            device=self._hf_pipeline_device(),
-                        )
-                        if self._nli_model:
-                            break
-                    except Exception as e:
-                        print(f"Warning: Failed to load NLI model '{candidate}': {e}")
+
+                self._nli_model = pipeline(
+                    "text-classification",
+                    model=self.nli_model_name,
+                    device=self._hf_pipeline_device(),
+                )
             except Exception as e:
-                print(f"Warning: Failed to initialize NLI pipeline: {e}")
-                self._nli_model = None
+                self._mark_unavailable("nli", self.nli_model_name, e)
         return self._nli_model
-    
+
     @property
-    def embedding_model(self):
-        """Lazy load embedding model for relevance."""
-        if self._embedding_model is None and self.use_embeddings:
+    def embedding_model(self) -> Optional[Any]:
+        """Lazy load the PINNED embedding model for relevance."""
+        if (
+            self._embedding_model is None
+            and self.use_embeddings
+            and "embedding" not in self._instrument_unavailable
+        ):
             try:
                 from sentence_transformers import SentenceTransformer
+
                 self._embedding_model = SentenceTransformer(
                     self.embedding_model_name,
                     device=self.device,
                 )
             except Exception as e:
-                print(f"Warning: Failed to load embedding model: {e}")
-                self._embedding_model = None
+                self._mark_unavailable("embedding", self.embedding_model_name, e)
         return self._embedding_model
-    
+
     @property
-    def bertscore_model(self):
-        """Lazy load BERTScore."""
-        if self._bertscore_model is None and self.use_bertscore:
+    def bertscore_model(self) -> Optional[Any]:
+        """Lazy load BERTScore for the PINNED model only (no fallback chain -- P0-5)."""
+        if (
+            self._bertscore_model is None
+            and self.use_bertscore
+            and "bertscore" not in self._instrument_unavailable
+        ):
             self._load_bertscore_model()
         return self._bertscore_model
-
-    def _iter_bertscore_candidates(self, exclude: Optional[set[str]] = None) -> List[str]:
-        exclude = exclude or set()
-        ordered: List[str] = []
-        for candidate in [self.bertscore_model_name, *self.bertscore_model_fallbacks]:
-            if not candidate or candidate in exclude or candidate in ordered:
-                continue
-            ordered.append(candidate)
-        return ordered
 
     def _probe_bertscore_model(self, scorer: Any) -> None:
         """Run a tiny score call to catch models that load but fail at inference time."""
         _, _, f1 = scorer.score(["cage sanity check"], ["cage sanity check"])
         _ = float(f1[0].cpu().numpy())
 
-    def _disable_bertscore(self, reason: str) -> None:
-        """Disable BERTScore for the remainder of the run after an unrecoverable compatibility failure."""
-        if self.use_bertscore:
-            print(f"Warning: Disabling BERTScore for this run: {reason}")
-        self.use_bertscore = False
-        self._bertscore_model = None
-        self._bertscore_model_active_name = None
-        self._bertscore_disabled_reason = reason
+    def _load_bertscore_model(self) -> Optional[Any]:
+        """Load the pinned BERTScore model, probing one real score call.
 
-    def _load_bertscore_model(self, exclude: Optional[set[str]] = None) -> Any:
-        self._bertscore_model = None
-        self._bertscore_model_active_name = None
-        failures: List[str] = []
+        P0-5: no fallback model and no silent unrescaled retry. Baseline rescaling
+        is part of the pinned instrument definition (raw RoBERTa F1 sits in a
+        compressed ~0.3 band; §8.4 mandates rescaling), so losing it mid-run would
+        change the metric's SCALE under the same column name. Any failure marks
+        the instrument unavailable (strict: raises).
+        """
         try:
             from bert_score import BERTScorer
 
-            for candidate in self._iter_bertscore_candidates(exclude=exclude):
-                try:
-                    # rescale_with_baseline is REQUIRED for discriminative scores:
-                    # raw RoBERTa F1 sits in a compressed ~0.3 band and is flat across
-                    # systems. Baseline rescaling restores dynamic range. lang selects
-                    # the correct baseline file.
-                    try:
-                        scorer = BERTScorer(
-                            model_type=candidate,
-                            device=self.device,
-                            lang=self.bertscore_lang,
-                            rescale_with_baseline=self.bertscore_rescale_with_baseline,
-                        )
-                    except Exception as baseline_err:
-                        # Some custom model_types have no published baseline file;
-                        # fall back to unrescaled rather than dropping the model.
-                        print(
-                            f"Warning: BERTScore baseline rescaling unavailable for "
-                            f"'{candidate}' ({baseline_err}); using unrescaled scores."
-                        )
-                        scorer = BERTScorer(model_type=candidate, device=self.device)
-                    self._probe_bertscore_model(scorer)
-                    self._bertscore_model = scorer
-                    self._bertscore_model_active_name = candidate
-                    break
-                except Exception as e:
-                    failures.append(f"{candidate}: {e}")
-                    print(f"Warning: Failed to initialize BERTScore model '{candidate}': {e}")
-            if self._bertscore_model is None and failures:
-                self._disable_bertscore(
-                    "all configured BERTScore models failed to initialize under the current bert-score/transformers stack"
-                )
+            scorer = BERTScorer(
+                model_type=self.bertscore_model_name,
+                device=self.device,
+                lang=self.bertscore_lang,
+                rescale_with_baseline=self.bertscore_rescale_with_baseline,
+            )
+            self._probe_bertscore_model(scorer)
         except Exception as e:
-            self._disable_bertscore(f"failed to import bert-score: {e}")
-        return self._bertscore_model
-    
+            self._mark_unavailable("bertscore", self.bertscore_model_name, e)
+            return None
+        self._bertscore_model = scorer
+        return scorer
+
     @property
-    def rouge_scorer(self):
-        """Lazy load ROUGE scorer."""
-        if self._rouge_scorer is None and self.use_rouge:
+    def rouge_scorer(self) -> Optional[Any]:
+        """Lazy load ROUGE scorer ('rouge_score' is the pinned implementation)."""
+        if (
+            self._rouge_scorer is None
+            and self.use_rouge
+            and "rouge" not in self._instrument_unavailable
+        ):
             try:
                 from rouge_score import rouge_scorer
+
                 self._rouge_scorer = rouge_scorer.RougeScorer(
                     ["rouge1", "rouge2", "rougeL"],
                     use_stemmer=True,
                 )
             except Exception as e:
-                print(f"Warning: Failed to load ROUGE: {e}")
-                self._rouge_scorer = None
+                self._mark_unavailable("rouge", "rouge_score", e)
         return self._rouge_scorer
 
     @property
-    def lettucedetect_model(self):
-        """Lazy load the LettuceDetect hallucination detector (PRIMARY grounding signal)."""
+    def lettucedetect_model(self) -> Optional[Any]:
+        """Lazy load the PINNED LettuceDetect detector (PRIMARY grounding signal)."""
         if (
             self._lettucedetect_model is None
             and self.use_lettucedetect
-            and self._lettucedetect_disabled_reason is None
+            and "lettucedetect" not in self._instrument_unavailable
         ):
             try:
                 from lettucedetect.models.inference import HallucinationDetector
@@ -479,12 +534,9 @@ class QualityEvaluator:
                     device=device_str,
                 )
             except Exception as e:
-                self._lettucedetect_disabled_reason = str(e)
-                print(
-                    f"Warning: LettuceDetect unavailable ({e}); "
-                    f"falling back to NLI faithfulness only."
+                self._mark_unavailable(
+                    "lettucedetect", self.lettucedetect_model_name, e
                 )
-                self._lettucedetect_model = None
         return self._lettucedetect_model
 
     @staticmethod
@@ -547,9 +599,20 @@ class QualityEvaluator:
             idx = self._resolve_nli_entail_index()
             if idx is not None:
                 return by_label.get(f"label_{idx}")
+            # No entailment class resolvable: the pinned model cannot be
+            # interpreted -- misconfiguration, not a per-input hiccup. Silently
+            # skipping every claim here is exactly the fail-open path P0-5 bans.
+            raise InstrumentUnavailableError(
+                "nli", self.nli_model_name,
+                "entailment class unresolvable from model labels/id2label",
+            )
+        except InstrumentUnavailableError:
+            if self.strict:
+                raise
+            self._note_row_status("nli", "error", "entailment-class-unresolved")
             return None
         except Exception as e:
-            print(f"Error in NLI entailment: {e}")
+            self._scoring_failure("nli", self.nli_model_name, e)
             return None
 
     # B2 (2026-07-16 audit): premise budget for a single NLI window, in NLI-tokenizer
@@ -657,11 +720,16 @@ class QualityEvaluator:
         empty: Dict[str, Any] = {
             "faithfulness": None, "supported_claim_ratio": None, "premise_mode": None,
         }
-        if not self.use_nli or not self.nli_model:
+        if not self.use_nli:
             return empty
         nonempty_ctx = [c for c in (context or []) if c and str(c).strip()]
         claims = self._split_claims(generated_text or "")
         if not nonempty_ctx or not claims:
+            return empty
+        # Instrument gate AFTER the input early-outs: rows the model was never
+        # needed for neither raise nor carry a status. Strict load failure raises.
+        if self.nli_model is None:
+            self._note_unavailable_row("nli")
             return empty
 
         try:
@@ -688,8 +756,10 @@ class QualityEvaluator:
                 "supported_claim_ratio": supported,
                 "premise_mode": "windowed" if windowed else "direct",
             }
+        except InstrumentUnavailableError:
+            raise  # strict-mode failure from _nli_entailment_prob: never swallow
         except Exception as e:
-            print(f"Error in faithfulness evaluation: {e}")
+            self._scoring_failure("nli", self.nli_model_name, e)
             return empty
 
     def evaluate_hallucination(
@@ -706,10 +776,13 @@ class QualityEvaluator:
             "hallucinated_span_ratio": None,
             "hallucinated_spans": None,
         }
-        detector = self.lettucedetect_model
         answer = generated_text or ""
         nonempty_ctx = [str(c) for c in (context or []) if c and str(c).strip()]
-        if detector is None or not nonempty_ctx or not answer.strip():
+        if not self.use_lettucedetect or not nonempty_ctx or not answer.strip():
+            return empty
+        detector = self.lettucedetect_model  # strict: raises on load failure
+        if detector is None:
+            self._note_unavailable_row("lettucedetect")
             return empty
         try:
             spans = detector.predict(
@@ -747,7 +820,7 @@ class QualityEvaluator:
                 "hallucinated_spans": norm_spans,
             }
         except Exception as e:
-            print(f"Error in LettuceDetect hallucination detection: {e}")
+            self._scoring_failure("lettucedetect", self.lettucedetect_model_name, e)
             return empty
     
     def evaluate_relevance(
@@ -762,17 +835,17 @@ class QualityEvaluator:
         model is unavailable.
         """
         nonempty_ctx = [c for c in (context or []) if c and str(c).strip()]
-        if not self.embedding_model or not nonempty_ctx:
+        if not self.use_embeddings or not nonempty_ctx:
+            return None
+        model = self.embedding_model  # strict: raises on load failure
+        if model is None:
+            self._note_unavailable_row("embedding")
             return None
 
         try:
             # Encode question and context
-            question_emb = self.embedding_model.encode(
-                question, convert_to_tensor=True
-            )
-            context_embs = self.embedding_model.encode(
-                nonempty_ctx, convert_to_tensor=True
-            )
+            question_emb = model.encode(question, convert_to_tensor=True)
+            context_embs = model.encode(nonempty_ctx, convert_to_tensor=True)
 
             # Compute cosine similarities
             from sentence_transformers.util import cos_sim
@@ -782,7 +855,7 @@ class QualityEvaluator:
             return float(similarities.max().cpu().numpy())
 
         except Exception as e:
-            print(f"Error in relevance evaluation: {e}")
+            self._scoring_failure("embedding", self.embedding_model_name, e)
             return None
     
     def evaluate_completeness(
@@ -813,37 +886,32 @@ class QualityEvaluator:
                 results["rouge_l_f1"] = 0.0
             return results
         
-        # BERTScore
-        if self.bertscore_model:
-            try:
-                P, R, F1 = self.bertscore_model.score(
-                    [generated_text], [reference_answer]
-                )
-                results["bertscore_f1"] = float(F1[0].cpu().numpy())
-            except Exception as e:
-                active_model = self._bertscore_model_active_name or self.bertscore_model_name
-                print(f"Error in BERTScore with model '{active_model}': {e}")
-                fallback = self._load_bertscore_model(exclude={active_model})
-                if fallback is not None:
-                    try:
-                        P, R, F1 = fallback.score(
-                            [generated_text], [reference_answer]
-                        )
-                        results["bertscore_f1"] = float(F1[0].cpu().numpy())
-                    except Exception as retry_error:
-                        print(f"Error in BERTScore fallback: {retry_error}")
-                        self._disable_bertscore(
-                            f"runtime scoring failed after fallback attempt: {retry_error}"
-                        )
-        
+        # BERTScore. P0-5: the old path reloaded a FALLBACK model on a runtime
+        # scoring error and kept scoring under the same column -- a silent mid-run
+        # instrument swap. Now: strict raises, non-strict labels the row.
+        if self.use_bertscore:
+            scorer = self.bertscore_model  # strict: raises on load failure
+            if scorer is None:
+                self._note_unavailable_row("bertscore")
+            else:
+                try:
+                    P, R, F1 = scorer.score([generated_text], [reference_answer])
+                    results["bertscore_f1"] = float(F1[0].cpu().numpy())
+                except Exception as e:
+                    self._scoring_failure("bertscore", self.bertscore_model_name, e)
+
         # ROUGE
-        if self.rouge_scorer:
-            try:
-                scores = self.rouge_scorer.score(reference_answer, generated_text)
-                results["rouge_l_f1"] = scores["rougeL"].fmeasure
-            except Exception as e:
-                print(f"Error in ROUGE: {e}")
-        
+        if self.use_rouge:
+            rs = self.rouge_scorer  # strict: raises on load failure
+            if rs is None:
+                self._note_unavailable_row("rouge")
+            else:
+                try:
+                    scores = rs.score(reference_answer, generated_text)
+                    results["rouge_l_f1"] = scores["rougeL"].fmeasure
+                except Exception as e:
+                    self._scoring_failure("rouge", "rouge_score", e)
+
         return results
     
     def evaluate_f1_score(
@@ -1030,6 +1098,10 @@ class QualityEvaluator:
         # The raw generation is NEVER overwritten: callers keep generated_answer and
         # this result carries sanitized_answer alongside. NOTE: hallucinated_spans
         # char offsets refer to the SANITIZED text.
+        # P0-5: per-row instrument status. Tokens accumulate as instruments are
+        # consulted; 'ok' means every pinned instrument asked to score this row
+        # produced a score (config-disabled instruments are not consulted).
+        self._row_status_tokens = []
         sanitized_text = sanitize_answer(generated_text)
         f1_metrics = self.evaluate_f1_score(sanitized_text, reference_answer, all_answers)
         relevance = self.evaluate_relevance(question, context)
@@ -1059,6 +1131,13 @@ class QualityEvaluator:
             halluc = self.evaluate_hallucination(question, context, sanitized_text)
             completeness = self.evaluate_completeness(sanitized_text, reference_answer)
 
+        # Dedupe (per-claim NLI errors repeat) while preserving consult order.
+        instrument_status = (
+            ";".join(dict.fromkeys(self._row_status_tokens))
+            if self._row_status_tokens
+            else "ok"
+        )
+
         return QualityMetrics(
             faithfulness=faith["faithfulness"],
             relevance=relevance,
@@ -1080,6 +1159,7 @@ class QualityEvaluator:
             supported_claim_ratio=faith["supported_claim_ratio"],
             faithfulness_premise_mode=faith.get("premise_mode"),
             sanitized_answer=sanitized_text,
+            instrument_status=instrument_status,
             hallucinated_spans=halluc.get("hallucinated_spans"),
         )
     
@@ -1126,54 +1206,62 @@ class QualityEvaluator:
                 relevant_block_count=0,
                 total_block_count=0,
                 per_block_scores=[],
+                method="none",
             )
-        
+
         per_block_scores = []
-        
-        # Method 1: Embedding similarity between each block and the reference answer
-        # This measures whether each block contains information relevant to the answer
+
+        # Method 1: Embedding similarity between each block and the reference answer.
+        # P0-5: the lexical fallback survives ONLY because this is an explicitly
+        # labeled DIAGNOSTIC (never in Y) and the method used is written into the
+        # row -- the substitute score never masquerades as the embedding scorer's.
+        # In strict mode a broken embedding model raises via the property.
+        method = f"embedding:{self.embedding_model_name}"
         if self.embedding_model:
             try:
                 from sentence_transformers.util import cos_sim
-                
+
                 # Encode reference answer (what we're trying to generate)
                 ref_emb = self.embedding_model.encode(
                     reference_answer, convert_to_tensor=True
                 )
-                
+
                 # Encode each cache block
                 block_embs = self.embedding_model.encode(
                     cache_blocks, convert_to_tensor=True
                 )
-                
+
                 # Compute similarity of each block to the reference answer
                 similarities = cos_sim(ref_emb, block_embs)[0]
                 per_block_scores = [float(s.cpu().numpy()) for s in similarities]
-                
+
             except Exception as e:
                 print(f"Error computing cache relevance embeddings: {e}")
-                # Fall back to lexical overlap
+                # Fall back to lexical overlap (labeled below).
+                method = "lexical_jaccard"
                 per_block_scores = self._lexical_cache_relevance(
                     reference_answer, cache_blocks
                 )
         else:
-            # Fallback: lexical overlap (token-based)
+            # Fallback: lexical overlap (token-based), labeled.
+            method = "lexical_jaccard"
             per_block_scores = self._lexical_cache_relevance(
                 reference_answer, cache_blocks
             )
-        
+
         # Count blocks above relevance threshold
         relevant_count = sum(1 for s in per_block_scores if s >= relevance_threshold)
         total_count = len(cache_blocks)
-        
+
         # Cache relevance = proportion of blocks that were actually useful
         cache_relevance = relevant_count / total_count if total_count > 0 else 0.0
-        
+
         return CacheRelevanceMetrics(
             cache_relevance=cache_relevance,
             relevant_block_count=relevant_count,
             total_block_count=total_count,
             per_block_scores=per_block_scores,
+            method=method,
         )
     
     def _lexical_cache_relevance(
@@ -1255,4 +1343,5 @@ class QualityEvaluator:
             generated_text, reference_answer, blocks_to_evaluate, relevance_threshold
         )
         metrics.cache_relevance = cache_rel.cache_relevance
+        metrics.cache_relevance_method = cache_rel.method  # P0-5 labeled diagnostic
         return metrics

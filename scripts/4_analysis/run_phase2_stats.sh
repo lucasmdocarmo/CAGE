@@ -1,4 +1,9 @@
 #!/bin/bash
+# PILOT-ERA — campaign analysis = run_campaign_analysis.py; kept for pilot re-renders.
+# This script aggregates the PILOT (Phase-2) results layout and its retired flat
+# baseline names. Campaign runs (RESULTS_LAYOUT v2 cell trees) go through
+# scripts/4_analysis/organize_results.py -> scripts/4_analysis/run_campaign_analysis.py.
+#
 # Consolidate all Phase-2 baselines (core + compression 2x2 + speculative 2x2) into one
 # dir and run the per-query statistical layer (Wilcoxon + Holm + bootstrap) vs no_cache.
 # Emits a JSON summary + a paper-ready LaTeX table, then syncs to GCS.

@@ -1,4 +1,9 @@
 #!/bin/bash
+# =============================================================================
+# PILOT HARNESS — drives the retired 9-name taxonomy via the alias map; the
+# campaign harness (CellSpec-native, D6 open-loop) lands at tranche P1; use for
+# pilot re-scoring only.
+# =============================================================================
 # Prefix-cache WORKLOAD-ENVELOPE cells + the true-CAG baseline (2026-07-15, tasks #71/#82).
 #
 # Why: with workload_mode=single on SQuAD every query carries a private paragraph, so the
@@ -25,7 +30,10 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR/../.."
+# No -e here (fault-tolerant cells): guard the cd so relative paths can never run elsewhere.
+cd "$SCRIPT_DIR/../.." || exit 1
+# shellcheck source=scripts/lib/_common.sh
+source scripts/lib/_common.sh
 source scripts/lib/_serving_config.sh
 
 MODEL=${1:-"Qwen/Qwen3-8B"}
@@ -38,8 +46,9 @@ REPEAT_QUERIES=${REPEAT_QUERIES:-3}
 OUTPUT_DIR="${CAGE_RUN_ROOT:-results/phase2/local}/envelope"
 mkdir -p "$OUTPUT_DIR"
 
-TELEMETRY_FLAG=""
-if [ "${VLLM_TELEMETRY:-0}" != "0" ]; then TELEMETRY_FLAG="--vllm-telemetry"; fi
+# Array so the empty case expands to zero argv words (safe under set -u via ${arr[@]+...}).
+TELEMETRY_FLAG=()
+if [ "${VLLM_TELEMETRY:-0}" != "0" ]; then TELEMETRY_FLAG=(--vllm-telemetry); fi
 
 FAILED=()
 
@@ -58,10 +67,10 @@ prepare_cell() {  # <label> -> 0 run, 1 skip
     local label="$1" dir="$OUTPUT_DIR/$1"
     if [ "${CAGE_FORCE_RERUN:-0}" = "1" ]; then
         [ -d "$dir" ] && echo "    FORCE RERUN: wiping $label"
-        rm -rf "$dir"; return 0
+        rm -rf "${dir:?}"; return 0
     fi
     if cell_complete "$dir"; then echo "SKIP (complete): $label"; return 1; fi
-    [ -d "$dir" ] && { echo "    PARTIAL: wiping incomplete $label"; rm -rf "$dir"; }
+    [ -d "$dir" ] && { echo "    PARTIAL: wiping incomplete $label"; rm -rf "${dir:?}"; }
     return 0
 }
 
@@ -79,7 +88,7 @@ run_cell() {  # <label> <baseline_type> [extra run_experiment args...]
         --num-trials "$NUM_TRIALS" \
         --seed "$SEED" \
         --output-dir "$OUTPUT_DIR/$label" \
-        $TELEMETRY_FLAG \
+        ${TELEMETRY_FLAG[@]+"${TELEMETRY_FLAG[@]}"} \
         "$@"; then
         mkdir -p "$OUTPUT_DIR/$label"
         echo "STATUS=failed reason=run_experiment model=$MODEL $(date)" > "$OUTPUT_DIR/$label/STATUS"

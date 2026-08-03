@@ -18,9 +18,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_DIR"
+# shellcheck source=scripts/lib/_common.sh
+source "$PROJECT_DIR/scripts/lib/_common.sh"
 
-PORT=${VLLM_PORT:-8000}
+PORT="${VLLM_PORT:-8000}"
 LOG_DIR="$PROJECT_DIR/logs/vllm"
+# Daemon discipline: the launched server's PID is recorded here at start and cleared
+# at stop, so status/stop have an authoritative handle instead of pgrep-guessing.
+PID_FILE="$LOG_DIR/vllm_server.pid"
 
 # Colors
 RED='\033[0;31m'
@@ -31,6 +36,17 @@ NC='\033[0m' # No Color
 mkdir -p "$LOG_DIR"
 
 get_vllm_pid() {
+    # Prefer the pidfile written at start; validate the PID is alive AND still a vLLM
+    # process (PIDs get recycled) before trusting it.
+    local fpid
+    if [ -f "$PID_FILE" ]; then
+        fpid="$(cat "$PID_FILE" 2>/dev/null || true)"
+        if [ -n "$fpid" ] && ps -p "$fpid" -o command= 2>/dev/null | grep -q "vllm"; then
+            echo "$fpid"
+            return 0
+        fi
+    fi
+    # Fallback (pre-pidfile servers / stale pidfile): pgrep.
     # head -n1: pgrep -f can match multiple PIDs (a lingering serve plus workers).
     # Callers store this in a scalar and run `ps -p "$pid"`, which errors on a
     # multiline value (breaking the prefix-cache-mode check and forcing needless restarts).
@@ -38,17 +54,18 @@ get_vllm_pid() {
 }
 
 get_loaded_model() {
-    curl -s http://localhost:${PORT}/v1/models 2>/dev/null | \
+    curl -s "http://localhost:${PORT}/v1/models" 2>/dev/null | \
         python3 -c "import sys, json; data=json.load(sys.stdin); print(data['data'][0]['id'] if data.get('data') else '')" 2>/dev/null || echo ""
 }
 get_server_prefix_cache_mode() {
-    local pid=$(get_vllm_pid)
+    local pid cmd
+    pid=$(get_vllm_pid)
     if [ -z "$pid" ]; then
         echo "unknown"
         return 1
     fi
 
-    local cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
+    cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
     if [[ "$cmd" == *"--no-enable-prefix-caching"* ]]; then
         echo "disabled"
         return 0
@@ -80,10 +97,11 @@ start_server() {
     echo -e "${YELLOW}Starting vLLM server with model: $model${NC}"
     
     # Check if already running
-    local pid=$(get_vllm_pid)
+    local pid
+    pid=$(get_vllm_pid)
     if [ -n "$pid" ]; then
-        local loaded_model=$(get_loaded_model)
-        local prefix_cache_mode
+        local loaded_model prefix_cache_mode
+        loaded_model=$(get_loaded_model)
         prefix_cache_mode=$(get_server_prefix_cache_mode)
         local has_prefix_cache="$prefix_cache_mode"
         if [ "$prefix_cache_mode" = "enabled" ]; then
@@ -111,8 +129,9 @@ start_server() {
     fi
     
     # Start server
-    local timestamp=$(date +%Y%m%d_%H%M%S)
-    local log_file="$LOG_DIR/vllm_${model//\//_}_${timestamp}.log"
+    local timestamp log_file
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    log_file="$LOG_DIR/vllm_${model//\//_}_${timestamp}.log"
     
     # Build the server argv as an ARRAY so values with internal whitespace (notably the
     # JSON speculative config) are passed as a single token and never word-split.
@@ -251,19 +270,21 @@ PYEOF
 
     echo "Starting vLLM server (logging to $log_file)..."
     nohup vllm serve "$model" "${vllm_args[@]}" > "$log_file" 2>&1 &
-    
+
     local server_pid=$!
-    echo "Server PID: $server_pid"
+    printf '%s\n' "$server_pid" > "$PID_FILE"
+    echo "Server PID: $server_pid (pidfile: $PID_FILE)"
     
     # Wait for server to be ready. vLLM's torch.compile + CUDA-graph capture can take
     # 2-3 min on smaller GPUs (e.g. L4), so 60s is too short and aborts the suite under
     # set -e. Allow 5 min by default; override with VLLM_START_TIMEOUT.
     echo "Waiting for server to start..."
-    local max_wait=${VLLM_START_TIMEOUT:-300}
+    local max_wait="${VLLM_START_TIMEOUT:-300}"
     local waited=0
-    while [ $waited -lt $max_wait ]; do
-        if curl -s http://localhost:${PORT}/health > /dev/null 2>&1; then
-            local loaded=$(get_loaded_model)
+    local loaded
+    while [ "$waited" -lt "$max_wait" ]; do
+        if curl -s "http://localhost:${PORT}/health" > /dev/null 2>&1; then
+            loaded=$(get_loaded_model)
             if [ "$loaded" = "$model" ]; then
                 echo -e "${GREEN}✓ Server ready with model: $model${NC}"
                 echo "  View logs: tail -f $log_file"
@@ -318,23 +339,27 @@ stop_server() {
     done
     sleep 2
 
+    # The daemon is down: clear its pidfile so a stale PID can never be trusted later.
+    rm -f "$PID_FILE"
+
     local gpu_mem
-    gpu_mem=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null)
+    gpu_mem=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null || true)
     echo -e "${GREEN}✓ Server stopped${NC} (GPU mem used: ${gpu_mem:-n/a})"
 }
 
 status_server() {
-    local pid=$(get_vllm_pid)
-    
+    local pid loaded_model
+    pid=$(get_vllm_pid)
+
     if [ -z "$pid" ]; then
         echo -e "${RED}✗ vLLM server is NOT running${NC}"
         return 1
     fi
-    
+
     echo -e "${GREEN}✓ vLLM server is running${NC}"
     echo "  PID: $pid"
-    
-    local loaded_model=$(get_loaded_model)
+
+    loaded_model=$(get_loaded_model)
     if [ -n "$loaded_model" ]; then
         echo "  Model: $loaded_model"
         echo "  Port: $PORT"

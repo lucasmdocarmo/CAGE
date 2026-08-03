@@ -1,5 +1,9 @@
 #!/bin/bash
 # =============================================================================
+# PILOT HARNESS — drives the retired 9-name taxonomy via the alias map; the
+# campaign harness (CellSpec-native, D6 open-loop) lands at tranche P1; use for
+# pilot re-scoring only.
+# =============================================================================
 # CAGE memory-pressure sweep: gpu_memory_utilization is THE swept axis.
 #
 # MECHANISM UNDER TEST (single-stream L4): memory pressure manifests as
@@ -41,7 +45,10 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR/../.."
+# No -e here (fault-tolerant cells): guard the cd so relative paths can never run elsewhere.
+cd "$SCRIPT_DIR/../.." || exit 1
+# shellcheck source=scripts/lib/_common.sh
+source scripts/lib/_common.sh
 source scripts/lib/_serving_config.sh
 source scripts/lib/_log_guard.sh
 
@@ -69,12 +76,16 @@ mkdir -p "$OUTPUT_DIR"
 # duration too (mirrors the full-sweep behavior). LOUD no-op if CAGE_RESULTS_BUCKET unset.
 _MS_PHASE="${CAGE_PHASE:-phase2}"
 bash scripts/5_observability/gcs_backup_daemon.sh start "results/${_MS_PHASE}" || true
+# INTERIM trap: covers an exit in the window before `trap cleanup EXIT` below, which
+# REPLACES this one (bash keeps ONE handler per signal). cleanup() therefore repeats
+# this daemon stop -- keep the two in lockstep.
 trap 'bash scripts/5_observability/gcs_backup_daemon.sh stop "results/'"${_MS_PHASE}"'" >/dev/null 2>&1 || true' EXIT
 
 # Telemetry defaults ON here (unlike the baseline trees): the phase-time counters,
 # preemptions_total, and telemetry_series.jsonl ARE this sweep's readout.
-TELEMETRY_FLAG=""
-if [ "${VLLM_TELEMETRY:-1}" != "0" ]; then TELEMETRY_FLAG="--vllm-telemetry"; fi
+# Array so the empty case expands to zero argv words (safe under set -u via ${arr[@]+...}).
+TELEMETRY_FLAG=()
+if [ "${VLLM_TELEMETRY:-1}" != "0" ]; then TELEMETRY_FLAG=(--vllm-telemetry); fi
 
 echo "=============================================="
 echo "MEMORY-PRESSURE SWEEP  model=$MODEL  Q=$NUM_QUERIES  trials=$NUM_TRIALS"
@@ -94,6 +105,10 @@ FAILED=()
 
 cleanup() {
     ./scripts/2_serving/manage_vllm_server.sh stop >/dev/null 2>&1 || true
+    # Stop the GCS backup daemon (kills the setsid sync loop + one final authoritative
+    # sync). MUST live here: `trap cleanup EXIT` below REPLACED the interim stop trap
+    # registered at daemon start, so omitting this orphans the loop on every exit.
+    bash scripts/5_observability/gcs_backup_daemon.sh stop "results/${_MS_PHASE}" || true
     # Chain the log-guard's EXIT handler (our trap replaced it): final results sync.
     type __lg_cleanup >/dev/null 2>&1 && __lg_cleanup
 }
@@ -111,10 +126,10 @@ prepare_cell() {  # <cell> -> 0 run, 1 skip
     local cell="$1" dir="$OUTPUT_DIR/$1"
     if [ "${CAGE_FORCE_RERUN:-0}" = "1" ]; then
         [ -d "$dir" ] && echo "    FORCE RERUN: wiping $cell"
-        rm -rf "$dir"; return 0
+        rm -rf "${dir:?}"; return 0
     fi
     if cell_complete "$dir"; then echo "SKIP (complete): $cell"; return 1; fi
-    [ -d "$dir" ] && { echo "    PARTIAL: wiping incomplete $cell"; rm -rf "$dir"; }
+    [ -d "$dir" ] && { echo "    PARTIAL: wiping incomplete $cell"; rm -rf "${dir:?}"; }
     return 0
 }
 
@@ -202,7 +217,7 @@ run_cell() {  # <cell> <baseline_type> [extra run_experiment args...]
         --seed "$SEED" \
         --reset-cache-between-trials \
         --output-dir "$OUTPUT_DIR/$cell" \
-        $TELEMETRY_FLAG \
+        ${TELEMETRY_FLAG[@]+"${TELEMETRY_FLAG[@]}"} \
         "$@"; then
         mkdir -p "$OUTPUT_DIR/$cell"
         echo "STATUS=failed reason=run_experiment model=$MODEL $(date)" > "$OUTPUT_DIR/$cell/STATUS"

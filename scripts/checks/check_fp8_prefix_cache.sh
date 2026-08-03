@@ -16,6 +16,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODEL="${1:-Qwen/Qwen3-4B}"
 PORT="${VLLM_PORT:-8000}"
 
+# Trap-based cleanup: under set -e ANY unexpected failure after the launch (probe error,
+# curl/python missing) must still stop the FP8 server, or it lingers holding ~all VRAM.
+trap '"$SCRIPT_DIR/../2_serving/manage_vllm_server.sh" stop >/dev/null 2>&1 || true' EXIT
+
 echo ">>> [gate] launching vLLM: --kv-cache-dtype fp8 --enable-prefix-caching"
 VLLM_KV_CACHE_DTYPE=fp8 "$SCRIPT_DIR/../2_serving/manage_vllm_server.sh" restart "$MODEL"
 sleep 12
@@ -40,8 +44,7 @@ except Exception as e:
 PY
 )
 
-"$SCRIPT_DIR/../2_serving/manage_vllm_server.sh" stop >/dev/null 2>&1 || true
-
+# Server stop happens in the EXIT trap (covers every path, including errors above).
 case "$RESULT" in
     ERR*)         echo ">>> [gate] request failed: $RESULT"; echo "INCONCLUSIVE (server/flag error)."; exit 2 ;;
     ''|*[!0-9]*)  echo ">>> [gate] unexpected output: '$RESULT'"; exit 2 ;;

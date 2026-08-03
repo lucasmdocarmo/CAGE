@@ -12,14 +12,20 @@
 #     LOCAL_DIR  local mirror dir (default: ./phase2_archive)
 #     INTERVAL   seconds between pulls (default: 30)
 #   Ctrl-C to stop. The snapshot PNG is at <LOCAL_DIR>/observability/snapshots/latest.png.
-set -uo pipefail
+#
+# For a single-shot campaign status line (layout v2, no GCS pull), use watch_campaign.sh.
+set -euo pipefail
 
 BUCKET="${1:-${CAGE_RESULTS_BUCKET:-}}"
 LOCAL_DIR="${2:-./phase2_archive}"
 INTERVAL="${3:-30}"
 
+case "$INTERVAL" in
+  ''|*[!0-9]*) echo "ERROR: INTERVAL '$INTERVAL' is not a positive integer" >&2; exit 2 ;;
+esac
+
 if [ -z "$BUCKET" ]; then
-  _proj="$(gcloud config get-value project 2>/dev/null)"
+  _proj="$(gcloud config get-value project 2>/dev/null || true)"
   if [ -z "$_proj" ] || [ "$_proj" = "(unset)" ]; then
     echo "ERROR: no bucket given and no gcloud project set." >&2
     echo "  usage: bash scripts/5_observability/watch_run.sh gs://YOUR-BUCKET [local_dir] [interval]" >&2
@@ -27,6 +33,7 @@ if [ -z "$BUCKET" ]; then
   fi
   BUCKET="gs://${_proj}-cage-results"
 fi
+case "$BUCKET" in gs://*) ;; *) BUCKET="gs://${BUCKET}" ;; esac
 
 if ! command -v gsutil >/dev/null 2>&1; then
   echo "ERROR: gsutil not found. Install the Google Cloud SDK." >&2
@@ -42,8 +49,8 @@ _status_line() {
   # The bucket nests observability under results/<phase>/<run-id>/, so find the newest
   # latest.json regardless of run-id (fixes the old hardcoded analysis/observability path).
   local latest
-  latest="$(find "$LOCAL_DIR" -path '*/observability/snapshots/latest.json' 2>/dev/null | sort | tail -1)"
-  { [ -n "$latest" ] && [ -f "$latest" ]; } || { echo "[watch]   (no snapshot yet)"; return; }
+  latest="$(find "$LOCAL_DIR" -path '*/observability/snapshots/latest.json' 2>/dev/null | sort | tail -1 || true)"
+  { [ -n "$latest" ] && [ -f "$latest" ]; } || { echo "[watch]   (no snapshot yet)"; return 0; }
   if command -v python3 >/dev/null 2>&1; then
     python3 - "$latest" <<'PY' 2>/dev/null || echo "[watch]   (snapshot present; parse skipped)"
 import json, sys
@@ -62,7 +69,7 @@ PY
 
 trap 'echo; echo "[watch] stopped."; exit 0' INT TERM
 while true; do
-  gsutil -m rsync -r "$BUCKET" "$LOCAL_DIR" >/dev/null 2>&1 || echo "[watch]   (rsync retry next tick)"
+  gsutil -m rsync -r "$BUCKET" "$LOCAL_DIR" >/dev/null 2>&1 || echo "[watch]   (rsync failed; retry next tick)"
   _status_line
   sleep "$INTERVAL"
 done

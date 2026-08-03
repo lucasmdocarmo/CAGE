@@ -766,7 +766,7 @@ def run_experiment(
     # generated on the fly from the gold context (answer redacted), so no separate corpus
     # artifact is needed. stale_fraction is swept via the CAGE_STALE_FRACTION env var (falls
     # back to the preset default 0.0). NOTE: run a live 5-query smoke pass before a full sweep
-    # (validate-before-run). See Documentation/STALENESS_BASELINE_DESIGN.md.
+    # (validate-before-run). See the pilot-era STALENESS_BASELINE_DESIGN.md (doc removed; MyDocs/PUBLICATION.md governs).
     if baseline_config.baseline_type.value == "staleness":
         # TTL mode is NOT IMPLEMENTED. The only wired staleness path is the deterministic
         # version sweep (stale_fraction -> v0/v1). Fail loud rather than silently ignoring a
@@ -789,7 +789,8 @@ def run_experiment(
         print(
             "Note: speculative decoding is a vLLM LAUNCH-time setting, not a per-request "
             "parameter. Enable it by (re)starting the server with the VLLM_SPECULATIVE_CONFIG "
-            "JSON (see scripts/3_run/run_speculative_matrix.sh and scripts/2_serving/manage_vllm_server.sh). Acceptance "
+            "JSON (see scripts/deprecated/run_speculative_matrix.sh [speculative arms retired, "
+            "charter §7.5] and scripts/2_serving/manage_vllm_server.sh). Acceptance "
             "rate is captured from /metrics via --vllm-telemetry; this baseline measures the "
             "resulting TTFT/TPOT/throughput, and since speculative decoding is output-preserving "
             "it does not change answer quality."
@@ -1271,7 +1272,7 @@ def run_experiment(
         # Staleness/freshness baseline (GATED): hold the warm served context fixed and make a
         # deterministic fraction of served hits STALE (evidence redacted so it no longer
         # supports the answer). Only entered for the staleness baseline, so it has zero effect
-        # on the other nine arms. See Documentation/STALENESS_BASELINE_DESIGN.md.
+        # on the other nine arms. See the pilot-era STALENESS_BASELINE_DESIGN.md (doc removed; MyDocs/PUBLICATION.md governs).
         if baseline_config.baseline_type.value == "staleness":
             served_from_cache = True  # warm-cache assumption: every query is a served hit
             _fresh = list(example.context or [])
@@ -1834,7 +1835,7 @@ def run_experiment(
             # soft-accepted the config but speculation never engaged, or /metrics lacks the
             # vllm:spec_decode_* counters). A stdout WARNING is easy to miss across a 500x3
             # sweep, so ALSO persist a STATUS sentinel next to the results -- the same
-            # convention run_speculative_matrix.sh uses -- so the cell reads as DEGRADED,
+            # convention scripts/deprecated/run_speculative_matrix.sh used -- so the cell reads as DEGRADED,
             # not silently DONE, in the stats consolidation.
             if baseline_config.baseline_type.value == "speculative":
                 _acc = (vllm_telemetry_snapshot or {}).get("spec_decode_acceptance_rate")
@@ -2254,7 +2255,7 @@ def main():
         "--baseline",
         required=True,
         choices=["no_cache", "prefix_cache", "redis", "rag", "distributed", "hybrid", "speculative", "compressed_rag", "compressed_cag", "staleness"],
-        help="Baseline to evaluate (staleness is a scaffold: see Documentation/STALENESS_BASELINE_DESIGN.md)",
+        help="Baseline to evaluate (staleness is a scaffold; pilot-era design doc removed -- MyDocs/PUBLICATION.md governs)",
     )
     parser.add_argument(
         "--model",

@@ -48,8 +48,8 @@ deploy a **single pinned version** everywhere, exposed as one knob:
 
 | Where | Current (risk) | Pin to |
 |---|---|---|
-| `terraform/gcp/main.tf` (`vllm_image` default) | `vllm/vllm-openai:latest` | `vllm/vllm-openai:v0.11.0` |
-| `terraform/gcp/terraform.tfvars.example` | `:latest` | `:v0.11.0` |
+| `scripts/lib/_serving_config.sh` (the serving-uniformity source all launchers must source) | pilot pin `v0.11.0`-era | **`v0.19.1` (charter pin; see §7 matrix — SGLang/LMDeploy pins fixed at preflight)** |
+| ~~`terraform/gcp/*` (`vllm_image`)~~ | — | ROW RETIRED 2026-08-02: the old terraform/gcp was replaced; the new `terraform/` provisions bare GPU hosts (image family per `sessions/*.tfvars`) and engine pins live in the serving config, not IaC |
 | `docker/docker-compose.gpu.yml` | `:latest` | `:v0.11.0` |
 | `scripts/2_serving/deploy_cluster.sh` | `:latest` | `:v0.11.0` |
 | `k8s/vllm-replica.yaml` (×3) | `vllm/vllm-openai:latest` | `vllm/vllm-openai:v0.11.0` ✅ pinned |
@@ -128,3 +128,110 @@ Sources: [vLLM spec‑decode metrics](https://docs.vllm.ai/en/stable/api/vllm/v1
 - [x] `check_fp8_prefix_cache.sh`: the FP8×prefix‑caching gate (§4), auto‑run by `run_compression.sh`.
 - [x] `terraform vllm_extra_args` so cluster replicas can enable FP8/speculative.
 - [ ] Validate on GPU (Phase 2) — speculative and FP8 are GPU‑meaningful; both are Phase‑2 runs.
+
+---
+
+## 7. Campaign engine × model matrix (4 × 4) — every cell VERIFY-LIVE at its session's preflight
+
+> Charter bindings: PUBLICATION.md §7.6 (groups), P7 (LMDeploy pinning), D4 (HF-oracle
+> exemption for V3), §5.2 (Qwen3-Next identity gate). **No cell below is "known good"
+> until its gate has run on the provisioned node at the pinned version** — supported?/
+> pin? are the plan; the gate result is the fact. Record pass/fail + actual versions
+> into the run manifest and update this table per session.
+
+Engine pins for the campaign:
+
+| Engine | Pin | Pin status |
+|---|---|---|
+| vLLM | **0.19.1** (PyPI wheel / `vllm/vllm-openai:v0.19.1`) | PINNED (§0) — the §0 migration gate applies to every vLLM cell |
+| SGLang | TBD — pin the latest release at session-A preflight and freeze for the campaign | [VERIFY-LIVE] incl. **deterministic-mode availability** (T=0 reproducible sampling) per model |
+| LMDeploy | TBD — pin at session-A preflight; **TurboMind backend only** | [VERIFY-LIVE] gate: TurboMind is actually selected (not the silent PyTorch-engine fallback) |
+| HF Transformers | TBD — pin `transformers` at session-A preflight (the old `transformers<5` was a 0.11-era workaround; re-verify) | [VERIFY-LIVE] |
+
+The matrix (cell = supported? · pin · preflight gate):
+
+| Engine \ Model | **Qwen3-14B** (A) | **Llama-3.3-70B** (B) | **Qwen3-Next-80B** (C) | **DeepSeek-V3-0324** (D) |
+|---|---|---|---|---|
+| **vLLM 0.19.1** | ✅ planned. Gate: §3 flag gate + prefix telemetry (`cached_tokens`) + thinking-mode pinned OFF | ✅ planned, TP=4. Gate: TP launch + §3 on the 4-GPU node | ⚠️ planned; hybrid-attention prefix cache is experimental. Gate: **§5.2 mandatory T=0 token-identity smoke** on every prefix-ON cell (fail → cell excluded, failure IS the result) + intra-node PD smoke | ⚠️ planned; FP8 671 GB, MLA, TP=8. Gates: **fp8-KV-on-MLA** [VERIFY-LIVE — buggy on some MLA models], MLA×TP launch, NixlConnector cross-node (§8) |
+| **SGLang** (pin TBD) | ✅ planned. Gate: deterministic mode + radix-cache telemetry (per-request granularity [VERIFY-LIVE]) | ✅ planned, TP=4. Gate: as A + TP | ✅ planned (second engine for Group C). Gate: deterministic mode + prefix/radix reuse proven on hybrid attention; PD smoke → if it passes, SGLang joins the disaggregation rung | ✅ planned — **PURE TP for every registered V3 cell** (pin 2026-08-02). Gate: deterministic mode + MLA serving; PD smoke optional (only for the D rung if act-1 smoke passed) |
+| **LMDeploy-TurboMind** (pin TBD) | ✅ planned (P7). Gate: TurboMind actually selected + blocked-KV pressure counters (weakest documented telemetry — a failed cache-telemetry gate → serving-only or excluded cells) | ✅ planned, TP=4 (P7). Gate: as A + TP | ❌ **ABSENT BY POLICY (P7)** — not run, absence reported | ❌ **ABSENT BY POLICY (P7)** — not run, absence reported |
+| **HF oracle** | ✅ planned. Gate: T=0 batch-1 output/logit match vs each server engine (P2/P3); sub-pressure F1 only | ✅ planned (batch-1 `device_map` across the 4-GPU box). Gate: as A | ✅ planned. Gate: as A | ❌ **EXEMPT (D4)** — 671B oracle infeasible; recorded exemption; substitute = cross-engine T=0 agreement vLLM↔SGLang |
+
+Reading rule: ✅/⚠️/❌ is the *plan*; ⚠️ means the gate is load-bearing (a plausible
+failure mode is on record). A ❌-by-policy cell is a reported ecosystem finding, never a
+silent hole.
+
+---
+
+## 8. C/D session act-2 RDMA preflight — [RECONSTRUCTED 2026-08-02 — revalidate live at act-2 preflight]
+
+> Reconstructed from the salvage record of the Plan-B HPC study (original doc archived
+> offline; pointer: MyDocs/BACKLOG.md "C/D session prep"). Every number and knob below
+> is a *recorded prior*, not a verified fact for the act-2 nodes — the whole section
+> re-runs live before any RDMA-rung cell. Context: two `a3-ultragpu-8g` (8× H200)
+> nodes, RoCE v2 fabric on the MRDMA VFs, vLLM NixlConnector
+> (`--kv-transfer-config`) prefill/decode split.
+
+### 8.1 The failure this section exists to catch
+
+NIXL/UCX will **silently fall back to TCP** when the RDMA path is unusable (wrong GID,
+tcp left in `UCX_TLS`, unpinned NICs, driver mismatch). The run then *works* and
+produces plausible-looking numbers that measure the wrong transport.
+**TCP-fallback signature: ~8.5× TTFT inflation** on transfer-bound requests vs the
+RDMA envelope. Any TTFT jump of that magnitude on the RDMA rung = assume fallback,
+stop, re-run the five-check smoke.
+
+### 8.2 Five-check RoCE-not-TCP smoke (all five must pass, in order)
+
+1. **Devices present:** `ibv_devinfo` on both nodes lists the MRDMA VFs (one per rail),
+   each `PORT_ACTIVE`. Missing/DOWN devices → wrong image/driver or non-RDMA VPC.
+2. **GID sanity:** `show_gids` (or `ibv_devinfo -v`) per device — identify the RoCE v2
+   GID index for the fabric subnet and pin it (`UCX_IB_GID_INDEX`). Never assume index
+   0/3; discover it live.
+3. **Raw fabric bandwidth:** `ib_write_bw --use_cuda=<gpu>` node-to-node on each rail
+   hits RoCE-class line rate (~400 Gbps/NIC ballpark on A3 Ultra [revalidate]). This
+   proves GPUDirect RDMA end-to-end *below* NIXL.
+4. **Counter attribution:** during check 3 (and again during the vLLM smoke),
+   `ethtool -S <vf>` vPort counters on the MRDMA VFs increment by ~the transferred
+   bytes while TCP socket byte counters stay flat. Bytes on the wrong counter = TCP.
+5. **In-band engine smoke:** a 2-node vLLM P/D transfer with UCX debug on
+   (`UCX_LOG_LEVEL=info`) — the selected transports must exclude `tcp`
+   (expect `rc`/`dc` + `cuda_copy`/GDR paths), vLLM `nixl_*` metrics increment, and
+   TTFT sits inside the RDMA envelope (no 8.5×-class inflation).
+
+### 8.3 UCX hardening (set explicitly; do not trust auto-selection)
+
+- `UCX_TLS` — explicit allowlist **excluding `tcp`** (e.g. `rc,dc,cuda_copy,cuda_ipc`
+  [revalidate exact set]) so fallback becomes a loud failure instead of a silent
+  downgrade.
+- `UCX_NET_DEVICES` — pinned to the RDMA NICs (the MRDMA VF device:port list from
+  check 1), never left to auto (which can pick the frontend gVNIC).
+- `UCX_IB_GID_INDEX` — the RoCE v2 GID index discovered in check 2.
+- Discovery is live, per node, every provisioning: `ibv_devinfo` + `show_gids` output
+  goes into the act-2 manifest.
+
+### 8.4 Version-triple pin rule
+
+The transfer stack is pinned as a **triple — (vLLM, NIXL wheel, UCX)** — recorded
+together in the manifest; bump any element → re-run this whole section.
+
+- **UCX backend, NOT LIBFABRIC** (vLLM issue #27055: the LIBFABRIC path is broken/
+  unsupported for NixlConnector) [revalidate on 0.19.1].
+- The **NIXL wheel's CUDA major must match** the node's CUDA/driver major, or transfers
+  fail (sometimes silently into fallback).
+- The `nixl_*` Prometheus metrics require the nixl-metrics PR — verify the pinned vLLM
+  actually exposes them (`curl /metrics | grep nixl_`); without them check 5 and the
+  transfer-cost instrumentation are blind.
+
+### 8.5 Validation instruments (the act-2 measurement toolkit)
+
+| Instrument | What it proves |
+|---|---|
+| `ib_write_bw --use_cuda` (perftest) | raw GPUDirect RDMA bandwidth per rail, below the serving stack |
+| `ethtool -S` vPort counters on the MRDMA VFs | bytes actually moved over RDMA (attribution, not inference) |
+| vLLM `nixl_*` metrics | transfer count/bytes/latency as the engine sees them |
+| **T=0 token-identity check after transfer** | the transferred KV produced *identical tokens* to the untransferred baseline — transfer is lossless, not just fast |
+
+Cross-layer calibration (perftest → NIXL → vLLM metrics → cage-stats) must agree
+within the pre-registered tolerance; disagreement is itself a finding to chase before
+running cells.

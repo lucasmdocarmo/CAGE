@@ -1,7 +1,11 @@
 #!/bin/bash
 # =============================================================================
+# PILOT HARNESS — drives the retired 9-name taxonomy via the alias map; the
+# campaign harness (CellSpec-native, D6 open-loop) lands at tranche P1; use for
+# pilot re-scoring only.
+# =============================================================================
 # CAGE full-sweep orchestrator: core suite (+plots) -> compression 2x2 ->
-# speculative 2x2 -> consolidated stats, ALL under ONE run-id
+# [speculative 2x2: RETIRED, opt-in only] -> consolidated stats, ALL under ONE run-id
 # (results/<phase>/<run-id>/{baselines,compression,speculative,stats,plots,observability}).
 #
 # RESUME SEMANTICS
@@ -25,6 +29,8 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_DIR" || exit 1
+# shellcheck source=scripts/lib/_common.sh
+source "$PROJECT_DIR/scripts/lib/_common.sh"
 
 MODEL="${1:-Qwen/Qwen3-8B}"
 export NUM_QUERIES="${2:-${NUM_QUERIES:-500}}"
@@ -99,8 +105,15 @@ run_tree core bash scripts/3_run/cloud_run.sh "$MODEL" "$NUM_QUERIES" "$NUM_TRIA
 # 2. Compression 2x2 (FP8-x-prefix-cache and LLMLingua gates run inside).
 run_tree compression bash scripts/3_run/run_compression.sh "$MODEL"
 
-# 3. Speculative 2x2 (native-draft engagement gate runs inside).
-run_tree speculative bash scripts/3_run/run_speculative_matrix.sh "$MODEL"
+# 3. Speculative 2x2 -- RETIRED (charter §7.5, MyDocs/PUBLICATION.md): the speculative
+#    arms are out of the campaign design; the harness moved to scripts/deprecated/.
+#    Default = SKIP (loudly). Pilot re-scoring may opt back in explicitly.
+if [ "${CAGE_RUN_RETIRED_SPECULATIVE:-0}" = "1" ]; then
+    warn "running the RETIRED speculative 2x2 (CAGE_RUN_RETIRED_SPECULATIVE=1; charter §7.5) -- pilot forensics only"
+    run_tree speculative bash scripts/deprecated/run_speculative_matrix.sh "$MODEL"
+else
+    log "TREE speculative SKIPPED -- retired per charter §7.5 (set CAGE_RUN_RETIRED_SPECULATIVE=1 to run the deprecated pilot harness)"
+fi
 
 # 4. Prefix-cache workload envelope + true-CAG cells (cag_true_off/on, grouped,
 #    multiturn, repeat) -- the cells that let the prefix/CAG mechanism show itself.

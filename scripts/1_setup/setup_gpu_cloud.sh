@@ -17,7 +17,12 @@
 #   source cage-env/bin/activate
 #   nohup bash scripts/3_run/cloud_run.sh Qwen/Qwen3-8B 500 3 > run.log 2>&1 &
 #
-# See Cloud/PHASE2_CHECKLIST.md for the full ordered procedure.
+# See Cloud/RUNBOOK.md for the full ordered procedure.
+#
+# PROVISIONING (2026-08-02 charter): the GCP campaign path now PROVISIONS via
+# terraform/ (sessions/*.tfvars; `terraform apply` gated by explicit user
+# approval). This script does NOT provision -- it bootstraps an ALREADY-CREATED
+# box, and remains the SSH-config + neocloud-manual path.
 # =============================================================================
 set -euo pipefail
 
@@ -28,6 +33,8 @@ set -euo pipefail
 VLLM_VERSION="${VLLM_VERSION:-0.19.1}"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$PROJECT_DIR"
+# shellcheck source=scripts/lib/_common.sh
+source "$PROJECT_DIR/scripts/lib/_common.sh"
 
 echo "[cage] ============================================================"
 echo "[cage]  GPU cloud bootstrap (vLLM ${VLLM_VERSION})"
@@ -46,9 +53,13 @@ nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader ||
 #     no python3.10-dev/build-essential -> vLLM's Triton/torch.compile gcc step fails
 #     ("InductorError: cuda_utils.c"); no redis-server -> redis/hybrid baselines fail.
 echo "[cage] [0b] installing system packages (python3.10-venv/-dev, build-essential, redis)..."
-sudo apt-get update -qq || true
-sudo apt-get install -y python3.10-venv python3.10-dev build-essential redis-server || true
-sudo systemctl enable --now redis-server 2>/dev/null || redis-server --daemonize yes 2>/dev/null || true
+# Loud (not silent) fallbacks: a failed apt step is announced and the venv/redis checks
+# downstream will catch anything that actually mattered; the bootstrap itself continues.
+sudo apt-get update -qq || warn "apt-get update failed; continuing with stale package lists"
+sudo apt-get install -y python3.10-venv python3.10-dev build-essential redis-server \
+  || warn "apt-get install failed (python3.10-venv/-dev, build-essential, redis-server); venv creation or redis baselines may fail below"
+sudo systemctl enable --now redis-server 2>/dev/null || redis-server --daemonize yes 2>/dev/null \
+  || warn "could not start redis-server (systemctl and --daemonize both failed); redis/hybrid baselines will fail until it is started"
 
 # 1. Isolated virtual environment.
 echo "[cage] [1/5] creating venv cage-env..."
@@ -77,9 +88,10 @@ pip install -U "openai>=2.0"
 
 # 4. Stage the Phase-2 datasets so they are not lazy-downloaded mid-run.
 echo "[cage] [4/5] staging datasets (squad_v2, natural_questions, musique)..."
-python scripts/1_setup/download_datasets.py --dataset squad_v2 || true
-python scripts/1_setup/download_datasets.py --dataset natural_questions || true
-python scripts/1_setup/download_datasets.py --dataset musique || true
+# Loud fallbacks: a failed stage is announced (the run would lazy-download mid-sweep).
+python scripts/1_setup/download_datasets.py --dataset squad_v2 || warn "dataset stage failed: squad_v2 (will lazy-download mid-run)"
+python scripts/1_setup/download_datasets.py --dataset natural_questions || warn "dataset stage failed: natural_questions (will lazy-download mid-run)"
+python scripts/1_setup/download_datasets.py --dataset musique || warn "dataset stage failed: musique (will lazy-download mid-run)"
 
 # 4b. Prefetch model weights ROBUSTLY so a stalled Hugging Face connection cannot hang the timed
 #     vLLM server start mid-sweep. Observed 2026-07-13: a plain snapshot_download hung ~57 min at
@@ -105,7 +117,7 @@ PY
     if [ "$_ok" = "1" ]; then
       echo "[cage]   ${_m}: cached"
     else
-      echo "[cage]   WARNING: ${_m} not fully prefetched after retries; the vLLM server start will retry (bounded by HF_HUB_DOWNLOAD_TIMEOUT)."
+      warn "${_m} not fully prefetched after retries; the vLLM server start will retry (bounded by HF_HUB_DOWNLOAD_TIMEOUT)."
     fi
   done
 else
@@ -139,6 +151,6 @@ echo "[cage]    source cage-env/bin/activate"
 echo "[cage]    nohup bash scripts/3_run/cloud_run.sh Qwen/Qwen3-8B 500 3 > run.log 2>&1 &"
 echo "[cage]  Launch-time levers (run from their own scripts, they restart the server):"
 echo "[cage]    bash scripts/3_run/run_compression.sh Qwen/Qwen3-8B   # FP8 2x2 (gates FP8 x prefix-cache)"
-echo "[cage]    bash scripts/3_run/run_speculative_matrix.sh Qwen/Qwen3-8B   # speculative 2x2 (repeat for MiMo-7B-RL)"
-echo "[cage]  Full procedure + definition of done: Cloud/PHASE2_CHECKLIST.md"
+echo "[cage]  (speculative 2x2 RETIRED per charter §7.5 -> scripts/deprecated/)"
+echo "[cage]  Full procedure + definition of done: Cloud/RUNBOOK.md"
 echo "[cage] ============================================================"

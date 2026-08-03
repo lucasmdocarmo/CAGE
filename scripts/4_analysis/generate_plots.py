@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Generate the run's publication figure set from the canonical results loader.
+"""PILOT-ERA — campaign analysis = run_campaign_analysis.py; kept for pilot re-renders.
+
+This module renders the PILOT (Phase-2 layout) figure set via _results_loader.py
+and the retired flat baseline names. Campaign runs (cloud/RESULTS_LAYOUT.md v2,
+cells/<row_key>/window_<dataset>-<k>) are analyzed by
+scripts/4_analysis/run_campaign_analysis.py + figure_pipeline.py instead.
+
+Generate the run's publication figure set from the canonical results loader.
 
 2026-07-16 publication overhaul (supersedes the 2026-07-15 set):
 - Every figure, legend and table uses the canonical DISPLAY_NAME mapping from

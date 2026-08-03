@@ -1,5 +1,9 @@
 #!/bin/bash
 # =============================================================================
+# PILOT HARNESS — drives the retired 9-name taxonomy via the alias map; the
+# campaign harness (CellSpec-native, D6 open-loop) lands at tranche P1; use for
+# pilot re-scoring only.
+# =============================================================================
 # CAGE core baseline suite (single-node GPU = phase2). Runs the core baselines for ONE
 # model (no_cache, rag, redis, prefix_cache, hybrid cold/warm; +distributed when
 # ENABLE_DISTRIBUTED=1). Phase-neutral driver: cloud_run.sh runs it as phase2 by default.
@@ -13,6 +17,8 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=scripts/lib/_common.sh
+source "$PROJECT_DIR/scripts/lib/_common.sh"
 
 # Uniform serving config across ALL trees (Option A): non-eager / max_len 4096 / mem-util 0.90,
 # so the core baselines are served under the SAME regime as the compression + speculative
@@ -56,14 +62,17 @@ ENABLE_DISTRIBUTED=${ENABLE_DISTRIBUTED:-0}
 # vLLM telemetry via cage-stats: VLLM_TELEMETRY=1 captures a /metrics snapshot
 # (spec-decode acceptance, KV-compression, token-source, GPU) into each baseline's
 # results + prints a dashboard. Auto-enabled by cloud_run.sh.
-TELEMETRY_FLAG=""
-if [ "${VLLM_TELEMETRY:-0}" != "0" ]; then TELEMETRY_FLAG="--vllm-telemetry"; fi
+# Array (not a word-split string) so the empty case expands to ZERO argv words;
+# expand with ${TELEMETRY_FLAG[@]+...} which is safe under set -u on old bash too.
+TELEMETRY_FLAG=()
+if [ "${VLLM_TELEMETRY:-0}" != "0" ]; then TELEMETRY_FLAG=(--vllm-telemetry); fi
 _cleanup_ran=0
 echo "=============================================="
 echo "CAGE core baseline suite: $MODEL on $DATASET"
 echo "=============================================="
 
-cd "$PROJECT_DIR"
+# No -e in this script (fault-tolerant cells): guard the cd or everything below runs elsewhere.
+cd "$PROJECT_DIR" || exit 1
 mkdir -p "$PROJECT_DIR/logs" "$OUTPUT_DIR"
 
 # Activate the project venv regardless of its name (.venv locally, cage-env on the GPU VM).
@@ -122,7 +131,7 @@ prepare_cell() {  # <full label> -> 0 = run it (stale dir wiped), 1 = skip (alre
     local label="$1" dir="$OUTPUT_DIR/$1"
     if [ "${CAGE_FORCE_RERUN:-0}" = "1" ]; then
         [ -d "$dir" ] && echo "    FORCE RERUN (CAGE_FORCE_RERUN=1): wiping $label"
-        rm -rf "$dir"
+        rm -rf "${dir:?}"
         return 0
     fi
     if cell_complete "$dir"; then
@@ -131,7 +140,7 @@ prepare_cell() {  # <full label> -> 0 = run it (stale dir wiped), 1 = skip (alre
     fi
     if [ -d "$dir" ]; then
         echo "    PARTIAL: wiping incomplete $label and re-running"
-        rm -rf "$dir"
+        rm -rf "${dir:?}"
     fi
     return 0
 }
@@ -199,7 +208,7 @@ run_baseline() {
         --num-trials "$NUM_TRIALS" \
         --seed "$SEED" \
         --output-dir "$OUTPUT_DIR/$baseline_label" \
-        $TELEMETRY_FLAG \
+        ${TELEMETRY_FLAG[@]+"${TELEMETRY_FLAG[@]}"} \
         "$@"; then
         echo "    CELL $baseline_label RUN-FAIL"
         mkdir -p "$OUTPUT_DIR/$baseline_label"
@@ -233,7 +242,7 @@ run_distributed_variant() {
         --api-base "http://localhost:${ROUTER_PORT}" \
         --sharding-policy "$policy" \
         --output-dir "$OUTPUT_DIR/$baseline_label" \
-        $TELEMETRY_FLAG; then
+        ${TELEMETRY_FLAG[@]+"${TELEMETRY_FLAG[@]}"}; then
         echo "    CELL $baseline_label RUN-FAIL"
         mkdir -p "$OUTPUT_DIR/$baseline_label"
         echo "STATUS=failed reason=run model=$MODEL baseline=distributed $(date)" > "$OUTPUT_DIR/$baseline_label/STATUS"

@@ -22,71 +22,78 @@
 #   CAGE_COLLECT_TOKEN    unique token for the success sentinel (teardown_vm.sh sets this)
 #   CAGE_EXTRA_LOG_DIRS   extra ':'-separated dirs to also scan for *.log/*.out
 #   CAGE_LOG_NO_SYNC=1    gather + manifest only, skip GCS upload (for local testing)
+#
+# Deliberately NOT `set -e`: collection is best-effort by design -- one unreadable
+# forensic source must never abort the gather; each step is individually guarded and
+# only the GCS sync result decides the exit code (fail-closed for teardown).
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-cd "$PROJECT_DIR"
+cd "$PROJECT_DIR" || { echo "[collect_logs] ERROR: cannot cd to $PROJECT_DIR" >&2; exit 1; }
 
 MODE="${1:-full}"
 HOST="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo vm)"
 HOST="$(printf '%s' "$HOST" | tr -c 'A-Za-z0-9_.-' '_')"   # sanitize for a safe GCS path
 TS="$(date +%Y%m%d_%H%M%S 2>/dev/null || echo run)"
 LOGROOT="logs"
-mkdir -p "$LOGROOT/vllm" "$LOGROOT/runs" "$LOGROOT/system"
+mkdir -p "$LOGROOT/vllm" "$LOGROOT/runs" "$LOGROOT/system" \
+  || { echo "[collect_logs] ERROR: cannot create $LOGROOT/ subdirs" >&2; exit 1; }
 
 is_light() { [ "$MODE" = "--light" ] || [ "$MODE" = "light" ]; }
 
 # --- 1. Gather stray stdout/stats/timeline logs (depth<=2) from HOME, repo, extras ---
 scan_dirs=("$HOME" "$PROJECT_DIR")
-IFS=':' read -r -a _extra <<< "${CAGE_EXTRA_LOG_DIRS:-}"
+IFS=':' read -r -a _extra <<< "${CAGE_EXTRA_LOG_DIRS:-}" || true
 for d in "${_extra[@]:-}"; do [ -n "$d" ] && scan_dirs+=("$d"); done
 for base in "${scan_dirs[@]}"; do
   [ -d "$base" ] || continue
   # Tag destination by source dir so same-basename logs (~/run.log vs ~/CAGE/run.log)
   # do not overwrite each other in the flat runs/ folder.
   tag="$(printf '%s' "$base" | tr -c 'A-Za-z0-9' '_' | tail -c 16)"
-  while IFS= read -r f; do
+  while IFS= read -r -d '' f; do
     case "$f" in "$PROJECT_DIR/$LOGROOT/"*) continue ;; esac   # skip our own tree
     cp -p "$f" "$LOGROOT/runs/${tag}__$(basename "$f")" 2>/dev/null || true
-  done < <(find "$base" -maxdepth 2 -type f \( -name '*.log' -o -name '*.out' -o -name 'nohup.out' \) 2>/dev/null)
+  done < <(find "$base" -maxdepth 2 -type f \( -name '*.log' -o -name '*.out' -o -name 'nohup.out' \) -print0 2>/dev/null)
 done
 
 # --- 2. System forensics (full mode only) ------------------------------------------
 if ! is_light; then
   SYS="$LOGROOT/system/${HOST}_${TS}"
-  mkdir -p "$SYS"
-  { hostname; uname -a; date -u; echo; uptime; }        > "$SYS/host.txt"            2>&1 || true
-  nvidia-smi                                            > "$SYS/nvidia-smi.txt"      2>&1 || true
-  nvidia-smi -q                                         > "$SYS/nvidia-smi-full.txt" 2>&1 || true
-  free -h                                               > "$SYS/mem.txt"             2>&1 || true
-  df -h                                                 > "$SYS/disk.txt"            2>&1 || true
-  ps aux                                                > "$SYS/ps.txt"              2>&1 || true
-  ( dmesg -T 2>/dev/null || sudo dmesg -T 2>/dev/null ) > "$SYS/dmesg.txt"           2>&1 || true
-  grep -iE "out of memory|oom-kill|killed process|xid|nvrm" "$SYS/dmesg.txt" \
-                                                        > "$SYS/dmesg_oom_gpu.txt"   2>/dev/null || true
-  ( journalctl --since "-6h" --no-pager 2>/dev/null \
-      || sudo journalctl --since "-6h" --no-pager 2>/dev/null ) > "$SYS/journal.txt" 2>&1 || true
-  ( journalctl -k --no-pager 2>/dev/null \
-      || sudo journalctl -k --no-pager 2>/dev/null )    > "$SYS/journal_kernel.txt"  2>&1 || true
-  ( pip freeze 2>/dev/null )                            > "$SYS/pip_freeze.txt"      2>&1 || true
-  ( python3 -c "import vllm,torch;print('vllm',vllm.__version__);print('torch',torch.__version__)" 2>/dev/null ) \
-                                                        > "$SYS/versions.txt"        2>&1 || true
-  ( env | grep -iE "VLLM|CAGE|CUDA|REDIS|HF_HOME|HUGGING" | sort ) \
-                                                        > "$SYS/cage_env.txt"        2>&1 || true
-  ( redis-cli ping 2>/dev/null )                        > "$SYS/redis.txt"           2>&1 || true
-  # docker / redis container logs (cloud_run starts a cage-redis container) - best effort
-  if command -v docker >/dev/null 2>&1; then
-    docker ps -a > "$SYS/docker_ps.txt" 2>&1 || true
-    for c in $(docker ps -aq 2>/dev/null); do
-      docker logs "$c" > "$SYS/docker_${c}.log" 2>&1 || true
-    done
+  mkdir -p "$SYS" || echo "[collect_logs] WARNING: cannot create $SYS (forensics skipped)" >&2
+  if [ -d "$SYS" ]; then
+    { hostname; uname -a; date -u; echo; uptime; }        > "$SYS/host.txt"            2>&1 || true
+    nvidia-smi                                            > "$SYS/nvidia-smi.txt"      2>&1 || true
+    nvidia-smi -q                                         > "$SYS/nvidia-smi-full.txt" 2>&1 || true
+    free -h                                               > "$SYS/mem.txt"             2>&1 || true
+    df -h                                                 > "$SYS/disk.txt"            2>&1 || true
+    ps aux                                                > "$SYS/ps.txt"              2>&1 || true
+    ( dmesg -T 2>/dev/null || sudo -n dmesg -T 2>/dev/null ) > "$SYS/dmesg.txt"        2>&1 || true
+    grep -iE "out of memory|oom-kill|killed process|xid|nvrm" "$SYS/dmesg.txt" \
+                                                          > "$SYS/dmesg_oom_gpu.txt"   2>/dev/null || true
+    ( journalctl --since "-6h" --no-pager 2>/dev/null \
+        || sudo -n journalctl --since "-6h" --no-pager 2>/dev/null ) > "$SYS/journal.txt" 2>&1 || true
+    ( journalctl -k --no-pager 2>/dev/null \
+        || sudo -n journalctl -k --no-pager 2>/dev/null ) > "$SYS/journal_kernel.txt"  2>&1 || true
+    ( pip freeze 2>/dev/null )                            > "$SYS/pip_freeze.txt"      2>&1 || true
+    ( python3 -c "import vllm,torch;print('vllm',vllm.__version__);print('torch',torch.__version__)" 2>/dev/null ) \
+                                                          > "$SYS/versions.txt"        2>&1 || true
+    ( env | grep -iE "VLLM|CAGE|CUDA|REDIS|HF_HOME|HUGGING" | sort ) \
+                                                          > "$SYS/cage_env.txt"        2>&1 || true
+    ( redis-cli ping 2>/dev/null )                        > "$SYS/redis.txt"           2>&1 || true
+    # docker / redis container logs (cloud_run starts a cage-redis container) - best effort
+    if command -v docker >/dev/null 2>&1; then
+      docker ps -a > "$SYS/docker_ps.txt" 2>&1 || true
+      for c in $(docker ps -aq 2>/dev/null); do
+        docker logs "$c" > "$SYS/docker_${c}.log" 2>&1 || true
+      done
+    fi
   fi
 fi
 
 # --- 3. Manifest -------------------------------------------------------------------
-find "$LOGROOT" -type f | sort > "$LOGROOT/COLLECTED_MANIFEST_${HOST}.txt"
-N=$(find "$LOGROOT" -type f | wc -l | tr -d ' ')
+find "$LOGROOT" -type f 2>/dev/null | sort > "$LOGROOT/COLLECTED_MANIFEST_${HOST}.txt" || true
+N=$(find "$LOGROOT" -type f 2>/dev/null | wc -l | tr -d ' ')
 echo "[collect_logs] gathered $N files under $LOGROOT/ (host=$HOST mode=$MODE)"
 
 # --- 4. Mirror to GCS, host-namespaced (unless CAGE_LOG_NO_SYNC=1) -----------------
@@ -95,7 +102,7 @@ if [ "${CAGE_LOG_NO_SYNC:-0}" = "1" ]; then
   echo "COLLECT_LOGS_DONE host=$HOST (no-sync)"
   exit 0
 fi
-if ! bash "$SCRIPT_DIR/../5_observability/sync_results_to_gcs.sh" "$LOGROOT" "${CAGE_RESULTS_BUCKET:-}" "vm_logs/$HOST"; then
+if ! bash "$SCRIPT_DIR/sync_results_to_gcs.sh" "$LOGROOT" "${CAGE_RESULTS_BUCKET:-}" "vm_logs/$HOST"; then
   echo "COLLECT_LOGS_SYNC_FAILED host=$HOST" >&2
   exit 1
 fi
@@ -108,9 +115,11 @@ if is_light; then
   exit 0
 fi
 TOKEN="${CAGE_COLLECT_TOKEN:-$TS}"
+TOKEN="$(printf '%s' "$TOKEN" | tr -c 'A-Za-z0-9_.-' '_')"   # sentinel name must be a safe object name
 SENT="$LOGROOT/COLLECT_OK_${TOKEN}"
-{ echo "host=$HOST"; echo "token=$TOKEN"; echo "files=$N"; date -u; } > "$SENT"
-if bash "$SCRIPT_DIR/../5_observability/sync_results_to_gcs.sh" "$LOGROOT" "${CAGE_RESULTS_BUCKET:-}" "vm_logs/$HOST" >/dev/null 2>&1; then
+{ echo "host=$HOST"; echo "token=$TOKEN"; echo "files=$N"; date -u; } > "$SENT" \
+  || { echo "COLLECT_LOGS_SENTINEL_WRITE_FAILED host=$HOST" >&2; exit 1; }
+if bash "$SCRIPT_DIR/sync_results_to_gcs.sh" "$LOGROOT" "${CAGE_RESULTS_BUCKET:-}" "vm_logs/$HOST" >/dev/null 2>&1; then
   echo "COLLECT_LOGS_DONE host=$HOST sentinel=COLLECT_OK_${TOKEN}"
 else
   echo "COLLECT_LOGS_SENTINEL_SYNC_FAILED host=$HOST" >&2

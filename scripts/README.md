@@ -1,19 +1,19 @@
 # CAGE scripts
 
 Organized by **lifecycle stage**, numbered to show execution order. Anything off the live run
-path lives in [`deprecated/`](deprecated/DEPRECATED.md) (untouched by the ordering).
+path lives in [`deprecated/`](deprecated/README.md) (untouched by the ordering).
 
 ```
 scripts/
   1_setup/          provision the box + pull data      setup_gpu_cloud.sh  download_datasets.py
   2_serving/        start / manage vLLM                manage_vllm_server.sh  manage_vllm_cluster.py  deploy_cluster.sh
-  3_run/            run the experiments                cloud_run.sh  run_baselines.sh  run_compression.sh  run_speculative_matrix.sh  run_experiment.py
+  3_run/            run the experiments                cloud_run.sh  run_baselines.sh  run_compression.sh  run_experiment.py
   4_analysis/       stats + plots + verify             run_phase2_stats.sh  statistical_tests.py  token_divergence.py  generate_plots.py  verify_results.py
   5_observability/  live monitor + durable GCS mirror  observe_run.py  watch_run.sh  sync_results_to_gcs.sh  log_sync_daemon.sh  collect_logs.sh  gcp_shutdown_hook.sh  run_status_logger.sh
   6_teardown/       sentinel-verified $0 teardown       teardown_vm.sh
-  checks/           gates & tests (run as needed)      preflight_check.sh  check_fp8_prefix_cache.sh  check_mtp_spec_decode.sh  smoke_staleness.sh  run_tests.sh  simulate_network.sh
-  lib/              sourced by drivers (not run)        _serving_config.sh  _log_guard.sh
-  deprecated/       off the live path (see DEPRECATED.md)
+  checks/           gates & tests (run as needed)      preflight_check.sh  check_fp8_prefix_cache.sh  smoke_staleness.sh  run_tests.sh  simulate_network.sh
+  lib/              sourced by drivers (not run)        _common.sh  _serving_config.sh  _log_guard.sh
+  deprecated/       off the live path (see README.md)   run_speculative_matrix.sh  check_mtp_spec_decode.sh  (speculative arms retired, charter §7.5)
 ```
 
 The numbered folders are the **happy-path order**; `checks/` and `5_observability/` run
@@ -30,7 +30,7 @@ bash scripts/1_setup/setup_gpu_cloud.sh
 # 2-3. run — cloud_run.sh mints the run-id, starts vLLM, runs the core suite, auto-plots
 nohup bash scripts/3_run/cloud_run.sh Qwen/Qwen3-8B 500 3 > run.log 2>&1 &
 bash scripts/3_run/run_compression.sh        Qwen/Qwen3-8B        # 2x2, shares the run-id
-bash scripts/3_run/run_speculative_matrix.sh Qwen/Qwen3-8B        # 2x2 (repeat for MiMo-7B-RL)
+# (speculative 2x2 RETIRED per charter §7.5 -> scripts/deprecated/)
 
 # 4. aggregate + stats (reads the shared run root)
 bash scripts/4_analysis/run_phase2_stats.sh

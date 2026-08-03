@@ -1,483 +1,273 @@
-# CAGE — Setup, Deploy & Run Runbook (authoritative)
+# CAGE — Campaign Runbook (cloud execution)
 
-> The single source of truth for **how to set up, run, deploy, and analyze** CAGE, locally
-> and on GCP — including **durable result persistence to Google Cloud Storage**.
-> Supersedes the command sections of `GCP_DEPLOYMENT_RUNBOOK.md`, `PHASE_EXECUTION_GUIDE.md`,
-> `CAGE_PROJECT_MASTER_DOCUMENT.md`, and the older continuation guides (all of which contain
-> invalid CLI flags). Verified against the code 2026-06-09.
+> **Authority.** `MyDocs/PUBLICATION.md` is THE design authority (groups, arms, engines,
+> matrices — verify section numbers by grepping it). This file is the *execution*
+> authority: how a provisioning session is actually brought up, validated, run, drained,
+> and torn down. Supersedes the pilot-era runbook (Phase-1/2 CPU/L4 content removed;
+> pilot data stays read-only under `results/phase2/` — see `cloud/RESULTS_LAYOUT.md`).
 >
-> **Repo root:** `/Users/lucasmariano/CAGE/` (single level; run everything from here).
->
-> ⚠️ **CLI reality check.** `run_experiment.py` runs **one baseline per call**. There is
-> **no** `--phase`, `--all-baselines`, `--trials`, `--queries`, or `--enable-disagg-prefill`
-> flag. The real flags are `--baseline`, `--num-trials`, `--num-queries` (full list in §6).
-> Run the whole 7-baseline suite with the phase scripts (§4), which also handle the required
-> vLLM prefix-cache on/off server toggling.
+> ⚠️ **APPROVAL GATE — READ FIRST. Nothing provisions without an explicit user "go".**
+> No `terraform apply`, no `gcloud compute instances create`, no neocloud instance
+> launch, no bucket creation — ever — as a side effect of preparation. Prepare plans,
+> print the cost+ETA report, then STOP and wait for the user. This is a standing,
+> binding discipline, not a preference.
 
 ---
 
-## 0. Concepts (30 seconds)
-- `scripts/3_run/run_experiment.py` is the workload driver. It hits an OpenAI-compatible endpoint
-  (`--api-base`) — a single vLLM server or the CAGE router — and writes results. **Where you
-  run it is where results land.**
-- 7 baselines (`--baseline`): `no_cache`, `prefix_cache`, `rag`, `redis`, `hybrid`,
-  `distributed`, `speculative`.
-- Output per baseline: `<output-dir>/aggregated_metrics.json` + `trial_N/results.csv` +
-  `trial_N/metrics.json`. Schema is identical local and cloud.
-- On the cloud, `scripts/3_run/cloud_run.sh` mirrors results to a durable GCS bucket continuously,
-  so teardown/SSH drops never lose completed work (§9).
+## 0. Standing disciplines (binding on every session)
+
+1. **Approval gate** — provisioning (any resource that bills or persists) happens only
+   after an explicit user go, per session AND per act. Plans/tfvars/dry-runs are fine.
+2. **Clean-room infra per run** — every run gets fresh infrastructure: a fresh bucket
+   named for the run-id (`gs://cage-<run_id>`), no reuse of past-run VMs, disks,
+   buckets, or leftover state. A surviving bucket from a previous run counts as a
+   violation.
+3. **Labels on everything** — every resource (VM, disk, bucket, reservation) carries
+   `agent-run=<run_id>`, `session=<a|b|cd-act1|cd-act2>`, `model=<charter-slug>` so the
+   orphan sweep can find strays: `gcloud compute instances list --filter='labels.agent-run:*'`.
+4. **Pull local BEFORE teardown, fail-closed** — results must exist in THREE places
+   (node + GCS + local) and the ledger must verify before anything is deleted (§5).
+5. **Teardown to TRUE $0** — including the bucket, after the local pull + ledger verify.
+   Prove it: instance list, disk list, bucket list all empty for the run's labels.
+6. **Cost + ETA on every cloud action** — §6 format. No cloud command in a report
+   without its price and its clock.
+7. **Validate infra before every run** — the live preflight (§3) with a real smoke, on
+   every session and after every engine restart. No mock, no cached green.
 
 ---
 
-## 1. Environment setup
+## 1. The three provisioning sessions (PUBLICATION.md §7.6)
+
+The campaign runs as **three provisioning sessions**; C and D share one session in two
+acts. Each session: approval → provision → preflight → run cells → pull-verify →
+teardown-$0. Cell carriage per family × group is §7.6.1 — that matrix is the single
+answer to "who carries what at which density".
+
+| Session | Group / model | Engines | Baselines | Hardware (GCP-fallback shape) | Mission |
+|---|---|---|---|---|---|
+| **A** | A — Qwen3-14B (anchor) | all 4 (vLLM, SGLang, LMDeploy-TurboMind, HF oracle) | B1–B12 + BM25 offline gate | 1× A100-80 GB (`a2-ultragpu-1g` class) | full controlled grid: every arm, every engine, all datasets; FULL D6 factorial (5×6) + fine r-grid |
+| **B** | B — Llama-3.3-70B | all 4 (TurboMind ✓, HF oracle ✓) | B1–B12 | one 4× A100-80 GB node (`a2-ultragpu-4g`), TP=4 (TP=2 = one labeled sensitivity point) | pressure at scale: FRESH set → F2 grid, REUSE set → F3; + SCBench slice |
+| **C/D act 1** | C — Qwen3-Next-80B | vLLM + SGLang (HF oracle; LMDeploy absent per P7) | B1–B10 | **ONE** `a3-ultragpu-8g` (8× H200) — intra-node TP + PD (PD needs 2× 160 GB weight copies) | disaggregation PROTOCOL cost isolated from the network; reduced F2 3×3 (pressure = concurrency) |
+| **C/D act 2** | D — DeepSeek-V3-0324 | vLLM + SGLang (HF **EXEMPT** per D4) | B1–B10 | **TWO** `a3-ultragpu-8g` nodes — TP=8 + PD **cross-node: TCP rung → RDMA/RoCE rung** (FP8 weights, 671 GB) | transfer cost + dedup-over-the-wire; MLA×TP; + SCBench ≤128k slice |
+
+Datasets across the campaign: SQuAD v2, HotpotQA, MuSiQue, Qasper, RULER, SCBench
+slice, ShareGPT (load donor). Per-cell lifecycle is §7.7(f): provision (gated) →
+preflight → launch engine with the cell tuple as config → drive manifest → collect
+three streams (our clock · engine `/metrics` · policy events) → **quality scored LATER,
+offline** → pull, verify, teardown.
+
+Act-1 → act-2 transition: preflight ONCE on the first node (act 1), then scale to two
+nodes for act 2 — but act 2 has its OWN additional gate (the RDMA preflight,
+`cloud/VLLM_COMPATIBILITY.md` §8) and its own user approval.
+
+---
+
+## 2. Provider decision — neocloud primary, GCP fallback
+
+- **Primary: neoclouds** (grant/credit providers per `MyDocs/GRANTS.md`). Cheapest
+  path for A/B; for C/D any provider that offers 8× H200 nodes with a real RoCE/IB
+  fabric between them qualifies for act 2. Act 2's fabric requirement is hard:
+  **no RDMA-capable inter-node fabric → the RDMA rung cannot run there** (TCP rung
+  still can).
+- **Fallback: GCP**, provisioned through `terraform/` with **one tfvars file per
+  session** (`terraform/sessions/group-a.tfvars`, `group-b.tfvars`, `group-cd.tfvars` —
+  each sets the terraform `session` variable to its short value `a` / `b` / `cd`, which
+  is also the `session` label stamped on every resource;
+  `session_cd.tfvars`). GCP is the *expected* fallback for C/D (H200 capacity via
+  `a3-ultragpu-8g`, typically DWS Flex-start / calendar reservation, and an
+  **RDMA-network-profile VPC** — an ordinary VPC will not carry RoCE).
+- ⚠️ **`terraform plan` is always allowed; `terraform apply` is GATED by the user
+  approval in §0.1.** Write the plan output into the session's cost report first.
+- Either provider: the node must expose the same contract to the run scripts — Linux +
+  NVIDIA driver, `$HOME/CAGE` repo tree, `cage-env` venv, outbound HTTPS to GCS (the
+  results bucket is on GCS even when compute is a neocloud).
+
+---
+
+## 3. Pre-flight gates (run per session; a failing gate = do NOT launch)
+
+The user-mandated live-infra validation rule: every component proven live with a real
+smoke, on the actual provisioned node, before any paid cell runs.
+
+**Gate list (all sessions):**
+
+1. **Engines up.** For each engine in the session's roster: server `/health` 200, the
+   target model listed at `/v1/models`, and one real completion at T=0.
+   vLLM extra: `POST /reset_prefix_cache` returns 200 (needs `VLLM_SERVER_DEV_MODE=1`)
+   — else cold-start-per-trial silently no-ops. `bash scripts/checks/preflight_check.sh
+   <MODEL> <API_BASE>` codifies (a)–(e) below for the vLLM path.
+2. **Version pins verified.** The engine×model VERIFY-LIVE matrix in
+   `cloud/VLLM_COMPATIBILITY.md` §7, plus the §0 0.19.1 migration gate items. Record
+   actual versions into the run manifest.
+3. **Metric models live.** Quality layer loads and scores a REAL pair: LettuceDetect
+   grounding returns a real number (not None), NLI entailment loads. (Scoring itself is
+   offline/decoupled, but the models must be proven loadable before we commit to a
+   data format.)
+4. **cage-stats live.** Importable, scrapes the engine's `/metrics`, dashboard renders
+   (`cage-stats --once --json`).
+5. **Retrieval live.** FAISS + embedding model load; one real top-k query against the
+   built index; reranker loads for B6+ cells.
+6. **No-mock check.** No disable/mock escape-hatch env var set
+   (`CAGE_DISABLE_LETTUCEDETECT`, `CAGE_SKIP_QUALITY`, etc.) unless the run design
+   explicitly declares it (quality-decoupled runs declare `CAGE_SKIP_QUALITY=1` —
+   that is a *declared* regime, not a mock).
+7. **T=0 identity smoke.** Single-stream, controlled: (i) HF-oracle match per
+   model×engine where the oracle exists (P2/P3; V3 substitutes cross-engine vLLM↔SGLang
+   agreement); (ii) B1↔B2 token-identity (reuse changes no tokens — quality equality by
+   construction must actually hold); (iii) session C: the §5.2 mandatory vLLM×Qwen3-Next
+   prefix-ON identity smoke — if it FAILS the cell is excluded and the failure IS the
+   result.
+8. **P6 floor table.** Compute per-model λ* and byte floors on the provisioned
+   hardware (one number per §7.6.1 cell family) before any pressure cell.
+9. **Session C/D act 2 only:** the **RDMA preflight** —
+   `cloud/VLLM_COMPATIBILITY.md` §8 (five-check RoCE-not-TCP smoke, UCX hardening,
+   version-triple pin). TCP rung cells may run before it; **no RDMA-rung cell runs
+   until it passes.**
+
+---
+
+## 4. Run flow (per session)
+
+### 4.1 Package → ship
+
+The node tree is a **tarball, not a git clone** (provenance via `BUILD_INFO`; a clone
+would record `sha=null` when git is absent):
 
 ```bash
-cd /Users/lucasmariano/CAGE
-
-# 1a. Python env
-python3.12 -m venv .venv && source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt          # includes lettucedetect (primary grounding detector)
-
-# 1b. vLLM
-#  - Linux + NVIDIA GPU (cloud): official wheel
-pip install vllm
-#  - macOS / ARM CPU (local Phase-1 repro): source build (slow) — legacy helper:
-#      bash scripts/setup/setup_fresh.sh
+# workstation
+scripts/ops/package_repo.sh                      # -> /tmp/cage_<sha8>.tar.gz, warns if tree dirty
+gcloud compute scp /tmp/cage_<sha8>.tar.gz <vm>:~ --zone=<zone>   # or plain scp on a neocloud
+# node
+mkdir -p ~/CAGE && tar xzf cage_*.tar.gz -C ~/CAGE
+head -3 ~/CAGE/BUILD_INFO                        # verify sha/dirty/packaged_at
 ```
 
-**LettuceDetect note.** It pulls a recent `transformers`. If that conflicts with the pinned
-stack on a constrained box, install it in its own env or disable it for a run with
-`export CAGE_DISABLE_LETTUCEDETECT=1` (faithfulness falls back to NLI-only; `grounding_score`
-becomes null). First run downloads `KRLabsOrg/lettucedect-base-modernbert-en-v1`.
+Node env (the run scripts hard-source it under `set -e` — do NOT use `.venv` here):
+
+```bash
+cd ~/CAGE && python3 -m venv cage-env && source cage-env/bin/activate
+pip install -r requirements.txt   # pulls cage-stats (git dep); auth git first if private
+pip install "vllm==0.19.1"        # the campaign pin — see cloud/VLLM_COMPATIBILITY.md
+export HF_TOKEN=hf_xxx            # gated models
+```
+
+### 4.2 SSH + long-job discipline (kept from the pilots — still true)
+
+- **Never run a long command through a blocking SSH.** Use
+  `scripts/ops/remote_job.sh` — submit/status/tail/grep/wait/kill/fetch with a durable
+  remote PID + status file, base64-shipped commands (quoting-proof), and local state
+  JSON under `.agent/tasks/` so a later shell can resume knowing only the job name:
+  ```bash
+  CAGE_VM=<vm> CAGE_ZONE=<zone> scripts/ops/remote_job.sh submit run_a_cells \
+    'cd ~/CAGE && source cage-env/bin/activate && bash scripts/3_run/cloud_run.sh ...'
+  scripts/ops/remote_job.sh status run_a_cells    # RUNNING | DONE(0) | FAILED(n) | ...
+  scripts/ops/remote_job.sh tail   run_a_cells 40 # bounded read — never firehose
+  ```
+- SSH flags that keep agents sane: `-o StrictHostKeyChecking=no -o ConnectTimeout=25
+  -o BatchMode=yes`, and `CLOUDSDK_CORE_DISABLE_PROMPTS=1` (a TTY-less prompt hangs
+  forever — the #1 cause of a "stuck" task).
+- Kill by the RECORDED PID, never `pkill -f <script>` (that matches the SSH command's
+  own shell and kills the session with exit 255).
+- A non-login `ssh --command` does NOT inherit the run's env — forward
+  `CAGE_RESULTS_BUCKET` (etc.) explicitly on every remote command.
+
+### 4.3 Preflight, then run cells
+
+1. Run §3 gates. Fix or abort; never "run through" a red gate.
+2. Run the session's cells **per the §7.6.1 family × group matrix**, one cell tuple at
+   a time (cell identity = `CellSpec`, `src/analysis/cellspec.py`; results tree =
+   `cloud/RESULTS_LAYOUT.md`). Quality scoring is decoupled (offline, later) — the
+   node's job is serving measurements + raw outputs + evidence.
+3. Engine relaunches between cells are normal (prefix ON/OFF, policy knobs, TP/PD
+   topology are launch-time levers). After any relaunch, re-run gate 1 (health +
+   `/v1/models` + reset endpoint) before the next cell.
+
+### 4.4 Continuous GCS sync (runs the whole session)
+
+```bash
+# node, once, right after preflight passes (REQUIRED env, fails LOUDLY if unset):
+export CAGE_RESULTS_BUCKET=gs://cage-<run_id>
+bash scripts/5_observability/gcs_backup_daemon.sh start results/<campaign>
+```
+
+The daemon mirrors the ENTIRE results tree on an interval (default 300 s,
+`CAGE_BACKUP_INTERVAL`), is `setsid`-detached (survives its parent shell / SSH drops),
+never uses `--delete`, and `stop` does one final authoritative sync. One-shot mirror:
+`bash scripts/5_observability/sync_results_to_gcs.sh <dir> [bucket] [remote_subpath]`.
+The bucket layout mirrors the local tree exactly (`cloud/RESULTS_LAYOUT.md` §4).
 
 ---
 
-## 2. Data & retrieval indices
+## 5. The FAIL-CLOSED end sequence (order is the point)
 
-```bash
-# Download datasets (SQuAD v2 by default; extend in scripts/1_setup/download_datasets.py)
-python3 scripts/1_setup/download_datasets.py
+Teardown is irreversible; the run must exist in three places and be ledger-proven
+before anything is destroyed. **Never reorder these steps.**
+
 ```
-**Rebuild the FAISS indices once.** The shipped indices under `experiments/ir_index/` predate
-the e5 `query:`/`passage:` prefix fix and default to un-prefixed retrieval. Add
-`--rebuild-ir-index` on the first RAG/redis/hybrid run (or delete
-`experiments/ir_index/ir_squad_v2_*` and let it rebuild).
+[1] final sync + stop daemon      gcs_backup_daemon.sh stop  (final authoritative sync)
+[2] PULL LOCAL                    scripts/5_observability/pull_run.sh cage-<run_id> results/<campaign>/<session>/<run_id>
+                                  (canonical entry point — until it lands in scripts/,
+                                  teardown_vm.sh step [4/6] performs the pull and
+                                  refuses to delete on an incomplete pull)
+[3] LEDGER VERIFY (local)         verify the pulled tree against ledger.json:
+                                  .venv/bin/python -c "from src.analysis.stats.ledger import verify_ledger; \
+                                    print(verify_ledger('<run_root>/ledger.json','<run_root>') or 'INTACT')"
+                                  any MISSING/HASH-MISMATCH line -> STOP. Re-pull. Do not tear down.
+[4] TEARDOWN                      scripts/6_teardown/teardown_vm.sh <vm> <zone>
+                                  (per node; fail-closed: unique COLLECT_OK sentinel in
+                                  GCS + complete local pull required before delete;
+                                  --force exists and is a user-only decision)
+[5] DELETE THE BUCKET             gcloud storage rm -r gs://cage-<run_id>   # only after [3] passed
+[6] PROVE TRUE $0                 orphan sweep by label:
+                                  gcloud compute instances list --filter='labels.agent-run=<run_id>'
+                                  gcloud compute disks list     --filter='labels.agent-run=<run_id>'
+                                  gcloud storage buckets list   --filter='labels.agent-run=<run_id>'
+                                  all three empty -> report "$0 confirmed" with timestamps
+```
+
+Notes:
+- The ledger (`ledger.json`, sha256 of every raw artifact) is written on the node at
+  run end, BEFORE any analysis — step [3] verifies the *local* copy against it, so a
+  truncated pull or a corrupted object cannot pass silently.
+- Pulling after teardown is one failed sync away from data loss — that ordering is
+  forbidden.
+- On a neocloud, steps [4]/[6] use the provider's CLI/console; the bucket steps are
+  unchanged (results live on GCS regardless of where compute ran).
 
 ---
 
-## 3. Start the inference server (local)
+## 6. Cost + ETA reporting duty
 
-CAGE talks to vLLM over HTTP. Two modes:
+Every cloud action (provision, resize, long job, teardown) is reported in this format,
+BEFORE performing it (and provisioning additionally waits for the §0.1 approval):
 
-```bash
-# Single server (most baselines). Prefix caching ON:
-./scripts/2_serving/manage_vllm_server.sh restart Qwen/Qwen3-4B
-# Prefix caching OFF (for no_cache / rag / redis-cold baselines):
-./scripts/2_serving/manage_vllm_server.sh restart Qwen/Qwen3-4B --no-prefix-cache
-./scripts/2_serving/manage_vllm_server.sh stop
-
-# Multi-replica + router (distributed baseline):
-python3 scripts/2_serving/manage_vllm_cluster.py restart --model Qwen/Qwen3-4B \
-  --replicas 3 --base-port 8001 --router-port 9000
-python3 scripts/2_serving/manage_vllm_cluster.py stop
 ```
-Servers start with `--enable-prefix-caching --enable-prompt-tokens-details` (required for
-cache telemetry). Redis (retrieval-cache baselines): `docker run -d -p 6379:6379 --name cage-redis redis:7-alpine`.
+ACTION:   <what, exactly — instance type × count, region, spot/on-demand/DWS>
+COST:     <$/h> × <est. hours> = <$ estimate>   (list price, provider, date checked)
+ETA:      <wall-clock estimate for the step and for the session>
+TEARDOWN: <what returns this to $0 and when>
+```
+
+Rates are volatile — quote the provider's current price at action time (for GCP:
+pricing calculator / `gcloud` SKU lookup), never a remembered number. Session-level
+dollar totals go into the session's ledger entry in `MyDocs/LEDGER.md` at EOD.
 
 ---
 
-## 4. Run experiments — the easy path (phase scripts)
+## 7. Quick reference
 
-The phase scripts encode the **correct** server toggling, baseline labels, warmup, Redis
-namespacing, and the distributed cluster bring-up.
-
-```bash
-# Full Phase-1 7-baseline suite on Qwen3-4B / SQuAD v2 (CPU-friendly defaults: 50 q, 3 trials)
-bash scripts/3_run/run_baselines.sh
-
-# Override scale via env vars (and model as $1):
-NUM_QUERIES=100 NUM_TRIALS=10 bash scripts/3_run/run_baselines.sh Qwen/Qwen3-8B
-
-# Results land in results/phase2/<run-id>/baselines/<baseline_label>/
-```
-Baseline labels produced: `no_cache`, `prefix_cache`, `rag`, `redis_retrieval_cache_cold`,
-`hybrid_retrieval_cache_cold`, `hybrid_retrieval_cache_warm`, `distributed_router_replicated`.
-> **DEPRECATED — do NOT use for Phase 2** (not on the canonical path): the deleted `run_phase2.sh` (was an orphan writing an ignored tree), the legacy single-cell speculative runners (now under `scripts/deprecated/`, superseded by `run_speculative_matrix.sh`), `scripts/deprecated/run_all_phases.sh` (the old multi-phase design). Canonical Phase-2 chain: `cloud_run.sh` → `run_compression.sh` → `run_speculative_matrix.sh` (×2 models) → `run_phase2_stats.sh`.
-
----
-
-## 5. Run experiments — manual single baseline (ad-hoc)
-
-```bash
-# Make sure the matching server is up (§3), then:
-python3 scripts/3_run/run_experiment.py \
-  --baseline prefix_cache \           # one of: no_cache prefix_cache redis rag distributed hybrid speculative
-  --baseline-label prefix_cache \
-  --model Qwen/Qwen3-4B \
-  --dataset squad_v2 \                # one of: squad_v2 hotpotqa trivia_qa qasper humaneval mbpp hpc_code
-  --num-queries 50 --num-trials 3 --seed 42 \
-  --api-base http://localhost:8000 \
-  --output-dir results/phase2/<run-id>/baselines/prefix_cache --rebuild-ir-index
-
-# Distributed baseline goes through the router:
-CAGE_REQUIRE_DISTINCT_REPLICAS=1 python3 scripts/3_run/run_experiment.py \
-  --baseline distributed --baseline-label distributed_router_replicated \
-  --model Qwen/Qwen3-4B --dataset squad_v2 --num-queries 50 --num-trials 3 \
-  --api-base http://localhost:9000 --sharding-policy replicated \
-  --output-dir results/phase2/<run-id>/baselines/distributed_router_replicated
-```
-
----
-
-## 6. `run_experiment.py` — real CLI reference
-
-**Core:** `--baseline` (req), `--model` (req), `--dataset`, `--num-queries`, `--num-trials`,
-`--seed`, `--max-tokens`, `--baseline-label`, `--output-dir`, `--api-base`
-(default `http://localhost:8000`), `--backend {vllm,gemini,ollama}`, `--offline`.
-
-**Retrieval/IR:** `--top-k`, `--top-k-values`, `--top-k-sweep`, `--embedding-model`,
-`--reranker-model`, `--reranker-device`, `--ir-index-dir`, `--rebuild-ir-index`,
-`--max-context-docs`, `--max-context-chars`, `--truncate-prompt-tokens`.
-
-**Redis:** `--redis-host`, `--redis-port`, `--redis-db`, `--redis-ttl-seconds`,
-`--redis-key-prefix`, `--flush-redis-namespace`.
-
-**Distributed:** `--sharding-policy {replicated,sharded_context}`, `--routing-switch-at`.
-
-**Workload:** `--workload-mode {single,batched,multi_turn}`, `--batch-size`,
-`--multi-turn-length`, `--repeat-queries`, `--warmup-queries`.
-
-**Protocol controls (new):** `--context-source {auto,gold,retrieved}` (confound control),
-`--reset-cache-between-trials` (cold-start per trial; needs `VLLM_SERVER_DEV_MODE=1`).
-
-**Compression axis (new):** `--compress-method {none,llmlingua2,llmlingua}`, `--compress-ratio <keep>`
-(0.5 = 2× compression), `--kv-cache-dtype {none,fp8}` (record-only here; also pass to the server).
-
-**Speculative:** vLLM configures speculation at **launch** — start the server with
-`VLLM_SPECULATIVE_CONFIG='{"method":"ngram","num_speculative_tokens":5}'`, then run the
-`speculative` baseline. (The old `--speculative-model` flag is deprecated.)
-
-> No `--phase`, `--all-baselines`, `--trials`, `--queries`, or disagg-prefill flag.
-
-### 6.1 Compression axis (the 2×2) — run it correctly
-
-The axis crosses **context source** (CAG vs RAG) with **compression** (full vs
-compressed). Run **all four cells with the same model, dataset, seed, and trials**
-so the cell is the only thing that varies.
-
-**Scripted (recommended):** `bash scripts/3_run/run_compression.sh <model>` runs all four cells
-through the launch-lever and runs the FP8×prefix-caching gate first. The manual equivalent:
-
-```bash
-MODEL=Qwen/Qwen3-8B; DS=squad_v2; N=100; T=10; SEED=42   # GPU-phase defaults
-
-# --- Full row (no compression) ---
-./scripts/2_serving/manage_vllm_server.sh restart $MODEL                          # prefix caching ON
-python3 scripts/3_run/run_experiment.py --baseline prefix_cache --model $MODEL --dataset $DS \
-  --num-queries $N --num-trials $T --seed $SEED --context-source gold          # FULL CAG
-python3 scripts/3_run/run_experiment.py --baseline rag --model $MODEL --dataset $DS \
-  --num-queries $N --num-trials $T --seed $SEED --rebuild-ir-index             # FULL RAG
-
-# --- Compressed row (ratio-matched at ~2x) ---
-python3 scripts/3_run/run_experiment.py --baseline compressed_rag --model $MODEL --dataset $DS \
-  --num-queries $N --num-trials $T --seed $SEED \
-  --compress-method llmlingua2 --compress-ratio 0.5                            # COMPRESSED RAG (~2x tokens)
-VLLM_KV_CACHE_DTYPE=fp8 ./scripts/2_serving/manage_vllm_server.sh restart $MODEL         # relaunch server with fp8 KV
-python3 scripts/3_run/run_experiment.py --baseline compressed_cag --model $MODEL --dataset $DS \
-  --num-queries $N --num-trials $T --seed $SEED --kv-cache-dtype fp8           # COMPRESSED CAG (~2x bytes)
-
-# MLA arm (optional, architectural KV compression — separate, more aggressive point):
-#   use configs/model/deepseek-v2-lite.yaml on a GPU; no --kv-cache-dtype needed.
-```
-
-**Fairness — match the ratio, not the algorithm.** Text and KV tensors are
-different objects, so the arms necessarily use different compressors (LLMLingua‑2 vs
-FP8); that is not a confound. Fairness comes from (a) identical
-model/dataset/seed/trials, (b) identical quality metrics, and (c) a **matched
-compression ratio** — pin the KV arm to **FP8 (~2×)** so it matches **LLMLingua‑2
-keep‑0.5 (~2×)**. Read the 2×2 *down* the columns (CAG vs RAG) or *across* the rows
-(full vs compressed within a paradigm) — **never diagonally** (LLMLingua vs FP8).
-MLA (~7–14×) is reported separately, not as the matched comparator.
-
-**Pre‑flight (or the cell is invalid):**
-- `pip install llmlingua` must be present — else `compressed_rag` silently runs with
-  **no** compression (ratio 1.0) and the result is meaningless.
-- `compressed_cag` needs a **GPU** and the server **relaunched** with
-  `VLLM_KV_CACHE_DTYPE=fp8`. The runner's `--kv-cache-dtype` only *labels* the run; it
-  does **not** reconfigure a live server.
-- CAG arms keep **prefix caching ON**; RAG arms rebuild the IR index once
-  (`--rebuild-ir-index`).
-
-**Post‑flight (confirm it actually ran compressed):**
-- `compressed_rag`: results carry `compression_stats` with an achieved ratio < 1.0.
-  If it is 1.0, llmlingua did not load — re-install and re-run.
-- `compressed_cag`: add `--vllm-telemetry`; `vllm_telemetry.json` / the cage‑stats KV
-  panel must show `kv_cache_dtype = fp8` and a reduced KV footprint.
-
-> **On the cloud (Path A, §9):** this 2×2 is **not** part of `cloud_run.sh`. Run the
-> block above on the GPU VM after the standard suite — install `llmlingua` and do the
-> fp8 server relaunch first; results then sync to GCS like any other baseline.
-
-### 6.2 Cache-state control for trials (resolves the per-trial flush question)
-There are **two legitimate measurement regimes** — declare which you're using:
-- **Cold-start per trial** (each trial starts from an empty cache): start the server with
-  `VLLM_SERVER_DEV_MODE=1` and add `--reset-cache-between-trials`. This flushes the vLLM prefix
-  cache via `POST /reset_prefix_cache` between trials — no model reload needed.
-- **Warm / steady-state** (cache pre-populated, the regime `hybrid_warm` targets): just run; the
-  seeded resampling now gives each trial *different* queries, so it's not a pure replay.
-Either is valid; what matters is that the regime is controlled and stated. For confound-free
-quality comparisons also pass `--context-source gold` (or `retrieved`).
-
----
-
-## 7. Analyze results
-
-```bash
-# 7a. Integrity check (no truncated/erroring trials)
-python3 scripts/4_analysis/verify_results.py
-
-# 7b. Per-query significance testing (Wilcoxon signed-rank, Holm-corrected, bootstrap CIs)
-python3 scripts/4_analysis/statistical_tests.py \
-  --results-dir results/phase2/<run-id>/baselines --reference no_cache \
-  --metrics ttft_ms latency_ms grounding_score faithfulness hallucinated_span_ratio f1_score \
-  --output results/phase2/<run-id>/stats/stats.json --latex-out results/phase2/<run-id>/stats/stats.tex
-
-# 7c. Publication plots
-python3 scripts/deprecated/generate_publication_plots.py \
-  --results-dir results/phase2/<run-id>/baselines --output-dir results/phase2/<run-id>/plots
-python3 scripts/deprecated/generate_compact_figures.py
-```
-Per-query quality fields: `grounding_score`, `hallucination_detected`,
-`hallucinated_span_ratio` (LettuceDetect); `faithfulness`, `supported_claim_ratio`
-(claim-level NLI); `context_relevance`; baseline-rescaled `completeness_bertscore`;
-`f1_score`/`exact_match`. `None` = metric model unavailable (excluded from means).
-
-### 7.1 vLLM serving telemetry (cage-stats)
-Capture what CAGE's own metrics don't expose — **spec-decode acceptance, KV-compression
-ratio/dtype, prompt-token source breakdown, prefix-cache hit rate, multi-vendor GPU** — and
-print a one-shot dashboard, via the standalone
-[cage-stats](https://github.com/lucasmdocarmo/cage-stats) package.
-
-**It's a git dependency in `requirements.txt`**, so `pip install -r requirements.txt` pulls it
-automatically (locally and on the cloud VM — no extra step). *Prerequisite:* the cage-stats
-repo must have the restructured package committed + pushed first; if it's private, ensure git
-creds on the install host. Local-dev alternative without installing: `export CAGE_STATS_HOME=/Users/lucasmariano/cage-stats`.
-
-Then add `--vllm-telemetry` to any run; a snapshot is saved to `<output-dir>/vllm_telemetry.json`
-and into `aggregated_metrics.json` under `vllm_telemetry`, and a dashboard prints to the terminal:
-```bash
-python3 scripts/3_run/run_experiment.py --baseline compressed_cag --model Qwen/Qwen3-8B \
-  --dataset squad_v2 --num-queries 50 --num-trials 3 --vllm-telemetry --api-base http://localhost:9000
-```
-Standalone (no CAGE): `cage-stats --url http://localhost:9000` (live TUI) ·
-`cage-stats --once` (static dashboard) · `cage-stats --once --json` (snapshot for scripting).
-Gracefully skips if cage-stats isn't installed.
-
----
-
-## 8. Tests
-
-```bash
-bash scripts/checks/run_tests.sh                                          # 1-replica cluster + pytest
-pytest -m vllm                                                     # adapter tests (live vLLM)
-ROUTER_TEST_API_BASE=http://localhost:9000 pytest -m integration  # router tests (live router)
-```
-
----
-
-## 9. Cloud deploy (GCP) with durable results
-
-> **Two topologies — pick by what you're measuring.** They are different on purpose:
->
-> | | **Path A — single GPU VM** | **Path B — multi-VM cluster** |
-> |---|---|---|
-> | What | one GPU box runs vLLM **and** the experiment | 3 GPU replicas + 1 CPU router (Terraform) |
-> | Use for | the **6 single-server baselines** (Phase 2 suite) | the **`distributed` baseline** at real scale (Phase 3) |
-> | Runner | `scripts/3_run/cloud_run.sh` (wraps `run_baselines.sh`) | `run_experiment.py --baseline distributed` against the router |
-> | Why split | `run_baselines.sh` starts a **local** vLLM and toggles prefix-cache on/off — that needs a GPU on the box running it | the cluster's replicas are fixed/always-on; only the distributed baseline exercises the router |
->
-> ❌ Do **not** run `cloud_run.sh`/`run_baselines.sh` on the cluster's CPU **router** — it has no GPU.
-
-### 9.0 One-time GCP setup (both paths)
-```bash
-gcloud auth login
-gcloud config set project <PROJECT_ID>
-gcloud config set compute/region us-central1
-gcloud config set compute/zone   us-central1-a
-gcloud services enable compute.googleapis.com cloudresourcemanager.googleapis.com storage.googleapis.com
-# Request GPU quota: IAM & Admin > Quotas -> NVIDIA_L4_GPUS >= 1 (Path A) or >= 3 (Path B).
-gcloud compute accelerator-types list --filter="zone:us-central1-a AND name:nvidia-l4"  # confirm
-# Create the durable results bucket once (Terraform also makes one; this is for Path A):
-gsutil mb -l us-central1 gs://$(gcloud config get-value project)-cage-results || true
-gsutil versioning set on gs://$(gcloud config get-value project)-cage-results
-```
-
-### Path A — full suite on ONE GPU VM (recommended for Phase 2)
-```bash
-# 1. Create a single L4 GPU VM with NVIDIA drivers auto-installed:
-PROJECT=$(gcloud config get-value project)
-gcloud compute instances create cage-gpu \
-  --zone=us-central1-a --machine-type=g2-standard-8 \
-  --accelerator=type=nvidia-l4,count=1 --maintenance-policy=TERMINATE \
-  --image-family=common-cu121-debian-11 --image-project=deeplearning-platform-release \
-  --boot-disk-size=200GB --boot-disk-type=pd-ssd \
-  --scopes=cloud-platform --metadata=install-nvidia-driver=True
-
-# 2. SSH in and set up:
-gcloud compute ssh cage-gpu --zone=us-central1-a
-nvidia-smi                                   # confirm the GPU is visible
-git clone <your-repo-url> CAGE && cd CAGE    # or scp your repo (dir MUST be CAGE: scripts hardcode $HOME/CAGE)
-# Use cage-env on the VM: setup_gpu_cloud.sh and the run scripts (run_compression.sh,
-# run_speculative_matrix.sh, run_phase2_stats.sh, ...) all source cage-env. A .venv here
-# would leave those scripts unable to activate it (they hard-source cage-env under set -e).
-python3 -m venv cage-env && source cage-env/bin/activate
-pip install -r requirements.txt && pip install vllm
-#   requirements.txt pulls cage-stats (git dependency) for --vllm-telemetry. If that
-#   repo is private, authenticate git on the VM first (e.g. `gh auth login` / a PAT),
-#   or install it explicitly:  pip install "cage-stats @ git+https://github.com/lucasmdocarmo/cage-stats.git"
-#   To run WITHOUT telemetry, comment the cage-stats line in requirements.txt (or VLLM_TELEMETRY=0 below).
-export HF_TOKEN=hf_xxx                        # if gated
-
-# 3. Run the suite + continuous GCS sync (nohup survives SSH drops):
-#    Telemetry is auto-captured (cloud_run.sh sets VLLM_TELEMETRY=1) ->
-#    each baseline writes <output>/vllm_telemetry.json, mirrored to GCS.
-nohup bash scripts/3_run/cloud_run.sh Qwen/Qwen3-8B 500 3 > run.log 2>&1 &
-tail -f run.log
-```
-`cloud_run.sh` starts Redis, runs the 6 single-server baselines on the local GPU vLLM, and
-mirrors `analysis/` to `gs://<project>-cage-results` every 2 min and at exit. It skips the
-distributed baseline by default (`ENABLE_DISTRIBUTED=0`) because 3 local replicas OOM a 24GB
-L4 — run that on Path B. Tunables: `SYNC_INTERVAL`, `SYNC_DIR`, `CAGE_RESULTS_BUCKET`.
-When done: `gcloud compute instances delete cage-gpu --zone=us-central1-a` (results stay in GCS).
-
-### Path B — the `distributed` baseline on the multi-VM cluster
-```bash
-cd terraform/gcp
-cp terraform.tfvars.example terraform.tfvars   # set project_id, model_name, repo_url, hf_token
-terraform init
-terraform apply -var="project_id=$(gcloud config get-value project)" -var="hf_token=$HF_TOKEN"
-terraform output            # router_external_ip, results_bucket
-
-# Verify the cluster is healthy:
-ROUTER_IP=$(terraform output -raw router_external_ip)
-curl -fsS http://$ROUTER_IP:9000/health && curl -fsS http://$ROUTER_IP:9000/stats
-
-# Run ONLY the distributed baseline against the router, then sync:
-gcloud compute ssh cage-router --zone=us-central1-a
-cd /opt/cage
-CAGE_REQUIRE_DISTINCT_REPLICAS=1 python3 scripts/3_run/run_experiment.py \
-  --baseline distributed --baseline-label distributed_router_replicated \
-  --model Qwen/Qwen3-8B --dataset squad_v2 --num-queries 100 --num-trials 10 \
-  --api-base http://localhost:9000 --sharding-policy replicated \
-  --output-dir results/phase2/<run-id>/baselines/distributed_router_replicated
-bash scripts/5_observability/sync_results_to_gcs.sh results
-
-# Tear down GPUs (results stay safe in the versioned bucket):
-cd terraform/gcp && terraform destroy -var="project_id=$(gcloud config get-value project)" -var="hf_token=$HF_TOKEN"
-```
-Terraform installs the NVIDIA driver, `git clone`s the repo into `/opt/cage` (if `repo_url`
-set), `/health`-gates the router, enables the APIs, and creates the versioned bucket. ⚠️ GPUs
-bill continuously — destroy promptly.
-
-### 9.5 Validate + analyze (either path)
-```bash
-python3 scripts/4_analysis/statistical_tests.py --results-dir results/phase2/<run-id>/baselines \
-  --reference no_cache --output results/phase2/<run-id>/stats/stats.json --latex-out results/phase2/<run-id>/stats/stats.tex
-python3 scripts/deprecated/generate_publication_plots.py \
-  --results-dir results/phase2/<run-id>/baselines --output-dir results/phase2/<run-id>/plots
-```
-
----
-
-## 10. Retrieve & reuse results later (from anywhere)
-```bash
-gsutil -m cp -r gs://<project>-cage-results/analysis ./analysis
-# then the same statistical_tests.py / plot commands as §7/§9.5 — identical CSV/JSON schema.
-```
-
----
-
-## 11. Phase 3 (HPC / A100) — switch via tfvars, no file edits
-In `terraform.tfvars`:
-```hcl
-gpu_type     = "nvidia-tesla-a100"
-machine_type = "a2-highgpu-1g"
-nic_type     = "GVNIC"     # ~100 Gbps for cross-node KV transfer
-network_mtu  = 8896        # jumbo frames
-model_name   = "Qwen/Qwen3-14B"
-```
-`terraform apply`, then run the distributed baseline as in §9 Path B. (Phase 3's real
-cross-node KV transfer is **not yet implemented** — the distributed baseline is still
-simulated; see §13.)
-
----
-
-## 12. Docker / Kubernetes (alternative to bare Terraform)
-```bash
-docker compose -f docker/docker-compose.yml up -d           # local CPU multi-replica (Apple Silicon)
-HF_TOKEN=hf_xxx docker compose -f docker/docker-compose.gpu.yml up -d   # GPU hosts (fixed)
-```
-K8s manifests are in `k8s/` — GPU limits are commented out and the router image must be
-pushed to a registry first (see VALIDATION_AND_SOTA_REVIEW.md I4/I7).
-
----
-
-## 13. Known gaps before trusting numbers (protocol, not setup)
-The metric *code* and GCS persistence are solid, but the experiment **protocol** still has
-open issues (full detail in [`VALIDATION_AND_SOTA_REVIEW.md`](VALIDATION_AND_SOTA_REVIEW.md) Part C):
-1. **Distributed baseline is simulated** — `cache_manager.py` models KV-transfer cost; no real
-   tensors move. Wire real KV transfer (vLLM V1 + LMCache) for a legitimate "distributed" claim.
-2. **Gold-vs-retrieved confound** — CAG baselines get the gold passage, RAG gets retrieved.
-3. **Per-trial independence** — restart vLLM / flush caches between trials; `--seed` is a no-op for HF datasets.
-4. **Warm-hybrid leakage** — warmup queries overlap the measured set.
-5. **Rebuild IR indices** with `--rebuild-ir-index` so the e5 prefix fix takes effect.
-6. **Install LettuceDetect** on the cluster (or `CAGE_DISABLE_LETTUCEDETECT=1`).
-
----
-
-## 14. Common gotchas
-- Old-doc flags fail: use `--num-queries`/`--num-trials`, **not** `--queries`/`--trials`; there is no `--phase`/`--all-baselines`/`--enable-disagg-prefill`.
-- `gsutil` permission denied on the VM: the VM SA needs `roles/storage.objectAdmin` on the bucket — Terraform grants this; for a manually-created bucket, add it.
-- RAG looks weak: ensure indices were rebuilt post e5-prefix fix (`--rebuild-ir-index`).
-- LettuceDetect OOM/load failure: `export CAGE_DISABLE_LETTUCEDETECT=1`.
-
----
-
-## 15. Quick reference card
 | Goal | Command |
 |---|---|
-| Local full Phase 1 | `bash scripts/3_run/run_baselines.sh` |
-| Bigger sweep | `NUM_QUERIES=100 NUM_TRIALS=10 bash scripts/3_run/run_baselines.sh Qwen/Qwen3-8B` |
-| Single baseline | `python3 scripts/3_run/run_experiment.py --baseline rag --model … --dataset squad_v2 --num-queries 50 --num-trials 3` |
-| Cloud run + persist | `nohup bash scripts/3_run/cloud_run.sh Qwen/Qwen3-8B 500 3 > run.log 2>&1 &` |
-| Sync results to GCS | `bash scripts/5_observability/sync_results_to_gcs.sh results` |
-| Pull results back | `gsutil -m cp -r gs://<project>-cage-results/analysis ./analysis` |
-| Significance tests | `bash scripts/4_analysis/run_phase2_stats.sh` (consolidates all trees + runs Wilcoxon/Holm/bootstrap vs no_cache) |
-| Provision cloud | `cd terraform/gcp && terraform apply -var=project_id=… -var=hf_token=…` |
-| Tear down (keep results) | `cd terraform/gcp && terraform destroy -var=project_id=… -var=hf_token=…` |
-| Compression 2×2 (GPU) | `bash scripts/3_run/run_compression.sh Qwen/Qwen3-8B` |
-| Speculative (GPU) | `bash scripts/3_run/run_speculative_matrix.sh Qwen/Qwen3-8B` (then `… XiaomiMiMo/MiMo-7B-RL`) |
-| FP8×prefix-cache gate | `bash scripts/checks/check_fp8_prefix_cache.sh Qwen/Qwen3-8B` |
+| Package repo for ship | `scripts/ops/package_repo.sh` |
+| Submit long remote job | `scripts/ops/remote_job.sh submit <name> '<cmd>' [deadline_s]` |
+| Poll / bounded tail | `scripts/ops/remote_job.sh status\|tail <name>` |
+| Live preflight (vLLM path) | `bash scripts/checks/preflight_check.sh <MODEL> <API_BASE>` |
+| Start GCS sync daemon | `CAGE_RESULTS_BUCKET=gs://cage-<run_id> scripts/5_observability/gcs_backup_daemon.sh start` |
+| One-shot sync | `scripts/5_observability/sync_results_to_gcs.sh <dir>` |
+| Pull run local | `scripts/5_observability/pull_run.sh cage-<run_id> results/<campaign>/<session>/<run_id>` (or teardown step [4/6]) |
+| Fail-closed teardown | `scripts/6_teardown/teardown_vm.sh <vm> <zone>` |
+| Orphan sweep | `gcloud compute instances list --filter='labels.agent-run:*'` |
 
----
-
-## 16. vLLM version pin & launch-time levers
-Deploy images are **pinned** to `vllm/vllm-openai:v0.11.0` (terraform, GPU compose,
-`deploy_cluster.sh`) — do **not** chase `:latest`; a renamed flag breaks a run. Spec, flag
-matrix, and the compatibility gate: [`VLLM_COMPATIBILITY.md`](VLLM_COMPATIBILITY.md). Bump
-deliberately, then re-gate.
-
-Levers are applied by (re)starting the server through `manage_vllm_server.sh`:
-
-| Lever | How | Baseline |
-|---|---|---|
-| FP8 KV cache | `VLLM_KV_CACHE_DTYPE=fp8 ./scripts/2_serving/manage_vllm_server.sh restart <model>` | `compressed_cag` |
-| Speculative | `VLLM_SPECULATIVE_CONFIG='{"model":"Qwen/Qwen3-0.6B","num_speculative_tokens":5}' ./scripts/2_serving/manage_vllm_server.sh restart <model>` | `speculative` |
-| Cluster (terraform) | `-var=vllm_extra_args='--kv-cache-dtype fp8'` | cloud replicas |
-
-`run_compression.sh` and `run_speculative_matrix.sh` drive these levers and capture `/metrics` telemetry;
-the compression script runs the FP8×prefix-caching gate first (else `compressed_cag` is
-confounded — VLLM_COMPATIBILITY.md §4). FP8 and speculative are **GPU-meaningful** → Phase 2.
-Speculative decoding is output-preserving, so it is a throughput baseline, not part of the
-efficiency-vs-quality axis.
+Compatibility gates and pins: `cloud/VLLM_COMPATIBILITY.md`.
+Results tree + ledger spec: `cloud/RESULTS_LAYOUT.md`.
+Design authority: `MyDocs/PUBLICATION.md` (§7.6 groups, §7.6.1 matrix, §7.7f lifecycle).

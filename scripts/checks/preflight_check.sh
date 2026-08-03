@@ -17,7 +17,9 @@
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-cd "$PROJECT_DIR"
+# No -e in this script (accumulates FAILED): guard the cd so the python probes below
+# can never import from the wrong working directory.
+cd "$PROJECT_DIR" || exit 1
 MODEL="${1:-Qwen/Qwen3-8B}"
 API_BASE="${2:-http://localhost:8000}"
 FAILED=0
@@ -73,7 +75,7 @@ done
 
 # (b)(c)(d) component loads via python
 echo "(b/c/d) metric models + cage-stats + FAISS"
-python3 - "$MODEL" <<'PY'
+if ! python3 - "$MODEL" <<'PY'
 import sys
 ok = True
 def pw(m): print(f"  [PASS] {m}")
@@ -152,7 +154,9 @@ except Exception as e:
 
 sys.exit(0 if ok else 1)
 PY
-[ $? -ne 0 ] && FAILED=1
+then
+    FAILED=1
+fi
 
 # (f) boot-disk free space: a multi-day sweep writes vLLM logs, observability snapshots and
 # per-trial results continuously; a full boot disk kills the run hours in. Gate on the

@@ -3,14 +3,15 @@
 # 5-query staleness SMOKE: validate the staleness serving path end-to-end BEFORE
 # committing the full sweep (validate-before-run).
 # =============================================================================
-# The staleness axis is a manual env-var sweep (CAGE_STALE_FRACTION), absent from
-# run_phase2.sh, and had no smoke artifact -- only a code comment. This script runs 5
+# The staleness axis is a manual env-var sweep (CAGE_STALE_FRACTION), absent from the
+# standard suite drivers (the old run_phase2.sh was deleted in the 2026-07-14 run-layout
+# standardization), and had no smoke artifact -- only a code comment. This script runs 5
 # queries at a non-trivial stale fraction and asserts that (a) the summary carries a
 # non-null staleness block (stale_hit_rate / unsafe_served_rate), and (b) at least one
 # query was actually served the STALE (v0) evidence version. A pass means the injection
 # fired and the metrics are computable; a fail means an env/context problem to fix before
-# spending the sweep. GPU-only (needs a served vLLM). See
-# Documentation/STALENESS_BASELINE_DESIGN.md.
+# spending the sweep. GPU-only (needs a served vLLM). Design doc: the pilot-era
+# STALENESS_BASELINE_DESIGN.md (since removed; MyDocs/PUBLICATION.md governs).
 #
 # Usage: bash scripts/checks/smoke_staleness.sh [MODEL]
 #   CAGE_STALE_FRACTION overrides the stale fraction (default 0.5).
@@ -23,8 +24,12 @@ DATASET="${DATASET:-squad_v2}"
 FRACTION="${CAGE_STALE_FRACTION:-0.5}"
 OUT="${OUT:-$PROJECT_DIR/results/_smoke/staleness}"
 
-rm -rf "$OUT"; mkdir -p "$OUT"
+# ${OUT:?}: a caller exporting OUT="" must die here, not rm -rf the cwd's root.
+rm -rf "${OUT:?}"; mkdir -p "$OUT"
 echo "[smoke] staleness: model=$MODEL frac=$FRACTION Q=5 trials=1"
+
+# Trap-based cleanup: the server must not linger on ANY exit path (incl. Ctrl-C).
+trap '"$SCRIPT_DIR/../2_serving/manage_vllm_server.sh" stop >/dev/null 2>&1 || true' EXIT
 
 # Staleness serves from cache -> prefix caching ON. Restart to a clean server.
 "$SCRIPT_DIR/../2_serving/manage_vllm_server.sh" restart "$MODEL"; sleep 10
@@ -35,11 +40,8 @@ if ! CAGE_STALE_FRACTION="$FRACTION" python3 "$PROJECT_DIR/scripts/3_run/run_exp
         --num-queries 5 --num-trials 1 --seed 42 \
         --vllm-telemetry --output-dir "$OUT/staleness_smoke"; then
     echo "[smoke] FAIL: run errored."
-    "$SCRIPT_DIR/../2_serving/manage_vllm_server.sh" stop >/dev/null 2>&1 || true
     exit 1
 fi
-
-"$SCRIPT_DIR/../2_serving/manage_vllm_server.sh" stop >/dev/null 2>&1 || true
 
 python3 - "$OUT/staleness_smoke" <<'PY'
 import csv, glob, json, os, sys

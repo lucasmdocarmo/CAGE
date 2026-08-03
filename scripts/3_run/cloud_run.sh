@@ -1,4 +1,9 @@
 #!/bin/bash
+# =============================================================================
+# PILOT HARNESS — drives the retired 9-name taxonomy via the alias map; the
+# campaign harness (CellSpec-native, D6 open-loop) lands at tranche P1; use for
+# pilot re-scoring only.
+# =============================================================================
 # Run the CAGE baseline suite on a SINGLE GPU machine with continuous result persistence.
 #
 # IMPORTANT: run this ON A GPU VM (it starts a local vLLM server via run_baselines.sh).
@@ -25,16 +30,18 @@
 #     SYNC_INTERVAL       seconds between background syncs (default: 120)
 #     CAGE_RESULTS_BUCKET override bucket (default: gs://<project>-cage-results)
 #
-# Launch-time levers (compressed_cag FP8 / speculative) need a server relaunch with an env var,
+# Launch-time levers (compressed_cag FP8) need a server relaunch with an env var,
 # so run those via their own scripts instead of this suite:
 #     compression 2x2:  bash scripts/3_run/run_compression.sh $MODEL   (gates FP8 x prefix-caching)
-#     speculative:      bash scripts/3_run/run_speculative_matrix.sh $MODEL   (per model; gates native draft)
+#     (speculative 2x2 RETIRED per charter §7.5 -> scripts/deprecated/run_speculative_matrix.sh)
 # The vLLM pin is v0.19.1 (Phase-3; Phase-2 ran v0.11.0) — see Cloud/VLLM_COMPATIBILITY.md.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_DIR"
+# shellcheck source=scripts/lib/_common.sh
+source "$PROJECT_DIR/scripts/lib/_common.sh"
 
 MODEL="${1:-Qwen/Qwen3-8B}"
 NUM_QUERIES="${2:-500}"

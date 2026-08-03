@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # remote_job.sh — submit / poll / reap a LONG-RUNNING command on a GCP VM over SSH.
 #
+# PROVISIONING (2026-08-02 charter): the GCP campaign path now provisions via
+# terraform/ (sessions/*.tfvars; apply gated by user approval). This script does
+# not provision — it drives work on an EXISTING VM and remains the SSH-config +
+# neocloud-manual path.
+#
 # WHY THIS EXISTS
 #   An agent's shell is not a terminal someone is watching. A blocking
 #   `gcloud compute ssh ... 'bash setup.sh'` that takes 30 min hits the tool timeout, the agent
@@ -44,6 +49,9 @@
 
 set -euo pipefail
 
+# shellcheck source=scripts/lib/_common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/_common.sh"
+
 VM="${CAGE_VM:-cage-gpu}"
 ZONE="${CAGE_ZONE:-$( [ -f .agent/cage_zone ] && cat .agent/cage_zone || echo us-central1-a )}"
 DIR="${BGTASK_DIR:-.agent/tasks}"
@@ -52,7 +60,7 @@ mkdir -p "$DIR"
 
 export CLOUDSDK_CORE_DISABLE_PROMPTS=1
 
-die()  { printf 'remote_job: %s\n' "$*" >&2; exit 1; }
+# die() comes from scripts/lib/_common.sh.
 iso()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 now()  { date +%s; }
 b64()  { if base64 --help 2>&1 | grep -q -- '-w'; then base64 -w0; else base64 | tr -d '\n'; fi; }
@@ -63,8 +71,18 @@ rssh() {
     -- -o StrictHostKeyChecking=no -o ConnectTimeout=25 -o BatchMode=yes 2>/dev/null
 }
 
+# Job names are spliced into REMOTE shell command strings and remote file paths;
+# constrain them so a hostile/typo'd name (spaces, /, $, quotes) cannot become remote
+# shell injection or write outside ~/.cage_jobs. Fail loud, never sanitize silently.
+check_name() {
+  case "${1:?job name required}" in
+    *[!A-Za-z0-9._-]*|'') die "invalid job name '$1' (allowed: A-Za-z0-9._-)" ;;
+  esac
+}
+
 cmd_submit() {
   local name="${1:?name required}" command="${2:?command required}" deadline="${3:-1800}"
+  check_name "$name"
   local enc; enc="$(printf '%s' "$command" | b64)"
 
   # Refuse to double-submit a live job (idempotency: a retry must not spawn a second run).
@@ -108,7 +126,9 @@ EOF
 _rpid() { [ -f "$DIR/$1.remote.json" ] && sed -n 's/.*"handle": "pid:\([0-9]*\)".*/\1/p' "$DIR/$1.remote.json" || true; }
 
 cmd_status() {
-  local name="${1:?name required}" pid; pid="$(_rpid "$name")"
+  local name="${1:?name required}" pid
+  check_name "$name"
+  pid="$(_rpid "$name")"
   [ -n "$pid" ] || { echo "UNKNOWN"; return 1; }
   local out
   out="$(rssh "if [ -f $RDIR/$name.status ]; then cat $RDIR/$name.status; elif kill -0 $pid 2>/dev/null; then echo RUNNING; else echo CRASHED; fi" | tr -d '\r\n ')"
@@ -122,9 +142,10 @@ cmd_status() {
   esac
 }
 
-cmd_tail() { local name="${1:?}" n="${2:-40}"; rssh "tail -n $n $RDIR/$name.log 2>/dev/null || echo '(no log yet)'"; }
+cmd_tail() { local name="${1:?}" n="${2:-40}"; check_name "$name"; rssh "tail -n $n $RDIR/$name.log 2>/dev/null || echo '(no log yet)'"; }
 cmd_grep() {
   local name="${1:?}" pat="${2:-error|fail|denied|exception|traceback|out of memory|quota}"
+  check_name "$name"
   rssh "grep -inE '$pat' $RDIR/$name.log 2>/dev/null | tail -n 25 || echo '(no matches)'"
 }
 
@@ -148,7 +169,9 @@ cmd_wait() {
 }
 
 cmd_kill() {
-  local name="${1:?}" pid; pid="$(_rpid "$name")"
+  local name="${1:?}" pid
+  check_name "$name"
+  pid="$(_rpid "$name")"
   [ -n "$pid" ] || die "no remote pid recorded for '$name'"
   rssh "kill -- -$pid 2>/dev/null || kill $pid 2>/dev/null || true; sleep 2; kill -9 -- -$pid 2>/dev/null || kill -9 $pid 2>/dev/null || true; echo 143 > $RDIR/$name.status" >/dev/null || true
   echo "killed $name (remote pid $pid on $VM)"
@@ -157,6 +180,7 @@ cmd_kill() {
 
 cmd_fetch() {
   local name="${1:?}"
+  check_name "$name"
   gcloud compute scp "$VM:$RDIR/$name.log" "$DIR/$name.remote.log" --zone="$ZONE" --quiet 2>/dev/null \
     && echo "fetched -> $DIR/$name.remote.log" || die "fetch failed for '$name'"
 }
@@ -180,5 +204,5 @@ case "${1:-}" in
   kill)   shift; cmd_kill   "$@" ;;
   fetch)  shift; cmd_fetch  "$@" ;;
   list)   shift; cmd_list   "$@" ;;
-  *) sed -n '2,40p' "$0"; exit 2 ;;
+  *) sed -n '2,46p' "$0"; exit 2 ;;  # header grew by the provisioning note; keep usage complete
 esac

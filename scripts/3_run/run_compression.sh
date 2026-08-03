@@ -1,5 +1,9 @@
 #!/bin/bash
 # =============================================================================
+# PILOT HARNESS — drives the retired 9-name taxonomy via the alias map; the
+# campaign harness (CellSpec-native, D6 open-loop) lands at tranche P1; use for
+# pilot re-scoring only.
+# =============================================================================
 # Compression axis (the 2x2) — ratio-matched at ~2x
 # =============================================================================
 #   context source {CAG, RAG}  x  compression {full, compressed}
@@ -17,6 +21,8 @@
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=scripts/lib/_common.sh
+source "$PROJECT_DIR/scripts/lib/_common.sh"
 MODEL="${1:-Qwen/Qwen3-8B}"
 DATASET="${DATASET:-squad_v2}"
 NUM_QUERIES="${NUM_QUERIES:-500}"
@@ -62,7 +68,8 @@ done
 # manifest captures. mem-util (0.90) is the swept memory-pressure axis.
 source "$SCRIPT_DIR/../lib/_serving_config.sh"
 
-cd "$PROJECT_DIR"
+# No -e in this script (fault-tolerant cells): guard the cd or everything below runs elsewhere.
+cd "$PROJECT_DIR" || exit 1
 # Activate the project venv if the caller has not already (cage-env on the VM, .venv locally),
 # so a standalone `nohup bash scripts/3_run/run_compression.sh` does not fall back to system python.
 if [ -z "${VIRTUAL_ENV:-}" ]; then
@@ -76,7 +83,7 @@ mkdir -p "$OUTPUT_DIR"
 case "$MODEL" in *MiMo*|*mimo*) MTAG="_mimo7b" ;; *) MTAG="" ;; esac
 
 # ---------------------------------------------------------------------------
-# Fault tolerance + resume (mirrors run_speculative_matrix.sh's sentinel pattern):
+# Fault tolerance + resume (the sentinel pattern shared by all pilot trees):
 # complete cells (all trial_1..NUM_TRIALS metrics.json) are skipped unless CAGE_FORCE_RERUN=1;
 # a failed cell/server writes STATUS=failed and the 2x2 continues; exit nonzero at the end.
 # ---------------------------------------------------------------------------
@@ -94,7 +101,7 @@ prepare_cell() {  # <full label> -> 0 = run it (stale dir wiped), 1 = skip (alre
     local label="$1" dir="$OUTPUT_DIR/$1"
     if [ "${CAGE_FORCE_RERUN:-0}" = "1" ]; then
         [ -d "$dir" ] && echo "    FORCE RERUN (CAGE_FORCE_RERUN=1): wiping $label"
-        rm -rf "$dir"
+        rm -rf "${dir:?}"
         return 0
     fi
     if cell_complete "$dir"; then
@@ -103,7 +110,7 @@ prepare_cell() {  # <full label> -> 0 = run it (stale dir wiped), 1 = skip (alre
     fi
     if [ -d "$dir" ]; then
         echo "    PARTIAL: wiping incomplete $label and re-running"
-        rm -rf "$dir"
+        rm -rf "${dir:?}"
     fi
     return 0
 }

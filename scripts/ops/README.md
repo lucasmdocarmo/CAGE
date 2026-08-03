@@ -3,6 +3,12 @@
 Unnumbered on purpose. The numbered stages (`1_setup` … `6_teardown`) are the happy path of a run;
 these are tools that run **alongside** any stage — same rationale as `checks/` and `lib/`.
 
+> **Provisioning (2026-08-02 charter):** the GCP campaign path now provisions via **`terraform/`**
+> (`sessions/*.tfvars`; `terraform apply` gated by explicit user approval — see `terraform/main.tf`).
+> The scripts here remain the **SSH-config + neocloud-manual** path: `gpu_vm.sh create` is the
+> pilot-era L4 zone-hunt, `remote_job.sh` drives work on an existing box either way, and
+> `gpu_vm.sh sweep` stays the universal prove-$0 check.
+
 Grounded in the `gcp-background-tasks` skill. The rule it exists to enforce:
 
 > **An agent's shell is not a terminal someone is watching.** A blocking command that can exceed the

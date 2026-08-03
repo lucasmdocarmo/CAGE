@@ -19,6 +19,12 @@
 #   scripts/6_teardown/teardown_vm.sh <instance> <zone> [--force]
 # Env: CAGE_RESULTS_BUCKET (default gs://<project>-cage-results)
 set -uo pipefail
+# (Deliberately no -e: each step's exit status is handled explicitly and verified
+# via GCS state, because SSH exit codes to these VMs are unreliable.)
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/_common.sh
+source "$SCRIPT_DIR/../lib/_common.sh"
 
 VM=""; ZONE=""; FORCE=0
 for a in "$@"; do
@@ -36,7 +42,14 @@ if [ -z "$VM" ] || [ -z "$ZONE" ]; then
   exit 2
 fi
 
-PROJECT="$(gcloud config get-value project 2>/dev/null)"
+require_cmd gcloud "install the Google Cloud SDK"
+PROJECT="$(gcloud config get-value project 2>/dev/null || true)"
+# Fail closed on a resolvable bucket: with no project AND no explicit bucket the default
+# would degenerate to gs://-cage-results and every verification below would "fail" for
+# the wrong reason.
+if [ -z "$PROJECT" ] && [ -z "${CAGE_RESULTS_BUCKET:-}" ]; then
+  die "no gcloud project configured and CAGE_RESULTS_BUCKET unset -- cannot resolve the results bucket"
+fi
 BUCKET="${CAGE_RESULTS_BUCKET:-gs://${PROJECT}-cage-results}"
 case "$BUCKET" in gs://*) ;; *) BUCKET="gs://$BUCKET" ;; esac
 TOKEN="teardown_$(date -u +%Y%m%d_%H%M%S)_$$"   # unique to THIS teardown invocation

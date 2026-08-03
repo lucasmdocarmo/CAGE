@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # gpu_vm.sh — create / locate / sweep the CAGE L4 GPU VM.
 #
+# PROVISIONING (2026-08-02 charter): the GCP campaign path now provisions via
+# terraform/ (sessions/*.tfvars; `terraform apply` gated by explicit user
+# approval — see terraform/main.tf header). This script remains the SSH-config +
+# neocloud-manual path (pilot-era L4 zone-hunt); `sweep` stays universally useful
+# for proving $0.
+#
 # WHY THIS EXISTS
 #   L4 capacity is genuinely scarce: on 2026-07-15 `g2-standard-8` returned
 #   ZONE_RESOURCE_POOL_EXHAUSTED in EVERY zone tried (us-central1 a/b/c, us-east1 b/c/d,
@@ -35,6 +41,9 @@
 set -euo pipefail
 export CLOUDSDK_CORE_DISABLE_PROMPTS=1
 
+# shellcheck source=scripts/lib/_common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/_common.sh"
+
 NAME_DEFAULT="cage-gpu"
 IMAGE_FAMILY="${CAGE_IMAGE_FAMILY:-common-cu129-ubuntu-2204-nvidia-580}"
 IMAGE_PROJECT="${CAGE_IMAGE_PROJECT:-deeplearning-platform-release}"
@@ -45,7 +54,7 @@ HOOK="scripts/5_observability/gcp_shutdown_hook.sh"
 # Zones where G2/L4 exists. Ordered: bucket-local (us-central1) first, then wider US.
 ZONES_DEFAULT="us-central1-a us-central1-b us-central1-c us-east1-b us-east1-c us-east1-d us-east4-c us-west1-a us-west1-b us-west1-c us-west4-a northamerica-northeast1-b"
 
-die() { printf 'gpu_vm: %s\n' "$*" >&2; exit 1; }
+# die() comes from scripts/lib/_common.sh.
 
 _try() {  # $1=name $2=zone $3=machine -> 0 on success, else prints reason
   local out
@@ -123,5 +132,5 @@ case "${1:-}" in
   ip)     shift; cmd_ip   "$@" ;;
   zone)   shift; cmd_zone "$@" ;;
   sweep)  shift; cmd_sweep "$@" ;;
-  *) sed -n '2,30p' "$0"; exit 2 ;;
+  *) sed -n '2,38p' "$0"; exit 2 ;;  # header grew by the provisioning note; keep usage complete
 esac

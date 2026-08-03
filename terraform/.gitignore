@@ -1,0 +1,20 @@
+# Terraform state stays LOCAL and per-run (clean-room discipline: a surviving
+# remote state bucket would violate teardown-to-TRUE-$0). Never commit state.
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+.terraform/
+# NOTE: .terraform.lock.hcl is deliberately NOT ignored — commit it so every
+# run resolves the same provider build (pinning discipline).
+crash.log
+crash.*.log
+
+# Real variable files carry the billing account id + project id — keep them out
+# of git. terraform.tfvars.example and sessions/*.tfvars (placeholders only)
+# ARE tracked.
+terraform.tfvars
+*.auto.tfvars
+
+# Plan files can embed secrets/resolved values.
+*.tfplan
+plan.out
