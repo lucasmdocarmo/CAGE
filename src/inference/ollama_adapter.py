@@ -143,7 +143,10 @@ class OllamaAdapter(InferenceEngine):
             num_tokens = (
                 int(completion_tokens) if isinstance(completion_tokens, (int, float)) else len(generated_text.split())
             )
-            ttft_ms = total_time_ms * 0.2
+            # Non-streaming: TTFT is unobservable (full response arrives at once), so
+            # report it as the full response time rather than a fabricated fraction.
+            # Use stream=True for a real TTFT measurement (see _stream_generate above).
+            ttft_ms = total_time_ms
 
             return InferenceResponse(
                 request_id=request.request_id,
@@ -170,7 +173,10 @@ class OllamaAdapter(InferenceEngine):
             )
 
     def batch_generate(self, requests: List[InferenceRequest]) -> List[InferenceResponse]:
-        return [self.generate(req) for req in requests]
+        # stream=True: a non-streamed call falls into the fabricated-TTFT branch
+        # (see generate() above), which would silently mix measurement methodologies
+        # with the streamed single-request path. Stream every row for a real TTFT.
+        return [self.generate(req, stream=True) for req in requests]
 
     def is_ready(self) -> bool:
         try:

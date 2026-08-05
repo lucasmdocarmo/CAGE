@@ -38,7 +38,7 @@ def main() -> int:
                    help="Default: data/manifests/<dataset>_<N>x<T>_seed<seed>.json")
     args = p.parse_args()
 
-    from src.data.loader import get_loader
+    from src.data.loader import get_loader, gold_only
     from src.data.manifest import build_manifest
 
     kwargs = {"seed": args.seed}
@@ -57,6 +57,11 @@ def main() -> int:
         pool_target=args.pool_target,
         dataset=args.dataset,
         split=split,
+        # Strip distractor paragraphs before packing (HotpotQA/MuSiQue keep gold +
+        # distractors in .context; no-op for SQuAD-shaped loaders). Without this,
+        # unique-per-question distractor text pollutes the shared corpus budget and
+        # each block degenerates to ~1 example (see src/data/manifest.py docstring).
+        context_selector=gold_only,
     )
 
     out = Path(args.out) if args.out else (

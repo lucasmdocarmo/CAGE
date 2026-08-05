@@ -3,22 +3,50 @@ Dataset loaders for CAGE evaluation.
 
 Supports loading and formatting HuggingFace datasets:
 - hotpotqa: multi-hop reasoning
-- qasper: scientific paper QA
+- qasper: scientific paper QA (charter D5 item 4 — full papers, evidence qrels)
 - squad_v2: reading comprehension
 - trivia_qa: multi-evidence questions
 - humaneval: code generation (HPC Layer 1)
 - mbpp: code generation (HPC Layer 1)
 - hpc_code: CUDA/OpenMP code generation prompts (HPC Layer 1)
+
+Plus two charter D5 instruments living in sibling modules (registered in
+``get_loader`` via lazy imports so this module stays importable without them):
+- ruler: synthetic RULER-style length instrument (src/data/ruler.py; D5 item 5)
+- scbench: SCBench two-subset external-validation slice (src/data/scbench.py;
+  D5 item 6)
 """
 
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import os
 import random
 
 # NOTE: `datasets` is imported lazily inside each loader's load() so this module
 # (CAGExample, get_loader, registry) stays importable in environments without the
 # HuggingFace `datasets` package (e.g. the local analysis venv running unit tests).
+
+
+class DatasetUnavailableError(RuntimeError):
+    """A required dataset failed to load or violated its expected schema.
+
+    Raised INSTEAD of silently returning an empty/partial example list: a
+    silently-degraded dataset would let a campaign cell run on the wrong (or no)
+    workload under the same cell name, voiding cross-cell comparability. Mirrors
+    the fail-closed contract of
+    ``src.evaluation.quality.InstrumentUnavailableError``.
+    """
+
+    def __init__(self, dataset: str, source: str, cause: str) -> None:
+        self.dataset = dataset
+        self.source = source
+        self.cause = cause
+        super().__init__(
+            f"Dataset '{dataset}' unavailable from '{source}': {cause}. "
+            f"Fail-closed by design — stage it first (see "
+            f"scripts/1_setup/download_datasets.py) or fix the named cause; "
+            f"no silent fallback workload is substituted."
+        )
 
 
 @dataclass
@@ -38,6 +66,26 @@ class CAGExample:
         
         context_str = "\n\n".join([f"Context {i+1}: {c}" for i, c in enumerate(self.context)])
         return f"{context_str}\n\nQuestion: {self.question}\nAnswer:"
+
+
+def gold_only(example: CAGExample) -> List[str]:
+    """Filter ``example.context`` down to just its gold paragraph(s).
+
+    Loaders that keep ALL paragraphs (gold + distractors) in ``.context`` --
+    HotpotQA, MuSiQue -- record the gold titles in ``metadata["supporting_titles"]``
+    and title-prefix every context string as ``"<title>: <text>"``; this returns only
+    the entries whose title matches. Loaders without that metadata (SQuAD v2, and
+    anything else whose ``.context`` already IS the gold paragraph(s)) are returned
+    unchanged.
+
+    Intended as the ``context_selector`` passed to
+    ``src.data.manifest.build_manifest`` so shared true-CAG corpus blocks are built
+    from gold paragraphs only, not unique-per-question distractor text.
+    """
+    titles = (example.metadata or {}).get("supporting_titles")
+    if not titles:
+        return example.context
+    return [c for c in (example.context or []) if any(c.startswith(f"{t}: ") for t in titles)]
 
 
 class DatasetLoader:
@@ -126,52 +174,191 @@ class HotpotQALoader(DatasetLoader):
 
 
 class QasperLoader(DatasetLoader):
-    """Loader for QASPER dataset (scientific papers)."""
-    
-    def __init__(self, split: str = "validation", seed: int = 42):
+    """Loader for QASPER (Dasigi et al., NAACL 2021) — charter D5 item 4.
+
+    Context (FULL paper, never LongBench-style truncation): one title-prefixed
+    doc per unit, in paper order — optional ``"Title: <paper title>"`` (only
+    when ``include_title=True``; default off preserves the pinned context
+    layout), then ``"Abstract: <abstract>"``, then one ``"<section name>:
+    <paragraphs joined by newline>"`` doc per full_text section. The real HF
+    schema is COLUMNAR and abstract is TOP-LEVEL (crash class fixed 2026-08-04,
+    pinned by tests/test_dataset_loaders.py): ``full_text = {"section_name":
+    [...], "paragraphs": [[...], ...]}`` (index-aligned lists), ``qas`` a dict
+    of parallel lists, and each per-question ``answers`` entry is ``{"answer":
+    [one dict per annotator], "annotation_id": [...], "worker_id": [...]}``.
+
+    Answer resolution — deterministic rule (charter D5#4: yes/no + unanswerable
+    special-cased; abstention axis preserved):
+      1. Each annotator dict is resolved independently with the fixed
+         precedence ``unanswerable -> yes_no -> free_form_answer ->
+         extractive_spans`` (unanswerable FIRST because a stale/default yes_no
+         can co-occur with ``unanswerable=True``; yes/no resolves to the
+         literal ``"Yes"``/``"No"``; extractive spans join with ``"; "``;
+         an annotator matching none of the four resolves to nothing).
+      2. Question-level gold: if EVERY resolvable annotator resolved
+         unanswerable, the question is unanswerable — empty ``answer`` +
+         ``metadata["is_impossible"]=True`` (same convention as SQuAD v2).
+         Otherwise the primary gold is the FIRST annotator (dataset order)
+         resolving to a non-empty answer; every annotator's non-empty
+         resolution is kept order-preserving-deduplicated (primary first) in
+         ``metadata["all_answers"]`` for max-over-golds scoring (same key the
+         SQuAD v2 loader emits, consumed by evaluation/quality.py). Questions
+         where no annotator resolves to anything are skipped.
+
+    Evidence (qrels-ready, feeds D8 §8.2 Layer-0): ``metadata["evidence"]`` /
+    ``metadata["highlighted_evidence"]`` hold the order-preserving-deduplicated
+    union of the human gold evidence texts across ALL annotators (exact
+    paragraph texts; figure/table refs appear as ``"FLOAT SELECTED: ..."`` and
+    are kept verbatim). ``metadata["evidence_doc_ids"]`` maps each evidence
+    text to the index of the emitted ``context`` doc containing it verbatim
+    (unmatched texts — e.g. floats not in full_text — contribute no id);
+    ``metadata["supporting_titles"]`` holds the section names of the matched
+    docs so ``gold_only()`` and the corpus/qrels machinery work exactly as for
+    HotpotQA/MuSiQue (note: duplicate section names within one paper make the
+    title-prefix match over-select; ``evidence_doc_ids`` is the precise form).
+    """
+
+    def __init__(self, split: str = "validation", seed: int = 42,
+                 include_title: bool = False):
         super().__init__("allenai/qasper", split, seed)
-    
+        self.include_title = include_title
+
+    # -- answer resolution -------------------------------------------------
+
+    @staticmethod
+    def _resolve_annotator(annotator: Dict[str, Any]) -> Tuple[str, Optional[str]]:
+        """Resolve ONE annotator dict -> (answer_text, answer_type).
+
+        Fixed precedence documented in the class docstring; answer_type is one
+        of "unanswerable" | "yes_no" | "abstractive" | "extractive" | None
+        (None = annotation resolves to nothing and is ignored).
+        """
+        annotator = annotator or {}
+        if annotator.get("unanswerable"):
+            return "", "unanswerable"
+        if annotator.get("yes_no") is not None:
+            return ("Yes" if annotator["yes_no"] else "No"), "yes_no"
+        if annotator.get("free_form_answer"):
+            return annotator["free_form_answer"], "abstractive"
+        if annotator.get("extractive_spans"):
+            return "; ".join(annotator["extractive_spans"]), "extractive"
+        return "", None
+
     def load(self, max_examples: Optional[int] = None) -> List[CAGExample]:
-        """Load QASPER dataset."""
+        """Load QASPER dataset (one CAGExample per question; ``max_examples``
+        bounds PAPERS, each contributing all its questions)."""
         from datasets import load_dataset  # lazy: see module-level note
 
         dataset = load_dataset("allenai/qasper", split=self.split)
-        
+
         if max_examples:
             # Seeded shuffle BEFORE select so different seeds (per trial) draw
             # different, reproducible samples — fixes the trial-independence bug
             # where every trial saw the identical first-N examples.
             dataset = dataset.shuffle(seed=self.seed).select(range(min(max_examples, len(dataset))))
-        
+
         examples = []
         for item in dataset:
-            # QASPER has paper full text + questions
-            paper_text = item.get("full_text", {})
-            
-            # Extract abstract and intro as context
-            context_docs = []
-            if "abstract" in paper_text:
-                context_docs.append(f"Abstract: {paper_text['abstract']}")
-            
-            # Process questions
-            for qa in item.get("qas", []):
-                question = qa.get("question", "")
-                # Use first answer if available
-                answers = qa.get("answers", [])
-                answer_text = answers[0].get("answer", "") if answers else ""
-                
-                if question and answer_text:
-                    examples.append(CAGExample(
-                        id=f"{item.get('id', '')}_{qa.get('question_id', len(examples))}",
-                        question=question,
-                        context=context_docs,
-                        answer=answer_text,
-                        metadata={
-                            "paper_id": item.get("id", ""),
-                            "title": item.get("title", ""),
-                        }
-                    ))
-        
+            # QASPER full text (charter D5#4: "full papers, never LongBench
+            # truncation"). Real schema: item["abstract"] is TOP-LEVEL (not nested
+            # under full_text); full_text = {"section_name": [...], "paragraphs":
+            # [[...], ...]} -- a list of paragraph strings PER section, aligned by
+            # index with section_name.
+            context_docs: List[str] = []
+            doc_titles: List[str] = []  # parallel: title-prefix of each doc ("" if none)
+            title = item.get("title") or ""
+            if self.include_title and title:
+                context_docs.append(f"Title: {title}")
+                doc_titles.append("Title")
+            abstract = item.get("abstract") or ""
+            if abstract:
+                context_docs.append(f"Abstract: {abstract}")
+                doc_titles.append("Abstract")
+
+            full_text = item.get("full_text") or {}
+            section_names = full_text.get("section_name") or []
+            section_paragraphs = full_text.get("paragraphs") or []
+            for section_name, paragraphs in zip(section_names, section_paragraphs):
+                body = "\n".join(p for p in (paragraphs or []) if p)
+                if not body:
+                    continue
+                context_docs.append(f"{section_name}: {body}" if section_name else body)
+                doc_titles.append(section_name or "")
+
+            # qas is COLUMNAR (dict of parallel lists), not a list of per-question
+            # records: {"question": [...], "question_id": [...], "answers": [...]}.
+            qas = item.get("qas") or {}
+            questions = qas.get("question") or []
+            question_ids = qas.get("question_id") or []
+            answers_list = qas.get("answers") or []
+            for i, question in enumerate(questions):
+                question_id = question_ids[i] if i < len(question_ids) else str(len(examples))
+                answers_struct = answers_list[i] if i < len(answers_list) else {}
+                annotator_answers = (answers_struct or {}).get("answer") or []
+
+                # Resolve EVERY annotator (deterministic rule in class docstring).
+                resolved: List[Tuple[str, str]] = []  # (text, type), type != None
+                for annotator in annotator_answers:
+                    text, answer_type = self._resolve_annotator(annotator)
+                    if answer_type is not None:
+                        resolved.append((text, answer_type))
+                if not question or not resolved:
+                    continue  # nothing resolvable: skip (pinned pre-existing filter)
+
+                non_empty = [(t, a) for t, a in resolved if t]
+                if not non_empty:
+                    # every resolvable annotator said unanswerable -> abstention axis
+                    answer_text, answer_type, is_impossible = "", "unanswerable", True
+                    all_answers: List[str] = []
+                else:
+                    answer_text, answer_type = non_empty[0]
+                    is_impossible = False
+                    all_answers = list(dict.fromkeys(t for t, _ in non_empty))
+
+                # Human gold evidence, unioned across ALL annotators (qrels basis).
+                evidence = list(dict.fromkeys(
+                    e for annotator in annotator_answers
+                    for e in ((annotator or {}).get("evidence") or []) if e
+                ))
+                highlighted = list(dict.fromkeys(
+                    h for annotator in annotator_answers
+                    for h in ((annotator or {}).get("highlighted_evidence") or []) if h
+                ))
+                evidence_doc_ids: List[int] = []
+                for ev in evidence:
+                    for doc_idx, doc in enumerate(context_docs):
+                        if ev in doc:
+                            if doc_idx not in evidence_doc_ids:
+                                evidence_doc_ids.append(doc_idx)
+                            break
+                supporting_titles = list(dict.fromkeys(
+                    doc_titles[doc_idx] for doc_idx in evidence_doc_ids if doc_titles[doc_idx]
+                ))
+
+                examples.append(CAGExample(
+                    id=f"{item.get('id', '')}_{question_id}",
+                    question=question,
+                    context=context_docs,
+                    answer=answer_text,
+                    metadata={
+                        "dataset": "qasper",
+                        "paper_id": item.get("id", ""),
+                        "title": title,
+                        # Yes/no + unanswerable scoring special-cased (charter D5#4).
+                        "is_impossible": is_impossible,
+                        "answer_type": answer_type,
+                        "all_answers": all_answers,
+                        "num_annotators": len(resolved),
+                        "num_unanswerable_annotators": sum(
+                            1 for _, a in resolved if a == "unanswerable"),
+                        # Qrels-ready gold evidence (D8 §8.2 Layer-0).
+                        "evidence": evidence,
+                        "highlighted_evidence": highlighted,
+                        "evidence_doc_ids": evidence_doc_ids,
+                        "supporting_titles": supporting_titles,
+                    }
+                ))
+
         return examples
 
 
@@ -203,6 +390,11 @@ class SquadV2Loader(DatasetLoader):
             # text[0] understated answerable F1 ~5pp / EM ~10pp. Empty list = unanswerable
             # (official SQuAD semantics). Consumed by evaluation/quality.py.
             all_answers = list(dict.fromkeys(t for t in (answers.get("text") or []) if t))
+            # DERIVED, not read from the schema: the real squad_v2 HF payload has no
+            # "is_impossible" field (only id/title/context/question/answers), so
+            # item.get("is_impossible", False) was silently always False. Official
+            # SQuAD v2 semantics: an empty gold-answer list means unanswerable.
+            is_impossible = len(all_answers) == 0
 
             examples.append(CAGExample(
                 id=item.get("id", str(len(examples))),
@@ -211,7 +403,7 @@ class SquadV2Loader(DatasetLoader):
                 answer=answer_text,
                 metadata={
                     "title": item.get("title", ""),
-                    "is_impossible": item.get("is_impossible", False),
+                    "is_impossible": is_impossible,
                     "all_answers": all_answers,
                 }
             ))
@@ -874,7 +1066,15 @@ class ShareGPTLoader(DatasetLoader):
 
 
 def get_loader(dataset_name: str, split: str = "validation", seed: int = 42) -> DatasetLoader:
-    """Factory function to get appropriate dataset loader."""
+    """Factory function to get appropriate dataset loader.
+
+    "ruler" (synthetic length instrument) and "scbench" (external-validation
+    slice) live in sibling modules imported lazily so this module keeps zero
+    non-stdlib imports; both are configured via env vars documented in their
+    classes (e.g. CAGE_RULER_CONTEXT_TOKENS, CAGE_SCBENCH_SUBSET). NOTE:
+    microsoft/SCBench publishes a "test" split — pass split="test" (or set
+    CAGE_SCBENCH_SPLIT) for scbench; the loader fails closed otherwise.
+    """
     loaders = {
         "hotpotqa": HotpotQALoader,
         "qasper": QasperLoader,
@@ -888,8 +1088,16 @@ def get_loader(dataset_name: str, split: str = "validation", seed: int = 42) -> 
         "mbpp": MBPPLoader,
         "hpc_code": HPCCodeLoader,
     }
-    
+
+    if dataset_name == "ruler":
+        from src.data.ruler import RulerLoader  # lazy: see docstring
+        return RulerLoader(split=split, seed=seed)
+    if dataset_name == "scbench":
+        from src.data.scbench import SCBenchLoader  # lazy: see docstring
+        return SCBenchLoader(split=split, seed=seed)
+
     if dataset_name not in loaders:
-        raise ValueError(f"Unknown dataset: {dataset_name}. Supported: {list(loaders.keys())}")
-    
+        supported = list(loaders.keys()) + ["ruler", "scbench"]
+        raise ValueError(f"Unknown dataset: {dataset_name}. Supported: {supported}")
+
     return loaders[dataset_name](split=split, seed=seed)

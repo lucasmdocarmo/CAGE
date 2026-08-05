@@ -34,6 +34,8 @@ IFS=$'\n\t'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=scripts/lib/_common.sh
+source "$PROJECT_DIR/scripts/lib/_common.sh"
 
 STALL_MAX_S=600                                   # the verdict literal is STALLED>10min
 SYNC_LAG_MAX_S="${CAGE_SYNC_LAG_MAX_S:-900}"
@@ -42,6 +44,8 @@ case "$SYNC_LAG_MAX_S" in ''|*[!0-9]*)
   SYNC_LAG_MAX_S=900 ;;
 esac
 
+# Local overrides of _common.sh's log/die (sourced above): status output IS the
+# data (bare stdout, no "[cage]" prefix) and errors carry this script's tag.
 log() { printf '%s\n' "$*"; }                     # status IS the data -> stdout
 err() { printf '[watch_campaign] ERROR: %s\n' "$*" >&2; }
 die() { err "$*"; exit 1; }

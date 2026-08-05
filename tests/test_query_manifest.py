@@ -110,3 +110,66 @@ def test_same_paragraph_questions_share_a_block() -> None:
         para = ex_id.split("_")[1]  # ex_<p>_<q>
         by_para.setdefault(para, set()).add(b)
     assert all(len(bs) == 1 for bs in by_para.values())
+
+
+def _gold_only(ex: FakeExample) -> List[str]:
+    titles = ex.metadata.get("supporting_titles") or []
+    return [c for c in ex.context if any(c.startswith(f"{t}: ") for t in titles)]
+
+
+def test_context_selector_strips_distractors_before_grouping_and_packing() -> None:
+    """HotpotQA/MuSiQue-shaped regression: examples share the SAME gold paragraphs but
+    each carries its OWN (unique, distractor) paragraphs in .context, exactly like the
+    real loaders (loader.py keeps gold + distractors, gold recoverable via
+    metadata['supporting_titles']). Without gold-filtering, build_manifest used to key
+    grouping/packing off the raw (mostly-distractor) context, so these examples never
+    grouped and each burned its own block (~1 example/block, defeating cross-question
+    corpus reuse). With context_selector=gold_only, they must all land in ONE block
+    built from gold paragraphs only.
+    """
+    gold1 = "Alpha: " + " ".join(f"a{w}" for w in range(20))
+    gold2 = "Beta: " + " ".join(f"b{w}" for w in range(20))
+
+    def make_ex(i: int) -> FakeExample:
+        distractors = [
+            "D" + str(i) + "_" + str(j) + ": " + " ".join(f"x{w}" for w in range(20))
+            for j in range(8)
+        ]
+        return FakeExample(
+            id=f"ex_{i}", question=f"Q{i}?", context=[gold1, gold2] + distractors,
+            metadata={"supporting_titles": ["Alpha", "Beta"]},
+        )
+
+    pool = [make_ex(i) for i in range(6)]
+    # One example's full raw context (2 gold + 8 unique distractors) is ~316 tokens;
+    # two examples' worth is ~561. A 350 budget therefore fits exactly one example's
+    # raw paragraphs per block -- reproducing the live-verified MuSiQue degeneration
+    # (pool_size == n_blocks, a 1:1 example:block ratio) deterministically.
+    RAW_BUDGET = 350
+
+    # WITHOUT the selector: unique-per-question distractors mean no two examples
+    # share a raw context tuple, so grouping is a no-op and every example fights for
+    # its own block (degenerate ~1-example-per-block).
+    m_raw = build_manifest(pool, num_queries=6, num_trials=1, seed=42, block_budget=RAW_BUDGET)
+    assert m_raw["stats"]["n_blocks"] == 6
+    assert m_raw["stats"]["pool_size"] == 6
+
+    # WITH the selector: filtered down to the shared gold pair, all 6 group and pack
+    # into ONE block, and that block's text carries no distractor content.
+    m = build_manifest(pool, num_queries=6, num_trials=1, seed=42, block_budget=RAW_BUDGET,
+                       context_selector=_gold_only)
+    assert m["stats"]["n_blocks"] == 1
+    assert m["stats"]["pool_size"] == 6
+    assert m["question_to_block"] == {f"ex_{i}": 0 for i in range(6)}
+    block_text = m["blocks"][0]["text"]
+    assert "Alpha:" in block_text and "Beta:" in block_text
+    assert "D0_" not in block_text and "D5_" not in block_text
+
+
+def test_context_selector_defaults_to_unfiltered_context() -> None:
+    """No context_selector -> unchanged behavior (SQuAD-shaped default)."""
+    pool = make_pool()
+    m_default = build_manifest(pool, num_queries=10, num_trials=1, seed=42, block_budget=BUDGET)
+    m_identity = build_manifest(pool, num_queries=10, num_trials=1, seed=42,
+                                block_budget=BUDGET, context_selector=lambda ex: ex.context)
+    assert m_default == m_identity

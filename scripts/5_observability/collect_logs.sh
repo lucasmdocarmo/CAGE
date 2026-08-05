@@ -30,7 +30,9 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-cd "$PROJECT_DIR" || { echo "[collect_logs] ERROR: cannot cd to $PROJECT_DIR" >&2; exit 1; }
+# shellcheck source=scripts/lib/_common.sh
+source "$PROJECT_DIR/scripts/lib/_common.sh"
+cd "$PROJECT_DIR" || die "cannot cd to $PROJECT_DIR"
 
 MODE="${1:-full}"
 HOST="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo vm)"
@@ -38,7 +40,7 @@ HOST="$(printf '%s' "$HOST" | tr -c 'A-Za-z0-9_.-' '_')"   # sanitize for a safe
 TS="$(date +%Y%m%d_%H%M%S 2>/dev/null || echo run)"
 LOGROOT="logs"
 mkdir -p "$LOGROOT/vllm" "$LOGROOT/runs" "$LOGROOT/system" \
-  || { echo "[collect_logs] ERROR: cannot create $LOGROOT/ subdirs" >&2; exit 1; }
+  || die "cannot create $LOGROOT/ subdirs"
 
 is_light() { [ "$MODE" = "--light" ] || [ "$MODE" = "light" ]; }
 

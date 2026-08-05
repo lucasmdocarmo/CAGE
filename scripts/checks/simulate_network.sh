@@ -4,6 +4,8 @@
 # Intended to be run inside Docker containers (privileged mode required).
 
 set -euo pipefail
+# shellcheck source=scripts/lib/_common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/_common.sh"
 
 # Default settings
 INTERFACE="${INTERFACE:-eth0}"
@@ -14,10 +16,7 @@ JITTER="${JITTER:-0.01ms}"
 LOSS="${LOSS:-0%}"
 
 # Check for tc
-if ! command -v tc > /dev/null 2>&1; then
-    printf "Error: 'tc' command not found. Ensure iproute2 is installed.\n" >&2
-    exit 1
-fi
+require_cmd tc "ensure iproute2 is installed"
 
 printf 'Setting up network simulation on %s\n' "$INTERFACE"
 printf '  Delay: %s +/- %s\n' "$DELAY" "$JITTER"

@@ -27,8 +27,9 @@ Pure stdlib + src.data.corpus: importable (and unit-testable) without the
 """
 from __future__ import annotations
 
+import dataclasses
 import random
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from src.data.corpus import build_corpus_block
 
@@ -52,11 +53,30 @@ def build_manifest(
     pool_target: Optional[int] = None,
     dataset: str = "",
     split: str = "",
+    context_selector: Optional[Callable[[Any], List[str]]] = None,
 ) -> Dict[str, Any]:
-    """Build the manifest dict from loader examples (.id/.question/.context/.answer)."""
+    """Build the manifest dict from loader examples (.id/.question/.context/.answer).
+
+    ``context_selector``, if given, maps each example to the paragraph list that is
+    actually shared-corpus material (default: ``example.context`` unchanged -- the
+    SQuAD-shaped "context IS the gold paragraph" case). Loaders that keep BOTH gold
+    and distractor paragraphs in ``.context`` (HotpotQA, MuSiQue: gold recoverable via
+    ``metadata["supporting_titles"]``) must pass a selector such as
+    ``src.data.loader.gold_only`` here -- otherwise unique-per-question distractor
+    text pollutes the shared block budget and same-paragraph-questions grouping keys
+    off it too, degenerating every block to ~1 example and defeating the cross-
+    question corpus reuse the manifest exists to measure. Applied FIRST, before
+    grouping/packing, so every downstream step (grouping, packing, exclusion) is
+    consistently gold-based.
+    """
     if num_queries < 1 or num_trials < 1:
         raise ManifestError("num_queries and num_trials must be >= 1")
     target = pool_target or max(3 * num_queries, num_queries * num_trials)
+
+    if context_selector is not None:
+        examples = [
+            dataclasses.replace(ex, context=context_selector(ex)) for ex in examples
+        ]
 
     # Same-paragraph questions adjacent; paragraph groups in seeded-random order.
     groups: Dict[tuple, List[Any]] = {}

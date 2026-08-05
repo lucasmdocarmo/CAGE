@@ -22,15 +22,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=scripts/lib/_common.sh
+source "$PROJECT_DIR/scripts/lib/_common.sh"
 
 LOCAL_DIR="${1:-results}"
 BUCKET="${2:-${CAGE_RESULTS_BUCKET:-}}"
 REMOTE_SUBPATH="${3:-$LOCAL_DIR}"
 
-if ! command -v gsutil >/dev/null 2>&1; then
-  echo "ERROR: gsutil not found -- install the Google Cloud SDK; NOTHING was synced." >&2
-  exit 1
-fi
+require_cmd gsutil "install the Google Cloud SDK; NOTHING was synced"
 
 if [ -z "$BUCKET" ]; then
   # Derive the project id: env var, then GCE metadata server, then gcloud config.
@@ -43,8 +42,7 @@ if [ -z "$BUCKET" ]; then
     PROJECT="$(gcloud config get-value project 2>/dev/null || true)"
   fi
   if [ -z "$PROJECT" ] || [ "$PROJECT" = "(unset)" ]; then
-    echo "ERROR: cannot determine GCP project. Pass the bucket explicitly or set CAGE_RESULTS_BUCKET." >&2
-    exit 1
+    die "cannot determine GCP project. Pass the bucket explicitly or set CAGE_RESULTS_BUCKET."
   fi
   BUCKET="gs://${PROJECT}-cage-results"
 fi

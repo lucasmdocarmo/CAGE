@@ -10,6 +10,9 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
+# shellcheck source=scripts/lib/_common.sh
+source "$REPO_ROOT/scripts/lib/_common.sh"
+require_cmd git "packaging stamps BUILD_INFO from the git HEAD"
 
 SHA="$(git rev-parse HEAD)"
 DIRTY=0

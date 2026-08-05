@@ -15,6 +15,8 @@
 #
 # For a single-shot campaign status line (layout v2, no GCS pull), use watch_campaign.sh.
 set -euo pipefail
+# shellcheck source=scripts/lib/_common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/_common.sh"
 
 BUCKET="${1:-${CAGE_RESULTS_BUCKET:-}}"
 LOCAL_DIR="${2:-./phase2_archive}"
@@ -27,18 +29,13 @@ esac
 if [ -z "$BUCKET" ]; then
   _proj="$(gcloud config get-value project 2>/dev/null || true)"
   if [ -z "$_proj" ] || [ "$_proj" = "(unset)" ]; then
-    echo "ERROR: no bucket given and no gcloud project set." >&2
-    echo "  usage: bash scripts/5_observability/watch_run.sh gs://YOUR-BUCKET [local_dir] [interval]" >&2
-    exit 1
+    die "no bucket given and no gcloud project set. usage: bash scripts/5_observability/watch_run.sh gs://YOUR-BUCKET [local_dir] [interval]"
   fi
   BUCKET="gs://${_proj}-cage-results"
 fi
 case "$BUCKET" in gs://*) ;; *) BUCKET="gs://${BUCKET}" ;; esac
 
-if ! command -v gsutil >/dev/null 2>&1; then
-  echo "ERROR: gsutil not found. Install the Google Cloud SDK." >&2
-  exit 1
-fi
+require_cmd gsutil "install the Google Cloud SDK"
 
 mkdir -p "$LOCAL_DIR"
 echo "[watch] pulling $BUCKET  ->  $LOCAL_DIR  every ${INTERVAL}s (Ctrl-C to stop)"

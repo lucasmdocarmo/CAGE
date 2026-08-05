@@ -11,6 +11,8 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_DIR"
+# shellcheck source=scripts/lib/_common.sh
+source "$PROJECT_DIR/scripts/lib/_common.sh"
 if [ -z "${VIRTUAL_ENV:-}" ]; then
   for _v in cage-env .venv ../cage-env; do
     [ -f "$_v/bin/activate" ] && { source "$_v/bin/activate"; break; }
@@ -25,9 +27,7 @@ if [ -z "$RUN_ROOT" ]; then
   RUN_ROOT="$(ls -dt "$PROJECT_DIR/results/$_phase"/*/ 2>/dev/null | head -1)"; RUN_ROOT="${RUN_ROOT%/}"
 fi
 if [ -z "$RUN_ROOT" ] || [ ! -d "$RUN_ROOT" ]; then
-  echo "ERROR: no run root to aggregate. Set CAGE_RUN_ID/CAGE_RUN_ROOT (same as the sweep)," >&2
-  echo "       or pass it explicitly: bash scripts/4_analysis/run_phase2_stats.sh results/<phase>/<run-id>" >&2
-  exit 1
+  die "no run root to aggregate. Set CAGE_RUN_ID/CAGE_RUN_ROOT (same as the sweep), or pass it explicitly: bash scripts/4_analysis/run_phase2_stats.sh results/<phase>/<run-id>"
 fi
 export CAGE_SYNC_DIR="${CAGE_SYNC_DIR:-${RUN_ROOT#"$PROJECT_DIR/"}}"
 # Continuous log+results mirror to GCS + full collect on exit (no built-in sync loop).
@@ -82,9 +82,7 @@ METRICS="grounding_score faithfulness context_relevance ttft_ms latency_ms tpot_
 
 # --- Qwen pass (reference no_cache) ---
 if [ ! -d "$ALL_Q/no_cache" ]; then
-  echo "ERROR: reference baseline 'no_cache' is missing from $ALL_Q." >&2
-  echo "       Run the core suite (cloud_run.sh -> run_baselines.sh) before phase-2 stats." >&2
-  exit 1
+  die "reference baseline 'no_cache' is missing from $ALL_Q. Run the core suite (cloud_run.sh -> run_baselines.sh) before phase-2 stats."
 fi
 python3 scripts/4_analysis/statistical_tests.py --results-dir "$ALL_Q" --reference no_cache \
     --metrics $METRICS \

@@ -71,3 +71,36 @@ def test_staleness_metrics_empty_is_none():
     m = staleness_metrics([])
     assert m["unsafe_served_rate"] is None
     assert m["stale_hit_rate"] is None
+
+
+# --------------------------------------------------------------------------- #
+# Review fix: grounded=None (abstention/unscored -- N/A, not "ungrounded") must
+# NOT be coerced to False. Coercing it silently mislabels a correct "Don't know."
+# as a grounding failure, inflating USR/FH/SHR.
+# --------------------------------------------------------------------------- #
+def test_staleness_metrics_none_grounded_excluded_not_coerced_unsafe():
+    records = [
+        {"served_from_cache": True, "grounded": False, "evidence_version": "v0"},  # real failure
+        {"served_from_cache": True, "grounded": None, "evidence_version": "v0"},   # abstention: N/A
+        {"served_from_cache": True, "grounded": None, "evidence_version": "v0"},   # abstention: N/A
+        {"served_from_cache": True, "grounded": True, "evidence_version": "v0"},   # correct
+    ]
+    m = staleness_metrics(records)
+    # Only the 2 grounded-scored rows count; 1 of 2 is a real failure.
+    assert m["unsafe_served_rate"] == 0.5
+    assert m["false_hit_rate"] == 0.5
+    assert m["stale_hit_rate"] == 0.5
+    # answer_hit_rate is unaffected by grounding N/A -- all 4 rows were served.
+    assert m["answer_hit_rate"] == 1.0
+
+
+def test_unsafe_served_rate_none_grounded_only_is_none():
+    # Every row's grounding is N/A: no scored population, must be None (not 1.0/0.0).
+    records = [
+        {"served_from_cache": True, "grounded": None, "evidence_version": "v0"},
+        {"served_from_cache": False, "grounded": None, "evidence_version": None},
+    ]
+    m = staleness_metrics(records)
+    assert m["unsafe_served_rate"] is None
+    assert m["false_hit_rate"] is None
+    assert m["stale_hit_rate"] is None

@@ -20,7 +20,14 @@ import types
 
 import pytest
 
-from src.data.loader import CAGExample, HotpotQALoader, MuSiQueLoader, get_loader
+from src.data.loader import (
+    CAGExample,
+    HotpotQALoader,
+    MuSiQueLoader,
+    QasperLoader,
+    SquadV2Loader,
+    get_loader,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -280,3 +287,168 @@ def test_musique_registered_in_factory(monkeypatch):
     assert isinstance(loader, MuSiQueLoader)
     assert loader.split == "validation"
     assert loader.seed == 7
+
+
+# ---------------------------------------------------------------------------
+# QasperLoader
+# ---------------------------------------------------------------------------
+
+
+def make_qasper_rows():
+    """Synthetic allenai/qasper rows (schema-faithful, confirmed against the live
+    HF dataset): abstract is TOP-LEVEL (not nested under full_text); full_text =
+    {"section_name": [...], "paragraphs": [[...], ...]} (list of paragraph strings
+    PER section, index-aligned); qas is COLUMNAR (dict of parallel lists), NOT a
+    list of per-question record dicts; each per-question "answers" entry is
+    {"answer": [...one dict per annotator...], "annotation_id": [...], "worker_id":
+    [...]} with no flat "answer" string anywhere.
+    """
+    return [{
+        "id": "paper_1",
+        "title": "A Paper About Widgets",
+        "abstract": "This paper studies widgets.",
+        "full_text": {
+            "section_name": ["Introduction", "Conclusion"],
+            "paragraphs": [
+                ["Widgets are useful.", "This paper studies them."],
+                ["Widgets work well."],
+            ],
+        },
+        "qas": {
+            "question": [
+                "Is this paper about widgets?",
+                "What is the population of the moon?",
+                "How many widgets were tested?",
+            ],
+            "question_id": ["q1", "q2", "q3"],
+            "answers": [
+                {
+                    "answer": [{
+                        "unanswerable": False, "extractive_spans": [], "yes_no": True,
+                        "free_form_answer": "", "evidence": [], "highlighted_evidence": [],
+                    }],
+                    "annotation_id": ["a1"], "worker_id": ["w1"],
+                },
+                {
+                    "answer": [{
+                        "unanswerable": True, "extractive_spans": [], "yes_no": None,
+                        "free_form_answer": "", "evidence": [], "highlighted_evidence": [],
+                    }],
+                    "annotation_id": ["a2"], "worker_id": ["w1"],
+                },
+                {
+                    "answer": [{
+                        "unanswerable": False, "extractive_spans": ["100 widgets"], "yes_no": None,
+                        "free_form_answer": "", "evidence": [], "highlighted_evidence": [],
+                    }],
+                    "annotation_id": ["a3"], "worker_id": ["w1"],
+                },
+            ],
+        },
+    }]
+
+
+def test_qasper_columnar_qas_parsed_without_crash(monkeypatch):
+    """Regression: qas is a dict-of-lists (columnar schema), NOT a list of
+    per-question record dicts -- `for qa in item['qas']` used to iterate the dict's
+    STRING KEYS and crash with AttributeError: 'str' object has no attribute 'get'.
+    """
+    install_fake_datasets(monkeypatch, make_qasper_rows())
+    examples = QasperLoader(split="validation").load()
+
+    assert len(examples) == 3
+    assert [ex.question for ex in examples] == [
+        "Is this paper about widgets?",
+        "What is the population of the moon?",
+        "How many widgets were tested?",
+    ]
+    assert [ex.id for ex in examples] == ["paper_1_q1", "paper_1_q2", "paper_1_q3"]
+    assert all(isinstance(ex, CAGExample) for ex in examples)
+
+
+def test_qasper_context_uses_top_level_abstract_and_full_text_sections(monkeypatch):
+    """Regression: the real abstract lives at item['abstract'] (TOP level), not
+    nested under full_text -- `'abstract' in paper_text` was always False, so
+    context_docs was permanently empty (charter D5#4 requires full papers, never
+    LongBench truncation). Each section's paragraph list must be joined internally
+    before being added as one context entry.
+    """
+    install_fake_datasets(monkeypatch, make_qasper_rows())
+    ex = QasperLoader().load()[0]
+
+    assert ex.context[0] == "Abstract: This paper studies widgets."
+    assert ex.context[1] == "Introduction: Widgets are useful.\nThis paper studies them."
+    assert ex.context[2] == "Conclusion: Widgets work well."
+    # Same full-paper context shared by every question on this paper.
+    assert QasperLoader().load()[1].context == ex.context
+
+
+def test_qasper_answer_resolution_precedence(monkeypatch):
+    """unanswerable -> empty answer + is_impossible=True; yes_no -> "Yes"/"No";
+    extractive_spans -> joined spans; checked in that precedence order per annotator.
+    """
+    install_fake_datasets(monkeypatch, make_qasper_rows())
+    yes_no_ex, unanswerable_ex, extractive_ex = QasperLoader().load()
+
+    assert yes_no_ex.answer == "Yes"
+    assert yes_no_ex.metadata["is_impossible"] is False
+
+    assert unanswerable_ex.answer == ""
+    assert unanswerable_ex.metadata["is_impossible"] is True
+
+    assert extractive_ex.answer == "100 widgets"
+    assert extractive_ex.metadata["is_impossible"] is False
+
+
+def test_qasper_registered_in_factory(monkeypatch):
+    """get_loader('qasper') resolves to QasperLoader."""
+    loader = get_loader("qasper", split="validation", seed=7)
+    assert isinstance(loader, QasperLoader)
+    assert loader.split == "validation"
+    assert loader.seed == 7
+
+
+# ---------------------------------------------------------------------------
+# SquadV2Loader
+# ---------------------------------------------------------------------------
+
+
+def make_squad_v2_rows():
+    """Synthetic squad_v2 rows (schema-faithful, confirmed against the live HF
+    dataset): features are exactly id/title/context/question/answers -- there is
+    NO "is_impossible" field anywhere in the real schema.
+    """
+    return [
+        {
+            "id": "sq_answerable",
+            "title": "France",
+            "context": "Paris is the capital of France.",
+            "question": "What is the capital of France?",
+            "answers": {"text": ["Paris", "Paris"], "answer_start": [0, 0]},
+        },
+        {
+            "id": "sq_unanswerable",
+            "title": "France",
+            "context": "Paris is the capital of France.",
+            "question": "What is the population of Mars?",
+            "answers": {"text": [], "answer_start": []},
+        },
+    ]
+
+
+def test_squad_v2_is_impossible_derived_from_empty_answers(monkeypatch):
+    """Regression: the real squad_v2 schema has no "is_impossible" field, so
+    `item.get("is_impossible", False)` was silently False for EVERY example
+    regardless of true (un)answerability. is_impossible must now be DERIVED from an
+    empty gold-answer list (official SQuAD v2 semantics), not read from a phantom key.
+    """
+    install_fake_datasets(monkeypatch, make_squad_v2_rows())
+    answerable, unanswerable = SquadV2Loader(split="validation").load()
+
+    assert answerable.answer == "Paris"
+    assert answerable.metadata["is_impossible"] is False
+    assert answerable.metadata["all_answers"] == ["Paris"]
+
+    assert unanswerable.answer == ""
+    assert unanswerable.metadata["is_impossible"] is True
+    assert unanswerable.metadata["all_answers"] == []

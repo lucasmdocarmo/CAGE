@@ -236,9 +236,15 @@ class PerformanceEvaluator:
         # produced (num_tokens - 1) tokens -> divide by (num_tokens - 1), not num_tokens.
         # Single-token outputs have no inter-token interval and are excluded (dividing by
         # num_tokens=1 would fold a spurious ~0 into the distribution and understate TPOT).
+        # Review fix: on non-streaming paths (e.g. VLLMOfflineAdapter's --offline debug
+        # engine), ttft_ms is deliberately set equal to total_time_ms because TTFT is
+        # unobservable there (reported as the full response time). That makes
+        # generation_time_ms == 0, which would silently fold a spurious ~0 TPOT into the
+        # distribution rather than being excluded as unmeasurable. Require a positive
+        # generation interval, not just num_tokens > 1.
         tpots = []
         for req in successful_requests:
-            if req.num_tokens > 1:
+            if req.num_tokens > 1 and req.total_time_ms > req.ttft_ms:
                 generation_time_ms = req.total_time_ms - req.ttft_ms
                 tpot = generation_time_ms / (req.num_tokens - 1)
                 tpots.append(tpot)

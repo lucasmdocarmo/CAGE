@@ -13,6 +13,8 @@
 # =============================================================================
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/_common.sh
+source "$SCRIPT_DIR/../lib/_common.sh"
 MODEL="${1:-Qwen/Qwen3-4B}"
 PORT="${VLLM_PORT:-8000}"
 

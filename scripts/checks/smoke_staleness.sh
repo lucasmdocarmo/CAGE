@@ -19,6 +19,8 @@
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=scripts/lib/_common.sh
+source "$PROJECT_DIR/scripts/lib/_common.sh"
 MODEL="${1:-Qwen/Qwen3-8B}"
 DATASET="${DATASET:-squad_v2}"
 FRACTION="${CAGE_STALE_FRACTION:-0.5}"

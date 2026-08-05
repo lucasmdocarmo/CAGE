@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import pandas as pd
 
@@ -23,10 +24,19 @@ def verify_dir(results_dir: Path) -> dict:
     # <label>_<dataset>_<ts>_metrics.json under trial_N/, not at the cell root. Exclude the
     # cell-root aggregated_metrics.json (it has no sibling *_results.csv). Hard-fail on zero
     # matches so a misdirected --results-dir cannot silently pass (audit false-pass fix).
+    #
+    # Review fix: Path.rglob does NOT traverse directory symlinks, and run_phase2_stats.sh
+    # builds exactly such a symlink tree (`ln -sfn ... stats/all_results`) -- rglob would
+    # silently see zero files through it (same class of bug as _results_loader.py's own
+    # documented iterdir()+glob-not-rglob rule). Use a followlinks=True os.walk instead, which
+    # preserves rglob's arbitrary-depth semantics while traversing symlinked subtrees.
     metrics_files = [
-        p for p in sorted(results_dir.rglob("*_metrics.json"))
-        if p.name != "aggregated_metrics.json"
+        Path(dirpath) / fn
+        for dirpath, _dirnames, filenames in os.walk(results_dir, followlinks=True)
+        for fn in sorted(filenames)
+        if fn.endswith("_metrics.json") and fn != "aggregated_metrics.json"
     ]
+    metrics_files.sort()
     if not metrics_files:
         report["ok"] = False
         report["errors"] = ["no_per_trial_metrics_found"]

@@ -579,3 +579,74 @@ class TestPrereg:
         for line in body:
             cells = re.split(r"(?<!\\)\|", line)
             assert len(cells) - 2 == len(fm.columns), line
+
+    # ---------------------------------------------------------------- #
+    # D8 §8.6 L4 instrument calibration is wired into the §9.13 chain
+    # ---------------------------------------------------------------- #
+
+    @staticmethod
+    def _passing_instrument_report():
+        from src.evaluation.instrument_calibration import calibrate_instrument
+
+        anchor = pd.DataFrame(
+            {
+                "item_id": [f"it{i}" for i in range(8)],
+                "score": [0.9, 0.8, 0.7, 0.6, 0.65, 0.3, 0.2, 0.1],
+                "label": [1, 1, 1, 1, 0, 0, 0, 0],
+                "context_length": [500, 500, 2000, 2000, 500, 500, 2000, 2000],
+            }
+        )
+        return calibrate_instrument(
+            anchor,
+            instrument_name="lettucedetect",
+            instrument_version="0.1.7",
+            dataset="ragtruth",
+            split="test",
+            auc_floor=0.9,
+            bin_edges=(0, 1024, 4096),
+        )
+
+    def test_instrument_calibration_embedded_under_section_7(self) -> None:
+        inst = self._passing_instrument_report()
+        text = assemble_preregistration(
+            _family_map(),
+            {"grounding rate": "|Δ| < 2 pp"},
+            _passing_report(),
+            "d" * 40,
+            instrument_calibrations=[inst],
+        )
+        # The L4 artifact rides the section-7 calibration heading, beside the
+        # §9.7 stats report (the to_markdown concatenation it was built for).
+        section = text.split("## 7. Calibration report")[1].split("## 8.")[0]
+        assert "Instrument calibration report (D8 §8.6)" in section
+        assert "lettucedetect@0.1.7" in section
+
+    def test_failed_instrument_calibration_blocks_registration(self) -> None:
+        import dataclasses as dc
+
+        inst = self._passing_instrument_report()
+        failed_bin = dc.replace(inst.length_bin_gate.bins[0], passed=False)
+        failed_gate = dc.replace(
+            inst.length_bin_gate,
+            bins=(failed_bin, *inst.length_bin_gate.bins[1:]),
+        )
+        broken = dc.replace(inst, length_bin_gate=failed_gate)
+        assert not broken.passed
+        with pytest.raises(PreregError, match="instrument calibration FAILED"):
+            assemble_preregistration(
+                _family_map(),
+                {"grounding rate": "|Δ| < 2 pp"},
+                _passing_report(),
+                "d" * 40,
+                instrument_calibrations=[broken],
+            )
+
+    def test_no_instrument_reports_keeps_existing_behavior(self) -> None:
+        # Default () preserves the pre-wiring assembly exactly (no L4 section).
+        text = assemble_preregistration(
+            _family_map(),
+            {"grounding rate": "|Δ| < 2 pp"},
+            _passing_report(),
+            "d" * 40,
+        )
+        assert "Instrument calibration report (D8 §8.6)" not in text

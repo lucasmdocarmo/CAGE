@@ -31,6 +31,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+# shellcheck source=scripts/lib/_common.sh
+source "${REPO_ROOT}/scripts/lib/_common.sh"
 PY="${REPO_ROOT}/.venv/bin/python"
 
 _verified=0

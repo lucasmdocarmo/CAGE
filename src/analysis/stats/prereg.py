@@ -1,9 +1,10 @@
 """§9.13 — PRE_REGISTRATION.md assembler (registration rung (b): repo SHA + OSF).
 
 Assembles the registration document TEXT from the registered inputs: the §9.3
-family-map table, the §9.5 equivalence margins, the §9.7 calibration report and
-the machinery git SHA. Pure function — it never writes anywhere; the caller
-owns the output path (and the commit that pins the SHA).
+family-map table, the §9.5 equivalence margins, the §9.7 calibration report,
+the D8 §8.6 L4 instrument-calibration artifacts and the machinery git SHA.
+Pure function — it never writes anywhere; the caller owns the output path (and
+the commit that pins the SHA).
 
 Charter gates enforced here (fail loud, §9.13): registration is BLOCKED until
 calibration passes, so assembling from a failing ``CalibrationReport`` raises;
@@ -20,6 +21,11 @@ from typing import Mapping, Sequence
 import pandas as pd
 
 from src.analysis.stats.calibration import CalibrationReport
+from src.evaluation.instrument_calibration import (
+    InstrumentCalibrationError,
+    InstrumentCalibrationReport,
+    assert_registrable,
+)
 
 # The §9.3 registered-table schema = ``families.compile_family_map`` output
 # (2026-08-02 fix: the assembler previously demanded a 'contrast' column no
@@ -114,6 +120,7 @@ def assemble_preregistration(
     power_table: pd.DataFrame | None = None,
     extra_exclusions: Sequence[str] = (),
     amendment_log_path: str = "MyDocs/registration/AMENDMENT_LOG.md",
+    instrument_calibrations: Sequence[InstrumentCalibrationReport] = (),
 ) -> str:
     """Return the PRE_REGISTRATION.md text (§9.13). Caller writes it to disk.
 
@@ -124,6 +131,13 @@ def assemble_preregistration(
     emitted for every entry. ``power_table`` is ``simulate_campaign`` output;
     absent, the power section carries a BLOCKING placeholder — the document is
     assemblable for review but explicitly not registrable (§9.6 sets N).
+    ``instrument_calibrations`` are the D8 §8.6 L4 quality-instrument
+    calibration artifacts; each is gated through
+    ``instrument_calibration.assert_registrable`` (a FAILING instrument
+    calibration BLOCKS registration exactly like a failing §9.7 stats
+    calibration — the D9 §9.13 refuse-to-register hook) and its
+    ``to_markdown()`` section is embedded under the section-7 calibration
+    heading beside the stats report.
     """
     _validate_family_map(family_map)
     if not margins:
@@ -141,6 +155,18 @@ def assemble_preregistration(
             f"calibration injection targets missed at effects "
             f"{[i.effect_size for i in failed]} — registration is BLOCKED (§9.7/§9.13)"
         )
+    # D9 §9.13 refuse-to-register hook for the L4 QUALITY instruments (D8
+    # §8.6): a failing instrument calibration blocks assembly exactly like the
+    # failing §9.7 stats calibration above — never a warning, never a skip.
+    for inst_report in instrument_calibrations:
+        try:
+            assert_registrable(inst_report)
+        except InstrumentCalibrationError as exc:
+            raise PreregError(
+                f"instrument calibration FAILED for "
+                f"{inst_report.instrument_name}@{inst_report.instrument_version} "
+                f"— registration is BLOCKED (§8.6/§9.13): {exc}"
+            ) from exc
 
     margin_rows = pd.DataFrame(
         {
@@ -214,6 +240,11 @@ def assemble_preregistration(
         "## 7. Calibration report (§9.7 — measured operating characteristics)",
         "",
         calibration_report.to_markdown(),
+        *(
+            part
+            for inst_report in instrument_calibrations
+            for part in ("", inst_report.to_markdown())
+        ),
         "## 8. Amendment log",
         "",
         f"Any mid-campaign protocol change gets a dated, justified entry in "

@@ -432,6 +432,197 @@ def test_tampered_artifact_is_reported_by_verify_ledger(run_tree: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# RESULTS_LAYOUT §6 scoring tree: rescore_quality writer + organizer validator
+# ---------------------------------------------------------------------------
+
+import argparse  # noqa: E402
+
+import rescore_quality as rq  # noqa: E402
+
+
+def _fast_args(**overrides: Any) -> argparse.Namespace:
+    base = dict(full=False, device="cpu", apply=False)
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def _enrich_evidence_and_reseal(run_dir: Path) -> None:
+    """Replace the minimal fixture evidence with scoreable QA rows + re-seal."""
+    for ev in sorted(run_dir.glob("cells/*/window_*/qa_evidence.jsonl")):
+        rows = [
+            json.dumps(
+                {
+                    "example_id": f"e{i}",
+                    "question": "What color is the sky?",
+                    "used_contexts": ["The sky is blue."],
+                    "generated_answer": "blue",
+                    "reference_answer": "blue",
+                    "baseline": "B1",
+                    "repeat_index": 0,
+                }
+            )
+            for i in range(2)
+        ]
+        ev.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    (run_dir / "ledger.json").unlink()
+    sealed = [
+        p
+        for p in sorted(run_dir.rglob("*"))
+        if p.is_file() and p.name != "ledger.json" and "index" not in p.parts
+    ]
+    write_ledger(hash_artifacts(sealed, base_dir=run_dir), run_dir / "ledger.json")
+
+
+def _raw_entries_sha(run_dir: Path) -> str:
+    return json.loads((run_dir / "ledger.json").read_text(encoding="utf-8"))[
+        "entries_sha256"
+    ]
+
+
+def _manual_scoring_pass(
+    run_dir: Path,
+    sid: str = "s02-manual",
+    *,
+    entries_sha: str | None = None,
+    cells: list[tuple[str, str]] | None = None,
+    seal: bool = True,
+) -> Path:
+    """Hand-build one scoring/<sid>/ pass (for validator failure injection)."""
+    sdir = run_dir / "scoring" / sid
+    sdir.mkdir(parents=True)
+    files: list[Path] = []
+    manifest = sdir / "scoring_manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "scoring_run_id": sid,
+                "mode": "fast",
+                "created_utc": "2026-08-04T00:00:00+00:00",
+                "raw_run_ledger_entries_sha256": entries_sha
+                or _raw_entries_sha(run_dir),
+            }
+        ),
+        encoding="utf-8",
+    )
+    files.append(manifest)
+    default_cell = _specs()[0].to_row_key()
+    for cell_name, window_name in cells or [(default_cell, "window_squad_v2-01")]:
+        wdir = sdir / "cells" / cell_name / window_name
+        wdir.mkdir(parents=True)
+        scores = wdir / "qa_scores.jsonl"
+        scores.write_text(json.dumps({"example_id": "e0", "f1_score": 1.0}) + "\n")
+        quality = wdir / "quality.json"
+        quality.write_text(json.dumps({"rows": 1, "abstained": 0, "means": {}}))
+        files.extend([scores, quality])
+    if seal:
+        write_ledger(hash_artifacts(files, base_dir=sdir), sdir / "ledger.json")
+    return sdir
+
+
+def test_scoring_tree_roundtrip_written_then_validated(run_tree: Path) -> None:
+    """rescore_quality --scoring-run-id writes the §6 tree; the organizer
+    validates it and reports it — the two halves compose."""
+    _enrich_evidence_and_reseal(run_tree)
+    rc = rq.run_scoring_tree(run_tree, "s01-fast", _fast_args())
+    assert rc == 0
+
+    sdir = run_tree / "scoring" / "s01-fast"
+    manifest = json.loads((sdir / "scoring_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["scoring_run_id"] == "s01-fast"
+    assert manifest["mode"] == "fast"
+    assert manifest["raw_run_ledger_entries_sha256"] == _raw_entries_sha(run_tree)
+    assert manifest["raw_run_id"] == RUN_ID
+    assert manifest["n_rows"] == manifest["n_evidence_files"] * 2
+
+    # Per-cell outputs mirror cells/<row_key>/window_<k>/ (§6), and the raw
+    # tree received NOTHING.
+    raw_windows = sorted(
+        p.parent.relative_to(run_tree).as_posix()
+        for p in run_tree.glob("cells/*/window_*/qa_evidence.jsonl")
+    )
+    scored_windows = sorted(
+        p.parent.relative_to(sdir).as_posix()
+        for p in sdir.glob("cells/*/window_*/qa_scores.jsonl")
+    )
+    assert scored_windows == raw_windows
+    for w in scored_windows:
+        assert (sdir / w / "quality.json").is_file()
+        agg = json.loads((sdir / w / "quality.json").read_text(encoding="utf-8"))
+        assert agg["rows"] == 2
+        assert agg["means"]["f1_score"] == 1.0
+    assert not list(run_tree.glob("cells/**/qa_scores.jsonl"))
+    assert not list(run_tree.glob("cells/**/results_rescored.csv"))
+
+    # The pass carries its OWN sealed ledger and it verifies.
+    assert verify_ledger(sdir / "ledger.json", sdir) == []
+
+    # The organizer accepts + reports the pass.
+    _, md_path = org.organize_run(run_tree)
+    report = md_path.read_text(encoding="utf-8")
+    assert "Scoring passes (RESULTS_LAYOUT §6)" in report
+    assert "`s01-fast`" in report
+
+
+def test_scoring_tree_refuses_existing_id_apply_and_unsealed(
+    run_tree: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _enrich_evidence_and_reseal(run_tree)
+    assert rq.run_scoring_tree(run_tree, "s01-fast", _fast_args()) == 0
+    capsys.readouterr()
+
+    # Same id again: a scoring bug is fixed by a NEW scoring_run_id (§6).
+    assert rq.run_scoring_tree(run_tree, "s01-fast", _fast_args()) == 2
+    assert "NEW scoring_run_id" in capsys.readouterr().err
+
+    # --apply writes into cells/ and is forbidden in scoring-tree mode.
+    assert rq.run_scoring_tree(run_tree, "s02-x", _fast_args(apply=True)) == 2
+    assert "cells/" in capsys.readouterr().err
+
+    # Bad grammar refuses.
+    assert rq.run_scoring_tree(run_tree, "S01_BAD", _fast_args()) == 2
+    assert "grammar" in capsys.readouterr().err
+
+    # An UNSEALED raw tree refuses (§5/§6: scoring references the seal).
+    (run_tree / "ledger.json").unlink()
+    assert rq.run_scoring_tree(run_tree, "s03-x", _fast_args()) == 2
+    assert "SEALED" in capsys.readouterr().err
+
+
+def test_validator_catches_seal_mismatch(run_tree: Path) -> None:
+    _manual_scoring_pass(run_tree, entries_sha="0" * 64)
+    with pytest.raises(org.LayoutError, match="DIFFERENT seal"):
+        org.organize_run(run_tree)
+
+
+def test_validator_catches_invented_cell_and_window(run_tree: Path) -> None:
+    ghost = "gold-reuse|none|none|single|vllm|qwen3-14b|F1"  # not in the raw tree
+    _manual_scoring_pass(run_tree, cells=[(ghost, "window_squad_v2-01")])
+    with pytest.raises(org.LayoutError, match="cannot invent cells"):
+        org.organize_run(run_tree)
+
+
+def test_validator_catches_scoring_output_inside_raw_cells(run_tree: Path) -> None:
+    contaminated = (
+        run_tree / "cells" / _specs()[0].to_row_key() / "window_squad_v2-01" / "qa_scores.jsonl"
+    )
+    contaminated.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(org.LayoutError, match="NEVER writes into cells/"):
+        org.organize_run(run_tree)
+
+
+def test_validator_requires_scoring_pass_own_ledger(run_tree: Path) -> None:
+    _manual_scoring_pass(run_tree, seal=False)
+    with pytest.raises(org.LayoutError, match="own ledger"):
+        org.organize_run(run_tree)
+
+
+def test_validator_accepts_valid_manual_pass(run_tree: Path) -> None:
+    _manual_scoring_pass(run_tree)
+    _, md_path = org.organize_run(run_tree)
+    assert "`s02-manual`" in md_path.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
 # pull_run.sh
 # ---------------------------------------------------------------------------
 

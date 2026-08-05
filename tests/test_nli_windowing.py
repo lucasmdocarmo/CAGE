@@ -178,3 +178,239 @@ def test_premise_mode_lands_in_quality_metrics() -> None:
     assert m.faithfulness_premise_mode == "windowed"
     assert m.to_dict()["faithfulness_premise_mode"] == "windowed"
     assert m.faithfulness is not None and m.faithfulness >= 0.9
+    # Review fix: faithfulness_method must reflect that faithfulness WAS scored here.
+    assert m.faithfulness_method == "nli_claim_max"
+    assert m.to_dict()["faithfulness_method"] == "nli_claim_max"
+
+
+# --------------------------------------------------------------------------- #
+# Review fix: premise_count provenance (mean-of-per-claim-max is premise-count
+# sensitive -- more premises raises the expected max by chance alone, independent
+# of true faithfulness; premise_count lets analysis condition on it).
+# --------------------------------------------------------------------------- #
+def test_premise_count_reported_and_grows_with_context_docs() -> None:
+    ev, _ = _evaluator_with_fake_nli()
+    r_one_doc = ev.evaluate_faithfulness(EVIDENCE, [f"Intro sentence. {EVIDENCE}"])
+    assert r_one_doc["premise_count"] == 1  # short doc: one direct premise
+
+    r_two_docs = ev.evaluate_faithfulness(
+        EVIDENCE, [f"Intro sentence. {EVIDENCE}", "Another short unrelated doc."]
+    )
+    assert r_two_docs["premise_count"] == 2
+
+    windowed_doc = _long_doc_with_late_evidence()
+    r_windowed = ev.evaluate_faithfulness(EVIDENCE, [windowed_doc])
+    windows = ev._split_premise_windows(windowed_doc)
+    assert r_windowed["premise_count"] == len(windows) > 1
+
+
+def test_premise_count_lands_in_quality_metrics() -> None:
+    ev, _ = _evaluator_with_fake_nli()
+    m = ev.evaluate(
+        question="What is the launch code?",
+        context=[_long_doc_with_late_evidence()],
+        generated_text=EVIDENCE,
+        reference_answer="8241",
+    )
+    assert m.faithfulness_premise_count is not None and m.faithfulness_premise_count > 1
+    assert m.to_dict()["faithfulness_premise_count"] == m.faithfulness_premise_count
+
+
+# --------------------------------------------------------------------------- #
+# D8 §8.5 3-class NLI reporting (CAGE_NLI_THREE_CLASS, default OFF).
+# Charter: "contradiction and neutral reported separately (misread evidence vs
+# invented claim -- different bugs)". Seam: _parse_nli_result retains the full
+# MNLI 3-class distribution (Williams, Nangia & Bowman, NAACL 2018); per-claim
+# aggregation is MAX over premises per class (the same rule as entailment --
+# 2026-08-04 technical review, quality L3 row), then mean over claims.
+# --------------------------------------------------------------------------- #
+import pytest  # noqa: E402
+
+THREE_CLASS_COLS = {"faithfulness_contradiction", "faithfulness_neutral"}
+
+
+class _PairDistNLI:
+    """Pair-deterministic 3-class fake accepting BOTH the sequential
+    single-dict call and the batched list-of-dicts call (like the real HF
+    pipeline). Distributions keyed by marker substrings in premise/claim."""
+
+    #                       (entailment, neutral, contradiction)
+    DISTS = {
+        "alphadoc": (0.10, 0.15, 0.70),
+        "betadoc": (0.60, 0.25, 0.20),
+        "claimtwo": (0.30, 0.10, 0.40),
+    }
+    DEFAULT = (0.90, 0.08, 0.02)
+
+    def __init__(self) -> None:
+        self.tokenizer = _FakeTokenizer()
+
+    def _one(self, item: dict) -> List[dict]:
+        # Claim (hypothesis) markers take precedence over premise markers so a
+        # test can pin a distribution to one claim regardless of the premise.
+        ent, neu, con = self.DEFAULT
+        for text in (item["text_pair"].lower(), item["text"].lower()):
+            hit = next(
+                (dist for marker, dist in self.DISTS.items() if marker in text),
+                None,
+            )
+            if hit is not None:
+                ent, neu, con = hit
+                break
+        return [
+            {"label": "entailment", "score": ent},
+            {"label": "neutral", "score": neu},
+            {"label": "contradiction", "score": con},
+        ]
+
+    def __call__(self, inputs, top_k=None, truncation=True, max_length=512,
+                 batch_size=None):
+        if isinstance(inputs, list):
+            return [self._one(x) for x in inputs]
+        return self._one(inputs)
+
+
+def _evaluator(fake=None, **kwargs) -> QualityEvaluator:
+    ev = QualityEvaluator(
+        use_nli=True, use_embeddings=False, use_bertscore=False,
+        use_rouge=False, use_lettucedetect=False, **kwargs,
+    )
+    ev._nli_model = fake if fake is not None else _FakeNLI()
+    return ev
+
+
+def test_three_class_default_off_to_dict_byte_identical(monkeypatch) -> None:
+    # THE default-off proof: with the flag unset, to_dict() output is unchanged
+    # -- the flag-on output differs by EXACTLY the two new columns and nothing
+    # else (same scoring, same keys, same values).
+    monkeypatch.delenv("CAGE_NLI_THREE_CLASS", raising=False)
+    kwargs = dict(
+        question="What is the launch code?",
+        context=[f"Intro sentence. {EVIDENCE}"],
+        generated_text=EVIDENCE,
+        reference_answer="8241",
+    )
+    d_off = _evaluator().evaluate(**kwargs).to_dict()
+    d_on = _evaluator(nli_three_class=True).evaluate(**kwargs).to_dict()
+    assert not (THREE_CLASS_COLS & set(d_off))
+    assert THREE_CLASS_COLS <= set(d_on)
+    assert {k: v for k, v in d_on.items() if k not in THREE_CLASS_COLS} == d_off
+    # The faithfulness result dict is equally unchanged when the flag is off.
+    r_off = _evaluator().evaluate_faithfulness(EVIDENCE, [f"Intro. {EVIDENCE}"])
+    assert "contradiction" not in r_off and "neutral" not in r_off
+
+
+def test_three_class_env_flag_emits_columns(monkeypatch) -> None:
+    monkeypatch.setenv("CAGE_NLI_THREE_CLASS", "1")
+    ev = _evaluator()  # env-gated on, no constructor arg
+    assert ev.nli_three_class
+    m = ev.evaluate(
+        question="What is the launch code?",
+        context=[f"Intro sentence. {EVIDENCE}"],
+        generated_text=EVIDENCE,
+        reference_answer="8241",
+    )
+    # _FakeNLI: entailment 0.97, neutral 1-0.97-0.01=0.02, contradiction 0.01.
+    assert m.faithfulness == pytest.approx(0.97)
+    assert m.faithfulness_neutral == pytest.approx(0.02)
+    assert m.faithfulness_contradiction == pytest.approx(0.01)
+    d = m.to_dict()
+    assert d["faithfulness_neutral"] == pytest.approx(0.02)
+    assert d["faithfulness_contradiction"] == pytest.approx(0.01)
+
+
+def test_three_class_max_over_premises_then_mean_over_claims() -> None:
+    ev = _evaluator(fake=_PairDistNLI(), nli_three_class=True)
+    # One claim, two premises: per-class MAX over premises (same rule as
+    # entailment). alphadoc contra=0.70 > betadoc contra=0.20, etc.
+    r = ev.evaluate_faithfulness(
+        "The result is fine.",
+        ["Something about alphadoc here.", "Something about betadoc here."],
+    )
+    assert r["faithfulness"] == pytest.approx(0.60)  # max entailment (betadoc)
+    assert r["contradiction"] == pytest.approx(0.70)  # max contra (alphadoc)
+    assert r["neutral"] == pytest.approx(0.25)  # max neutral (betadoc)
+    # Two claims, one premise each scored differently: mean over claims.
+    r2 = ev.evaluate_faithfulness(
+        "The result is fine. This one mentions claimtwo.",
+        ["Something about betadoc here."],
+    )
+    # claim 1 -> betadoc dist (0.60, 0.25, 0.20); claim 2 -> claimtwo dist
+    # (0.30, 0.10, 0.40); means: ent 0.45, neutral 0.175, contra 0.30.
+    assert r2["faithfulness"] == pytest.approx(0.45)
+    assert r2["neutral"] == pytest.approx(0.175)
+    assert r2["contradiction"] == pytest.approx(0.30)
+
+
+def test_three_class_batched_matches_sequential() -> None:
+    rows = dict(
+        questions=["Q1?", "Q2?", "Q3?"],
+        contexts=[
+            ["Something about alphadoc here.", "Something about betadoc here."],
+            ["Something about betadoc here."],
+            ["Any context at all."],
+        ],
+        generated_texts=[
+            "The result is fine.",
+            "The result is fine. This one mentions claimtwo.",
+            "I don't know.",  # abstention: columns present, None
+        ],
+        reference_answers=["fine", "fine", ""],
+    )
+    seq_ev = _evaluator(fake=_PairDistNLI(), nli_three_class=True)
+    seq = [
+        seq_ev.evaluate(q, c, g, ref).to_dict()
+        for q, c, g, ref in zip(
+            rows["questions"], rows["contexts"],
+            rows["generated_texts"], rows["reference_answers"],
+        )
+    ]
+    bat_ev = _evaluator(fake=_PairDistNLI(), nli_three_class=True)
+    bat = [
+        m.to_dict()
+        for m in bat_ev.batch_evaluate(
+            rows["questions"], rows["contexts"],
+            rows["generated_texts"], rows["reference_answers"],
+        )
+    ]
+    assert bat == seq  # field-for-field, incl. the two new columns
+    # Both new columns are STABLE columns on every row of a flagged run;
+    # the abstention row carries None (excluded from means downstream).
+    for d in bat:
+        assert THREE_CLASS_COLS <= set(d)
+    assert bat[2]["faithfulness_contradiction"] is None
+    assert bat[2]["faithfulness_neutral"] is None
+    assert bat[0]["faithfulness_contradiction"] == pytest.approx(0.70)
+
+
+def test_three_class_label_x_resolution_via_model_config() -> None:
+    # Models emitting LABEL_x names resolve neutral/contradiction through
+    # id2label, mirroring the entailment resolver (never hardcode indices).
+    class _LabelXNLI:
+        def __init__(self) -> None:
+            self.tokenizer = _FakeTokenizer()
+
+            class _Cfg:
+                id2label = {0: "entailment", 1: "neutral", 2: "contradiction"}
+
+            class _Model:
+                config = _Cfg()
+
+            self.model = _Model()
+
+        def __call__(self, inputs, top_k=None, truncation=True,
+                     max_length=512, batch_size=None):
+            out = [
+                {"label": "LABEL_0", "score": 0.8},
+                {"label": "LABEL_1", "score": 0.15},
+                {"label": "LABEL_2", "score": 0.05},
+            ]
+            if isinstance(inputs, list):
+                return [list(out) for _ in inputs]
+            return list(out)
+
+    ev = _evaluator(fake=_LabelXNLI(), nli_three_class=True)
+    r = ev.evaluate_faithfulness("A claim.", ["Some context."])
+    assert r["faithfulness"] == pytest.approx(0.8)
+    assert r["neutral"] == pytest.approx(0.15)
+    assert r["contradiction"] == pytest.approx(0.05)

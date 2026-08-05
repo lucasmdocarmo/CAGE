@@ -15,6 +15,13 @@
 # PATH itself, resolves the repo and the run user, and runs the sync as that user (whose
 # login shell carries the gcloud ADC + config). Every step is best-effort: with a ~30s
 # preemption budget, a partial sync beats an aborted one, so nothing here may exit early.
+#
+# DELIBERATE EXEMPTION from the scripts/lib/_common.sh sourcing doctrine
+# (tests/test_scripts_doctrine.py): GCP copies this FILE'S CONTENT into instance
+# metadata and executes it standalone from /var/lib/google — there is no repo tree
+# relative to $0/BASH_SOURCE at run time, so a `source .../_common.sh` would fail.
+# And _common.sh's die() (exit on error) directly contradicts this hook's contract
+# that nothing may exit early inside the preemption budget.
 set -u
 export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/snap/bin${PATH:+:$PATH}"
 LOG=/var/log/cage_shutdown_hook.log

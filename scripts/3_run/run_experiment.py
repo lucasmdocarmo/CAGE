@@ -6,6 +6,7 @@ Runs baseline experiments with specified model, dataset, and configuration.
 """
 
 import argparse
+import asyncio
 import sys
 import json
 import csv
@@ -28,6 +29,17 @@ from src.inference.engine import InferenceEngine, InferenceRequest
 from src.inference.vllm_adapter import VLLMAdapter, VLLMOfflineAdapter
 from src.inference.ollama_adapter import OllamaAdapter
 from src.inference.gemini_adapter import GeminiAdapter
+from src.inference.sglang_adapter import SGLangAdapter
+from src.inference.lmdeploy_adapter import LMDeployAdapter
+from src.inference.hf_oracle_adapter import HFOracleAdapter
+from src.orchestration.load_generator import (
+    DispatchReport,
+    LoadGeneratorError,
+    OpenLoopDispatcher,
+    RequestRecord,
+    generate_arrival_schedule,
+    trim_to_measurement_window,
+)
 from src.evaluation.quality import QualityEvaluator
 from src.evaluation.performance import PerformanceEvaluator, CacheMetricsTracker
 from src.evaluation.code_evaluator import CodeQualityEvaluator
@@ -37,10 +49,14 @@ from src.orchestration.ir import (
     IRHit,
     build_corpus_from_contexts,
     ensure_ir_index,
+    ensure_bm25_index,
     default_index_dir,
+    default_bm25_index_dir,
     retrieval_hit_rate,
     retrieval_rank_of_gold,
+    rrf_fuse,
     stable_text_id,
+    stage_tagged_search,
     CrossEncoderReranker,
 )
 from src.orchestration.redis_cache import RedisConfig, RedisClient, RetrievalCache
@@ -336,6 +352,13 @@ def default_experiment_label(
 def default_dataset_split(dataset_name: str) -> str:
     if dataset_name in {"humaneval", "mbpp", "hpc_code"}:
         return "test"
+    if dataset_name == "ruler":
+        # Synthetic length instrument (src/data/ruler.py): generated, no HF splits.
+        return "synthetic"
+    if dataset_name == "scbench":
+        # microsoft/SCBench publishes a "test" split only (src/data/scbench.py);
+        # passing "validation" would fail closed at load time.
+        return "test"
     return "validation"
 
 
@@ -520,6 +543,245 @@ def normalize_reranker_model(name: Optional[str]) -> Optional[str]:
     return name
 
 
+def build_reranker(reranker_model: Optional[str], reranker_device: str) -> Optional[CrossEncoderReranker]:
+    """Initialize the cross-encoder reranker, strict (fail-closed) by default.
+
+    B6/B7/B8/B9/B11 all inherit the RANKED retrieval pipeline (PUBLICATION.md
+    Sec 7.1 -- the reranker ablation is exactly B5-vs-B6). If reranker init
+    silently fails (missing dependency, OOM, bad model name, network failure),
+    those baselines would collapse into B5's unranked pipeline with nothing
+    checking it live. Mirrors ContextCompressor's CAGE_ALLOW_NO_COMPRESSION
+    precedent (src/orchestration/compression.py), which was hardened after an
+    identical silent-no-op bug class.
+    """
+    if not reranker_model:
+        return None
+    try:
+        reranker = CrossEncoderReranker(reranker_model, device=reranker_device)
+        print(f"Reranker enabled: {reranker_model}")
+        return reranker
+    except Exception as e:
+        _allow_no_rerank = os.getenv("CAGE_ALLOW_NO_RERANK", "").strip().lower() in {"1", "true", "yes"}
+        msg = f"failed to initialize reranker {reranker_model}: {e}"
+        if not _allow_no_rerank:
+            raise RuntimeError(
+                f"CAGE requires the reranker for this baseline; {msg} "
+                f"(set CAGE_ALLOW_NO_RERANK=1 to explicitly opt into an unranked fallback)"
+            ) from e
+        print(f"Warning: {msg}")
+        return None
+
+
+def _adapter_env_extras(engine_key: str) -> Dict[str, Any]:
+    """Optional adapter kwargs sourced from environment variables (ADR-0007).
+
+    ``CAGE_<ENGINE>_CHAT_TEMPLATE_KWARGS`` (JSON object; pass only after
+    preflight verifies the server honors the kwarg -- charter D2.1
+    [VERIFY-LIVE]) and ``CAGE_ADAPTER_MAX_RETRIES`` (int). Malformed values
+    raise (fail-closed): a silently-dropped chat-template pin would serve
+    measured rows under unverified prompt semantics.
+    """
+    extras: Dict[str, Any] = {}
+    raw = os.getenv(f"CAGE_{engine_key}_CHAT_TEMPLATE_KWARGS", "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"CAGE_{engine_key}_CHAT_TEMPLATE_KWARGS is not valid JSON: {exc}"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                f"CAGE_{engine_key}_CHAT_TEMPLATE_KWARGS must be a JSON object, "
+                f"got {type(parsed).__name__}"
+            )
+        extras["chat_template_kwargs"] = parsed
+    retries_raw = os.getenv("CAGE_ADAPTER_MAX_RETRIES", "").strip()
+    if retries_raw:
+        extras["max_retries"] = int(retries_raw)  # int() raises on garbage (fail-closed)
+    return extras
+
+
+# --retriever wiring (charter sec. 7.2 / sec. 8.2): "dense" is the pre-existing
+# FAISS+cross-encoder path, byte-identical to before the flag existed. "bm25"
+# and "hybrid-rrf" run the stage-tagged retrieval built in
+# src/orchestration/ir.py (Okapi BM25 per Robertson & Zaragoza 2009
+# [robertson2009bm25]; RRF per Cormack, Clarke & Buettcher 2009
+# [cormack2009rrf]).
+RETRIEVER_CHOICES = ("dense", "bm25", "hybrid-rrf")
+
+
+def stage_tagged_retrieve(
+    question: str,
+    *,
+    retriever: str,
+    bm25_index: Any,
+    dense_index: Any = None,
+    reranker: Any = None,
+    pool_k: int = 100,
+    served_k: int = 5,
+) -> Tuple[List[IRHit], Any]:
+    """One stage-tagged retrieval pass for the non-dense ``--retriever`` paths.
+
+    Returns ``(served_hits, stage)``: the served hit list in rank order (what
+    downstream context assembly consumes, exactly like the dense path's
+    ``hits``) plus the full ``StageTaggedRetrieval`` whose ``stage_ranks()``
+    (pool / reranked / served -- charter sec. 8.2 Layer 0) is threaded into the
+    qa-evidence records. Fail-closed on a missing index: a silently absent
+    BM25/dense leg would serve the wrong retriever under the cell's name.
+    """
+    if retriever == "bm25":
+        if bm25_index is None:
+            raise RuntimeError("BM25 index not initialized for --retriever bm25")
+        stage = stage_tagged_search(
+            question,
+            index=bm25_index,
+            pool_k=pool_k,
+            served_k=served_k,
+            reranker=reranker,
+            retriever_label="bm25",
+        )
+        return list(stage.served), stage
+    if retriever == "hybrid-rrf":
+        if bm25_index is None or dense_index is None:
+            raise RuntimeError(
+                "--retriever hybrid-rrf requires BOTH the BM25 and dense "
+                "indexes (one of them is not initialized)"
+            )
+        bm25_pool = bm25_index.search(question, top_k=pool_k)
+        dense_pool = dense_index.search(question, top_k=pool_k)
+        fused = rrf_fuse(
+            [bm25_pool, dense_pool], names=["bm25", "dense"], top_k=pool_k
+        )
+        stage = stage_tagged_search(
+            question,
+            pool=fused,
+            pool_k=pool_k,
+            served_k=served_k,
+            reranker=reranker,
+            resolve_index=bm25_index,
+            retriever_label="hybrid-rrf",
+        )
+        return list(stage.served), stage
+    raise ValueError(
+        f"stage_tagged_retrieve does not handle retriever '{retriever}' "
+        f"(the dense path stays on the pre-existing pipeline)"
+    )
+
+
+def derive_corpus_prompt_prefix(build_prompt: Any) -> str:
+    """Shared cacheable prefix of a corpus-block prompt (template-agnostic).
+
+    Mirrors ``compute_chat_prefix`` in scripts/3_run/run_cag_reference.py (the
+    Chan et al. 2024, arXiv:2412.15605 manual-CAG recipe [chan2024cag]):
+    ``build_prompt(question) -> str`` renders the FULL request prompt for a
+    question over the block's context; probing with two sentinel questions and
+    trimming the common prefix back to just before the ``"\\n\\nQuestion:"``
+    marker yields everything the layout renders up to and including the corpus
+    block -- the exact prefix ``HFOracleAdapter.preload_corpus_prefix`` must
+    hold so each query's suffix literally extends the cached text. Fails
+    closed when the layout does not preserve the corpus/question boundary.
+    """
+    common = os.path.commonprefix([build_prompt("A?"), build_prompt("B?")])
+    cut = common.rfind("\n\nQuestion:")
+    if cut == -1:
+        raise ValueError(
+            "prompt layout did not preserve the corpus-block/question boundary; "
+            "cannot derive a cacheable corpus prefix for the hf-oracle preload "
+            "(expected the '\\n\\nQuestion:' marker after the context blocks)"
+        )
+    return common[:cut]
+
+
+class OracleCorpusPreloader:
+    """Per-block corpus-prefix preloading for the HF reference oracle.
+
+    In corpus-prefix mode (CAGE_CORPUS_PREFIX_BUDGET > 0) every example of a
+    block shares one literal prompt prefix; the oracle's manual-CAG recipe
+    (Chan et al. 2024, arXiv:2412.15605 [chan2024cag]) serves prefix+suffix
+    against a resident DynamicCache. This wrapper tracks the currently loaded
+    block and calls the adapter's ``preload_corpus_prefix`` seam exactly once
+    per block change (``preload_corpus_prefix`` itself clears the previous
+    block first). Construction is fail-closed: an adapter lacking the seam
+    raises an honest error instead of silently serving full prefix-free
+    prompts inside a true-CAG cell (charter D2 idea-gain zero point).
+    """
+
+    _UNLOADED = object()  # sentinel: no block loaded yet
+
+    def __init__(self, engine: Any, prompt_mode_value: str) -> None:
+        caps: Dict[str, Any] = {}
+        if callable(getattr(engine, "capabilities", None)):
+            try:
+                caps = engine.capabilities() or {}
+            except Exception:
+                caps = {}
+        if not (
+            caps.get("corpus_prefix_reuse")
+            and callable(getattr(engine, "preload_corpus_prefix", None))
+            and callable(getattr(engine, "clear_corpus_prefix", None))
+        ):
+            raise RuntimeError(
+                "corpus-prefix mode with backend=hf-oracle requires the adapter "
+                "preload seam (capabilities()['corpus_prefix_reuse'] plus "
+                "preload_corpus_prefix()/clear_corpus_prefix(); see "
+                "src/inference/hf_oracle_adapter.py) -- this engine lacks it, "
+                "refusing to silently serve full prefix-free prompts in a "
+                "true-CAG cell (charter D2 idea-gain zero point)"
+            )
+        self.engine = engine
+        self._prompt_mode = prompt_mode_value
+        self._loaded_block: Any = self._UNLOADED
+        self.preload_count = 0
+
+    def ensure(self, example: CAGExample, used_contexts: List[str]) -> None:
+        """Make sure this example's corpus-block prefix KV is resident."""
+        meta = example.metadata if isinstance(example.metadata, dict) else {}
+        if not meta.get("corpus_prefix"):
+            return  # not a corpus-mode example; oracle serves it prefix-free
+        block_id = meta.get("corpus_block", "__single__")
+        if block_id == self._loaded_block:
+            return
+
+        def _build(q: str) -> str:
+            # Reproduce EXACTLY the prompt text the runner attaches to the
+            # request (hf-oracle serves request.prompt; in chat mode that is
+            # the flattened fallback prompt).
+            if self._prompt_mode == "chat":
+                return messages_to_fallback_prompt(
+                    format_qa_messages(q, used_contexts)
+                )
+            return format_qa_prompt(q, used_contexts)
+
+        prefix = derive_corpus_prompt_prefix(_build)
+        prefill_ms = self.engine.preload_corpus_prefix(prefix)
+        self._loaded_block = block_id
+        self.preload_count += 1
+        print(
+            f"[oracle] corpus block {block_id!r} prefix preloaded "
+            f"({len(prefix)} chars, prefill {float(prefill_ms):.1f} ms)"
+        )
+
+
+def adapter_honesty_columns(response: Any) -> Dict[str, Any]:
+    """ADR-0007 / charter-D2 telemetry-provenance columns persisted per row.
+
+    The adapters stamp these as plain attributes on InferenceResponse
+    (OpenAIChatAdapter._finalize, HFOracleAdapter.generate); absent attributes
+    stay None -- provenance is recorded, never fabricated. Appended AFTER the
+    existing result columns via the union-of-keys CSV convention.
+    """
+    return {
+        "engine_id": getattr(response, "engine_id", None),
+        "usage_telemetry_available": getattr(response, "usage_telemetry_available", None),
+        "cached_token_telemetry_available": getattr(
+            response, "cached_token_telemetry_available", None
+        ),
+        "retries": getattr(response, "retries", None),
+        "reference_engine": getattr(response, "reference_engine", None),
+    }
+
+
 def setup_inference_engine(
     model_name: str,
     baseline_config: Any,
@@ -529,19 +791,20 @@ def setup_inference_engine(
     strict: bool = True,
 ) -> InferenceEngine:
     """Setup inference engine based on backend.
-    
+
     Args:
         model_name: Model to use for inference
         baseline_config: Configuration for the baseline
-        backend: Backend to use (vllm, gemini, ollama)
+        backend: Backend to use (vllm, sglang, lmdeploy, hf-oracle, gemini, ollama)
         use_offline: Use offline/in-process engine (vllm only)
         strict: If True, fail if model doesn't match server's loaded model
-    
+
     Returns:
         Configured inference engine
-    
+
     Raises:
         RuntimeError: If strict=True and model validation fails
+        ValueError: Unknown backend name (fail-closed; never a silent default)
     """
     print(f"Setting up inference engine for {model_name} with backend={backend}...")
 
@@ -553,9 +816,22 @@ def setup_inference_engine(
             engine = VLLMOfflineAdapter(model_name)
         else:
             print(f"Using vLLM API at {baseline_config.api_base}")
+            # CAGE_ADAPTER_MAX_RETRIES applies to the primary backend too (the
+            # env knob is not backend-scoped). chat_template_kwargs is NOT
+            # forwarded: VLLMAdapter pins its own verified kwargs (ADR-0007),
+            # so an operator setting CAGE_VLLM_CHAT_TEMPLATE_KWARGS gets a
+            # loud refusal rather than a silently-dropped pin.
+            vllm_extras = _adapter_env_extras("VLLM")
+            if "chat_template_kwargs" in vllm_extras:
+                raise ValueError(
+                    "CAGE_VLLM_CHAT_TEMPLATE_KWARGS is not supported: "
+                    "VLLMAdapter pins its own verified chat_template_kwargs "
+                    "(ADR-0007) — refusing to silently drop the override"
+                )
             engine = VLLMAdapter(
                 model_name=model_name,
                 api_base=baseline_config.api_base,
+                **vllm_extras,
             )
             
             # Strict validation: ensure the model on the server matches
@@ -582,9 +858,59 @@ def setup_inference_engine(
             model_name=model_name,
             api_base=baseline_config.api_base,
         )
+    elif backend in {"sglang", "lmdeploy", "lmdeploy-turbomind"}:
+        # ADR-0007 serving-engine adapters (charter D2): transport-only HTTP
+        # clients against each engine's OpenAI-compatible surface. api_base
+        # resolution: CAGE_SGLANG_API_BASE / CAGE_LMDEPLOY_API_BASE override,
+        # falling back to the run's --api-base (baseline_config.api_base).
+        if backend == "sglang":
+            adapter_cls: Any = SGLangAdapter
+            env_key = "SGLANG"
+            engine_label = "SGLang"
+        else:
+            adapter_cls = LMDeployAdapter
+            env_key = "LMDEPLOY"
+            engine_label = "LMDeploy"
+        resolved_api_base = (
+            os.getenv(f"CAGE_{env_key}_API_BASE", "").strip() or baseline_config.api_base
+        )
+        print(f"Using {engine_label} API at {resolved_api_base}")
+        engine = adapter_cls(
+            model_name=model_name,
+            api_base=resolved_api_base,
+            **_adapter_env_extras(env_key),
+        )
+        # Same strict served-model validation as the vLLM branch (both adapters
+        # expose the OpenAI /v1/models surface via OpenAIChatAdapter).
+        if strict and hasattr(engine, "get_loaded_model"):
+            loaded_model = engine.get_loaded_model()
+            if loaded_model and loaded_model != model_name:
+                raise RuntimeError(
+                    f"Model mismatch: expected {model_name}, server has {loaded_model}. "
+                    f"Restart the {engine_label} server with the requested model."
+                )
+    elif backend in {"hf-oracle", "hf_oracle"}:
+        # Charter D2 idea-gain zero point: in-process T=0 batch-1 HF reference
+        # engine (Chan et al. 2024, arXiv:2412.15605 manual-CAG recipe). The
+        # strict get_loaded_model() server check does not apply (in-process);
+        # construction itself is fail-closed on a missing torch/transformers
+        # stack (EngineDependencyUnavailableError).
+        hf_device = os.getenv("CAGE_HF_DEVICE", "auto").strip() or "auto"
+        hf_dtype = os.getenv("CAGE_HF_DTYPE", "bfloat16").strip() or "bfloat16"
+        print(
+            f"Using HF Transformers reference oracle (in-process, "
+            f"device={hf_device}, dtype={hf_dtype})"
+        )
+        engine = HFOracleAdapter(
+            model_name=model_name,
+            device=hf_device,
+            dtype=hf_dtype,
+        )
     else:
-        raise ValueError("Unsupported backend: choose vllm, gemini, or ollama")
-    
+        raise ValueError(
+            "Unsupported backend: choose vllm, sglang, lmdeploy, hf-oracle, gemini, or ollama"
+        )
+
     # Check if engine is ready
     if not engine.is_ready():
         error_msg = "Inference engine not ready."
@@ -596,7 +922,13 @@ def setup_inference_engine(
             error_msg += " --enable-prompt-tokens-details"
         elif backend == "ollama":
             error_msg += "\nMake sure Ollama is running and the model is pulled."
-        
+        elif backend in {"sglang", "lmdeploy", "lmdeploy-turbomind"}:
+            error_msg += (
+                f"\nMake sure the {backend} server is running with model {model_name} "
+                f"at the resolved api_base (see CAGE_SGLANG_API_BASE / "
+                f"CAGE_LMDEPLOY_API_BASE or --api-base)."
+            )
+
         if strict:
             print(f"ERROR: {error_msg}")
             raise RuntimeError(error_msg)
@@ -604,6 +936,107 @@ def setup_inference_engine(
             print(f"Warning: {error_msg}")
     
     return engine
+
+
+def merge_open_loop_row(row: Dict[str, Any], record: RequestRecord) -> Dict[str, Any]:
+    """Merge one open-loop RequestRecord's accounting fields into a results row.
+
+    The open-loop columns (arrival_s, scheduled_ts, actual_send_ts,
+    scheduler_lag_ms, first_token_ts, ttft_from_send_ms,
+    ttft_from_scheduled_ms, completion_ts, latency_from_scheduled_ms,
+    latency_from_send_ms, in_flight_at_send, delayed_by_cap, dropped_by_cap,
+    dispatch_error -- see RequestRecord.to_row) are APPENDED after the
+    existing keys, so the results-CSV header (union-of-keys, insertion-ordered)
+    gains new columns without disturbing existing ones. A key collision with an
+    existing column raises (fail-closed): silently overwriting a served-row
+    field with dispatcher accounting would corrupt the row schema.
+    """
+    extra = record.to_row()
+    collisions = sorted(set(extra) & set(row))
+    if collisions:
+        raise ValueError(
+            f"open-loop row fields would overwrite existing result columns: {collisions}"
+        )
+    row.update(extra)
+    return row
+
+
+def dispatch_open_loop(
+    engine: Any,
+    requests: List[InferenceRequest],
+    *,
+    rate_qps: float,
+    seed: int,
+    duration_s: Optional[float] = None,
+    n_arrivals: Optional[int] = None,
+    warmup_s: float = 0.0,
+    max_in_flight: Optional[int] = None,
+    distribution: str = "poisson",
+) -> Tuple[List[RequestRecord], DispatchReport]:
+    """Run one open-loop dispatch pass over prepared requests (charter D6 §6.1).
+
+    Builds a seeded pre-drawn arrival schedule (Poisson by default; Schroeder,
+    Wierman & Harchol-Balter, NSDI 2006 open-loop arrival model as used by
+    DistServe, Zhong et al. OSDI 2024) and issues each request AT its intended
+    arrival time through ``engine.async_stream_generate`` -- the async
+    STREAMING path -- never waiting on completions. Streaming is REQUIRED, not
+    an optimization: the non-streaming ``async_generate`` reports ``ttft_ms``
+    as the FULL response time ('full-response-proxy'), and D6 makes TTFT <=
+    10x the streamed single-stream baseline the PRIMARY relative SLO
+    (PUBLICATION.md §6.1) -- mixing the two methodologies would silently
+    overstate open-loop TTFT and understate attainment. The dispatcher's
+    ``on_first_token`` hook additionally stamps ``first_token_ts`` on the
+    dispatcher clock so rows carry both ``ttft_from_send_ms`` and the §6.3
+    coordinated-omission-corrected ``ttft_from_scheduled_ms`` (clocked from
+    the INTENDED arrival). Schedule index i maps to
+    ``requests[i % len(requests)]`` so a duration-mode schedule may replay the
+    prepared set. Returns the records trimmed to the measurement window (Jain
+    1991 ch. 25 warmup removal when ``warmup_s > 0``; per-record filtering
+    keys on the INTENDED arrival) plus the full DispatchReport for the run
+    manifest.
+
+    Raises:
+        LoadGeneratorError: no prepared requests, or the engine does not expose
+            ``async_stream_generate`` (fail-closed -- degrading to the
+            non-streaming ``async_generate``, or to a closed-loop fallback,
+            would silently void the pre-registered open-loop TTFT
+            methodology / load model).
+    """
+    if not requests:
+        raise LoadGeneratorError(
+            "requests", 0, "open-loop dispatch requires at least one prepared request"
+        )
+    if not callable(getattr(engine, "async_stream_generate", None)):
+        raise LoadGeneratorError(
+            "engine",
+            type(engine).__name__,
+            "backend engine does not expose async_stream_generate; "
+            "workload_mode=open_loop requires the async STREAMING adapter path "
+            "(vllm/sglang/lmdeploy) for real first-token TTFT -- the "
+            "non-streaming async_generate reports ttft_ms as the full response "
+            "time, which would silently mix TTFT methodologies against the "
+            "streamed single-stream baseline (charter D6 §6.3)",
+        )
+    schedule = generate_arrival_schedule(
+        rate_qps,
+        seed=seed,
+        duration_s=duration_s,
+        n_requests=n_arrivals,
+        distribution=distribution,  # type: ignore[arg-type]
+    )
+    dispatcher = OpenLoopDispatcher(max_in_flight=max_in_flight, cap_policy="delay")
+
+    async def _send(i: int, on_first_token: Any) -> Any:
+        return await engine.async_stream_generate(
+            requests[i % len(requests)], on_first_token=on_first_token
+        )
+
+    report = asyncio.run(dispatcher.run(schedule, _send))
+    if warmup_s > 0:
+        kept = trim_to_measurement_window(report.records, warmup_s=warmup_s)
+    else:
+        kept = list(report.records)
+    return kept, report
 
 
 def run_experiment(
@@ -623,6 +1056,10 @@ def run_experiment(
     embedding_model: str,
     ir_index_dir: str,
     rebuild_ir_index: bool,
+    # Retriever variant (charter sec. 7.2): "dense" (default) = the pre-existing
+    # FAISS+cross-encoder path unchanged; "bm25"/"hybrid-rrf" = the stage-tagged
+    # BM25 / RRF-fused paths (src/orchestration/ir.py).
+    retriever: str = "dense",
     # Redis cache
     redis_host: str,
     redis_port: int,
@@ -636,6 +1073,13 @@ def run_experiment(
     workload_mode: str,
     batch_size: int,
     multi_turn_length: int,
+    # Open-loop workload (workload_mode="open_loop"; charter D6 §6.1/§6.3).
+    # Defaults keep every existing closed-loop caller untouched.
+    open_loop_rate_qps: Optional[float] = None,
+    open_loop_duration_s: Optional[float] = None,
+    open_loop_num_arrivals: Optional[int] = None,
+    open_loop_warmup_s: float = 0.0,
+    open_loop_max_in_flight: Optional[int] = None,
     # Routing migration
     routing_switch_at: Optional[int],
     # Sharding simulation
@@ -675,6 +1119,58 @@ def run_experiment(
         sharding_policy=sharding_policy,
         warmup_queries=warmup_queries,
     )
+
+    # Retriever validation, EARLY (before any dataset/engine work) and
+    # fail-closed: an unknown retriever token, or a non-dense retriever on the
+    # retrieval-cache baselines (whose Redis payloads are keyed by the dense
+    # embedding model -- mixing retrievers would silently serve cross-retriever
+    # cache hits), must never burn a GPU run.
+    if retriever not in RETRIEVER_CHOICES:
+        raise ValueError(
+            f"Unknown retriever '{retriever}'. Supported: {list(RETRIEVER_CHOICES)}"
+        )
+    if retriever != "dense" and baseline in {"redis", "hybrid"}:
+        raise ValueError(
+            f"--retriever {retriever} is not wired for the retrieval-cache "
+            f"baselines (redis/hybrid): their cache keys pin the dense "
+            f"embedding-model pipeline. Use the dense retriever for these arms."
+        )
+
+    # hf-oracle corpus-prefix preload is wired for the single/batched workload
+    # modes only (the multi-turn prompt layout breaks the literal-prefix
+    # contract; open_loop already refuses the non-streaming oracle). Fail
+    # closed EARLY rather than silently serving prefix-free rows in a
+    # true-CAG cell.
+    _corpus_budget_cfg = int(os.getenv("CAGE_CORPUS_PREFIX_BUDGET", "0") or "0")
+    if (
+        backend in {"hf-oracle", "hf_oracle"}
+        and _corpus_budget_cfg > 0
+        and workload_mode not in {"single", "batched"}
+    ):
+        raise ValueError(
+            f"backend=hf-oracle with corpus-prefix mode supports workload_mode "
+            f"single/batched only (got '{workload_mode}'): the corpus-prefix "
+            f"preload requires every prompt to literally extend the cached "
+            f"block prefix (Chan et al. 2024 recipe)"
+        )
+
+    # Open-loop configuration validation, EARLY (before any dataset/engine work)
+    # and fail-closed (typed LoadGeneratorError, mirroring the load generator's
+    # own doctrine): a mis-specified arrival process must never burn a GPU run.
+    if workload_mode == "open_loop":
+        if open_loop_rate_qps is None:
+            raise LoadGeneratorError(
+                "open_loop_rate_qps",
+                None,
+                "workload_mode=open_loop requires an offered arrival rate (--rate)",
+            )
+        if (open_loop_duration_s is None) == (open_loop_num_arrivals is None):
+            raise LoadGeneratorError(
+                "open_loop_duration_s/open_loop_num_arrivals",
+                (open_loop_duration_s, open_loop_num_arrivals),
+                "workload_mode=open_loop requires exactly one of --duration-s "
+                "or --arrival-count",
+            )
 
     print("=" * 70)
     print("CAGE Experiment")
@@ -894,7 +1390,17 @@ def run_experiment(
               f"{len(_blocks)} blocks, block-ordered")
     elif _corpus_budget > 0:
         from src.data.corpus import build_corpus_block
-        _block = build_corpus_block(base_examples, token_budget=_corpus_budget)
+        from src.data.loader import gold_only
+        # Same gold-only rule as the manifest path (src/data/manifest.py): the shared
+        # block is packed from gold paragraphs only -- per-question distractor text
+        # (HotpotQA/MuSiQue keep it in .context) must not consume corpus budget.
+        _gold_ctx = {ex.id: gold_only(ex) for ex in base_examples}
+        _gold_view = [
+            CAGExample(id=ex.id, question=ex.question, context=_gold_ctx[ex.id],
+                       answer=ex.answer, metadata=ex.metadata)
+            for ex in base_examples
+        ]
+        _block = build_corpus_block(_gold_view, token_budget=_corpus_budget)
         _in_corpus = set(_block.example_ids)
         _n_dropped = sum(1 for ex in base_examples if ex.id not in _in_corpus)
         base_examples = [
@@ -903,7 +1409,7 @@ def run_experiment(
                 metadata={**(ex.metadata or {}),
                           "corpus_prefix": True,
                           "corpus_tokens": _block.token_count,
-                          "gold_context": (ex.context or [None])[0]},
+                          "gold_context": (_gold_ctx[ex.id] or [None])[0]},
             )
             for ex in base_examples if ex.id in _in_corpus
         ]
@@ -985,15 +1491,27 @@ def run_experiment(
         f"({len(warmup_examples)} warmup requests, {len(measured_examples)} measured requests)"
     )
 
-    warmup_work_units = build_work_units(warmup_examples)
-    work_units = build_work_units(measured_examples)
+    if workload_mode == "open_loop":
+        # Open-loop measured stage bypasses the closed-loop work-unit machinery
+        # (it is dispatched by arrival schedule, not by completion). Warmup, when
+        # requested, primes the caches closed-loop single-shot -- identical to
+        # the "single" mode warmup pass.
+        warmup_work_units = [[ex] for ex in warmup_examples]
+        work_units = []
+    else:
+        warmup_work_units = build_work_units(warmup_examples)
+        work_units = build_work_units(measured_examples)
 
     # IR index / retriever (for RAG/Redis/Hybrid baselines, or any baseline when
     # context_source == "retrieved" so gold-context arms can be fed retrieved docs).
     ir_index = None
+    bm25_index = None
     corpus_docs = None
     if baseline_config.use_faiss or context_source == "retrieved":
-        print("\nBuilding/loading IR index (FAISS)...")
+        if retriever == "dense":
+            print("\nBuilding/loading IR index (FAISS)...")
+        else:
+            print(f"\nBuilding/loading IR index(es) for retriever={retriever}...")
         base_dir = Path(baseline_config.ir_index_dir)
         index_dir = default_index_dir(
             base_dir=base_dir,
@@ -1042,14 +1560,27 @@ def run_experiment(
                 f"(requested {_n_distractors}, gold excluded, content-deduped)"
             )
         print(f"IR corpus documents: {len(corpus_docs)}")
-        ir_index = ensure_ir_index(
-            index_dir=index_dir,
-            documents=corpus_docs,
-            embedding_model=baseline_config.embedding_model,
-            rebuild=bool(baseline_config.ir_rebuild),
-            device="cpu",
-        )
-        print(f"IR index ready at: {index_dir}")
+        # Dense (FAISS) leg: the pre-existing default, also required by
+        # hybrid-rrf. A bm25-only run skips the embedding-model load entirely.
+        if retriever in {"dense", "hybrid-rrf"}:
+            ir_index = ensure_ir_index(
+                index_dir=index_dir,
+                documents=corpus_docs,
+                embedding_model=baseline_config.embedding_model,
+                rebuild=bool(baseline_config.ir_rebuild),
+                device="cpu",
+            )
+            print(f"IR index ready at: {index_dir}")
+        # Lexical (BM25) leg over the SAME chunk store (charter sec. 7.2;
+        # Robertson & Zaragoza 2009 [robertson2009bm25]).
+        if retriever in {"bm25", "hybrid-rrf"}:
+            bm25_dir = default_bm25_index_dir(base_dir=base_dir, dataset_name=dataset)
+            bm25_index = ensure_bm25_index(
+                index_dir=bm25_dir,
+                documents=corpus_docs,
+                rebuild=bool(baseline_config.ir_rebuild),
+            )
+            print(f"BM25 index ready at: {bm25_dir}")
 
     # Optional Redis retrieval cache
     retrieval_cache = None
@@ -1086,11 +1617,20 @@ def run_experiment(
     # Optional reranker
     reranker = None
     if baseline_config.use_faiss and reranker_model:
-        try:
-            reranker = CrossEncoderReranker(reranker_model, device=reranker_device)
-            print(f"Reranker enabled: {reranker_model}")
-        except Exception as e:
-            print(f"Warning: failed to initialize reranker {reranker_model}: {e}")
+        reranker = build_reranker(reranker_model, reranker_device)
+
+    # Stage-tagged candidate-pool size for the non-dense retrievers (charter
+    # sec. 8.2: pool recall@100 default), never below the served top_k.
+    _retriever_pool_k = max(
+        int(os.getenv("CAGE_RETRIEVER_POOL_K", "100") or "100"),
+        int(baseline_config.top_k_retrieval or 1),
+    )
+    if retriever != "dense":
+        print(
+            f"RETRIEVER: {retriever} (stage-tagged pool_k={_retriever_pool_k}, "
+            f"served_k={baseline_config.top_k_retrieval}; dense path untouched "
+            f"for --retriever dense)"
+        )
 
     # Decision 1B (approved pre-run package, 2026-07-16): serve via the model's chat
     # template by default (vLLM /v1/chat/completions with the system message carrying
@@ -1100,6 +1640,17 @@ def run_experiment(
     _prompt_mode = prompt_mode()
     print(f"PROMPT MODE: {_prompt_mode} "
           f"({'chat template via /v1/chat/completions' if _prompt_mode == 'chat' else 'legacy raw completions'})")
+
+    # Stop sequences per backend: the HF reference oracle fails closed on stop
+    # lists BY DESIGN (run_cag_reference.py never uses them; the adapter refuses
+    # to silently ignore a stop request), so hf-oracle requests carry stop=None.
+    # Every other backend keeps the historical stop=["\n"] unchanged.
+    _request_stop: Optional[List[str]] = (
+        None if backend in {"hf-oracle", "hf_oracle"} else ["\n"]
+    )
+    # Streamed-TTFT backends: the two new serving-grade adapters stream like
+    # vLLM (charter D2 telemetry parity -- adapter capabilities streamed_ttft).
+    _stream_backends = {"vllm", "ollama", "sglang", "lmdeploy", "lmdeploy-turbomind"}
 
     # B5 (2026-07-16 audit): a ~35-60ms host-side TTFT constant was traced to host-side
     # scheduling/GC jitter bleeding into the timed window. A short monotonic-clock settle
@@ -1118,7 +1669,19 @@ def run_experiment(
 
     # Setup inference engine
     engine = setup_inference_engine(model, baseline_config, backend=backend, use_offline=use_offline)
-    
+
+    # hf-oracle corpus-prefix preload (charter D2 idea-gain zero point): when
+    # the reference oracle serves a corpus-prefix workload, preload each
+    # block's KV through the adapter seam so the oracle serves prefix+suffix
+    # (Chan et al. 2024 manual-CAG recipe) instead of full prefix-free
+    # prompts. Constructing the preloader is fail-closed on an adapter
+    # without the seam (honest error, never silent degradation).
+    oracle_preloader: Optional[OracleCorpusPreloader] = None
+    if backend in {"hf-oracle", "hf_oracle"} and _corpus_budget > 0:
+        oracle_preloader = OracleCorpusPreloader(engine, _prompt_mode)
+        print("[oracle] corpus-prefix preload ACTIVE (per-block KV reuse)")
+
+
     # Setup evaluators
     print("\nInitializing evaluators...")
     # Decoupled-scoring mode (2026-07-15): with CAGE_SKIP_QUALITY=1 (or --skip-quality),
@@ -1180,6 +1743,7 @@ def run_experiment(
         retrieval_top1_score = None
         retrieved_doc_ids: List[str] = []
         retrieval_reranked = False
+        retrieval_stages = None    # stage-tagged pool/reranked/served ranks (non-dense retrievers)
         evidence_version = None    # staleness baseline: "v0" (stale) | "v1" (fresh)
         served_from_cache = None   # staleness baseline: warm-cache hit flag
 
@@ -1189,7 +1753,40 @@ def run_experiment(
             baseline_config.baseline_type.value in {"rag", "redis", "hybrid"}
             or context_source == "retrieved"
         )
-        if do_retrieval:
+        if do_retrieval and retriever != "dense":
+            # Stage-tagged BM25 / hybrid-RRF retrieval (charter sec. 7.2 /
+            # sec. 8.2). The redis/hybrid retrieval-cache baselines were
+            # refused up front, so no cache read/write happens on this path.
+            hits, _stage = stage_tagged_retrieve(
+                question,
+                retriever=retriever,
+                bm25_index=bm25_index,
+                dense_index=ir_index,
+                reranker=reranker,
+                pool_k=_retriever_pool_k,
+                served_k=baseline_config.top_k_retrieval,
+            )
+            retrieval_reranked = _stage.reranked is not None
+            retrieval_stages = _stage.stage_ranks()
+            retrieved_doc_ids = [h.doc_id for h in hits]
+            retrieval_top1_score = hits[0].score if hits else 0.0
+            retrieved_docs = bm25_index.resolve_hits(hits)
+            used_contexts = [d.text for d in retrieved_docs]
+
+            gold_doc_ids = [stable_text_id(c) for c in (example.context or []) if c]
+            retrieval_hit = retrieval_hit_rate(
+                gold_doc_ids=gold_doc_ids,
+                retrieved_doc_ids=retrieved_doc_ids,
+                gold_texts=list(example.context or []),
+                retrieved_texts=used_contexts,
+            )
+            retrieval_rank = retrieval_rank_of_gold(
+                gold_doc_ids=gold_doc_ids,
+                retrieved_doc_ids=retrieved_doc_ids,
+                gold_texts=list(example.context or []),
+                retrieved_texts=used_contexts,
+            )
+        elif do_retrieval:
             if ir_index is None:
                 raise RuntimeError("IR index not initialized for retrieval-backed baseline")
 
@@ -1330,6 +1927,10 @@ def run_experiment(
             "retrieval_top1_score": retrieval_top1_score,
             "retrieved_doc_ids": retrieved_doc_ids,
             "retrieval_reranked": retrieval_reranked,
+            # Non-dense retrievers only (None on the untouched dense path):
+            # the label plus the charter sec. 8.2 stage-tagged rank lists.
+            "retriever": retriever if retrieval_stages is not None else None,
+            "retrieval_stages": retrieval_stages,
             "compression_stats": compression_stats,
             "evidence_version": evidence_version,
             "served_from_cache": served_from_cache,
@@ -1343,6 +1944,7 @@ def run_experiment(
         batch_id: int,
         turn_index: int,
         settle_ms: float = 0.0,
+        open_loop_record: Optional[RequestRecord] = None,
     ) -> None:
 
         question = meta["question"]
@@ -1531,6 +2133,15 @@ def run_experiment(
             "compression_latency_ms": (meta.get("compression_stats") or {}).get("compression_latency_ms"),
             **_quality_row,
         }
+        # Adapter honesty/provenance columns (ADR-0007 / charter D2), appended
+        # AFTER the existing columns via the union-of-keys CSV convention:
+        # engine_id, usage_telemetry_available, cached_token_telemetry_available,
+        # retries, plus the reference_engine flag the hf-oracle stamps.
+        result.update(adapter_honesty_columns(response))
+        # Non-dense retriever label (dense rows stay byte-identical: the key
+        # is only added when the stage-tagged path actually ran).
+        if meta.get("retriever"):
+            result["retriever"] = meta["retriever"]
         if code_metrics is not None:
             result.update(
                 {
@@ -1539,6 +2150,11 @@ def run_experiment(
                     "code_security_issues": ";".join(code_metrics.security_issues),
                 }
             )
+        if open_loop_record is not None:
+            # Open-loop accounting columns (scheduled_ts, actual_send_ts,
+            # scheduler_lag_ms, ... -- D6 §6.3 coordinated-omission-safe
+            # timestamps) are APPENDED after the existing columns.
+            merge_open_loop_row(result, open_loop_record)
         results.append(result)
 
         # Per-query evidence, appended INCREMENTALLY (one JSON line per query) so a mid-trial
@@ -1578,6 +2194,13 @@ def run_experiment(
                 "hallucinated_spans": getattr(quality_metrics, "hallucinated_spans", None),
                 "retrieved_doc_ids": meta.get("retrieved_doc_ids") or [],
             }
+            # Stage-tagged retrieval provenance (non-dense --retriever paths
+            # only, so existing dense evidence rows keep their exact schema):
+            # the retriever label + the charter sec. 8.2 pool/reranked/served
+            # rank lists that feed Layer-0 scoring.
+            if meta.get("retrieval_stages") is not None:
+                _evidence["retriever"] = meta.get("retriever")
+                _evidence["retrieval_stages"] = meta.get("retrieval_stages")
             with open(os.path.join(output_dir, "qa_evidence.jsonl"), "a", encoding="utf-8") as _ef:
                 _ef.write(json.dumps(_evidence, default=str) + "\n")
         except Exception as _ev_exc:
@@ -1629,12 +2252,12 @@ def run_experiment(
                             top_p=0.95,
                             request_id=example.id,
                             truncate_prompt_tokens=truncate_prompt_tokens,
-                            stop=["\n"],
+                            stop=_request_stop,
                         )
                         if messages is not None:
                             # Plain attribute consumed by VLLMAdapter -> /v1/chat/completions.
                             request.messages = messages
-                        stream_flag = backend in {"vllm", "ollama"}
+                        stream_flag = backend in _stream_backends
                         # B5: settle immediately before the TIMED request only.
                         settle_ms = settle_before_request() if collect_results else 0.0
                         response = engine.generate(request, stream=stream_flag)
@@ -1676,7 +2299,7 @@ def run_experiment(
                             top_p=0.95,
                             request_id=example.id,
                             truncate_prompt_tokens=truncate_prompt_tokens,
-                            stop=["\n"],
+                            stop=_request_stop,
                         )
                         if messages is not None:
                             # Plain attribute consumed by VLLMAdapter -> /v1/chat/completions.
@@ -1691,12 +2314,19 @@ def run_experiment(
                 if not requests:
                     continue  # whole unit failed to prepare; nothing to send
 
+                # hf-oracle corpus-prefix preload: the unit's shared block KV
+                # must be resident BEFORE the timed send (units share one
+                # context by construction: single units have one example,
+                # batched units are grouped by context hash).
+                if oracle_preloader is not None:
+                    oracle_preloader.ensure(kept[0], metas[0]["used_contexts"])
+
                 # B5: settle immediately before the TIMED request/batch only. For a
                 # batched unit the single settle precedes the batch send; each of the
                 # unit's rows records the same measured value.
                 settle_ms = settle_before_request() if collect_results else 0.0
                 if len(requests) == 1:
-                    stream_flag = backend in {"vllm", "ollama"}
+                    stream_flag = backend in _stream_backends
                     responses = [engine.generate(requests[0], stream=stream_flag)]
                 else:
                     responses = engine.batch_generate(requests)
@@ -1721,6 +2351,109 @@ def run_experiment(
                 stage_processed % 10 == 0 or stage_processed == total_stage_examples
             ):
                 print(f"{stage_name}: processed {stage_processed}/{total_stage_examples} requests...")
+
+    # ------------------------------------------------------------------ #
+    # Open-loop measured stage (workload_mode="open_loop"; charter D6 §6.1)
+    # ------------------------------------------------------------------ #
+    open_loop_report: Optional[DispatchReport] = None
+
+    def build_open_loop_request(example: CAGExample) -> Tuple[Dict[str, Any], InferenceRequest]:
+        """Prepare one example exactly as the single-shot closed-loop path does."""
+        meta = prepare_example(example)
+        messages = None
+        if _prompt_mode == "chat":
+            messages = format_qa_messages(meta["question"], meta["used_contexts"])
+            prompt = messages_to_fallback_prompt(messages)
+        else:
+            prompt = format_qa_prompt(meta["question"], meta["used_contexts"])
+        request = InferenceRequest(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=0.0,
+            top_p=0.95,
+            request_id=example.id,
+            truncate_prompt_tokens=truncate_prompt_tokens,
+            stop=_request_stop,
+        )
+        if messages is not None:
+            # Plain attribute consumed by VLLMAdapter -> /v1/chat/completions.
+            request.messages = messages
+        return meta, request
+
+    def execute_open_loop_measured() -> None:
+        """Dispatch the measured set open-loop and record rows with D6 columns."""
+        nonlocal open_loop_report, sent_requests, measured_processed
+
+        prepared: List[Tuple[CAGExample, Dict[str, Any], InferenceRequest]] = []
+        for example in measured_examples:
+            # Per-query guard (B4): a failed prepare (retrieval / rerank /
+            # compression) skips just this example, not the whole stage.
+            try:
+                meta, request = build_open_loop_request(example)
+            except Exception as _ex:
+                print(f"[open-loop] prepare failed for {example.id}: {_ex}; skipping")
+                continue
+            prepared.append((example, meta, request))
+        if not prepared:
+            raise LoadGeneratorError(
+                "measured_examples",
+                len(measured_examples),
+                "no request prepared successfully for the open-loop measured stage",
+            )
+
+        print(
+            f"Open-loop dispatch: rate={open_loop_rate_qps} qps, "
+            f"duration_s={open_loop_duration_s}, n_arrivals={open_loop_num_arrivals}, "
+            f"warmup_s={open_loop_warmup_s}, max_in_flight={open_loop_max_in_flight}, "
+            f"{len(prepared)} prepared requests (schedule index maps modulo)"
+        )
+        kept, report = dispatch_open_loop(
+            engine,
+            [req for _, _, req in prepared],
+            rate_qps=float(open_loop_rate_qps),  # validated non-None above
+            seed=seed,
+            duration_s=open_loop_duration_s,
+            n_arrivals=open_loop_num_arrivals,
+            warmup_s=open_loop_warmup_s,
+            max_in_flight=open_loop_max_in_flight,
+        )
+        open_loop_report = report
+
+        for record in kept:
+            example, meta, _req = prepared[record.index % len(prepared)]
+            sent_requests += 1
+            measured_processed += 1
+            if record.result is not None:
+                # Per-query guard (B4): a failed record drops one row only.
+                try:
+                    record_result(
+                        example, meta, record.result,
+                        batch_id=1, turn_index=0, settle_ms=0.0,
+                        open_loop_record=record,
+                    )
+                except Exception as _ex:
+                    print(f"[open-loop] record failed for {example.id}: {_ex}; skipping row")
+            else:
+                # Dropped-by-cap / dispatch-error arrivals are DATA (they count
+                # against D6 §6.1 attainment over the full offered schedule),
+                # recorded as error rows -- never silently omitted.
+                stub_row: Dict[str, Any] = {
+                    "example_id": example.id,
+                    "baseline": experiment_label,
+                    "baseline_family": baseline_config.baseline_type.value,
+                    "workload_mode": workload_mode,
+                    "error": record.error
+                    or ("dropped_by_cap" if record.dropped_by_cap else "no_response"),
+                }
+                merge_open_loop_row(stub_row, record)
+                results.append(stub_row)
+
+        print(
+            f"Open-loop stage complete: {report.n_scheduled} scheduled, "
+            f"{report.n_sent} sent, {report.n_completed} completed, "
+            f"{report.n_errors} errors, {report.n_dropped} dropped "
+            f"(measured rows after warmup trim: {len(kept)})"
+        )
 
     if warmup_work_units:
         print(
@@ -1752,7 +2485,10 @@ def run_experiment(
 
     performance_evaluator.start()
     try:
-        execute_work_units(work_units, collect_results=True, stage_name="Measured")
+        if workload_mode == "open_loop":
+            execute_open_loop_measured()
+        else:
+            execute_work_units(work_units, collect_results=True, stage_name="Measured")
     except Exception:
         # A crash escaped the per-query guards (e.g. the server died mid-stage). Persist
         # whatever rows were already collected so the baseline is not lost, then re-raise.
@@ -2186,6 +2922,10 @@ def run_experiment(
             "prompt_mode": _prompt_mode,
             "request_settle_ms": _settle_ms_cfg,
             "distractor_docs": int(os.getenv("CAGE_DISTRACTOR_DOCS", "1000") or "0"),
+            # Retriever provenance (additive key): "dense" for every
+            # pre-existing run shape; "bm25"/"hybrid-rrf" for the
+            # stage-tagged paths.
+            "retriever": retriever,
         },
         "workload": {
             "repeat_queries": repeat_queries,
@@ -2193,6 +2933,21 @@ def run_experiment(
             "mode": workload_mode,
             "batch_size": batch_size,
             "multi_turn_length": multi_turn_length,
+            # Open-loop provenance (schedule seed/rate/window + dispatch
+            # accounting -- reconstructible arrival process, D6 §6.1). Key is
+            # only present for open-loop runs so existing metrics.json schemas
+            # are untouched.
+            **(
+                {
+                    "open_loop": {
+                        **open_loop_report.to_manifest(),
+                        "warmup_s": open_loop_warmup_s,
+                        "max_in_flight": open_loop_max_in_flight,
+                    }
+                }
+                if open_loop_report is not None
+                else {}
+            ),
         },
         "prompt_truncation": {
             "truncate_prompt_tokens": truncate_prompt_tokens,
@@ -2244,6 +2999,76 @@ def run_experiment(
     return experiment_summary
 
 
+def _reset_prefix_cache(api_base: str, *, backend: str = "vllm", model: str = "") -> None:
+    """Flush the serving engine's prefix/KV cache between trials (cold-start-per-trial).
+
+    Migrated to the adapter flush seam (ADR-0007): when the backend's adapter
+    declares a flush endpoint in ``capabilities()`` the typed
+    ``adapter.flush_cache()`` is used (vLLM POST /reset_prefix_cache, SGLang
+    POST /flush_cache). The legacy raw vLLM dev-endpoint POST is KEPT as the
+    fallback for backends without an adapter flush capability (e.g. LMDeploy,
+    which documents none, or unknown backends) -- behavior-preserving for
+    them. Failures WARN loudly but never abort the trial loop, matching the
+    historical helper.
+    """
+    adapter_cls = {
+        "vllm": VLLMAdapter,
+        "sglang": SGLangAdapter,
+        "lmdeploy": LMDeployAdapter,
+        "lmdeploy-turbomind": LMDeployAdapter,
+    }.get(backend)
+    env_key = {
+        "sglang": "SGLANG",
+        "lmdeploy": "LMDEPLOY",
+        "lmdeploy-turbomind": "LMDEPLOY",
+    }.get(backend)
+    resolved_api_base = api_base
+    if env_key:
+        resolved_api_base = (
+            os.getenv(f"CAGE_{env_key}_API_BASE", "").strip() or api_base
+        )
+
+    if adapter_cls is not None:
+        try:
+            adapter = adapter_cls(
+                model_name=model or "cache-flush-probe", api_base=resolved_api_base
+            )
+            caps = (
+                adapter.capabilities()
+                if callable(getattr(adapter, "capabilities", None))
+                else {}
+            ) or {}
+            if caps.get("flush_endpoint") and callable(
+                getattr(adapter, "flush_cache", None)
+            ):
+                adapter.flush_cache()
+                print(
+                    f"[cache] flushed {backend} cache via adapter.flush_cache() "
+                    f"({caps['flush_endpoint']})"
+                )
+                return
+            # No declared flush endpoint -> fall through to the legacy path.
+        except Exception as e:
+            # The adapter targets the same endpoint the legacy path would;
+            # retrying raw would fail identically, so warn and return.
+            print(f"[cache] WARNING: could not reset prefix cache ({e}). "
+                  f"For vLLM, start the server with VLLM_SERVER_DEV_MODE=1 to "
+                  f"enable /reset_prefix_cache.")
+            return
+
+    # Legacy fallback (pre-ADR-0007 behavior, kept verbatim): raw POST to the
+    # vLLM dev-mode endpoint.
+    import urllib.request
+    url = api_base.rstrip("/") + "/reset_prefix_cache"
+    try:
+        req = urllib.request.Request(url, method="POST")
+        urllib.request.urlopen(req, timeout=10)
+        print(f"[cache] reset prefix cache via {url}")
+    except Exception as e:
+        print(f"[cache] WARNING: could not reset prefix cache ({e}). "
+              f"Start vLLM with VLLM_SERVER_DEV_MODE=1 to enable /reset_prefix_cache.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Run CAGE baseline experiments",
@@ -2267,8 +3092,29 @@ def main():
     parser.add_argument(
         "--dataset",
         default="squad_v2",
-        choices=["hotpotqa", "qasper", "squad_v2", "trivia_qa", "natural_questions", "musique", "crag", "sharegpt", "humaneval", "mbpp", "hpc_code"],
-        help="Dataset to use",
+        choices=["hotpotqa", "qasper", "squad_v2", "trivia_qa", "natural_questions", "musique", "crag", "sharegpt", "humaneval", "mbpp", "hpc_code", "ruler", "scbench"],
+        help="Dataset to use (ruler = synthetic RULER-style length instrument, "
+             "src/data/ruler.py; scbench = SCBench two-subset slice, "
+             "src/data/scbench.py -- subset via CAGE_SCBENCH_SUBSET)",
+    )
+    # RULER instrument parameters (charter D5 item 5; src/data/ruler.py). The
+    # loader reads CAGE_RULER_* env vars; these flags export them, mirroring
+    # the --skip-quality / --corpus-prefix-budget convention. The per-run
+    # --seed already feeds the loader's deterministic per-item child RNGs.
+    parser.add_argument(
+        "--ruler-context-tokens",
+        type=int,
+        default=None,
+        help="RULER target context length in tokens (loader default 4096; hard "
+             "input cap 32512 per SHAPE-32K). Equivalent to "
+             "CAGE_RULER_CONTEXT_TOKENS.",
+    )
+    parser.add_argument(
+        "--ruler-task",
+        choices=["niah_single", "niah_multikey"],
+        default=None,
+        help="RULER task variant (loader default niah_single). Equivalent to "
+             "CAGE_RULER_TASK.",
     )
     parser.add_argument(
         "--num-queries",
@@ -2318,9 +3164,11 @@ def main():
     )
     parser.add_argument(
         "--backend",
-        choices=["vllm", "gemini", "ollama"],
+        choices=["vllm", "sglang", "lmdeploy", "hf-oracle", "gemini", "ollama"],
         default="vllm",
-        help="Inference backend",
+        help="Inference backend (sglang/lmdeploy = OpenAI-compatible servers per ADR-0007; "
+             "hf-oracle = in-process T=0 HF reference engine, charter D2 idea-gain zero "
+             "point; gemini/ollama are legacy)",
     )
     parser.add_argument(
         "--offline",
@@ -2398,9 +3246,12 @@ def main():
     )
     parser.add_argument(
         "--workload-mode",
-        choices=["single", "batched", "multi_turn"],
+        choices=["single", "batched", "multi_turn", "open_loop"],
         default="single",
-        help="Workload mode: single-shot, batched shared-context, or multi-turn conversational",
+        help="Workload mode: single-shot, batched shared-context, multi-turn "
+             "conversational, or open_loop (D6 pressure cells: seeded Poisson arrivals "
+             "dispatched at their INTENDED times regardless of completions; requires "
+             "--rate plus exactly one of --duration-s / --arrival-count)",
     )
     parser.add_argument(
         "--batch-size",
@@ -2413,6 +3264,43 @@ def main():
         type=int,
         default=3,
         help="Number of turns per conversation in multi-turn mode",
+    )
+
+    # Open-loop workload controls (workload_mode=open_loop; charter D6 §6.1/§6.3)
+    parser.add_argument(
+        "--rate",
+        type=float,
+        default=None,
+        help="Open-loop offered arrival rate in QPS (required for --workload-mode "
+             "open_loop; arrivals are a seeded Poisson process at this rate)",
+    )
+    parser.add_argument(
+        "--duration-s",
+        type=float,
+        default=None,
+        help="Open-loop window duration in seconds (exactly one of --duration-s / "
+             "--arrival-count; fixed pre-costed windows, no CI-stopping)",
+    )
+    parser.add_argument(
+        "--arrival-count",
+        type=int,
+        default=None,
+        help="Open-loop exact number of arrivals (exactly one of --duration-s / "
+             "--arrival-count)",
+    )
+    parser.add_argument(
+        "--open-loop-warmup-s",
+        type=float,
+        default=0.0,
+        help="Jain warmup removal (D6 §6.3): drop measured rows whose INTENDED "
+             "arrival offset is before this many seconds",
+    )
+    parser.add_argument(
+        "--max-in-flight",
+        type=int,
+        default=None,
+        help="Open-loop client-side SAFETY cap on concurrent in-flight requests; "
+             "cap-affected arrivals are flagged (delayed_by_cap), never silently gated",
     )
 
     # Prompt / context truncation
@@ -2451,6 +3339,18 @@ def main():
         "--top-k-values",
         default="1,3,5,10",
         help="Comma-separated top-k values to sweep when --top-k-sweep is set",
+    )
+    parser.add_argument(
+        "--retriever",
+        choices=list(RETRIEVER_CHOICES),
+        default="dense",
+        help="Retrieval pipeline variant (charter sec. 7.2): dense = the "
+             "pre-existing FAISS+cross-encoder path (default, unchanged); "
+             "bm25 = stage-tagged Okapi BM25 (robertson2009bm25); hybrid-rrf "
+             "= BM25+dense fused via Reciprocal Rank Fusion, k=60 "
+             "(cormack2009rrf). Non-dense variants emit pool/reranked/served "
+             "stage tags into qa_evidence.jsonl (charter sec. 8.2); pool size "
+             "via CAGE_RETRIEVER_POOL_K (default 100).",
     )
     parser.add_argument(
         "--embedding-model",
@@ -2571,18 +3471,13 @@ def main():
         os.environ["CAGE_ORDER_BY_CONTEXT"] = "1"
     if args.query_manifest:
         os.environ["CAGE_QUERY_MANIFEST"] = args.query_manifest
-
-    def _reset_prefix_cache(api_base: str) -> None:
-        """Flush the vLLM prefix cache (dev-mode endpoint) for cold-start-per-trial."""
-        import urllib.request
-        url = api_base.rstrip("/") + "/reset_prefix_cache"
-        try:
-            req = urllib.request.Request(url, method="POST")
-            urllib.request.urlopen(req, timeout=10)
-            print(f"[cache] reset prefix cache via {url}")
-        except Exception as e:
-            print(f"[cache] WARNING: could not reset prefix cache ({e}). "
-                  f"Start vLLM with VLLM_SERVER_DEV_MODE=1 to enable /reset_prefix_cache.")
+    # RULER instrument parameters -> env (the loader's documented interface,
+    # src/data/ruler.py). Only exported when explicitly provided so the
+    # loader defaults stay authoritative.
+    if args.ruler_context_tokens is not None:
+        os.environ["CAGE_RULER_CONTEXT_TOKENS"] = str(args.ruler_context_tokens)
+    if args.ruler_task:
+        os.environ["CAGE_RULER_TASK"] = args.ruler_task
 
     embedding_model = normalize_embedding_model(args.embedding_model)
     reranker_model = normalize_reranker_model(args.reranker_model)
@@ -2605,6 +3500,7 @@ def main():
             embedding_model=embedding_model,
             ir_index_dir=args.ir_index_dir,
             rebuild_ir_index=args.rebuild_ir_index,
+            retriever=args.retriever,
             redis_host=args.redis_host,
             redis_port=args.redis_port,
             redis_db=args.redis_db,
@@ -2616,6 +3512,11 @@ def main():
             workload_mode=args.workload_mode,
             batch_size=args.batch_size,
             multi_turn_length=args.multi_turn_length,
+            open_loop_rate_qps=args.rate,
+            open_loop_duration_s=args.duration_s,
+            open_loop_num_arrivals=args.arrival_count,
+            open_loop_warmup_s=args.open_loop_warmup_s,
+            open_loop_max_in_flight=args.max_in_flight,
             routing_switch_at=args.routing_switch_at,
             reranker_model=reranker_model,
             reranker_device=args.reranker_device,
@@ -2659,7 +3560,7 @@ def main():
             # trial measures from a known (empty) cache state. Requires the server to be
             # started with VLLM_SERVER_DEV_MODE=1 (enables POST /reset_prefix_cache).
             if args.reset_cache_between_trials and trial > 1:
-                _reset_prefix_cache(args.api_base)
+                _reset_prefix_cache(args.api_base, backend=args.backend, model=args.model)
 
             # Create trial-specific output directory
             trial_output_dir = os.path.join(args.output_dir, f"trial_{trial}")
@@ -2680,6 +3581,7 @@ def main():
                 embedding_model=embedding_model,
                 ir_index_dir=args.ir_index_dir,
                 rebuild_ir_index=args.rebuild_ir_index if trial == 1 else False,
+                retriever=args.retriever,
                 redis_host=args.redis_host,
                 redis_port=args.redis_port,
                 redis_db=args.redis_db,
@@ -2691,6 +3593,11 @@ def main():
                 workload_mode=args.workload_mode,
                 batch_size=args.batch_size,
                 multi_turn_length=args.multi_turn_length,
+                open_loop_rate_qps=args.rate,
+                open_loop_duration_s=args.duration_s,
+                open_loop_num_arrivals=args.arrival_count,
+                open_loop_warmup_s=args.open_loop_warmup_s,
+                open_loop_max_in_flight=args.max_in_flight,
                 routing_switch_at=args.routing_switch_at,
                 reranker_model=reranker_model,
                 reranker_device=args.reranker_device,

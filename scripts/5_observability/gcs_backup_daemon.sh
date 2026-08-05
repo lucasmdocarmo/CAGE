@@ -40,7 +40,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-cd "$PROJECT_DIR" || exit 1
+# shellcheck source=scripts/lib/_common.sh
+source "$PROJECT_DIR/scripts/lib/_common.sh"
+cd "$PROJECT_DIR" || die "cannot cd to $PROJECT_DIR"
 
 ACTION="${1:-}"
 PHASE_DIR="${2:-results/${CAGE_PHASE:-phase2}}"
@@ -55,6 +57,8 @@ PIDF="$STATE_DIR/gcs_backup.pid"
 LOGF="$STATE_DIR/gcs_backup.log"
 mkdir -p "$STATE_DIR"
 
+# Local prefix overrides of _common.sh's log/warn (sourced above): the daemon's
+# output lines are grepped by operators as "[gcs-backup]", so the prefix stays.
 log()  { printf '[gcs-backup] %s\n' "$*"; }
 warn() { printf '[gcs-backup] WARNING: %s\n' "$*" >&2; }
 

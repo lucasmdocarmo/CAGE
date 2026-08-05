@@ -249,3 +249,22 @@ def test_sanitized_answer_and_premise_mode_in_to_dict() -> None:
     assert d["sanitized_answer"] == "Paris"          # alongside, never overwriting
     assert "faithfulness_premise_mode" in d          # B2 column always present
     assert d["faithfulness_premise_mode"] is None    # NLI off -> not scored
+    # Review fix: faithfulness_method must reflect whether faithfulness was ACTUALLY
+    # scored, not a hardcoded default. NLI is off here (faithfulness is None), so the
+    # method must be None too -- not the misleading "nli_claim_max".
+    assert d["faithfulness"] is None
+    assert d["faithfulness_method"] is None
+    assert "faithfulness_premise_count" in d
+    assert d["faithfulness_premise_count"] is None
+
+
+def test_faithfulness_method_none_on_abstention() -> None:
+    # An abstention short-circuits faithfulness scoring (evaluate(), 2026-07-15 audit):
+    # faithfulness_method must be None there too, not "nli_claim_max".
+    m = _model_free_evaluator().evaluate(
+        question="q", context=["ctx"],
+        generated_text="I don't know.", reference_answer="",
+    )
+    assert m.faithfulness is None
+    assert m.faithfulness_method is None
+    assert m.faithfulness_premise_count is None

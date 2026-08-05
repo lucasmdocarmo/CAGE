@@ -1,40 +1,98 @@
 # CAGE Framework Dependencies
 # Python 3.12 required
+#
+# ============================== PINNING POLICY ===============================
+# (CAGE_TECHNICAL_REVIEW_2026-08-04.md §5 S1/S17/S18; PUBLICATION.md D9 §9.13:
+# "the registered SHA must be the runnable, calibrated one".) Four tiers:
+#
+#   Tier 1 — EXACT PIN (==): scientific instruments whose version is RESOLVED
+#     AND TESTED in the local analysis venv (.venv, `pip freeze` 2026-08-04),
+#     or whose PyPI-latest release equals the long-stable floor (verified via
+#     `pip index versions` 2026-08-04). The pin records tested reality.
+#   Tier 2 — TIGHT BOUNDED RANGE (>=floor,<cap): scientific instruments that
+#     only fully resolve on the GPU host (co-resolved with vllm==0.19.1 and
+#     the CUDA stack), where a laptop-minted exact pin would record an
+#     UNTESTED claim or break platform wheel resolution (torch). Caps sit just
+#     above the PyPI-latest verified 2026-08-04. Exact values get frozen into
+#     requirements.lock.txt at D8 calibration time (review §4.8) — that
+#     lockfile pass is a separate, still-open item.
+#   Tier 3 — FLOOR PIN (>=): non-scientific infrastructure (serving,
+#     orchestration, CLI, testing) where version drift cannot change a
+#     reported number.
+#   Tier 4 — GIT SHA: internal tools (cage-stats), pinned to an exact commit.
+#
+# A Tier-1 pin is only ever changed by a DELIBERATE bump + re-test, never by
+# deleting the pin. Doctrine test: tests/test_scripts_doctrine.py fails on any
+# scientific-instrument line that regresses to a bare floor pin.
+# =============================================================================
 
 # Core ML & Inference
-torch>=2.1.0
+# Tier 2: an exact torch pin is platform-hazardous — CUDA/CPU wheel variants
+# differ per host, and on GPU hosts vllm==0.19.1's resolver owns the effective
+# exact version. Local CPU analysis floats inside this bound.
+torch>=2.1.0,<3
+# Tier 2: must co-resolve with vllm==0.19.1 (needs >=4.56.0 per its metadata)
+# and lettucedetect; capped <5 because the CAGE scoring code targets the
+# transformers 4.x API.
 transformers>=4.36.0,<5
-datasets>=2.16.0
+# Tier 2: capped below the 5.x major (PyPI latest 5.0.1, 2026-08-04); the 5.x
+# line moves in lockstep with huggingface-hub>=1.20, which breaks the legacy
+# dataset ids this repo loads (see huggingface-hub pin below).
+datasets>=2.16.0,<5
 
 # Evaluation Metrics
-sentence-transformers>=2.2.2
-bert-score>=0.3.13
-rouge-score>=0.1.2
-ragas>=0.1.0
-evaluate>=0.4.1
+# Tier 2: GPU-host-resolved (drags the transformers/torch stack); PyPI latest
+# 5.6.1 on 2026-08-04.
+sentence-transformers>=2.2.2,<6
+# Tier 1: 0.3.13 is both the tested floor and the PyPI-latest release
+# (unchanged upstream since 2022; verified 2026-08-04).
+bert-score==0.3.13
+# Tier 1: 0.1.2 is both the tested floor and the PyPI-latest release
+# (verified 2026-08-04).
+rouge-score==0.1.2
+# Tier 2: declared for the pre-registered RAGAS secondary but never imported
+# yet (review §5.1); PyPI latest 0.4.3 on 2026-08-04.
+ragas>=0.1.0,<0.5
+# Tier 2: PyPI latest 0.4.6 on 2026-08-04.
+evaluate>=0.4.1,<0.5
 # Context/prompt compression for the compressed_rag baseline (LLMLingua-2, client-side).
 # REQUIRED for that baseline: without it ContextCompressor silently no-ops (ratio 1.0),
 # which invalidated compressed_rag in Phase 2. Run with CAGE_REQUIRE_COMPRESSION=1 to
 # make a missing/failed compressor raise instead of pass through.
-llmlingua>=0.2.2
+# Tier 1: 0.2.2 is both the tested floor and the PyPI-latest release (verified 2026-08-04).
+llmlingua==0.2.2
 # Primary grounding/hallucination detector (token/span-level, ModernBERT/RAGTruth).
 # Pulls a recent transformers; if it conflicts with the pinned stack, install in a
 # dedicated env or set CAGE_DISABLE_LETTUCEDETECT=1 to fall back to NLI faithfulness.
-lettucedetect>=0.1.0
+# Tier 2: GPU-host-resolved; PyPI latest 0.2.2 on 2026-08-04.
+lettucedetect>=0.1.0,<0.3
 
-# Framework & Orchestration
+# Statistical Engine (Tier 1 — exact, from the tested analysis venv 2026-08-04)
+# scipy computes every primary/secondary p-value (Wilcoxon, Welch t, McNemar,
+# binomtest — src/analysis/stats/*); it was previously UNDECLARED, arriving
+# only transitively (review findings S10/S18).
+scipy==1.18.0
+
+# Retrieval Evaluation
+# Layer-0 stage-tagged retrieval eval (charter D8 §8.2): ranx — Bassani 2022,
+# "ranx: A Blazing-Fast Python Library for Ranking Evaluation and Comparison"
+# (ECIR 2022). Tier 1: 0.3.21 is the PyPI-latest, verified resolvable into
+# this venv via `pip install --dry-run ranx==0.3.21` on 2026-08-04.
+ranx==0.3.21
+
+# Framework & Orchestration (Tier 3)
 mlflow>=2.9.0
 hydra-core>=1.3.0
 fastapi>=0.108.0
 uvicorn>=0.25.0
 
-# Distributed Systems
+# Distributed Systems (Tier 3)
 aiohttp>=3.9.0
 requests>=2.31.0
 redis>=5.0.1
 ray[default]>=2.9.0
 
-# Monitoring & Telemetry
+# Monitoring & Telemetry (Tier 3)
 prometheus-client>=0.19.0
 # httpx is used by the in-process cage-stats telemetry path (VllmProvider). It otherwise
 # arrives only transitively via the cage-stats git dep; pin it directly so --vllm-telemetry
@@ -46,25 +104,35 @@ psutil>=5.9.6
 nvidia-ml-py>=12.535.0
 
 # Visualization & Analysis
-matplotlib>=3.8.0
-seaborn>=0.13.0
+# Tier 1: exact pins from the tested analysis venv (2026-08-04). numpy/pandas
+# feed every aggregation; matplotlib/seaborn render the paper figures.
+matplotlib==3.11.0
+seaborn==0.13.2
 jupyter>=1.0.0
-pandas>=2.1.0
-numpy>=1.24.0
+pandas==3.0.3
+numpy==2.5.1
 
-# Utilities
+# Utilities (Tier 3)
 loguru>=0.7.2
 pyyaml>=6.0.1
 python-dotenv>=1.0.0
 tqdm>=4.66.0
 
 # Vector Store (for RAG baseline)
-faiss-cpu>=1.7.4
+# Tier 2: GPU-host-resolved (co-installed with the CUDA stack); PyPI latest
+# 1.15.0 on 2026-08-04.
+faiss-cpu>=1.7.4,<2
 
 # HuggingFace Hub CLI
-huggingface-hub>=0.20.0
+# Upper-bounded: huggingface-hub>=1.20 breaks load_dataset() for every legacy
+# (non-namespaced) HF dataset id this repo uses (squad_v2, hotpot_qa, trivia_qa,
+# nq_open, mbpp, openai_humaneval, crag) with HfUriError while resolving the
+# dataset's hf:// metadata URI. Verified working through 1.10.0; <1.20 leaves
+# headroom and stays compatible with vLLM 0.19.1's own huggingface-hub>=0.34.0
+# floor (via transformers>=4.56.0), unlike a <0.25 ceiling which would conflict.
+huggingface-hub>=0.23,<1.20
 
-# Testing
+# Testing (Tier 3)
 pytest>=7.4.0
 pytest-cov>=4.1.0
 pytest-asyncio>=0.21.0
@@ -78,7 +146,8 @@ pytest-asyncio>=0.21.0
 # NOTE: requires the cage-stats restructure to be committed + pushed to its remote first.
 # If that repo is private, ensure git credentials are available on the install host.
 # Telemetry is optional — comment this line out if you don't need it (CAGE still runs).
-# PINNED to an exact commit (2026-07-15): an unpinned git dep installs whatever main is
-# at setup time, making two runs weeks apart silently non-comparable. Bump deliberately.
+# Tier 4: PINNED to an exact commit (2026-07-15): an unpinned git dep installs whatever
+# main is at setup time, making two runs weeks apart silently non-comparable. Bump
+# deliberately.
 cage-stats @ git+https://github.com/lucasmdocarmo/cage-stats.git@1cb902e2881a22fe2580ed264bd8a8ce16eb43fb
 # Local dev alternative (no install): set CAGE_STATS_HOME=/Users/lucasmariano/cage-stats

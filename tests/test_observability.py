@@ -53,6 +53,74 @@ def test_build_manifest_is_hermetic(tmp_path: Path, monkeypatch) -> None:
     assert d["seed"] == 42 and d["num_queries"] == 500
 
 
+def test_instrument_versions_records_installed_and_missing() -> None:
+    # scipy IS installed in the test venv -> exact version string; a nonsense
+    # distribution -> None (fail-soft record, never a raise).
+    from importlib import metadata
+
+    got = prov.instrument_versions(["scipy", "cage-definitely-not-a-package"])
+    assert got["scipy"] == metadata.version("scipy")
+    assert got["cage-definitely-not-a-package"] is None
+
+
+def test_instrument_versions_default_covers_scoring_stack() -> None:
+    got = prov.instrument_versions()
+    # Every declared scoring-stack package gets a key (value may be None off-GPU,
+    # e.g. torch/transformers are absent from the slim analysis venv).
+    assert set(got.keys()) == set(prov.SCORING_STACK_PACKAGES)
+    for name in ("transformers", "sentence-transformers", "lettucedetect", "bert-score", "torch"):
+        assert name in got                                # review §4.8 required set
+
+
+def test_collect_dataset_fingerprints_hashes_and_fails_soft(tmp_path: Path) -> None:
+    f = tmp_path / "query_manifest.json"
+    f.write_text("hello", encoding="utf-8")
+    fps = prov.collect_dataset_fingerprints(
+        {"query_manifest": str(f), "missing_corpus": str(tmp_path / "nope.jsonl")}
+    )
+    qm = fps["query_manifest"]
+    assert qm["sha256"] == "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+    assert qm["size_bytes"] == 5 and qm["path"] == str(f)
+    miss = fps["missing_corpus"]
+    assert miss["sha256"] is None and miss["size_bytes"] is None  # soft record, no raise
+
+
+def test_build_manifest_scoring_provenance_additive(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(prov, "gcp_instance_metadata", lambda: {"on_gce": False})
+    monkeypatch.setattr(prov, "gpu_info", lambda: {"name": None})
+    monkeypatch.setattr(prov, "vllm_version", lambda: None)
+    models = {
+        "grounding": {"model_id": "KRLabsOrg/lettucedect-base-modernbert-en-v1", "revision": "abc123"},
+        "serving_llm": {"model_id": "Qwen/Qwen3-8B", "revision": "def456"},
+    }
+    fps = {"query_manifest": {"path": "x", "sha256": None, "size_bytes": None}}
+    m = build_manifest(
+        run_id="r2", created_at="2026-08-04T00:00:00+00:00", cage_repo_dir=str(tmp_path),
+        instrument_models=models, dataset_fingerprints=fps,
+    )
+    d = m.to_dict()
+    # New keys present and faithful.
+    assert d["instrument_models"] == models
+    assert d["dataset_fingerprints"] == fps
+    assert set(d["instrument_versions"].keys()) == set(prov.SCORING_STACK_PACKAGES)
+    # Existing keys unbroken (backward compatibility of the manifest structure).
+    for k in ("run_id", "created_at", "cage_git_sha", "vllm_version", "torch_version",
+              "model", "dataset", "kv_cache_dtype", "gpu", "gcp_instance", "extra"):
+        assert k in d
+
+
+def test_build_manifest_defaults_keep_new_keys_empty(tmp_path: Path, monkeypatch) -> None:
+    # Callers that predate the scoring-provenance fields get empty dicts, not errors.
+    monkeypatch.setattr(prov, "gcp_instance_metadata", lambda: {"on_gce": False})
+    monkeypatch.setattr(prov, "gpu_info", lambda: {"name": None})
+    monkeypatch.setattr(prov, "vllm_version", lambda: None)
+    d = build_manifest(
+        run_id="r3", created_at="2026-08-04T00:00:00+00:00", cage_repo_dir=str(tmp_path),
+    ).to_dict()
+    assert d["instrument_models"] == {} and d["dataset_fingerprints"] == {}
+    assert d["instrument_versions"]  # auto-collected, never empty
+
+
 def test_trace_recorder_appends_jsonl(tmp_path: Path) -> None:
     tr = TraceRecorder(str(tmp_path / "trace.jsonl"))
     tr.event("observe_start", run_id="r1")

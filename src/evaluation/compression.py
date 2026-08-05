@@ -83,6 +83,7 @@ def analytical_kv_footprint(
     *,
     dtype: str = "bf16",
     baseline_dtype: str = "bf16",
+    mla_latent_dim: Optional[int] = None,
 ) -> Optional[dict]:
     """Best-effort analytical KV-cache footprint for a HF model at ``num_tokens``.
 
@@ -90,6 +91,14 @@ def analytical_kv_footprint(
     into :func:`kv_cache_bytes`, so the compression axis carries an analytical estimate
     alongside the empirical footprint from GPUMetricsTracker. Compares the configured
     KV dtype (e.g. ``fp8`` for ``compressed_cag``) against a ``bf16`` baseline.
+
+    MLA models (DeepSeek-V2/V3) cache a compressed KV latent (``kv_lora_rank``) PLUS a
+    decoupled RoPE key shared across heads (``qk_rope_head_dim``) per token per layer,
+    replacing the per-head K/V that ``kv_cache_bytes`` assumes by default. Unless the
+    caller passes an explicit ``mla_latent_dim`` override, it is auto-derived from the
+    HF config as ``kv_lora_rank + qk_rope_head_dim`` when ``kv_lora_rank`` is present
+    (e.g. DeepSeek-V3: 512 + 64 = 576 -> 68.6 KiB/token). Omitting the decoupled RoPE
+    key would silently undercount MLA models by ~11%.
 
     Returns ``None`` if the config cannot be read (never raises), so it is safe to call
     from the run summary on any host.
@@ -105,16 +114,21 @@ def analytical_kv_footprint(
         head_dim = getattr(cfg, "head_dim", None) or (
             int(hidden // num_heads) if hidden and num_heads else None
         )
+        if mla_latent_dim is None:
+            kv_lora_rank = getattr(cfg, "kv_lora_rank", None)
+            if kv_lora_rank:
+                qk_rope_head_dim = getattr(cfg, "qk_rope_head_dim", 0) or 0
+                mla_latent_dim = int(kv_lora_rank) + int(qk_rope_head_dim)
         if not (num_layers and num_kv_heads and head_dim and num_tokens):
             return None
 
         comp = kv_cache_bytes(
             num_tokens, num_layers=num_layers, num_kv_heads=num_kv_heads,
-            head_dim=head_dim, dtype=dtype,
+            head_dim=head_dim, dtype=dtype, mla_latent_dim=mla_latent_dim,
         )
         base = kv_cache_bytes(
             num_tokens, num_layers=num_layers, num_kv_heads=num_kv_heads,
-            head_dim=head_dim, dtype=baseline_dtype,
+            head_dim=head_dim, dtype=baseline_dtype, mla_latent_dim=mla_latent_dim,
         )
         return {
             "model": model_name,
@@ -123,9 +137,10 @@ def analytical_kv_footprint(
             "num_layers": int(num_layers),
             "num_kv_heads": int(num_kv_heads),
             "head_dim": int(head_dim),
+            "mla_latent_dim": mla_latent_dim,
             "kv_bytes_per_token": kv_bytes_per_token(
                 num_layers=num_layers, num_kv_heads=num_kv_heads,
-                head_dim=head_dim, dtype=dtype,
+                head_dim=head_dim, dtype=dtype, mla_latent_dim=mla_latent_dim,
             ),
             "kv_cache_bytes": comp,
             "kv_cache_bytes_baseline_bf16": base,

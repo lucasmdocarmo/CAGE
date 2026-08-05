@@ -17,9 +17,11 @@
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=scripts/lib/_common.sh
+source "$PROJECT_DIR/scripts/lib/_common.sh"
 # No -e in this script (accumulates FAILED): guard the cd so the python probes below
 # can never import from the wrong working directory.
-cd "$PROJECT_DIR" || exit 1
+cd "$PROJECT_DIR" || die "cannot cd to $PROJECT_DIR"
 MODEL="${1:-Qwen/Qwen3-8B}"
 API_BASE="${2:-http://localhost:8000}"
 FAILED=0
@@ -174,6 +176,77 @@ else
     else
         pass "free disk ${_free_gb}GB >= ${MIN_FREE_GB}GB (threshold: CAGE_MIN_FREE_GB)"
     fi
+fi
+
+# (h) charter-D2 telemetry-parity gate: every measured backend must DECLARE
+# streamed first-token TTFT in its adapter capabilities() (ADR-0007 data feed;
+# the adapters encode unverified entries as 'verify-live', never fabricated
+# True). Backends checked: CAGE_PREFLIGHT_BACKENDS (comma-separated adapter
+# tokens, default "vllm"). Each configured adapter's full capabilities() dict
+# is printed for the run log; a backend lacking streamed_ttft FAILS the gate
+# (its TTFT would be a full-response proxy, silently mixing methodologies
+# against the streamed single-stream baseline -- charter D2/D6 sec. 6.3).
+echo "(h) telemetry parity: adapter capabilities() must declare streamed_ttft (charter D2)"
+PREFLIGHT_BACKENDS="${CAGE_PREFLIGHT_BACKENDS:-vllm}"
+if ! python3 - "$PREFLIGHT_BACKENDS" <<'PY'
+# CAGE-D2-TELEMETRY-PARITY-GATE (extracted and exercised by tests/test_integration_wiring.py)
+import json
+import sys
+
+backends = [
+    b.strip()
+    for b in (sys.argv[1] if len(sys.argv) > 1 else "vllm").split(",")
+    if b.strip()
+]
+ok = True
+def pw(m): print(f"  [PASS] {m}")
+def pf(m):
+    global ok; ok = False; print(f"  [FAIL] {m}")
+
+try:
+    from src.inference.vllm_adapter import VLLMAdapter
+    from src.inference.sglang_adapter import SGLangAdapter
+    from src.inference.lmdeploy_adapter import LMDeployAdapter
+except Exception as e:
+    pf(f"could not import adapter classes: {e}")
+    sys.exit(1)
+
+# HTTP adapter tokens whose constructors are offline (no request at init).
+ADAPTERS = {
+    "vllm": VLLMAdapter,
+    "sglang": SGLangAdapter,
+    "lmdeploy": LMDeployAdapter,
+    "lmdeploy-turbomind": LMDeployAdapter,
+}
+
+for backend in backends:
+    cls = ADAPTERS.get(backend)
+    if cls is None:
+        pf(f"backend '{backend}': no serving-grade adapter with a verifiable "
+           f"streamed_ttft capability (hf-oracle is the reference engine, "
+           f"gemini/ollama are legacy) -- charter D2 telemetry parity cannot "
+           f"hold for a measured arm on this backend")
+        continue
+    try:
+        caps = cls(
+            model_name="preflight-probe", api_base="http://localhost:1"
+        ).capabilities()
+    except Exception as e:
+        pf(f"backend '{backend}': constructing the adapter to read "
+           f"capabilities() failed: {e}")
+        continue
+    print(f"  [caps] {backend}: {json.dumps(caps, sort_keys=True, default=str)}")
+    if caps.get("streamed_ttft") is True:
+        pw(f"backend '{backend}' declares streamed_ttft=True")
+    else:
+        pf(f"backend '{backend}' lacks streamed_ttft "
+           f"(got {caps.get('streamed_ttft')!r}) -- charter D2 telemetry "
+           f"parity requires real streamed first-token TTFT on measured arms")
+
+sys.exit(0 if ok else 1)
+PY
+then
+    FAILED=1
 fi
 
 echo "=============================================="

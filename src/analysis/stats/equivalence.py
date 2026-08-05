@@ -107,8 +107,14 @@ def conditional_tost(
         raise ValueError(f"margin={margin} must be finite and > 0")
     if dominance_margin <= 0.0 or dominance_margin >= 1.0:
         raise ValueError(f"dominance_margin={dominance_margin} must be in (0, 1)")
-    if not 0.0 < alpha < 1.0:
-        raise ValueError(f"alpha={alpha} must be in (0, 1)")
+    if not 0.0 < alpha < 0.5:
+        raise ValueError(
+            f"alpha={alpha} must be in (0, 0.5) — alpha is a one-sided TOST "
+            "significance level (Westlake 1976/Schuirmann 1987), and the "
+            "dominance-layer CI below is built as a (1 - 2*alpha)*100% "
+            "bootstrap interval, which inverts (ci_low > ci_high) for "
+            "alpha >= 0.5"
+        )
     if min_events < 2:
         raise ValueError(f"min_events={min_events} must be ≥ 2")
     if bootstrap_iters < 100:
@@ -153,8 +159,10 @@ def conditional_tost(
     rng = np.random.default_rng(seed)
     idx = rng.integers(0, n_events, size=(bootstrap_iters, n_events))
     boot = signs[idx].mean(axis=1)
-    ci_low = float(np.percentile(boot, 2.5))
-    ci_high = float(np.percentile(boot, 97.5))
+    # (1 - 2*alpha)*100% CI — matches two one-sided tests each at level alpha
+    # (the same alpha the domain/Layer-1 t-test above uses), not a fixed 95%.
+    ci_low = float(np.percentile(boot, 100 * alpha))
+    ci_high = float(np.percentile(boot, 100 * (1 - alpha)))
     dominance_verdict: Verdict = (
         "equivalent"
         if max(abs(ci_low), abs(ci_high)) < dominance_margin

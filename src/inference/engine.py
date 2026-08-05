@@ -84,11 +84,33 @@ class InferenceEngine(ABC):
     def is_ready(self) -> bool:
         """Check if engine is ready to serve requests."""
         pass
-    
+
     @abstractmethod
     def shutdown(self) -> None:
         """Cleanup and shutdown engine."""
         pass
+
+    def capabilities(self) -> Dict[str, Any]:
+        """Data-driven capability declaration for the charter-D2
+        telemetry-parity preflight gate (ADR-0007).
+
+        Conservative default: an engine declares NOTHING until its adapter
+        overrides this -- absence of a declared capability must read as
+        "unavailable", never as an implicit yes. Value convention used by the
+        adapters: ``True`` (verified in this codebase), ``False``/``None``
+        (absent or deliberately not implemented), ``"verify-live"``
+        (documented upstream, unverified here -- charter D2.1 [VERIFY-LIVE]).
+        """
+        return {
+            "engine": getattr(self, "engine_id", type(self).__name__.lower()),
+            "serving_grade": False,
+            "in_process": False,
+            "streamed_ttft": False,
+            "cached_token_telemetry": False,
+            "kv_usage_gauge": False,
+            "flush_endpoint": None,
+            "kv_transfer_params": False,
+        }
 
 
 class DummyEngine(InferenceEngine):

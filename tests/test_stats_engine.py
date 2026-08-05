@@ -446,6 +446,65 @@ class TestConditionalTost:
         with pytest.raises(ValueError, match="boolean"):
             conditional_tost(a, a, np.full(10, 2.0), margin=0.1)
 
+    def test_dominance_ci_tracks_alpha_not_hardcoded(self) -> None:
+        # Regression: the dominance-layer bootstrap CI used to be pinned to
+        # the literals 2.5/97.5 (a fixed 95% CI, i.e. alpha=0.025) no matter
+        # what `alpha` the caller passed. It must now be a
+        # (1 - 2*alpha)*100% CI, matching the domain layer's own alpha.
+        rng = np.random.default_rng(9)
+        b = rng.normal(0, 1, 80)
+        a = b + rng.normal(0, 0.01, 80)
+        mask = np.ones(80, dtype=bool)
+        wide = conditional_tost(a, b, mask, margin=0.05, alpha=0.01, seed=42)
+        narrow = conditional_tost(a, b, mask, margin=0.05, alpha=0.1, seed=42)
+        # A smaller alpha -> a wider (1 - 2*alpha) CI; a larger alpha -> a
+        # narrower one. Before the fix both had IDENTICAL bounds.
+        assert (wide.dominance_ci_high - wide.dominance_ci_low) > (
+            narrow.dominance_ci_high - narrow.dominance_ci_low
+        )
+        assert narrow.dominance_ci_low >= wide.dominance_ci_low
+        assert narrow.dominance_ci_high <= wide.dominance_ci_high
+
+    def test_dominance_ci_matches_alpha_percentile_mapping(self) -> None:
+        # Locks the alpha -> percentile mapping exactly: at alpha=0.05 the
+        # dominance CI must equal the 5th/95th percentiles of the bootstrap
+        # sign distribution (a 90% CI, i.e. two one-sided tests each at level
+        # alpha) — NOT the previously hardcoded 2.5th/97.5th (a fixed 95% CI
+        # that ignored `alpha` entirely).
+        d = np.zeros(200)
+        d[:40] = 0.01
+        d[40:70] = -0.01
+        a = d.copy()
+        b = np.zeros(200)
+        mask = np.ones(200, dtype=bool)
+        seed = 42
+        res = conditional_tost(a, b, mask, margin=0.05, alpha=0.05, seed=seed)
+
+        signs = np.sign(d)
+        rng = np.random.default_rng(seed)
+        idx = rng.integers(0, 200, size=(10_000, 200))
+        boot = signs[idx].mean(axis=1)
+        expected_low = float(np.percentile(boot, 5))
+        expected_high = float(np.percentile(boot, 95))
+        assert res.dominance_ci_low == pytest.approx(expected_low)
+        assert res.dominance_ci_high == pytest.approx(expected_high)
+
+        # And NOT the stale hardcoded 2.5/97.5 mapping.
+        stale_low = float(np.percentile(boot, 2.5))
+        stale_high = float(np.percentile(boot, 97.5))
+        assert res.dominance_ci_low != pytest.approx(stale_low)
+        assert res.dominance_ci_high != pytest.approx(stale_high)
+
+    def test_alpha_out_of_bounds_rejected(self) -> None:
+        # alpha >= 0.5 would invert the (1 - 2*alpha)*100% CI (ci_low >
+        # ci_high), silently corrupting the equivalence verdict.
+        a = np.zeros(20)
+        b = np.zeros(20)
+        mask = np.ones(20, dtype=bool)
+        for bad_alpha in (0.5, 0.6, 0.99):
+            with pytest.raises(ValueError, match="alpha"):
+                conditional_tost(a, b, mask, margin=0.1, alpha=bad_alpha)
+
 
 # --------------------------------------------------------------------------- #
 # equivalence.py — Bayesian ROPE sensitivity (§9.5)
@@ -711,3 +770,167 @@ class TestWinLossTie:
             win_loss_tie([np.inf], [1.0])
         with pytest.raises(ValueError, match="empty"):
             win_loss_tie([], [])
+
+
+# --------------------------------------------------------------------------- #
+# calibration.py §9.7 gate-artifact serializer <-> analysis-driver loader
+# (round trip: CalibrationReport.write == the schema load_calibration_report
+# parses -- run_campaign_analysis.py's loader is the schema authority)
+# --------------------------------------------------------------------------- #
+import json  # noqa: E402
+import sys  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from src.analysis.stats.calibration import (  # noqa: E402
+    AAResult,
+    CalibrationReport,
+    InjectionResult,
+    build_report,
+)
+
+_SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts" / "4_analysis"
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+import run_campaign_analysis as rca  # noqa: E402
+
+
+def _mwu_p(a: np.ndarray, b: np.ndarray) -> float:
+    return float(sps.mannwhitneyu(a, b, alternative="two-sided").pvalue)
+
+
+def _sample_report() -> CalibrationReport:
+    """Hand-built report exercising every serialized field, including a
+    target_power=None injection and the 'flip' kind."""
+    return CalibrationReport(
+        seed=11,
+        n_observations=120,
+        aa=AAResult(
+            n_splits=40, alpha=0.05, n_rejections=2,
+            fp_rate=0.05, ci_low=0.0061, ci_high=0.1692,
+        ),
+        injections=(
+            InjectionResult(
+                effect_size=0.5, kind="shift", n_splits=40, alpha=0.05,
+                n_rejections=30, power=0.75, ci_low=0.588, ci_high=0.873,
+                target_power=0.7,
+            ),
+            InjectionResult(
+                effect_size=0.25, kind="flip", n_splits=40, alpha=0.05,
+                n_rejections=20, power=0.5, ci_low=0.338, ci_high=0.662,
+                target_power=None,
+            ),
+        ),
+    )
+
+
+class TestCalibrationReportSerializer:
+    def test_write_load_round_trip_identity(self, tmp_path: Path) -> None:
+        report = _sample_report()
+        out = report.write(tmp_path / "nested" / "calibration_report.json")
+        assert out.is_file()  # write() creates parent dirs
+        loaded = rca.load_calibration_report(out)
+        # Frozen-dataclass equality covers every field, incl. the injections
+        # tuple; json's repr-based float serialization round-trips exactly.
+        assert loaded == report
+        assert loaded.aa.approximates_nominal == report.aa.approximates_nominal
+
+    def test_round_trip_through_the_real_machinery(self, tmp_path: Path) -> None:
+        # End-to-end: build_report on the literal campaign test path, write,
+        # load through the driver, and pass the confirmatory gate.
+        rng = np.random.default_rng(7)
+        data = rng.normal(0.0, 1.0, size=120)
+        report = build_report(
+            data, _mwu_p, n_splits=40, seed=11,
+            effect_sizes=(1.5,), target_power=0.2,
+        )
+        out = report.write(tmp_path / "calibration_report.json")
+        loaded = rca.load_calibration_report(out)
+        assert loaded == report
+        summary = rca.check_calibration(loaded, out)
+        assert summary["verdict"] == "PASS"
+        assert summary["seed"] == 11
+        assert summary["n_observations"] == 120
+        assert summary["n_injections"] == 1
+
+    def test_artifact_shape_is_exactly_the_loader_schema(
+        self, tmp_path: Path
+    ) -> None:
+        out = _sample_report().write(tmp_path / "calibration_report.json")
+        text = out.read_text(encoding="utf-8")
+        assert text.endswith("\n")
+        raw = json.loads(text)
+        assert set(raw) == {"seed", "n_observations", "aa", "injections"}
+        assert set(raw["aa"]) == {
+            "n_splits", "alpha", "n_rejections", "fp_rate", "ci_low", "ci_high",
+        }
+        for inj in raw["injections"]:
+            assert set(inj) == {
+                "effect_size", "kind", "n_splits", "alpha", "n_rejections",
+                "power", "ci_low", "ci_high", "target_power",
+            }
+        # Derived verdicts are recomputed by the gate, never serialized (a
+        # stale PASS in the artifact could contradict the code's criterion).
+        assert "approximates_nominal" not in raw["aa"]
+        assert all("meets_target" not in inj for inj in raw["injections"])
+        assert raw["injections"][1]["target_power"] is None
+
+    def test_numpy_scalars_are_coerced_to_native_json(self, tmp_path: Path) -> None:
+        # A report hand-assembled from numpy scalars must still serialize
+        # (json.dumps rejects np.int64/np.float64 without coercion).
+        report = CalibrationReport(
+            seed=np.int64(3),  # type: ignore[arg-type]
+            n_observations=np.int64(50),  # type: ignore[arg-type]
+            aa=AAResult(
+                n_splits=np.int64(20), alpha=np.float64(0.05),  # type: ignore[arg-type]
+                n_rejections=np.int64(1), fp_rate=np.float64(0.05),  # type: ignore[arg-type]
+                ci_low=np.float64(0.0013), ci_high=np.float64(0.2487),  # type: ignore[arg-type]
+            ),
+        )
+        out = report.write(tmp_path / "calibration_report.json")
+        loaded = rca.load_calibration_report(out)
+        assert loaded.n_observations == 50
+        assert loaded.aa.n_splits == 20
+
+    def test_failing_aa_report_is_written_but_gate_refuses(
+        self, tmp_path: Path
+    ) -> None:
+        # Failure is documented (write always succeeds); refusal is the
+        # consumer's job -- same doctrine as instrument_calibration.write_report.
+        failing = CalibrationReport(
+            seed=1,
+            n_observations=80,
+            aa=AAResult(
+                n_splits=40, alpha=0.05, n_rejections=20,
+                fp_rate=0.5, ci_low=0.338, ci_high=0.662,  # CI excludes alpha
+            ),
+        )
+        out = failing.write(tmp_path / "calibration_report.json")
+        loaded = rca.load_calibration_report(out)
+        assert loaded == failing
+        with pytest.raises(rca.CalibrationGateError, match="A/A FAILED"):
+            rca.check_calibration(loaded, out)
+
+    def test_missed_injection_target_round_trips_and_refuses(
+        self, tmp_path: Path
+    ) -> None:
+        report = CalibrationReport(
+            seed=1,
+            n_observations=80,
+            aa=AAResult(
+                n_splits=40, alpha=0.05, n_rejections=2,
+                fp_rate=0.05, ci_low=0.0061, ci_high=0.1692,
+            ),
+            injections=(
+                InjectionResult(
+                    effect_size=0.5, kind="shift", n_splits=40, alpha=0.05,
+                    n_rejections=10, power=0.25, ci_low=0.127, ci_high=0.412,
+                    target_power=0.8,  # point estimate misses -> FAIL
+                ),
+            ),
+        )
+        out = report.write(tmp_path / "calibration_report.json")
+        loaded = rca.load_calibration_report(out)
+        assert loaded == report
+        assert loaded.injections[0].meets_target is False
+        with pytest.raises(rca.CalibrationGateError, match="injection targets"):
+            rca.check_calibration(loaded, out)

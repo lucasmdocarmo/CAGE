@@ -20,9 +20,24 @@ import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 logger = logging.getLogger("cage.observability.provenance")
+
+# Scoring-stack packages whose installed versions must travel with every manifest
+# (charter PUBLICATION.md D8 §8.1: "every score row carries instrument id+version";
+# CAGE_TECHNICAL_REVIEW_2026-08-04.md §4.8). Distribution names as pip declares them.
+SCORING_STACK_PACKAGES: Tuple[str, ...] = (
+    "transformers",
+    "sentence-transformers",
+    "lettucedetect",
+    "bert-score",
+    "rouge-score",
+    "ragas",
+    "torch",
+    "scipy",
+    "numpy",
+)
 
 # GCP metadata server: authoritative for the instance's own name/zone/machine-type. Answers
 # only from inside a GCE VM; a short timeout makes it a no-op (empty dict) off-cloud.
@@ -112,6 +127,50 @@ def vllm_version() -> Optional[str]:
         return None
 
 
+def instrument_versions(
+    packages: Sequence[str] = SCORING_STACK_PACKAGES,
+) -> Dict[str, Optional[str]]:
+    """Installed version of each scoring-stack package, by distribution name.
+
+    A missing package records ``None`` with a warning (fail-soft, per this module's
+    contract: provenance capture must never crash a run). The scoring layer itself
+    (src/evaluation/quality.py) is where a missing instrument fails CLOSED -- here we
+    only RECORD what was installed, so a null is honest evidence, not degradation.
+    """
+    from importlib import metadata
+
+    out: Dict[str, Optional[str]] = {}
+    for name in packages:
+        try:
+            out[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            logger.warning("provenance: package %s not installed (version=None)", name)
+            out[name] = None
+        except Exception as exc:  # pragma: no cover - defensive: odd metadata states
+            logger.warning("provenance: version lookup failed for %s: %s", name, exc)
+            out[name] = None
+    return out
+
+
+def collect_dataset_fingerprints(paths: Mapping[str, str]) -> Dict[str, Dict[str, Any]]:
+    """Content-fingerprint hook for dataset / query-manifest artifacts.
+
+    Maps a logical name (e.g. ``"query_manifest"``, ``"squad_v2_corpus"``) to the file's
+    ``{path, sha256, size_bytes}`` so a run's inputs are tied to exact bytes on disk,
+    mirroring ``write_provenance`` for outputs. Unreadable files record ``sha256=None``
+    (fail-soft, with the warning emitted by ``sha256_file``).
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for name, path in paths.items():
+        p = Path(path)
+        try:
+            size: Optional[int] = p.stat().st_size if p.is_file() else None
+        except OSError:  # pragma: no cover - race between is_file and stat
+            size = None
+        out[name] = {"path": str(path), "sha256": sha256_file(str(path)), "size_bytes": size}
+    return out
+
+
 def gpu_info() -> Dict[str, Any]:
     """GPU name / memory / driver / CUDA via pynvml. Empty-ish dict if unavailable."""
     info: Dict[str, Any] = {
@@ -199,6 +258,15 @@ class RunManifest:
     hostname: str = field(default_factory=platform.node)
     gpu: Dict[str, Any] = field(default_factory=dict)
     gcp_instance: Dict[str, Any] = field(default_factory=dict)
+    # Scoring-instrument provenance (charter D8 §8.1; review §4.8) -- ADDITIVE keys:
+    #   instrument_versions   installed scoring-stack package versions (auto-collected);
+    #   instrument_models     instrument/serving HF model ids + revisions IN USE, passed
+    #                         by the caller (constructors know the resolved revision);
+    #   dataset_fingerprints  content hashes of the dataset / query-manifest artifacts
+    #                         the run consumed (see collect_dataset_fingerprints()).
+    instrument_versions: Dict[str, Optional[str]] = field(default_factory=dict)
+    instrument_models: Dict[str, Any] = field(default_factory=dict)
+    dataset_fingerprints: Dict[str, Any] = field(default_factory=dict)
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -230,9 +298,18 @@ def build_manifest(
     enforce_eager: Optional[bool] = None,
     max_model_len: Optional[int] = None,
     gpu_memory_utilization: Optional[float] = None,
+    instrument_models: Optional[Dict[str, Any]] = None,
+    dataset_fingerprints: Optional[Dict[str, Any]] = None,
     extra: Optional[Dict[str, Any]] = None,
 ) -> RunManifest:
-    """Collect all provenance for one run. ``created_at`` is passed in (module stays clock-free)."""
+    """Collect all provenance for one run. ``created_at`` is passed in (module stays clock-free).
+
+    ``instrument_models`` maps instrument name -> {model_id, revision, ...} for the HF
+    models actually in use (grounding, NLI, embedder, reranker, serving LLM); callers
+    pass resolved values because only the constructor site knows the loaded revision.
+    ``dataset_fingerprints`` is the output of :func:`collect_dataset_fingerprints` (or a
+    compatible mapping). Scoring-stack package versions are always auto-collected.
+    """
     return RunManifest(
         run_id=run_id,
         created_at=created_at,
@@ -256,6 +333,9 @@ def build_manifest(
         gpu_memory_utilization=gpu_memory_utilization,
         gpu=gpu_info(),
         gcp_instance=gcp_instance_metadata(),
+        instrument_versions=instrument_versions(),
+        instrument_models=dict(instrument_models or {}),
+        dataset_fingerprints=dict(dataset_fingerprints or {}),
         extra=dict(extra or {}),
     )
 

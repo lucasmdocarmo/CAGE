@@ -36,8 +36,15 @@ def _served(rec: Mapping) -> bool:
     return bool(rec.get("served_from_cache"))
 
 
-def _grounded(rec: Mapping) -> bool:
-    return bool(rec.get("grounded"))
+def _grounded(rec: Mapping) -> Optional[bool]:
+    """True/False when scored; None when grounding is N/A (abstention/unscored row).
+
+    Must NOT coerce None to False: the producer (run_experiment.py) deliberately sets
+    `grounded=None` (not False) for abstentions/unscored rows -- a missing flag, not a
+    grounding failure. Coercing it here would mislabel a correct "Don't know." as unsafe.
+    """
+    g = rec.get("grounded")
+    return None if g is None else bool(g)
 
 
 def _is_stale(rec: Mapping, *, stale_value: str = "v0", field: str = "evidence_version") -> bool:
@@ -45,11 +52,17 @@ def _is_stale(rec: Mapping, *, stale_value: str = "v0", field: str = "evidence_v
 
 
 def unsafe_served_rate(records: Iterable[Mapping]) -> Optional[float]:
-    """USR = fraction of ALL queries served a wrong (ungrounded) cached answer."""
-    recs = list(records)
+    """USR = fraction of ALL queries served a wrong (ungrounded) cached answer.
+
+    Rows where grounding is N/A (`_grounded` is None -- abstention/unscored) are
+    excluded from both numerator and denominator: grounding was never established
+    for them, so they are neither "safe" nor "unsafe", mirroring the codebase's
+    mean_or_none None-exclusion convention for missing quality data.
+    """
+    recs = [r for r in records if _grounded(r) is not None]
     if not recs:
         return None
-    unsafe = sum(1 for r in recs if _served(r) and not _grounded(r))
+    unsafe = sum(1 for r in recs if _served(r) and _grounded(r) is False)
     return unsafe / len(recs)
 
 
@@ -62,24 +75,33 @@ def answer_hit_rate(records: Iterable[Mapping]) -> Optional[float]:
 
 
 def false_hit_rate(records: Iterable[Mapping]) -> Optional[float]:
-    """FH = error rate conditional on a cache hit = USR / aHR = Pr[wrong | served]."""
-    served = [r for r in records if _served(r)]
+    """FH = error rate conditional on a cache hit = USR / aHR = Pr[wrong | served].
+
+    Served rows with grounding N/A (`_grounded` is None) are excluded from both the
+    numerator and denominator -- see `unsafe_served_rate`.
+    """
+    served = [r for r in records if _served(r) and _grounded(r) is not None]
     if not served:
         return None
-    wrong = sum(1 for r in served if not _grounded(r))
+    wrong = sum(1 for r in served if _grounded(r) is False)
     return wrong / len(served)
 
 
 def stale_hit_rate(records: Iterable[Mapping], *, stale_value: str = "v0",
                    field: str = "evidence_version") -> Optional[float]:
-    """SHR = fraction of served STALE (v0) hits that produced an ungrounded answer."""
+    """SHR = fraction of served STALE (v0) hits that produced an ungrounded answer.
+
+    Served+stale rows with grounding N/A (`_grounded` is None) are excluded from both
+    the numerator and denominator -- see `unsafe_served_rate`.
+    """
     stale_served = [
         r for r in records
-        if _served(r) and _is_stale(r, stale_value=stale_value, field=field)
+        if _served(r) and _grounded(r) is not None
+        and _is_stale(r, stale_value=stale_value, field=field)
     ]
     if not stale_served:
         return None
-    ungrounded = sum(1 for r in stale_served if not _grounded(r))
+    ungrounded = sum(1 for r in stale_served if _grounded(r) is False)
     return ungrounded / len(stale_served)
 
 

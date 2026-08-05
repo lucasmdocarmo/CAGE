@@ -15,8 +15,10 @@ point of §9.7.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
-from typing import Callable, Literal, Sequence
+from pathlib import Path
+from typing import Any, Callable, Literal, Sequence
 
 import numpy as np
 from scipy.stats import binomtest
@@ -86,6 +88,68 @@ class CalibrationReport:
     n_observations: int
     aa: AAResult
     injections: tuple[InjectionResult, ...] = field(default_factory=tuple)
+
+    def to_json_dict(self) -> dict[str, Any]:
+        """The §9.7 gate-artifact payload, exactly as the consumers parse it.
+
+        Schema authority: ``scripts/4_analysis/run_campaign_analysis.py``
+        ``load_calibration_report`` (the same shape ``prereg.py`` gates
+        registration on) — top-level ``seed`` / ``n_observations`` /
+        ``aa{n_splits, alpha, n_rejections, fp_rate, ci_low, ci_high}`` /
+        ``injections[{effect_size, kind, n_splits, alpha, n_rejections,
+        power, ci_low, ci_high, target_power}]``. Derived verdicts
+        (``approximates_nominal`` / ``meets_target``) are deliberately NOT
+        serialized: the gate recomputes them from the raw counts, so the
+        artifact can never carry a stale PASS that contradicts the code's
+        current criterion (fail-closed). Values are coerced to native
+        ``int``/``float`` so numpy scalars never leak into the JSON.
+        """
+        return {
+            "seed": int(self.seed),
+            "n_observations": int(self.n_observations),
+            "aa": {
+                "n_splits": int(self.aa.n_splits),
+                "alpha": float(self.aa.alpha),
+                "n_rejections": int(self.aa.n_rejections),
+                "fp_rate": float(self.aa.fp_rate),
+                "ci_low": float(self.aa.ci_low),
+                "ci_high": float(self.aa.ci_high),
+            },
+            "injections": [
+                {
+                    "effect_size": float(inj.effect_size),
+                    "kind": str(inj.kind),
+                    "n_splits": int(inj.n_splits),
+                    "alpha": float(inj.alpha),
+                    "n_rejections": int(inj.n_rejections),
+                    "power": float(inj.power),
+                    "ci_low": float(inj.ci_low),
+                    "ci_high": float(inj.ci_high),
+                    "target_power": (
+                        float(inj.target_power)
+                        if inj.target_power is not None
+                        else None
+                    ),
+                }
+                for inj in self.injections
+            ],
+        }
+
+    def to_json(self) -> str:
+        """Serialized artifact text (same conventions as the L4 instrument
+        report writer ``instrument_calibration.write_report``: indent=2,
+        sorted keys, trailing newline)."""
+        return json.dumps(self.to_json_dict(), indent=2, sort_keys=True) + "\n"
+
+    def write(self, path: str | Path) -> Path:
+        """Write the §9.7 JSON gate artifact (always — a FAILING calibration
+        is documented, not hidden; refusal happens at the consumers:
+        ``prereg.assemble_preregistration`` and the analysis driver's
+        ``check_calibration``)."""
+        out = Path(path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(self.to_json(), encoding="utf-8")
+        return out
 
     def to_markdown(self) -> str:
         lines = [

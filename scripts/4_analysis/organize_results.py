@@ -14,7 +14,10 @@ NOT the pilot layout — pilots stay on scripts/4_analysis/_results_loader.py):
                 qa_evidence.jsonl         # raw outputs + evidence (required; sharegpt exempt)
                 engine_metrics.json       # engine /metrics snapshots (required)
                 cage_stats.jsonl          # cage-stats telemetry stream (required)
-        scoring/...                       # offline quality scoring outputs (opaque here)
+        scoring/<scoring_run_id>/         # offline scoring passes (§6): validated —
+            scoring_manifest.json         #   manifest + own ledger + cells/ mirror of
+            ledger.json                   #   the raw tree (qa_scores.jsonl, quality.json);
+            cells/<row_key>/window_<k>/   #   NEVER indexed, NEVER inside raw cells/
 
 The dataset lives IN the window directory name (e.g. ``window_squad_v2-01``) —
 that is what makes the §8 dataset-scoped globs (``window_<Y>-*``) possible
@@ -63,6 +66,7 @@ for _p in (str(_HERE), str(_REPO_ROOT)):
         sys.path.insert(0, _p)
 
 from src.analysis.cellspec import BASELINES, CellSpec, CellSpecError  # noqa: E402
+from src.analysis.stats.ledger import LedgerError, read_ledger, verify_ledger  # noqa: E402
 
 #: §1: window dir k = <dataset_id>-<ordinal>, e.g. window_squad_v2-01. The
 #: dataset id is validated against DATASET_IDS separately so an unknown id is
@@ -83,6 +87,17 @@ RUN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,40}$")
 
 #: §1 session vocabulary (RUNBOOK §1).
 SESSIONS: frozenset[str] = frozenset({"a", "b", "cd-act1", "cd-act2"})
+
+#: §6 scoring-tree contract (offline quality passes; validated, never indexed).
+SCORING_DIRNAME = "scoring"
+SCORING_MANIFEST_NAME = "scoring_manifest.json"
+SCORING_RUN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
+REQUIRED_SCORING_WINDOW_ARTIFACTS: tuple[str, ...] = ("qa_scores.jsonl", "quality.json")
+_SCORING_MANIFEST_REQUIRED_KEYS: tuple[str, ...] = (
+    "scoring_run_id",
+    "created_utc",
+    "raw_run_ledger_entries_sha256",
+)
 
 #: §1 dataset ids — the ONLY legal window-name datasets.
 DATASET_IDS: frozenset[str] = frozenset(
@@ -582,6 +597,175 @@ def build_coverage_report(manifest: Mapping[str, Any], index: pd.DataFrame) -> s
 
 
 # ---------------------------------------------------------------------------
+# §6 scoring-tree validation (RESULTS_LAYOUT: scoring/<scoring_run_id>/)
+# ---------------------------------------------------------------------------
+
+
+def validate_scoring_tree(run_dir: Path) -> list[str]:
+    """Validate every ``scoring/<scoring_run_id>/`` pass against §6 (fail loud).
+
+    Rules enforced:
+    - the raw ``cells/`` tree carries NO scoring output (scoring NEVER writes
+      into cells/ — the raw tree is sealed);
+    - each scoring pass id obeys the §6 grammar and carries a
+      ``scoring_manifest.json`` whose ``scoring_run_id`` matches its directory
+      and whose ``raw_run_ledger_entries_sha256`` matches THIS run's sealed
+      ledger (a pass that scored a different seal proves nothing here);
+    - its ``cells/<row_key>/window_<k>/`` mirror only cells/windows that exist
+      in the raw tree, each window carrying qa_scores.jsonl + quality.json;
+    - the pass carries its OWN sealed ledger and verifies against it (§6:
+      sealed before stats may consume it).
+
+    Returns human-readable summary lines for the coverage report ("none" when
+    the run has no scoring passes — scoring is optional at organize time).
+    """
+    problems: list[str] = []
+    summary: list[str] = []
+
+    contamination = sorted(
+        p.relative_to(run_dir).as_posix()
+        for name in REQUIRED_SCORING_WINDOW_ARTIFACTS
+        for p in (run_dir / "cells").rglob(name)
+    )
+    for path in contamination:
+        problems.append(
+            f"{path}: scoring output inside the sealed raw tree — §6: scoring "
+            "NEVER writes into cells/"
+        )
+
+    scoring_root = run_dir / SCORING_DIRNAME
+    if not scoring_root.is_dir():
+        if problems:
+            raise LayoutError(problems)
+        return summary
+
+    raw_entries_sha256: str | None = None
+    raw_ledger_path = run_dir / "ledger.json"
+    if raw_ledger_path.is_file():
+        try:
+            read_ledger(raw_ledger_path)  # verifies the self-hash
+            raw_entries_sha256 = json.loads(
+                raw_ledger_path.read_text(encoding="utf-8")
+            )["entries_sha256"]
+        except (LedgerError, json.JSONDecodeError, KeyError) as exc:
+            problems.append(f"ledger.json unusable for scoring validation: {exc}")
+
+    for scoring_dir in sorted(p for p in scoring_root.iterdir() if not p.name.startswith(".")):
+        sid = scoring_dir.name
+        prefix = f"{SCORING_DIRNAME}/{sid}"
+        if not scoring_dir.is_dir():
+            problems.append(f"{prefix}: not a directory (stray file in scoring/)")
+            continue
+        if not SCORING_RUN_ID_RE.match(sid):
+            problems.append(
+                f"{prefix}: scoring run id violates the §6 grammar "
+                f"{SCORING_RUN_ID_RE.pattern}"
+            )
+            continue
+
+        manifest_path = scoring_dir / SCORING_MANIFEST_NAME
+        if not manifest_path.is_file():
+            problems.append(f"{prefix}: missing {SCORING_MANIFEST_NAME} (§6)")
+            continue
+        try:
+            scoring_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            problems.append(f"{prefix}/{SCORING_MANIFEST_NAME}: invalid JSON: {exc}")
+            continue
+        if not isinstance(scoring_manifest, dict):
+            problems.append(f"{prefix}/{SCORING_MANIFEST_NAME}: root must be an object")
+            continue
+        missing_keys = [
+            k for k in _SCORING_MANIFEST_REQUIRED_KEYS if not scoring_manifest.get(k)
+        ]
+        if missing_keys:
+            problems.append(
+                f"{prefix}/{SCORING_MANIFEST_NAME}: missing required key(s) "
+                f"{missing_keys}"
+            )
+            continue
+        if scoring_manifest["scoring_run_id"] != sid:
+            problems.append(
+                f"{prefix}/{SCORING_MANIFEST_NAME}: scoring_run_id "
+                f"{scoring_manifest['scoring_run_id']!r} != directory name {sid!r}"
+            )
+        if (
+            raw_entries_sha256 is not None
+            and scoring_manifest["raw_run_ledger_entries_sha256"] != raw_entries_sha256
+        ):
+            problems.append(
+                f"{prefix}: raw_run_ledger_entries_sha256 does not match this "
+                "run's sealed ledger — the pass scored a DIFFERENT seal"
+            )
+
+        n_windows = 0
+        scoring_cells = scoring_dir / "cells"
+        if scoring_cells.is_dir():
+            for cell_dir in sorted(
+                p for p in scoring_cells.iterdir() if not p.name.startswith(".")
+            ):
+                raw_cell = run_dir / "cells" / cell_dir.name
+                if not raw_cell.is_dir():
+                    problems.append(
+                        f"{prefix}/cells/{cell_dir.name}: no such cell in the "
+                        "raw tree — a scoring pass cannot invent cells (§6 mirror)"
+                    )
+                    continue
+                for window_dir in sorted(
+                    p for p in cell_dir.iterdir() if not p.name.startswith(".")
+                ):
+                    if not window_dir.is_dir() or not WINDOW_DIR_RE.match(window_dir.name):
+                        problems.append(
+                            f"{prefix}/cells/{cell_dir.name}/{window_dir.name}: "
+                            "expected a window_<dataset>-<ordinal> directory"
+                        )
+                        continue
+                    if not (raw_cell / window_dir.name).is_dir():
+                        problems.append(
+                            f"{prefix}/cells/{cell_dir.name}/{window_dir.name}: "
+                            "no such window in the raw tree (§6 mirror)"
+                        )
+                        continue
+                    missing = [
+                        name
+                        for name in REQUIRED_SCORING_WINDOW_ARTIFACTS
+                        if not (window_dir / name).is_file()
+                    ]
+                    if missing:
+                        problems.append(
+                            f"{prefix}/cells/{cell_dir.name}/{window_dir.name}: "
+                            f"missing scoring artifact(s) {missing} (§6)"
+                        )
+                        continue
+                    n_windows += 1
+
+        scoring_ledger = scoring_dir / "ledger.json"
+        if not scoring_ledger.is_file():
+            problems.append(
+                f"{prefix}: missing its own ledger.json — §6: scoring passes "
+                "get their own ledger before being used by stats"
+            )
+        else:
+            try:
+                mismatches = verify_ledger(scoring_ledger, scoring_dir)
+            except LedgerError as exc:
+                problems.append(f"{prefix}/ledger.json: {exc}")
+            else:
+                for line in mismatches:
+                    problems.append(f"{prefix}: ledger mismatch — {line}")
+
+        summary.append(
+            f"- `{sid}`: {n_windows} scored window(s), mode="
+            f"{scoring_manifest.get('mode', '?')}, sealed="
+            f"{'yes' if scoring_ledger.is_file() else 'NO'}"
+        )
+
+    if problems:
+        raise LayoutError(problems)
+    return summary
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -593,8 +777,17 @@ def organize_run(run_dir: Path, index_dir: Path | None = None) -> tuple[Path, Pa
         raise OrganizeError(f"run directory does not exist: {run_dir}")
     manifest = load_manifest(run_dir)
     records = walk_run_tree(run_dir, manifest)
+    scoring_summary = validate_scoring_tree(run_dir)
     index = build_index(manifest, records)
     report = build_coverage_report(manifest, index)
+    report += "\n".join(
+        [
+            "## Scoring passes (RESULTS_LAYOUT §6)",
+            "",
+            *(scoring_summary or ["none"]),
+            "",
+        ]
+    )
 
     out_dir = Path(index_dir) if index_dir is not None else run_dir / INDEX_DIRNAME
     out_dir.mkdir(parents=True, exist_ok=True)
