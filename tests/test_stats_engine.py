@@ -87,10 +87,22 @@ class TestFamilies:
         tiers = fm.drop_duplicates("contrast_id").set_index("contrast_id")["tier"]
         # chain primaries #4/#14 at full alpha; #13 carries its own holm/tost
         # decomposition (tested separately); floor suite spends no alpha
-        assert set(fm.loc[fm["contrast_id"].isin([4, 14]), "correction"]) == {"none"}
+        confirmatory = fm[fm["tier"] != "exploratory"]
+        assert set(
+            confirmatory.loc[confirmatory["contrast_id"].isin([4, 14]), "correction"]
+        ) == {"none"}
         assert set(fm.loc[fm["tier"] == "secondary", "correction"]) == {"holm"}
         assert set(fm.loc[fm["tier"] == "exploratory", "correction"]) == {"bh-fdr"}
         assert set(fm.loc[fm["tier"] == "falsification", "correction"]) == {"none"}
+        # 2026-08-07 amendment (ADR-0087): every generic per_query contrast leg
+        # carries one exploratory faithfulness row — BH-FDR, ungated, two-sided.
+        faith = fm[fm["metric"] == "faithfulness"]
+        assert not faith.empty
+        assert set(faith["tier"]) == {"exploratory"}
+        assert set(faith["correction"]) == {"bh-fdr"}
+        assert set(faith["sidedness"]) == {"two-sided"}
+        assert not faith["gatekept"].any()
+        assert faith["notes"].str.contains("demotion").all()
         assert tiers.loc[4] == "primary"
         # headline expands per dataset (co-primary SET, pooling prohibited)
         headline = fm[fm["contrast_id"] == 4]
@@ -113,7 +125,8 @@ class TestFamilies:
         fm = compile_family_map(DATASETS)
         locality = fm[fm["contrast_id"] == 11]
         assert set(locality["dataset"]) == {"cross-dataset"}
-        assert len(locality) == 2 * len(DEFAULT_METRICS)  # groups A,B x metrics
+        # groups A,B x (metric pair + the 2026-08-07 exploratory faithfulness row)
+        assert len(locality) == 2 * (len(DEFAULT_METRICS) + 1)
 
     def test_family_map_row_count(self) -> None:
         fm = compile_family_map(DATASETS)
@@ -126,7 +139,9 @@ class TestFamilies:
             elif c.metrics is not None:
                 per_cell = len(c.metrics)
             else:
-                per_cell = len(DEFAULT_METRICS)
+                # generic pair + the 2026-08-07 exploratory faithfulness row
+                # (per_query legs only — window-unit generics get no such row)
+                per_cell = len(DEFAULT_METRICS) + (1 if c.unit == "per_query" else 0)
             for slot, groups in legs:
                 n_ds = 1 if slot == "dataset" else len(DATASETS)
                 expected += len(groups) * per_cell * n_ds

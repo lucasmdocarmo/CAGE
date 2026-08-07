@@ -60,6 +60,14 @@ KNOWN_DATASETS: frozenset[str] = frozenset(
 SERVING_METRIC: str = "ttft"
 PREDICATE_METRIC: str = "predicate"
 DEFAULT_METRICS: tuple[str, ...] = (SERVING_METRIC, PREDICATE_METRIC)
+# 2026-08-07 owner decision (pre-freeze charter edit, ADR-0087): per-query
+# continuous faithfulness is DEMOTED from the confirmatory tier (the §9.6
+# power-sim honesty guard refused every additive-shift model on the real
+# tie-heavy paired diffs) and instead rides the EXPLORATORY tier: one
+# BH-FDR-corrected, ungated faithfulness row per generic per_query contrast
+# leg. Confirmatory quality claims ride the §8.5 predicate (which on Qasper
+# IS faithfulness binarized at the registered τ) and the window-level rows.
+EXPLORATORY_FAITHFULNESS_METRIC: str = "faithfulness"
 
 _CORRECTION_BY_TIER: dict[str, str] = {
     "primary": "none",
@@ -335,13 +343,15 @@ def compile_family_map(
         sidedness: str,
         sub_hypothesis: str,
         notes: str,
+        tier: str | None = None,
+        gatekept: bool | None = None,
     ) -> None:
         rows.append(
             {
                 "contrast_id": c.id,
                 "name": c.name,
-                "tier": c.tier,
-                "gatekept": c.gatekept,
+                "tier": c.tier if tier is None else tier,
+                "gatekept": c.gatekept if gatekept is None else gatekept,
                 "family": family,
                 "group": group,
                 "metric": metric,
@@ -405,5 +415,27 @@ def compile_family_map(
                             sidedness=c.sidedness,
                             sub_hypothesis="",
                             notes=notes,
+                        )
+                    if c.metrics is None and c.unit == "per_query":
+                        # 2026-08-07 amendment (ADR-0087): exploratory
+                        # per-query faithfulness row — BH-FDR, ungated,
+                        # two-sided. Labeled p-values only; the claim ladder
+                        # bars confirmatory sentences on this row.
+                        emit(
+                            c, family=family, group=group, dataset=dataset,
+                            comparison=comparison,
+                            metric=EXPLORATORY_FAITHFULNESS_METRIC,
+                            unit="per_query",
+                            correction=_CORRECTION_BY_TIER["exploratory"],
+                            sidedness="two-sided",
+                            sub_hypothesis="",
+                            notes=(
+                                "exploratory tier (2026-08-07 demotion "
+                                "decision): guard-refused for powered "
+                                "superiority; descriptive + labeled "
+                                "exploratory only. " + notes
+                            ).strip(),
+                            tier="exploratory",
+                            gatekept=False,
                         )
     return pd.DataFrame(rows)
