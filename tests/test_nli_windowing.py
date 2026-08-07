@@ -61,6 +61,9 @@ def _evaluator_with_fake_nli() -> tuple[QualityEvaluator, _FakeNLI]:
     ev = QualityEvaluator(
         use_nli=True, use_embeddings=False, use_bertscore=False,
         use_rouge=False, use_lettucedetect=False,
+        # NLI path under test: pinned since the 2026-08-05 default flip
+        # to 'alignscore' (DECISION.md).
+        claim_checker="nli",
     )
     fake = _FakeNLI()
     ev._nli_model = fake  # bypass lazy HF loading; property returns this directly
@@ -273,7 +276,10 @@ class _PairDistNLI:
 def _evaluator(fake=None, **kwargs) -> QualityEvaluator:
     ev = QualityEvaluator(
         use_nli=True, use_embeddings=False, use_bertscore=False,
-        use_rouge=False, use_lettucedetect=False, **kwargs,
+        use_rouge=False, use_lettucedetect=False,
+        # NLI path under test: pinned since the 2026-08-05 default flip
+        # to 'alignscore' (DECISION.md).
+        claim_checker="nli", **kwargs,
     )
     ev._nli_model = fake if fake is not None else _FakeNLI()
     return ev

@@ -39,9 +39,13 @@ PROVENANCE_KEYS = (
 
 
 def _evaluator(**overrides: Any) -> QualityEvaluator:
+    # claim_checker='nli' pinned: these tests exercise NLI-path provenance;
+    # since the 2026-08-05 default flip to 'alignscore' (DECISION.md) the
+    # NLI path must be selected explicitly.
     kwargs: Dict[str, Any] = dict(
         use_nli=False, use_embeddings=False, use_bertscore=False,
         use_rouge=False, use_lettucedetect=False, strict=True,
+        claim_checker="nli",
     )
     kwargs.update(overrides)
     return QualityEvaluator(**kwargs)

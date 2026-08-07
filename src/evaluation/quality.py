@@ -32,8 +32,11 @@ D8 additions (build pass 2026-08-04):
 - Real batching: ``batch_evaluate`` accumulates NLI pairs and BERTScore texts
   across rows into single batched model calls with identical per-row outputs.
 - Instrument B seams (D8 §8.5): MiniCheck/AlignScore claim checkers, lazily
-  loaded fail-closed, selected via CAGE_CLAIM_CHECKER (default 'nli' keeps the
-  DeBERTa-MNLI path unchanged before calibration).
+  loaded fail-closed, selected via CAGE_CLAIM_CHECKER (default 'alignscore'
+  since the 2026-08-05 owner decision -- see MyDocs/registration/
+  instrument_selection_2026-08-05/DECISION.md; in the project venv the
+  alignscore package can never install, so the default fails closed and
+  points to the out-of-process runner scripts/4_analysis/score_instrument_b.py).
 - 3-class NLI reporting (D8 §8.5 "contradiction and neutral reported
   separately"): env-gated via CAGE_NLI_THREE_CLASS; default OFF (current
   behavior byte-identical). When ON, per-row faithfulness_contradiction /
@@ -148,9 +151,14 @@ class SentenceClaimDecomposer:
 # calibration" with generic DeBERTa-MNLI demoted to legacy fallback. These
 # classes are the SEAMS: lazily loaded, fail-closed (InstrumentUnavailableError
 # when the package is absent -- never a silent skip), selected via the
-# CAGE_CLAIM_CHECKER env var whose DEFAULT ("nli") keeps the current
-# DeBERTa-MNLI path so scored behavior does not change before calibration.
-# Dependencies are NOT added here; the rigor builder pins them (handoff).
+# CAGE_CLAIM_CHECKER env var. DEFAULT = "alignscore" since 2026-08-05 (owner
+# decision, MyDocs/registration/instrument_selection_2026-08-05/DECISION.md;
+# charter stamp PUBLICATION.md §8.6(c)): AlignScore-large won the selection
+# calibration. Its 2023 stack can NEVER install into the project venv, so the
+# in-process default fails closed and every unavailability message points to
+# the sanctioned out-of-process runner scripts/4_analysis/score_instrument_b.py.
+# Dependencies are NOT added here; the isolated env is managed by
+# src/evaluation/instrument_b_runner.py.
 class MiniCheckClaimChecker:
     """MiniCheck claim checker (Instrument B candidate).
 
@@ -203,7 +211,7 @@ class MiniCheckClaimChecker:
 
 
 class AlignScoreClaimChecker:
-    """AlignScore claim checker (Instrument B candidate).
+    """AlignScore claim checker (Instrument B, SELECTED 2026-08-05).
 
     Citation: Zha, Yang, Li & Hu 2023, "AlignScore: Evaluating Factual
     Consistency with a Unified Alignment Function" (ACL 2023, arXiv:2305.16739).
@@ -247,14 +255,19 @@ class AlignScoreClaimChecker:
             if not self.ckpt_path:
                 raise InstrumentUnavailableError(
                     "claim_checker", self.instrument_id,
-                    "AlignScore checkpoint not configured (set CAGE_ALIGNSCORE_CKPT)",
+                    "AlignScore checkpoint not configured (set CAGE_ALIGNSCORE_CKPT); "
+                    "the sanctioned execution path is the out-of-process runner: "
+                    "scripts/4_analysis/score_instrument_b.py",
                 )
             try:
                 from alignscore import AlignScore
             except Exception as e:
                 raise InstrumentUnavailableError(
                     "claim_checker", self.instrument_id,
-                    f"alignscore package unavailable: {e}",
+                    f"alignscore package unavailable: {e}; it can never install "
+                    "into the project venv (2023 dependency stack) -- score via "
+                    "the out-of-process runner: "
+                    "scripts/4_analysis/score_instrument_b.py",
                 ) from e
             # evaluation_mode='nli_sp' is the paper's headline configuration
             # (Zha et al. 2023 §4: sentence-splitting + NLI-style aggregation).
@@ -276,8 +289,10 @@ class AlignScoreClaimChecker:
         return [float(s) for s in scores]
 
 
-# Valid CAGE_CLAIM_CHECKER values. 'nli' = the current DeBERTa-MNLI path (the
-# DEFAULT, so scored behavior is unchanged before D8 §8.6 calibration).
+# Valid CAGE_CLAIM_CHECKER values. DEFAULT = 'alignscore' (flipped 2026-08-05,
+# owner decision: MyDocs/registration/instrument_selection_2026-08-05/DECISION.md,
+# charter stamp PUBLICATION.md §8.6(c)); 'nli' (legacy DeBERTa-MNLI path) and
+# 'minicheck' (documented runner-up) remain selectable.
 _CLAIM_CHECKER_NAMES: Tuple[str, ...] = ("nli", "minicheck", "alignscore")
 
 
@@ -645,11 +660,21 @@ class QualityEvaluator:
             ).strip().lower() in {"1", "true", "yes"}
         self.nli_three_class = bool(nli_three_class)
         # D8 §8.5 Instrument B seam: which claim checker scores faithfulness.
-        # DEFAULT 'nli' = the current DeBERTa-MNLI path (scored behavior
-        # unchanged before calibration); 'minicheck'/'alignscore' route through
-        # the fail-closed checker classes. Invalid names raise (fail-closed).
+        # DEFAULT 'alignscore' -- flipped from 'nli' on 2026-08-05 by owner
+        # decision (MyDocs/registration/instrument_selection_2026-08-05/
+        # DECISION.md; charter stamp PUBLICATION.md §8.6(c)): AlignScore-large
+        # won the selection calibration (pooled AUC 0.8275 vs MiniCheck 0.7734).
+        # In the project venv the alignscore package can never install, so the
+        # default fails closed (unavailability recorded, message pointing to
+        # scripts/4_analysis/score_instrument_b.py -- the sanctioned
+        # out-of-process runner). 'nli' (legacy DeBERTa-MNLI) and 'minicheck'
+        # remain selectable; the DeBERTa continuous-faithfulness columns are a
+        # separate charter role and are untouched by this flip. Invalid names
+        # raise (fail-closed).
         checker_name = (
-            claim_checker or os.getenv("CAGE_CLAIM_CHECKER", "nli") or "nli"
+            claim_checker
+            or os.getenv("CAGE_CLAIM_CHECKER", "alignscore")
+            or "alignscore"
         ).strip().lower()
         if checker_name not in _CLAIM_CHECKER_NAMES:
             raise ValueError(
@@ -1300,7 +1325,9 @@ class QualityEvaluator:
         claim-checker id+version consulted; None on early-outs) and ``method``
         (e.g. 'nli_claim_max'; None when no score was produced). Claims come
         from the pluggable ``claim_decomposer`` (default: sentence split); the
-        checker is the CAGE_CLAIM_CHECKER selection (default: DeBERTa-MNLI).
+        checker is the CAGE_CLAIM_CHECKER selection (default: 'alignscore'
+        since 2026-08-05 -- see DECISION.md; in-process it fails closed and
+        points to scripts/4_analysis/score_instrument_b.py).
 
         D8 §8.5 3-class reporting: when ``nli_three_class`` is on (CAGE_NLI_
         THREE_CLASS) and the NLI path scored, the dict ALSO carries

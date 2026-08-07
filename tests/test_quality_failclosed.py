@@ -34,10 +34,15 @@ REFERENCE = "France"
 
 
 def _evaluator(**overrides: Any) -> QualityEvaluator:
-    """All instruments OFF unless a test switches one on."""
+    """All instruments OFF unless a test switches one on.
+
+    claim_checker='nli' is pinned: these tests exercise the DeBERTa-MNLI
+    NLI path, which since the 2026-08-05 default flip to 'alignscore'
+    (DECISION.md) must be selected explicitly.
+    """
     kwargs: dict[str, Any] = dict(
         use_nli=False, use_embeddings=False, use_bertscore=False,
-        use_rouge=False, use_lettucedetect=False,
+        use_rouge=False, use_lettucedetect=False, claim_checker="nli",
     )
     kwargs.update(overrides)
     return QualityEvaluator(**kwargs)

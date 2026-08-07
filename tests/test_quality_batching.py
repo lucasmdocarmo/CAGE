@@ -149,6 +149,9 @@ def _make_evaluator() -> QualityEvaluator:
     ev = QualityEvaluator(
         use_nli=True, use_embeddings=False, use_bertscore=True,
         use_rouge=True, use_lettucedetect=True, strict=True,
+        # NLI path under test: pinned since the 2026-08-05 default flip
+        # to 'alignscore' (DECISION.md).
+        claim_checker="nli",
     )
     ev._nli_model = _FakeNLI()
     ev._bertscore_model = _FakeBERTScorer()
@@ -317,6 +320,7 @@ def _make_nonstrict_exploding() -> QualityEvaluator:
     ev = QualityEvaluator(
         use_nli=True, use_embeddings=False, use_bertscore=False,
         use_rouge=False, use_lettucedetect=False, strict=False,
+        claim_checker="nli",  # NLI path under test (2026-08-05 default flip)
     )
     ev._nli_model = _ExplodingNLI()
     return ev
@@ -341,6 +345,7 @@ def test_strict_batched_call_failure_raises_typed() -> None:
     ev = QualityEvaluator(
         use_nli=True, use_embeddings=False, use_bertscore=False,
         use_rouge=False, use_lettucedetect=False, strict=True,
+        claim_checker="nli",  # NLI path under test (2026-08-05 default flip)
     )
     ev._nli_model = _ExplodingNLI()
     with pytest.raises(InstrumentUnavailableError):

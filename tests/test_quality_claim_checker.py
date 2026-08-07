@@ -1,15 +1,19 @@
 """D8 §8.5 Instrument B seams (MiniCheck / AlignScore) + claim-decomposer seam.
 
-The charter demotes generic DeBERTa-MNLI to "legacy fallback only" and
-pre-registers a TRUE-selected trained claim checker (MiniCheck vs AlignScore,
-decided at calibration). These tests prove the SEAMS: selection via
-CAGE_CLAIM_CHECKER whose DEFAULT ('nli') leaves the scored behavior untouched,
-lazy fail-closed loading (absent package / unpinned checkpoint raises
-InstrumentUnavailableError -- never a silent skip), and the ClaimDecomposer
-protocol whose default is the historical sentence splitter.
+The charter demotes generic DeBERTa-MNLI to "legacy fallback only"; the
+2026-08-05 selection calibration decided AlignScore-large (owner decision:
+MyDocs/registration/instrument_selection_2026-08-05/DECISION.md; charter
+stamp PUBLICATION.md §8.6(c)). These tests prove the SEAMS: selection via
+CAGE_CLAIM_CHECKER whose DEFAULT is now 'alignscore' (the flip), lazy
+fail-closed loading (absent package / unpinned checkpoint raises
+InstrumentUnavailableError whose message points to the sanctioned
+out-of-process runner scripts/4_analysis/score_instrument_b.py -- never a
+silent skip), 'nli' still selectable via env AND constructor, and the
+ClaimDecomposer protocol whose default is the historical sentence splitter.
 
-Packages are stubbed via sys.modules (no dependencies added here -- pins are
-the rigor builder's handoff).
+Packages are stubbed via sys.modules (no dependencies added here -- the
+alignscore stack can NEVER install into the project venv; the isolated env is
+managed by src/evaluation/instrument_b_runner.py).
 """
 from __future__ import annotations
 
@@ -101,14 +105,67 @@ def _block_import(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Default: scored behavior unchanged before calibration
+# Default: 'alignscore' since 2026-08-05 (DECISION.md; PUBLICATION.md §8.6(c))
 # --------------------------------------------------------------------------- #
-def test_default_checker_is_nli_path(monkeypatch: pytest.MonkeyPatch) -> None:
+RUNNER_POINTER = "scripts/4_analysis/score_instrument_b.py"
+
+
+def test_default_checker_is_alignscore(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CAGE_CLAIM_CHECKER", raising=False)
+    ev = _evaluator()
+    assert ev.claim_checker_name == "alignscore"
+    assert isinstance(ev._claim_checker, AlignScoreClaimChecker)
+
+
+def test_default_alignscore_unavailable_strict_points_to_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Project-venv reality: alignscore can NEVER install there. The default
+    checker must fail closed AND its message must point the operator to the
+    sanctioned out-of-process runner."""
+    monkeypatch.delenv("CAGE_CLAIM_CHECKER", raising=False)
+    monkeypatch.setenv("CAGE_ALIGNSCORE_CKPT", "/models/alignscore.ckpt")
+    _block_import(monkeypatch, "alignscore")
+    ev = _evaluator(strict=True)
+    with pytest.raises(InstrumentUnavailableError) as ei:
+        ev.evaluate_faithfulness(ANSWER, CONTEXT)
+    assert ei.value.instrument == "claim_checker"
+    assert RUNNER_POINTER in ei.value.cause
+
+
+def test_default_alignscore_unavailable_nonstrict_labels_and_sticks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-strict: unavailability recorded exactly as before the flip --
+    score=None + sticky 'claim_checker:unavailable:' row token."""
+    monkeypatch.delenv("CAGE_CLAIM_CHECKER", raising=False)
+    monkeypatch.setenv("CAGE_ALIGNSCORE_CKPT", "/models/alignscore.ckpt")
+    _block_import(monkeypatch, "alignscore")
+    ev = _evaluator(strict=False)
+    m = ev.evaluate(QUESTION, CONTEXT, ANSWER, REFERENCE)
+    assert m.faithfulness is None
+    assert "claim_checker:unavailable:" in m.instrument_status
+    m2 = ev.evaluate(QUESTION, CONTEXT, ANSWER, REFERENCE)
+    assert "claim_checker:unavailable:" in m2.instrument_status
+    assert "claim_checker" in ev._instrument_unavailable
+
+
+def test_nli_still_selectable_via_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CAGE_CLAIM_CHECKER", "nli")
     ev = _evaluator()
     assert ev.claim_checker_name == "nli"
     assert ev._claim_checker is None
     assert ev._faithfulness_instrument_id().startswith(f"{ev.nli_model_name}@transformers-")
+
+
+def test_nli_still_selectable_via_constructor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The constructor arg wins even with the env unset (default alignscore).
+    monkeypatch.delenv("CAGE_CLAIM_CHECKER", raising=False)
+    ev = _evaluator(claim_checker="nli")
+    assert ev.claim_checker_name == "nli"
+    assert ev._claim_checker is None
 
 
 def test_invalid_checker_name_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -186,6 +243,8 @@ def test_alignscore_requires_checkpoint_fail_closed(
     with pytest.raises(InstrumentUnavailableError) as ei:
         ev.evaluate_faithfulness(ANSWER, CONTEXT)
     assert "checkpoint" in ei.value.cause.lower() or "CKPT" in ei.value.cause
+    # Every alignscore unavailability message points to the sanctioned runner.
+    assert RUNNER_POINTER in ei.value.cause
 
 
 def test_alignscore_with_checkpoint_scores(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -210,6 +269,7 @@ def test_alignscore_absent_package_strict_raises(monkeypatch: pytest.MonkeyPatch
     with pytest.raises(InstrumentUnavailableError) as ei:
         ev.evaluate_faithfulness(ANSWER, CONTEXT)
     assert ei.value.instrument == "claim_checker"
+    assert RUNNER_POINTER in ei.value.cause
 
 
 # --------------------------------------------------------------------------- #
@@ -297,9 +357,10 @@ def test_custom_decomposer_drives_claim_construction(
     assert record["score_calls"] == [2]
 
 
-def test_custom_decomposer_with_default_nli_path() -> None:
+def test_custom_decomposer_with_nli_path() -> None:
+    # 'nli' must be pinned explicitly since the 2026-08-05 default flip.
     decomp = _WordDecomposer()
-    ev = _evaluator(claim_decomposer=decomp)
+    ev = _evaluator(claim_decomposer=decomp, claim_checker="nli")
 
     class _FakeNLI:
         tokenizer = None
