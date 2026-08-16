@@ -31,9 +31,11 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from dataclasses import replace as dc_replace
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -133,8 +135,14 @@ def _build_run_tree(
         "run_id": RUN_ID,
         "model": MODEL,
         "git_sha": "deadbeef",
+        "git_dirty": False,
         "engine": "vllm",
+        "engine_version": "0.0-test",
         "seed": 1,
+        "provider": "test",
+        "hardware": "test-gpu",
+        "dataset_manifests_sha256": "0" * 64,
+        "cellspec_schema_version": 1,
         "created_utc": "2026-08-02T14:00:00Z",
     }
     (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -817,6 +825,140 @@ def test_confirmatory_records_one_time_unblinding(
     assert rca.main([str(organized_run)]) == 0
     _, stats2 = _load_stats(organized_run)
     assert stats2["blinding"]["active"] is False
+
+
+# ---------------------------------------------------------------------------
+# H4 regression: NaN pressure-coordinate pairing + index schema guards
+# ---------------------------------------------------------------------------
+
+
+def _f2_pair_specs_unset_coords() -> list[CellSpec]:
+    """Contrast #15's F2 leg with UNSET pressure coords — legal per CellSpec
+    (budget_r/rate_frac are ``float | None``; only F1 forbids SETTING them)."""
+    return [
+        CellSpec.from_baseline("B11", model=MODEL, family="F2"),  # type: ignore[arg-type]
+        CellSpec.from_baseline("B6", model=MODEL, family="F2"),  # type: ignore[arg-type]
+    ]
+
+
+def test_window_pair_with_unset_coords_pairs(tmp_path: Path) -> None:
+    # H4 regression: these legal F2 cells index budget_r/rate_frac as NaN;
+    # groupby(dropna=False) tuple keys holding NaN never matched across the
+    # two group dicts (NaN != NaN), so the pair was silently skipped as
+    # "no legal pair". It MUST compute.
+    run_dir = _build_run_tree(tmp_path, extra_specs=_f2_pair_specs_unset_coords())
+    org.organize_run(run_dir)
+    index = pd.read_csv(run_dir / "index" / "cells_index.csv")
+    f2 = index[index["family"] == "F2"]
+    assert f2["budget_r"].isna().all() and f2["rate_frac"].isna().all()
+
+    rc = rca.main([str(run_dir), "--contrasts", "15"])
+    assert rc == 0
+    _, stats = _load_stats(run_dir)
+    entries = stats["contrasts"]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["contrast_id"] == 15
+    assert entry["unit"] == "window"
+    assert entry["family"] == "F2"
+    for row in entry["per_dataset"]:
+        assert row["n_windows_cell"] == WINDOWS_PER_DATASET
+        assert row["n_windows_reference"] == WINDOWS_PER_DATASET
+        # B11 saves TTFT vs B6 by construction (180 vs 235 offsets).
+        assert row["mean_diff"] < 0
+    # The paired F2 rows were CONSUMED, not dumped into the pressure skip.
+    assert stats["skipped"]["pressure_rows"] is None
+
+
+def _window_index_frame(
+    entries: list[tuple[str, float | None, float | None]]
+) -> pd.DataFrame:
+    """Minimal index frame for select_window_pairs: one row per dataset/cell."""
+    arm_retr = {"B11": ("retr-trunc", "rerank"), "B6": ("retr-fresh", "rerank")}
+    rows: list[dict[str, Any]] = []
+    for baseline, budget_r, rate_frac in entries:
+        arm, retriever = arm_retr[baseline]
+        spec = CellSpec(
+            arm=arm, retriever=retriever, policy="none", topology="single",  # type: ignore[arg-type]
+            engine="vllm", model=MODEL, family="F2",  # type: ignore[arg-type]
+            budget_r=budget_r, rate_frac=rate_frac,
+        )
+        for dataset in DATASETS:
+            rows.append(
+                {
+                    "family": "F2",
+                    "baseline": baseline,
+                    "engine": "vllm",
+                    "model": MODEL,
+                    "topology": "single",
+                    "policy": "none",
+                    "budget_r": np.nan if budget_r is None else budget_r,
+                    "rate_frac": np.nan if rate_frac is None else rate_frac,
+                    "row_key": spec.to_row_key(),
+                    "dataset": dataset,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def test_unset_coords_never_pair_with_set_coords() -> None:
+    # Absence is NOT a value: a B11 cell with no coords must never pair with
+    # a B6 cell at (0.5, 0.8) — only unset-vs-unset matches.
+    contrast = rca.CONTRAST_BY_ID[15]
+    mixed = _window_index_frame([("B11", None, None), ("B6", 0.5, 0.8)])
+    pairs, reasons = rca.select_window_pairs(mixed, contrast)
+    assert pairs == []
+    assert any("no legal pair" in r for r in reasons)
+
+    both_unset = _window_index_frame([("B11", None, None), ("B6", None, None)])
+    pairs, _ = rca.select_window_pairs(both_unset, contrast)
+    assert len(pairs) == 1
+    assert pairs[0].datasets == tuple(sorted(DATASETS))
+
+
+def test_equivalence_tost_pairs_with_unset_coords(tmp_path: Path) -> None:
+    # The same NaN-key hazard at the §9.5 equivalence matcher: a
+    # policy-vs-none F2 pair with UNSET pressure coords must still pair.
+    specs = [
+        (dc_replace(spec, budget_r=None, rate_frac=None), extra)
+        for spec, extra in _tost_pair_specs()
+    ]
+    run_dir = _build_run_tree(tmp_path, special_specs=specs)
+    org.organize_run(run_dir)
+    rc = rca.main(
+        [
+            str(run_dir),
+            "--tost-margin", "0.05",
+            "--equivalence-metric", "grounding_score",
+        ]
+    )
+    assert rc == 0
+    _, stats = _load_stats(run_dir)
+    results = stats["equivalence"]["results"]
+    assert {r["dataset"] for r in results} == set(DATASETS)
+    for r in results:
+        assert r["policy"] == "recompute"
+        assert r["equivalent"] is True
+
+
+@pytest.mark.parametrize(
+    "column", ["budget_r", "rate_frac", "cell_json", "artifacts"]
+)
+def test_index_missing_required_column_refuses(
+    organized_run: Path, column: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The four columns added to _INDEX_REQUIRED_COLUMNS (task #128): the
+    # matchers group on budget_r/rate_frac; cell_json/artifacts complete the
+    # 20-column INDEX_COLUMNS contract. A truncated index refuses, named.
+    index_path = organized_run / "index" / "cells_index.csv"
+    index = pd.read_csv(index_path)
+    index.drop(columns=[column]).to_csv(index_path, index=False)
+    rc = rca.main([str(organized_run)])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "missing required columns" in err
+    assert column in err
+    assert not (organized_run / "analysis").exists()
 
 
 # ---------------------------------------------------------------------------

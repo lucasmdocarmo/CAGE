@@ -24,6 +24,7 @@ from src.orchestration.load_generator import (
     OpenLoopDispatcher,
     RequestRecord,
     build_rate_grid_schedules,
+    ensure_no_measured_replay,
     generate_arrival_schedule,
     trim_to_measurement_window,
 )
@@ -561,6 +562,46 @@ def test_trim_zero_warmup_keeps_all():
     records = _records_at([0.5, 1.5])
     kept = trim_to_measurement_window(records, warmup_s=0.0)
     assert len(kept) == 2
+
+
+# --------------------------------------------------------------------------- #
+# E4 replay pin (code-assertion walkthrough 2026-08-12): measured windows
+# never replay a request unless explicitly labeled
+# --------------------------------------------------------------------------- #
+
+
+def test_replay_guard_passes_when_schedule_fits_unique_set():
+    sched = generate_arrival_schedule(10.0, seed=1, n_requests=5)
+    assert ensure_no_measured_replay(sched, 5) is False
+    assert ensure_no_measured_replay(sched, 8) is False
+
+
+def test_replay_guard_refuses_wrap_by_default_with_typed_error():
+    sched = generate_arrival_schedule(10.0, seed=1, n_requests=6)
+    with pytest.raises(LoadGeneratorError) as exc:
+        ensure_no_measured_replay(sched, 5)
+    # The refusal must name the operator escape hatch and the registered
+    # reasons (pairing + warm-cache locality shift).
+    msg = str(exc.value)
+    assert "CAGE_ALLOW_REPLAY" in msg
+    assert "example_id" in msg or "pairing" in msg
+
+
+def test_replay_guard_allows_wrap_only_when_explicitly_labeled():
+    sched = generate_arrival_schedule(10.0, seed=1, n_requests=6)
+    assert ensure_no_measured_replay(sched, 5, allow_replay=True) is True
+
+
+@pytest.mark.parametrize("bad_n", [0, -3, 1.5, True])
+def test_replay_guard_invalid_unique_count_raises(bad_n):
+    sched = generate_arrival_schedule(10.0, seed=1, n_requests=2)
+    with pytest.raises(LoadGeneratorError):
+        ensure_no_measured_replay(sched, bad_n)
+
+
+def test_replay_guard_rejects_non_schedule():
+    with pytest.raises(LoadGeneratorError):
+        ensure_no_measured_replay("not-a-schedule", 5)
 
 
 @pytest.mark.parametrize(

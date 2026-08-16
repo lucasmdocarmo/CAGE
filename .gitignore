@@ -17,16 +17,20 @@ __pycache__/
 *.so
 
 # Distribution / packaging
+# NOTE: anchored to the repo root (leading slash). An unanchored pattern matches
+# at EVERY depth -- the bare `lib/` used to hide scripts/lib/_common.sh, which 30
+# scripts source and `git archive HEAD` ships to every GPU VM
+# (code assertion 2026-08-07, finding A1).
 .Python
-build/
+/build/
 develop-eggs/
-dist/
-downloads/
+/dist/
+/downloads/
 eggs/
 .eggs/
-lib/
-lib64/
-parts/
+/lib/
+/lib64/
+/parts/
 sdist/
 var/
 wheels/

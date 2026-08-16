@@ -154,6 +154,21 @@ def _build_run_tree(tmp_path: Path, manifest_extra: dict[str, Any] | None = None
     return run_dir
 
 
+def _reseal(run_dir: Path) -> None:
+    """Re-seal the raw tree after a fixture mutates it (§5: EVERY file under
+    cells/ plus manifest.json; scoring/ and index/ carry their own artifacts)."""
+    (run_dir / "ledger.json").unlink()
+    sealed = [
+        p
+        for p in sorted(run_dir.rglob("*"))
+        if p.is_file()
+        and p.name != "ledger.json"
+        and "index" not in p.parts
+        and "scoring" not in p.parts
+    ]
+    write_ledger(hash_artifacts(sealed, base_dir=run_dir), run_dir / "ledger.json")
+
+
 @pytest.fixture()
 def run_tree(tmp_path: Path) -> Path:
     return _build_run_tree(tmp_path)
@@ -355,13 +370,15 @@ def test_missing_required_window_artifact_raises(run_tree: Path) -> None:
 
 
 def test_sharegpt_load_donor_needs_no_qa_evidence(run_tree: Path) -> None:
-    # §1: ShareGPT windows carry serving streams only.
+    # §1: ShareGPT windows carry serving streams only. The window is added
+    # BEFORE sealing (re-seal) — post-seal additions are now EXTRA (H7).
     spec = _specs()[0]
     _write_window(
         run_tree / "cells" / spec.to_row_key() / "window_sharegpt-01",
         "sharegpt",
         skip={"qa_evidence.jsonl"},
     )
+    _reseal(run_tree)
     csv_path, _ = org.organize_run(run_tree)
     df = pd.read_csv(csv_path)
     assert "sharegpt-01" in set(df["window_key"])
@@ -549,7 +566,9 @@ def test_scoring_tree_roundtrip_written_then_validated(run_tree: Path) -> None:
         assert (sdir / w / "quality.json").is_file()
         agg = json.loads((sdir / w / "quality.json").read_text(encoding="utf-8"))
         assert agg["rows"] == 2
-        assert agg["means"]["f1_score"] == 1.0
+        # Task #127 quality.json schema: per-metric mean WITH denominators.
+        assert agg["metrics"]["f1_score"]["mean"] == 1.0
+        assert agg["metrics"]["f1_score"]["n"] == 2
     assert not list(run_tree.glob("cells/**/qa_scores.jsonl"))
     assert not list(run_tree.glob("cells/**/results_rescored.csv"))
 
@@ -620,6 +639,169 @@ def test_validator_accepts_valid_manual_pass(run_tree: Path) -> None:
     _manual_scoring_pass(run_tree)
     _, md_path = org.organize_run(run_tree)
     assert "`s02-manual`" in md_path.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Task #129 (H7/H8/H12) — manifest enforcement, provenance, collision guard,
+# atomic index writes, --force, contamination/EXTRA sweeps
+# ---------------------------------------------------------------------------
+
+
+def _edit_manifest(run_dir: Path, **changes: Any) -> None:
+    """Apply field edits to manifest.json (value=None sentinel deletes the key).
+
+    The fixtures do not seal manifest.json, so editing it post-build does not
+    disturb the §5 ledger.
+    """
+    path = run_dir / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    for key, value in changes.items():
+        if value is _DELETE:
+            manifest.pop(key, None)
+        else:
+            manifest[key] = value
+    path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+
+_DELETE = object()
+
+
+def test_manifest_missing_required_provenance_fields_fail_loud(run_tree: Path) -> None:
+    # §3 (task #129/H8): git_sha/seed/... are REQUIRED; every gap listed at once.
+    _edit_manifest(
+        run_tree,
+        git_sha=_DELETE,
+        seed=_DELETE,
+        dataset_manifests_sha256=_DELETE,
+    )
+    with pytest.raises(org.LayoutError) as excinfo:
+        org.organize_run(run_tree)
+    message = str(excinfo.value)
+    assert "git_sha" in message
+    assert "seed" in message
+    assert "dataset_manifests_sha256" in message
+
+
+def test_manifest_mistyped_provenance_fields_fail_loud(run_tree: Path) -> None:
+    _edit_manifest(
+        run_tree,
+        git_dirty="no",  # must be a boolean, not a string
+        seed="1",  # must be an integer
+        dataset_manifests_sha256="not-a-sha",
+    )
+    with pytest.raises(org.LayoutError) as excinfo:
+        org.organize_run(run_tree)
+    message = str(excinfo.value)
+    assert "git_dirty" in message and "boolean" in message
+    assert "'seed' must be an integer" in message
+    assert "dataset_manifests_sha256" in message
+
+
+def test_provenance_json_and_report_surface_git_sha_and_seed(run_tree: Path) -> None:
+    csv_path, md_path = org.organize_run(run_tree)
+    prov_path = csv_path.parent / org.PROVENANCE_JSON_NAME
+    assert prov_path.is_file()
+    prov = json.loads(prov_path.read_text(encoding="utf-8"))
+    assert set(prov) == set(org.MANIFEST_REQUIRED_FIELDS)
+    assert prov["git_sha"] == "deadbeef"
+    assert prov["seed"] == 1
+    assert prov["run_id"] == RUN_ID
+    report = md_path.read_text(encoding="utf-8")
+    assert "git_sha: `deadbeef`" in report
+    assert "- seed: 1" in report
+    # INDEX_COLUMNS is a 20-column cross-module contract — provenance must NOT
+    # have leaked into the index schema.
+    df = pd.read_csv(csv_path)
+    assert list(df.columns) == list(org.INDEX_COLUMNS)
+
+
+def test_window_ordinal_collision_guard(run_tree: Path) -> None:
+    # window_squad_v2-1 vs window_squad_v2-01: same (dataset, ordinal) identity.
+    spec = _specs()[0]
+    _write_window(
+        run_tree / "cells" / spec.to_row_key() / "window_squad_v2-1", "squad_v2"
+    )
+    with pytest.raises(org.LayoutError, match="collides"):
+        org.organize_run(run_tree)
+
+
+def test_refuses_overwrite_without_force(run_tree: Path) -> None:
+    org.organize_run(run_tree)
+    with pytest.raises(org.OrganizeError, match="--force"):
+        org.organize_run(run_tree)
+    # Deliberate re-index with force succeeds (and via the CLI flag too).
+    csv_path, _ = org.organize_run(run_tree, force=True)
+    assert csv_path.is_file()
+    assert org.main([str(run_tree), "--force"]) == 0
+
+
+def test_index_writes_are_atomic_and_leave_no_tmp(
+    run_tree: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    replaced: list[tuple[str, str]] = []
+    real_replace = org.os.replace
+
+    def _recording_replace(src: Any, dst: Any) -> None:
+        replaced.append((str(src), str(dst)))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(org.os, "replace", _recording_replace)
+    csv_path, md_path = org.organize_run(run_tree)
+    finals = {dst for _src, dst in replaced}
+    assert {str(csv_path), str(md_path)} <= finals  # written via tmp+os.replace
+    assert str(csv_path.parent / org.PROVENANCE_JSON_NAME) in finals
+    assert not list(csv_path.parent.glob("*.tmp"))
+
+
+def test_crashed_index_write_leaves_no_partial_artifact(
+    run_tree: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _boom(src: Any, dst: Any) -> None:
+        raise OSError("simulated crash mid-publish")
+
+    monkeypatch.setattr(org.os, "replace", _boom)
+    with pytest.raises(OSError, match="simulated crash"):
+        org.organize_run(run_tree)
+    index_dir = run_tree / "index"
+    assert not (index_dir / org.INDEX_CSV_NAME).exists()  # no truncated index
+    assert not list(index_dir.glob("*.tmp"))  # tmp cleaned up on failure
+
+
+def test_symlinked_contamination_is_caught(run_tree: Path) -> None:
+    # H7: the old rglob sweep did not traverse directory symlinks — a scoring
+    # artifact smuggled into cells/ through one passed undetected.
+    stray = run_tree / "stray_scoring"
+    stray.mkdir()
+    (stray / "qa_scores.jsonl").write_text("{}\n", encoding="utf-8")
+    window = (
+        run_tree / "cells" / _specs()[0].to_row_key() / "window_squad_v2-01"
+    )
+    (window / "nested").symlink_to(stray, target_is_directory=True)
+    with pytest.raises(org.LayoutError, match="NEVER writes into cells/") as excinfo:
+        org.organize_run(run_tree)
+    assert "nested/qa_scores.jsonl" in str(excinfo.value)
+
+
+def test_extra_unsealed_file_in_cells_fails_seal_verification(run_tree: Path) -> None:
+    # H7: a file added to cells/ AFTER sealing must not verify clean.
+    sneaky = (
+        run_tree
+        / "cells"
+        / _specs()[0].to_row_key()
+        / "window_squad_v2-01"
+        / "sneaky_extra.jsonl"
+    )
+    sneaky.write_text('{"example_id": "ghost"}\n', encoding="utf-8")
+    with pytest.raises(org.LayoutError, match="EXTRA") as excinfo:
+        org.organize_run(run_tree)
+    assert "sneaky_extra.jsonl" in str(excinfo.value)
+
+
+def test_coverage_report_records_ledger_verification(run_tree: Path) -> None:
+    _, md_path = org.organize_run(run_tree)
+    report = md_path.read_text(encoding="utf-8")
+    assert "## Ledger (RESULTS_LAYOUT §5)" in report
+    assert "ledger: verified (" in report
 
 
 # ---------------------------------------------------------------------------

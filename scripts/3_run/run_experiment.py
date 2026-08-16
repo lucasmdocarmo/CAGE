@@ -37,6 +37,7 @@ from src.orchestration.load_generator import (
     LoadGeneratorError,
     OpenLoopDispatcher,
     RequestRecord,
+    ensure_no_measured_replay,
     generate_arrival_schedule,
     trim_to_measurement_window,
 )
@@ -961,6 +962,97 @@ def merge_open_loop_row(row: Dict[str, Any], record: RequestRecord) -> Dict[str,
     return row
 
 
+def _json_default(obj: Any) -> Any:
+    """qa_evidence.jsonl JSON fallback (task #127, audit H3 'default=str drift').
+
+    numpy scalars/arrays become native JSON numbers/lists -- never quoted
+    strings a downstream parser would read as text. Everything else falls back
+    to ``str`` exactly as the historical ``default=str`` did.
+    """
+    import numpy as np
+
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return str(obj)
+
+
+def evidence_integrity_fields(
+    *,
+    error: Optional[str],
+    generated_text: Optional[str],
+    open_loop_record: Optional[RequestRecord] = None,
+) -> Dict[str, Any]:
+    """Evidence-chain integrity stamp for every qa_evidence.jsonl row (task #127,
+    audit H2/H3): the offline scorer must be able to apply the SAME validity
+    predicate the loaders share (NOT error AND NOT empty_generation), instead of
+    re-scoring a serving error's empty answer as a hard zero.
+
+    ``error``/``empty_generation`` mirror the results-row semantics verbatim;
+    ``ok`` is the shared validity predicate. ``record_index``/``arrival_s``
+    (INTENDED arrival, D6 §6.3) disambiguate open-loop replayed example_ids
+    (the schedule index maps modulo over prepared requests); both None on
+    closed-loop rows -- absence of a schedule is not index 0.
+    """
+    empty_generation = (not error) and not (generated_text or "").strip()
+    return {
+        "ok": (not error) and not empty_generation,
+        "error": error or None,
+        "empty_generation": empty_generation,
+        "record_index": open_loop_record.index if open_loop_record is not None else None,
+        "arrival_s": (
+            open_loop_record.scheduled_offset_s if open_loop_record is not None else None
+        ),
+    }
+
+
+def count_evidence_failure(failures: Dict[str, Any], exc: BaseException) -> None:
+    """Count one lost qa_evidence.jsonl row (charter §9.10: every exclusion must
+    be countable from artifacts). Prints once per trial -- the first failure --
+    not per row; run_experiment persists the counter into metrics.json."""
+    failures["count"] += 1
+    if failures["first_error"] is None:
+        failures["first_error"] = f"{type(exc).__name__}: {exc}"
+        print(
+            "[evidence] qa_evidence.jsonl append FAILED (printed once per trial; "
+            "count persisted to metrics.json as evidence_write_failures): "
+            f"{failures['first_error']}"
+        )
+
+
+def append_evidence_row(path: str, row: Dict[str, Any], failures: Dict[str, Any]) -> bool:
+    """Append one evidence row; never raises (per-query guard -- a single failed
+    append must not kill the run mid-flight) but every loss is counted LOUDLY
+    via ``count_evidence_failure``. Returns True iff the row was written."""
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        line = json.dumps(row, default=_json_default)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+        return True
+    except Exception as exc:
+        count_evidence_failure(failures, exc)
+        return False
+
+
+def write_json_atomic(path: Any, payload: Any) -> None:
+    """Write JSON via tmp + os.replace (task #127, audit H10).
+
+    metrics.json is the completeness sentinel resume gates key on (a cell with
+    trial_*/metrics.json is skipped as complete), so a crash mid-write must
+    never leave a truncated file that freezes a corrupt cell as complete."""
+    path = os.fspath(path)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
 def dispatch_open_loop(
     engine: Any,
     requests: List[InferenceRequest],
@@ -1024,6 +1116,22 @@ def dispatch_open_loop(
         n_requests=n_arrivals,
         distribution=distribution,  # type: ignore[arg-type]
     )
+    # E4 replay pin (walkthrough 2026-08-12): measured windows never replay a
+    # request (duplicate example_ids break per-example pairing; a replayed
+    # request hits warm prefix cache) — fail-closed unless the operator labels
+    # the run with CAGE_ALLOW_REPLAY=1 (non-confirmatory).
+    replay = ensure_no_measured_replay(
+        schedule,
+        len(requests),
+        allow_replay=os.environ.get("CAGE_ALLOW_REPLAY") == "1",
+    )
+    if replay:
+        print(
+            f"[open-loop] WARNING: CAGE_ALLOW_REPLAY=1 — schedule of "
+            f"{schedule.n_arrivals} arrivals REPLAYS the {len(requests)} unique "
+            f"request(s); this run is NON-confirmatory (replay shifts the "
+            f"cache-locality profile and duplicates example_ids)"
+        )
     dispatcher = OpenLoopDispatcher(max_in_flight=max_in_flight, cap_policy="delay")
 
     async def _send(i: int, on_first_token: Any) -> Any:
@@ -1712,6 +1820,18 @@ def run_experiment(
     sent_requests = 0
     measured_processed = 0
 
+    # CONSORT accounting (task #127, audit H3/H11; charter §9.10: exclusions must
+    # be countable from artifacts, not stdout). Persisted into metrics.json.
+    # evidence_failures: qa_evidence.jsonl rows lost to append failures (a row in
+    # results.csv but absent from the evidence chain). consort_counters: measured
+    # queries dropped by the per-query guards (prepare / record / whole-turn).
+    evidence_failures: Dict[str, Any] = {"count": 0, "first_error": None}
+    consort_counters: Dict[str, int] = {
+        "n_dropped_prepare": 0,
+        "n_dropped_record": 0,
+        "n_dropped_turn": 0,
+    }
+
     def maybe_reshuffle_router(idx: int) -> None:
         if (
             baseline_config.baseline_type.value == "distributed"
@@ -2163,8 +2283,9 @@ def run_experiment(
         # for the staleness arm, WHICH served text was stale. The served context text and the
         # LettuceDetect spans are otherwise computed then dropped (never in results.csv). Lands
         # under output_dir (the per-trial dir) so it is already covered by the GCS sync.
+        # A failed append never kills the run (per-query guard) but is COUNTED into
+        # metrics.json via evidence_failures (task #127; charter §9.10).
         try:
-            os.makedirs(output_dir, exist_ok=True)
             _evidence = {
                 "example_id": example.id,
                 "baseline": experiment_label,
@@ -2193,6 +2314,15 @@ def run_experiment(
                 "grounded": result.get("grounded"),
                 "hallucinated_spans": getattr(quality_metrics, "hallucinated_spans", None),
                 "retrieved_doc_ids": meta.get("retrieved_doc_ids") or [],
+                # Task #127 (audit H2/H3): ok / error / empty_generation (the same
+                # validity semantics as the results row, so offline scoring can null
+                # error rows instead of scoring empty answers as hard zeros) plus
+                # record_index / arrival_s replay disambiguators (None closed-loop).
+                **evidence_integrity_fields(
+                    error=response.error,
+                    generated_text=response.generated_text,
+                    open_loop_record=open_loop_record,
+                ),
             }
             # Stage-tagged retrieval provenance (non-dense --retriever paths
             # only, so existing dense evidence rows keep their exact schema):
@@ -2201,10 +2331,14 @@ def run_experiment(
             if meta.get("retrieval_stages") is not None:
                 _evidence["retriever"] = meta.get("retriever")
                 _evidence["retrieval_stages"] = meta.get("retrieval_stages")
-            with open(os.path.join(output_dir, "qa_evidence.jsonl"), "a", encoding="utf-8") as _ef:
-                _ef.write(json.dumps(_evidence, default=str) + "\n")
         except Exception as _ev_exc:
-            print(f"[evidence] could not append qa_evidence.jsonl: {_ev_exc}")
+            # Row construction failed: the loss is identical to a write failure
+            # from the evidence chain's point of view -- count it the same way.
+            count_evidence_failure(evidence_failures, _ev_exc)
+        else:
+            append_evidence_row(
+                os.path.join(output_dir, "qa_evidence.jsonl"), _evidence, evidence_failures
+            )
 
     def execute_work_units(
         units: List[List[CAGExample]],
@@ -2268,6 +2402,10 @@ def run_experiment(
                             print(f"[warmup] Request {example.id} failed: {response.error}")
                         history.append((meta["question"], response.generated_text or ""))
                     except Exception as _ex:
+                        # One guard covers the whole turn (prepare+send+record), so the
+                        # drop is counted as a turn, not attributed to a stage (§9.10).
+                        if collect_results:
+                            consort_counters["n_dropped_turn"] += 1
                         print(f"[{stage_name}] {example.id} failed: {_ex}; skipping this turn")
                     sent_requests += 1
                     stage_processed += 1
@@ -2305,6 +2443,8 @@ def run_experiment(
                             # Plain attribute consumed by VLLMAdapter -> /v1/chat/completions.
                             request.messages = messages
                     except Exception as _ex:
+                        if collect_results:
+                            consort_counters["n_dropped_prepare"] += 1
                         print(f"[{stage_name}] prepare failed for {example.id}: {_ex}; skipping")
                         continue
                     metas.append(meta)
@@ -2341,6 +2481,8 @@ def run_experiment(
                         elif response.error:
                             print(f"[warmup] Request {example.id} failed: {response.error}")
                     except Exception as _ex:
+                        if collect_results:
+                            consort_counters["n_dropped_record"] += 1
                         print(f"[{stage_name}] record failed for {example.id}: {_ex}; skipping row")
                     sent_requests += 1
                     stage_processed += 1
@@ -2391,6 +2533,7 @@ def run_experiment(
             try:
                 meta, request = build_open_loop_request(example)
             except Exception as _ex:
+                consort_counters["n_dropped_prepare"] += 1  # measured stage by definition
                 print(f"[open-loop] prepare failed for {example.id}: {_ex}; skipping")
                 continue
             prepared.append((example, meta, request))
@@ -2432,6 +2575,7 @@ def run_experiment(
                         open_loop_record=record,
                     )
                 except Exception as _ex:
+                    consort_counters["n_dropped_record"] += 1
                     print(f"[open-loop] record failed for {example.id}: {_ex}; skipping row")
             else:
                 # Dropped-by-cap / dispatch-error arrivals are DATA (they count
@@ -2982,13 +3126,20 @@ def run_experiment(
             "included_in_metrics": False,
         },
         "repeat_passes": repeat_summary,
+        # CONSORT accounting (task #127; charter §9.10): measured queries dropped
+        # by the per-query guards and evidence rows lost to append failures --
+        # countable from this artifact, never stdout-only.
+        "consort": {
+            **consort_counters,
+            "evidence_write_failures": evidence_failures["count"],
+            "evidence_write_first_error": evidence_failures["first_error"],
+        },
     }
-    
-    with open(metrics_file, "w") as f:
-        json.dump(experiment_summary, f, indent=2)
 
-    with open(stable_metrics_file, "w") as f:
-        json.dump(experiment_summary, f, indent=2)
+    # Atomic writes (task #127, audit H10): metrics.json is the completeness
+    # sentinel the resume gates key on -- it must exist fully-formed or not at all.
+    write_json_atomic(metrics_file, experiment_summary)
+    write_json_atomic(stable_metrics_file, experiment_summary)
     
     print(f"Metrics saved to: {metrics_file}")
     print("=" * 70)
@@ -3616,11 +3767,21 @@ def main():
                 vllm_telemetry=args.vllm_telemetry,
             )
             
-            # Load trial results
+            # Load trial results. A metrics.json that EXISTS but does not parse is
+            # an INCOMPLETE trial (task #127, audit H10: existence is not validity)
+            # -- excluded from aggregation, loudly, so the cell reads as needing a
+            # re-run rather than freezing corrupt data as complete.
             metrics_file = os.path.join(trial_output_dir, "metrics.json")
             if os.path.exists(metrics_file):
-                with open(metrics_file) as f:
-                    trial_results.append(json.load(f))
+                try:
+                    with open(metrics_file) as f:
+                        trial_results.append(json.load(f))
+                except (json.JSONDecodeError, OSError) as _mx:
+                    print(
+                        f"[trials] {metrics_file} is corrupt/truncated ({_mx}); "
+                        f"treating trial {trial} as INCOMPLETE and excluding it "
+                        "from aggregation -- re-run this cell"
+                    )
         
         # Aggregate results across trials
         if trial_results:

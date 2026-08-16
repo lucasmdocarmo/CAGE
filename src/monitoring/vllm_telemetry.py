@@ -202,6 +202,16 @@ class VllmTelemetrySampler:
         written next to vllm_telemetry.json by run_experiment as
         telemetry_series.jsonl. Returns None (writes nothing) when no samples exist,
         so an empty run never leaves a misleading empty artifact.
+
+        Each record ALSO carries the canonical §6.1 regime-input field names —
+        ``ts_s`` and ``kv_cache_usage``, the ``src.analysis.regime_inputs``
+        defaults — alongside the legacy ``ts``/``kv_usage`` spellings (Topic-8
+        H1: the writer/reader schema mismatch left the regime bridge with no
+        producer). Legacy names are kept for existing readers of
+        telemetry_series.jsonl (run_memory_sweep.sh's offline readout; possibly
+        the cage-stats sibling repo). Absence stays absence: ``kv_cache_usage``
+        mirrors ``kv_usage`` only when the snapshot carried the gauge at all —
+        a missing gauge is never coerced into a value.
         """
         pairs = [(ts, s) for ts, s in zip(self._sample_ts, self._samples)
                  if isinstance(s, dict)]
@@ -211,6 +221,9 @@ class VllmTelemetrySampler:
             for ts, snap in pairs:
                 rec = {"ts": round(ts, 3)}
                 rec.update(snap)
+                rec.setdefault("ts_s", rec["ts"])
+                if "kv_usage" in rec:
+                    rec.setdefault("kv_cache_usage", rec["kv_usage"])
                 fh.write(json.dumps(rec, default=str) + "\n")
         return path
 

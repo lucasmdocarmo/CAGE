@@ -1,5 +1,7 @@
 # CAGE Framework Dependencies
-# Python 3.12 required
+# Python 3.13 required (canonical: CAGE_CANONICAL_PYTHON in scripts/lib/_common.sh;
+# Tier-1 exact pins below were frozen and tested on CPython 3.13.7, 2026-08-04 —
+# any other interpreter makes them an untested claim; finding B1 2026-08-07)
 #
 # ============================== PINNING POLICY ===============================
 # (CAGE_TECHNICAL_REVIEW_2026-08-04.md §5 S1/S17/S18; PUBLICATION.md D9 §9.13:

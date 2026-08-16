@@ -20,6 +20,14 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_DIR"
 # shellcheck source=scripts/lib/_common.sh
 source "$PROJECT_DIR/scripts/lib/_common.sh"
+# Serving-uniformity source of truth (Option A). Sourcing it HERE — not only in
+# the run drivers — makes the uniform regime structural: a manual restart from a
+# bare shell now serves the same config instead of relying on this file's
+# mirrored fallbacks staying in sync (the drift hazard noted at the
+# --max-model-len block below). D1 fix, 2026-08-12: all three engine launchers
+# (vllm/sglang/lmdeploy) source it, pinned by test_scripts_doctrine.py.
+# shellcheck source=scripts/lib/_serving_config.sh
+source "$PROJECT_DIR/scripts/lib/_serving_config.sh"
 
 PORT="${VLLM_PORT:-8000}"
 LOG_DIR="$PROJECT_DIR/logs/vllm"
@@ -102,7 +110,10 @@ start_server() {
     if [ -n "$pid" ]; then
         local loaded_model prefix_cache_mode
         loaded_model=$(get_loaded_model)
-        prefix_cache_mode=$(get_server_prefix_cache_mode)
+        # `|| prefix_cache_mode=unknown`: the probe returns non-zero when the
+        # pid vanished between checks; a bare assignment would abort the whole
+        # script under set -e instead of falling through to the restart path.
+        prefix_cache_mode=$(get_server_prefix_cache_mode) || prefix_cache_mode="unknown"
         local has_prefix_cache="$prefix_cache_mode"
         if [ "$prefix_cache_mode" = "enabled" ]; then
             has_prefix_cache=true
@@ -110,11 +121,24 @@ start_server() {
             has_prefix_cache=false
         fi
 
+        # Dial parity on reuse (adversarial review 2026-08-12): the memory
+        # budget is THE swept axis (_serving_config.sh), so a pressure-sweep
+        # iteration invoked via `start` must never reuse the previous F's
+        # server while the driver labels data with the new F. This launcher
+        # always passes both dials explicitly, so string-compare the live
+        # cmdline; any mismatch (incl. a manually-started server) restarts.
+        local live_cmd dials_match
+        live_cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
+        dials_match=true
+        [[ "$live_cmd" == *"--max-model-len ${VLLM_MAX_MODEL_LEN:-4096}"* ]] || dials_match=false
+        [[ "$live_cmd" == *"--gpu-memory-utilization ${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"* ]] || dials_match=false
+
         # Reuse the running server ONLY when no serving lever is requested. The running
         # check cannot read back the live --speculative-config / --kv-cache-dtype, so if
         # either is set we force a restart rather than risk reusing a server with different
         # levers and mislabeling the arm's serving data.
         if [ "$loaded_model" = "$model" ] && [ "$has_prefix_cache" = "$want_prefix_cache" ] \
+           && [ "$dials_match" = "true" ] \
            && [ -z "${VLLM_SPECULATIVE_CONFIG:-}" ] && [ -z "${VLLM_KV_CACHE_DTYPE:-}" ]; then
             echo -e "${GREEN}✓ Server already running with correct model and cache mode ($model)${NC}"
             return 0

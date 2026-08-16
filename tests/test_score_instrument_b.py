@@ -72,24 +72,37 @@ def _write_evidence(path: Path) -> Path:
 
 @pytest.fixture()
 def fake_manager(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
-    """Monkeypatch ib.score/ib.ensure_env, recording every call."""
+    """Monkeypatch ib.score_with_provenance/ib.ensure_env, recording calls.
+
+    The CLI routes through ``score_with_provenance`` (task #130 (c): every
+    pass discloses cache provenance), so that is the seam faked here; a
+    deterministic CacheProvenance rides back with the fake scores."""
     recorded: dict[str, Any] = {"score_calls": [], "ensure_calls": []}
 
-    def fake_score(
+    def fake_score_with_provenance(
         items: list[dict[str, str]], **kwargs: Any
-    ) -> dict[str, float]:
+    ) -> tuple[dict[str, float], Any]:
         recorded["score_calls"].append({"items": list(items), **kwargs})
         scores: dict[str, float] = {}
         for item in items:
             example_part = item["id"].split("::")[1]
             scores[item["id"]] = FAKE_SCORES[example_part]
-        return scores
+        provenance = sib.ib.CacheProvenance(
+            reused=False,
+            forced_fresh=bool(kwargs.get("fresh", False)),
+            work_dir="/fake/work/0123456789abcdef",
+            work_dir_digest="0" * 64,
+            n_items=len(items),
+            n_cached=0,
+            n_scored_fresh=len(scores),
+        )
+        return scores, provenance
 
     def fake_ensure_env(env_home: Any = None, *args: Any, **kwargs: Any) -> Path:
         recorded["ensure_calls"].append(env_home)
         return Path(env_home) if env_home is not None else Path("/fake/home")
 
-    monkeypatch.setattr(sib.ib, "score", fake_score)
+    monkeypatch.setattr(sib.ib, "score_with_provenance", fake_score_with_provenance)
     monkeypatch.setattr(sib.ib, "ensure_env", fake_ensure_env)
     return recorded
 
@@ -151,8 +164,12 @@ class TestFlatMode:
         # stringified contexts were parsed, not scored as a JSON blob
         e1_item = call["items"][1]
         assert e1_item["context"] == "London is the capital of the UK."
-        # id carries file key + example id + repeat index
-        assert call["items"][2]["id"] == f"{ev.as_posix()}::e3::1"
+        # Task #130 (a): worker-bound ids carry a BLINDED file token + example
+        # id + repeat index — never the evidence path (which can embed arm
+        # names in pilot trees).
+        assert call["items"][2]["id"].endswith("::e3::1")
+        assert call["items"][2]["id"].startswith("blind-")
+        assert ev.as_posix() not in call["items"][2]["id"]
 
         # -- output rows: real apply_tau, boundary INCLUSIVE at τ ---------- #
         rows = _read_jsonl(out)
@@ -374,3 +391,127 @@ class TestScoringTreeMode:
             "--scoring-run-id", "s02-instrument-b",
         ])
         assert rc == 2
+
+    def test_tree_items_are_blinded_and_manifest_discloses_everything(
+        self, tmp_path: Path, fake_manager: dict[str, Any]
+    ) -> None:
+        """Task #130 (a)+(c): worker-bound ids carry a blinded row_key token
+        (never 'rk1'); the manifest stamps the blinding section AND the cache
+        provenance the fake manager reported."""
+        root, _ = _sealed_run_root(tmp_path)
+        rc = sib.main([
+            "--evidence", str(root),
+            "--scoring-run-id", "s05-blind",
+            "--tau", "0.5",
+            "--env-home", str(tmp_path / "eh"),
+        ])
+        assert rc == 0
+        call = fake_manager["score_calls"][0]
+        for item in call["items"]:
+            assert item["id"].startswith("cells/blind-")
+            assert "rk1" not in item["id"]
+        # default plumbing: no --fresh -> fresh=False reaches the manager
+        assert call["fresh"] is False
+
+        sdir = root / "scoring" / "s05-blind"
+        manifest = json.loads(
+            (sdir / sib.SCORING_MANIFEST_NAME).read_text(encoding="utf-8")
+        )
+        blinding = manifest["blinding"]
+        assert blinding["mode"] == sib.BLINDING_MODE_STRIPPED
+        assert blinding["salt_file"] == "scoring/blinding_salt.json"
+        assert blinding["map_file"] == sib.BLINDING_MAP_NAME
+        assert blinding["n_labels"] == 1  # one row_key in the fixture
+        assert blinding["cache_note"]
+        assert (root / "scoring" / sib.SALT_FILE_NAME).is_file()
+        map_doc = json.loads(
+            (sdir / sib.BLINDING_MAP_NAME).read_text(encoding="utf-8")
+        )
+        assert set(map_doc["mapping"].values()) == {"rk1"}
+        assert manifest["cache_provenance"]["reused"] is False
+        assert manifest["cache_provenance"]["n_scored_fresh"] == 3
+        # the sealed map rides inside the pass's own ledger
+        assert verify_ledger(sdir / "ledger.json", sdir) == []
+
+    def test_fresh_flag_reaches_the_manager_and_is_disclosed(
+        self, tmp_path: Path, fake_manager: dict[str, Any]
+    ) -> None:
+        root, _ = _sealed_run_root(tmp_path)
+        rc = sib.main([
+            "--evidence", str(root),
+            "--scoring-run-id", "s06-fresh",
+            "--fresh",
+            "--env-home", str(tmp_path / "eh"),
+        ])
+        assert rc == 0
+        assert fake_manager["score_calls"][0]["fresh"] is True
+        manifest = json.loads(
+            (root / "scoring" / "s06-fresh" / sib.SCORING_MANIFEST_NAME).read_text(
+                encoding="utf-8"
+            )
+        )
+        assert manifest["cache_provenance"]["forced_fresh"] is True
+
+
+# --------------------------------------------------------------------------- #
+# Task #130 decision (d): --abandon through the instrument-B CLI
+# --------------------------------------------------------------------------- #
+
+
+class TestAbandonCli:
+    def test_abandon_frees_id_for_instrument_b_retry(
+        self, tmp_path: Path, fake_manager: dict[str, Any]
+    ) -> None:
+        root, _ = _sealed_run_root(tmp_path)
+        crashed = root / "scoring" / "s09-crash"
+        crashed.mkdir(parents=True)
+        (crashed / "scoring_manifest.json").write_text("{}", encoding="utf-8")
+
+        rc = sib.main([
+            "--evidence", str(root),
+            "--abandon", "s09-crash", "--reason", "smoke crashed",
+        ])
+        assert rc == 0
+        assert not crashed.exists()
+        abandoned = list((root / "scoring").glob("s09-crash.abandoned-*"))
+        assert len(abandoned) == 1
+        tomb = json.loads(
+            (abandoned[0] / sib.rescore.ABANDONED_TOMBSTONE_NAME).read_text(
+                encoding="utf-8"
+            )
+        )
+        assert tomb["reason"] == "smoke crashed"
+        # the id is free: a retry through instrument-B tree mode succeeds
+        rc = sib.main([
+            "--evidence", str(root),
+            "--scoring-run-id", "s09-crash",
+            "--env-home", str(tmp_path / "eh"),
+        ])
+        assert rc == 0
+
+    def test_abandon_combos_and_arity_refused(
+        self, tmp_path: Path, fake_manager: dict[str, Any]
+    ) -> None:
+        root, _ = _sealed_run_root(tmp_path)
+        crashed = root / "scoring" / "s09-crash"
+        crashed.mkdir(parents=True)
+        # exclusive with --scoring-run-id / --out
+        assert sib.main([
+            "--evidence", str(root), "--abandon", "s09-crash", "--reason", "r",
+            "--scoring-run-id", "s10-x",
+        ]) == 2
+        assert sib.main([
+            "--evidence", str(root), "--abandon", "s09-crash", "--reason", "r",
+            "--out", str(tmp_path / "o.jsonl"),
+        ]) == 2
+        # exactly one --evidence root
+        assert sib.main([
+            "--evidence", str(root), str(root),
+            "--abandon", "s09-crash", "--reason", "r",
+        ]) == 2
+        assert sib.main(["--abandon", "s09-crash", "--reason", "r"]) == 2
+        # missing --reason surfaces the helper's refusal as exit 2
+        assert sib.main([
+            "--evidence", str(root), "--abandon", "s09-crash",
+        ]) == 2
+        assert crashed.is_dir()  # every refusal left the pass untouched

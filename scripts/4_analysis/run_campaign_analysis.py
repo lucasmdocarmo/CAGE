@@ -81,6 +81,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import sys
 from dataclasses import dataclass, field, replace as dc_replace
@@ -179,10 +180,15 @@ PRESSURE_FAMILIES: frozenset[str] = frozenset({"F2", "F3"})
 #: axis the baseline ids do not determine (baseline fixes arm + retriever).
 _PAIR_MATCH_AXES: tuple[str, ...] = ("engine", "model", "topology", "policy")
 
+#: The FULL organize_results.INDEX_COLUMNS contract (RESULTS_LAYOUT.md, 20
+#: columns): the window-pair selector and the §9.5 equivalence matcher group
+#: on budget_r/rate_frac, and cell_json/artifacts carry the provenance handoff
+#: — a truncated index must refuse, not silently degrade the pairing.
 _INDEX_REQUIRED_COLUMNS: tuple[str, ...] = (
     "run_id", "campaign", "session", "model", "engine", "arm", "baseline",
-    "retriever", "policy", "topology", "family", "dataset", "window",
-    "window_key", "row_key", "window_dir",
+    "retriever", "policy", "topology", "family", "dataset", "budget_r",
+    "rate_frac", "window", "window_key", "row_key", "window_dir", "cell_json",
+    "artifacts",
 )
 
 #: Metric direction registry — FAIL CLOSED on unknown metrics rather than
@@ -434,6 +440,49 @@ class WindowPair:
 #: contrasting different (r, λ) grid points would confound the slot.
 _WINDOW_PAIR_MATCH_AXES: tuple[str, ...] = (*_PAIR_MATCH_AXES, "budget_r", "rate_frac")
 
+#: The §6.1 pressure coordinates are OPTIONAL on legal F2/F3 cells: CellSpec
+#: declares budget_r/rate_frac as ``float | None`` and only forbids SETTING
+#: them on F1 (src/analysis/cellspec.py) — so index rows may carry them as NaN.
+_PRESSURE_COORD_AXES: tuple[str, ...] = ("budget_r", "rate_frac")
+#: Group-KEYING sentinel for an unset pressure coordinate. Can never collide
+#: with a set coordinate: those key as ``repr(float(value))``.
+_UNSET_COORD_KEY = "<unset>"
+
+
+def _coord_keyed(frame: pd.DataFrame) -> pd.DataFrame:
+    """Copy of ``frame`` with budget_r/rate_frac normalized for GROUP KEYING.
+
+    ``groupby(dropna=False)`` KEEPS NaN group keys, but a tuple key holding
+    NaN can never be FOUND in a dict built from another groupby: NaN != NaN,
+    and dict lookup falls back to equality after the identity check, so
+    probing one side's group dict with the other side's keys silently never
+    matches. Legal F2/F3 cells with unset coordinates (see
+    ``_PRESSURE_COORD_AXES``) index as NaN and MUST still pair, so the coords
+    are string-keyed: unset-vs-unset matches, unset-vs-0.5 stays distinct —
+    absence is matched as absence, never coerced to a number. KEYING ONLY:
+    callers group the returned copy but read only columns this rewrite does
+    not touch (row_key/dataset); ``dropna=False`` semantics elsewhere are
+    unchanged.
+    """
+    keyed = frame.copy()
+    for axis in _PRESSURE_COORD_AXES:
+        normalized: list[str] = []
+        for value in keyed[axis]:
+            if value is None or (isinstance(value, float) and math.isnan(value)) or value == "":
+                # Absent per cellspec.CellSpec.from_flat_dict (None/""/NaN).
+                normalized.append(_UNSET_COORD_KEY)
+                continue
+            try:
+                normalized.append(repr(float(value)))
+            except (TypeError, ValueError):
+                raise AnalysisError(
+                    f"index column {axis!r} holds non-numeric value {value!r} "
+                    "— pressure coordinates must be floats or absent "
+                    "(cellspec.CellSpec)"
+                ) from None
+        keyed[axis] = normalized
+    return keyed
+
 
 def select_window_pairs(
     index: pd.DataFrame, contrast: Contrast
@@ -465,12 +514,18 @@ def select_window_pairs(
                 "in this run"
             )
             continue
+        # Group the coord-keyed copies: NaN pressure coords would make the
+        # cross-groupby dict probe below never match (see _coord_keyed).
         ref_groups = {
             key: grp
-            for key, grp in refs.groupby(list(_WINDOW_PAIR_MATCH_AXES), dropna=False)
+            for key, grp in _coord_keyed(refs).groupby(
+                list(_WINDOW_PAIR_MATCH_AXES), dropna=False
+            )
         }
         matched = False
-        for key, cell_grp in cells.groupby(list(_WINDOW_PAIR_MATCH_AXES), dropna=False):
+        for key, cell_grp in _coord_keyed(cells).groupby(
+            list(_WINDOW_PAIR_MATCH_AXES), dropna=False
+        ):
             ref_grp = ref_groups.get(key)
             if ref_grp is None:
                 continue
@@ -1422,11 +1477,14 @@ def compute_equivalence(
             "arm", "retriever", "topology", "engine", "model", "family",
             "budget_r", "rate_frac",
         ]
+        # Group the coord-keyed copies: NaN pressure coords would make the
+        # cross-groupby dict probe below never match (see _coord_keyed).
         ref_groups = {
-            key: grp for key, grp in refs.groupby(match_axes, dropna=False)
+            key: grp
+            for key, grp in _coord_keyed(refs).groupby(match_axes, dropna=False)
         }
         found_pair = False
-        for key, cell_grp in cells.groupby(match_axes, dropna=False):
+        for key, cell_grp in _coord_keyed(cells).groupby(match_axes, dropna=False):
             ref_grp = ref_groups.get(key)
             if ref_grp is None:
                 continue

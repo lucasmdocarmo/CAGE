@@ -430,6 +430,117 @@ class TestManagerScore:
             ib.score([{"id": "a", "context": "c", "claim": ""}], env_home=env_home)
 
 
+class TestScoreWithProvenance:
+    """Task #130 decision (c) (audit H12): the content-addressed cache may be
+    reused — but its contribution is DISCLOSED, and ``fresh=True`` forces a
+    clean work dir. All through the REAL worker with the stub alignscore."""
+
+    @staticmethod
+    def _setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        stub_dir = tmp_path / "stub"
+        (stub_dir / "alignscore").mkdir(parents=True)
+        (stub_dir / "alignscore" / "__init__.py").write_text(
+            _STUB_ALIGNSCORE, encoding="utf-8"
+        )
+        monkeypatch.setenv("PYTHONPATH", str(stub_dir))
+        return _fake_ready_env(tmp_path)
+
+    @staticmethod
+    def _items() -> list[dict[str, str]]:
+        return [
+            {"id": f"i{n}", "context": "ctx", "claim": f"claim {n}"}
+            for n in range(3)
+        ]
+
+    def test_first_pass_discloses_no_reuse(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        env_home = self._setup(tmp_path, monkeypatch)
+        scores, prov = ib.score_with_provenance(
+            self._items(), env_home=env_home, stream=False
+        )
+        assert len(scores) == 3
+        assert prov.reused is False
+        assert prov.forced_fresh is False
+        assert prov.n_items == 3
+        assert prov.n_cached == 0
+        assert prov.n_scored_fresh == 3
+        # the digest is the FULL content hash; the work dir is its truncation
+        assert len(prov.work_dir_digest) == 64
+        assert Path(prov.work_dir).name == prov.work_dir_digest[:16]
+        assert prov.to_dict()["reused"] is False  # manifest-ready form
+
+    def test_second_pass_discloses_cache_reuse(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        env_home = self._setup(tmp_path, monkeypatch)
+        _, first = ib.score_with_provenance(
+            self._items(), env_home=env_home, stream=False
+        )
+        scores, second = ib.score_with_provenance(
+            self._items(), env_home=env_home, stream=False
+        )
+        assert len(scores) == 3
+        assert second.reused is True
+        assert second.n_cached == 3
+        assert second.n_scored_fresh == 0
+        assert second.work_dir_digest == first.work_dir_digest
+
+    def test_fresh_forces_clean_work_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        env_home = self._setup(tmp_path, monkeypatch)
+        items = self._items()
+        _, first = ib.score_with_provenance(
+            items, env_home=env_home, stream=False
+        )
+        scores, prov = ib.score_with_provenance(
+            items, env_home=env_home, stream=False, fresh=True
+        )
+        assert len(scores) == 3
+        assert prov.forced_fresh is True
+        assert prov.reused is False
+        assert prov.n_cached == 0
+        assert prov.n_scored_fresh == 3
+        # same content-address: the DIR was cleaned, not relocated
+        assert prov.work_dir_digest == first.work_dir_digest
+
+    def test_partial_max_items_counts_cached_vs_fresh(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Smoke-then-full: the second call's provenance separates resumed
+        scores (n_cached) from newly produced ones (n_scored_fresh)."""
+        env_home = self._setup(tmp_path, monkeypatch)
+        items = self._items()
+        partial, prov1 = ib.score_with_provenance(
+            items, env_home=env_home, max_items=2, stream=False
+        )
+        assert len(partial) == 2
+        assert prov1.n_cached == 0
+        assert prov1.n_scored_fresh == 2
+        full, prov2 = ib.score_with_provenance(
+            items, env_home=env_home, stream=False
+        )
+        assert len(full) == 3
+        assert prov2.reused is True
+        assert prov2.n_cached == 2
+        assert prov2.n_scored_fresh == 1
+
+    def test_score_wrapper_keeps_its_contract(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """score() stays the provenance-free convenience wrapper."""
+        env_home = self._setup(tmp_path, monkeypatch)
+        scores = ib.score(self._items(), env_home=env_home, stream=False)
+        assert set(scores) == {"i0", "i1", "i2"}
+
+    def test_items_digest_is_content_sensitive(self) -> None:
+        a = [{"id": "x", "context": "c", "claim": "one"}]
+        b = [{"id": "x", "context": "c", "claim": "two"}]
+        assert ib._items_digest(a) != ib._items_digest(b)
+        assert ib._items_digest(a) == ib._items_digest(list(a))
+
+
 class TestReadScores:
     def test_ignores_torn_tail(self, tmp_path: Path) -> None:
         path = tmp_path / "scores.jsonl"

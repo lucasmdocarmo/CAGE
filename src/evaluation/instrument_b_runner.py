@@ -894,6 +894,19 @@ def read_scores(output_path: Path) -> dict[str, float]:
     return scores
 
 
+def _items_digest(normalized: Sequence[Mapping[str, str]]) -> str:
+    """Full sha256 hex digest over the normalized items (id + context + claim).
+
+    The content-address of one scoring job: recorded verbatim in cache
+    provenance (task #130 decision (c)) and truncated to 16 hex chars for the
+    work-dir name."""
+    digest = hashlib.sha256()
+    for item in normalized:
+        digest.update(json.dumps(item, sort_keys=True).encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
 def _job_dir_for(home: Path, normalized: Sequence[Mapping[str, str]]) -> Path:
     """Content-addressed default work dir: ``<home>/work/<sha256[:16]>``.
 
@@ -906,11 +919,30 @@ def _job_dir_for(home: Path, normalized: Sequence[Mapping[str, str]]) -> Path:
     crash-safe resume; any content change → fresh dir → stale scores can
     never be joined.
     """
-    digest = hashlib.sha256()
-    for item in normalized:
-        digest.update(json.dumps(item, sort_keys=True).encode("utf-8"))
-        digest.update(b"\n")
-    return home / "work" / digest.hexdigest()[:16]
+    return home / "work" / _items_digest(normalized)[:16]
+
+
+@dataclass(frozen=True)
+class CacheProvenance:
+    """What the content-addressed cache contributed to ONE scoring call.
+
+    Task #130 decision (c) (audit H12): the checkpointed work dir silently
+    served pass-1 scores to pass-2 — a genuine feature (crash-safe resume,
+    cross-pass shareability) that must be DISCLOSED, never silently claimed
+    as independent scoring.  Callers persist this block into the pass
+    manifest / provenance sidecar.
+    """
+
+    reused: bool  # any wanted id was already scored before the worker ran
+    forced_fresh: bool  # the caller demanded a clean work dir (--fresh)
+    work_dir: str
+    work_dir_digest: str  # FULL content sha256 of the normalized items
+    n_items: int
+    n_cached: int  # wanted ids already present in the work dir's scores
+    n_scored_fresh: int  # ids scored by THIS call's worker run
+
+    def to_dict(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
 
 
 def score(
@@ -923,8 +955,41 @@ def score(
     device: str = "cpu",
     max_items: int | None = None,
     stream: bool = True,
+    fresh: bool = False,
 ) -> dict[str, float]:
     """Score items out of process; returns ``{id: alignscore}``.
+
+    Back-compat wrapper around :func:`score_with_provenance` (same contract,
+    provenance discarded — callers that must DISCLOSE cache reuse, i.e. every
+    §6 scoring pass, use ``score_with_provenance``; task #130 decision (c)).
+    """
+    scores, _ = score_with_provenance(
+        items,
+        env_home=env_home,
+        spec=spec,
+        work_dir=work_dir,
+        batch_size=batch_size,
+        device=device,
+        max_items=max_items,
+        stream=stream,
+        fresh=fresh,
+    )
+    return scores
+
+
+def score_with_provenance(
+    items: Sequence[Mapping[str, Any]],
+    *,
+    env_home: Path | None = None,
+    spec: AlignScoreEnvSpec = SPEC,
+    work_dir: Path | None = None,
+    batch_size: int = 8,
+    device: str = "cpu",
+    max_items: int | None = None,
+    stream: bool = True,
+    fresh: bool = False,
+) -> tuple[dict[str, float], CacheProvenance]:
+    """Score items out of process; returns ``({id: alignscore}, provenance)``.
 
     Items are mappings with ``id``/``context``/``claim``.  The worker is
     checkpointed: rerunning with the same items (or the same explicit
@@ -935,6 +1000,12 @@ def score(
     ``max_items=None`` every input id must come back scored — anything less
     raises (fail closed); with ``max_items`` set, the partial score set is
     returned as-is (resumable smoke/budget mode).
+
+    ``fresh=True`` (task #130 decision (c): drift-audit passes) deletes any
+    pre-existing work dir before scoring — every score is then produced by
+    THIS call's worker run.  The returned :class:`CacheProvenance` discloses
+    exactly what the cache contributed either way; §6 pass manifests persist
+    it (never silently claim independence — audit H12).
 
     Bootstraps the environment on demand via :func:`ensure_env` (no-op when
     ready).
@@ -949,12 +1020,22 @@ def score(
     worker_path = Path(manifest["worker"])
     ckpt_path = Path(manifest["verified"]["ckpt"]["path"])
 
+    job_digest = _items_digest(normalized)
     job_dir = (
-        Path(work_dir) if work_dir is not None else _job_dir_for(home, normalized)
+        Path(work_dir) if work_dir is not None else home / "work" / job_digest[:16]
     )
+    forced_fresh = False
+    if fresh and job_dir.exists():
+        shutil.rmtree(job_dir)
+        forced_fresh = True
     job_dir.mkdir(parents=True, exist_ok=True)
     input_path = job_dir / "input.jsonl"
     output_path = job_dir / "scores.jsonl"
+    # Cache census BEFORE the worker runs (task #130 (c)): what was already
+    # scored in this work dir — the worker will resume past exactly these.
+    wanted = {item["id"] for item in normalized}
+    pre_existing = read_scores(output_path)
+    n_cached = sum(1 for item_id in wanted if item_id in pre_existing)
     with input_path.open("w", encoding="utf-8") as fh:
         for item in normalized:
             fh.write(json.dumps(item) + "\n")
@@ -1017,7 +1098,6 @@ def score(
         )
 
     scores = read_scores(output_path)
-    wanted = {item["id"] for item in normalized}
     joined = {item_id: scores[item_id] for item_id in wanted if item_id in scores}
     if max_items is None and len(joined) != len(wanted):
         missing = sorted(wanted - set(joined))
@@ -1025,7 +1105,16 @@ def score(
             f"worker returned {len(joined)}/{len(wanted)} scores; missing e.g. "
             f"{missing[:5]} — refusing a silent partial score set"
         )
-    return joined
+    provenance = CacheProvenance(
+        reused=n_cached > 0,
+        forced_fresh=forced_fresh,
+        work_dir=str(job_dir),
+        work_dir_digest=job_digest,
+        n_items=len(normalized),
+        n_cached=n_cached,
+        n_scored_fresh=len(joined) - n_cached,
+    )
+    return joined, provenance
 
 
 # --------------------------------------------------------------------------- #

@@ -50,16 +50,45 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+for _p in (str(Path(__file__).resolve().parent), str(REPO_ROOT)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from src.evaluation import instrument_b_runner as ib  # noqa: E402
+
+# Task #130 shared layer (decisions (a) + (d)): the label-stripping blinder,
+# the sealed per-run-root salt and the --abandon helper live in
+# rescore_quality.py (same directory — the primary owner of the offline
+# scoring chain) so BOTH scripts derive identical tokens from the same salt.
+import rescore_quality as rescore  # noqa: E402,F401  (module alias kept for tests)
+from rescore_quality import (  # noqa: E402
+    BLINDING_MAP_NAME,
+    BLINDING_MODE_CONTROL,
+    BLINDING_MODE_STRIPPED,
+    SALT_FILE_NAME,
+    LabelBlinder,
+    ScoringBlindingError,
+    blinding_join_checksum,
+    canonical_sha256,
+    load_or_create_scoring_salt,
+    write_blinding_map,
+)
 
 #: RESULTS_LAYOUT §6 scoring-run-id grammar (same as rescore_quality.py).
 SCORING_RUN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
 SCORING_DIRNAME = "scoring"
 SCORING_MANIFEST_NAME = "scoring_manifest.json"
 SCORES_NAME = "instrument_b_scores.jsonl"
+
+#: Task #130 (a) cache-continuity disclosure (stamped into blinding sections):
+#: token-stable ids keep the content-addressed cache shareable ACROSS passes
+#: from #130 onward, but break continuity with PRE-#130 passes (whose ids
+#: carried real labels).
+_CACHE_CONTINUITY_NOTE = (
+    "item ids are token-stable across passes from task #130 onward "
+    "(deterministic per-run-root salt); content-addressed work dirs do NOT "
+    "match passes scored before #130, whose ids embedded real arm labels"
+)
 
 
 def _positive_int(value: str) -> int:
@@ -105,6 +134,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Campaign v2 mode (cloud/RESULTS_LAYOUT.md §6): write "
                         "scoring/<scoring_run_id>/ under the run root instead of "
                         "--out. Never writes into cells/.")
+    p.add_argument("--fresh", action="store_true",
+                   help="Task #130 decision (c): force a CLEAN content-addressed "
+                        "work dir — every score is produced by THIS pass's "
+                        "worker run, none served from a previous pass's "
+                        "checkpoint (drift-audit passes). Either way the pass "
+                        "manifest/sidecar records cache_provenance; reuse is "
+                        "disclosed, never silently claimed as independence.")
+    p.add_argument("--abandon", default=None, metavar="SCORING_RUN_ID",
+                   help="Task #130 decision (d): rename scoring/<id>/ under the "
+                        "run root (--evidence, exactly one) to "
+                        "scoring/<id>.abandoned-<UTCstamp>/ with a tombstone, "
+                        "freeing the id for a clean retry. Requires --reason; a "
+                        "VERIFIED complete pass is refused unless "
+                        "--force-abandon.")
+    p.add_argument("--reason", default=None,
+                   help="Reason recorded in the --abandon tombstone.")
+    p.add_argument("--force-abandon", action="store_true", dest="force_abandon",
+                   help="Allow --abandon on a pass whose own ledger VERIFIES "
+                        "complete (normally refused: audit record).")
+    p.add_argument("--no-blinding-control", action="store_true",
+                   dest="no_blinding_control",
+                   help="TEST-ONLY control run without the #130 label-stripping "
+                        "layer (for the blinding-equivalence checksum test); "
+                        f"recorded as blinding mode {BLINDING_MODE_CONTROL!r}. "
+                        "Never use for a registered confirmatory pass.")
     args = p.parse_args(argv)
     # Registered-τ resolution (owner decision 2026-08-05, DECISION.md +
     # PUBLICATION.md §8.6(c)): the None sentinel distinguishes "operator gave
@@ -182,6 +236,99 @@ def _build_items(
             continue
         items.append({"id": item_id, "context": context, "claim": claim})
     return items, skipped
+
+
+# ---------------------------------------------------------------------------
+# Task #130 decision (a): label-stripped item ids (charter §9.8, audit H9)
+# ---------------------------------------------------------------------------
+
+
+def _blind_tree_file_key(rel: Path, blinder: LabelBlinder) -> str:
+    """Blind the arm-bearing row_key component of a §6 evidence path.
+
+    ``cells/<row_key>/window_<k>/qa_evidence.jsonl`` ->
+    ``cells/<token>/window_<k>/qa_evidence.jsonl``: the row_key STARTS with
+    the arm (RESULTS_LAYOUT §2), so it must never reach the worker; the
+    window component carries only dataset+ordinal and stays readable."""
+    parts = list(rel.parts)
+    if len(parts) != 4 or parts[0] != "cells":
+        raise ScoringBlindingError(
+            f"unexpected §6 evidence path shape {rel.as_posix()!r} — cannot "
+            "locate the arm-bearing row_key component to blind"
+        )
+    parts[1] = blinder.token(parts[1])
+    return "/".join(parts)
+
+
+def _record_blind_ids(
+    items: list[dict[str, str]],
+    blind_key: str,
+    real_key: str,
+    blind_to_real: dict[str, str],
+) -> None:
+    """Extend the blind_id -> real_id join map for one evidence file's items.
+
+    Item ids are ``<file_key>::<example_id>::<repeat_index>``; the real id is
+    the same suffix on the real file key. Fails loud on a colliding blind id
+    (the join must stay bijective — task #130 (a))."""
+    for item in items:
+        item_id = item["id"]
+        if not item_id.startswith(blind_key):
+            raise ScoringBlindingError(
+                f"item id {item_id!r} does not start with its blinded file "
+                f"key {blind_key!r}"
+            )
+        real_id = real_key + item_id[len(blind_key):]
+        if item_id in blind_to_real and blind_to_real[item_id] != real_id:
+            raise ScoringBlindingError(
+                f"blind id {item_id!r} maps to two different input rows — "
+                "refusing a non-bijective unblind join"
+            )
+        blind_to_real[item_id] = real_id
+
+
+def _check_join_bijective(blind_to_real: dict[str, str], n_items: int) -> None:
+    """The unblind join must be a bijection over the scoreable items."""
+    if len(blind_to_real) != n_items:
+        raise ScoringBlindingError(
+            f"unblind map covers {len(blind_to_real)} ids for {n_items} "
+            "scoreable items — the join is not one-to-one"
+        )
+    if len(set(blind_to_real.values())) != len(blind_to_real):
+        raise ScoringBlindingError(
+            "two blinded ids unblind to the same input row — refusing a "
+            "non-injective join (silent score mis-assignment is the failure "
+            "mode this check makes impossible)"
+        )
+
+
+def _unblind_ib_rows(
+    rows: list[dict[str, Any]], blind_to_real: dict[str, str]
+) -> list[dict[str, Any]]:
+    """Unblind output row ids through the checked join (task #130 (a)).
+
+    Every scored row must resolve to exactly one input row; an unknown blind
+    id or a duplicate real id raises — never a silent mis-assignment."""
+    out: list[dict[str, Any]] = []
+    seen_real: set[str] = set()
+    for row in rows:
+        blind_id = row["id"]
+        try:
+            real_id = blind_to_real[blind_id]
+        except KeyError:
+            raise ScoringBlindingError(
+                f"scored id {blind_id!r} has no entry in the unblind map — a "
+                "scored item does not correspond to any input row"
+            ) from None
+        if real_id in seen_real:
+            raise ScoringBlindingError(
+                f"two scored items unblind to the same input row {real_id!r}"
+            )
+        seen_real.add(real_id)
+        new = dict(row)
+        new["id"] = real_id
+        out.append(new)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -356,37 +503,76 @@ def run_scoring_tree(root: Path, args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 2
 
-    per_file: dict[Path, list[dict[str, str]]] = {}
+    # Task #130 decision (a): item ids embed the evidence path, and the §6
+    # row_key STARTS with the arm — blind that component with the per-run-root
+    # sealed salt (shared with rescore_quality.py; deterministic so the
+    # content-addressed cache stays shareable across passes, decision (c))
+    # BEFORE anything reaches the worker.
+    no_blinding = bool(getattr(args, "no_blinding_control", False))
+    blinder: LabelBlinder | None = None
+    scoring_salt = None
+    if not no_blinding:
+        scoring_salt = load_or_create_scoring_salt(
+            root / SCORING_DIRNAME / SALT_FILE_NAME
+        )
+        blinder = LabelBlinder(scoring_salt.salt)
+
+    per_file: dict[Path, tuple[list[dict[str, str]], int]] = {}
+    blind_to_real: dict[str, str] = {}
     n_skipped = 0
     for ev_path in evidence_files:
-        file_key = ev_path.relative_to(root).as_posix()
+        rel = ev_path.relative_to(root)
+        real_key = rel.as_posix()
+        file_key = (
+            _blind_tree_file_key(rel, blinder) if blinder is not None else real_key
+        )
         items, skipped = _build_items(ev_path, file_key)
+        if blinder is not None:
+            _record_blind_ids(items, file_key, real_key, blind_to_real)
         n_skipped += skipped
-        per_file[ev_path] = items
-    all_items = [item for items in per_file.values() for item in items]
+        per_file[ev_path] = (items, skipped)
+    all_items = [item for items, _ in per_file.values() for item in items]
     if not all_items:
         print("ERROR: no scoreable rows (all empty-context/empty-answer)",
               file=sys.stderr)
         return 2
+    if blinder is not None:
+        _check_join_bijective(blind_to_real, len(all_items))
 
     env_home = Path(args.env_home).expanduser() if args.env_home else None
-    scores = ib.score(
+    scores, cache_provenance = ib.score_with_provenance(
         all_items,
         env_home=env_home,
         batch_size=args.batch,
         device=args.device,
         max_items=args.max_items,
+        fresh=bool(getattr(args, "fresh", False)),
     )
     verdicts = ib.apply_tau(scores, args.tau) if args.tau is not None else None
 
     written: list[Path] = []
     n_rows = 0
+    # Per-window accounting (task #127, audit H11): EVERY window gets a manifest
+    # entry -- a window whose rows are all unscoreable (or all left unscored by
+    # a --max-items partial pass) is an explicit n_scored=0 record with its
+    # skip counts, never a bare continue (charter §9.10).
+    windows: dict[str, dict[str, int]] = {}
     scoring_dir.mkdir(parents=True)
-    for ev_path, items in per_file.items():
+    for ev_path, (items, skipped) in per_file.items():
         rows = _rows_for(items, scores, verdicts)
-        if not rows:
-            continue
+        # Task #130 (a): unblind at output time — final artifacts carry REAL
+        # ids; the join is bijective and checked (loud failure).
+        if blinder is not None:
+            rows = _unblind_ib_rows(rows, blind_to_real)
         rel_window = ev_path.parent.relative_to(root)  # cells/<row_key>/window_<k>
+        windows[rel_window.as_posix()] = {
+            "n_evidence_rows": len(items) + skipped,
+            "n_scoreable": len(items),
+            "n_skipped_unscoreable": skipped,
+            "n_scored": len(rows),
+        }
+        if not rows:
+            continue  # accounted above; no empty scores file is written
         out_window = scoring_dir / rel_window
         out_window.mkdir(parents=True, exist_ok=True)
         scores_path = out_window / SCORES_NAME
@@ -396,12 +582,44 @@ def run_scoring_tree(root: Path, args: argparse.Namespace) -> int:
         written.append(scores_path)
         n_rows += len(rows)
 
+    # Task #130 (a): seal this pass's token->row_key map and build the
+    # "blinding" section the #112 prereg text cites.
+    if blinder is not None and scoring_salt is not None:
+        map_path = scoring_dir / BLINDING_MAP_NAME
+        map_sha256 = write_blinding_map(map_path, blinder.mapping)
+        written.append(map_path)
+        blinding_section: dict[str, Any] = {
+            "mode": BLINDING_MODE_STRIPPED,
+            "salt_file": f"{SCORING_DIRNAME}/{SALT_FILE_NAME}",  # run-root-relative
+            "salt_sha256": scoring_salt.sha256,
+            "map_file": BLINDING_MAP_NAME,
+            "map_sha256": map_sha256,
+            "join_checksum": blinding_join_checksum(blinder.mapping, n_rows),
+            "n_labels": len(blinder.mapping),
+            "n_rows_unblinded": n_rows,
+            "cache_note": _CACHE_CONTINUITY_NOTE,
+        }
+    else:
+        blinding_section = {
+            "mode": BLINDING_MODE_CONTROL,
+            "note": ("NO label stripping — test-only control for the #130 "
+                     "blinding-equivalence checksum; never a registered "
+                     "confirmatory pass"),
+        }
+
     scoring_manifest = {
         "scoring_run_id": scoring_run_id,
         "raw_run_id": raw_run_id,
         "raw_run_ledger_entries_sha256": entries_sha256,
         "n_evidence_files": len(evidence_files),
         "n_rows": n_rows,
+        "windows": windows,
+        # Task #130 decision (a) — §9.8 label stripping (cited by #112 prereg).
+        "blinding": blinding_section,
+        # Task #130 decision (c) — cache disclosure (audit H12): reuse of the
+        # content-addressed work dir is recorded, never silently claimed as
+        # independent scoring; --fresh forces a clean dir for drift audits.
+        "cache_provenance": cache_provenance.to_dict(),
         **_provenance_block(
             args, evidence_files, len(all_items), len(scores), n_skipped
         ),
@@ -441,39 +659,91 @@ def run_flat(args: argparse.Namespace) -> int:
         print(f"ERROR: no evidence files matched {args.evidence}", file=sys.stderr)
         return 2
 
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Task #130 (a): flat-mode item ids embed the FULL evidence path, which
+    # for pilot trees carries arm names (baselines/no_cache/...) — blind the
+    # whole path component per file. The salt is sealed BESIDE the output
+    # (there is no run root here) so re-running the same --out keeps tokens —
+    # and the worker's checkpointed resume — deterministic.
+    no_blinding = bool(getattr(args, "no_blinding_control", False))
+    blinder: LabelBlinder | None = None
+    scoring_salt = None
+    if not no_blinding:
+        scoring_salt = load_or_create_scoring_salt(
+            Path(str(out_path) + ".blinding_salt.json")
+        )
+        blinder = LabelBlinder(scoring_salt.salt)
+
     all_items: list[dict[str, str]] = []
+    blind_to_real: dict[str, str] = {}
     n_skipped = 0
     for ev_path in evidence_files:
-        items, skipped = _build_items(ev_path, ev_path.as_posix())
+        real_key = ev_path.as_posix()
+        file_key = blinder.token(real_key) if blinder is not None else real_key
+        items, skipped = _build_items(ev_path, file_key)
+        if blinder is not None:
+            _record_blind_ids(items, file_key, real_key, blind_to_real)
         all_items.extend(items)
         n_skipped += skipped
     if not all_items:
         print("ERROR: no scoreable rows (all empty-context/empty-answer)",
               file=sys.stderr)
         return 2
+    if blinder is not None:
+        _check_join_bijective(blind_to_real, len(all_items))
 
     env_home = Path(args.env_home).expanduser() if args.env_home else None
-    scores = ib.score(
+    scores, cache_provenance = ib.score_with_provenance(
         all_items,
         env_home=env_home,
         batch_size=args.batch,
         device=args.device,
         max_items=args.max_items,
+        fresh=bool(getattr(args, "fresh", False)),
     )
     verdicts = ib.apply_tau(scores, args.tau) if args.tau is not None else None
     rows = _rows_for(all_items, scores, verdicts)
+    # Task #130 (a): unblind at output time (checked bijective join).
+    if blinder is not None:
+        rows = _unblind_ib_rows(rows, blind_to_real)
 
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if blinder is not None and scoring_salt is not None:
+        blinding_section: dict[str, Any] = {
+            "mode": BLINDING_MODE_STRIPPED,
+            "salt_file": str(scoring_salt.path),
+            "salt_sha256": scoring_salt.sha256,
+            # No pass dir to seal a map file into — the sidecar IS the flat
+            # pass's manifest, so the token->path map rides inline.
+            "mapping": blinder.mapping,
+            "map_sha256": canonical_sha256(blinder.mapping),
+            "join_checksum": blinding_join_checksum(blinder.mapping, len(rows)),
+            "n_labels": len(blinder.mapping),
+            "n_rows_unblinded": len(rows),
+            "cache_note": _CACHE_CONTINUITY_NOTE,
+        }
+    else:
+        blinding_section = {
+            "mode": BLINDING_MODE_CONTROL,
+            "note": ("NO label stripping — test-only control for the #130 "
+                     "blinding-equivalence checksum"),
+        }
+
     with out_path.open("w", encoding="utf-8") as fh:
         for row in rows:
             fh.write(json.dumps(row) + "\n")
     sidecar = Path(str(out_path) + ".provenance.json")
     sidecar.write_text(
         json.dumps(
-            _provenance_block(
-                args, evidence_files, len(all_items), len(scores), n_skipped
-            ),
+            {
+                # Task #130 decisions (a) + (c): blinding + cache disclosure.
+                "blinding": blinding_section,
+                "cache_provenance": cache_provenance.to_dict(),
+                **_provenance_block(
+                    args, evidence_files, len(all_items), len(scores), n_skipped
+                ),
+            },
             indent=2,
         )
         + "\n",
@@ -495,6 +765,24 @@ def main(argv: list[str] | None = None) -> int:
         home = ib.ensure_env(env_home)
         print(f"BOOTSTRAP_OK  env_home={home}")
         return 0
+
+    if getattr(args, "abandon", None) is not None:
+        # Task #130 decision (d): shared helper — pass dirs are owned jointly
+        # with rescore_quality.py, so the same rename+tombstone semantics
+        # apply regardless of which instrument wrote the pass.
+        if args.scoring_run_id is not None or args.out is not None:
+            print("ERROR: --abandon is exclusive with --scoring-run-id/--out",
+                  file=sys.stderr)
+            return 2
+        if not args.evidence or len(args.evidence) != 1:
+            print("ERROR: --abandon takes exactly ONE --evidence arg: the run "
+                  "root owning scoring/", file=sys.stderr)
+            return 2
+        root = Path(args.evidence[0])
+        if not root.is_dir():
+            print(f"ERROR: run root {root} is not a directory", file=sys.stderr)
+            return 2
+        return rescore.run_abandon(root, args)
 
     if not args.evidence:
         print("ERROR: --evidence is required (or --bootstrap-only)",

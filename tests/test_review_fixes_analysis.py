@@ -124,8 +124,14 @@ def _build_run_tree(tmp_path: Path) -> Path:
         "run_id": RUN_ID,
         "model": MODEL,
         "git_sha": "deadbeef",
+        "git_dirty": False,
         "engine": "vllm",
+        "engine_version": "0.0-test",
         "seed": 1,
+        "provider": "test",
+        "hardware": "test-gpu",
+        "dataset_manifests_sha256": "0" * 64,
+        "cellspec_schema_version": 1,
         "created_utc": "2026-08-04T09:00:00Z",
     }
     (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")

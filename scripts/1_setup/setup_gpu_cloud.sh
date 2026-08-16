@@ -49,21 +49,44 @@ fi
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader || true
 
 # 0b. System packages the DLVM's MINIMAL system python lacks. Without these the run
-#     fails in non-obvious ways: no python3.10-venv -> can't create the venv;
-#     no python3.10-dev/build-essential -> vLLM's Triton/torch.compile gcc step fails
+#     fails in non-obvious ways: no <py>-venv -> can't create the venv;
+#     no <py>-dev/build-essential -> vLLM's Triton/torch.compile gcc step fails
 #     ("InductorError: cuda_utils.c"); no redis-server -> redis/hybrid baselines fail.
-echo "[cage] [0b] installing system packages (python3.10-venv/-dev, build-essential, redis)..."
-# Loud (not silent) fallbacks: a failed apt step is announced and the venv/redis checks
-# downstream will catch anything that actually mattered; the bootstrap itself continues.
+echo "[cage] [0b] installing system packages (build-essential, redis) + canonical python..."
+# Loud (not silent) fallbacks for build/redis: a failed apt step is announced and the
+# downstream checks catch anything that actually mattered; the bootstrap continues.
 sudo apt-get update -qq || warn "apt-get update failed; continuing with stale package lists"
-sudo apt-get install -y python3.10-venv python3.10-dev build-essential redis-server \
-  || warn "apt-get install failed (python3.10-venv/-dev, build-essential, redis-server); venv creation or redis baselines may fail below"
+sudo apt-get install -y build-essential redis-server \
+  || warn "apt-get install failed (build-essential, redis-server); vLLM compile or redis baselines may fail below"
 sudo systemctl enable --now redis-server 2>/dev/null || redis-server --daemonize yes 2>/dev/null \
   || warn "could not start redis-server (systemctl and --daemonize both failed); redis/hybrid baselines will fail until it is started"
 
-# 1. Isolated virtual environment.
-echo "[cage] [1/5] creating venv cage-env..."
-python3 -m venv cage-env
+# 0c. Canonical interpreter (code assertion 2026-08-07, finding B1): the Tier-1
+#     exact pins in requirements.txt were frozen on CPython ${CAGE_CANONICAL_PYTHON};
+#     numpy/pandas at those pins do not even resolve on older interpreters. FAIL
+#     CLOSED if it cannot be provisioned — do NOT fall back to bare `python3`
+#     (whatever the image ships), which is exactly how untested-interpreter
+#     drift happens. deadsnakes is attempted on Ubuntu images only.
+PYBIN="python${CAGE_CANONICAL_PYTHON}"
+if ! command -v "$PYBIN" >/dev/null 2>&1; then
+  echo "[cage] [0c] ${PYBIN} not on PATH; attempting apt install..."
+  sudo apt-get install -y "${PYBIN}-venv" "${PYBIN}-dev" 2>/dev/null || {
+    if command -v add-apt-repository >/dev/null 2>&1; then
+      echo "[cage] [0c] not in default archives; trying deadsnakes PPA (Ubuntu)..."
+      sudo add-apt-repository -y ppa:deadsnakes/ppa 2>/dev/null || true
+      sudo apt-get update -qq 2>/dev/null || true
+      sudo apt-get install -y "${PYBIN}-venv" "${PYBIN}-dev" 2>/dev/null || true
+    fi
+  }
+fi
+command -v "$PYBIN" >/dev/null 2>&1 \
+  || die "canonical interpreter ${PYBIN} unavailable on this image (finding B1: refusing to fall back to bare python3). Use an image that provides ${PYBIN}, or provision it, then re-run."
+"$PYBIN" -m venv --help >/dev/null 2>&1 \
+  || die "${PYBIN} exists but its venv module is missing (install ${PYBIN}-venv), refusing to continue"
+
+# 1. Isolated virtual environment (canonical interpreter, never bare python3).
+echo "[cage] [1/5] creating venv cage-env with ${PYBIN}..."
+"$PYBIN" -m venv cage-env
 # shellcheck disable=SC1091
 source cage-env/bin/activate
 pip install --upgrade pip setuptools wheel

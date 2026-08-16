@@ -29,6 +29,32 @@ Output layouts:
       scoring_run_id. Refuses an existing scoring_run_id, an unsealed run
       (missing ledger.json), and the --apply flag (which mutates cells/).
 
+Label stripping (task #130 decision (a), audit H9, charter §9.8): the scoring
+computation NEVER sees arm identity. Arm-bearing identifiers (the evidence
+"baseline" field; in tree mode the row_key directory the evidence came from)
+are replaced by deterministic opaque tokens BEFORE any row reaches
+QualityEvaluator; the final artifacts (qa_scores.jsonl, results_rescored.csv)
+are unblinded at output time through a checked bijective join. Tokens derive
+via HMAC-SHA256(salt, label): in tree mode the salt is created ONCE per run
+root and stored sealed at scoring/blinding_salt.json (outside cells/ —
+determinism across passes keeps instrument-B's content-addressed cache
+shareable, decision (c)); legacy mode uses an ephemeral per-invocation salt
+(nothing may be added to the pilot archive, decision (b)). Each tree pass
+seals its token->label map (blinding_map.json) and stamps a "blinding"
+section into scoring_manifest.json for the #112 prereg text.
+
+Pilot archive is READ-ONLY (task #130 decision (b), audit H7; RESULTS_LAYOUT
+§7): --apply REFUSES any run root under the pilot archive (the repo results/
+tree by default; override via $CAGE_PILOT_ARCHIVE for tests) — sidecar
+outputs (results_rescored.csv + accounting) are the ONLY rescore products
+there. --apply keeps working for non-archive scratch trees.
+
+Abandoning a crashed pass (task #130 decision (d), audit H10): --abandon
+<scoring_run_id> renames scoring/<id>/ to scoring/<id>.abandoned-<UTCstamp>/
+with a tombstone JSON inside, freeing the id for a clean retry. A pass with a
+VERIFIED complete ledger is an audit record, not a failure — refused unless
+--force-abandon.
+
 Usage:
   python3 scripts/4_analysis/rescore_quality.py --run-root results/phase2/<run-id>
   python3 scripts/4_analysis/rescore_quality.py --run-root <run> --full --device cuda
@@ -36,15 +62,23 @@ Usage:
       --scoring-run-id s01-fast
   python3 scripts/4_analysis/rescore_quality.py --run-root <run> --full \
       --device cuda --batch-size 32   # cross-row batched scoring (D8 §8.1)
+  python3 scripts/4_analysis/rescore_quality.py --run-root <run> \
+      --abandon s01-fast --reason "worker OOM mid-pass"
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import hmac
 import json
+import os
 import re
+import secrets
 import subprocess
 import sys
+from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -59,6 +93,28 @@ SCORING_DIRNAME = "scoring"
 SCORING_MANIFEST_NAME = "scoring_manifest.json"
 QA_SCORES_NAME = "qa_scores.jsonl"
 QUALITY_JSON_NAME = "quality.json"
+
+#: Task #130 decision (a) — label-stripping layer (charter §9.8, audit H9).
+#: The per-run-root salt lives at scoring/<SALT_FILE_NAME> (OUTSIDE cells/,
+#: shared by rescore_quality AND score_instrument_b so tokens agree across
+#: instruments and passes); each pass seals its token->label map as
+#: <pass>/<BLINDING_MAP_NAME>.
+SALT_FILE_NAME = "blinding_salt.json"
+BLINDING_MAP_NAME = "blinding_map.json"
+BLINDING_MODE_STRIPPED = "label-stripped"
+BLINDING_MODE_CONTROL = "disabled-control-run"
+_TOKEN_PREFIX = "blind-"
+_TOKEN_HEX_LEN = 16
+
+#: Task #130 decision (b) — the pilot archive root --apply must refuse.
+#: Default: the repo's results/ tree (RESULTS_LAYOUT §7: pilot-era data is
+#: read-only historical). Overridable for tests via $CAGE_PILOT_ARCHIVE.
+PILOT_ARCHIVE_ENV = "CAGE_PILOT_ARCHIVE"
+
+#: Task #130 decision (d) — tombstone written inside an abandoned pass dir.
+ABANDONED_TOMBSTONE_NAME = "ABANDONED.json"
+#: UTC stamp format appended to an abandoned pass directory name.
+_ABANDON_STAMP_FMT = "%Y%m%dT%H%M%SZ"
 
 
 def _positive_int(value: str) -> int:
@@ -102,6 +158,36 @@ def parse_args() -> argparse.Namespace:
                         "preserves the historical sequential row-by-row behavior "
                         "(batched=False); the two paths are output-equivalent "
                         "(proven in tests/test_rescore_wiring.py).")
+    p.add_argument("--allow-duplicates", action="store_true", dest="allow_duplicates",
+                   help="Duplicate (example_id, repeat_index, record_index) evidence "
+                        "rows are REFUSED by default (task #127 integrity guard, "
+                        "aligned with instrument_b_runner which raises). With this "
+                        "flag: keep-LAST, and the dropped count is PERSISTED "
+                        "(quality.json + scoring manifest in tree mode; a "
+                        "<out-name>.accounting.json sidecar in legacy mode) -- "
+                        "never stdout-only (charter §9.10).")
+    p.add_argument("--abandon", default=None, metavar="SCORING_RUN_ID",
+                   help="Task #130 decision (d): rename scoring/<id>/ under the "
+                        "run root to scoring/<id>.abandoned-<UTCstamp>/ with a "
+                        "tombstone JSON inside, freeing the id for a clean retry. "
+                        "Requires --reason. A pass with a VERIFIED complete "
+                        "ledger is an audit record and is refused unless "
+                        "--force-abandon. Exclusive with --scoring-run-id/--apply.")
+    p.add_argument("--reason", default=None,
+                   help="Human-readable reason recorded in the --abandon "
+                        "tombstone (required with --abandon).")
+    p.add_argument("--force-abandon", action="store_true", dest="force_abandon",
+                   help="Allow --abandon on a pass whose own ledger VERIFIES "
+                        "complete (normally refused: completed passes are audit "
+                        "record, not failures).")
+    p.add_argument("--no-blinding-control", action="store_true",
+                   dest="no_blinding_control",
+                   help="TEST-ONLY control run: skip the #130 label-stripping "
+                        "layer entirely. Exists so the blinding-equivalence "
+                        "checksum test can compare a blinded pass against an "
+                        "unblinded control bitwise. The scoring manifest records "
+                        f"blinding mode {BLINDING_MODE_CONTROL!r}; never use for "
+                        "a registered confirmatory pass.")
     return p.parse_args()
 
 
@@ -124,6 +210,409 @@ _MODEL_FIELDS = [
     "faithfulness_source", "grounding_source",
 ]
 
+#: quality.json aggregation allowlist (task #127, audit H11): ONLY score columns
+#: are aggregated. Provenance numerics riding in a score row (old_grounding_score,
+#: record_index, faithfulness_premise_count, ...) must never fold into a mean.
+#: sanitized_answer / faithfulness_premise_mode are string-valued and excluded;
+#: the D8 §8.5 diagnostics that ARE rates (scored_windowed, the flag-gated
+#: 3-class columns) and cache_relevance ride along explicitly.
+_QUALITY_AGG_KEYS: tuple[str, ...] = tuple(
+    [k for k in _MODEL_FREE_FIELDS if k != "sanitized_answer"]
+    + [k for k in _MODEL_FIELDS if k != "faithfulness_premise_mode"]
+    + ["scored_windowed", "cache_relevance",
+       "faithfulness_contradiction", "faithfulness_neutral"]
+)
+
+
+# ---------------------------------------------------------------------------
+# Task #130 decision (a): label stripping (charter §9.8, audit H9)
+#
+# Sealed-file pattern reused from src/analysis/stats/blinding.py (read-only
+# authority for the §9.8 machinery): the file carries a sha256 of its own
+# payload so tampering is detectable; loading verifies before trusting.
+# Deliberately NOT importing that module here — its top level needs pandas,
+# and fast-mode rescoring must keep working in a lean analysis venv.
+# ---------------------------------------------------------------------------
+
+
+class ScoringBlindingError(RuntimeError):
+    """Label-stripping protocol violation in the offline scoring chain.
+
+    Task #130 decision (a): the catastrophic failure mode is SILENT
+    mis-assignment of scores to arms through a buggy unblind join — every
+    integrity breach (tampered salt, unknown token, non-bijective join,
+    token collision) raises this instead of degrading."""
+
+
+class ScoringAbandonError(RuntimeError):
+    """--abandon refusal (task #130 decision (d)): bad id, missing pass,
+    missing reason, or a VERIFIED complete pass without --force-abandon."""
+
+
+def canonical_sha256(obj: Any) -> str:
+    """sha256 over the canonical (sorted, compact) JSON form of ``obj``."""
+    canonical = json.dumps(obj, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class ScoringSalt:
+    """One run root's sealed label-stripping salt (task #130 decision (a))."""
+
+    salt: bytes
+    sha256: str  # the sealed file's self-hash (quoted by pass manifests)
+    path: Path
+
+
+def load_or_create_scoring_salt(salt_path: Path) -> ScoringSalt:
+    """Load the sealed per-run-root salt, creating it on first use.
+
+    Determinism is load-bearing (task #130 decisions (a)+(c)): tokens must be
+    identical across passes so instrument-B's content-addressed work-dir cache
+    stays shareable — a per-pass salt would silently defeat it. The salt is
+    created ONCE (crypto-random, 32 bytes), sealed with a self-hash
+    (blinding.py's sealed-file pattern), and every later pass re-verifies the
+    seal before trusting it; a tampered or truncated salt file raises."""
+    salt_path = Path(salt_path)
+    if salt_path.exists():
+        try:
+            doc = json.loads(salt_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ScoringBlindingError(
+                f"sealed salt file is not valid JSON: {salt_path}"
+            ) from exc
+        salt_hex = doc.get("salt_hex")
+        if not isinstance(salt_hex, str) or not salt_hex:
+            raise ScoringBlindingError(
+                f"sealed salt file lacks 'salt_hex': {salt_path}"
+            )
+        if canonical_sha256(salt_hex) != doc.get("salt_sha256"):
+            raise ScoringBlindingError(
+                f"sealed salt self-hash mismatch — the salt file was altered "
+                f"after sealing: {salt_path}"
+            )
+        try:
+            salt = bytes.fromhex(salt_hex)
+        except ValueError as exc:
+            raise ScoringBlindingError(
+                f"sealed salt 'salt_hex' is not hex: {salt_path}"
+            ) from exc
+        return ScoringSalt(salt=salt, sha256=doc["salt_sha256"], path=salt_path)
+
+    salt = secrets.token_bytes(32)
+    salt_hex = salt.hex()
+    doc = {
+        "seal_version": 1,
+        "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "purpose": (
+            "scoring label-stripping salt (charter §9.8; task #130 decision "
+            "(a)) — HMAC-SHA256 key deriving opaque arm tokens; created once "
+            "per run root so tokens (and instrument-B's content-addressed "
+            "cache) stay deterministic across scoring passes"
+        ),
+        "salt_hex": salt_hex,
+        "salt_sha256": canonical_sha256(salt_hex),
+    }
+    salt_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with salt_path.open("x", encoding="utf-8") as fh:
+            fh.write(json.dumps(doc, indent=2) + "\n")
+    except FileExistsError:
+        # A concurrent pass won the create race — its salt is THE salt.
+        return load_or_create_scoring_salt(salt_path)
+    return ScoringSalt(salt=salt, sha256=doc["salt_sha256"], path=salt_path)
+
+
+class LabelBlinder:
+    """Deterministic arm-label -> opaque-token layer (task #130 decision (a)).
+
+    ``token(label)`` = ``blind-`` + HMAC-SHA256(salt, label)[:16 hex]:
+    deterministic for a fixed salt (cache continuity, decision (c)) and
+    opaque without it. The instance accumulates the token->label map used by
+    the pass's unblind join; a token collision between two DIFFERENT labels
+    (astronomically unlikely, catastrophic if silent) raises."""
+
+    def __init__(self, salt: bytes) -> None:
+        if not salt:
+            raise ScoringBlindingError("empty blinding salt")
+        self._salt = salt
+        self._token_to_label: dict[str, str] = {}
+
+    def token(self, label: str) -> str:
+        digest = hmac.new(
+            self._salt, str(label).encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+        tok = _TOKEN_PREFIX + digest[:_TOKEN_HEX_LEN]
+        prior = self._token_to_label.get(tok)
+        if prior is not None and prior != str(label):
+            raise ScoringBlindingError(
+                f"token collision: {tok!r} maps to both {prior!r} and "
+                f"{label!r} — refusing a non-bijective unblind join"
+            )
+        self._token_to_label[tok] = str(label)
+        return tok
+
+    @property
+    def mapping(self) -> dict[str, str]:
+        """token -> real label, for the sealed per-pass map."""
+        return dict(self._token_to_label)
+
+    def unblind(self, token: str) -> str:
+        try:
+            return self._token_to_label[token]
+        except KeyError:
+            raise ScoringBlindingError(
+                f"unknown blinding token {token!r} — a scored item does not "
+                "unblind to any input row (refusing: silent mis-assignment of "
+                "scores to arms is the failure mode this join check exists "
+                "to make impossible)"
+            ) from None
+
+
+def ephemeral_blinder() -> LabelBlinder:
+    """Per-invocation blinder for legacy/pilot rescoring (decision (b): the
+    pilot archive gains NO new files, so the salt is never persisted there;
+    determinism across passes is irrelevant without a shared cache)."""
+    return LabelBlinder(secrets.token_bytes(32))
+
+
+def unblind_score_rows(
+    rows: list[dict[str, Any]], blinder: LabelBlinder
+) -> list[dict[str, Any]]:
+    """Unblind the ``baseline`` column of score rows — the checked join.
+
+    Every row must carry a token that resolves through the (injective, checked
+    at token() time) map: rows unblind 1:1 to their input rows or the join
+    raises loudly. A row that somehow bypassed blinding (real label where a
+    token belongs) also raises — a half-blinded pass proves nothing."""
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        tok = row.get("baseline")
+        if not isinstance(tok, str) or not tok.startswith(_TOKEN_PREFIX):
+            raise ScoringBlindingError(
+                f"score row baseline {tok!r} is not a blinding token — the "
+                "row bypassed the label-stripping layer (task #130 (a))"
+            )
+        new = dict(row)
+        new["baseline"] = blinder.unblind(tok)
+        out.append(new)
+    return out
+
+
+def blinding_join_checksum(mapping: dict[str, str], n_rows_unblinded: int) -> str:
+    """The pass manifest's join checksum: pins WHICH token->label map was
+    applied to HOW MANY rows (cited by the #112 prereg text)."""
+    return canonical_sha256(
+        {"mapping": mapping, "n_rows_unblinded": n_rows_unblinded}
+    )
+
+
+def write_blinding_map(map_path: Path, mapping: dict[str, str]) -> str:
+    """Seal the pass's token->label map (self-hashed); returns map_sha256."""
+    doc = {
+        "seal_version": 1,
+        "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "purpose": (
+            "token->label unblind map for ONE scoring pass (charter §9.8; "
+            "task #130 decision (a)) — the sealed record of the join that "
+            "unblinded this pass's output artifacts"
+        ),
+        "map_sha256": canonical_sha256(mapping),
+        "mapping": mapping,
+    }
+    map_path.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8")
+    return doc["map_sha256"]
+
+
+# ---------------------------------------------------------------------------
+# Task #130 decision (b): pilot-archive read-only guard for --apply
+# ---------------------------------------------------------------------------
+
+
+def _pilot_archive_root() -> Path:
+    """The read-only pilot archive root (RESULTS_LAYOUT §7).
+
+    Default: the repo's results/ tree. $CAGE_PILOT_ARCHIVE overrides —
+    explicit and test-friendly, never a heuristic."""
+    raw = os.environ.get(PILOT_ARCHIVE_ENV)
+    root = Path(raw).expanduser() if raw else REPO_ROOT / "results"
+    return root.resolve()
+
+
+def _is_under_pilot_archive(path: Path) -> bool:
+    try:
+        Path(path).resolve().relative_to(_pilot_archive_root())
+    except ValueError:
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Task #130 decision (d): --abandon (audit H10 — a crashed pass permanently
+# blocked its scoring_run_id; completed passes stay untouchable audit record)
+# ---------------------------------------------------------------------------
+
+
+def abandon_scoring_pass(
+    root: Path, scoring_run_id: str, *, reason: str, force: bool = False
+) -> Path:
+    """Rename scoring/<id>/ to scoring/<id>.abandoned-<UTCstamp>/ + tombstone.
+
+    Frees ``scoring_run_id`` for a clean retry (§6 passes are append-only, so
+    a crashed pass otherwise burns its id forever — audit H10). Refuses a
+    pass whose own ledger VERIFIES complete unless ``force``: completed
+    passes are audit record, not failures. Returns the renamed path. The
+    tombstone records the reason, the timestamp, and what was present."""
+    from src.analysis.stats.ledger import LedgerError, verify_ledger
+
+    if not SCORING_RUN_ID_RE.match(scoring_run_id):
+        raise ScoringAbandonError(
+            f"scoring run id {scoring_run_id!r} violates the §6 grammar "
+            f"{SCORING_RUN_ID_RE.pattern} — refusing (an id with separators "
+            "could escape scoring/)"
+        )
+    if not isinstance(reason, str) or not reason.strip():
+        raise ScoringAbandonError(
+            "--abandon requires a non-empty --reason (the tombstone is the "
+            "§9.10 record of WHY the pass was abandoned)"
+        )
+    pass_dir = Path(root) / SCORING_DIRNAME / scoring_run_id
+    if not pass_dir.is_dir():
+        raise ScoringAbandonError(f"no scoring pass to abandon: {pass_dir}")
+
+    ledger_path = pass_dir / "ledger.json"
+    if not ledger_path.is_file():
+        ledger_state = "absent"
+    else:
+        try:
+            mismatches = verify_ledger(ledger_path, pass_dir)
+        except LedgerError as exc:
+            ledger_state = f"corrupt ({exc})"
+        else:
+            ledger_state = "verified" if not mismatches else (
+                f"mismatched ({len(mismatches)} line(s))"
+            )
+    if ledger_state == "verified" and not force:
+        raise ScoringAbandonError(
+            f"{pass_dir} has a VERIFIED complete ledger — completed passes "
+            "are audit record, not failures (RESULTS_LAYOUT §6). Pass "
+            "--force-abandon to abandon it anyway."
+        )
+
+    now = datetime.now(timezone.utc)
+    target = pass_dir.with_name(
+        f"{scoring_run_id}.abandoned-{now.strftime(_ABANDON_STAMP_FMT)}"
+    )
+    if target.exists():
+        raise ScoringAbandonError(
+            f"{target} already exists (two abandons of the same id within "
+            "one second?) — retry"
+        )
+
+    # Census BEFORE the rename: the tombstone honestly records what was there.
+    all_files = [p for p in sorted(pass_dir.rglob("*")) if p.is_file()]
+    tombstone = {
+        "schema_version": 1,
+        "scoring_run_id": scoring_run_id,
+        "abandoned_utc": now.isoformat(timespec="seconds"),
+        "reason": reason.strip(),
+        "forced": bool(force),
+        "ledger_state": ledger_state,
+        "present": {
+            "manifest": (pass_dir / SCORING_MANIFEST_NAME).is_file(),
+            "ledger": ledger_path.is_file(),
+            "n_files": len(all_files),
+            "n_cell_files": len(
+                [p for p in all_files if "cells" in p.relative_to(pass_dir).parts]
+            ),
+        },
+    }
+    pass_dir.rename(target)
+    (target / ABANDONED_TOMBSTONE_NAME).write_text(
+        json.dumps(tombstone, indent=2) + "\n", encoding="utf-8"
+    )
+    return target
+
+
+def run_abandon(root: Path, args: argparse.Namespace) -> int:
+    """CLI wrapper for --abandon (shared with score_instrument_b.py)."""
+    try:
+        target = abandon_scoring_pass(
+            root,
+            args.abandon,
+            reason=args.reason or "",
+            force=bool(getattr(args, "force_abandon", False)),
+        )
+    except ScoringAbandonError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    print(f"ABANDONED  id={args.abandon}")
+    print(f"  moved to : {target}")
+    print(f"  tombstone: {target / ABANDONED_TOMBSTONE_NAME}")
+    print(f"  the id {args.abandon!r} is free for a clean retry")
+    return 0
+
+
+def _json_default(obj: Any) -> Any:
+    """qa_scores.jsonl JSON fallback (task #127, audit H3 'default=str drift'):
+    numpy scalars/arrays become native numbers/lists, never quoted strings;
+    everything else falls back to str exactly as the historical default=str."""
+    import numpy as np
+
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return str(obj)
+
+
+def _evidence_row_key(rec: dict[str, Any]) -> tuple[Any, str, Any]:
+    """Identity of one evidence row: (example_id, repeat_index, record_index).
+
+    record_index is the open-loop replay disambiguator stamped by
+    run_experiment.py (task #127); pre-#127 evidence lacks the field -> None,
+    so genuinely replayed rows in old files collide -- which is exactly the
+    ambiguity the duplicate guard must surface, not paper over."""
+    return (
+        rec.get("example_id"),
+        str(rec.get("repeat_index") or "0"),
+        rec.get("record_index"),
+    )
+
+
+class DuplicateEvidenceError(ValueError):
+    """Duplicate (example_id, repeat_index, record_index) evidence rows.
+
+    Task #127 (audit H3): identical triples mean the SAME logical row appears
+    more than once; silently scoring both (or keeping an arbitrary one) is an
+    uncounted exclusion (charter §9.10). Refuse by default -- aligned with
+    instrument_b_runner, which raises on duplicate item ids -- unless the
+    operator passes --allow-duplicates (keep-last, dropped count persisted)."""
+
+    def __init__(self, ev_path: Path, dup_counts: dict[tuple[Any, str, Any], int]) -> None:
+        self.ev_path = ev_path
+        self.dup_counts = dup_counts
+        n_extra = sum(c - 1 for c in dup_counts.values())
+        shown = sorted(dup_counts, key=repr)[:10]
+        more = "" if len(dup_counts) <= 10 else f" (+{len(dup_counts) - 10} more keys)"
+        super().__init__(
+            f"{ev_path}: {len(dup_counts)} duplicate (example_id, repeat_index, "
+            f"record_index) key(s) / {n_extra} extra row(s): {shown}{more}. "
+            "Pass --allow-duplicates to keep-last (dropped rows are persisted "
+            "as n_duplicates_dropped, charter §9.10)."
+        )
+
+
+def _duplicate_key_counts(ev_path: Path) -> dict[tuple[Any, str, Any], int]:
+    """Duplicate-key census of one evidence file (keys seen more than once)."""
+    keys = [
+        _evidence_row_key(json.loads(line))
+        for line in ev_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    return {k: c for k, c in Counter(keys).items() if c > 1}
+
 
 def _fmt_cell(v) -> str:
     if v is None:
@@ -131,6 +620,29 @@ def _fmt_cell(v) -> str:
     if isinstance(v, bool):
         return str(v)
     return str(v)
+
+
+def _write_rescored_csv(out_path: Path, rows_out: list[dict[str, Any]]) -> None:
+    """Write one results_rescored.csv (legacy sidecar layout).
+
+    Header = union of keys across ALL rows (first-seen order), not row 0's
+    keys: QualityMetrics.to_dict() is row-dependent (hallucination_detected
+    appears only when LettuceDetect returns a verdict), so row 0
+    under-specifies the header. Live failure 2026-07-16: "dict contains
+    fields not in fieldnames". Extracted (task #130) so the blinding
+    no-blinding-control checksum test writes its control CSV through the
+    EXACT same writer."""
+    fieldnames = list(rows_out[0].keys())
+    seen = set(fieldnames)
+    for row in rows_out[1:]:
+        for key in row.keys():
+            if key not in seen:
+                seen.add(key)
+                fieldnames.append(key)
+    with out_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, restval="")
+        writer.writeheader()
+        writer.writerows(rows_out)
 
 
 def _apply_to_results_csv(trial_dir: Path, rows_out: list, full_mode: bool) -> int:
@@ -183,13 +695,29 @@ def _apply_to_results_csv(trial_dir: Path, rows_out: list, full_mode: bool) -> i
 
 
 def _score_evidence_file(
-    ev_path: Path, evaluator: Any, batch_size: int | None = None
-) -> list[dict[str, Any]]:
+    ev_path: Path,
+    evaluator: Any,
+    batch_size: int | None = None,
+    allow_duplicates: bool = False,
+    blinder: LabelBlinder | None = None,
+) -> tuple[list[dict[str, Any]], int]:
     """Score every record of one qa_evidence.jsonl; shared by both layouts.
 
-    Behavior is byte-identical to the historical inline loop: B4 sanitized
-    abstention gate, M5 all-answers max-over-golds, B3d dual scoring against
-    pre-compression originals when the evidence carries them.
+    Returns ``(rows_out, n_duplicates_dropped)``. Duplicate
+    (example_id, repeat_index, record_index) rows RAISE
+    ``DuplicateEvidenceError`` unless ``allow_duplicates`` (then: keep-LAST,
+    and the dropped count is returned so callers persist it -- task #127,
+    charter §9.10: exclusions countable from artifacts).
+
+    ``blinder`` (task #130 decision (a), charter §9.8): when given, the
+    arm-bearing cell identity (the evidence ``baseline`` field, else the
+    row_key directory name) is replaced by its opaque token in the emitted
+    rows — nothing inside the scoring boundary carries arm identity; callers
+    unblind at output time via :func:`unblind_score_rows` (checked join).
+
+    Behavior is otherwise byte-identical to the historical inline loop: B4
+    sanitized abstention gate, M5 all-answers max-over-golds, B3d dual scoring
+    against pre-compression originals when the evidence carries them.
 
     Scoring routes through ``QualityEvaluator.batch_evaluate`` (D8 §8.1;
     review 2026-08-04 §4.6 L3). ``batch_size=None`` (default) passes
@@ -230,7 +758,26 @@ def _score_evidence_file(
             "all_answers": all_answers,
         })
     if not records:
-        return []
+        return [], 0
+
+    # Duplicate guard (task #127, audit H3): identical row keys are refused
+    # unless --allow-duplicates, in which case the LAST occurrence wins and the
+    # drop is counted for persistence (never stdout-only, §9.10).
+    keys = [_evidence_row_key(r["rec"]) for r in records]
+    dup_counts = {k: c for k, c in Counter(keys).items() if c > 1}
+    n_duplicates_dropped = 0
+    if dup_counts:
+        if not allow_duplicates:
+            raise DuplicateEvidenceError(ev_path, dup_counts)
+        last_index: dict[tuple[Any, str, Any], int] = {}
+        for i, key in enumerate(keys):
+            last_index[key] = i
+        keep = sorted(last_index.values())
+        n_duplicates_dropped = len(records) - len(keep)
+        print(f"[rescore] {ev_path}: {len(dup_counts)} duplicate (example_id, "
+              f"repeat_index, record_index) key(s); kept LAST, dropped "
+              f"{n_duplicates_dropped} row(s) (--allow-duplicates)")
+        records = [records[i] for i in keep]
 
     # Phase 2: ONE scoring call for both modes.
     metrics_list = evaluator.batch_evaluate(
@@ -286,13 +833,21 @@ def _score_evidence_file(
         old_g = rec.get("grounding_score")
         old_g = None if old_g in (None, "", "None") else float(old_g)
 
-        cell = rec.get("baseline") or ev_path.parent.parent.name
+        # Task #130 (a): the cell identity is arm-bearing (either the evidence
+        # "baseline" field or the cells/<row_key>/ directory) — with a blinder
+        # the row carries its opaque token, never the real label.
+        cell_source = rec.get("baseline") or ev_path.parent.parent.name
+        cell = blinder.token(str(cell_source)) if blinder is not None else cell_source
 
         rows_out.append({
             "example_id": rec.get("example_id"),
             "baseline": cell,
             "trial_dir": ev_path.parent.name,
             "repeat_index": str(rec.get("repeat_index") or "0"),
+            # Task #127: the open-loop replay disambiguator (None on closed-loop
+            # rows and pre-#127 evidence) rides into the score rows so a
+            # keep-last dedup pass stays reconstructible from qa_scores.jsonl.
+            "record_index": rec.get("record_index"),
             "generated_answer": generated,
             "reference_answer": reference,
             "abstained": abstained,
@@ -302,7 +857,7 @@ def _score_evidence_file(
             "faithfulness_source": faithfulness_source,
             "grounding_source": grounding_source,
         })
-    return rows_out
+    return rows_out, n_duplicates_dropped
 
 
 def _build_evaluator(args: argparse.Namespace) -> Any:
@@ -369,19 +924,41 @@ def _instrument_models(evaluator: Any) -> dict[str, Any]:
     return models
 
 
-def _quality_aggregate(rows_out: list[dict[str, Any]]) -> dict[str, Any]:
-    """Per-window quality.json: counts + means of the numeric score columns."""
+def _quality_aggregate(
+    rows_out: list[dict[str, Any]], n_duplicates_dropped: int = 0
+) -> dict[str, Any]:
+    """Per-window quality.json: per-metric mean WITH its denominators.
+
+    Task #127 (audit H11): every aggregated key carries ``n`` (rows that
+    actually scored) and ``n_none`` (rows missing/None for that key) alongside
+    ``mean`` -- a metric scored on 3/500 rows must be distinguishable from full
+    coverage. Aggregation is restricted to the ``_QUALITY_AGG_KEYS`` allowlist
+    so provenance numerics (old_grounding_score, record_index, ...) never fold
+    into a mean. ``mean`` is None when no row scored -- absence is not zero.
+    """
     n_abstained = sum(1 for r in rows_out if r.get("abstained"))
-    sums: dict[str, list[float]] = {}
-    for row in rows_out:
-        for key, value in row.items():
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                continue
-            sums.setdefault(key, []).append(float(value))
+    metrics: dict[str, dict[str, Any]] = {}
+    for key in sorted(_QUALITY_AGG_KEYS):
+        values = [
+            float(row[key])
+            for row in rows_out
+            if isinstance(row.get(key), (int, float))
+        ]
+        metrics[key] = {
+            "mean": (sum(values) / len(values)) if values else None,
+            "n": len(values),
+            "n_none": len(rows_out) - len(values),
+        }
     return {
         "rows": len(rows_out),
         "abstained": n_abstained,
-        "means": {k: sum(v) / len(v) for k, v in sorted(sums.items()) if v},
+        # §9.10: keep-last dedup losses are persisted here, not stdout-only.
+        "n_duplicates_dropped": n_duplicates_dropped,
+        # Back-compat convenience view (scored keys only, same allowlist —
+        # provenance numerics no longer fold in); "metrics" with its explicit
+        # n / n_none denominators is the authoritative form.
+        "means": {k: m["mean"] for k, m in metrics.items() if m["n"] > 0},
+        "metrics": metrics,
     }
 
 
@@ -447,18 +1024,53 @@ def run_scoring_tree(root: Path, scoring_run_id: str, args: argparse.Namespace) 
               file=sys.stderr)
         return 2
 
-    evaluator = _build_evaluator(args)
-    # getattr: hand-built Namespaces predating the --batch-size flag (and older
-    # callers) keep the sequential default — defaults preserved, fail-open to
-    # the historical behavior, never to a new one.
+    # getattr: hand-built Namespaces predating the newer flags (and older
+    # callers) keep the historical defaults — fail-open to the historical
+    # behavior, never to a new one.
     batch_size = getattr(args, "batch_size", None)
+    allow_duplicates = bool(getattr(args, "allow_duplicates", False))
+
+    # Duplicate guard pre-scan (task #127, audit H3) BEFORE the tree is
+    # created: scoring ids are append-only, so a refusal mid-pass would burn
+    # the id on a partial tree. Refuse here, with counts and offending keys.
+    if not allow_duplicates:
+        for ev_path in evidence_files:
+            dup_counts = _duplicate_key_counts(ev_path)
+            if dup_counts:
+                print(f"ERROR: {DuplicateEvidenceError(ev_path, dup_counts)}",
+                      file=sys.stderr)
+                return 2
+
+    # Task #130 decision (a): label stripping is the DEFAULT. The per-run-root
+    # salt (sealed, shared with score_instrument_b.py) keeps tokens — and the
+    # instrument-B cache — deterministic across passes. The control escape
+    # hatch exists ONLY for the blinding-equivalence checksum test and is
+    # recorded loudly in the manifest.
+    no_blinding = bool(getattr(args, "no_blinding_control", False))
+    blinder: LabelBlinder | None = None
+    scoring_salt: ScoringSalt | None = None
+    if not no_blinding:
+        scoring_salt = load_or_create_scoring_salt(
+            root / SCORING_DIRNAME / SALT_FILE_NAME
+        )
+        blinder = LabelBlinder(scoring_salt.salt)
+
+    evaluator = _build_evaluator(args)
     written: list[Path] = []
     total_rows = 0
     total_abstained = 0
+    total_duplicates_dropped = 0
 
     scoring_dir.mkdir(parents=True)
     for ev_path in evidence_files:
-        rows_out = _score_evidence_file(ev_path, evaluator, batch_size=batch_size)
+        rows_out, n_dup = _score_evidence_file(
+            ev_path, evaluator, batch_size=batch_size,
+            allow_duplicates=allow_duplicates, blinder=blinder,
+        )
+        # Task #130 (a): the unblind join — output artifacts carry REAL
+        # labels; the join is bijective and checked (loud failure).
+        if blinder is not None:
+            rows_out = unblind_score_rows(rows_out, blinder)
         rel_window = ev_path.parent.relative_to(root)  # cells/<row_key>/window_<k>
         out_window = scoring_dir / rel_window
         out_window.mkdir(parents=True, exist_ok=True)
@@ -466,18 +1078,46 @@ def run_scoring_tree(root: Path, scoring_run_id: str, args: argparse.Namespace) 
         scores_path = out_window / QA_SCORES_NAME
         with scores_path.open("w", encoding="utf-8") as fh:
             for row in rows_out:
-                fh.write(json.dumps(row, default=str) + "\n")
+                fh.write(json.dumps(row, default=_json_default) + "\n")
         written.append(scores_path)
 
         quality_path = out_window / QUALITY_JSON_NAME
         quality_path.write_text(
-            json.dumps(_quality_aggregate(rows_out), indent=2) + "\n",
+            json.dumps(
+                _quality_aggregate(rows_out, n_duplicates_dropped=n_dup), indent=2
+            )
+            + "\n",
             encoding="utf-8",
         )
         written.append(quality_path)
 
         total_rows += len(rows_out)
         total_abstained += sum(1 for r in rows_out if r.get("abstained"))
+        total_duplicates_dropped += n_dup
+
+    # Task #130 (a): seal this pass's token->label map and stamp the
+    # "blinding" section the #112 prereg text cites.
+    if blinder is not None and scoring_salt is not None:
+        map_path = scoring_dir / BLINDING_MAP_NAME
+        map_sha256 = write_blinding_map(map_path, blinder.mapping)
+        written.append(map_path)
+        blinding_section: dict[str, Any] = {
+            "mode": BLINDING_MODE_STRIPPED,
+            "salt_file": f"{SCORING_DIRNAME}/{SALT_FILE_NAME}",  # run-root-relative
+            "salt_sha256": scoring_salt.sha256,
+            "map_file": BLINDING_MAP_NAME,
+            "map_sha256": map_sha256,
+            "join_checksum": blinding_join_checksum(blinder.mapping, total_rows),
+            "n_labels": len(blinder.mapping),
+            "n_rows_unblinded": total_rows,
+        }
+    else:
+        blinding_section = {
+            "mode": BLINDING_MODE_CONTROL,
+            "note": ("NO label stripping — test-only control for the #130 "
+                     "blinding-equivalence checksum; never a registered "
+                     "confirmatory pass"),
+        }
 
     scoring_manifest = {
         "scoring_run_id": scoring_run_id,
@@ -497,6 +1137,11 @@ def run_scoring_tree(root: Path, scoring_run_id: str, args: argparse.Namespace) 
         "raw_run_ledger_entries_sha256": entries_sha256,
         "n_evidence_files": len(evidence_files),
         "n_rows": total_rows,
+        # Task #127 duplicate accounting (§9.10: countable from artifacts).
+        "allow_duplicates": allow_duplicates,
+        "n_duplicates_dropped": total_duplicates_dropped,
+        # Task #130 decision (a) — §9.8 label stripping (cited by #112 prereg).
+        "blinding": blinding_section,
         **_git_provenance(),
     }
     manifest_out = scoring_dir / SCORING_MANIFEST_NAME
@@ -533,6 +1178,29 @@ def main() -> int:
         print(f"ERROR: {root} does not exist", file=sys.stderr)
         return 2
 
+    if getattr(args, "abandon", None) is not None:
+        # Task #130 decision (d): --abandon is its own operation — combining
+        # it with a scoring run would blur which pass the flags describe.
+        if args.scoring_run_id is not None or args.apply:
+            print("ERROR: --abandon is exclusive with --scoring-run-id/--apply",
+                  file=sys.stderr)
+            return 2
+        return run_abandon(root, args)
+
+    # Task #130 decision (b): the pilot archive is READ-ONLY (RESULTS_LAYOUT
+    # §7); --apply mutates results.csv in place and is refused fail-fast for
+    # any run root inside it. Sidecar outputs are the only rescore products
+    # there; --apply keeps working for non-archive scratch trees.
+    if args.apply and _is_under_pilot_archive(root):
+        print(f"ERROR: --apply refused: {root} is inside the read-only pilot "
+              f"archive ({_pilot_archive_root()}) — RESULTS_LAYOUT §7: "
+              "pilot-era data stays exactly where it is, read-only; sidecar "
+              "outputs (results_rescored.csv + accounting) are the ONLY "
+              "rescore products there (task #130 decision (b)). Copy the tree "
+              f"to a scratch dir to --apply, or unset ${PILOT_ARCHIVE_ENV} "
+              "override if this is not the archive.", file=sys.stderr)
+        return 2
+
     if args.scoring_run_id is not None:
         return run_scoring_tree(root, args.scoring_run_id, args)
 
@@ -543,14 +1211,50 @@ def main() -> int:
 
     evaluator = _build_evaluator(args)
     batch_size = getattr(args, "batch_size", None)  # see run_scoring_tree note
+    allow_duplicates = bool(getattr(args, "allow_duplicates", False))
+    # Task #130 (a): legacy passes blind too (ephemeral salt — decision (b)
+    # forbids persisting anything new into the pilot archive; determinism
+    # across passes is irrelevant without a shared cache).
+    blinder = (
+        None if getattr(args, "no_blinding_control", False) else ephemeral_blinder()
+    )
 
     total_rows = 0
     total_abstained = 0
+    total_duplicates_dropped = 0
     newly_na_grounding = 0  # abstained rows the ORIGINAL run had scored with a grounding number
     per_cell: dict[str, list[int]] = {}
 
     for ev_path in evidence_files:
-        rows_out = _score_evidence_file(ev_path, evaluator, batch_size=batch_size)
+        try:
+            rows_out, n_dup = _score_evidence_file(
+                ev_path, evaluator, batch_size=batch_size,
+                allow_duplicates=allow_duplicates, blinder=blinder,
+            )
+        except DuplicateEvidenceError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        # Task #130 (a): unblind at output time (checked bijective join) —
+        # results_rescored.csv and the accounting stay real-labeled.
+        if blinder is not None:
+            rows_out = unblind_score_rows(rows_out, blinder)
+        total_duplicates_dropped += n_dup
+        if n_dup:
+            # §9.10: the keep-last drop must be countable from an artifact,
+            # not stdout -- sidecar next to this trial's rescored CSV.
+            accounting_path = ev_path.parent / f"{args.out_name}.accounting.json"
+            accounting_path.write_text(
+                json.dumps(
+                    {
+                        "evidence_file": ev_path.name,
+                        "n_rows_scored": len(rows_out),
+                        "n_duplicates_dropped": n_dup,
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
         for row in rows_out:
             total_rows += 1
             if row["abstained"]:
@@ -563,28 +1267,25 @@ def main() -> int:
             per_cell[cell][1] += int(bool(row["abstained"]))
 
         if rows_out:
-            out_path = ev_path.parent / args.out_name
-            # Header = union of keys across ALL rows (first-seen order), not row 0's keys:
-            # QualityMetrics.to_dict() is row-dependent (hallucination_detected appears only
-            # when LettuceDetect returns a verdict), so row 0 under-specifies the header.
-            # Live failure 2026-07-16: "dict contains fields not in fieldnames".
-            fieldnames = list(rows_out[0].keys())
-            _seen = set(fieldnames)
-            for _r in rows_out[1:]:
-                for _k in _r.keys():
-                    if _k not in _seen:
-                        _seen.add(_k)
-                        fieldnames.append(_k)
-            with out_path.open("w", newline="", encoding="utf-8") as fh:
-                writer = csv.DictWriter(fh, fieldnames=fieldnames, restval="")
-                writer.writeheader()
-                writer.writerows(rows_out)
+            _write_rescored_csv(ev_path.parent / args.out_name, rows_out)
             if args.apply:
+                # Task #130 (b) belt-and-suspenders: the fail-fast root guard
+                # above covers the tree, but a symlinked trial dir could still
+                # resolve into the archive — refuse per trial too.
+                if _is_under_pilot_archive(ev_path.parent):
+                    print(f"ERROR: --apply refused for {ev_path.parent}: "
+                          "resolves inside the read-only pilot archive "
+                          "(RESULTS_LAYOUT §7; task #130 decision (b))",
+                          file=sys.stderr)
+                    return 2
                 n_upd = _apply_to_results_csv(ev_path.parent, rows_out, args.full)
                 print(f"  applied -> {ev_path.parent}/results.csv ({n_upd} rows updated)")
 
     mode = "FULL" if args.full else "FAST (model-free metrics + abstention short-circuit)"
     print(f"RESCORE_DONE  mode={mode}  files={len(evidence_files)}  rows={total_rows}")
+    if total_duplicates_dropped:
+        print(f"  duplicate rows dropped (keep-last, --allow-duplicates): "
+              f"{total_duplicates_dropped}")
     print(f"  abstentions detected: {total_abstained}")
     print(f"  abstained rows the original run had scored for grounding "
           f"(now correctly N/A): {newly_na_grounding}")

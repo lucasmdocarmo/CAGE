@@ -68,6 +68,7 @@ __all__ = [
     "RequestRecord",
     "DispatchReport",
     "OpenLoopDispatcher",
+    "ensure_no_measured_replay",
     "trim_to_measurement_window",
 ]
 
@@ -638,6 +639,53 @@ class OpenLoopDispatcher:
             state.in_flight -= 1
             if semaphore is not None:
                 semaphore.release()
+
+
+def ensure_no_measured_replay(
+    schedule: ArrivalSchedule,
+    n_unique_requests: int,
+    *,
+    allow_replay: bool = False,
+) -> bool:
+    """E4 replay pin (code-assertion walkthrough 2026-08-12): measured windows
+    never replay a request unless the operator EXPLICITLY labels the run.
+
+    Duration-mode schedules map index i to ``requests[i % n]``, so a schedule
+    longer than the prepared set issues some examples MORE THAN ONCE inside
+    the window. That is forbidden for confirmatory cells for two registered
+    reasons: (a) duplicate example_ids meet the per-example paired joins of
+    the stats layer (§9.4 pairing is per example_id), and (b) a replayed
+    request re-arrives with its prefix already hot, silently shifting the
+    cell's cache-locality profile mid-window. Returns False when the schedule
+    fits within the unique set (no replay), True when replay WILL occur and
+    ``allow_replay`` says the caller accepted it (the caller must label the
+    run non-confirmatory and warn loudly); otherwise raises the typed
+    fail-closed error.
+    """
+    if not isinstance(schedule, ArrivalSchedule):
+        raise LoadGeneratorError("schedule", schedule, "must be an ArrivalSchedule")
+    if not isinstance(n_unique_requests, int) or isinstance(n_unique_requests, bool):
+        raise LoadGeneratorError(
+            "n_unique_requests", n_unique_requests, "must be an int"
+        )
+    if n_unique_requests <= 0:
+        raise LoadGeneratorError(
+            "n_unique_requests", n_unique_requests, "must be > 0"
+        )
+    if schedule.n_arrivals <= n_unique_requests:
+        return False
+    if not allow_replay:
+        raise LoadGeneratorError(
+            "n_arrivals",
+            schedule.n_arrivals,
+            f"schedule wraps past the {n_unique_requests} unique prepared "
+            f"request(s): a measured window would replay examples (duplicate "
+            f"example_ids break per-example pairing; a replayed request hits "
+            f"warm prefix cache and shifts the locality profile). Shorten the "
+            f"window / raise the manifest size, or set CAGE_ALLOW_REPLAY=1 to "
+            f"accept replay for a NON-confirmatory, labeled run",
+        )
+    return True
 
 
 # --------------------------------------------------------------------------- #

@@ -345,7 +345,11 @@ def test_dispatch_open_loop_rows_carry_the_three_new_fields():
         assert record.result.generated_text == "stub answer"
 
 
-def test_dispatch_open_loop_maps_schedule_index_modulo_requests():
+def test_dispatch_open_loop_maps_schedule_index_modulo_requests(monkeypatch):
+    # 5 arrivals over 2 requests is a deliberate replay: the E4 measured-window
+    # replay guard refuses it unless CAGE_ALLOW_REPLAY=1 (labeled
+    # non-confirmatory) — this test pins the modulo mapping on that path.
+    monkeypatch.setenv("CAGE_ALLOW_REPLAY", "1")
     engine = _StubAsyncEngine()
     kept, _report = runner.dispatch_open_loop(
         engine, _requests(2), rate_qps=200.0, seed=3, n_arrivals=5

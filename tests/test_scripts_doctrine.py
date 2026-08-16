@@ -62,6 +62,18 @@ def _rel(p: Path) -> str:
     return str(p.relative_to(REPO_ROOT))
 
 
+def _sources_file(text: str, name: str) -> bool:
+    """True only for an actual `source` / `.` STATEMENT naming the file.
+
+    A bare substring check is satisfiable by a shellcheck directive or prose
+    comment mentioning the file with the real source line deleted — the exact
+    mirror-drift the doctrine exists to prevent (adversarial review
+    2026-08-12 on the D1 launcher test). The path portion may contain spaces
+    (e.g. `source "$(cd "$(dirname ...)" && pwd)/_common.sh"`), so match any
+    non-comment run after the source keyword rather than a single \\S+ token."""
+    return re.search(rf"^\s*(?:source|\.)\s+[^#\n]*{re.escape(name)}", text, re.M) is not None
+
+
 # ---------------------------------------------------------------------------
 # 1. _common.sh adoption
 # ---------------------------------------------------------------------------
@@ -72,7 +84,7 @@ def test_every_nondeprecated_script_sources_common_sh() -> None:
         rel = _rel(script)
         if rel in SOURCING_EXEMPT:
             continue
-        if "_common.sh" not in script.read_text(encoding="utf-8"):
+        if not _sources_file(script.read_text(encoding="utf-8"), "_common.sh"):
             missing.append(rel)
     assert not missing, (
         "scripts not sourcing scripts/lib/_common.sh (add the source line or a "
@@ -145,6 +157,112 @@ def _is_bare_floor(spec: str) -> bool:
     has_floor = ">=" in spec or bool(re.search(r"(?<!=)>(?!=)", spec))
     has_cap = "<" in spec or "~=" in spec
     return has_floor and not has_cap
+
+
+# ---------------------------------------------------------------------------
+# 3. Canonical interpreter (B1) + shipped-tree guard (B3) — code assertion
+#    walkthrough 2026-08-07 (MyDocs/CODE_ASSERTION_2026-08.md).
+# ---------------------------------------------------------------------------
+
+# The ONE canonical CPython. Must equal CAGE_CANONICAL_PYTHON in _common.sh,
+# the requirements.txt header, and the setup script's provisioning target.
+CANONICAL_PYTHON = "3.13"
+
+
+def test_canonical_python_single_source_of_truth() -> None:
+    """B1: the interpreter is declared in exactly one place and echoed
+    consistently — requirements header, _common.sh constant, and the GPU
+    bootstrap must all agree, and the bootstrap must never use bare python3."""
+    common = (SCRIPTS_DIR / "lib" / "_common.sh").read_text(encoding="utf-8")
+    m = re.search(r'CAGE_CANONICAL_PYTHON="(\d+\.\d+)"', common)
+    assert m, "_common.sh no longer defines CAGE_CANONICAL_PYTHON"
+    assert m.group(1) == CANONICAL_PYTHON, (
+        f"_common.sh says {m.group(1)}, test constant says {CANONICAL_PYTHON} "
+        f"— update BOTH deliberately or neither"
+    )
+
+    req_header = "\n".join(
+        (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()[:5]
+    )
+    assert f"Python {CANONICAL_PYTHON} required" in req_header, (
+        "requirements.txt header must declare the canonical interpreter "
+        f"(expected 'Python {CANONICAL_PYTHON} required')"
+    )
+
+    setup = (SCRIPTS_DIR / "1_setup" / "setup_gpu_cloud.sh").read_text(encoding="utf-8")
+    assert 'PYBIN="python${CAGE_CANONICAL_PYTHON}"' in setup, (
+        "setup_gpu_cloud.sh must derive its interpreter from CAGE_CANONICAL_PYTHON"
+    )
+    assert re.search(r"^\s*python3 -m venv", setup, re.M) is None, (
+        "setup_gpu_cloud.sh creates a venv with bare `python3` — finding B1: "
+        "the venv must be created with the canonical interpreter, fail-closed"
+    )
+
+
+def test_engine_launchers_source_uniform_serving_config() -> None:
+    """D1 (walkthrough Topic 4, 2026-08-12): scripts/lib/_serving_config.sh is
+    the serving-uniformity source of truth ALL engine launchers must source —
+    an engine launched outside the uniform regime silently breaks §6.5
+    cross-mechanism fairness. Pins every manage_*_server.sh (vllm, sglang,
+    lmdeploy today; any future engine automatically) to source it."""
+    launchers = sorted((SCRIPTS_DIR / "2_serving").glob("manage_*_server.sh"))
+    assert len(launchers) >= 3, (
+        f"expected the three engine launchers (vllm/sglang/lmdeploy), found: "
+        f"{[p.name for p in launchers]}"
+    )
+    missing = [
+        _rel(p) for p in launchers
+        if not _sources_file(p.read_text(encoding="utf-8"), "_serving_config.sh")
+    ]
+    assert not missing, (
+        "engine launchers not sourcing scripts/lib/_serving_config.sh "
+        f"(uniform-serving doctrine, D1): {missing}"
+    )
+
+
+def _git_ls_files() -> set:
+    """Tracked paths (index-inclusive), or skip when git/its metadata is absent
+    — a tarball deploy on the VM has no .git and BUILD_INFO is the provenance."""
+    if not (REPO_ROOT / ".git").exists():
+        pytest.skip("not a git checkout (tarball deploy)")
+    if shutil.which("git") is None:
+        pytest.skip("git unavailable")
+    out = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "ls-files", "--",
+         "scripts", "src", "configs", "requirements.txt", "pytest.ini"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    return set(out.splitlines())
+
+
+def test_deployable_code_is_tracked_by_git() -> None:
+    """B3 (the A1 vaccine): worktree presence is NOT shipped-ness. The deploy
+    tarball is `git archive HEAD`, so every deployable file must be TRACKED —
+    an is_file() guard passed for three days while scripts/lib/_common.sh was
+    silently absent from every tarball (gitignore `lib/` shadowing)."""
+    tracked = _git_ls_files()
+    wanted = [
+        p for p in sorted((REPO_ROOT / "scripts").rglob("*"))
+        if p.suffix in (".sh", ".py") and "__pycache__" not in p.parts
+    ]
+    wanted += [
+        p for p in sorted((REPO_ROOT / "src").rglob("*.py"))
+        if "__pycache__" not in p.parts
+    ]
+    wanted += [
+        p for p in sorted((REPO_ROOT / "configs").rglob("*"))
+        if p.is_file() and p.name != ".DS_Store"
+    ]
+    wanted += [REPO_ROOT / "requirements.txt", REPO_ROOT / "pytest.ini"]
+    missing = [
+        str(p.relative_to(REPO_ROOT))
+        for p in wanted
+        if str(p.relative_to(REPO_ROOT)) not in tracked
+    ]
+    assert not missing, (
+        "on disk but NOT tracked by git — these will silently NOT ship in the "
+        f"deploy tarball (git archive HEAD): {missing}"
+    )
 
 
 def test_no_scientific_instrument_is_bare_floor_pinned() -> None:

@@ -31,6 +31,7 @@ from src.analysis.stats.calibration import (
     inject_effect,
     recover_power,
 )
+from src.analysis.stats import ledger as ledger_mod
 from src.analysis.stats.ledger import (
     LedgerError,
     hash_artifacts,
@@ -434,6 +435,118 @@ class TestLedger:
             hash_artifacts([real], base_dir=tmp_path / "elsewhere")
         with pytest.raises(LedgerError, match="empty ledger"):
             write_ledger({}, tmp_path / "ledger.json")
+
+    # ---- task #129 / H7: extra-file detection + key-join semantics ----
+
+    def test_extra_file_reported_only_with_extra_roots(
+        self, artifacts: tuple[Path, list[Path]], tmp_path: Path
+    ) -> None:
+        base, files = artifacts
+        ledger_path = write_ledger(
+            hash_artifacts(files, base_dir=base), tmp_path / "ledger.json"
+        )
+        sneaky = base / "baselines" / "sneaky.jsonl"
+        sneaky.write_text("{}\n")
+        # Default behavior unchanged: no extra_roots -> the seal is blind to it.
+        assert verify_ledger(ledger_path, base) == []
+        mismatches = verify_ledger(ledger_path, base, extra_roots=[base])
+        assert mismatches == ["EXTRA baselines/sneaky.jsonl"]
+
+    def test_extra_sweep_scoped_root_ignores_legal_siblings(
+        self, artifacts: tuple[Path, list[Path]], tmp_path: Path
+    ) -> None:
+        # The §6 layout: scoring/ (and index/, analysis/) are LEGAL post-seal
+        # siblings at the run root — a sweep scoped to baselines/ must not
+        # flag them, while still catching additions inside the scoped root.
+        base, files = artifacts
+        ledger_path = write_ledger(
+            hash_artifacts(files, base_dir=base), tmp_path / "ledger.json"
+        )
+        scoring = base / "scoring" / "s01" / "cells"
+        scoring.mkdir(parents=True)
+        (scoring / "qa_scores.jsonl").write_text("{}\n")
+        assert verify_ledger(ledger_path, base, extra_roots=[base / "baselines"]) == []
+        (base / "baselines" / "added.csv").write_text("x\n")
+        assert verify_ledger(ledger_path, base, extra_roots=[base / "baselines"]) == [
+            "EXTRA baselines/added.csv"
+        ]
+
+    def test_ledger_file_itself_is_not_extra(
+        self, artifacts: tuple[Path, list[Path]]
+    ) -> None:
+        base, files = artifacts
+        ledger_path = write_ledger(
+            hash_artifacts(files, base_dir=base), base / "ledger.json"
+        )
+        assert verify_ledger(ledger_path, base, extra_roots=[base]) == []
+
+    def test_extra_sweep_follows_directory_symlinks(
+        self, artifacts: tuple[Path, list[Path]], tmp_path: Path
+    ) -> None:
+        # rglob-style sweeps are blind to directory symlinks (H7); the walk
+        # must follow them and report the smuggled file at its LOGICAL path.
+        base, files = artifacts
+        ledger_path = write_ledger(
+            hash_artifacts(files, base_dir=base), tmp_path / "ledger.json"
+        )
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "smuggled.jsonl").write_text("{}\n")
+        (base / "baselines" / "nested").symlink_to(outside, target_is_directory=True)
+        mismatches = verify_ledger(ledger_path, base, extra_roots=[base])
+        assert mismatches == ["EXTRA baselines/nested/smuggled.jsonl"]
+
+    def test_extra_sweep_symlink_cycle_terminates(
+        self, artifacts: tuple[Path, list[Path]], tmp_path: Path
+    ) -> None:
+        base, files = artifacts
+        ledger_path = write_ledger(
+            hash_artifacts(files, base_dir=base), tmp_path / "ledger.json"
+        )
+        (base / "baselines" / "loop").symlink_to(base, target_is_directory=True)
+        mismatches = verify_ledger(ledger_path, base, extra_roots=[base])
+        # Terminates, and everything visible through the cycle that is not a
+        # sealed entry (or the ledger file) is EXTRA — no false negatives.
+        assert all(m.startswith("EXTRA ") for m in mismatches)
+
+    def test_extra_root_must_exist_and_be_inside_base(
+        self, artifacts: tuple[Path, list[Path]], tmp_path: Path
+    ) -> None:
+        base, files = artifacts
+        ledger_path = write_ledger(
+            hash_artifacts(files, base_dir=base), tmp_path / "ledger.json"
+        )
+        with pytest.raises(LedgerError, match="not a directory"):
+            verify_ledger(ledger_path, base, extra_roots=[base / "ghost"])
+        outside = tmp_path / "outside-root"
+        outside.mkdir()
+        with pytest.raises(LedgerError, match="outside base_dir"):
+            verify_ledger(ledger_path, base, extra_roots=[outside])
+
+    def test_absolute_and_traversal_keys_refused(self, tmp_path: Path) -> None:
+        # `Path(base) / "/abs"` silently DISCARDS base — an absolute-key ledger
+        # would verify against unrelated files. Refused at write AND verify.
+        target = tmp_path / "abs.csv"
+        target.write_text("x")
+        with pytest.raises(LedgerError, match="absolute"):
+            write_ledger(
+                {target.as_posix(): "0" * 64}, tmp_path / "ledger_abs.json"
+            )
+        with pytest.raises(LedgerError, match=r"\.\."):
+            write_ledger({"../escape.csv": "0" * 64}, tmp_path / "ledger_dots.json")
+        # A hand-tampered ledger with such keys fails verification loudly too.
+        doc_path = tmp_path / "ledger_forged.json"
+        entries = {target.as_posix(): "0" * 64}
+        doc = {
+            "ledger_version": 1,
+            "algorithm": "sha256",
+            "created_utc": "2026-08-14T00:00:00+00:00",
+            "entries_sha256": ledger_mod._entries_sha256(entries),
+            "entries": entries,
+        }
+        doc_path.write_text(json.dumps(doc))
+        with pytest.raises(LedgerError, match="absolute"):
+            verify_ledger(doc_path, tmp_path)
 
 
 # --------------------------------------------------------------------- prereg

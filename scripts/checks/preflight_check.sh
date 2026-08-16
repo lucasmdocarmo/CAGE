@@ -249,6 +249,83 @@ then
     FAILED=1
 fi
 
+# (i) environment matches the registration (code assertion 2026-08-07, findings
+#     B1/B4): the interpreter must be the canonical one the Tier-1 pins were
+#     frozen on, `pip check` must be clean, every Tier-1 exact pin must be
+#     installed at exactly its pinned version, and — once B2's lockfile exists
+#     (requirements.lock.gpu.txt) — the full locked set must match. Runs with
+#     the SAME python3 every other gate probes (the activated cage-env).
+echo "[gate i] environment-vs-registration (interpreter + Tier-1 pins + pip check)..."
+if ! python3 - "$CAGE_CANONICAL_PYTHON" "$CAGE_ROOT" <<'PY'
+import importlib.metadata as md
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+canonical, root = sys.argv[1], Path(sys.argv[2])
+ok = True
+
+
+def pf(msg: str) -> None:
+    global ok
+    ok = False
+    print(f"  [FAIL] {msg}")
+
+
+got = f"{sys.version_info.major}.{sys.version_info.minor}"
+if got != canonical:
+    pf(f"interpreter is CPython {got}, canonical is {canonical} "
+       f"(Tier-1 pins in requirements.txt were frozen on {canonical}; "
+       f"finding B1 -- this venv was created with the wrong python)")
+else:
+    print(f"  [ok] interpreter CPython {got} == canonical {canonical}")
+
+_PIN = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?==([^,;\s]+)$")
+
+
+def check_pins(path: Path, label: str) -> None:
+    n_checked = 0
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or line.startswith("-") or "@" in line:
+            continue
+        m = _PIN.match(line)
+        if not m:
+            continue
+        name, want = m.groups()
+        try:
+            have = md.version(name)
+        except md.PackageNotFoundError:
+            pf(f"{label}: {name}=={want} declared but NOT installed")
+            continue
+        n_checked += 1
+        if have != want:
+            pf(f"{label}: {name} installed {have} != pinned {want}")
+    print(f"  [ok] {label}: {n_checked} exact pins verified against the venv")
+
+
+check_pins(root / "requirements.txt", "requirements.txt Tier-1")
+lock = root / "requirements.lock.gpu.txt"
+if lock.is_file():
+    check_pins(lock, "requirements.lock.gpu.txt")
+else:
+    print("  [note] requirements.lock.gpu.txt absent (B2 pending; minted at S0)")
+
+res = subprocess.run(
+    [sys.executable, "-m", "pip", "check"], capture_output=True, text=True
+)
+if res.returncode != 0:
+    pf(f"pip check reports broken requirements:\n{res.stdout.strip()}")
+else:
+    print("  [ok] pip check clean")
+
+sys.exit(0 if ok else 1)
+PY
+then
+    FAILED=1
+fi
+
 echo "=============================================="
 if [ "$FAILED" -eq 0 ]; then
     echo "PREFLIGHT PASS -- all Gate-2 components green. Safe to launch the sweep."

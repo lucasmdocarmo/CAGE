@@ -39,6 +39,13 @@ Outputs (under <run>/index/):
   MISSING versus the PUBLICATION.md §7.6.1 family x group matrix (F1 arm-level
   floor; plus manifest ``expected_cells`` exactly when declared) are LISTED,
   never silently absent.
+- ``provenance.json`` — the §3 provenance snapshot (git_sha, seed, ...)
+  verbatim from the manifest, index-adjacent so no analysis has to re-open
+  manifest.json for run identity (task #129 / H8).
+
+All three are written atomically (tmp + os.replace); re-organizing over an
+existing index requires ``--force``. The §5 seal is FULLY verified here
+(re-hash + extra-file sweep over cells/), not merely checked for presence.
 
 Fail-loud doctrine: layout violations (missing manifest/ledger/cells, missing
 cell.json, malformed window dirs, unknown dataset ids, missing required window
@@ -51,6 +58,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -76,6 +84,7 @@ CELL_META_NAME = "cell.json"
 INDEX_DIRNAME = "index"
 INDEX_CSV_NAME = "cells_index.csv"
 COVERAGE_MD_NAME = "coverage_report.md"
+PROVENANCE_JSON_NAME = "provenance.json"
 _ARTIFACT_SEP = ";"
 
 #: §1 run_id grammar: lowercase, bucket-name-safe [a-z0-9-] ONLY — it names the
@@ -93,6 +102,15 @@ SCORING_DIRNAME = "scoring"
 SCORING_MANIFEST_NAME = "scoring_manifest.json"
 SCORING_RUN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
 REQUIRED_SCORING_WINDOW_ARTIFACTS: tuple[str, ...] = ("qa_scores.jsonl", "quality.json")
+#: Task #130 decision (a): the ONE legal non-pass file at the scoring/ root —
+#: the sealed per-run-root label-stripping salt written by
+#: scripts/4_analysis/rescore_quality.py (shared with score_instrument_b.py).
+BLINDING_SALT_NAME = "blinding_salt.json"
+#: Task #130 decision (d): abandoned pass directories
+#: (rescore_quality.abandon_scoring_pass): scoring/<id>.abandoned-<UTCstamp>/
+#: carrying an ABANDONED.json tombstone — tolerated, never validated/consumed.
+ABANDONED_DIR_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}\.abandoned-\d{8}T\d{6}Z$")
+ABANDONED_TOMBSTONE_NAME = "ABANDONED.json"
 _SCORING_MANIFEST_REQUIRED_KEYS: tuple[str, ...] = (
     "scoring_run_id",
     "created_utc",
@@ -112,7 +130,8 @@ REQUIRED_WINDOW_ARTIFACTS: tuple[str, ...] = (
     "engine_metrics.json",
     "cage_stats.jsonl",
 )
-_QA_EVIDENCE_EXEMPT_DATASETS: frozenset[str] = frozenset({"sharegpt"})
+QA_EVIDENCE_EXEMPT_DATASETS: frozenset[str] = frozenset({"sharegpt"})
+_QA_EVIDENCE_EXEMPT_DATASETS = QA_EVIDENCE_EXEMPT_DATASETS  # historical alias
 
 #: §7.6.1 group letter per D4 model (campaign roster; groups A-D).
 GROUP_OF_MODEL: dict[str, str] = {
@@ -140,13 +159,34 @@ BASELINE_OF_CELL: dict[tuple[str, str], str] = {
     (spec.arm, spec.retriever): bid for bid, spec in BASELINES.items()
 }
 
-#: §3 manifest keys this organizer consumes. The spec's required set is larger
-#: (git_sha, engine, seed, provider, hardware, ...) — those are provenance for
-#: humans/stats and are passed through opaquely here. `model` is SINGULAR per
-#: §3 (one run = one model; a re-run is a new run_id). There are NO
-#: `models`/`datasets` list keys in the spec: datasets come from the window
+#: §3 manifest identity keys with dedicated semantic checks below. `model` is
+#: SINGULAR per §3 (one run = one model; a re-run is a new run_id). There are
+#: NO `models`/`datasets` list keys in the spec: datasets come from the window
 #: directory names (§1); an OPTIONAL `datasets` list may narrow coverage.
 _MANIFEST_STR_KEYS = ("campaign", "session", "run_id", "model")
+
+#: §3 REQUIRED manifest fields (cloud/RESULTS_LAYOUT.md §3 — task #129 / H8:
+#: a run without its provenance cannot be organized; fail loud, every gap
+#: listed). ``engine``/``engine_version`` structure is per-engine in the spec;
+#: this organizer requires engine_version and accepts str or mapping there and
+#: for hardware. The full snapshot is surfaced in index/provenance.json.
+MANIFEST_REQUIRED_FIELDS: tuple[str, ...] = (
+    "campaign",
+    "session",
+    "run_id",
+    "model",
+    "git_sha",
+    "git_dirty",
+    "engine_version",
+    "seed",
+    "provider",
+    "hardware",
+    "dataset_manifests_sha256",
+    "cellspec_schema_version",
+    "created_utc",
+)
+
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class OrganizeError(RuntimeError):
@@ -210,6 +250,59 @@ def parse_row_key_dir(name: str) -> CellSpec:
     return spec
 
 
+def _validate_manifest_provenance(manifest: Mapping[str, Any]) -> list[str]:
+    """§3 provenance-field enforcement (task #129 / H8) — returns problem lines.
+
+    Every MANIFEST_REQUIRED_FIELDS entry must be present with the right shape;
+    absence is NOT defaulted (a run whose git_sha/seed are unknown cannot be
+    reproduced, so it cannot be indexed). The four identity keys are typed by
+    the caller's _MANIFEST_STR_KEYS pass; this covers the rest.
+    """
+    problems: list[str] = []
+    missing = [k for k in MANIFEST_REQUIRED_FIELDS if k not in manifest]
+    if missing:
+        problems.append(
+            f"manifest.json missing REQUIRED §3 field(s) {missing} "
+            "(cloud/RESULTS_LAYOUT.md §3 — provenance is not optional)"
+        )
+    checks: tuple[tuple[str, str], ...] = (
+        ("git_sha", "non-empty string"),
+        ("provider", "non-empty string"),
+        ("created_utc", "non-empty string (ISO-8601)"),
+    )
+    for key, expected in checks:
+        if key in manifest and (
+            not isinstance(manifest[key], str) or not manifest[key]
+        ):
+            problems.append(f"manifest.json key {key!r} must be a {expected}")
+    if "git_dirty" in manifest and not isinstance(manifest["git_dirty"], bool):
+        problems.append("manifest.json key 'git_dirty' must be a boolean")
+    for key in ("engine_version", "hardware"):
+        if key in manifest:
+            value = manifest[key]
+            ok = (isinstance(value, str) and value) or (
+                isinstance(value, dict) and value
+            )
+            if not ok:
+                problems.append(
+                    f"manifest.json key {key!r} must be a non-empty string or object"
+                )
+    for key in ("seed", "cellspec_schema_version"):
+        if key in manifest and (
+            isinstance(manifest[key], bool) or not isinstance(manifest[key], int)
+        ):
+            problems.append(f"manifest.json key {key!r} must be an integer")
+    if "dataset_manifests_sha256" in manifest and (
+        not isinstance(manifest["dataset_manifests_sha256"], str)
+        or not _SHA256_HEX_RE.match(manifest["dataset_manifests_sha256"])
+    ):
+        problems.append(
+            "manifest.json key 'dataset_manifests_sha256' must be a 64-char "
+            "lowercase sha256 hex string (§3: pins the exact dataset builds)"
+        )
+    return problems
+
+
 def load_manifest(run_dir: Path) -> dict[str, Any]:
     """Load + validate manifest.json — the run's declared contract (fail loud)."""
     path = run_dir / "manifest.json"
@@ -225,6 +318,7 @@ def load_manifest(run_dir: Path) -> dict[str, Any]:
     for key in _MANIFEST_STR_KEYS:
         if not isinstance(manifest.get(key), str) or not manifest.get(key):
             problems.append(f"manifest.json key {key!r} must be a non-empty string")
+    problems.extend(_validate_manifest_provenance(manifest))
     declared_datasets = manifest.get("datasets")
     if declared_datasets is not None:
         if (
@@ -372,6 +466,10 @@ def walk_run_tree(run_dir: Path, manifest: Mapping[str, Any]) -> list[WindowReco
                 f"cells/{cell_dir.name}: cell has no window_<dataset>-<ordinal> directories"
             )
             continue
+        #: Task #129 / H12 collision guard: two dirs must never resolve to the
+        #: same (dataset, ordinal) identity (window_x-1 vs window_x-01 would
+        #: silently double-count one window under one §8 join key).
+        seen_identity: dict[tuple[str, int], str] = {}
         for window_dir in window_dirs:
             match = WINDOW_DIR_RE.match(window_dir.name)
             if not window_dir.is_dir() or match is None:
@@ -381,6 +479,16 @@ def walk_run_tree(run_dir: Path, manifest: Mapping[str, Any]) -> list[WindowReco
                 )
                 continue
             dataset, ordinal = match.group(1), int(match.group(2))
+            identity = (dataset, ordinal)
+            if identity in seen_identity:
+                problems.append(
+                    f"cells/{cell_dir.name}/{window_dir.name}: window identity "
+                    f"({dataset}, {ordinal}) collides with sibling "
+                    f"{seen_identity[identity]!r} — two directories resolve to "
+                    "the same (dataset, ordinal); the §8 join key would be ambiguous"
+                )
+                continue
+            seen_identity[identity] = window_dir.name
             if dataset not in DATASET_IDS:
                 problems.append(
                     f"cells/{cell_dir.name}/{window_dir.name}: dataset {dataset!r} is not "
@@ -511,6 +619,9 @@ def build_coverage_report(manifest: Mapping[str, Any], index: pd.DataFrame) -> s
         "",
         f"- run_id: `{manifest['run_id']}`",
         f"- campaign / session: `{manifest['campaign']}` / `{manifest['session']}`",
+        # §3 provenance surfaced where the analyst actually looks (task #129/H8).
+        f"- git_sha: `{manifest['git_sha']}` (dirty: {json.dumps(manifest['git_dirty'])})",
+        f"- seed: {manifest['seed']}",
         f"- indexed windows: {len(index)}",
         f"- cells (distinct row keys): {index['row_key'].nunique()}",
         "",
@@ -601,6 +712,34 @@ def build_coverage_report(manifest: Mapping[str, Any], index: pd.DataFrame) -> s
 # ---------------------------------------------------------------------------
 
 
+def _sweep_contamination(run_dir: Path) -> list[str]:
+    """Find §6-forbidden scoring artifacts anywhere under ``cells/``.
+
+    Task #129 / H7: the old ``rglob`` sweep did not traverse directory
+    symlinks, so a symlinked subtree carrying qa_scores.jsonl/quality.json
+    into the sealed raw tree passed undetected. ``os.walk(followlinks=True)``
+    traverses them; a realpath visited-set terminates symlink cycles.
+    Returns run-dir-relative posix paths, sorted.
+    """
+    cells_root = run_dir / "cells"
+    if not cells_root.is_dir():
+        return []
+    hits: set[str] = set()
+    visited: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(cells_root, followlinks=True):
+        real = os.path.realpath(dirpath)
+        if real in visited:
+            dirnames[:] = []  # symlink cycle: prune, do not recurse forever
+            continue
+        visited.add(real)
+        for name in filenames:
+            if name in REQUIRED_SCORING_WINDOW_ARTIFACTS:
+                hits.add(
+                    Path(os.path.relpath(Path(dirpath) / name, run_dir)).as_posix()
+                )
+    return sorted(hits)
+
+
 def validate_scoring_tree(run_dir: Path) -> list[str]:
     """Validate every ``scoring/<scoring_run_id>/`` pass against §6 (fail loud).
 
@@ -622,12 +761,7 @@ def validate_scoring_tree(run_dir: Path) -> list[str]:
     problems: list[str] = []
     summary: list[str] = []
 
-    contamination = sorted(
-        p.relative_to(run_dir).as_posix()
-        for name in REQUIRED_SCORING_WINDOW_ARTIFACTS
-        for p in (run_dir / "cells").rglob(name)
-    )
-    for path in contamination:
+    for path in _sweep_contamination(run_dir):
         problems.append(
             f"{path}: scoring output inside the sealed raw tree — §6: scoring "
             "NEVER writes into cells/"
@@ -653,8 +787,32 @@ def validate_scoring_tree(run_dir: Path) -> list[str]:
     for scoring_dir in sorted(p for p in scoring_root.iterdir() if not p.name.startswith(".")):
         sid = scoring_dir.name
         prefix = f"{SCORING_DIRNAME}/{sid}"
+        if sid == BLINDING_SALT_NAME and scoring_dir.is_file():
+            # Task #130 (a): the sealed per-run-root blinding salt is legal
+            # scoring/ metadata (charter §9.8 label stripping), not a stray.
+            summary.append(
+                f"- blinding salt present (`{SCORING_DIRNAME}/{BLINDING_SALT_NAME}`,"
+                " §9.8 label stripping — task #130)"
+            )
+            continue
         if not scoring_dir.is_dir():
             problems.append(f"{prefix}: not a directory (stray file in scoring/)")
+            continue
+        if ABANDONED_DIR_RE.match(sid):
+            # Task #130 (d): an abandoned pass is tombstoned dead weight — it
+            # is neither validated nor consumed, but it must not fail the
+            # tree (its id was freed for a clean retry). A directory NAMED
+            # abandoned without its tombstone is still a problem.
+            if (scoring_dir / ABANDONED_TOMBSTONE_NAME).is_file():
+                summary.append(
+                    f"- `{sid}`: ABANDONED pass (tombstoned — not validated,"
+                    " not consumed; task #130)"
+                )
+            else:
+                problems.append(
+                    f"{prefix}: abandoned-named directory without its "
+                    f"{ABANDONED_TOMBSTONE_NAME} tombstone"
+                )
             continue
         if not SCORING_RUN_ID_RE.match(sid):
             problems.append(
@@ -770,18 +928,77 @@ def validate_scoring_tree(run_dir: Path) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def organize_run(run_dir: Path, index_dir: Path | None = None) -> tuple[Path, Path]:
-    """Validate + index one pulled run; returns (cells_index.csv, coverage_report.md)."""
+def verify_run_ledger(run_dir: Path) -> str:
+    """Fully verify the run's §5 seal at organize time (task #129 item 4).
+
+    Presence alone proves nothing (H8: the ledger was previously verified at
+    analysis load only, and only in confirmatory mode — §5 says always). Here
+    the whole tree is re-hashed, INCLUDING the H7 extra-file sweep scoped to
+    ``cells/`` (the append-only-then-immutable subtree; §6 siblings such as
+    ``scoring/``/``index/``/``analysis/`` are legal post-seal additions and
+    are never falsely flagged). Any mismatch fails loud; an absent ledger is
+    recorded honestly as "ledger: absent" (walk_run_tree already treats
+    absence as a layout violation upstream, so this line is reachable only if
+    that presence rule is ever relaxed).
+    """
+    ledger_path = run_dir / "ledger.json"
+    if not ledger_path.is_file():
+        return "ledger: absent (§5 — the run is unsealed)"
+    cells_dir = run_dir / "cells"
+    extra_roots = (cells_dir,) if cells_dir.is_dir() else None
+    try:
+        entries = read_ledger(ledger_path)
+        mismatches = verify_ledger(ledger_path, run_dir, extra_roots=extra_roots)
+    except LedgerError as exc:
+        raise LayoutError([f"ledger.json: {exc}"]) from exc
+    if mismatches:
+        raise LayoutError(
+            [f"ledger.json (§5 seal violated): {line}" for line in mismatches]
+        )
+    return f"ledger: verified ({len(entries)} sealed artifact(s), 0 mismatches, 0 extra)"
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` via tmp + os.replace (crash cannot truncate)."""
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _build_provenance(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """The §3 provenance snapshot surfaced beside the index (task #129 / H8)."""
+    return {key: manifest[key] for key in MANIFEST_REQUIRED_FIELDS}
+
+
+def organize_run(
+    run_dir: Path, index_dir: Path | None = None, *, force: bool = False
+) -> tuple[Path, Path]:
+    """Validate + index one pulled run; returns (cells_index.csv, coverage_report.md).
+
+    Also writes ``provenance.json`` (the §3 snapshot) beside the index. All
+    three outputs are written atomically (tmp + os.replace); an existing index
+    is REFUSED unless ``force=True`` — silently re-indexing over a table other
+    tooling may have already consumed is the drift this guard exists to stop.
+    """
     run_dir = Path(run_dir).resolve()
     if not run_dir.is_dir():
         raise OrganizeError(f"run directory does not exist: {run_dir}")
     manifest = load_manifest(run_dir)
     records = walk_run_tree(run_dir, manifest)
     scoring_summary = validate_scoring_tree(run_dir)
+    ledger_line = verify_run_ledger(run_dir)
     index = build_index(manifest, records)
     report = build_coverage_report(manifest, index)
     report += "\n".join(
         [
+            "## Ledger (RESULTS_LAYOUT §5)",
+            "",
+            f"- {ledger_line}",
+            "",
             "## Scoring passes (RESULTS_LAYOUT §6)",
             "",
             *(scoring_summary or ["none"]),
@@ -790,11 +1007,23 @@ def organize_run(run_dir: Path, index_dir: Path | None = None) -> tuple[Path, Pa
     )
 
     out_dir = Path(index_dir) if index_dir is not None else run_dir / INDEX_DIRNAME
-    out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / INDEX_CSV_NAME
     md_path = out_dir / COVERAGE_MD_NAME
-    index.to_csv(csv_path, index=False)
-    md_path.write_text(report, encoding="utf-8")
+    prov_path = out_dir / PROVENANCE_JSON_NAME
+    existing = [p for p in (csv_path, md_path, prov_path) if p.exists()]
+    if existing and not force:
+        raise OrganizeError(
+            f"index output(s) already exist ({', '.join(str(p) for p in existing)}) "
+            "— refusing to silently overwrite an index other tooling may have "
+            "consumed; pass --force to re-index deliberately"
+        )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(csv_path, index.to_csv(index=False))
+    _atomic_write_text(md_path, report)
+    _atomic_write_text(
+        prov_path,
+        json.dumps(_build_provenance(manifest), indent=2, sort_keys=True) + "\n",
+    )
     return csv_path, md_path
 
 
@@ -817,9 +1046,14 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="output directory (default: <run_dir>/index)",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite an existing index (refused by default)",
+    )
     args = parser.parse_args(argv)
     try:
-        csv_path, md_path = organize_run(args.run_dir, args.index_dir)
+        csv_path, md_path = organize_run(args.run_dir, args.index_dir, force=args.force)
     except OrganizeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
