@@ -27,12 +27,23 @@ primaries, tested in the declared fixed sequence ``PRIMARY_CHAIN_ORDER``
 table: one row per contrast leg × campaign group × metric × dataset (a
 contrast may carry ``extra_legs`` — #15 registers BOTH B11-vs-B6 (F2) and
 B12-vs-B3 (F3, both reuse-ON, 2026-08-02 user call)), family membership rule
-= group × metric × dataset (audit §2.2, engines as members), correction =
+= group × metric × dataset × F-slot × UNIT (audit §2.2, engines as members;
+the unit axis is the 2026-08-16 owner decision closing assertion G19 — no
+Holm family may pool per-query Wilcoxon/McNemar and window-Welch p-values;
+the F-slot axis is forced by the same decision's tier-natural upstreams, else
+#15's F2/F3 window legs would straddle two gates in one family), correction =
 none for gatekept primaries (full α per dataset), Holm within family for
 secondaries, BH-FDR for the exploratory tier, holm/tost per fingerprint
 sub-hypothesis. Contrasts with pinned ``metrics`` (the #12/#14 estimand
-variables) ignore the caller's metric pair. No test runs that is not a row
-in this table.
+variables) ignore the caller's metric pair; caller metrics must come from the
+``REGISTERED_METRICS`` roster (assertion G7 — the map compiles no row for a
+metric name the driver does not register). Every gated secondary row carries
+its REGISTERED ``upstream`` chain endpoint (2026-08-16 owner decision closing
+assertion G10 — tier-natural parents: per-query secondaries gate on the #4
+headline, F2/pressure window secondaries on #14 truth-tax, F3/reuse + DIST
+secondaries on #13 fingerprint); primaries, falsification and exploratory
+rows carry the ``UNGATED`` sentinel (a string, so the §9.13 renderer never
+meets a null cell). No test runs that is not a row in this table.
 """
 
 from __future__ import annotations
@@ -47,6 +58,10 @@ from src.analysis.cellspec import BASELINES, Family
 Tier = Literal["primary", "secondary", "exploratory", "falsification"]
 Sidedness = Literal["one-sided", "two-sided", "two one-sided (TOST)"]
 Unit = Literal["per_query", "binary", "window"]
+#: The Holm-family UNIT axis (2026-08-16 decision, G19): 'binary' rows share
+#: the per-query pairing unit (McNemar pairs the same §9.4 per-query draws
+#: Wilcoxon does), so the axis collapses to per_query vs window.
+FamilyUnit = Literal["per_query", "window"]
 Group = Literal["A", "B", "C", "D"]
 
 CAMPAIGN_GROUPS: tuple[Group, ...] = ("A", "B", "C", "D")
@@ -56,10 +71,46 @@ KNOWN_DATASETS: frozenset[str] = frozenset(
     {"squad_v2", "hotpotqa", "musique", "qasper"}
 )
 # §9.1 co-primary metric pair (audit §2.1): serving = paired TTFT delta,
-# quality = the §8.5 per-dataset Y predicate.
-SERVING_METRIC: str = "ttft"
+# quality = the §8.5 per-dataset Y predicate. 2026-08-16 (assertion G7):
+# metric names are unified ON THE DRIVER'S namespace ('ttft_ms', the
+# run_campaign_analysis.HIGHER_IS_BETTER key) — the old registered-but-never-
+# exercised 'ttft' spelling is gone, so the registered pair IS what runs.
+SERVING_METRIC: str = "ttft_ms"
 PREDICATE_METRIC: str = "predicate"
 DEFAULT_METRICS: tuple[str, ...] = (SERVING_METRIC, PREDICATE_METRIC)
+
+# G7 roster guard (2026-08-16): ``compile_family_map`` refuses caller metric
+# names outside this roster, so the map can never register a test on a column
+# the driver would refuse (or silently drift from the driver's namespace).
+# DUPLICATED from the driver's HIGHER_IS_BETTER registry
+# (scripts/4_analysis/run_campaign_analysis.py) because src/ must not import
+# scripts/; the duplication is pinned by a cross-check test
+# (tests/test_stats_engine.py — roster == driver HIGHER_IS_BETTER keys).
+# Pinned estimand variables (#12/#14: lambda_star_onset, truth_tax) and the
+# #13 'fingerprint' pseudo-metric are registry-internal, never caller-supplied,
+# and therefore live outside the caller roster.
+REGISTERED_METRICS: frozenset[str] = frozenset(
+    {
+        # serving (lower is better in the driver's direction registry)
+        "ttft_ms",
+        "latency_ms",
+        "tpot_ms",
+        "e2e_ms",
+        # quality (higher is better)
+        "f1_score",
+        "exact_match",
+        "f1_answerable",
+        "exact_match_answerable",
+        "grounding_score",
+        "faithfulness",
+        "context_relevance",
+        "completeness_bertscore",
+        "completeness_rouge_l",
+        "predicate",
+        "goodput_frac",
+        "yield_frac",
+    }
+)
 # 2026-08-07 owner decision (pre-freeze charter edit, ADR-0087): per-query
 # continuous faithfulness is DEMOTED from the confirmatory tier (the §9.6
 # power-sim honesty guard refused every additive-shift model on the real
@@ -292,6 +343,86 @@ PRIMARY_IDS: frozenset[int] = frozenset({4, 13, 14})
 PRIMARY_CHAIN_ORDER: tuple[int, ...] = (4, 14, 13)
 
 
+def chain_endpoint(contrast_id: int) -> str:
+    """Endpoint name of a chain primary — the driver's naming (contrast-<id>)."""
+    return f"contrast-{contrast_id}"
+
+
+#: The registered chain endpoints — the only legal gating ``upstream`` values.
+CHAIN_ENDPOINTS: frozenset[str] = frozenset(
+    chain_endpoint(cid) for cid in PRIMARY_CHAIN_ORDER
+)
+
+#: ``upstream`` sentinel for rows outside the gated-secondary tier
+#: (primary/falsification/exploratory). A STRING, not a null, for the same
+#: reason ``correction`` uses the string "none": the §9.13 renderer
+#: (``prereg._markdown_table``) cannot render nulls under the pinned pandas
+#: (astype(str) keeps NaN), and a registration table cell must never be
+#: blank. Semantics are exactly "no upstream gate".
+UNGATED: str = "ungated"
+
+# Registered gating topology (owner decision d, 2026-08-16; closes assertion
+# G10 — the driver may no longer hard-code "everything gates on #4").
+# Tier-natural parents:
+# - per-query secondaries          → #4  (headline co-primary set)
+# - F2/pressure window secondaries → #14 (truth-tax estimand)
+# - F3/reuse + DIST secondaries    → #13 (fingerprint intersection)
+PER_QUERY_SECONDARY_UPSTREAM: str = chain_endpoint(HEADLINE_CONTRAST_ID)
+WINDOW_SECONDARY_UPSTREAM: dict[Family, str] = {
+    "F2": chain_endpoint(14),
+    "F3": chain_endpoint(FINGERPRINT_CONTRAST_ID),
+    "DIST": chain_endpoint(FINGERPRINT_CONTRAST_ID),
+}
+
+# Import-time validation: every registered upstream must be a registered chain
+# endpoint — a typo here would wire a family to a gate that can never open.
+for _upstream_endpoint in (
+    PER_QUERY_SECONDARY_UPSTREAM,
+    *WINDOW_SECONDARY_UPSTREAM.values(),
+):
+    if _upstream_endpoint not in CHAIN_ENDPOINTS:
+        raise FamilyMapError(
+            f"registered upstream {_upstream_endpoint!r} is not a chain "
+            f"endpoint {sorted(CHAIN_ENDPOINTS)} (§9.3 gating topology)"
+        )
+del _upstream_endpoint
+
+
+def family_unit_of(unit: str) -> FamilyUnit:
+    """Collapse a row's §9.4 test unit onto the Holm-family UNIT axis.
+
+    ``binary`` shares the per-query pairing unit (a McNemar row pairs the
+    same per-query draws a Wilcoxon row does); ``window`` is the batch-means
+    unit. The family_id carries this axis so no Holm family can pool
+    per-query and window p-values (2026-08-16 decision, assertion G19).
+    """
+    if unit == "window":
+        return "window"
+    if unit in ("per_query", "binary"):
+        return "per_query"
+    raise FamilyMapError(f"unknown test unit {unit!r} (per_query|binary|window)")
+
+
+def registered_upstream(tier: str, family: Family, unit: str) -> str:
+    """The registered chain endpoint gating a row; ``UNGATED`` otherwise.
+
+    Only secondary-tier rows are gated on an upstream primary (§9.3);
+    primaries gate each other through the serial order, the falsification
+    suite spends no α, and the exploratory tier is ungated by construction.
+    """
+    if tier != "secondary":
+        return UNGATED
+    if family_unit_of(unit) == "per_query":
+        return PER_QUERY_SECONDARY_UPSTREAM
+    endpoint = WINDOW_SECONDARY_UPSTREAM.get(family)
+    if endpoint is None:
+        raise FamilyMapError(
+            f"window-unit secondary in family {family!r} has no registered "
+            f"upstream (§9.3 gating topology, 2026-08-16 decision)"
+        )
+    return endpoint
+
+
 def compile_family_map(
     datasets: Sequence[str],
     *,
@@ -307,11 +438,17 @@ def compile_family_map(
     per-query Wilcoxon; every pressure-family row is window-level batch means.
 
     ``metrics`` applies only to contrasts without pinned ``metrics`` (#12/#14
-    register their §9.2 estimand variables instead). Contrast #13 expands into
+    register their §9.2 estimand variables instead) and must come from the
+    ``REGISTERED_METRICS`` roster (G7 guard — the table must not follow the
+    caller into an unregistered metric namespace). Contrast #13 expands into
     the six §9.3 fingerprint sub-hypothesis rows (3 Holm superiority + 3
     conditional-TOST NONE), never into the generic metric pair. Every row
-    carries ``comparison`` (the cells compared) and ``sub_hypothesis``
-    (fingerprint rows only; empty elsewhere).
+    carries ``comparison`` (the cells compared), ``sub_hypothesis``
+    (fingerprint rows only; empty elsewhere), ``family_unit`` (the Holm-family
+    UNIT axis embedded in ``family_id`` — decision d 2026-08-16/G19) and
+    ``upstream`` (the registered gating endpoint for secondary rows; the
+    ``UNGATED`` sentinel on primary/falsification/exploratory rows —
+    decision d 2026-08-16/G10).
     """
     if not datasets:
         raise FamilyMapError("datasets must be non-empty")
@@ -325,6 +462,14 @@ def compile_family_map(
         )
     if not metrics:
         raise FamilyMapError("metrics must be non-empty")
+    unregistered = set(metrics) - REGISTERED_METRICS
+    if unregistered:
+        raise FamilyMapError(
+            f"unregistered metric names {sorted(unregistered)} (G7 roster "
+            f"guard): the §9.3 map only compiles rows for the registered "
+            f"roster (= the driver's HIGHER_IS_BETTER keys) "
+            f"{sorted(REGISTERED_METRICS)}"
+        )
     if not 0.0 < alpha < 1.0:
         raise FamilyMapError(f"alpha={alpha} must be in (0, 1)")
 
@@ -346,11 +491,13 @@ def compile_family_map(
         tier: str | None = None,
         gatekept: bool | None = None,
     ) -> None:
+        row_tier = c.tier if tier is None else tier
+        f_unit = family_unit_of(unit)
         rows.append(
             {
                 "contrast_id": c.id,
                 "name": c.name,
-                "tier": c.tier if tier is None else tier,
+                "tier": row_tier,
                 "gatekept": c.gatekept if gatekept is None else gatekept,
                 "family": family,
                 "group": group,
@@ -358,7 +505,17 @@ def compile_family_map(
                 "dataset": dataset,
                 "comparison": comparison,
                 "sub_hypothesis": sub_hypothesis,
-                "family_id": f"{group}|{metric}|{dataset}",
+                # Family membership = group × metric × dataset × F-slot ×
+                # UNIT axis (decision d 2026-08-16/G19): the old 3-axis id
+                # pooled per-query Wilcoxon and window-Welch p-values in one
+                # Holm family (the pre-split m=12 family). The F-slot axis is
+                # forced by the same decision's tier-natural upstreams: #15's
+                # F2 leg gates on #14 while its F3 leg (and #17) gate on #13,
+                # so a group|metric|dataset|window family would straddle two
+                # gates — a §9.3 map error `_validate_compiled` refuses.
+                "family_id": f"{group}|{metric}|{dataset}|{family}|{f_unit}",
+                "family_unit": f_unit,
+                "upstream": registered_upstream(row_tier, family, unit),
                 "correction": correction,
                 "sidedness": sidedness,
                 "unit": unit,
@@ -438,4 +595,51 @@ def compile_family_map(
                             tier="exploratory",
                             gatekept=False,
                         )
-    return pd.DataFrame(rows)
+    frame = pd.DataFrame(rows)
+    _validate_compiled(frame)
+    return frame
+
+
+def _validate_compiled(frame: pd.DataFrame) -> None:
+    """Fail-closed structural invariants of the compiled §9.3 table.
+
+    Redundant with construction by design (the emit path derives both axes),
+    so a future edit that breaks either registered invariant fails HERE, not
+    in a downstream Holm pool.
+    """
+    # Decision d 2026-08-16 (G19): one Holm family = one §9.4 unit — a family
+    # must never pool per-query (Wilcoxon/McNemar) and window (Welch) rows.
+    mixed = frame.groupby("family_id")["family_unit"].nunique()
+    mixed = mixed[mixed > 1]
+    if not mixed.empty:
+        raise FamilyMapError(
+            f"families mixing units: {sorted(mixed.index)} — one Holm family "
+            f"= one §9.4 unit (2026-08-16 decision, G19)"
+        )
+    if frame["upstream"].isna().any():
+        raise FamilyMapError(
+            "null upstream cells — every row carries a chain endpoint or the "
+            "UNGATED sentinel (§9.3/G10); a null would blank a registration "
+            "table cell"
+        )
+    gated = frame.loc[frame["upstream"] != UNGATED]
+    unknown_upstreams = set(gated["upstream"]) - set(CHAIN_ENDPOINTS)
+    if unknown_upstreams:
+        raise FamilyMapError(
+            f"upstream values {sorted(unknown_upstreams)} are not registered "
+            f"chain endpoints {sorted(CHAIN_ENDPOINTS)} (§9.3)"
+        )
+    non_secondary = gated.loc[gated["tier"] != "secondary"]
+    if not non_secondary.empty:
+        raise FamilyMapError(
+            f"non-secondary rows carry an upstream gate (tiers "
+            f"{sorted(set(non_secondary['tier']))}) — only secondaries are "
+            f"gated on a chain primary (§9.3)"
+        )
+    straddling = gated.groupby("family_id")["upstream"].nunique()
+    straddling = straddling[straddling > 1]
+    if not straddling.empty:
+        raise FamilyMapError(
+            f"families straddling upstream gates: {sorted(straddling.index)} "
+            f"— one family = one gate (§9.3)"
+        )

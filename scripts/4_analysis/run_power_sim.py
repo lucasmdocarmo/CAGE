@@ -49,10 +49,13 @@ registered ``conditional_tost``):
    seed, so the final artifact must be regenerated at a committed SHA).
 
 Alpha sensitivity — three roles in BOTH per-query and window stages: full
-α=0.05 (gatekept primaries spend full α per dataset), α/3 (fingerprint Holm
-worst case), and α/m where m is the LARGEST Holm-corrected secondary family in
-the COMPILED §9.3 family map over the four charter datasets (computed at
-import, not hard-coded; m=12 as of 2026-08-07).
+α=0.05 (gatekept primaries spend full α per dataset), α/k where k is the
+registered count of #13 Holm superiority legs (derived from
+``families.FINGERPRINT_SUB_HYPOTHESES``, G15 — k=3 as registered), and α/m
+where m is the LARGEST Holm-corrected secondary family in the COMPILED §9.3
+family map over the four charter datasets (computed at import, not
+hard-coded; m=9 as of 2026-08-16 — the unit-split family map no longer pools
+per-query and window rows in one family, which the pre-split m=12 did).
 
 Pooling across datasets is PROHIBITED for the headline (§9.1) — required N is
 per dataset and the binding recommendation is the max. Qasper has zero pilot
@@ -94,7 +97,11 @@ from src.analysis.stats.equivalence import (  # noqa: E402
     DEFAULT_MIN_EVENTS,
     conditional_tost,
 )
-from src.analysis.stats.families import KNOWN_DATASETS, compile_family_map  # noqa: E402
+from src.analysis.stats.families import (  # noqa: E402
+    FINGERPRINT_SUB_HYPOTHESES,
+    KNOWN_DATASETS,
+    compile_family_map,
+)
 from src.analysis.stats.power_sim import (  # noqa: E402
     PowerSimError,
     required_n,
@@ -147,6 +154,15 @@ BINARY_EFFECT_UNIT = (
     "0-outcome-flip unit (see provenance effect_unit_reconciliation)"
 )
 
+# G15 (2026-08-16): the pilot archive predates the §8.5 predicate column, so
+# the per-query binary family simulates on exact_match — a LABELED PROXY for
+# the registered predicate, stamped on every binary per-query artifact row.
+EXACT_MATCH_PROXY_NOTE = (
+    "exact_match is a labeled PROXY for the registered §8.5 per-dataset Y "
+    "predicate (the pilot archive predates the predicate column); the "
+    "registered campaign test runs on 'predicate' (G15)"
+)
+
 EFFECT_UNIT_RECONCILIATION = (
     "The §9.7 calibration CLI (calibration.inject_effect kind='flip') flips a "
     "fraction of one arm's 0-OUTCOMES (denominator: marginal zero mass 1-p); "
@@ -175,12 +191,29 @@ def _compiled_holm_worst() -> tuple[int, str]:
 
 SECONDARY_HOLM_M, SECONDARY_HOLM_WORST_FAMILY = _compiled_holm_worst()
 
+# G15 (2026-08-16): the fingerprint worst-case divisor is DERIVED from the
+# registered §9.3 decomposition — the count of Holm-corrected superiority legs
+# in families.FINGERPRINT_SUB_HYPOTHESES — never a literal /3 that could
+# silently drift from the registry (the TOST NONE legs spend no Holm alpha).
+FINGERPRINT_HOLM_LEGS: int = sum(
+    1
+    for _policy, _correction, _sidedness, _predicted in FINGERPRINT_SUB_HYPOTHESES
+    if _correction == "holm"
+)
+if FINGERPRINT_HOLM_LEGS < 1:
+    raise RuntimeError(
+        "families.FINGERPRINT_SUB_HYPOTHESES registers no Holm legs — the "
+        "fingerprint alpha role cannot be derived"
+    )
+
 # α sensitivity roles — identical role set in BOTH stages (the 2026-08-07
 # verification found the window stage missing the secondary worst case while
-# window-unit secondaries #15/#17/#18/#20 are Holm-corrected).
+# window-unit secondaries #15/#17/#18/#20 are Holm-corrected). The role KEY
+# 'fingerprint_holm3_worst' stays stable across artifacts; its value is
+# derived above.
 ALPHA_ROLES: dict[str, float] = {
     "primary_full_alpha": 0.05,
-    "fingerprint_holm3_worst": 0.05 / 3,
+    "fingerprint_holm3_worst": 0.05 / FINGERPRINT_HOLM_LEGS,
     "secondary_holm_worst": 0.05 / SECONDARY_HOLM_M,
 }
 WINDOW_ALPHA_ROLES: dict[str, float] = dict(ALPHA_ROLES)
@@ -821,6 +854,13 @@ def run_per_query_stage(
                         if fam.kind == "flip"
                         else np.nan
                     )
+                    # G15: the proxy status rides the artifact row itself, not
+                    # just prose — a table consumer must see it.
+                    table["metric_note"] = (
+                        EXACT_MATCH_PROXY_NOTE
+                        if fam.metric == "exact_match"
+                        else ""
+                    )
                     frames.append(table)
                     print(
                         f"[run_power_sim] per_query {dataset}/{regime}/"
@@ -1302,7 +1342,8 @@ def _markdown_report(
         "binary family uses the honest tie-flip injection on the REAL paired "
         "tie mass (audit §2.5). Continuous required_n is an UPPER bound "
         "(symmetrized dispersion keeps treatment-effect heterogeneity); the "
-        "binary effect unit is the tie-flip unit (see reconciliation note).",
+        "binary effect unit is the tie-flip unit (see reconciliation note). "
+        f"PROXY LABEL (G15): {EXACT_MATCH_PROXY_NOTE}.",
         "",
         "| dataset | regime | family | α role | effect | required n |",
         "|---|---|---|---|---|---|",
@@ -1368,15 +1409,31 @@ def _markdown_report(
         "percentage points: tie mass differs per dataset, so the co-primary "
         "set is powered at per-dataset pp-effects. Stated plainly:",
         "",
-        "| dataset | regime | tie mass | effect 0.02 -> pp | 0.05 -> pp | 0.10 -> pp |",
-        "|---|---|---|---|---|---|",
     ]
-    for t in translation:
-        lines.append(
-            f"| {t['dataset']} | {t['pair_regime']} | {t['tie_mass']:.3f} | "
-            f"{t['implied_pp']['0.02']:.4f} | {t['implied_pp']['0.05']:.4f} | "
-            f"{t['implied_pp']['0.1']:.4f} |"
-        )
+    # G15 (2026-08-16): effect columns are DERIVED from the simulated grid —
+    # the old hard-coded 0.02/0.05/0.1 keys raised KeyError AFTER a long sim
+    # whenever the binary effect grid changed.
+    effect_keys: list[str] = sorted(
+        {key for t in translation for key in t["implied_pp"]}, key=float
+    )
+    if not effect_keys:
+        lines.append("(no binary flip rows were simulated — nothing to translate)")
+    else:
+        lines += [
+            "| dataset | regime | tie mass | "
+            + " | ".join(f"effect {key} -> pp" for key in effect_keys)
+            + " |",
+            "|---|---|---|" + "---|" * len(effect_keys),
+        ]
+        for t in translation:
+            cells = " | ".join(
+                f"{t['implied_pp'][key]:.4f}" if key in t["implied_pp"] else "n/a"
+                for key in effect_keys
+            )
+            lines.append(
+                f"| {t['dataset']} | {t['pair_regime']} | "
+                f"{t['tie_mass']:.3f} | {cells} |"
+            )
     lines += [
         "",
         "## Recommendation at the declared candidate MDEs",
@@ -1560,7 +1617,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "loader_validity_rule": cal.LOADER_VALIDITY_RULE,
         "registered_test_paths": {
             "per_query_continuous": "tests_by_unit.paired_wilcoxon (two-sided)",
-            "per_query_binary": "tests_by_unit.mcnemar_binary (two-sided, exact)",
+            "per_query_binary": (
+                "tests_by_unit.mcnemar_binary (two-sided, exact) — "
+                + EXACT_MATCH_PROXY_NOTE
+            ),
             "window": "tests_by_unit.batch_means_contrast (Welch, two-sided)",
             "tost": "equivalence.conditional_tost (two-layer, §9.5)",
         },

@@ -57,6 +57,25 @@ MODEL = "qwen3-14b"
 DATASET = "squad_v2"
 N_EXAMPLES = 18
 
+#: Well-formed hex registration SHAs for the G1-bound confirmatory calls.
+REG_SHA_ATTEMPT_1 = "aaaa1111aaaa1111"
+REG_SHA_ATTEMPT_2 = "bbbb2222bbbb2222"
+REG_SHA_ATTEMPT_3 = "cccc3333cccc3333"
+
+
+def _bind_registration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, sha: str
+) -> None:
+    """Satisfy the G1 registration binding for a confirmatory run_analysis
+    call (executing HEAD == sha, clean; prereg embeds sha; ADR-0086 ladder
+    scaled to the fixture's N_EXAMPLES — the registered ladder itself is
+    pinned in tests/test_campaign_analysis.py)."""
+    prereg = tmp_path / "PRE_REGISTRATION.md"
+    prereg.write_text(f"Machinery SHA: `{sha}`\n", encoding="utf-8")
+    monkeypatch.setattr(rca, "_git_head_state", lambda repo_dir=None: (sha, False))
+    monkeypatch.setattr(rca, "PREREG_PATH", prereg)
+    monkeypatch.setattr(rca, "ADR0086_REALIZED_N_LADDER", (N_EXAMPLES,))
+
 WINDOW_ARTIFACTS = (
     "requests.jsonl",
     "qa_evidence.jsonl",
@@ -275,12 +294,15 @@ def test_concurrent_confirmatory_acquire_refuses_atomically(organized_run: Path)
 
 
 def test_crashed_confirmatory_attempt_does_not_burn_the_one_look_budget(
-    organized_run: Path, monkeypatch: pytest.MonkeyPatch
+    organized_run: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     real_load_index = rca.load_index
     calibration = _write_passing_calibration_report(
         organized_run.parent / "calibration_report.json"
     )
+    # G1: confirmatory calls are registration-bound; metrics=None resolves
+    # to the REGISTERED §9.1 pair (an explicit non-registered list refuses).
+    _bind_registration(monkeypatch, tmp_path, REG_SHA_ATTEMPT_1)
 
     def _boom(run_dir: Path) -> None:
         raise RuntimeError("simulated crash mid-pipeline (e.g. OOM)")
@@ -290,9 +312,8 @@ def test_crashed_confirmatory_attempt_does_not_burn_the_one_look_budget(
         rca.run_analysis(
             organized_run,
             contrast_ids=[4],
-            metrics=["ttft_ms"],
             mode="confirmatory",
-            registered_sha="sha-attempt-1",
+            registered_sha=REG_SHA_ATTEMPT_1,
             calibration_report=calibration,
         )
     # The crash must NOT leave a lock behind — a retry is still legal, i.e.
@@ -300,28 +321,28 @@ def test_crashed_confirmatory_attempt_does_not_burn_the_one_look_budget(
     assert not (organized_run / rca.LOCK_NAME).exists()
 
     monkeypatch.setattr(rca, "load_index", real_load_index)
+    _bind_registration(monkeypatch, tmp_path, REG_SHA_ATTEMPT_2)
     result = rca.run_analysis(
         organized_run,
         contrast_ids=[4],
-        metrics=["ttft_ms"],
         mode="confirmatory",
-        registered_sha="sha-attempt-2",
+        registered_sha=REG_SHA_ATTEMPT_2,
         calibration_report=calibration,
     )
     assert result.stats_path.is_file()
     lock = json.loads((organized_run / rca.LOCK_NAME).read_text(encoding="utf-8"))
     assert lock["phase"] == "DONE"
-    assert lock["registered_sha"] == "sha-attempt-2"
+    assert lock["registered_sha"] == REG_SHA_ATTEMPT_2
 
     # A third confirmatory attempt now correctly refuses — the budget WAS
     # spent, by the successful attempt-2, not by the earlier crash.
+    _bind_registration(monkeypatch, tmp_path, REG_SHA_ATTEMPT_3)
     with pytest.raises(rca.OneLookError, match="ONE-LOOK"):
         rca.run_analysis(
             organized_run,
             contrast_ids=[4],
-            metrics=["ttft_ms"],
             mode="confirmatory",
-            registered_sha="sha-attempt-3",
+            registered_sha=REG_SHA_ATTEMPT_3,
             calibration_report=calibration,
         )
     # No leftover temp file from the atomic write-temp+os.replace finalize.

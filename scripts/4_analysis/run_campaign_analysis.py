@@ -17,6 +17,24 @@ Two modes, mutually exclusive:
   ``<run>/analysis_lock.json``; a second confirmatory invocation on the same
   run REFUSES — the campaign data is analyzed once (§9.11).
 
+Registration binding (G1, 2026-08-16): the confirmatory look is BOUND to the
+frozen registration, not to the CLI —
+
+- metrics come from ``families.DEFAULT_METRICS`` (the registered §9.1
+  co-primary pair); ``--metrics`` is design-input-only and a confirmatory
+  override differing from the registered pair REFUSES naming both lists;
+- ``--registered-sha`` must be 7-64 lowercase hex, must match the EXECUTING
+  code's git HEAD, the worktree must be clean, and
+  ``MyDocs/registration/PRE_REGISTRATION.md`` must exist with a matching
+  embedded Machinery SHA (absent pre-freeze -> refusal naming task #112);
+- ``--alpha`` must equal the registered ``REGISTERED_ALPHA``;
+- §9.5 margins come from the registered-margins artifact
+  (``registered_margins.json`` beside the prereg); a CLI ``--tost-margin``
+  must match it or refuse;
+- ADR-0086 realized-n: every primary per-query row records its realized n
+  and confirmatory refuses below the registered floor unless a pre-declared
+  step-down rung (``ADR0086_REALIZED_N_LADDER``) is explicitly accepted.
+
 Pipeline per run:
 
 1. Load ``index/cells_index.csv`` (the organize_results handoff table).
@@ -37,7 +55,7 @@ Pipeline per run:
    (full α per dataset, pooling prohibited); every other tier gets a
    DIAGNOSTIC ``corrections.holm`` ACROSS DATASETS within each contrast ×
    metric — while the REGISTERED §9.3 Holm-WITHIN-FAMILY correction (sibling
-   contrasts pooled per group×metric×dataset via
+   contrasts pooled per group×metric×dataset×family×unit via
    ``families.compile_family_map``) is executed by
    ``gatekeeping.evaluate_chain`` and reported in ``stats['gatekeeping']``
    with the full auditable trace (Dmitrienko serial order =
@@ -69,11 +87,26 @@ Guards (§9.4 unit-of-analysis rules):
   batch-means contrast are listed in a labeled skip block instead of
   producing wrong statistics.
 - Registered contrasts whose selector is not a single baseline pair (e.g. the
-  gated #6, the engine-slot #10, the estimand-carrying #13/#14) are reported
-  as labeled skips, never silently dropped.
-- Sidedness: this driver runs every test TWO-SIDED (conservative for any
-  correctly-directed one-sided registration); the registered sidedness is
-  recorded beside each result.
+  gated #6, the engine-slot #10) are reported as labeled skips, never
+  silently dropped. The estimand-carrying primaries have executors (G4):
+  #13's fingerprint superiority legs run per
+  ``families.FINGERPRINT_SUB_HYPOTHESES`` (3 one-sided legs, Holm at the
+  registered m=3, intersection-union p as the chain endpoint contribution);
+  #14 (truth_tax) is a fail-loud stub naming its #119 dependency; #12
+  (lambda_star_onset) computes the interpolated Chiu-Jain argmax from the
+  F2 rate grid or fails loud naming the missing artifact.
+- Sidedness (owner decision a, 2026-08-16): each row EXECUTES its REGISTERED
+  sidedness from the §9.3 family-map row — one-sided rows derive their scipy
+  ``alternative`` from the registered contrast direction
+  (``REGISTERED_CELL_DIRECTION``) x the metric's direction; the executed
+  alternative is recorded per row. Tie handling (decision b): the driver
+  passes ``zero_method='pratt'`` (the registered value) into every paired
+  Wilcoxon and surfaces the effective n (``n_nonzero``) per row.
+- Tier routing (G2): a row's tier comes from the family-map ROW, never from
+  ``Contrast.tier`` alone — ADR-0087-demoted exploratory rows (faithfulness)
+  can never enter the primary chain or a Holm family; they receive BH-FDR in
+  the separated ``stats['exploratory']`` section (G3), clearly
+  non-confirmatory.
 """
 
 from __future__ import annotations
@@ -83,6 +116,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
 from dataclasses import dataclass, field, replace as dc_replace
 from datetime import datetime, timezone
@@ -110,7 +144,7 @@ from src.analysis.stats.calibration import (  # noqa: E402
     CalibrationReport,
     InjectionResult,
 )
-from src.analysis.stats.corrections import holm  # noqa: E402
+from src.analysis.stats.corrections import benjamini_hochberg, holm  # noqa: E402
 from src.analysis.stats.equivalence import (  # noqa: E402
     conditional_tost,
     rope_sensitivity,
@@ -118,12 +152,17 @@ from src.analysis.stats.equivalence import (  # noqa: E402
 from src.analysis.stats.families import (  # noqa: E402
     CONTRASTS,
     Contrast,
+    DEFAULT_METRICS as REGISTERED_DEFAULT_METRICS,
+    FINGERPRINT_CONTRAST_ID,
     FINGERPRINT_SUB_HYPOTHESES,
+    FLOOR_SUITE_CONTRAST_ID,
     HEADLINE_CONTRAST_ID,
     KNOWN_DATASETS,
     PREDICATE_METRIC,
     PRIMARY_CHAIN_ORDER,
+    UNGATED,
     FamilyMapError,
+    chain_endpoint,
     compile_family_map,
 )
 from src.analysis.stats.gatekeeping import (  # noqa: E402
@@ -140,6 +179,10 @@ from src.analysis.stats.tests_by_unit import (  # noqa: E402
     paired_wilcoxon,
 )
 from src.analysis.stats.wlt import win_loss_tie  # noqa: E402
+from src.observability.provenance import (  # noqa: E402
+    git_dirty as _prov_git_dirty,
+    git_sha as _prov_git_sha,
+)
 
 Mode = Literal["design-input", "confirmatory"]
 
@@ -160,10 +203,103 @@ BLINDING_DIRNAME = "blinding"
 SEALED_MAP_NAME = "sealed_arm_map.json"
 UNBLIND_LOG_NAME = "unblind_log.jsonl"
 
-#: §9.3 serial-gate upstream for the F1 secondary families: the headline
-#: co-primary set (#4) gates them — a secondary is confirmatory only if #4
-#: passed on the SAME dataset × metric (gatekeeping.evaluate_chain enforces it).
-_SECONDARY_UPSTREAM_ID: int = HEADLINE_CONTRAST_ID
+#: Registered gating topology (decision d, 2026-08-16 — G10): each secondary
+#: row's upstream comes from the family map's ``upstream`` column, never from
+#: a driver hard-code. The headline (#4) gates per (dataset x the secondary's
+#: OWN metric); the estimand endpoints gate per (dataset x their registered
+#: estimand variable) — this table maps a chain endpoint to the metric leg its
+#: outcomes are keyed under (the co-primary keys are ``<dataset>|<metric>``).
+_UPSTREAM_LEG_METRIC: dict[str, str] = {
+    chain_endpoint(FINGERPRINT_CONTRAST_ID): "fingerprint",
+    chain_endpoint(14): "truth_tax",
+}
+
+#: G1 (2026-08-16): confirmatory registration binding.
+REGISTERED_ALPHA: float = 0.05
+_REGISTERED_SHA_RE = re.compile(r"^[0-9a-f]{7,64}$")
+#: The SHA line ``prereg.assemble_preregistration`` embeds ("Machinery SHA:
+#: `<sha>`") — the confirmatory look must execute exactly that machinery.
+_PREREG_EMBEDDED_SHA_RE = re.compile(r"Machinery SHA: `([0-9a-f]{7,64})`")
+#: The ONE tracked registration document (freeze task #112 lands it).
+PREREG_PATH: Path = _REPO_ROOT / "MyDocs" / "registration" / "PRE_REGISTRATION.md"
+#: Machine-readable §9.5 registered margins (metric -> margin, metric units),
+#: frozen beside the prereg at #112. prereg.py's ``margins`` argument is
+#: free-text registration prose; this sidecar is its numeric dual so the
+#: driver can CHECK a margin instead of trusting the CLI (G1d/G9).
+REGISTERED_MARGINS_PATH: Path = (
+    _REPO_ROOT / "MyDocs" / "registration" / "registered_margins.json"
+)
+
+#: ADR-0086 (G16): registered per-dataset primary realized-n floor with the
+#: pre-declared step-down ladder. The first rung is the registered floor; a
+#: confirmatory look below it must explicitly accept a later rung
+#: (``--accept-step-down``) and the acceptance is recorded in stats.json.
+ADR0086_REALIZED_N_LADDER: tuple[int, ...] = (2000, 1600, 1200)
+
+#: G14: the registered resampling seeds, passed EXPLICITLY to the §9.5
+#: primitives (registration lives in the driver, not in primitive defaults)
+#: and echoed into stats['provenance'].
+BOOTSTRAP_SEED: int = 42
+ROPE_SEED: int = 42
+
+#: Registered direction of each ONE-SIDED baseline-pair contrast (decision a,
+#: 2026-08-16): whether the registered claim is that the CELL (baseline_a)
+#: comes out better or worse than the reference on the tested metric.
+#: 'cell-worse' encodes the price/ablation contrasts (#5's note pins the
+#: convention: "BERGEN monotone chain: B5 < B6"); #3 is the mirrored oracle
+#: claim (retrieval PAYS vs gold context, so the B1 cell is better); #15 is
+#: metric-dependent by its own registered wording ("latency saved vs truth
+#: lost"): serving metrics -> cell-better, quality metrics -> cell-worse.
+#: A one-sided row whose contrast has no entry here FAILS LOUD — running an
+#: undeclared tail would be an unregistered test.
+REGISTERED_CELL_DIRECTION: dict[int, str] = {
+    1: "cell-worse",
+    2: "cell-worse",
+    3: "cell-better",
+    5: "cell-worse",
+    7: "cell-worse",
+    15: "serving-better-quality-worse",
+}
+
+#: Direction registry for the registry-internal estimand variables (#12/#14
+#: pinned metrics + the #13 pseudo-metric). Kept SEPARATE from
+#: HIGHER_IS_BETTER because families.REGISTERED_METRICS is pinned equal to
+#: the HIGHER_IS_BETTER keys (the G7 caller roster) and estimand variables
+#: are never caller-suppliable.
+ESTIMAND_HIGHER_IS_BETTER: dict[str, bool] = {
+    # truth_tax = G - Y: a TAX, lower is better (§9.2).
+    "truth_tax": False,
+    # onset later = the system copes longer before the knee (§9.2).
+    "lambda_star_onset": True,
+    # fingerprint legs test harm on a quality instrument (higher better).
+    "fingerprint": True,
+}
+
+#: §6.1/§9.2 floor suite (#12): rates are FRACTIONS of the predicted λ*, so
+#: the prediction under test is onset at rate_frac = 1.0 with the registered
+#: multiplicative ×/÷1.15 band; the knee estimator is the interpolated
+#: Chiu-Jain power-metric argmax over the F2 rate grid.
+LAMBDA_STAR_BAND: float = 1.15
+LAMBDA_STAR_MIN_GRID_POINTS: int = 3
+#: Per-window inputs of the Chiu-Jain power metric (goodput-weighted offered
+#: rate over response time).
+_LAMBDA_STAR_REQUIRED_COLUMNS: tuple[str, ...] = ("goodput_frac", "latency_ms")
+
+#: #13 fingerprint superiority legs (G4a): the policy-axis pairings for the
+#: 3 registered Holm legs. 'truncate' is NOT a policy value (§7.3) — the
+#: truncation fingerprint rides the B11-vs-B6 ARM pair under pressure.
+_FINGERPRINT_POLICY_OF_LEG: dict[str, str] = {
+    "evict": "evict",
+    "compress": "compress-fp8",
+}
+_FINGERPRINT_TRUNCATE_PAIR: tuple[str, str] = ("B11", "B6")
+#: Registered Holm family size of the fingerprint superiority legs (§9.3:
+#: 3 superiority predictions). Missing legs are padded at p=1.0 (conservative)
+#: and force the intersection-union p to 1.0 — an incomplete fingerprint can
+#: never pass its chain step.
+FINGERPRINT_HOLM_M: int = sum(
+    1 for _, corr, _, _ in FINGERPRINT_SUB_HYPOTHESES if corr == "holm"
+)
 
 #: §9.5: the three pre-registered NONE fingerprints tested by conditional TOST.
 #: 'distribute' is a topology-slot leg (no policy-axis pairing exists for it in
@@ -292,8 +428,9 @@ def classify_contrast(contrast: Contrast) -> str | None:
     rows (paired Wilcoxon / McNemar); (b) window-unit baseline-pair contrasts
     on loaded rows via window-level batch means
     (``tests_by_unit.batch_means_contrast``, §9.4). Selector contrasts (no
-    single baseline pair — e.g. the gated #6, the engine-slot #10, the
-    estimand-carrying #13/#14) remain labeled skips.
+    single baseline pair — e.g. the gated #6, the engine-slot #10) remain
+    labeled skips. The estimand primaries never reach this classifier: #13
+    and #12 have executors, #14 is a fail-loud stub (G4).
     """
     if contrast.baseline_a is None or contrast.baseline_b is None:
         return (
@@ -597,17 +734,27 @@ def load_per_query(
     """Long per-query table for the given cells across ALL their index windows.
 
     Joins ``requests.jsonl`` + ``qa_evidence.jsonl`` per window on
-    ``example_id`` (numeric fields only; duplicate example_id lines within a
-    window are multiple trials and are averaged, matching the figure-pipeline
-    convention). Output columns: row_key, dataset, window_key, example_id,
-    plus every numeric field seen. A window with zero joinable records fails
-    loud.
+    ``example_id`` (numeric fields; duplicate example_id lines within a
+    window are multiple trials — disambiguated by ``record_index`` — and are
+    averaged, matching the figure-pipeline convention). Output columns:
+    row_key, dataset, window_key, example_id, plus every numeric field seen.
+    A window with zero joinable records fails loud.
+
+    G11 (2026-08-16): JSON booleans are COERCED to 1.0/0.0 instead of being
+    silently dropped (the future #119 predicate producer may emit
+    true/false); the coerced field names are surfaced on the returned frame
+    as ``frame.attrs['bool_coerced_fields']``. Two records in ONE artifact
+    file sharing the same ``(example_id, record_index)`` key (including both
+    missing ``record_index``) are a duplicate-row hazard (H3: replay rows
+    are duplicated BY DESIGN and must carry the disambiguating key) — the
+    loader REFUSES naming the window.
     """
     wanted = set(row_keys)
     selection = index[index["row_key"].isin(wanted)]
     if selection.empty:
         raise AnalysisError(f"no index rows for row keys {sorted(wanted)}")
     rows: list[dict[str, Any]] = []
+    bool_coerced: set[str] = set()
     for rec in selection.itertuples(index=False):
         window_dir = run_dir / str(rec.window_dir)
         merged: dict[str, dict[str, list[float]]] = {}
@@ -616,14 +763,29 @@ def load_per_query(
             path = window_dir / name
             if not path.is_file():
                 continue  # qa_evidence is dataset-exempt for load donors (§1)
+            seen_keys: set[tuple[str, Any]] = set()
             for obj in _read_jsonl(path):
                 example_id = obj.get("example_id")
                 if not isinstance(example_id, str) or not example_id:
                     n_unjoined += 1
                     continue
+                dup_key = (example_id, obj.get("record_index"))
+                if dup_key in seen_keys:
+                    raise AnalysisError(
+                        f"{path}: duplicate (example_id, record_index) = "
+                        f"{dup_key!r} — replayed rows must carry a distinct "
+                        "record_index (H3/#127); refusing to average "
+                        "indistinguishable rows (G11)"
+                    )
+                seen_keys.add(dup_key)
                 bucket = merged.setdefault(example_id, {})
                 for field_name, value in obj.items():
-                    if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    if isinstance(value, bool):
+                        # true/false -> 1.0/0.0, noted — never dropped (G11).
+                        bool_coerced.add(field_name)
+                        bucket.setdefault(field_name, []).append(float(value))
+                        continue
+                    if not isinstance(value, (int, float)):
                         continue
                     bucket.setdefault(field_name, []).append(float(value))
         if not merged:
@@ -642,7 +804,9 @@ def load_per_query(
                     **{k: float(np.mean(v)) for k, v in fields.items()},
                 }
             )
-    return pd.DataFrame(rows)
+    frame = pd.DataFrame(rows)
+    frame.attrs["bool_coerced_fields"] = sorted(bool_coerced)
+    return frame
 
 
 # ---------------------------------------------------------------------------
@@ -651,14 +815,226 @@ def load_per_query(
 
 
 def _metric_direction(metric: str) -> bool:
-    try:
+    if metric in HIGHER_IS_BETTER:
         return HIGHER_IS_BETTER[metric]
-    except KeyError:
+    if metric in ESTIMAND_HIGHER_IS_BETTER:
+        return ESTIMAND_HIGHER_IS_BETTER[metric]
+    raise AnalysisError(
+        f"metric {metric!r} has no registered direction — add it to "
+        f"HIGHER_IS_BETTER (caller roster) or ESTIMAND_HIGHER_IS_BETTER "
+        f"(estimand variables) in run_campaign_analysis.py (known: "
+        f"{sorted(HIGHER_IS_BETTER) + sorted(ESTIMAND_HIGHER_IS_BETTER)}). "
+        "Guessing a direction flips W/L/T."
+    )
+
+
+def _derive_alternative(
+    contrast_id: int, sidedness: str, metric: str, higher_is_better: bool
+) -> str:
+    """The scipy ``alternative`` a registered row EXECUTES (decision a).
+
+    Two-sided rows pass through. One-sided rows resolve the registered
+    contrast direction (``REGISTERED_CELL_DIRECTION``) against the metric's
+    direction: with a = cell and b = reference on every §9.4 primitive,
+    "cell better" means H1: a > b on a higher-is-better metric and H1: a < b
+    on a lower-is-better one — i.e. ``alternative = "greater" iff
+    claim_cell_better == higher_is_better``. The mapping holds verbatim for
+    the McNemar binary route (``"greater"`` = arm a succeeds more, which is
+    "better" exactly when higher_is_better). A one-sided contrast with no
+    registered direction FAILS LOUD: an undeclared tail is an unregistered
+    test.
+    """
+    if sidedness == "two-sided":
+        return "two-sided"
+    if sidedness != "one-sided":
         raise AnalysisError(
-            f"metric {metric!r} has no registered direction — add it to "
-            f"HIGHER_IS_BETTER in run_campaign_analysis.py (known: "
-            f"{sorted(HIGHER_IS_BETTER)}). Guessing a direction flips W/L/T."
-        ) from None
+            f"contrast #{contrast_id}: sidedness {sidedness!r} has no direct "
+            "test execution (TOST rows run through the §9.5 equivalence "
+            "machinery, never this router)"
+        )
+    direction = REGISTERED_CELL_DIRECTION.get(contrast_id)
+    if direction is None:
+        raise AnalysisError(
+            f"contrast #{contrast_id} is registered one-sided but has no "
+            "entry in REGISTERED_CELL_DIRECTION — refusing to guess a tail "
+            "(decision a, 2026-08-16)"
+        )
+    if direction == "serving-better-quality-worse":
+        # #15 "latency saved vs truth lost": the cell is predicted BETTER on
+        # serving metrics (lower is better) and WORSE on quality metrics.
+        claim_cell_better = not higher_is_better
+    else:
+        claim_cell_better = direction == "cell-better"
+    return "greater" if claim_cell_better == higher_is_better else "less"
+
+
+# ---------------------------------------------------------------------------
+# G1: confirmatory registration binding (SHA, worktree, prereg, alpha, margins)
+# ---------------------------------------------------------------------------
+
+
+def _git_head_state(repo_dir: Path = _REPO_ROOT) -> tuple[str | None, bool | None]:
+    """(HEAD sha, dirty flag) of the EXECUTING code — subprocess git, like
+    campaign_layout (src.observability.provenance owns the fallbacks)."""
+    return _prov_git_sha(str(repo_dir)), _prov_git_dirty(str(repo_dir))
+
+
+def _sha_matches(short_or_full: str, full: str) -> bool:
+    return full == short_or_full or full.startswith(short_or_full)
+
+
+def check_registration_binding(
+    registered_sha: str, *, alpha: float, metrics: Sequence[str],
+    metrics_overridden: bool,
+) -> dict[str, Any]:
+    """G1 (2026-08-16): bind the confirmatory look to the frozen registration.
+
+    Refuses (AnalysisError, BEFORE the §9.11 lock) unless: the SHA is 7-64
+    lowercase hex; it names the EXECUTING code's git HEAD; the worktree is
+    clean; ``PREREG_PATH`` exists and embeds a matching Machinery SHA; alpha
+    equals ``REGISTERED_ALPHA``; and any ``--metrics`` override equals the
+    registered pair (checked by the caller before this runs — recorded here).
+    Returns the summary recorded into stats['preconditions']['registration'].
+    """
+    if not _REGISTERED_SHA_RE.fullmatch(registered_sha):
+        raise AnalysisError(
+            f"--registered-sha {registered_sha!r} is not a 7-64 char "
+            "lowercase hex git SHA — the confirmatory look executes a frozen "
+            "registration, not a label (G1)"
+        )
+    head_sha, dirty = _git_head_state()
+    if head_sha is None or dirty is None:
+        raise AnalysisError(
+            "cannot resolve the EXECUTING code's git HEAD/dirty state — the "
+            "confirmatory look must prove it runs the registered machinery "
+            "(G1); run from the registered checkout"
+        )
+    if not _sha_matches(registered_sha, head_sha):
+        raise AnalysisError(
+            f"--registered-sha {registered_sha!r} does not name the EXECUTING "
+            f"code (git HEAD {head_sha!r}) — the registered look must run "
+            "exactly the frozen machinery (G1); check out the registered SHA"
+        )
+    if dirty:
+        raise AnalysisError(
+            f"the worktree at HEAD {head_sha!r} is DIRTY — uncommitted edits "
+            "mean the executing code is NOT the registered code; commit or "
+            "stash before the confirmatory look (G1)"
+        )
+    if not PREREG_PATH.is_file():
+        raise AnalysisError(
+            f"no frozen registration document at {PREREG_PATH} — the "
+            "confirmatory look executes a registration that does not exist "
+            "yet; the §9.13 freeze (task #112) must land PRE_REGISTRATION.md "
+            "before any confirmatory analysis (G1)"
+        )
+    prereg_text = PREREG_PATH.read_text(encoding="utf-8")
+    match = _PREREG_EMBEDDED_SHA_RE.search(prereg_text)
+    if match is None:
+        raise AnalysisError(
+            f"{PREREG_PATH} carries no embedded 'Machinery SHA: `<sha>`' "
+            "line — a registration without its machinery SHA cannot be "
+            "executed against (G1); re-assemble via prereg.py"
+        )
+    embedded = match.group(1)
+    if not (_sha_matches(registered_sha, embedded) or _sha_matches(embedded, registered_sha)):
+        raise AnalysisError(
+            f"--registered-sha {registered_sha!r} does not match the SHA "
+            f"embedded in {PREREG_PATH.name} ({embedded!r}) — the look must "
+            "execute the registration it names (G1)"
+        )
+    if alpha != REGISTERED_ALPHA:
+        raise AnalysisError(
+            f"--alpha {alpha!r} differs from the registered alpha "
+            f"{REGISTERED_ALPHA!r} — alpha is registration content, not a "
+            "CLI knob (G1)"
+        )
+    return {
+        "registered_sha": registered_sha,
+        "executing_git_sha": head_sha,
+        "executing_git_dirty": dirty,
+        "prereg_path": str(PREREG_PATH),
+        "prereg_embedded_sha": embedded,
+        "alpha": alpha,
+        "metrics": list(metrics),
+        "metrics_source": (
+            "CLI override (== registered pair)"
+            if metrics_overridden
+            else "families.DEFAULT_METRICS (registered §9.1 co-primary pair)"
+        ),
+        "verdict": "BOUND",
+    }
+
+
+def resolve_registered_margin(
+    tost_margin: float | None, equivalence_metric: str | None
+) -> tuple[float | None, dict[str, Any]]:
+    """G1d/G9: confirmatory §9.5 margins come from the registered artifact.
+
+    Returns (margin_to_use, record). With a registered-margins artifact
+    present and an equivalence metric named, the registered margin is
+    CONSUMED (a CLI ``--tost-margin`` must match it or refuse). Without the
+    artifact, a CLI margin REFUSES — margins are registration content and
+    cannot be minted at the one look; no margin at all leaves the §9.5 legs
+    as labeled skips (the honest pre-freeze state).
+    """
+    record: dict[str, Any] = {
+        "artifact": str(REGISTERED_MARGINS_PATH),
+        "artifact_present": REGISTERED_MARGINS_PATH.is_file(),
+        "equivalence_metric": equivalence_metric,
+        "cli_margin": tost_margin,
+        "margin_used": None,
+    }
+    if equivalence_metric is None:
+        if tost_margin is not None:
+            raise AnalysisError(
+                "--tost-margin without --equivalence-metric cannot be "
+                "cross-checked against the registered margins (G1d); name "
+                "the metric the registered margin belongs to"
+            )
+        return None, record
+    if not REGISTERED_MARGINS_PATH.is_file():
+        if tost_margin is not None:
+            raise AnalysisError(
+                f"confirmatory --tost-margin={tost_margin} refused: no "
+                f"registered-margins artifact at {REGISTERED_MARGINS_PATH} — "
+                "§9.5 margins are registration content (G1d/G9); the §9.13 "
+                "freeze (task #112) writes registered_margins.json beside "
+                "PRE_REGISTRATION.md"
+            )
+        return None, record
+    try:
+        margins = json.loads(REGISTERED_MARGINS_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise AnalysisError(
+            f"registered margins artifact {REGISTERED_MARGINS_PATH} is not "
+            f"valid JSON: {exc}"
+        ) from exc
+    if not isinstance(margins, dict):
+        raise AnalysisError(
+            f"registered margins artifact {REGISTERED_MARGINS_PATH} must be "
+            "a JSON object mapping metric -> margin"
+        )
+    if equivalence_metric not in margins:
+        if tost_margin is not None:
+            raise AnalysisError(
+                f"metric {equivalence_metric!r} has no registered §9.5 "
+                f"margin in {REGISTERED_MARGINS_PATH.name} (registered: "
+                f"{sorted(margins)}) — an unregistered margin cannot run at "
+                "the confirmatory look (G1d)"
+            )
+        return None, record
+    registered = float(margins[equivalence_metric])
+    if tost_margin is not None and tost_margin != registered:
+        raise AnalysisError(
+            f"--tost-margin={tost_margin} contradicts the REGISTERED margin "
+            f"{registered} for {equivalence_metric!r} "
+            f"({REGISTERED_MARGINS_PATH.name}) — the registered margin is "
+            "what runs (G1d/G9)"
+        )
+    record["margin_used"] = registered
+    record["margin_source"] = REGISTERED_MARGINS_PATH.name
+    return registered, record
 
 
 #: §9.1: primaries are NEVER pooled/corrected across datasets (full alpha per
@@ -667,8 +1043,9 @@ def _metric_direction(metric: str) -> bool:
 #: executed chain). The Holm shown for every other tier here is
 #: across-DATASET only — a labeled diagnostic; the registered §9.3
 #: Holm-WITHIN-FAMILY correction (sibling contrasts sharing
-#: group×metric×dataset per families.compile_family_map) is executed by
-#: gatekeeping.evaluate_chain and reported in stats['gatekeeping'].
+#: group×metric×dataset×family×unit per families.compile_family_map) is
+#: executed by gatekeeping.evaluate_chain and reported in
+#: stats['gatekeeping'].
 _PRIMARY_CORRECTION_LABEL = (
     "none (primary tier, full alpha per dataset, §9.1 co-primary set — "
     "cross-dataset pooling/correction PROHIBITED; the registered pass/fail "
@@ -678,22 +1055,66 @@ _PRIMARY_CORRECTION_LABEL = (
 _DIAGNOSTIC_HOLM_LABEL = (
     "holm across datasets within contrast × metric (DIAGNOSTIC ONLY — the "
     "registered §9.3 Holm-within-family correction pools sibling contrasts "
-    "sharing group×metric×dataset via families.compile_family_map and is "
-    "executed by gatekeeping.evaluate_chain in stats['gatekeeping'])"
+    "sharing group×metric×dataset×family×unit via families.compile_family_map "
+    "and is executed by gatekeeping.evaluate_chain in stats['gatekeeping'])"
+)
+_EXPLORATORY_CORRECTION_LABEL = (
+    "bh-fdr in stats['exploratory'] (registered §9.3 exploratory tier — "
+    "NON-CONFIRMATORY, ungated, no diagnostic Holm here)"
 )
 
 
+@dataclass(frozen=True)
+class MapRow:
+    """One §9.3 family-map row's registered execution attributes (G2/G10:
+    the ROW — not ``Contrast`` — is the routing authority)."""
+
+    tier: str
+    family_id: str
+    upstream: str
+    sidedness: str
+    unit: str
+    correction: str
+
+
+def _tier_correction(
+    tier: str, per_dataset: Sequence[dict[str, Any]]
+) -> str:
+    """Attach the tier-conditional across-dataset correction in place."""
+    computed = [row for row in per_dataset if "p_value" in row]
+    if tier == "primary":
+        for row in computed:
+            row["p_holm_across_datasets"] = None
+        return _PRIMARY_CORRECTION_LABEL
+    if tier == "exploratory":
+        # G2/G3: exploratory rows are BH-FDR territory (stats['exploratory']);
+        # a diagnostic Holm here would dress them as near-confirmatory.
+        for row in computed:
+            row["p_holm_across_datasets"] = None
+        return _EXPLORATORY_CORRECTION_LABEL
+    adjusted = holm([row["p_value"] for row in computed]) if computed else []
+    for row, p_adj in zip(computed, adjusted):
+        row["p_holm_across_datasets"] = float(p_adj)
+    return _DIAGNOSTIC_HOLM_LABEL
+
+
 def compute_pair_stats(
-    per_query: pd.DataFrame, pair: ResolvedPair, metric: str
+    per_query: pd.DataFrame,
+    pair: ResolvedPair,
+    metric: str,
+    *,
+    map_row: MapRow | None = None,
 ) -> dict[str, Any]:
     """Per-dataset test + W/L/T for one pair.
 
-    The test routes on the row's registered unit (§9.4): the binary §8.5 Y
-    predicate goes through ``mcnemar_binary`` (exact binomial on discordant
-    pairs); every other per-query metric goes through the paired Wilcoxon.
-    Multiplicity correction depends on tier (§9.1/§9.3): primaries carry NO
-    cross-dataset correction; everything else carries a diagnostic
-    across-dataset Holm (see ``_DIAGNOSTIC_HOLM_LABEL``).
+    ``map_row`` is the §9.3 family-map row for (contrast, metric, dataset,
+    family) — when present it is the REGISTERED routing authority (G2): the
+    row's tier drives correction routing, the row's unit drives the
+    McNemar-vs-Wilcoxon route (G8: by UNIT, not by the metric's name), and
+    the row's sidedness is EXECUTED (decision a) via the derived scipy
+    alternative. Without a map (non-charter data, design-input), the
+    ``Contrast`` registry attributes apply. Tie handling is the registered
+    ``zero_method='pratt'`` (decision b) with the effective n surfaced.
     """
     higher_is_better = _metric_direction(metric)
     if metric not in per_query.columns:
@@ -702,10 +1123,18 @@ def compute_pair_stats(
             f"record for contrast #{pair.contrast.id} "
             f"({pair.cell_row_key} vs {pair.reference_row_key})"
         )
-    unit = (
-        "binary"
-        if pair.contrast.unit == "per_query" and metric == PREDICATE_METRIC
-        else pair.contrast.unit
+    tier = map_row.tier if map_row is not None else pair.contrast.tier
+    sidedness = map_row.sidedness if map_row is not None else pair.contrast.sidedness
+    if map_row is not None:
+        unit = map_row.unit
+    else:
+        unit = (
+            "binary"
+            if pair.contrast.unit == "per_query" and metric == PREDICATE_METRIC
+            else pair.contrast.unit
+        )
+    alternative = _derive_alternative(
+        pair.contrast.id, sidedness, metric, higher_is_better
     )
     per_dataset: list[dict[str, Any]] = []
     for dataset in pair.datasets:
@@ -736,10 +1165,11 @@ def compute_pair_stats(
         b = wide[pair.reference_row_key].to_numpy(dtype=float)
         triple = win_loss_tie(a, b, higher_is_better=higher_is_better)
         if unit == "binary":
-            mcnemar = mcnemar_binary(a, b, alternative="two-sided")
+            mcnemar = mcnemar_binary(a, b, alternative=alternative)
             row: dict[str, Any] = {
                 "dataset": dataset,
                 "n_pairs": mcnemar.n_pairs,
+                "realized_n": mcnemar.n_pairs,
                 "n_dropped_nan": int(n_dropped),
                 "median_delta": float(np.median(a - b)),
                 "p_value": mcnemar.p_value,
@@ -754,35 +1184,42 @@ def compute_pair_stats(
                 "ties": triple.ties,
             }
         else:
-            wilcoxon = paired_wilcoxon(a, b, alternative="two-sided")
+            # Decision b (2026-08-16): the REGISTERED tie handling — Pratt
+            # zeros with the pinned unconditional normal-approx execution —
+            # passed explicitly by the driver, never a primitive default.
+            wilcoxon = paired_wilcoxon(
+                a, b, alternative=alternative, zero_method="pratt"
+            )
             row = {
                 "dataset": dataset,
                 "n_pairs": wilcoxon.n_pairs,
+                "realized_n": wilcoxon.n_pairs,
                 "n_dropped_nan": int(n_dropped),
                 "median_delta": float(np.median(a - b)),
                 "statistic": wilcoxon.statistic,
                 "p_value": wilcoxon.p_value,
                 "cliffs_delta_paired": wilcoxon.cliffs_delta_paired,
+                "n_nonzero": wilcoxon.n_nonzero,
+                "zero_method": wilcoxon.zero_method,
                 "wins": triple.wins,
                 "losses": triple.losses,
                 "ties": triple.ties,
             }
         per_dataset.append(row)
 
-    if pair.contrast.tier == "primary":
-        for row in per_dataset:
-            row["p_holm_across_datasets"] = None
-        correction_label = _PRIMARY_CORRECTION_LABEL
-    else:
-        adjusted = holm([row["p_value"] for row in per_dataset])
-        for row, p_adj in zip(per_dataset, adjusted):
-            row["p_holm_across_datasets"] = float(p_adj)
-        correction_label = _DIAGNOSTIC_HOLM_LABEL
+    correction_label = _tier_correction(tier, per_dataset)
 
     return {
         "contrast_id": pair.contrast.id,
         "name": pair.contrast.name,
-        "tier": pair.contrast.tier,
+        "tier": tier,
+        "tier_source": (
+            "family-map row (§9.3)" if map_row is not None
+            else "contrast registry (no family map for this run)"
+        ),
+        "family": pair.contrast.family,
+        "family_id": map_row.family_id if map_row is not None else None,
+        "upstream": map_row.upstream if map_row is not None else None,
         "cell_baseline": pair.contrast.baseline_a,
         "reference_baseline": pair.contrast.baseline_b,
         "cell_row_key": pair.cell_row_key,
@@ -791,16 +1228,19 @@ def compute_pair_stats(
         "unit": unit,
         "test": "mcnemar_binary" if unit == "binary" else "paired_wilcoxon",
         "higher_is_better": higher_is_better,
-        "registered_sidedness": pair.contrast.sidedness,
-        "test_sidedness": "two-sided (driver policy: conservative superset of "
-        "any correctly-directed one-sided registration)",
+        "registered_sidedness": sidedness,
+        "executed_alternative": alternative,
         "correction": correction_label,
         "per_dataset": per_dataset,
     }
 
 
 def compute_window_pair_stats(
-    per_query: pd.DataFrame, pair: WindowPair, metric: str
+    per_query: pd.DataFrame,
+    pair: WindowPair,
+    metric: str,
+    *,
+    map_row: MapRow | None = None,
 ) -> dict[str, Any]:
     """Batch-means Welch contrast for one loaded-window pair (§9.4).
 
@@ -809,7 +1249,9 @@ def compute_window_pair_stats(
     means — per-query pairing under load is PROHIBITED). Datasets with < 2
     windows on either side are labeled skips inside ``per_dataset``, never
     silently dropped. No W/L/T triple here: §8.13's triple is a per-query
-    mandate and window means are unpaired across cells.
+    mandate and window means are unpaired across cells. ``map_row`` supplies
+    the REGISTERED tier/sidedness (G2 / decision a) exactly as in
+    ``compute_pair_stats``.
     """
     higher_is_better = _metric_direction(metric)
     if metric not in per_query.columns:
@@ -818,6 +1260,11 @@ def compute_window_pair_stats(
             f"record for window contrast #{pair.contrast.id} "
             f"({pair.cell_row_key} vs {pair.reference_row_key})"
         )
+    tier = map_row.tier if map_row is not None else pair.contrast.tier
+    sidedness = map_row.sidedness if map_row is not None else pair.contrast.sidedness
+    alternative = _derive_alternative(
+        pair.contrast.id, sidedness, metric, higher_is_better
+    )
     per_dataset: list[dict[str, Any]] = []
     for dataset in pair.datasets:
         sub = per_query[per_query["dataset"] == dataset]
@@ -848,7 +1295,7 @@ def compute_window_pair_stats(
         result = batch_means_contrast(
             means_a.to_numpy(dtype=float),
             means_b.to_numpy(dtype=float),
-            alternative="two-sided",
+            alternative=alternative,  # registered sidedness (decision a)
         )
         per_dataset.append(
             {
@@ -866,22 +1313,19 @@ def compute_window_pair_stats(
             }
         )
 
-    computed = [row for row in per_dataset if "p_value" in row]
-    if pair.contrast.tier == "primary":
-        for row in computed:
-            row["p_holm_across_datasets"] = None
-        correction_label = _PRIMARY_CORRECTION_LABEL
-    else:
-        adjusted = holm([row["p_value"] for row in computed]) if computed else []
-        for row, p_adj in zip(computed, adjusted):
-            row["p_holm_across_datasets"] = float(p_adj)
-        correction_label = _DIAGNOSTIC_HOLM_LABEL
+    correction_label = _tier_correction(tier, per_dataset)
 
     return {
         "contrast_id": pair.contrast.id,
         "name": pair.contrast.name,
-        "tier": pair.contrast.tier,
+        "tier": tier,
+        "tier_source": (
+            "family-map row (§9.3)" if map_row is not None
+            else "contrast registry (no family map for this run)"
+        ),
         "family": pair.family,
+        "family_id": map_row.family_id if map_row is not None else None,
+        "upstream": map_row.upstream if map_row is not None else None,
         "cell_baseline": pair.contrast.baseline_a,
         "reference_baseline": pair.contrast.baseline_b,
         "cell_row_key": pair.cell_row_key,
@@ -890,9 +1334,8 @@ def compute_window_pair_stats(
         "unit": "window",
         "test": "batch_means_welch_t (tests_by_unit.batch_means_contrast, §9.4)",
         "higher_is_better": higher_is_better,
-        "registered_sidedness": pair.contrast.sidedness,
-        "test_sidedness": "two-sided (driver policy: conservative superset of "
-        "any correctly-directed one-sided registration)",
+        "registered_sidedness": sidedness,
+        "executed_alternative": alternative,
         "correction": correction_label,
         "per_dataset": per_dataset,
     }
@@ -1176,13 +1619,63 @@ def apply_blinding_to_entry(
         ("cell_row_key", "cell_baseline"),
         ("reference_row_key", "reference_baseline"),
     ):
-        row_key = entry[key_field]
-        arms = index.loc[index["row_key"] == row_key, "arm"].dropna().unique()
-        arm = str(arms[0]) if len(arms) else row_key.split("|", 1)[0]
-        code = _blind_value(mapping, arm)
-        masked[key_field] = f"BLINDED:{code}"
-        masked[baseline_field] = f"BLINDED:{code}"
+        code = _blind_row_key(entry[key_field], mapping, index)
+        masked[key_field] = code
+        masked[baseline_field] = code
     return masked
+
+
+def _blind_row_key(
+    row_key: str, mapping: Mapping[str, str], index: pd.DataFrame
+) -> str:
+    """Blind code for one row key (its arm is the leading tuple slot)."""
+    arms = index.loc[index["row_key"] == row_key, "arm"].dropna().unique()
+    arm = str(arms[0]) if len(arms) else row_key.split("|", 1)[0]
+    return f"BLINDED:{_blind_value(mapping, arm)}"
+
+
+def apply_blinding_to_sections(
+    stats: dict[str, Any], mapping: Mapping[str, str], index: pd.DataFrame
+) -> None:
+    """§9.8 masking for EVERY arm-revealing section (G12), in place.
+
+    The contrast entries are masked by ``apply_blinding_to_entry``; this
+    covers the sections the audit found leaking raw row keys: the §9.5
+    equivalence results, the #13 fingerprint legs, and the pressure-skip
+    block (row keys carry the arm as their leading tuple slot).
+    """
+    for result in stats.get("equivalence", {}).get("results", ()):
+        for key_field in ("cell_row_key", "reference_row_key"):
+            result[key_field] = _blind_row_key(result[key_field], mapping, index)
+    for leg in stats.get("fingerprint", {}).get("legs", ()):
+        for key_field in ("cell_row_key", "reference_row_key"):
+            leg[key_field] = _blind_row_key(leg[key_field], mapping, index)
+    # Skip-reason strings may embed raw row keys ("cell vs ref" phrasing) —
+    # rewrite every known row key inside them to its blind code.
+    key_codes = {
+        str(k): _blind_row_key(str(k), mapping, index)
+        for k in index["row_key"].dropna().unique()
+    }
+    for section_name in ("equivalence", "fingerprint"):
+        for skip_entry in stats.get(section_name, {}).get("skipped", ()):
+            reason = str(skip_entry.get("reason", ""))
+            for raw, code in key_codes.items():
+                reason = reason.replace(raw, code)
+            skip_entry["reason"] = reason
+    falsification = stats.get("falsification")
+    if falsification:
+        for result in falsification.get("results", ()):
+            axes = result.get("cell_axes", {})
+            if "arm" in axes:
+                axes["arm"] = f"BLINDED:{_blind_value(mapping, axes['arm'])}"
+    pressure_block = stats.get("skipped", {}).get("pressure_rows")
+    if pressure_block:
+        pressure_block["row_keys"] = sorted(
+            {
+                _blind_row_key(k, mapping, index)
+                for k in pressure_block["row_keys"]
+            }
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1199,6 +1692,58 @@ class FamilyContext:
     table: pd.DataFrame
     #: membership set: (contrast_id, metric, dataset) rows for this run's group.
     keys: frozenset[tuple[int, str, str]]
+    #: (contrast_id, metric, dataset, family) -> the registered row (G2: the
+    #: ROW is the routing authority; on ADR-0087 duplicate keys the
+    #: exploratory row wins — demotion is the stronger registration fact).
+    rows: Mapping[tuple[int, str, str, str], MapRow] = field(
+        default_factory=dict
+    )
+
+    def map_row(
+        self, contrast_id: int, metric: str, dataset: str, family: str
+    ) -> MapRow | None:
+        return self.rows.get((contrast_id, metric, dataset, family))
+
+    def registered_family_sizes(self) -> dict[str, int]:
+        """family_id -> registered Holm m (the map's holm-corrected rows)."""
+        holm_rows = self.table[self.table["correction"] == "holm"]
+        return {
+            str(fid): int(n)
+            for fid, n in holm_rows.groupby("family_id").size().items()
+        }
+
+    def upstream_by_family(self) -> dict[str, str]:
+        """family_id -> registered upstream endpoint (gated families only)."""
+        gated = self.table[self.table["upstream"] != UNGATED]
+        return {
+            str(fid): str(ups.iloc[0])
+            for fid, ups in gated.groupby("family_id")["upstream"]
+        }
+
+    def registered_set_legs(self, contrast_id: int) -> tuple[str, ...]:
+        """The registered co-primary legs of a chain endpoint (§9.1/G5) —
+        the ``<dataset>|<metric>`` keys the driver keys outcomes under.
+        #13's six sub-hypothesis rows collapse to one ``|fingerprint`` leg
+        per dataset (the intersection-union endpoint contribution); other
+        endpoints read the ADR-0087-preferred routing rows, so a demoted
+        (exploratory) row never re-enters the registered set expectation."""
+        if contrast_id == FINGERPRINT_CONTRAST_ID:
+            rows = self.table[
+                (self.table["contrast_id"] == contrast_id)
+                & (self.table["tier"] == "primary")
+            ]
+            return tuple(
+                sorted({f"{r.dataset}|fingerprint" for r in rows.itertuples(index=False)})
+            )
+        return tuple(
+            sorted(
+                {
+                    f"{dataset}|{metric}"
+                    for (cid, metric, dataset, _family), row in self.rows.items()
+                    if cid == contrast_id and row.tier == "primary"
+                }
+            )
+        )
 
 
 def build_family_context(
@@ -1228,11 +1773,67 @@ def build_family_context(
         (int(r.contrast_id), str(r.metric), str(r.dataset))
         for r in scoped.itertuples(index=False)
     )
-    return FamilyContext(group=group, datasets=datasets, table=scoped, keys=keys)
+    rows: dict[tuple[int, str, str, str], MapRow] = {}
+    for r in scoped.itertuples(index=False):
+        if int(r.contrast_id) == FINGERPRINT_CONTRAST_ID:
+            # #13's six sub-hypothesis rows share one (metric, dataset) key;
+            # they route through compute_fingerprint / compute_equivalence
+            # (G4a), never the baseline-pair pipeline.
+            continue
+        key = (int(r.contrast_id), str(r.metric), str(r.dataset), str(r.family))
+        candidate = MapRow(
+            tier=str(r.tier),
+            family_id=str(r.family_id),
+            upstream=str(r.upstream),
+            sidedness=str(r.sidedness),
+            unit=str(r.unit),
+            correction=str(r.correction),
+        )
+        existing = rows.get(key)
+        if existing is not None:
+            # ADR-0087 duplicate (caller-passed 'faithfulness' collides with
+            # the demotion row): the EXPLORATORY row wins — a demoted metric
+            # may never re-enter the confirmatory chain via a CLI flag (G2).
+            if existing.tier == "exploratory":
+                continue
+            if candidate.tier != "exploratory":
+                raise AnalysisError(
+                    f"§9.3 map key {key} is ambiguous across tiers "
+                    f"({existing.tier!r} vs {candidate.tier!r}) with no "
+                    "ADR-0087 exploratory row to prefer — refusing to route"
+                )
+        rows[key] = candidate
+    return FamilyContext(
+        group=group, datasets=datasets, table=scoped, keys=keys, rows=rows
+    )
 
 
 def _primary_endpoint(contrast_id: int) -> str:
-    return f"contrast-{contrast_id}"
+    return chain_endpoint(contrast_id)
+
+
+def _gate_leg_key(upstream: str, dataset: str, secondary_metric: str) -> str:
+    """The ``<dataset>|<metric>`` primary-outcome key a secondary gates on.
+
+    The headline (#4) gates per (dataset × the secondary's OWN metric); the
+    estimand endpoints (#13/#14) key their outcomes under their registered
+    estimand variable (decision d, 2026-08-16).
+    """
+    return f"{dataset}|{_UPSTREAM_LEG_METRIC.get(upstream, secondary_metric)}"
+
+
+def _annotate_missing_leg(leg: str) -> str:
+    """Human reason for a registered co-primary leg with no outcome (G5)."""
+    if leg.endswith(f"|{PREDICATE_METRIC}"):
+        return (
+            f"registered co-primary leg {leg!r} has no outcome: the §8.5 Y "
+            "predicate producer (task #119) has not landed — the set FAILS, "
+            "it never shrinks (G5, 2026-08-16)"
+        )
+    return (
+        f"registered co-primary leg {leg!r} has no outcome — the set FAILS, "
+        "it never shrinks (G5, 2026-08-16)"
+    )
 
 
 def run_gatekeeping(
@@ -1241,30 +1842,41 @@ def run_gatekeeping(
     *,
     alpha: float = 0.05,
     intra_set_rule: str = "all-datasets",
+    extra_primaries: Sequence[PrimaryOutcome] = (),
 ) -> dict[str, Any]:
     """Execute the §9.3 Dmitrienko serial chain + Holm-within-family gating.
 
     Primaries: every computed primary-tier per-dataset p becomes a
     ``PrimaryOutcome`` under endpoint ``contrast-<id>``; the per-dataset
     co-primary SET spans dataset × metric (§9.1's metric pair are co-primary),
-    so the outcome's dataset key is ``<dataset>|<metric>``. The chain runs in
-    the registered ``families.PRIMARY_CHAIN_ORDER`` restricted to the
-    endpoints this run computed; ``chain_complete`` is False (and loudly
-    listed) whenever any registered chain endpoint is missing — an incomplete
-    chain cannot license the registered confirmatory claims.
+    so the outcome's dataset key is ``<dataset>|<metric>``.
+    ``extra_primaries`` carries executor-produced endpoint outcomes (the #13
+    fingerprint intersection-union p per dataset, keyed
+    ``<dataset>|fingerprint``). The chain runs in the registered
+    ``families.PRIMARY_CHAIN_ORDER`` restricted to the endpoints this run
+    computed; ``chain_complete`` is False (and loudly listed) whenever any
+    registered chain endpoint is missing.
 
-    Secondaries: computed secondary-tier rows whose (dataset, metric) has a
-    matching headline (#4) outcome join their §9.3 family
-    ``<group>|<metric>|<dataset>`` and receive the REGISTERED
-    Holm-within-family correction from ``gatekeeping.evaluate_chain`` (sibling
-    contrasts pooled per family). Rows with no computable upstream are listed
-    under ``ungated`` — never silently dropped.
+    Tier routing consults the family-map ROW tier carried on each entry (G2)
+    — an ADR-0087 exploratory row can never enter here as a primary or a
+    Holm-family member.
+
+    Secondaries (decision d, 2026-08-16): each computed secondary row joins
+    its REGISTERED family (the map's 5-axis ``family_id``) and gates on its
+    REGISTERED ``upstream`` endpoint from the map — never a driver hard-code.
+    With a family context the chain is BOUND to the registration (G5):
+    ``registered_sets`` (a missing registered co-primary leg FAILS the set —
+    the predicate leg's absence pre-#119 fails #4's set with a reason naming
+    #119), ``registered_family_sizes`` (Holm at the REGISTERED m), and
+    ``upstream_by_family`` (topology enforced). Rows with no computable
+    upstream outcome are listed under ``ungated`` — never silently dropped.
     """
-    primaries: list[PrimaryOutcome] = []
+    primaries: list[PrimaryOutcome] = list(extra_primaries)
     secondaries: list[SecondaryOutcome] = []
     ungated: list[dict[str, Any]] = []
-    computed_primary_ids: set[int] = set()
-    headline_keys: set[str] = set()
+    computed_primary_ids: set[int] = {
+        int(p.endpoint.rsplit("-", 1)[1]) for p in extra_primaries
+    }
 
     for entry in contrast_stats:
         if entry["tier"] != "primary":
@@ -1282,8 +1894,6 @@ def run_gatekeeping(
                     p_value=float(row["p_value"]),
                 )
             )
-            if cid == _SECONDARY_UPSTREAM_ID:
-                headline_keys.add(key)
 
     if not primaries:
         return {
@@ -1294,6 +1904,7 @@ def run_gatekeeping(
             )
         }
 
+    supplied_primary_keys = {(p.endpoint, p.dataset) for p in primaries}
     group = family_ctx.group if family_ctx is not None else "?"
     for entry in contrast_stats:
         if entry["tier"] != "secondary":
@@ -1301,18 +1912,45 @@ def run_gatekeeping(
         for row in entry["per_dataset"]:
             if "p_value" not in row:
                 continue
-            key = f"{row['dataset']}|{entry['metric']}"
-            if key not in headline_keys:
+            metric = str(entry["metric"])
+            dataset = str(row["dataset"])
+            if family_ctx is not None:
+                map_row = family_ctx.map_row(
+                    int(entry["contrast_id"]), metric, dataset,
+                    str(entry.get("family")),
+                )
+                if map_row is None:
+                    ungated.append(
+                        {
+                            "contrast_id": entry["contrast_id"],
+                            "metric": metric,
+                            "dataset": dataset,
+                            "reason": (
+                                "not a §9.3 family-map row for this run's "
+                                "group — reported raw, unregistered"
+                            ),
+                        }
+                    )
+                    continue
+                family_id = map_row.family_id
+                upstream = map_row.upstream
+            else:
+                # No charter family map (non-charter datasets, design-input):
+                # legacy flat behavior — headline-gated pseudo-family.
+                family_id = f"{group}|{metric}|{dataset}"
+                upstream = _primary_endpoint(HEADLINE_CONTRAST_ID)
+            gate_key = _gate_leg_key(upstream, dataset, metric)
+            if (upstream, gate_key) not in supplied_primary_keys:
                 ungated.append(
                     {
                         "contrast_id": entry["contrast_id"],
-                        "metric": entry["metric"],
-                        "dataset": row["dataset"],
+                        "metric": metric,
+                        "dataset": dataset,
+                        "upstream": upstream,
                         "reason": (
-                            f"upstream primary #{_SECONDARY_UPSTREAM_ID} has no "
-                            f"computed outcome on ({row['dataset']}, "
-                            f"{entry['metric']}) — the gate cannot open or "
-                            "close; reported raw, unregistered"
+                            f"registered upstream primary {upstream!r} has no "
+                            f"computed outcome on {gate_key!r} — the gate "
+                            "cannot open or close; reported raw, unregistered"
                         ),
                     }
                 )
@@ -1320,9 +1958,9 @@ def run_gatekeeping(
             secondaries.append(
                 SecondaryOutcome(
                     contrast=f"#{entry['contrast_id']} {entry['name']}",
-                    family_id=f"{group}|{entry['metric']}|{row['dataset']}",
-                    upstream=_primary_endpoint(_SECONDARY_UPSTREAM_ID),
-                    dataset=key,
+                    family_id=family_id,
+                    upstream=upstream,
+                    dataset=gate_key,
                     p_value=float(row["p_value"]),
                 )
             )
@@ -1337,6 +1975,21 @@ def run_gatekeeping(
         for cid in PRIMARY_CHAIN_ORDER
         if cid not in computed_primary_ids
     ]
+    registered_sets: dict[str, tuple[str, ...]] | None = None
+    registered_family_sizes: dict[str, int] | None = None
+    upstream_by_family: dict[str, str] | None = None
+    if family_ctx is not None:
+        # G5 / decision d: bind the chain to the REGISTERED expectations.
+        registered_sets = {
+            endpoint: family_ctx.registered_set_legs(cid)
+            for cid, endpoint in (
+                (cid, _primary_endpoint(cid)) for cid in PRIMARY_CHAIN_ORDER
+            )
+            if cid in computed_primary_ids
+            and family_ctx.registered_set_legs(cid)
+        }
+        registered_family_sizes = family_ctx.registered_family_sizes()
+        upstream_by_family = family_ctx.upstream_by_family()
     try:
         trace: GatekeepingTrace = evaluate_chain(
             primaries,
@@ -1344,6 +1997,9 @@ def run_gatekeeping(
             alpha=alpha,
             primary_order=registered_order,
             intra_set_rule=intra_set_rule,  # type: ignore[arg-type]
+            registered_sets=registered_sets,
+            registered_family_sizes=registered_family_sizes,
+            upstream_by_family=upstream_by_family,
         )
     except GatekeepingError as exc:
         raise AnalysisError(f"gatekeeping chain refused (§9.3): {exc}") from exc
@@ -1387,8 +2043,30 @@ def run_gatekeeping(
                 "status": s.status,
                 "p_holm_within_family": s.p_holm,
                 "significant": s.significant,
+                "m_supplied": s.m_supplied,
+                "m_registered": s.m_registered,
             }
             for s in trace.secondaries
+        ],
+        "set_decisions": [
+            {
+                "endpoint": d.endpoint,
+                "rule": d.rule,
+                "passed": d.passed,
+                "binding_p": d.binding_p,
+                "supplied_legs": list(d.supplied_legs),
+                "registered_legs": (
+                    list(d.registered_legs)
+                    if d.registered_legs is not None
+                    else None
+                ),
+                "missing_legs": list(d.missing_legs),
+                "reason": d.reason,
+                "missing_leg_reasons": [
+                    _annotate_missing_leg(leg) for leg in d.missing_legs
+                ],
+            }
+            for d in trace.set_decisions
         ],
         "events": [
             {
@@ -1410,6 +2088,83 @@ def run_gatekeeping(
 # ---------------------------------------------------------------------------
 
 
+#: Non-baseline axes a policy-vs-none pressure pair must agree on.
+_POLICY_PAIR_MATCH_AXES: tuple[str, ...] = (
+    "arm", "retriever", "topology", "engine", "model", "family",
+    "budget_r", "rate_frac",
+)
+#: Axes for the #13 truncate leg (B11 vs B6): the baseline ids fix arm +
+#: retriever, so those axes are excluded (they differ by construction).
+_TRUNCATE_PAIR_MATCH_AXES: tuple[str, ...] = (
+    "policy", "topology", "engine", "model", "family", "budget_r", "rate_frac",
+)
+
+
+def _match_pressure_pairs(
+    cells: pd.DataFrame,
+    refs: pd.DataFrame,
+    match_axes: Sequence[str],
+    label: str,
+) -> list[tuple[str, str, list[str]]]:
+    """(cell_row_key, ref_row_key, shared datasets) per matched axes-slot.
+
+    Shared §9.5/#13 pressure matcher; groups the ``_coord_keyed`` copies so
+    NaN pressure coordinates pair as absence (H4). Ambiguous slots fail loud.
+    """
+    pairs: list[tuple[str, str, list[str]]] = []
+    ref_groups = {
+        key: grp
+        for key, grp in _coord_keyed(refs).groupby(list(match_axes), dropna=False)
+    }
+    for key, cell_grp in _coord_keyed(cells).groupby(list(match_axes), dropna=False):
+        ref_grp = ref_groups.get(key)
+        if ref_grp is None:
+            continue
+        cell_keys = sorted(cell_grp["row_key"].unique())
+        ref_keys = sorted(ref_grp["row_key"].unique())
+        if len(cell_keys) != 1 or len(ref_keys) != 1:
+            raise AnalysisError(
+                f"{label}: ambiguous cell pair (cells={cell_keys}, "
+                f"refs={ref_keys}); refusing to guess"
+            )
+        datasets = sorted(set(cell_grp["dataset"]) & set(ref_grp["dataset"]))
+        if datasets:
+            pairs.append((cell_keys[0], ref_keys[0], datasets))
+    return pairs
+
+
+def _paired_pivot(
+    per_query: pd.DataFrame,
+    dataset: str,
+    cell_key: str,
+    ref_key: str,
+    column: str,
+    *,
+    agg: str = "mean",
+    by_window: bool = True,
+) -> pd.DataFrame | None:
+    """Wide (a, b) pivot of ``column`` for one dataset's pair.
+
+    ``by_window=True`` pairs per (example_id, window_key) — the §9.5
+    pressure carve-out keeps the per-example estimand while the WINDOW stays
+    recoverable as the block-bootstrap resampling unit (decision c).
+    ``by_window=False`` averages across windows first (one draw per example).
+    Returns None when either side is absent entirely.
+    """
+    sub = per_query[per_query["dataset"] == dataset]
+    group_cols = ["example_id", "window_key", "row_key"] if by_window else [
+        "example_id", "row_key"
+    ]
+    wide = (
+        sub.groupby(group_cols, observed=True)[column]
+        .agg(agg)
+        .unstack("row_key")
+    )
+    if cell_key not in wide.columns or ref_key not in wide.columns:
+        return None
+    return wide
+
+
 def compute_equivalence(
     per_query_loader: Any,
     index: pd.DataFrame,
@@ -1427,6 +2182,15 @@ def compute_equivalence(
     registered margin supplied) or listed as a labeled skip with the exact
     missing ingredient — declared legs are never silently absent.
 
+    Decision c (2026-08-16, G18/G13): these legs live on PRESSURE cells, so
+    pairing is per (example_id, window_key) and the WINDOW is passed to
+    ``conditional_tost``/``rope_sensitivity`` as the block-bootstrap
+    resampling unit — within-window dependence can never make equivalence
+    artificially easy. Fewer than the registered floor of unique windows
+    REFUSES (fail-loud, wrapped with the leg's context). G6: a paired row
+    whose ``policy_event`` telemetry is MISSING is EXCLUDED and counted
+    (``n_policy_event_missing``) — absence is never coerced to "no event".
+
     ``per_query_loader(row_keys) -> pd.DataFrame`` defers I/O so no window is
     read unless a leg is actually computable.
     """
@@ -1438,6 +2202,10 @@ def compute_equivalence(
     section: dict[str, Any] = {
         "declared_legs": declared,
         "source": "families.FINGERPRINT_SUB_HYPOTHESES (§9.3 TOST rows)",
+        "resampling": (
+            "window-block bootstrap (decision c 2026-08-16: window = "
+            "resampling unit on §9.5 pressure legs)"
+        ),
         "results": [],
         "skipped": [],
     }
@@ -1473,33 +2241,12 @@ def compute_equivalence(
         if cells.empty:
             skip(policy, f"no policy={policy!r} pressure cells in this run")
             continue
-        match_axes = [
-            "arm", "retriever", "topology", "engine", "model", "family",
-            "budget_r", "rate_frac",
-        ]
-        # Group the coord-keyed copies: NaN pressure coords would make the
-        # cross-groupby dict probe below never match (see _coord_keyed).
-        ref_groups = {
-            key: grp
-            for key, grp in _coord_keyed(refs).groupby(match_axes, dropna=False)
-        }
+        matched = _match_pressure_pairs(
+            cells, refs, _POLICY_PAIR_MATCH_AXES, f"equivalence leg {policy!r}"
+        )
         found_pair = False
-        for key, cell_grp in _coord_keyed(cells).groupby(match_axes, dropna=False):
-            ref_grp = ref_groups.get(key)
-            if ref_grp is None:
-                continue
-            cell_keys = sorted(cell_grp["row_key"].unique())
-            ref_keys = sorted(ref_grp["row_key"].unique())
-            if len(cell_keys) != 1 or len(ref_keys) != 1:
-                raise AnalysisError(
-                    f"equivalence leg {policy!r}: ambiguous cell pair "
-                    f"(cells={cell_keys}, refs={ref_keys}); refusing to guess"
-                )
-            cell_key, ref_key = cell_keys[0], ref_keys[0]
-            datasets = sorted(
-                set(cell_grp["dataset"]) & set(ref_grp["dataset"])
-                & set(family_ctx.datasets)
-            )
+        for cell_key, ref_key, datasets in matched:
+            datasets = sorted(set(datasets) & set(family_ctx.datasets))
             if not datasets:
                 continue
             found_pair = True
@@ -1521,40 +2268,58 @@ def compute_equivalence(
                 )
                 continue
             for dataset in datasets:
-                sub = per_query[per_query["dataset"] == dataset]
-                wide = (
-                    sub.groupby(["example_id", "row_key"], observed=True)[metric]
-                    .mean()
-                    .unstack("row_key")
+                wide = _paired_pivot(
+                    per_query, dataset, cell_key, ref_key, metric
                 )
-                mask_wide = (
-                    sub.groupby(["example_id", "row_key"], observed=True)[
-                        POLICY_EVENT_COLUMN
-                    ]
-                    .max()
-                    .unstack("row_key")
-                )
-                if cell_key not in wide.columns or ref_key not in wide.columns:
+                if wide is None:
                     skip(
                         policy,
                         f"{dataset}: no {metric!r} values on both sides "
                         f"({cell_key} vs {ref_key})",
                     )
                     continue
+                mask_wide = _paired_pivot(
+                    per_query, dataset, cell_key, ref_key,
+                    POLICY_EVENT_COLUMN, agg="max",
+                )
                 wide = wide.dropna(subset=[cell_key, ref_key])
                 if wide.empty:
                     skip(policy, f"{dataset}: no overlapping example_id pairs")
                     continue
+                # G6: the S2 mask is TELEMETRY — a paired example/window with
+                # no policy_event record is EXCLUDED with a counted reason,
+                # never treated as "no event" (fillna(0.0) was the defect).
+                assert mask_wide is not None  # column presence checked above
+                mask_series = mask_wide.reindex(wide.index)[cell_key]
+                n_mask_missing = int(mask_series.isna().sum())
+                keep = mask_series.notna()
+                wide = wide[keep]
+                if wide.empty:
+                    skip(
+                        policy,
+                        f"{dataset}: every paired row lacks "
+                        f"{POLICY_EVENT_COLUMN!r} telemetry "
+                        f"({n_mask_missing} excluded, G6)",
+                    )
+                    continue
                 a = wide[cell_key].to_numpy(dtype=float)
                 b = wide[ref_key].to_numpy(dtype=float)
-                mask = (
-                    mask_wide.reindex(wide.index)[cell_key]
-                    .fillna(0.0)
-                    .to_numpy(dtype=float)
-                    > 0.0
-                )
-                tost = conditional_tost(a, b, mask, margin=margin, alpha=alpha)
-                rope = rope_sensitivity(a, b, mask, rope=margin)
+                mask = mask_series[keep].to_numpy(dtype=float) > 0.0
+                window_ids = wide.index.get_level_values("window_key").to_numpy()
+                try:
+                    tost = conditional_tost(
+                        a, b, mask, margin=margin, alpha=alpha,
+                        seed=BOOTSTRAP_SEED, window_ids=window_ids,
+                    )
+                    rope = rope_sensitivity(
+                        a, b, mask, rope=margin,
+                        seed=ROPE_SEED, window_ids=window_ids,
+                    )
+                except ValueError as exc:
+                    raise AnalysisError(
+                        f"equivalence leg {policy!r} × {dataset} "
+                        f"({cell_key} vs {ref_key}): {exc}"
+                    ) from exc
                 section["results"].append(
                     {
                         "policy": policy,
@@ -1565,6 +2330,7 @@ def compute_equivalence(
                         "reference_row_key": ref_key,
                         "margin": tost.margin,
                         "n_total": tost.n_total,
+                        "n_policy_event_missing": n_mask_missing,
                         "n_events": tost.n_events,
                         "n_discordant": tost.n_discordant,
                         "mean_diff": tost.mean_diff,
@@ -1577,11 +2343,14 @@ def compute_equivalence(
                         ],
                         "dominance_verdict": tost.dominance_verdict,
                         "equivalent": tost.equivalent,
+                        "resampling": tost.resampling,
+                        "n_windows": tost.n_windows,
                         "rope_sensitivity": {
                             "p_left": rope.p_left,
                             "p_rope": rope.p_rope,
                             "p_right": rope.p_right,
                             "verdict": rope.verdict,
+                            "resampling": rope.resampling,
                             "note": "sensitivity LINE beside the TOST "
                             "conclusion, never the confirmatory gate (§9.5)",
                         },
@@ -1594,6 +2363,510 @@ def compute_equivalence(
                 "with a policy='none' reference in this run",
             )
     return section
+
+
+# ---------------------------------------------------------------------------
+# G4a: #13 fingerprint superiority legs (Holm at registered m=3 + IU p)
+# ---------------------------------------------------------------------------
+
+
+def compute_fingerprint(
+    per_query_loader: Any,
+    index: pd.DataFrame,
+    family_ctx: FamilyContext | None,
+    *,
+    metric: str | None,
+    alpha: float = 0.05,
+) -> tuple[dict[str, Any], list[PrimaryOutcome]]:
+    """The #13 superiority legs per ``families.FINGERPRINT_SUB_HYPOTHESES``.
+
+    Per dataset, the 3 registered one-sided legs (evict / compress-fp8 on the
+    policy axis; truncate = the B11-vs-B6 arm pair under pressure, §7.3) run
+    a paired Wilcoxon (registered ``zero_method='pratt'``) on the fingerprint
+    quality instrument (``--equivalence-metric``, the same §9.5 instrument),
+    tail = "the policy HARMS quality". Pairing is per example (averaged
+    across windows — one draw per example, the §9.5 pressure carve-out's
+    conservative reading for a rank test that cannot block-cluster). Holm
+    runs at the REGISTERED m=3: missing legs are padded at p=1.0, and the
+    intersection-union p (max of the 3 adjusted values, pads included) is
+    the endpoint's chain contribution — an incomplete fingerprint therefore
+    contributes p=1.0 and can never pass its chain step. Returns
+    (section, per-dataset PrimaryOutcomes keyed ``<dataset>|fingerprint``).
+    """
+    declared = [
+        {"leg": policy, "correction": corr, "sidedness": sided, "predicted": pred}
+        for policy, corr, sided, pred in FINGERPRINT_SUB_HYPOTHESES
+        if corr == "holm"
+    ]
+    section: dict[str, Any] = {
+        "contrast_id": FINGERPRINT_CONTRAST_ID,
+        "declared_legs": declared,
+        "source": "families.FINGERPRINT_SUB_HYPOTHESES (§9.3 Holm rows)",
+        "holm_m_registered": FINGERPRINT_HOLM_M,
+        "legs": [],
+        "per_dataset_intersection": [],
+        "skipped": [],
+        "note": (
+            "intersection-union p = max of the 3 Holm-adjusted superiority "
+            "legs (missing legs padded at p=1.0) — the #13 chain endpoint "
+            "contribution; the 3 NONE predictions ride stats['equivalence']"
+        ),
+    }
+
+    def skip(leg: str, reason: str) -> None:
+        section["skipped"].append({"leg": leg, "reason": reason})
+
+    if family_ctx is None:
+        for leg in declared:
+            skip(leg["leg"], "no §9.3 family-map dataset in this run")
+        return section, []
+    if metric is None:
+        for leg in declared:
+            skip(
+                leg["leg"],
+                "no fingerprint quality instrument supplied "
+                "(--equivalence-metric; the §9.5 instrument is the "
+                "fingerprint instrument)",
+            )
+        return section, []
+
+    higher_is_better = _metric_direction(metric)
+    # The registered claim: the coping policy HARMS quality (cell worse).
+    alternative = "greater" if not higher_is_better else "less"
+    pressure = index[index["family"].isin(sorted(PRESSURE_FAMILIES))]
+    #: dataset -> {leg -> p}
+    leg_p: dict[str, dict[str, float]] = {}
+
+    def leg_pairs(leg: str) -> list[tuple[str, str, list[str]]] | None:
+        if leg in _FINGERPRINT_POLICY_OF_LEG:
+            policy_value = _FINGERPRINT_POLICY_OF_LEG[leg]
+            cells = pressure[pressure["policy"] == policy_value]
+            refs = pressure[pressure["policy"] == "none"]
+            if cells.empty:
+                skip(leg, f"no policy={policy_value!r} pressure cells in this run")
+                return None
+            return _match_pressure_pairs(
+                cells, refs, _POLICY_PAIR_MATCH_AXES, f"fingerprint leg {leg!r}"
+            )
+        cell_b, ref_b = _FINGERPRINT_TRUNCATE_PAIR
+        cells = pressure[pressure["baseline"] == cell_b]
+        refs = pressure[pressure["baseline"] == ref_b]
+        if cells.empty or refs.empty:
+            skip(
+                leg,
+                f"no {cell_b}-vs-{ref_b} pressure pair in this run "
+                "(truncation rides the arm axis, §7.3)",
+            )
+            return None
+        return _match_pressure_pairs(
+            cells, refs, _TRUNCATE_PAIR_MATCH_AXES, f"fingerprint leg {leg!r}"
+        )
+
+    for leg_info in declared:
+        leg = leg_info["leg"]
+        matched = leg_pairs(leg)
+        if matched is None:
+            continue
+        found = False
+        for cell_key, ref_key, datasets in matched:
+            datasets = sorted(set(datasets) & set(family_ctx.datasets))
+            if not datasets:
+                continue
+            found = True
+            per_query = per_query_loader({cell_key, ref_key})
+            if metric not in per_query.columns:
+                skip(
+                    leg,
+                    f"metric {metric!r} absent from the pair's per-query "
+                    f"records ({cell_key} vs {ref_key})",
+                )
+                continue
+            for dataset in datasets:
+                wide = _paired_pivot(
+                    per_query, dataset, cell_key, ref_key, metric,
+                    by_window=False,
+                )
+                if wide is None:
+                    skip(
+                        leg,
+                        f"{dataset}: no {metric!r} values on both sides "
+                        f"({cell_key} vs {ref_key})",
+                    )
+                    continue
+                wide = wide.dropna(subset=[cell_key, ref_key])
+                if wide.empty:
+                    skip(leg, f"{dataset}: no overlapping example_id pairs")
+                    continue
+                a = wide[cell_key].to_numpy(dtype=float)
+                b = wide[ref_key].to_numpy(dtype=float)
+                result = paired_wilcoxon(
+                    a, b, alternative=alternative, zero_method="pratt"
+                )
+                if dataset in leg_p and leg in leg_p[dataset]:
+                    raise AnalysisError(
+                        f"fingerprint leg {leg!r} × {dataset}: two matched "
+                        "pressure pairs supply the same registered leg — "
+                        "ambiguous; refusing to guess"
+                    )
+                leg_p.setdefault(dataset, {})[leg] = result.p_value
+                section["legs"].append(
+                    {
+                        "leg": leg,
+                        "predicted": leg_info["predicted"],
+                        "dataset": dataset,
+                        "metric": metric,
+                        "cell_row_key": cell_key,
+                        "reference_row_key": ref_key,
+                        "n_pairs": result.n_pairs,
+                        "n_nonzero": result.n_nonzero,
+                        "zero_method": result.zero_method,
+                        "executed_alternative": alternative,
+                        "p_value": result.p_value,
+                        "cliffs_delta_paired": result.cliffs_delta_paired,
+                    }
+                )
+        if matched is not None and not found:
+            skip(
+                leg,
+                f"leg {leg!r}: matched pressure cells share no charter "
+                "dataset in this run",
+            )
+
+    primaries: list[PrimaryOutcome] = []
+    for dataset in sorted(leg_p):
+        supplied = leg_p[dataset]
+        missing = sorted(
+            {d["leg"] for d in declared} - set(supplied)
+        )
+        padded = list(supplied.values()) + [1.0] * len(missing)
+        adjusted = holm(padded)
+        p_iu = float(max(adjusted))
+        for leg_row in section["legs"]:
+            if leg_row["dataset"] != dataset:
+                continue
+            leg_idx = list(supplied).index(leg_row["leg"])
+            leg_row["p_holm_within_fingerprint"] = float(adjusted[leg_idx])
+        section["per_dataset_intersection"].append(
+            {
+                "dataset": dataset,
+                "p_intersection_union": p_iu,
+                "n_legs_supplied": len(supplied),
+                "holm_m_registered": FINGERPRINT_HOLM_M,
+                "missing_legs": missing,
+                "note": (
+                    "incomplete fingerprint: missing legs padded at p=1.0, "
+                    "IU p is 1.0 by construction" if missing else
+                    "complete registered fingerprint (3 legs)"
+                ),
+            }
+        )
+        primaries.append(
+            PrimaryOutcome(
+                endpoint=_primary_endpoint(FINGERPRINT_CONTRAST_ID),
+                dataset=f"{dataset}|fingerprint",
+                p_value=p_iu,
+            )
+        )
+    return section, primaries
+
+
+# ---------------------------------------------------------------------------
+# G4b: #12 lambda_star_onset (falsification suite executor)
+# ---------------------------------------------------------------------------
+
+
+def lambda_star_onset_from_grid(
+    rates: Sequence[float], powers: Sequence[float]
+) -> dict[str, Any]:
+    """Interpolated Chiu-Jain power-metric argmax on one rate grid (§9.2).
+
+    ``rates`` are rate_frac grid points (fractions of the predicted λ*, so
+    the prediction under test is onset at 1.0); ``powers`` the Chiu-Jain
+    power metric at each point. Quadratic interpolation through the argmax
+    and its neighbors gives the onset; an argmax at either grid EDGE is the
+    registered INCONCLUSIVE-AT-RESOLUTION label (no interior maximum at this
+    resolution — §9.2). Verdict: onset inside the multiplicative ×/÷1.15
+    band around 1.0 -> WITHIN-BAND; outside -> OUTSIDE-BAND (publishable in
+    either direction; the suite spends no α).
+    """
+    rate_arr = np.asarray(rates, dtype=float)
+    power_arr = np.asarray(powers, dtype=float)
+    if rate_arr.ndim != 1 or rate_arr.shape != power_arr.shape:
+        raise AnalysisError(
+            f"lambda-star grid shapes disagree: rates {rate_arr.shape} vs "
+            f"powers {power_arr.shape}"
+        )
+    if not (np.all(np.isfinite(rate_arr)) and np.all(np.isfinite(power_arr))):
+        raise AnalysisError("lambda-star grid holds non-finite values")
+    if np.unique(rate_arr).size < LAMBDA_STAR_MIN_GRID_POINTS:
+        raise AnalysisError(
+            f"lambda-star onset needs >= {LAMBDA_STAR_MIN_GRID_POINTS} "
+            f"distinct rate_frac grid points to interpolate an interior "
+            f"argmax; got {sorted(np.unique(rate_arr))}"
+        )
+    order = np.argsort(rate_arr, kind="stable")
+    rate_arr, power_arr = rate_arr[order], power_arr[order]
+    k = int(np.argmax(power_arr))
+    band_low, band_high = 1.0 / LAMBDA_STAR_BAND, LAMBDA_STAR_BAND
+    if k == 0 or k == rate_arr.size - 1:
+        return {
+            "estimand": "lambda_star_onset",
+            "onset_rate_frac": float(rate_arr[k]),
+            "interpolated": False,
+            "verdict": "INCONCLUSIVE-AT-RESOLUTION",
+            "band": [band_low, band_high],
+            "grid_rate_frac": rate_arr.tolist(),
+            "grid_power": power_arr.tolist(),
+            "reason": (
+                "Chiu-Jain power-metric argmax sits at the grid EDGE — no "
+                "interior maximum at this grid resolution (§9.2 registered "
+                "label)"
+            ),
+        }
+    x0, x1, x2 = rate_arr[k - 1 : k + 2]
+    y0, y1, y2 = power_arr[k - 1 : k + 2]
+    denom = (x0 - x1) * (x0 - x2) * (x1 - x2)
+    a_coef = (x2 * (y1 - y0) + x1 * (y0 - y2) + x0 * (y2 - y1)) / denom
+    b_coef = (x2**2 * (y0 - y1) + x1**2 * (y2 - y0) + x0**2 * (y1 - y2)) / denom
+    onset = float(-b_coef / (2 * a_coef)) if a_coef != 0.0 else float(x1)
+    within = band_low <= onset <= band_high
+    return {
+        "estimand": "lambda_star_onset",
+        "onset_rate_frac": onset,
+        "interpolated": True,
+        "verdict": "WITHIN-BAND" if within else "OUTSIDE-BAND",
+        "band": [band_low, band_high],
+        "grid_rate_frac": rate_arr.tolist(),
+        "grid_power": power_arr.tolist(),
+        "reason": (
+            f"interpolated Chiu-Jain argmax at rate_frac={onset:.4g} "
+            f"{'inside' if within else 'OUTSIDE'} the ×/÷{LAMBDA_STAR_BAND} "
+            "band around the predicted λ* (rate_frac=1.0)"
+        ),
+    }
+
+
+def compute_falsification_suite(
+    per_query_loader: Any, index: pd.DataFrame
+) -> dict[str, Any]:
+    """#12 executor: the pressure-curve onset vs the λ* prediction (§9.2).
+
+    FAIL-LOUD by design (G4b): a run without the required inputs names
+    exactly which artifact is missing — the F2 rate grid (>= 3 rate_frac
+    points per pressure cell), and per-window ``goodput_frac`` +
+    ``latency_ms`` columns (the Chiu-Jain power metric = goodput-weighted
+    offered rate over response time). The suite is falsification tier: it
+    spends no α and its verdicts are labels, never gates (§9.2 exile).
+    """
+    f2 = index[index["family"] == "F2"].copy()
+    f2 = f2[pd.to_numeric(f2["rate_frac"], errors="coerce").notna()]
+    if f2.empty:
+        raise AnalysisError(
+            "contrast #12 (lambda_star_onset): MISSING ARTIFACT — no F2 "
+            "pressure rows with a numeric rate_frac grid in this run's "
+            "index; the §6.1 rate sweep (S0 campaign producer, task #116) "
+            "has not landed"
+        )
+    group_axes = [
+        "model", "engine", "arm", "retriever", "policy", "topology",
+        "budget_r", "dataset",
+    ]
+    results: list[dict[str, Any]] = []
+    for key, grp in f2.groupby(group_axes, dropna=False):
+        rates = pd.to_numeric(grp["rate_frac"], errors="coerce")
+        if rates.nunique() < LAMBDA_STAR_MIN_GRID_POINTS:
+            continue
+        per_query = per_query_loader(set(grp["row_key"].unique()))
+        missing_cols = [
+            c for c in _LAMBDA_STAR_REQUIRED_COLUMNS
+            if c not in per_query.columns
+        ]
+        if missing_cols:
+            raise AnalysisError(
+                f"contrast #12 (lambda_star_onset): MISSING ARTIFACT — "
+                f"per-query records for cells {sorted(grp['row_key'].unique())} "
+                f"carry no {missing_cols} column(s); the Chiu-Jain power "
+                "metric needs per-window goodput_frac and latency_ms (the "
+                "#116/#126 regime bridge produces them)"
+            )
+        grid: dict[float, float] = {}
+        joined = grp.merge(
+            per_query, on=["row_key", "dataset", "window_key"], how="inner",
+            suffixes=("", "_pq"),
+        )
+        for rate, rate_grp in joined.groupby(
+            pd.to_numeric(joined["rate_frac"], errors="coerce")
+        ):
+            window_means = rate_grp.groupby("window_key")[
+                list(_LAMBDA_STAR_REQUIRED_COLUMNS)
+            ].mean()
+            goodput = float(window_means["goodput_frac"].mean())
+            latency = float(window_means["latency_ms"].mean())
+            if latency <= 0.0:
+                raise AnalysisError(
+                    f"contrast #12: non-positive mean latency at "
+                    f"rate_frac={rate} for {key} — power metric undefined"
+                )
+            grid[float(rate)] = float(rate) * goodput / latency
+        onset = lambda_star_onset_from_grid(list(grid), list(grid.values()))
+        onset["cell_axes"] = dict(zip(group_axes, [str(v) for v in key]))
+        results.append(onset)
+    if not results:
+        raise AnalysisError(
+            "contrast #12 (lambda_star_onset): MISSING ARTIFACT — no F2 "
+            f"pressure cell carries >= {LAMBDA_STAR_MIN_GRID_POINTS} distinct "
+            "rate_frac grid points; the §6.1 rate sweep grid "
+            "({0.5,0.7,0.85,0.95,1.05,1.2}·λ*) has not been produced "
+            "(task #116)"
+        )
+    return {
+        "contrast_id": FLOOR_SUITE_CONTRAST_ID,
+        "tier": "falsification",
+        "label": (
+            "§9.2 EXILE: standalone falsification suite — spends no α, "
+            "gates nothing, publishable in either direction"
+        ),
+        "estimand": "lambda_star_onset",
+        "band_multiplicative": LAMBDA_STAR_BAND,
+        "results": results,
+    }
+
+
+# ---------------------------------------------------------------------------
+# G3: exploratory tier (BH-FDR, separated, non-confirmatory)
+# ---------------------------------------------------------------------------
+
+
+def build_exploratory_section(
+    contrast_stats: Sequence[Mapping[str, Any]],
+    family_ctx: FamilyContext | None,
+) -> dict[str, Any]:
+    """BH-FDR over the computed exploratory-tier rows (G3).
+
+    The registered §9.3 exploratory tier (ADR-0087 faithfulness rows, #11,
+    #16, #19) receives ``corrections.benjamini_hochberg`` within the
+    computed exploratory set and lives in its own clearly-non-confirmatory
+    section — never in the chain, never in a Holm family (G2).
+    """
+    rows: list[dict[str, Any]] = []
+    for entry in contrast_stats:
+        if entry["tier"] != "exploratory":
+            continue
+        for row in entry["per_dataset"]:
+            if "p_value" not in row:
+                continue
+            rows.append(
+                {
+                    "contrast_id": entry["contrast_id"],
+                    "name": entry["name"],
+                    "metric": entry["metric"],
+                    "dataset": row["dataset"],
+                    "p_value": float(row["p_value"]),
+                }
+            )
+    if rows:
+        adjusted = benjamini_hochberg([r["p_value"] for r in rows])
+        for row, p_adj in zip(rows, adjusted):
+            row["p_bh_fdr"] = float(p_adj)
+    n_registered = (
+        int((family_ctx.table["correction"] == "bh-fdr").sum())
+        if family_ctx is not None
+        else None
+    )
+    return {
+        "label": "EXPLORATORY — NON-CONFIRMATORY (§9.3 bh-fdr tier)",
+        "correction": (
+            "benjamini-hochberg across the computed exploratory rows "
+            "(corrections.benjamini_hochberg; registered §9.3 exploratory "
+            "tier — ungated, no α spent, no confirmatory sentence may cite "
+            "these rows)"
+        ),
+        "n_computed": len(rows),
+        "n_registered_rows_scoped": n_registered,
+        "rows": rows,
+    }
+
+
+# ---------------------------------------------------------------------------
+# G16: ADR-0086 realized-n gate (registered floor + step-down ladder)
+# ---------------------------------------------------------------------------
+
+
+def check_realized_n(
+    contrast_stats: Sequence[Mapping[str, Any]],
+    accepted_step_down: int | None,
+) -> dict[str, Any]:
+    """Confirmatory ADR-0086 gate: primary per-query rows below the floor.
+
+    The ladder IS the registered data (``ADR0086_REALIZED_N_LADDER``): the
+    first rung is the registered floor; ``accepted_step_down`` names the
+    pre-declared rung the look explicitly steps down to (recorded — never
+    silent). A primary row whose realized n is below the accepted floor
+    REFUSES the look (before any output; the placeholder lock is released
+    by the caller's failure path, so the one-look budget survives).
+    """
+    ladder = ADR0086_REALIZED_N_LADDER
+    if accepted_step_down is not None and accepted_step_down not in ladder:
+        raise AnalysisError(
+            f"--accept-step-down {accepted_step_down} is not a rung of the "
+            f"pre-declared ADR-0086 ladder {list(ladder)} — only registered "
+            "rungs may be accepted (G16)"
+        )
+    floor = accepted_step_down if accepted_step_down is not None else ladder[0]
+    violations: list[str] = []
+    for entry in contrast_stats:
+        if entry["tier"] != "primary" or entry.get("unit") == "window":
+            continue
+        for row in entry["per_dataset"]:
+            realized = row.get("realized_n")
+            if realized is None:
+                continue
+            if int(realized) < floor:
+                violations.append(
+                    f"contrast #{entry['contrast_id']} × {entry['metric']} × "
+                    f"{row['dataset']}: realized n={realized} < floor={floor}"
+                )
+    if violations:
+        detail = "\n".join(f"  {v}" for v in violations)
+        raise AnalysisError(
+            "ADR-0086 REALIZED-N REFUSAL (G16): primary rows below the "
+            f"accepted floor ({floor}; registered ladder {list(ladder)}):\n"
+            f"{detail}\n— a confirmatory look below the registered floor "
+            "requires the pre-declared step-down (--accept-step-down "
+            "<rung>), and no rung admits these n"
+        )
+    return {
+        "checked": True,
+        "ladder": list(ladder),
+        "floor": floor,
+        "step_down_accepted": accepted_step_down,
+    }
+
+
+# ---------------------------------------------------------------------------
+# G14: atomic outputs + executing-code provenance stamp
+# ---------------------------------------------------------------------------
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """tmp + ``os.replace``: no reader ever observes a partial file (G14)."""
+    tmp_path = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    tmp_path.write_text(text, encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
+def executing_provenance() -> dict[str, Any]:
+    """The G14 stamp: EXECUTING code SHA + dirty flag + resampling seeds."""
+    try:
+        sha, dirty = _git_head_state()
+    except Exception:  # noqa: BLE001 — provenance must never sink an analysis
+        sha, dirty = None, None
+    return {
+        "executing_git_sha": sha,
+        "executing_git_dirty": dirty,
+        "bootstrap_seed": BOOTSTRAP_SEED,
+        "rope_seed": ROPE_SEED,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1630,13 +2903,15 @@ def build_summary_md(stats: Mapping[str, Any]) -> str:
             if stats["one_look"]["registered_sha"]
             else ""
         ),
-        f"- driver sidedness policy: two-sided (paired Wilcoxon for continuous "
-        "metrics, McNemar exact-binomial for the binary §8.5 predicate, "
-        "batch-means Welch t for loaded windows; registered sidedness recorded "
-        "per contrast); correction: none for primary-tier endpoints (full α "
-        "per dataset, §9.1), diagnostic Holm across datasets otherwise — the "
-        "registered §9.3 Holm-within-family correction is executed in the "
-        "gatekeeping section below",
+        f"- sidedness policy (decision a, 2026-08-16): each row EXECUTES its "
+        "REGISTERED sidedness from the §9.3 family-map row (paired Wilcoxon "
+        "zero_method='pratt' for continuous metrics, McNemar exact-binomial "
+        "for binary-unit rows, batch-means Welch t for loaded windows; the "
+        "executed alternative is recorded per contrast); correction: none "
+        "for primary-tier endpoints (full α per dataset, §9.1), diagnostic "
+        "Holm across datasets for secondaries, BH-FDR for the exploratory "
+        "tier (separated section) — the registered §9.3 Holm-within-family "
+        "correction is executed in the gatekeeping section below",
         "",
         f"**Every number below is {stamp}.**",
         "",
@@ -1707,6 +2982,14 @@ def build_summary_md(stats: Mapping[str, Any]) -> str:
         lines.append(
             f"- intra-set rule: `{gate['intra_set_rule']}` at α={gate['alpha']:g}"
         )
+        for decision in gate.get("set_decisions", ()):
+            verdict = "PASSED" if decision["passed"] else "FAILED"
+            lines.append(
+                f"- co-primary set `{decision['endpoint']}`: **{verdict}** "
+                f"(binding p={decision['binding_p']:.3g})"
+            )
+            for reason in decision.get("missing_leg_reasons", ()):
+                lines.append(f"  - **{reason}**")
         lines.append("")
         lines.append("| endpoint | dataset×metric | p | passed | status |")
         lines.append("|---|---|---|---|---|")
@@ -1755,6 +3038,62 @@ def build_summary_md(stats: Mapping[str, Any]) -> str:
             f"- `{skipped_leg['policy']}`: SKIPPED — {skipped_leg['reason']}"
         )
     lines.append("")
+
+    fingerprint = stats.get("fingerprint", {})
+    lines.append(
+        "## Fingerprint superiority legs (#13, §9.3 — Holm at registered "
+        f"m={fingerprint.get('holm_m_registered', 3)} + intersection-union p)"
+    )
+    lines.append("")
+    for leg_row in fingerprint.get("legs", ()):
+        p_holm_fp = leg_row.get("p_holm_within_fingerprint")
+        lines.append(
+            f"- `{leg_row['leg']}` × {leg_row['dataset']} "
+            f"[{leg_row['metric']}]: p={leg_row['p_value']:.3g}"
+            + (f", p_holm={p_holm_fp:.3g}" if p_holm_fp is not None else "")
+            + f" (alternative `{leg_row['executed_alternative']}`, "
+            f"n_nonzero={leg_row['n_nonzero']})"
+        )
+    for iu in fingerprint.get("per_dataset_intersection", ()):
+        lines.append(
+            f"- **{iu['dataset']}: IU p = {iu['p_intersection_union']:.3g}** "
+            f"({iu['n_legs_supplied']}/{iu['holm_m_registered']} legs; "
+            f"{iu['note']})"
+        )
+    for skipped_leg in fingerprint.get("skipped", ()):
+        lines.append(
+            f"- `{skipped_leg['leg']}`: SKIPPED — {skipped_leg['reason']}"
+        )
+    lines.append("")
+
+    exploratory = stats.get("exploratory", {})
+    if exploratory.get("n_computed"):
+        lines.append("## Exploratory tier (§9.3 BH-FDR) — **NON-CONFIRMATORY**")
+        lines.append("")
+        lines.append(f"- {exploratory['correction']}")
+        lines.append("")
+        lines.append("| contrast | metric | dataset | p | p (BH-FDR) |")
+        lines.append("|---|---|---|---|---|")
+        for row in exploratory["rows"]:
+            lines.append(
+                f"| #{row['contrast_id']} {row['name']} | {row['metric']} "
+                f"| {row['dataset']} | {row['p_value']:.3g} "
+                f"| {row['p_bh_fdr']:.3g} |"
+            )
+        lines.append("")
+
+    falsification = stats.get("falsification")
+    if falsification:
+        lines.append(
+            "## Falsification suite (#12, §9.2 exile — spends no α)"
+        )
+        lines.append("")
+        for result in falsification["results"]:
+            lines.append(
+                f"- onset rate_frac = {result['onset_rate_frac']:.4g} "
+                f"-> **{result['verdict']}** ({result['reason']})"
+            )
+        lines.append("")
 
     blinding_info = stats.get("blinding", {})
     if blinding_info.get("sealed_map"):
@@ -1812,7 +3151,13 @@ def build_summary_md(stats: Mapping[str, Any]) -> str:
             lines.append(f"- `{name}` (stamped {stamp} in-figure)")
         lines.append("")
     lines.append("---")
-    lines.append(f"Stamp: **{stamp}** · schema v{stats['schema_version']}")
+    prov = stats.get("provenance", {})
+    lines.append(
+        f"Stamp: **{stamp}** · schema v{stats['schema_version']} · executing "
+        f"code `{prov.get('executing_git_sha')}`"
+        f"{' (DIRTY)' if prov.get('executing_git_dirty') else ''} · seeds "
+        f"bootstrap={prov.get('bootstrap_seed')}/rope={prov.get('rope_seed')}"
+    )
     lines.append("")
     return "\n".join(lines)
 
@@ -1957,36 +3302,92 @@ def run_analysis(
     run_dir: Path,
     *,
     contrast_ids: Sequence[int],
-    metrics: Sequence[str],
+    metrics: Sequence[str] | None = None,
     mode: Mode,
     registered_sha: str | None = None,
     calibration_report: Path | None = None,
     tost_margin: float | None = None,
     equivalence_metric: str | None = None,
     alpha: float = 0.05,
+    accepted_step_down: int | None = None,
 ) -> AnalysisResult:
     """Execute the pipeline; the CLI wraps this with the one-look flag checks.
 
     Confirmatory preconditions (checked BEFORE the §9.11 lock is acquired, so
-    a refusal never touches the run's one-look budget): a registered SHA, a
+    a refusal never touches the run's one-look budget): the G1 registration
+    binding (SHA grammar/HEAD/clean-worktree/prereg/alpha/margins/metrics), a
     PASSING §9.7 calibration-report artifact, and a clean §9.10 ledger
-    verification of the raw tree.
+    verification of the raw tree. ``metrics=None`` resolves to the mode's
+    registered default: ``families.DEFAULT_METRICS`` (the §9.1 co-primary
+    pair) in confirmatory mode, the driver's serving default otherwise.
     """
     run_dir = Path(run_dir).resolve()
     if not run_dir.is_dir():
         raise AnalysisError(f"run directory does not exist: {run_dir}")
+
+    # G1a: confirmatory metrics ARE the registered pair — the CLI list is a
+    # design-input instrument only.
+    metrics_overridden = metrics is not None
+    if metrics is None:
+        resolved_metrics: tuple[str, ...] = (
+            REGISTERED_DEFAULT_METRICS if mode == "confirmatory" else DEFAULT_METRICS
+        )
+    else:
+        resolved_metrics = tuple(metrics)
+    if (
+        mode == "confirmatory"
+        and metrics_overridden
+        and resolved_metrics != REGISTERED_DEFAULT_METRICS
+    ):
+        raise AnalysisError(
+            f"confirmatory --metrics {list(resolved_metrics)} differs from "
+            f"the REGISTERED §9.1 metric pair "
+            f"{list(REGISTERED_DEFAULT_METRICS)} — the registered table may "
+            "not follow the caller (G1); --metrics is design-input only"
+        )
+    metrics = resolved_metrics
     for metric in metrics:
         _metric_direction(metric)  # fail before any I/O on unknown direction
 
+    # G4c: the truth-tax estimand (#14) has no computable inputs until the
+    # §8.5 Y predicate producer lands — a fail-loud stub, never a silent skip.
+    if 14 in contrast_ids:
+        raise AnalysisError(
+            "contrast #14 (truth-tax estimand, §9.2) cannot be computed: its "
+            "registered variable truth_tax = G − Y requires the §8.5 Y "
+            "predicate producer (task #119), which has not landed — "
+            "chain_complete stays honestly False until it does (G4)"
+        )
+
     stamp = CONFIRMATORY_STAMP if mode == "confirmatory" else DESIGN_STAMP
     preconditions: dict[str, Any] = {
+        "registration": {"checked": False},
         "calibration": {"checked": False},
         "ledger": {"checked": False},
+        "realized_n": {
+            "checked": False,
+            "ladder": list(ADR0086_REALIZED_N_LADDER),
+        },
     }
     lock_acquired_here = False
     if mode == "confirmatory":
         if not registered_sha:
             raise OneLookError("confirmatory mode requires a registered SHA")
+        # G1: bind the look to the frozen registration BEFORE anything runs.
+        preconditions["registration"] = {
+            "checked": True,
+            **check_registration_binding(
+                registered_sha,
+                alpha=alpha,
+                metrics=metrics,
+                metrics_overridden=metrics_overridden,
+            ),
+        }
+        # G1d/G9: margins come from the registered artifact, never the CLI.
+        tost_margin, margin_record = resolve_registered_margin(
+            tost_margin, equivalence_metric
+        )
+        preconditions["registration"]["tost_margin"] = margin_record
         if calibration_report is None:
             raise CalibrationGateError(
                 "confirmatory mode requires --calibration-report: the §9.7 "
@@ -2053,7 +3454,15 @@ def run_analysis(
             ),
         }
 
-        computable, skipped_contrasts = resolve_contrasts(contrast_ids)
+        # Executor-backed ids (G4) never enter the baseline-pair pipeline:
+        # #13 runs through compute_fingerprint (always), #12 through
+        # compute_falsification_suite (when requested), #14 raised above.
+        pair_ids = [
+            cid
+            for cid in contrast_ids
+            if cid not in (FINGERPRINT_CONTRAST_ID, FLOOR_SUITE_CONTRAST_ID)
+        ]
+        computable, skipped_contrasts = resolve_contrasts(pair_ids)
         per_query_contrasts = [
             c
             for c in computable
@@ -2128,13 +3537,62 @@ def run_analysis(
                 )
             return kept
 
+        def _map_row_for(
+            contrast_id: int, metric: str, datasets: tuple[str, ...],
+            family: str,
+        ) -> MapRow | None:
+            """The registered row routing this (contrast, metric) — G2."""
+            if family_ctx is None:
+                return None
+            for dataset in datasets:
+                row = family_ctx.map_row(contrast_id, metric, dataset, family)
+                if row is not None:
+                    return row
+            return None
+
+        def _registered_metric_absent(contrast_id: int, metric: str) -> bool:
+            """Confirmatory-only (G5/#119): a REGISTERED metric column with
+            no per-query data is a recorded missing-leg state — the
+            co-primary set FAILS via registered_sets; the invocation must
+            not crash (the CLI never asked for this metric, the
+            registration did)."""
+            if mode != "confirmatory" or metric in per_query.columns:
+                return False
+            confirmatory_exclusions.append(
+                {
+                    "contrast_id": contrast_id,
+                    "metric": metric,
+                    "datasets": ["ALL"],
+                    "reason": (
+                        f"registered metric {metric!r} appears in no "
+                        "per-query artifact"
+                        + (
+                            " — the §8.5 Y predicate producer (task #119) "
+                            "has not landed; the co-primary set FAILS on "
+                            "the missing legs (G5), it never shrinks"
+                            if metric == PREDICATE_METRIC
+                            else " — the registered leg is missing; the "
+                            "co-primary set FAILS on it (G5)"
+                        )
+                    ),
+                }
+            )
+            return True
+
         for pair in pairs:
             for metric in metrics:
+                if _registered_metric_absent(pair.contrast.id, metric):
+                    continue
                 allowed = _family_filter(pair.contrast.id, metric, pair.datasets)
                 if not allowed:
                     continue
                 entry = compute_pair_stats(
-                    per_query, dc_replace(pair, datasets=allowed), metric
+                    per_query,
+                    dc_replace(pair, datasets=allowed),
+                    metric,
+                    map_row=_map_row_for(
+                        pair.contrast.id, metric, allowed, pair.contrast.family
+                    ),
                 )
                 for row in entry["per_dataset"]:
                     row["in_family_map"] = _in_family(
@@ -2143,19 +3601,34 @@ def run_analysis(
                 contrast_stats.append(entry)
         for w_pair in window_pairs:
             for metric in metrics:
+                if _registered_metric_absent(w_pair.contrast.id, metric):
+                    continue
                 allowed = _family_filter(
                     w_pair.contrast.id, metric, w_pair.datasets
                 )
                 if not allowed:
                     continue
                 entry = compute_window_pair_stats(
-                    per_query, dc_replace(w_pair, datasets=allowed), metric
+                    per_query,
+                    dc_replace(w_pair, datasets=allowed),
+                    metric,
+                    map_row=_map_row_for(
+                        w_pair.contrast.id, metric, allowed, w_pair.family
+                    ),
                 )
                 for row in entry["per_dataset"]:
                     row["in_family_map"] = _in_family(
                         entry["contrast_id"], metric, row["dataset"]
                     )
                 contrast_stats.append(entry)
+
+        # G16 / ADR-0086: realized n recorded per row above; the confirmatory
+        # look refuses below the accepted floor (the placeholder lock is
+        # released by the failure path — the budget survives a refusal).
+        if mode == "confirmatory":
+            preconditions["realized_n"] = check_realized_n(
+                contrast_stats, accepted_step_down
+            )
 
         consumed = frozenset(
             k
@@ -2164,19 +3637,57 @@ def run_analysis(
         )
         pressure_block = pressure_row_skip(index, consumed)
 
+        per_query_loader = lambda keys: load_per_query(run_dir, index, keys)  # noqa: E731
+
+        # G4a: the #13 fingerprint superiority legs — their per-dataset
+        # intersection-union p is the endpoint's chain contribution.
+        fingerprint_section, fingerprint_primaries = compute_fingerprint(
+            per_query_loader,
+            index,
+            family_ctx,
+            metric=equivalence_metric,
+            alpha=alpha,
+        )
+
         # §9.3 wiring: the registered chain + Holm-within-family corrections.
         gatekeeping_section = run_gatekeeping(
-            contrast_stats, family_ctx, alpha=alpha
+            contrast_stats,
+            family_ctx,
+            alpha=alpha,
+            extra_primaries=fingerprint_primaries,
         )
 
         # §9.5 wiring: conditional TOST for the declared equivalence legs.
         equivalence_section = compute_equivalence(
-            lambda keys: load_per_query(run_dir, index, keys),
+            per_query_loader,
             index,
             family_ctx,
             metric=equivalence_metric,
             margin=tost_margin,
             alpha=alpha,
+        )
+
+        # G4b: the #12 falsification suite, only when explicitly requested
+        # (fail-loud on missing inputs by design).
+        falsification_section = (
+            compute_falsification_suite(per_query_loader, index)
+            if FLOOR_SUITE_CONTRAST_ID in contrast_ids
+            else None
+        )
+
+        # G3: the exploratory tier — BH-FDR, separated, non-confirmatory.
+        exploratory_section = build_exploratory_section(
+            contrast_stats, family_ctx
+        )
+
+        analysis_dir = _make_analysis_dir(run_dir)
+        figure_metrics = [m for m in metrics if m in per_query.columns]
+        figures = (
+            render_figures(
+                per_query, pairs, figure_metrics, analysis_dir, stamp, index
+            )
+            if pairs and figure_metrics and not blinding_active
+            else []
         )
 
         if blinding_active:
@@ -2187,13 +3698,6 @@ def run_analysis(
             contrast_stats = [
                 apply_blinding_to_entry(e, mapping, index) for e in contrast_stats
             ]
-
-        analysis_dir = _make_analysis_dir(run_dir)
-        figures = (
-            render_figures(per_query, pairs, metrics, analysis_dir, stamp, index)
-            if pairs and not blinding_active
-            else []
-        )
 
         run_identity = {
             key: str(index[key].iloc[0]) for key in ("run_id", "campaign", "session", "model")
@@ -2208,9 +3712,17 @@ def run_analysis(
                 "registered_sha": registered_sha,
                 "lock_file": LOCK_NAME if mode == "confirmatory" else None,
             },
+            "provenance": executing_provenance(),
             "preconditions": preconditions,
             "requested_contrast_ids": list(dict.fromkeys(contrast_ids)),
             "metrics": list(metrics),
+            "loader_notes": {
+                "bool_coerced_fields": per_query.attrs.get(
+                    "bool_coerced_fields", []
+                )
+                if not per_query.empty
+                else [],
+            },
             "family_map": (
                 {
                     "group": family_ctx.group,
@@ -2229,6 +3741,9 @@ def run_analysis(
             "contrasts": contrast_stats,
             "gatekeeping": gatekeeping_section,
             "equivalence": equivalence_section,
+            "fingerprint": fingerprint_section,
+            "exploratory": exploratory_section,
+            "falsification": falsification_section,
             "blinding": blinding_section,
             "skipped": {
                 "pressure_rows": pressure_block,
@@ -2245,6 +3760,9 @@ def run_analysis(
             },
             "figures": figures,
         }
+        if blinding_active:
+            # G12: mask EVERY arm-revealing section, not just the entries.
+            apply_blinding_to_sections(stats, mapping, index)
 
         # §9.8: the confirmatory look IS the freeze — record the one-time
         # unblinding event AFTER the pipeline computed, BEFORE the outputs
@@ -2267,9 +3785,9 @@ def run_analysis(
             }
 
         stats_path = analysis_dir / STATS_JSON_NAME
-        stats_path.write_text(json.dumps(stats, indent=2) + "\n", encoding="utf-8")
+        _atomic_write_text(stats_path, json.dumps(stats, indent=2) + "\n")
         summary_path = analysis_dir / SUMMARY_MD_NAME
-        summary_path.write_text(build_summary_md(stats), encoding="utf-8")
+        _atomic_write_text(summary_path, build_summary_md(stats))
 
         if mode == "confirmatory":
             assert registered_sha is not None
@@ -2323,9 +3841,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--metrics",
         nargs="+",
-        default=list(DEFAULT_METRICS),
+        default=None,
         metavar="METRIC",
-        help=f"per-query metric columns to test (default: {' '.join(DEFAULT_METRICS)})",
+        help="per-query metric columns to test — DESIGN-INPUT ONLY (G1): "
+        f"design-input default {' '.join(DEFAULT_METRICS)}; confirmatory mode "
+        "always tests the registered §9.1 pair "
+        f"({' '.join(REGISTERED_DEFAULT_METRICS)}) and refuses an override "
+        "that differs",
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
@@ -2383,7 +3905,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.05,
         metavar="ALPHA",
         help="significance level for the gatekeeping chain and family map "
-        "(default: 0.05)",
+        "(default: 0.05; confirmatory mode must match REGISTERED_ALPHA)",
+    )
+    parser.add_argument(
+        "--accept-step-down",
+        type=int,
+        default=None,
+        metavar="N",
+        help="confirmatory-only: accept the pre-declared ADR-0086 realized-n "
+        f"step-down to this ladder rung ({ADR0086_REALIZED_N_LADDER}); "
+        "recorded in stats.json — never silent (G16)",
     )
     return parser
 
@@ -2412,11 +3943,16 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         mode: Mode = "confirmatory"
     else:
-        if args.i_understand_one_look or args.registered_sha:
+        if (
+            args.i_understand_one_look
+            or args.registered_sha
+            or args.accept_step_down is not None
+        ):
             print(
-                "REFUSED: --i-understand-one-look/--registered-sha are "
-                "confirmatory-mode flags; pass --confirmatory or drop them "
-                "(design-input outputs never carry a registration).",
+                "REFUSED: --i-understand-one-look/--registered-sha/"
+                "--accept-step-down are confirmatory-mode flags; pass "
+                "--confirmatory or drop them (design-input outputs never "
+                "carry a registration).",
                 file=sys.stderr,
             )
             return 1
@@ -2433,6 +3969,7 @@ def main(argv: list[str] | None = None) -> int:
             tost_margin=args.tost_margin,
             equivalence_metric=args.equivalence_metric,
             alpha=args.alpha,
+            accepted_step_down=args.accept_step_down,
         )
     except AnalysisError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

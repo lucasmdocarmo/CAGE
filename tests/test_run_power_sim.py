@@ -460,6 +460,94 @@ class TestRequiredAndRecommendation:
 
 
 # --------------------------------------------------------------------------- #
+# Report assembly (G15 fixes, 2026-08-16)
+# --------------------------------------------------------------------------- #
+
+
+def _minimal_config() -> dict:
+    """Just the keys _markdown_report reads — no simulation required."""
+    return {
+        "repo_state": {"dirty": False, "head": "abc1234"},
+        "generated_utc": "2026-08-16T00:00:00+00:00",
+        "seed": 1,
+        "n_sims": 2,
+        "secondary_holm_m": rps.SECONDARY_HOLM_M,
+        "secondary_holm_worst_family": "A|x|y|F1|per_query",
+        "source_runs": {"squad_v2": "/tmp/run"},
+        "pair_regimes": {"cross_mechanism": ["rag", "prefix_cache"]},
+        "null_model": "synthetic (test)",
+        "effect_unit_reconciliation": "n/a (test)",
+        "loader_validity_rule": "n/a (test)",
+        "alpha_roles": dict(rps.ALPHA_ROLES),
+    }
+
+
+class TestMarkdownReport:
+    def test_translation_table_derives_effect_keys_from_grid(self) -> None:
+        # G15: the old table hard-coded the 0.02/0.05/0.1 keys and raised
+        # KeyError AFTER a long sim whenever the binary grid changed. Keys
+        # must now come from the simulated grid itself.
+        translation = [
+            {
+                "dataset": "squad_v2",
+                "pair_regime": "cross_mechanism",
+                "tie_mass": 0.9,
+                "implied_pp": {"0.03": 0.027, "0.07": 0.063},
+            },
+        ]
+        md = rps._markdown_report(
+            _minimal_config(), [], [], [],
+            {"qasper_policy": "zero pilot data (test)"}, [], translation,
+        )
+        assert "effect 0.03 -> pp" in md
+        assert "effect 0.07 -> pp" in md
+        assert "0.0270" in md and "0.0630" in md
+
+    def test_translation_table_ragged_grids_render_na(self) -> None:
+        translation = [
+            {"dataset": "a", "pair_regime": "r", "tie_mass": 0.5,
+             "implied_pp": {"0.02": 0.01}},
+            {"dataset": "b", "pair_regime": "r", "tie_mass": 0.5,
+             "implied_pp": {"0.05": 0.025}},
+        ]
+        md = rps._markdown_report(
+            _minimal_config(), [], [], [],
+            {"qasper_policy": "zero pilot data (test)"}, [], translation,
+        )
+        assert "n/a" in md  # a missing key renders, never KeyErrors
+
+    def test_translation_table_empty_is_labeled(self) -> None:
+        md = rps._markdown_report(
+            _minimal_config(), [], [], [],
+            {"qasper_policy": "zero pilot data (test)"}, [], [],
+        )
+        assert "nothing to translate" in md
+
+    def test_per_query_stage_labels_exact_match_as_proxy(
+        self, pair_archive: Path
+    ) -> None:
+        # G15: the pilot archive predates the §8.5 predicate column, so the
+        # binary family runs on exact_match — the artifact rows themselves
+        # must carry the PROXY label, not just prose.
+        table, refusals = rps.run_per_query_stage(
+            {"squad_v2": pair_archive},
+            seed=3,
+            n_grid=[24],
+            n_sims=3,
+            alpha_roles={"primary_full_alpha": 0.05},
+            pair_regimes={"cross_mechanism": ("rag", "prefix_cache")},
+        )
+        binary = table[table["metric"] == "exact_match"]
+        assert not binary.empty
+        assert binary["metric_note"].str.contains("PROXY").all()
+        assert binary["metric_note"].str.contains("predicate").all()
+        others = table[table["metric"] != "exact_match"]
+        assert (others["metric_note"] == "").all()
+        # the provenance string also names the proxy status
+        assert "PROXY" in rps.EXACT_MATCH_PROXY_NOTE
+
+
+# --------------------------------------------------------------------------- #
 # Config sanity (charter + 2026-08-07 verification pins)
 # --------------------------------------------------------------------------- #
 
@@ -495,8 +583,30 @@ class TestConfig:
         holm = fam_map[fam_map["correction"] == "holm"]
         m = int(holm.groupby("family_id").size().max())
         assert rps.SECONDARY_HOLM_M == m
-        assert m >= 10  # regression floor: the hard-coded 10 understated it
+        # Pinned at the 2026-08-16 unit-split value: the pre-split map pooled
+        # 9 per-query + 3 window rows into one m=12 family (the G19 unit
+        # mixing); the family_id UNIT axis splits them, so the largest
+        # compiled Holm family is now the 9-member per-query group-A family.
+        # (The old ">= 10 regression floor" asserted exactly that pooled
+        # family and is superseded by this exact pin.)
+        assert m == 9
         assert rps.ALPHA_ROLES["secondary_holm_worst"] == pytest.approx(0.05 / m)
+
+    def test_fingerprint_alpha_derived_from_registered_holm_legs(self) -> None:
+        # G15 (2026-08-16): no literal /3 — the divisor is the count of Holm
+        # superiority legs in the registered #13 decomposition.
+        from src.analysis.stats.families import FINGERPRINT_SUB_HYPOTHESES
+
+        holm_legs = [
+            policy
+            for policy, correction, _sided, _pred in FINGERPRINT_SUB_HYPOTHESES
+            if correction == "holm"
+        ]
+        assert rps.FINGERPRINT_HOLM_LEGS == len(holm_legs) == 3
+        assert holm_legs == ["evict", "compress", "truncate"]
+        assert rps.ALPHA_ROLES["fingerprint_holm3_worst"] == pytest.approx(
+            0.05 / rps.FINGERPRINT_HOLM_LEGS
+        )
 
     def test_window_stage_has_all_three_alpha_roles(self) -> None:
         # 2026-08-07 fix: window secondaries (#15/#17/#18/#20) are Holm-corrected.

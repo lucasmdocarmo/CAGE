@@ -14,6 +14,7 @@ from src.analysis.stats.equivalence import (
     rope_sensitivity,
 )
 from src.analysis.stats.families import (
+    CHAIN_ENDPOINTS,
     CONTRASTS,
     DEFAULT_METRICS,
     FINGERPRINT_SUB_HYPOTHESES,
@@ -21,6 +22,8 @@ from src.analysis.stats.families import (
     HEADLINE_CONTRAST_ID,
     PRIMARY_CHAIN_ORDER,
     PRIMARY_IDS,
+    REGISTERED_METRICS,
+    UNGATED,
     compile_family_map,
 )
 from src.analysis.stats.gatekeeping import (
@@ -108,15 +111,21 @@ class TestFamilies:
         headline = fm[fm["contrast_id"] == 4]
         assert set(headline["dataset"]) == set(DATASETS)
         assert set(headline["group"]) == {"A", "B", "C", "D"}
-        # family membership rule: group x metric x dataset
+        # family membership rule (decision d 2026-08-16): group x metric x
+        # dataset x F-slot x UNIT — the unit axis stops per-query/window
+        # pooling (G19); the F-slot axis keeps one family on one gate.
         row = headline.iloc[0]
-        assert row["family_id"] == f"{row['group']}|{row['metric']}|{row['dataset']}"
+        assert row["family_id"] == (
+            f"{row['group']}|{row['metric']}|{row['dataset']}"
+            f"|{row['family']}|{row['family_unit']}"
+        )
 
     def test_family_map_unit_binary_for_sub_pressure_predicate(self) -> None:
         fm = compile_family_map(DATASETS)
         f1_predicate = fm[(fm["contrast_id"] == 4) & (fm["metric"] == "predicate")]
         assert set(f1_predicate["unit"]) == {"binary"}  # McNemar (§9.4)
-        f1_ttft = fm[(fm["contrast_id"] == 4) & (fm["metric"] == "ttft")]
+        f1_ttft = fm[(fm["contrast_id"] == 4) & (fm["metric"] == "ttft_ms")]
+        assert not f1_ttft.empty  # G7: the driver's name, not the old 'ttft'
         assert set(f1_ttft["unit"]) == {"per_query"}
         loaded = fm[fm["contrast_id"] == 14]
         assert set(loaded["unit"]) == {"window"}
@@ -146,6 +155,103 @@ class TestFamilies:
                 n_ds = 1 if slot == "dataset" else len(DATASETS)
                 expected += len(groups) * per_cell * n_ds
         assert len(fm) == expected
+
+    def test_family_map_pinned_shape(self) -> None:
+        # Pinned literals (2026-08-16, decision d). The 674-row TOTAL and the
+        # correction/tier splits are UNCHANGED by the unit/F-slot family axes
+        # (axes relabel families, they add no rows). What DID change: the
+        # largest Holm family drops 12 -> 9, because the pre-split
+        # group|metric|dataset id pooled 9 per-query rows (#1,2,3,5,6,7,8,9,10
+        # for group A) with 3 window rows (#15 F2 leg, #15 F3 leg, #17) in ONE
+        # family — exactly the per-query/window unit mixing G19 flagged.
+        fm = compile_family_map(DATASETS)
+        assert len(fm) == 674
+        assert fm["correction"].value_counts().to_dict() == {
+            "holm": 384,  # 336 secondary + 48 fingerprint superiority
+            "bh-fdr": 178,
+            "none": 64,  # #4 (32) + #14 (16) + #12 falsification (16)
+            "tost": 48,
+        }
+        assert fm.groupby("tier").size().to_dict() == {
+            "primary": 144,
+            "secondary": 336,
+            "exploratory": 178,
+            "falsification": 16,
+        }
+        holm_sizes = fm[fm["correction"] == "holm"].groupby("family_id").size()
+        assert int(holm_sizes.max()) == 9  # was 12 pre-unit-split
+        assert holm_sizes.idxmax().endswith("|F1|per_query")
+
+    def test_unit_axis_purity_no_family_mixes_units(self) -> None:
+        # Decision d (2026-08-16, G19): no Holm family may pool per-query
+        # (Wilcoxon/McNemar) and window (Welch) p-values.
+        fm = compile_family_map(DATASETS)
+        assert set(fm["family_unit"]) == {"per_query", "window"}
+        for family_id, rows in fm.groupby("family_id"):
+            units = set(rows["unit"])
+            assert not (
+                "window" in units and units & {"per_query", "binary"}
+            ), family_id
+            assert rows["family_unit"].nunique() == 1, family_id
+            # binary rides the per-query pairing unit on the family axis
+            if units == {"binary"}:
+                assert set(rows["family_unit"]) == {"per_query"}, family_id
+        # the family_id string itself carries the axis (last token)
+        tokens = fm["family_id"].str.split("|").str[-1]
+        assert (tokens == fm["family_unit"]).all()
+
+    def test_upstream_registered_topology(self) -> None:
+        # Decision d (2026-08-16, G10): tier-natural parents as a REGISTERED
+        # column — per-query secondaries gate on #4, F2 window secondaries on
+        # #14, F3/reuse + DIST secondaries on #13; everything else UNGATED.
+        fm = compile_family_map(DATASETS)
+        sec = fm[fm["tier"] == "secondary"]
+        assert set(
+            sec.loc[sec["family_unit"] == "per_query", "upstream"]
+        ) == {"contrast-4"}
+        assert set(
+            sec.loc[(sec["family"] == "F2") & (sec["family_unit"] == "window"),
+                    "upstream"]
+        ) == {"contrast-14"}
+        assert set(
+            sec.loc[sec["family"].isin(["F3", "DIST"]), "upstream"]
+        ) == {"contrast-13"}
+        # non-secondary tiers carry the sentinel, never a gate, never a null
+        others = fm[fm["tier"] != "secondary"]
+        assert set(others["upstream"]) == {UNGATED}
+        assert not fm["upstream"].isna().any()
+        # every non-sentinel upstream is a registered chain endpoint
+        gated = fm.loc[fm["upstream"] != UNGATED, "upstream"]
+        assert set(gated) <= set(CHAIN_ENDPOINTS)
+        assert set(CHAIN_ENDPOINTS) == {"contrast-4", "contrast-13", "contrast-14"}
+        # one family = one gate (§9.3) holds by construction
+        per_family = fm[fm["upstream"] != UNGATED].groupby("family_id")["upstream"]
+        assert (per_family.nunique() == 1).all()
+
+    def test_metric_roster_refusal(self) -> None:
+        # G7 guard: the compiler refuses metric names outside the registered
+        # roster — including the OLD drifted spelling 'ttft', which is exactly
+        # the namespace bug the roster exists to prevent.
+        with pytest.raises(FamilyMapError, match="unregistered metric"):
+            compile_family_map(DATASETS, metrics=("ttft", "predicate"))
+        with pytest.raises(FamilyMapError, match="unregistered metric"):
+            compile_family_map(DATASETS, metrics=("no_such_metric",))
+        # registered names pass
+        fm = compile_family_map(DATASETS, metrics=("ttft_ms", "predicate"))
+        assert not fm.empty
+
+    def test_registered_metrics_roster_matches_driver(self) -> None:
+        # REGISTERED_METRICS is a families-level DUPLICATE of the driver's
+        # HIGHER_IS_BETTER keys (src/ must not import scripts/); this
+        # cross-check pins the duplication (G7).
+        import run_campaign_analysis as driver
+
+        assert REGISTERED_METRICS == frozenset(driver.HIGHER_IS_BETTER)
+
+    def test_default_metrics_are_the_registered_pair(self) -> None:
+        # G7: the registered §9.1 co-primary pair in the DRIVER'S namespace.
+        assert DEFAULT_METRICS == ("ttft_ms", "predicate")
+        assert set(DEFAULT_METRICS) <= REGISTERED_METRICS
 
     def test_fingerprint_decomposition_registers_tost_rows(self) -> None:
         # §9.3: 6 sub-hypotheses — Holm for the 3 superiority predictions,
@@ -759,6 +865,189 @@ class TestGatekeeping:
         trace = evaluate_chain(primaries, secondaries)
         assert trace.primary_order is None
         assert all(p.status == "confirmatory" for p in trace.primaries)
+
+    # ---- G5a (2026-08-16): registered co-primary SET completeness ----
+
+    def test_registered_set_missing_leg_fails_not_shrinks(self) -> None:
+        # The G5 defect: #4 could pass on TTFT alone with the registered
+        # predicate leg absent. Now the SET fails with an explicit reason —
+        # the tiny supplied p proves the verdict did NOT shrink to it.
+        primaries = [
+            PrimaryOutcome("headline", "squad_v2|ttft_ms", 0.001),
+            PrimaryOutcome("truth_tax", "squad_v2|truth_tax", 0.0001),
+        ]
+        trace = evaluate_chain(
+            primaries,
+            [],
+            primary_order=["headline", "truth_tax"],
+            registered_sets={
+                "headline": ["squad_v2|ttft_ms", "squad_v2|predicate"],
+                "truth_tax": ["squad_v2|truth_tax"],
+            },
+        )
+        by_endpoint = {d.endpoint: d for d in trace.set_decisions}
+        headline = by_endpoint["headline"]
+        assert headline.passed is False
+        assert headline.missing_legs == ("squad_v2|predicate",)
+        assert "absence is not evidence" in headline.reason
+        assert headline.registered_legs == (
+            "squad_v2|predicate", "squad_v2|ttft_ms",
+        )
+        # the serial chain closes on the incomplete set: downstream endpoint
+        # is descriptive despite p=0.0001
+        tax = {(p.endpoint): p for p in trace.primaries}["truth_tax"]
+        assert tax.status == "descriptive" and tax.passed is False
+        serial = {e.family_id: e for e in trace.events}
+        assert serial["primary-chain:truth_tax"].opened is False
+        assert "set incomplete" in serial["primary-chain:truth_tax"].reason
+
+    def test_registered_set_complete_passes_and_is_recorded(self) -> None:
+        primaries = [
+            PrimaryOutcome("headline", "squad_v2|ttft_ms", 0.001),
+            PrimaryOutcome("headline", "squad_v2|predicate", 0.002),
+        ]
+        trace = evaluate_chain(
+            primaries,
+            [],
+            primary_order=["headline"],
+            registered_sets={
+                "headline": ["squad_v2|ttft_ms", "squad_v2|predicate"]
+            },
+        )
+        (decision,) = trace.set_decisions
+        assert decision.passed is True
+        assert decision.missing_legs == ()
+        assert decision.binding_p == 0.002  # max raw p under all-datasets
+
+    def test_registered_set_extra_leg_fails_loud(self) -> None:
+        primaries = [
+            PrimaryOutcome("headline", "squad_v2|ttft_ms", 0.001),
+            PrimaryOutcome("headline", "squad_v2|predicate", 0.002),
+        ]
+        with pytest.raises(GatekeepingError, match="unregistered leg"):
+            evaluate_chain(
+                primaries,
+                [],
+                registered_sets={"headline": ["squad_v2|ttft_ms"]},
+            )
+
+    def test_registered_set_unknown_endpoint_fails_loud(self) -> None:
+        primaries = [PrimaryOutcome("headline", "squad_v2|ttft_ms", 0.001)]
+        with pytest.raises(GatekeepingError, match="no supplied outcomes"):
+            evaluate_chain(
+                primaries,
+                [],
+                registered_sets={"ghost": ["squad_v2|ttft_ms"]},
+            )
+
+    # ---- G5b (2026-08-16): Holm m from the REGISTERED family size ----
+
+    def test_registered_m_holm_is_conservative_and_flagged(self) -> None:
+        primaries, secondaries = self._chain()
+        sizes = {"A|ttft|squad_v2": 4, "A|ttft|musique": 1}
+        trace = evaluate_chain(
+            primaries, secondaries, registered_family_sizes=sizes
+        )
+        open_rows = {
+            s.contrast: s
+            for s in trace.secondaries
+            if s.family_id == "A|ttft|squad_v2"
+        }
+        # 2 supplied of 4 registered: padding the missing members with p=1.0
+        # gives every supplied p its worst-case multiplier (registered m -
+        # rank + 1) — conservative vs ANY true completion of the family, and
+        # strictly larger than the shrunken-m defect the fix removes.
+        expected = holm([0.01, 0.03, 1.0, 1.0])[:2]
+        np.testing.assert_allclose(
+            [open_rows["B5-vs-B6"].p_holm, open_rows["B9-vs-B6"].p_holm],
+            expected,
+        )
+        shrunken = holm([0.01, 0.03])
+        assert open_rows["B5-vs-B6"].p_holm > shrunken[0]
+        assert open_rows["B9-vs-B6"].p_holm > shrunken[1]
+        # the shortfall is flagged on the decision record and the gate event
+        for s in open_rows.values():
+            assert (s.m_supplied, s.m_registered) == (2, 4)
+        event = {e.family_id: e for e in trace.events}["A|ttft|squad_v2"]
+        assert "REGISTERED m=4" in event.reason
+        assert "2 registered member(s) missing" in event.reason
+        assert "conservative" in event.reason
+        frame = trace.to_frame()
+        assert {"m_supplied", "m_registered"} <= set(frame.columns)
+
+    def test_registered_m_equal_supplied_matches_plain_holm(self) -> None:
+        primaries, secondaries = self._chain()
+        sizes = {"A|ttft|squad_v2": 2, "A|ttft|musique": 1}
+        trace = evaluate_chain(
+            primaries, secondaries, registered_family_sizes=sizes
+        )
+        open_rows = {
+            s.contrast: s
+            for s in trace.secondaries
+            if s.family_id == "A|ttft|squad_v2"
+        }
+        np.testing.assert_allclose(
+            [open_rows["B5-vs-B6"].p_holm, open_rows["B9-vs-B6"].p_holm],
+            holm([0.01, 0.03]),
+        )
+        event = {e.family_id: e for e in trace.events}["A|ttft|squad_v2"]
+        assert "missing" not in event.reason
+
+    def test_registered_m_smaller_than_supplied_fails_loud(self) -> None:
+        primaries, secondaries = self._chain()
+        with pytest.raises(GatekeepingError, match="unregistered member"):
+            evaluate_chain(
+                primaries,
+                secondaries,
+                registered_family_sizes={
+                    "A|ttft|squad_v2": 1,
+                    "A|ttft|musique": 1,
+                },
+            )
+
+    def test_registered_m_missing_family_fails_loud(self) -> None:
+        primaries, secondaries = self._chain()
+        with pytest.raises(GatekeepingError, match="no registered member count"):
+            evaluate_chain(
+                primaries,
+                secondaries,
+                registered_family_sizes={"A|ttft|squad_v2": 2},
+            )
+
+    # ---- G5c/G10 (2026-08-16): upstream per family from the map ----
+
+    def test_upstream_by_family_match_passes(self) -> None:
+        primaries, secondaries = self._chain()
+        trace = evaluate_chain(
+            primaries,
+            secondaries,
+            upstream_by_family={
+                "A|ttft|squad_v2": "B6-vs-B3",
+                "A|ttft|musique": "B6-vs-B3",
+            },
+        )
+        assert len(trace.secondaries) == 3
+
+    def test_upstream_by_family_mismatch_fails_loud(self) -> None:
+        primaries, secondaries = self._chain()
+        with pytest.raises(GatekeepingError, match="registered topology"):
+            evaluate_chain(
+                primaries,
+                secondaries,
+                upstream_by_family={
+                    "A|ttft|squad_v2": "some-other-primary",
+                    "A|ttft|musique": "B6-vs-B3",
+                },
+            )
+
+    def test_upstream_by_family_missing_family_fails_loud(self) -> None:
+        primaries, secondaries = self._chain()
+        with pytest.raises(GatekeepingError, match="no registered upstream"):
+            evaluate_chain(
+                primaries,
+                secondaries,
+                upstream_by_family={"A|ttft|squad_v2": "B6-vs-B3"},
+            )
 
 
 # --------------------------------------------------------------------------- #

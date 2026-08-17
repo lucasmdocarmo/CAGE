@@ -570,7 +570,7 @@ def _family_map() -> pd.DataFrame:
             "tier": ["primary", "primary", "secondary"],
             "family": ["F1", "F1", "F1"],
             "group": ["A", "A", "A"],
-            "metric": ["ttft", "ttft", "predicate"],
+            "metric": ["ttft_ms", "ttft_ms", "predicate"],
             "dataset": ["squad_v2", "musique", "squad_v2"],
             "correction": ["none (co-primary set rule)", "none (co-primary set rule)", "holm"],
             "sidedness": ["two-sided", "two-sided", "one-sided (greater)"],
@@ -680,8 +680,12 @@ class TestPrereg:
         assert "lambda_star_onset" in text
         assert "tost" in text
         assert "falsification" in text
-        # family_id pipes are escaped so cells never split
-        assert r"A\|ttft\|squad_v2" in text
+        # the registered gating topology rides the table (2026-08-16)
+        assert "contrast-14" in text
+        assert "ungated" in text
+        # family_id pipes are escaped so cells never split (5-axis id:
+        # group|metric|dataset|F-slot|unit, driver-namespace metric — G7/G19)
+        assert r"A\|ttft_ms\|squad_v2\|F1\|per_query" in text
         section = text.split("## 2. Family map")[1].split("## 3.")[0]
         body = [
             line

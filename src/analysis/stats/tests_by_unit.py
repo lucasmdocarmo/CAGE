@@ -23,8 +23,10 @@ from scipy import stats as _stats
 from src.analysis.stats.wlt import _as_float_1d
 
 Alternative = Literal["two-sided", "greater", "less"]
+ZeroMethod = Literal["wilcox", "pratt"]
 
 _ALTERNATIVES: frozenset[str] = frozenset({"two-sided", "greater", "less"})
+_ZERO_METHODS: frozenset[str] = frozenset({"wilcox", "pratt"})
 # §9.4 guard: batch-means inputs are per-window aggregates (≥3 replications,
 # at most a few dozen windows); a per-query vector under load is 100s long.
 DEFAULT_MAX_WINDOWS: int = 50
@@ -34,6 +36,13 @@ def _check_alternative(alternative: str) -> None:
     if alternative not in _ALTERNATIVES:
         raise ValueError(
             f"alternative={alternative!r} not in {sorted(_ALTERNATIVES)}"
+        )
+
+
+def _check_zero_method(zero_method: str) -> None:
+    if zero_method not in _ZERO_METHODS:
+        raise ValueError(
+            f"zero_method={zero_method!r} not in {sorted(_ZERO_METHODS)}"
         )
 
 
@@ -55,33 +64,84 @@ class PairedWilcoxonResult:
     p_value: float
     cliffs_delta_paired: float
     alternative: Alternative
+    # Effective n (decision 2026-08-16 b): the count of non-zero pairs, the
+    # sample size that actually feeds the signed-rank statistic — reported
+    # beside the §8.13 W/L/T triple because under pilot-level tie saturation
+    # (~95% zeros) n_pairs wildly overstates the evidence.
+    n_nonzero: int
+    zero_method: ZeroMethod
 
 
 def paired_wilcoxon(
-    a: Any, b: Any, *, alternative: Alternative = "two-sided"
+    a: Any,
+    b: Any,
+    *,
+    alternative: Alternative = "two-sided",
+    zero_method: ZeroMethod = "wilcox",
 ) -> PairedWilcoxonResult:
     """Wilcoxon signed-rank on per-query paired values (sub-pressure only).
 
     ``cliffs_delta_paired`` is the tie-aware within-pair dominance statistic
     (ties counted in the denominator), NOT the between-groups delta. The
     n_pos/n_neg/n_zero triple is the §8.13-mandatory win/loss/tie raw form
-    (direction-neutral: n_pos counts a > b).
+    (direction-neutral: n_pos counts a > b). ``n_nonzero`` = n_pos + n_neg is
+    the effective n.
+
+    Sidedness (owner decision 2026-08-16 a): ``alternative`` passes through
+    to scipy — ``"greater"`` tests H1: a > b (positive differences dominate),
+    ``"less"`` tests H1: a < b. The REGISTERED per-row sidedness is supplied
+    explicitly by the driver from the §9.3 family map; the ``"two-sided"``
+    default here is back-compat only, never the registration.
+
+    Tie handling (owner decision 2026-08-16 b) — the pinned
+    exact-vs-approx rule:
+
+    - ``zero_method="wilcox"`` (back-compat default): zero differences are
+      discarded before ranking; the scipy call keeps scipy's own defaults
+      (``method="auto"``, ``correction=False``). scipy's auto rule (pinned
+      scipy 1.18): exact distribution iff there are no zeros AND no tied
+      |d| AND n ≤ 50; exhaustive permutation iff ties/zeros with n ≤ 13;
+      otherwise the normal approximation WITHOUT continuity correction.
+    - ``zero_method="pratt"`` (the REGISTERED value, passed explicitly by
+      the driver per §9.4): zeros are kept in the ranking (Pratt 1959), so
+      the tie mass penalizes the statistic instead of silently shrinking n.
+      The execution is pinned to the normal approximation WITH continuity
+      correction (``method="approx"``, ``correction=True``) UNCONDITIONALLY:
+      scipy's auto rule would otherwise switch between permutation and
+      asymptotic paths depending on the realized tie pattern, making the
+      executed test data-dependent — unacceptable for a registered
+      procedure under ~95% tie saturation (audit S11 / finding G8).
+
+    The all-zero vector short-circuits to the T=0 identity outcome
+    (p = 1.0) under BOTH zero methods — scipy raises on it for either.
     """
     _check_alternative(alternative)
+    _check_zero_method(zero_method)
     arr_a, arr_b = _paired(a, b)
     diffs = arr_a - arr_b
     n_pos = int(np.count_nonzero(diffs > 0))
     n_neg = int(np.count_nonzero(diffs < 0))
     n_zero = diffs.size - n_pos - n_neg
+    n_nonzero = n_pos + n_neg
     delta = (n_pos - n_neg) / diffs.size
-    if n_pos + n_neg == 0:
+    if n_nonzero == 0:
         # Legitimate T=0 identity outcome (e.g. B1 vs B2), not an error.
         return PairedWilcoxonResult(
             n_pairs=diffs.size, n_pos=0, n_neg=0, n_zero=n_zero,
             statistic=0.0, p_value=1.0, cliffs_delta_paired=0.0,
-            alternative=alternative,
+            alternative=alternative, n_nonzero=0, zero_method=zero_method,
         )
-    res = _stats.wilcoxon(diffs, zero_method="wilcox", alternative=alternative)
+    if zero_method == "pratt":
+        # Registered execution: pinned normal approximation + continuity
+        # correction (see docstring). "approx" is scipy's asymptotic path.
+        res = _stats.wilcoxon(
+            diffs, zero_method="pratt", alternative=alternative,
+            method="approx", correction=True,
+        )
+    else:
+        # Back-compat path: bit-identical to the pre-decision behavior
+        # (scipy defaults: method="auto", correction=False).
+        res = _stats.wilcoxon(diffs, zero_method="wilcox", alternative=alternative)
     return PairedWilcoxonResult(
         n_pairs=diffs.size,
         n_pos=n_pos,
@@ -91,6 +151,8 @@ def paired_wilcoxon(
         p_value=float(res.pvalue),
         cliffs_delta_paired=float(delta),
         alternative=alternative,
+        n_nonzero=n_nonzero,
+        zero_method=zero_method,
     )
 
 
@@ -133,7 +195,24 @@ def mcnemar_binary(
     a: Any, b: Any, *, alternative: Alternative = "two-sided"
 ) -> McNemarResult:
     """McNemar's test on paired binary outcomes: exact binomial on the
-    discordant pairs (n_10 successes out of n_10 + n_01 at p=0.5)."""
+    discordant pairs (n_10 successes out of n_10 + n_01 at p=0.5).
+
+    Direction mapping (owner decision 2026-08-16 a) — under
+    H0, n_10 ~ Binomial(n_discordant, ½); with b := n_10:
+
+    - ``alternative="greater"`` tests H1: arm ``a`` succeeds where ``b``
+      fails MORE often than the reverse (P(a=1,b=0) > P(a=0,b=1), i.e.
+      ``a`` is the better arm); p = P[X ≥ b] (exact binomial upper tail,
+      ``scipy.stats.binomtest`` with ``alternative="greater"``).
+    - ``alternative="less"`` tests H1: arm ``a`` is WORSE than arm ``b``;
+      p = P[X ≤ b] (lower tail).
+    - ``alternative="two-sided"`` is scipy's exact two-sided binomial test.
+
+    The registered per-row sidedness is supplied explicitly by the driver
+    from the §9.3 family map; ``"two-sided"`` is the back-compat default.
+    Zero discordant pairs is the identity outcome (p = 1.0) under every
+    alternative.
+    """
     _check_alternative(alternative)
     arr_a = _as_binary("a", a)
     arr_b = _as_binary("b", b)
@@ -190,6 +269,14 @@ def batch_means_contrast(
     the ≥3 replications), never raw per-query values: any input longer than
     ``max_windows`` is refused because per-query pairing under load is
     prohibited by the registration.
+
+    Direction mapping (owner decision 2026-08-16 a): ``alternative`` passes
+    through to the one-sided Welch t — ``"greater"`` tests
+    H1: mean(means_a) > mean(means_b), ``"less"`` the reverse. The
+    registered per-row sidedness is supplied explicitly by the driver from
+    the §9.3 family map; ``"two-sided"`` is the back-compat default. The
+    ``ci95_*`` bounds stay a descriptive two-sided 95% CI regardless of
+    ``alternative``.
     """
     _check_alternative(alternative)
     arr_a = _as_float_1d("means_a", means_a)
