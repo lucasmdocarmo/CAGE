@@ -210,6 +210,58 @@ FAMILY_MARKER: Dict[str, str] = {
     "Other": "X",
 }
 
+# ---------------------------------------------------------------------------
+# Generic categorical encodings (audit I11: no tab10, no silent truncation)
+# ---------------------------------------------------------------------------
+
+#: Colorblind-safe categorical palette (seaborn "colorblind" hexes, capped at
+#: the dataviz-doctrine limit of 8 ordered for adjacent contrast). Every ad-hoc
+#: categorical encoding maps through ``categorical_colors`` — never ``tab10``.
+CATEGORICAL_PALETTE: List[str] = [
+    "#0173b2",  # blue
+    "#de8f05",  # orange
+    "#029e73",  # green
+    "#d55e00",  # vermillion
+    "#cc78bc",  # purple
+    "#ca9161",  # tan
+    "#949494",  # grey
+    "#56b4e9",  # sky blue
+]
+
+#: Matching marker cycle for redundant (color + shape) categorical encodings.
+CATEGORICAL_MARKERS: List[str] = ["o", "s", "^", "D", "v", "P", "X", "*"]
+
+
+def _categorical_map(
+    levels: Sequence[str], codes: Sequence[str], what: str, where: str
+) -> Dict[str, str]:
+    uniq = list(dict.fromkeys(str(level) for level in levels))
+    if not uniq:
+        raise ValueError(f"{where}: no categorical levels to encode")
+    if len(uniq) > len(codes):
+        raise ValueError(
+            f"{where}: {len(uniq)} categorical levels exceed the "
+            f"{len(codes)}-{what} colorblind-safe budget — a categorical "
+            "encoding beyond that is unreadable; facet or regroup instead "
+            f"(levels: {uniq})"
+        )
+    return dict(zip(uniq, codes))
+
+
+def categorical_colors(levels: Sequence[str], where: str) -> Dict[str, str]:
+    """level -> colorblind-safe hex; FAILS LOUD (with the count) past 8 levels.
+
+    Replaces the pilot ``plt.cm.tab10`` zips whose silent truncation the
+    2026-08-16 audit flagged (I11): an over-budget encoding raises instead of
+    dropping levels.
+    """
+    return _categorical_map(levels, CATEGORICAL_PALETTE, "color", where)
+
+
+def categorical_markers(levels: Sequence[str], where: str) -> Dict[str, str]:
+    """level -> marker glyph; FAILS LOUD (with the count) past the cycle."""
+    return _categorical_map(levels, CATEGORICAL_MARKERS, "marker", where)
+
 
 def family_short(cell: str, tree: str = "") -> str:
     """Short family label (legend-sized) for a cell."""

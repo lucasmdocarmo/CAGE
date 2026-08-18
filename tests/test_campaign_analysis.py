@@ -433,10 +433,21 @@ def test_design_input_default_stats_figures_and_stamp(organized_run: Path) -> No
     assert stats["blinding"]["sealed_map"] is None
     assert stats["blinding"]["active"] is False
 
-    # Figures rendered and recorded.
-    assert set(stats["figures"]) == {"forest_ttft_ms.png", "wlt_ttft_ms.png"}
-    for name in stats["figures"]:
-        path = analysis_dir / name
+    # Figures rendered from the REGISTERED statistics (audit I1) and recorded
+    # with metadata: the per-dataset W/L/T panels are the default view, the
+    # pooled view is a disclosed supplementary file (audit I2).
+    files = {e["file"] for e in stats["figures"] if "file" in e}
+    assert files == {
+        "forest_ttft_ms.png",
+        "wlt_ttft_ms.png",
+        "wlt_ttft_ms_pooled_supplementary.png",
+    }
+    for entry in stats["figures"]:
+        assert "file" in entry  # every requested metric rendered — no skips
+        assert "stats.json" in entry["source"]
+        assert entry["n_dropped_nan_total"] == 0  # I11: counted disclosure
+        assert entry["consumed"]  # the figures-agree-with-stats seam
+        path = analysis_dir / entry["file"]
         assert path.is_file() and path.stat().st_size > 0
 
     # summary.md is stamped and readable.
@@ -749,6 +760,13 @@ def test_window_contrast_computes_batch_means(tmp_path: Path) -> None:
         assert 0.0 <= row["p_value"] <= 1.0
         assert row["ci95_low"] <= row["mean_diff"] <= row["ci95_high"]
 
+    # I11: a metric with no per-query contrast entry renders no figure — a
+    # COUNTED skip entry in the figures list, never a silent omission.
+    assert len(stats["figures"]) == 1
+    fig_skip = stats["figures"][0]
+    assert fig_skip["skipped_metric"] == "ttft_ms"
+    assert "window-unit" in fig_skip["reason"]
+
     # The consumed F2 rows are NOT in the pressure skip block…
     block = stats["skipped"]["pressure_rows"]
     assert block is None
@@ -767,12 +785,63 @@ def test_multiple_f1_contrasts_share_reference_grouping(organized_run: Path) -> 
     assert rc == 0
     analysis_dir, stats = _load_stats(organized_run)
     assert {e["contrast_id"] for e in stats["contrasts"]} == {3, 4}
-    names = set(stats["figures"])
+    names = {e["file"] for e in stats["figures"] if "file" in e}
     assert "wlt_ttft_ms.png" in names
+    assert "wlt_ttft_ms_pooled_supplementary.png" in names
     forest_names = {n for n in names if n.startswith("forest_")}
     assert forest_names == {"forest_ttft_ms__vs_B3.png", "forest_ttft_ms__vs_B6.png"}
     for name in names:
         assert (analysis_dir / name).stat().st_size > 0
+
+
+def test_figures_agree_with_stats_bit_for_bit(organized_run: Path) -> None:
+    # #131 item 6 (audit I1): every statistic a published figure consumed must
+    # equal the stats.json value BIT-FOR-BIT. render_figures feeds the
+    # renderers from the same dicts serialized into stats['contrasts'] and
+    # records the consumed values per figure — the two are compared here on
+    # the loaded JSON, so any divergence (recomputation, rounding, drift)
+    # fails this test.
+    rc = rca.main([str(organized_run), "--contrasts", "4", "3"])
+    assert rc == 0
+    _, stats = _load_stats(organized_run)
+
+    registered: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for entry in stats["contrasts"]:
+        for row in entry["per_dataset"]:
+            key = (
+                entry["cell_row_key"],
+                entry["reference_row_key"],
+                entry["metric"],
+                row["dataset"],
+            )
+            assert key not in registered
+            registered[key] = row
+
+    rendered = [e for e in stats["figures"] if "file" in e]
+    assert rendered, "no figure was rendered"
+    for fig_entry in rendered:
+        assert fig_entry["consumed"], fig_entry["file"]
+        for consumed in fig_entry["consumed"]:
+            row = registered[
+                (
+                    consumed["cell_row_key"],
+                    consumed["reference_row_key"],
+                    fig_entry["metric"],
+                    consumed["dataset"],
+                )
+            ]
+            assert consumed["p_value"] == row["p_value"]
+            assert consumed["p_corrected"] == row["p_holm_across_datasets"]
+            assert consumed["median_delta"] == row["median_delta"]
+            assert consumed["n_pairs"] == row["n_pairs"]
+            assert consumed["n_dropped_nan"] == row["n_dropped_nan"]
+            assert (
+                consumed["wins"], consumed["losses"], consumed["ties"]
+            ) == (row["wins"], row["losses"], row["ties"])
+    # The W/L/T figures consumed EVERY registered per-query row (nothing
+    # silently omitted); each forest consumed its reference's rows.
+    wlt = next(e for e in rendered if e["file"] == "wlt_ttft_ms.png")
+    assert len(wlt["consumed"]) == len(registered)
 
 
 def test_unregistered_metric_direction_fails_closed(

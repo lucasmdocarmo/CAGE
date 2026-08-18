@@ -3,11 +3,16 @@
 
 Consumed only by generate_plots.py. Two artifacts:
 
+PILOT DATA (task #135): every emitted artifact is stamped "PILOT DATA — design
+input only, do not cite as campaign results" (a leading ``%`` header comment in
+each .tex plus a visible table note). The registered campaign tables come from
+the D9 stats.json pipeline, not from this module.
+
 - main_results_table.md / .tex  (F1): one row per cell, grouped by arm family,
   columns = TTFT / Latency / TPOT medians (ms), token-weighted cached-prompt %,
   grounding mean, F1 on answerable questions, abstention %. Serving columns carry
   Holm-corrected Wilcoxon significance stars vs No Cache (straight from
-  phase2_stats.json, so the table cannot disagree with the stats). Cells whose
+  pilot_stats.json, so the table cannot disagree with the stats). Cells whose
   NLI premise exceeds the validity envelope are daggered.
 - speculative_summary_table.md  (F7 companion): the 4 speculative cells with TPOT,
   latency, Delta TPOT vs No Cache and the acceptance | draft-proposed rate.
@@ -25,6 +30,7 @@ All numbers come from the summary frame built by generate_plots.build_summary
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -42,9 +48,33 @@ from _plot_style import (
 
 SERVING_METRICS = ("ttft_ms", "latency_ms", "tpot_ms")
 
+# --------------------------------------------------------------------------- #
+# Pilot fences (task #135, finding I11): the pilot archive is design input
+# only; its .tex used to read "dissertation-ready" with no provenance stamp.
+# --------------------------------------------------------------------------- #
+
+#: Leading comment on every emitted .tex artifact.
+PILOT_TEX_HEADER = (
+    "% PILOT DATA -- design input only, do not cite as campaign results "
+    "(2026-07 pilot archive; the registered tables come from the D9 "
+    "stats.json pipeline)."
+)
+
+#: Visible table note (Markdown + first note of each table).
+PILOT_NOTE = (
+    "PILOT DATA (2026-07 pilot archive) -- design input only; do not cite "
+    "as campaign results."
+)
+
+#: TeX-safe version of PILOT_NOTE (kept in sync by hand, like NOTES_TEX).
+PILOT_NOTE_TEX = (
+    "\\textbf{PILOT DATA} (2026-07 pilot archive) -- design input only; "
+    "do not cite as campaign results."
+)
+
 
 def significance_lookup(stats_payload: Optional[dict]) -> Dict[Tuple[str, str], dict]:
-    """(baseline, metric) -> comparison dict from a phase2_stats.json payload."""
+    """(baseline, metric) -> comparison dict from a pilot_stats.json payload."""
     out: Dict[Tuple[str, str], dict] = {}
     for comp in (stats_payload or {}).get("comparisons") or []:
         b, m = comp.get("baseline"), comp.get("metric")
@@ -73,9 +103,26 @@ def _fmt_pct(v: float) -> str:
     return "--" if (v is None or math.isnan(v)) else f"{v:.1f}"
 
 
+# Task #135 (finding I11): the old chain covered only &/%/_/# — a backslash,
+# brace, $, ^ or ~ in a cell label reached the .tex raw and broke the compile.
+# Single-pass regex substitution so escape text is never re-escaped.
+_TEX_ESCAPES: Dict[str, str] = {
+    "\\": r"\textbackslash{}",
+    "&": r"\&",
+    "%": r"\%",
+    "_": r"\_",
+    "#": r"\#",
+    "$": r"\$",
+    "{": r"\{",
+    "}": r"\}",
+    "^": r"\textasciicircum{}",
+    "~": r"\textasciitilde{}",
+}
+_TEX_SPECIAL_RE = re.compile(r"[\\&%_#${}^~]")
+
+
 def _tex_escape(s: str) -> str:
-    return (s.replace("&", r"\&").replace("%", r"\%").replace("_", r"\_")
-             .replace("#", r"\#"))
+    return _TEX_SPECIAL_RE.sub(lambda m: _TEX_ESCAPES[m.group(0)], str(s))
 
 
 def _grouped_rows(df: pd.DataFrame) -> List[Tuple[str, List[pd.Series]]]:
@@ -116,9 +163,41 @@ def _row_values(row: pd.Series, sig: Dict[Tuple[str, str], dict],
 HEADERS = ["Baseline", "TTFT (ms)", "Latency (ms)", "TPOT (ms)",
            "Cached (%)", "Grounding", "F1 answerable", "Abstention (%)"]
 
+# Task #135 (finding I11): the per-cell N is DERIVED from the loaded frame —
+# the old hardcoded pilot constant ("N = 300 ... 100 questions x 3 trials")
+# rendered a stale note on any other run shape.
+def _n_per_cell(df: pd.DataFrame) -> Optional[str]:
+    """Valid measurements per cell from the frame's ``n_rows`` column
+    (emitted by ``generate_plots.build_summary``). Cells that differ render
+    as 'lo-hi'; ``None`` (note omitted, never fabricated) when absent."""
+    if "n_rows" not in df.columns:
+        return None
+    s = pd.to_numeric(df["n_rows"], errors="coerce").dropna()
+    if s.empty:
+        return None
+    lo, hi = int(s.min()), int(s.max())
+    return str(hi) if lo == hi else f"{lo}-{hi}"
+
+
+def _n_frag_tex(n_txt: str) -> str:
+    """TeX 'N = <n>' fragment; a lo-hi range stays OUT of math mode (a math
+    hyphen would render as subtraction) and becomes an en-dash."""
+    if "-" in n_txt:
+        return "$N$ = " + n_txt.replace("-", "--")
+    return f"$N = {n_txt}$"
+
+
+def _median_note(n_txt: Optional[str], tex: bool) -> str:
+    base = "Medians are pooled per-example medians (same estimand as the Wilcoxon tables)"
+    if n_txt is not None:
+        n_frag = _n_frag_tex(n_txt) if tex else f"N = {n_txt}"
+        base += f"; {n_frag} valid measurements per cell (repeat-0 rows)"
+    return base + "."
+
+
 NOTES = [
-    "Medians are pooled per-example medians (same estimand as the Wilcoxon tables); "
-    "N = 300 valid measurements per cell (100 questions x 3 trials, repeat-0 rows).",
+    PILOT_NOTE,
+    # (the derived per-cell-N median note is injected here at write time)
     "Stars: Holm-corrected Wilcoxon signed-rank vs No Cache on the serving columns "
     "(* p<0.05, ** p<0.01, *** p<0.001).",
     "Cached (%) is the token-weighted cached-prompt share: sum(cached prompt tokens) / "
@@ -131,9 +210,8 @@ NOTES = [
 
 # TeX-safe versions of NOTES (kept in sync by hand; no string surgery at runtime).
 NOTES_TEX = [
-    "Medians are pooled per-example medians (same estimand as the Wilcoxon tables); "
-    "$N = 300$ valid measurements per cell (100 questions $\\times$ 3 trials, "
-    "repeat-0 rows).",
+    PILOT_NOTE_TEX,
+    # (the derived per-cell-N median note is injected here at write time)
     "Stars: Holm-corrected Wilcoxon signed-rank vs.\\ No Cache on the serving columns "
     "($^{*}p<0.05$, $^{**}p<0.01$, $^{***}p<0.001$).",
     "Cached (\\%) is the token-weighted cached-prompt share (total cached prompt "
@@ -153,6 +231,10 @@ def write_main_results_table(df: pd.DataFrame, stats_payload: Optional[dict],
     reference = (stats_payload or {}).get("reference", "no_cache")
     grouped = _grouped_rows(df)
     written: List[str] = []
+    # Task #135 (I11): per-cell N derived from the frame, never hardcoded.
+    n_txt = _n_per_cell(df)
+    notes_md = [NOTES[0], _median_note(n_txt, tex=False), *NOTES[1:]]
+    notes_tex = [NOTES_TEX[0], _median_note(n_txt, tex=True), *NOTES_TEX[1:]]
 
     # ---------------- Markdown ----------------
     md: List[str] = ["# Main results (Phase 2, Qwen3-8B, SQuAD v2)", ""]
@@ -166,7 +248,7 @@ def write_main_results_table(df: pd.DataFrame, stats_payload: Optional[dict],
             md.append("| " + " | ".join([name] + _row_values(row, sig, reference,
                                                              tex=False)) + " |")
     md.append("")
-    for note in NOTES:
+    for note in notes_md:
         md.append(f"- {note}")
     md.append("")
     (out_dir / "main_results_table.md").write_text("\n".join(md), encoding="utf-8")
@@ -176,13 +258,14 @@ def write_main_results_table(df: pd.DataFrame, stats_payload: Optional[dict],
     ncols = len(HEADERS)
     tex: List[str] = [
         "% Auto-generated by generate_plots.py -- do not edit by hand.",
+        PILOT_TEX_HEADER,
         "% Requires: \\usepackage{booktabs}",
         "\\begin{table}[htbp]",
         "\\centering",
         "\\caption{Serving and quality results per arm (Phase 2, Qwen3-8B, "
-        "SQuAD v2). Medians are pooled per-example medians; N = 300 valid "
-        "measurements per cell (100 questions $\\times$ 3 trials). Stars: "
-        "Holm-corrected Wilcoxon signed-rank vs.\\ No Cache "
+        "SQuAD v2). Medians are pooled per-example medians"
+        + (f"; {_n_frag_tex(n_txt)} valid measurements per cell" if n_txt else "")
+        + ". Stars: Holm-corrected Wilcoxon signed-rank vs.\\ No Cache "
         "($^{*}p<0.05$, $^{**}p<0.01$, $^{***}p<0.001$).}",
         "\\label{tab:phase2-main-results}",
         "\\small",
@@ -207,7 +290,7 @@ def write_main_results_table(df: pd.DataFrame, stats_payload: Optional[dict],
         "\\vspace{2pt}",
         "\\begin{minipage}{\\linewidth}\\footnotesize",
     ]
-    for note_tex in NOTES_TEX:
+    for note_tex in notes_tex:
         tex.append(note_tex + " \\\\")
     tex += [
         "\\end{minipage}",
@@ -232,11 +315,13 @@ TRILEMMA_HEADERS = ["Baseline", "TTFT (ms)", "Latency (ms)", "F1 ans.",
                     "Serving", "Quality", "Memory"]
 
 TRILEMMA_NOTES = [
+    PILOT_NOTE,
     "Tri-lemma axes -- SERVING: TTFT median (ms; lower is better). QUALITY: mean "
     "F1 on answerable questions (valid for all arms). MEMORY: per-query KV "
     "context footprint -- Resident KV = median prompt tokens/query held in KV; "
-    "Marginal KV = median NEW KV tokens materialized per query (prompt - cached, "
-    "missing cached = 0); Cached (%) is the token-weighted cached-prompt share.",
+    "Marginal KV = median NEW KV tokens materialized per query (prompt - "
+    "cached; rows missing cached-token telemetry are dropped and counted); "
+    "Cached (%) is the token-weighted cached-prompt share.",
     "Axis scores are 0-100, min-max normalized WITHIN THIS RUN (relative, not "
     "absolute): serving = min-max of -log TTFT; quality = min-max of "
     "F1-answerable; memory = min-max of -marginal KV. 100 = best arm in the run "
@@ -248,12 +333,13 @@ TRILEMMA_NOTES = [
 ]
 
 TRILEMMA_NOTES_TEX = [
+    PILOT_NOTE_TEX,
     "Tri-lemma axes -- SERVING: TTFT median (ms; lower is better). QUALITY: mean "
     "F1 on answerable questions (valid for all arms). MEMORY: per-query KV "
     "context footprint -- Resident KV = median prompt tokens/query held in KV; "
     "Marginal KV = median NEW KV tokens materialized per query (prompt $-$ "
-    "cached, missing cached = 0); Cached (\\%) is the token-weighted "
-    "cached-prompt share.",
+    "cached; rows missing cached-token telemetry are dropped and counted); "
+    "Cached (\\%) is the token-weighted cached-prompt share.",
     "Axis scores are 0--100, min-max normalized WITHIN THIS RUN (relative, not "
     "absolute): serving = min-max of $-\\log$ TTFT; quality = min-max of "
     "F1-answerable; memory = min-max of $-$marginal KV. 100 = best arm in the "
@@ -353,6 +439,7 @@ def write_trilemma_table(df: pd.DataFrame, out_dir: Path) -> List[str]:
     ncols = len(TRILEMMA_HEADERS)
     tex: List[str] = [
         "% Auto-generated by generate_plots.py -- do not edit by hand.",
+        PILOT_TEX_HEADER,
         "% Requires: \\usepackage{booktabs}",
         "\\begin{table}[htbp]",
         "\\centering",
@@ -443,6 +530,7 @@ def write_speculative_table(df: pd.DataFrame, acc: Optional[pd.DataFrame],
             f"| {delta} | {acc_txt} |")
     lines += [
         "",
+        f"- {PILOT_NOTE}",
         f"- No Cache reference TPOT: {_fmt_ms(ref_tpot)} ms (median).",
         "- Acceptance is the cumulative acceptance rate GIVEN the drafter proposed "
         "(acceptance | draft proposed), not an unconditional acceptance rate; "

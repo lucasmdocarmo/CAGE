@@ -66,9 +66,16 @@ Pipeline per run:
    registered margin, the policy/none cell pair, and the S2 ``policy_event``
    mask exist — and listed as labeled skips otherwise.
 6. Emit ``<run>/analysis/<timestamp>/{stats.json, summary.md,
-   forest_<metric>.png, wlt_<metric>.png}`` (figures via
-   ``figure_pipeline.plot_forest`` / ``plot_win_loss_tie``), every one
-   carrying the mode stamp.
+   forest_<metric>.png, wlt_<metric>.png,
+   wlt_<metric>_pooled_supplementary.png}``. Figures CONSUME the registered
+   statistics (audit I1): ``render_figures`` feeds
+   ``figure_pipeline.plot_forest_registered`` /
+   ``plot_win_loss_tie_registered`` from the same contrast dicts written into
+   stats.json — nothing is recomputed, per-dataset panels are the default
+   W/L/T view (§9.1, audit I2), the pooled view is a disclosed supplementary
+   file, and unrenderable metrics become counted skip entries in
+   ``stats['figures']`` (audit I11). Rendering happens AFTER the one-time
+   unblinding is logged (audit I10). Every output carries the mode stamp.
 
 Confirmatory preconditions (all checked BEFORE the §9.11 lock is touched):
 
@@ -1351,74 +1358,171 @@ def _baseline_of_key(index: pd.DataFrame, row_key: str) -> str:
     return str(values[0]) if len(values) else row_key
 
 
+def _figure_rows_for_metric(
+    contrast_entries: Sequence[Mapping[str, Any]], metric: str
+) -> list[fp.ContrastStatRow]:
+    """ContrastStatRow inputs built from the SAME dicts written to stats.json.
+
+    Audit I1: the figures consume these rows and nothing else — the values a
+    figure renders are bit-for-bit the values stats.json carries, so a
+    published figure is structurally unable to contradict the registered
+    statistics. Window-unit entries carry no §8.13 per-query triple and are
+    excluded here (they have no forest/W-L-T rendering).
+    """
+    rows: list[fp.ContrastStatRow] = []
+    for entry in contrast_entries:
+        if entry["metric"] != metric or entry["unit"] == "window":
+            continue
+        label = f"{entry['cell_baseline']} vs {entry['reference_baseline']}"
+        for row in entry["per_dataset"]:
+            if "p_value" not in row:  # labeled skip rows carry no statistics
+                continue
+            rows.append(
+                fp.ContrastStatRow(
+                    cell_row_key=str(entry["cell_row_key"]),
+                    reference_row_key=str(entry["reference_row_key"]),
+                    dataset=str(row["dataset"]),
+                    metric=metric,
+                    higher_is_better=bool(entry["higher_is_better"]),
+                    executed_alternative=str(entry["executed_alternative"]),
+                    correction=str(entry["correction"]),
+                    p_value=float(row["p_value"]),
+                    n_pairs=int(row["n_pairs"]),
+                    n_dropped_nan=int(row["n_dropped_nan"]),
+                    median_delta=float(row["median_delta"]),
+                    wins=int(row["wins"]),
+                    losses=int(row["losses"]),
+                    ties=int(row["ties"]),
+                    p_corrected=row.get("p_holm_across_datasets"),
+                    n_nonzero=row.get("n_nonzero"),
+                    ci_low=row.get("ci_low"),
+                    ci_high=row.get("ci_high"),
+                    contrast_label=label,
+                )
+            )
+    return rows
+
+
+def _figure_record(
+    path: Path, kind: str, metric: str, rows: Sequence[fp.ContrastStatRow]
+) -> dict[str, Any]:
+    """stats.json figure metadata: source + counted drops + consumed values.
+
+    ``consumed`` records exactly the statistics the renderer was fed (the
+    regression seam for the figures-agree-with-stats test); ``n_dropped_nan``
+    totals are the I11 counted disclosure.
+    """
+    return {
+        "file": path.name,
+        "kind": kind,
+        "metric": metric,
+        "source": "stats.json contrast per_dataset rows "
+        "(registered statistics — never recomputed, audit I1)",
+        "n_dropped_nan_total": int(sum(r.n_dropped_nan for r in rows)),
+        "consumed": [
+            {
+                "cell_row_key": r.cell_row_key,
+                "reference_row_key": r.reference_row_key,
+                "dataset": r.dataset,
+                "p_value": r.p_value,
+                "p_corrected": r.p_corrected,
+                "median_delta": r.median_delta,
+                "n_pairs": r.n_pairs,
+                "n_dropped_nan": r.n_dropped_nan,
+                "wins": r.wins,
+                "losses": r.losses,
+                "ties": r.ties,
+            }
+            for r in rows
+        ],
+    }
+
+
 def render_figures(
-    per_query: pd.DataFrame,
-    pairs: Sequence[ResolvedPair],
+    contrast_entries: Sequence[Mapping[str, Any]],
     metrics: Sequence[str],
+    per_query_columns: Sequence[str],
     out_dir: Path,
     stamp: str,
     index: pd.DataFrame,
-) -> list[str]:
-    """forest_<metric>.png (per reference) + wlt_<metric>.png, all stamped."""
-    figures: list[str] = []
-    for metric in metrics:
-        higher_is_better = _metric_direction(metric)
-        contrast_pairs = tuple(
-            dict.fromkeys((p.cell_row_key, p.reference_row_key) for p in pairs)
-        )
-        involved = sorted({k for pair in contrast_pairs for k in pair})
-        wlt_df = per_query[per_query["row_key"].isin(involved)][
-            ["row_key", "example_id", metric]
-        ]
-        wlt_path = out_dir / f"wlt_{metric}.png"
-        fp.plot_win_loss_tie(
-            wlt_df,
-            wlt_path,
-            config=fp.WinLossTieConfig(
-                contrasts=contrast_pairs,
-                metric=metric,
-                higher_is_better=higher_is_better,
-                title=f"[{stamp}] W/L/T per contrast — {metric} "
-                "(pooled across datasets; per-dataset triples in stats.json)",
-            ),
-        )
-        figures.append(wlt_path.name)
+) -> list[dict[str, Any]]:
+    """Publication figures FROM THE REGISTERED STATISTICS (audit I1/I2/I11).
 
-        by_reference: dict[str, list[ResolvedPair]] = {}
-        for pair in pairs:
-            by_reference.setdefault(pair.reference_row_key, []).append(pair)
+    Consumes the computed contrast entries (the dicts serialized into
+    stats.json) — never per-query data: wlt_<metric>.png renders the
+    per-dataset §8.13 triples as small multiples (the §9.1 co-primary view),
+    wlt_<metric>_pooled_supplementary.png is the disclosed pooled extra, and
+    forest_<metric>[__vs_<ref>].png renders one forest per reference. Metrics
+    with nothing renderable become COUNTED skip entries in the returned list
+    instead of silent omissions (audit I11). Every returned record embeds the
+    consumed statistics for the figures-agree-with-stats regression seam.
+    """
+    figures: list[dict[str, Any]] = []
+    for metric in metrics:
+        if metric not in per_query_columns:
+            figures.append(
+                {
+                    "skipped_metric": metric,
+                    "reason": "metric appears in no per-query artifact — no "
+                    "figure rendered (counted disclosure, audit I11; the "
+                    "registered-set consequences are in "
+                    "skipped.confirmatory_exclusions)",
+                }
+            )
+            continue
+        rows = _figure_rows_for_metric(contrast_entries, metric)
+        if not rows:
+            figures.append(
+                {
+                    "skipped_metric": metric,
+                    "reason": "no per-query contrast entry carries this "
+                    "metric (window-unit contrasts have no §8.13 W/L/T "
+                    "triple) — no figure rendered (counted disclosure, "
+                    "audit I11)",
+                }
+            )
+            continue
+
+        wlt_path = out_dir / f"wlt_{metric}.png"
+        fp.plot_win_loss_tie_registered(
+            rows,
+            wlt_path,
+            title=f"[{stamp}] W/L/T per contrast × dataset — {metric} "
+            "(registered per-dataset triples, stats.json)",
+        )
+        figures.append(_figure_record(wlt_path, "wlt_per_dataset", metric, rows))
+
+        pooled_path = out_dir / f"wlt_{metric}_pooled_supplementary.png"
+        fp.plot_win_loss_tie_registered(
+            rows,
+            pooled_path,
+            title=f"[{stamp}] W/L/T per contrast — {metric}",
+            pooled=True,
+        )
+        figures.append(
+            _figure_record(pooled_path, "wlt_pooled_supplementary", metric, rows)
+        )
+
+        by_reference: dict[str, list[fp.ContrastStatRow]] = {}
+        for row in rows:
+            by_reference.setdefault(row.reference_row_key, []).append(row)
         multi_reference = len(by_reference) > 1
-        for reference_key, group in by_reference.items():
-            cells = tuple(dict.fromkeys(p.cell_row_key for p in group))
-            common_datasets = set.intersection(*(set(p.datasets) for p in group))
-            if not common_datasets:
-                raise AnalysisError(
-                    f"forest vs {reference_key!r}: contrasted cells share no "
-                    "dataset — cannot render per-dataset panels"
-                )
-            forest_df = per_query[
-                per_query["row_key"].isin([*cells, reference_key])
-                & per_query["dataset"].isin(common_datasets)
-            ][["row_key", "example_id", "dataset", metric]]
+        for reference_key, ref_rows in by_reference.items():
+            ref_label = _baseline_of_key(index, reference_key)
             if multi_reference:
-                ref_label = _baseline_of_key(index, reference_key)
                 name = f"forest_{metric}__vs_{ref_label}.png"
             else:
                 name = f"forest_{metric}.png"
             forest_path = out_dir / name
-            fp.plot_forest(
-                forest_df,
+            fp.plot_forest_registered(
+                ref_rows,
                 forest_path,
-                config=fp.ForestConfig(
-                    reference=reference_key,
-                    metric=metric,
-                    higher_is_better=higher_is_better,
-                    cells=cells,
-                    title=f"[{stamp}] paired Δ{metric} vs "
-                    f"{_baseline_of_key(index, reference_key)}",
-                ),
+                title=f"[{stamp}] paired Δ{metric} vs {ref_label} "
+                "(registered statistics)",
             )
-            figures.append(forest_path.name)
+            figures.append(
+                _figure_record(forest_path, "forest", metric, ref_rows)
+            )
     return figures
 
 
@@ -3145,10 +3249,21 @@ def build_summary_md(stats: Mapping[str, Any]) -> str:
             )
         lines.append("")
     if stats["figures"]:
-        lines.append("## Figures")
+        lines.append("## Figures (registered statistics — stats.json rows)")
         lines.append("")
-        for name in stats["figures"]:
-            lines.append(f"- `{name}` (stamped {stamp} in-figure)")
+        for entry in stats["figures"]:
+            if "file" in entry:
+                lines.append(
+                    f"- `{entry['file']}` ({entry['kind']}; consumes the "
+                    "registered stats.json contrast rows; unpairable examples "
+                    f"dropped+counted: {entry['n_dropped_nan_total']}; "
+                    f"stamped {stamp} in-figure)"
+                )
+            else:
+                lines.append(
+                    f"- metric `{entry['skipped_metric']}` — NO FIGURE: "
+                    f"{entry['reason']}"
+                )
         lines.append("")
     lines.append("---")
     prov = stats.get("provenance", {})
@@ -3681,14 +3796,6 @@ def run_analysis(
         )
 
         analysis_dir = _make_analysis_dir(run_dir)
-        figure_metrics = [m for m in metrics if m in per_query.columns]
-        figures = (
-            render_figures(
-                per_query, pairs, figure_metrics, analysis_dir, stamp, index
-            )
-            if pairs and figure_metrics and not blinding_active
-            else []
-        )
 
         if blinding_active:
             assert blinding_state is not None
@@ -3758,7 +3865,7 @@ def run_analysis(
                 ],
                 "confirmatory_exclusions": confirmatory_exclusions,
             },
-            "figures": figures,
+            "figures": [],  # rendered below, AFTER the logged unblinding (I10)
         }
         if blinding_active:
             # G12: mask EVERY arm-revealing section, not just the entries.
@@ -3784,6 +3891,25 @@ def run_analysis(
                 "freeze (§9.8); outputs below carry REAL labels",
             }
 
+        # I10 (audit 2026-08-16): figures render ONLY AFTER the one-time
+        # unblinding above is logged — no real-labeled artifact may precede
+        # the recorded reveal. I1: they consume the registered contrast
+        # entries (the very dicts serialized into stats.json), never a
+        # per-query recompute; blinded design-input suppresses them entirely.
+        figures = (
+            render_figures(
+                contrast_stats,
+                metrics,
+                tuple(per_query.columns),
+                analysis_dir,
+                stamp,
+                index,
+            )
+            if contrast_stats and not blinding_active
+            else []
+        )
+        stats["figures"] = figures
+
         stats_path = analysis_dir / STATS_JSON_NAME
         _atomic_write_text(stats_path, json.dumps(stats, indent=2) + "\n")
         summary_path = analysis_dir / SUMMARY_MD_NAME
@@ -3804,7 +3930,9 @@ def run_analysis(
         analysis_dir=analysis_dir,
         stats_path=stats_path,
         summary_path=summary_path,
-        figures=tuple(figures),
+        figures=tuple(
+            str(entry["file"]) for entry in figures if "file" in entry
+        ),
     )
 
 

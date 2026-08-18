@@ -4,12 +4,29 @@ Smoke coverage: every figure renders to a PNG in a tmpdir from synthetic data �
 and, where the local pilot archive exists, from real pilot per-query rows re-keyed
 through ``from_legacy``. Failure cases assert the fail-loud contract (missing
 columns, unknown reference, malformed row keys, scale violations).
+
+2026-08-17 figure-integrity batch (#131, audit I1/I2/I3/I10/I11):
+
+- the from-stats publication path (``ContrastStatRow`` +
+  ``plot_forest_registered`` / ``plot_win_loss_tie_registered``): validation,
+  per-dataset panels, no invented CI, baked POOLED_DISCLOSURE;
+- the per-query recompute path is pilot-exploration-only and bakes
+  RECOMPUTED_STAMP into every figure;
+- ``paired_deltas`` counts its drops (I11);
+- ``plot_goodput_grid`` groups polylines by arm identity — the multi-arm
+  fixture FAILS on the pre-#131 budget-only grouping (I3) — and refuses
+  duplicate (arm, budget, rate) points and >8-arm categorical encodings;
+- ``plot_truth_tax`` maps through the colorblind categorical helpers (no
+  tab10, no silent truncation).
 """
 
 from __future__ import annotations
 
+import inspect
+import math
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -21,6 +38,7 @@ for _p in (str(_SCRIPTS_DIR), str(REPO_ROOT)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import _plot_style as ps  # noqa: E402
 import figure_pipeline as fp  # noqa: E402
 from src.analysis.cellspec import CellSpec, from_legacy  # noqa: E402
 from src.analysis.goodput import (  # noqa: E402
@@ -177,9 +195,25 @@ def test_paired_deltas_averages_trials_and_pairs() -> None:
             "m": [10.0, 20.0, 6.0, 8.0, 15.0],
         }
     )
-    deltas = fp.paired_deltas(df, cell=K_B2, reference=K_B1, metric="m")
+    paired = fp.paired_deltas(df, cell=K_B2, reference=K_B1, metric="m")
     # e0: mean(6,8) - 10 = -3; e1: 15 - 20 = -5.
-    assert sorted(deltas.tolist()) == [-5.0, -3.0]
+    assert sorted(paired.deltas.tolist()) == [-5.0, -3.0]
+    assert paired.n_dropped == 0
+
+
+def test_paired_deltas_counts_unpairable_examples() -> None:
+    # I11: dropna is a COUNTED disclosure — e2 exists only on the cell side,
+    # e3 carries a NaN metric on the reference side; both are dropped+counted.
+    df = pd.DataFrame(
+        {
+            "row_key": [K_B1, K_B1, K_B1, K_B2, K_B2, K_B2],
+            "example_id": ["e0", "e1", "e3", "e0", "e1", "e2"],
+            "m": [10.0, 20.0, np.nan, 6.0, 15.0, 9.0],
+        }
+    )
+    paired = fp.paired_deltas(df, cell=K_B2, reference=K_B1, metric="m")
+    assert paired.deltas.shape[0] == 2
+    assert paired.n_dropped == 2
 
 
 def test_paired_deltas_missing_cell_raises(per_query_df: pd.DataFrame) -> None:
@@ -197,10 +231,12 @@ def test_forest_summary_reference_is_configurable(per_query_df: pd.DataFrame) ->
     assert K_B1 in set(summary["row_key"])  # the old hardcoded reference is now a row
     assert set(summary["dataset"]) == {"squad_v2", "musique"}
     assert {"median_delta", "ci_low", "ci_high", "p_holm", "wins", "losses",
-            "ties"} <= set(summary.columns)
+            "ties", "n_dropped"} <= set(summary.columns)
     # W/L/T totals must equal the paired n per row (§8.13: no silent drops).
     wlt = summary[["wins", "losses", "ties"]].sum(axis=1)
     assert (wlt == summary["n_pairs"]).all()
+    # I11: the drop column is a counted disclosure (fully-paired fixture: 0).
+    assert (summary["n_dropped"] == 0).all()
 
 
 def test_forest_summary_all_tie_pair_gets_nan_p() -> None:
@@ -454,6 +490,317 @@ def test_plot_goodput_grid_accepts_label_regime_output(
     _assert_rendered(
         fp.plot_goodput_grid(df, out, config=fp.GoodputGridConfig()), out
     )
+
+
+# ---------------------------------------------------------------------------
+# From-stats publication path (audit I1/I2): ContrastStatRow + renderers
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def captured_fig(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Spy on ``ps.save_fig`` to inspect the figure BEFORE it is closed."""
+    box: dict[str, Any] = {}
+    real_save = fp.ps.save_fig
+
+    def spy(fig, path):  # noqa: ANN001 — matplotlib figure duck-typing
+        box["texts"] = [t.get_text() for t in fig.texts]
+        box["suptitle"] = fig.get_suptitle()
+        box["axes_titles"] = [ax.get_title() for ax in fig.axes]
+        box["n_lines_per_axes"] = [len(ax.get_lines()) for ax in fig.axes]
+        real_save(fig, path)
+
+    monkeypatch.setattr(fp.ps, "save_fig", spy)
+    return box
+
+
+def _stat_row(**overrides: Any) -> fp.ContrastStatRow:
+    base: dict[str, Any] = dict(
+        cell_row_key=K_B6,
+        reference_row_key=K_B3,
+        dataset="squad_v2",
+        metric="ttft_ms",
+        higher_is_better=False,
+        executed_alternative="greater",
+        correction="none (primary tier, full alpha per dataset)",
+        p_value=0.01,
+        n_pairs=10,
+        n_dropped_nan=0,
+        median_delta=-5.0,
+        wins=7,
+        losses=2,
+        ties=1,
+    )
+    base.update(overrides)
+    return fp.ContrastStatRow(**base)
+
+
+class TestContrastStatRow:
+    def test_valid_row_and_p_display_fallback(self) -> None:
+        row = _stat_row()
+        assert row.p_display == 0.01  # no correction -> registered p (§9.1)
+        assert _stat_row(p_corrected=0.04).p_display == 0.04
+        assert _stat_row(p_corrected=math.nan).p_display == 0.01
+        assert not row.has_ci
+
+    def test_nan_p_is_the_all_tie_semantics(self) -> None:
+        row = _stat_row(p_value=math.nan, wins=0, losses=0, ties=10)
+        assert math.isnan(row.p_display)
+
+    def test_totals_must_close(self) -> None:
+        with pytest.raises(fp.FigureDataError, match="totals must close"):
+            _stat_row(wins=8)  # 8+2+1 != 10
+
+    def test_negative_count_rejected(self) -> None:
+        with pytest.raises(fp.FigureDataError, match="negative"):
+            _stat_row(wins=8, losses=2, ties=-1, n_pairs=9)
+
+    def test_half_ci_rejected(self) -> None:
+        with pytest.raises(fp.FigureDataError, match="both present or both"):
+            _stat_row(ci_low=-6.0)
+
+    def test_p_out_of_range_rejected(self) -> None:
+        with pytest.raises(fp.FigureDataError, match="not a probability"):
+            _stat_row(p_value=1.5)
+
+    def test_cell_equals_reference_rejected(self) -> None:
+        with pytest.raises(fp.FigureDataError, match="must differ"):
+            _stat_row(reference_row_key=K_B6)
+
+
+def _registered_rows() -> list[fp.ContrastStatRow]:
+    rows = []
+    for ds, (p6, p2) in (("squad_v2", (0.01, 0.20)), ("musique", (0.03, 0.80))):
+        rows.append(
+            _stat_row(dataset=ds, p_value=p6, contrast_label="B6 vs B3")
+        )
+        rows.append(
+            _stat_row(
+                cell_row_key=K_B2,
+                dataset=ds,
+                p_value=p2,
+                median_delta=-2.0,
+                wins=4,
+                losses=4,
+                ties=2,
+                n_dropped_nan=1,
+                contrast_label="B2 vs B3",
+            )
+        )
+    return rows
+
+
+def test_plot_forest_registered_renders_per_dataset_panels(
+    tmp_path: Path, captured_fig: dict[str, Any]
+) -> None:
+    out = tmp_path / "forest_reg.png"
+    _assert_rendered(
+        fp.plot_forest_registered(
+            _registered_rows(), out, title="registered forest"
+        ),
+        out,
+    )
+    # One panel per dataset (§9.1: pooling prohibited).
+    assert captured_fig["axes_titles"] == ["squad_v2", "musique"]
+    texts = " ".join(captured_fig["texts"])
+    assert fp.REGISTERED_SOURCE_NOTE in texts
+    # No registered CI in the rows -> the medians-only disclosure, and never
+    # an invented whisker (audit I1).
+    assert "no registered CI — medians only" in texts
+    assert "dropped+counted: 2" in texts  # 2 rows × n_dropped_nan=1
+
+
+def test_plot_forest_registered_with_registered_ci_renders(
+    tmp_path: Path,
+) -> None:
+    rows = [
+        _stat_row(ci_low=-8.0, ci_high=-2.0),
+        _stat_row(dataset="musique", ci_low=-7.0, ci_high=-1.0),
+    ]
+    out = tmp_path / "forest_reg_ci.png"
+    _assert_rendered(fp.plot_forest_registered(rows, out), out)
+
+
+def test_plot_forest_registered_refuses_mixed_references(tmp_path: Path) -> None:
+    rows = [_stat_row(), _stat_row(cell_row_key=K_B2, reference_row_key=K_B1)]
+    with pytest.raises(fp.FigureDataError, match="mix references"):
+        fp.plot_forest_registered(rows, tmp_path / "x.png")
+
+
+def test_plot_forest_registered_refuses_mixed_metrics(tmp_path: Path) -> None:
+    rows = [_stat_row(), _stat_row(dataset="musique", metric="f1_score",
+                                   higher_is_better=True)]
+    with pytest.raises(fp.FigureDataError, match="mix metrics"):
+        fp.plot_forest_registered(rows, tmp_path / "x.png")
+
+
+def test_plot_forest_registered_refuses_duplicate_rows(tmp_path: Path) -> None:
+    with pytest.raises(fp.FigureDataError, match="duplicate row"):
+        fp.plot_forest_registered(
+            [_stat_row(), _stat_row()], tmp_path / "x.png"
+        )
+
+
+def test_plot_forest_registered_empty_rows_raise(tmp_path: Path) -> None:
+    with pytest.raises(fp.FigureDataError, match="no ContrastStatRow"):
+        fp.plot_forest_registered([], tmp_path / "x.png")
+
+
+def test_plot_wlt_registered_default_is_per_dataset_panels(
+    tmp_path: Path, captured_fig: dict[str, Any]
+) -> None:
+    out = tmp_path / "wlt_reg.png"
+    _assert_rendered(
+        fp.plot_win_loss_tie_registered(
+            _registered_rows(), out, title="registered wlt"
+        ),
+        out,
+    )
+    # I2: the DEFAULT view is per-dataset small multiples.
+    assert captured_fig["axes_titles"] == ["squad_v2", "musique"]
+    assert fp.REGISTERED_SOURCE_NOTE in " ".join(captured_fig["texts"])
+
+
+def test_plot_wlt_registered_pooled_bakes_disclosure(
+    tmp_path: Path, captured_fig: dict[str, Any]
+) -> None:
+    out = tmp_path / "wlt_reg_pooled.png"
+    _assert_rendered(
+        fp.plot_win_loss_tie_registered(
+            _registered_rows(), out, title="a custom title", pooled=True
+        ),
+        out,
+    )
+    # I2: the pooled view discloses itself in its OWN title, unconditionally.
+    assert any(
+        fp.POOLED_DISCLOSURE in t for t in captured_fig["axes_titles"]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Recompute path = pilot exploration only (audit I1 option b): baked stamp
+# ---------------------------------------------------------------------------
+
+
+def test_plot_forest_bakes_recomputed_stamp(
+    per_query_df: pd.DataFrame, tmp_path: Path, captured_fig: dict[str, Any]
+) -> None:
+    cfg = fp.ForestConfig(reference=K_B1, metric="ttft_ms",
+                          higher_is_better=False, n_boot=100)
+    fp.plot_forest(per_query_df, tmp_path / "forest.png", config=cfg)
+    assert any(fp.RECOMPUTED_STAMP in t for t in captured_fig["texts"])
+
+
+def test_plot_win_loss_tie_bakes_recomputed_stamp(
+    per_query_df: pd.DataFrame, tmp_path: Path, captured_fig: dict[str, Any]
+) -> None:
+    cfg = fp.WinLossTieConfig(contrasts=((K_B2, K_B1),), metric="ttft_ms",
+                              higher_is_better=False)
+    fp.plot_win_loss_tie(per_query_df, tmp_path / "wlt.png", config=cfg)
+    texts = " ".join(captured_fig["texts"])
+    assert fp.RECOMPUTED_STAMP in texts
+    assert "dropped+counted: 0" in texts  # I11: the drop count is rendered
+
+
+# ---------------------------------------------------------------------------
+# Goodput grid arm-identity grouping (audit I3)
+# ---------------------------------------------------------------------------
+
+
+def _f2_grid_row(spec: CellSpec, lam: float, g: float) -> dict[str, Any]:
+    return {
+        "row_key": spec.to_row_key(),
+        "goodput_frac": g,
+        "yield_frac": g * 0.85,
+        "regime": IN_REGIME,
+        "knee": False,
+        "cliff": False,
+    }
+
+
+def _f2_arm(arm: str, retriever: str, *, lam: float, r: float = 0.5) -> CellSpec:
+    return CellSpec(
+        arm=arm, retriever=retriever, policy="none", topology="single",
+        engine="vllm", model="qwen3-14b", family="F2",
+        budget_r=r, rate_frac=lam,
+    )
+
+
+def test_plot_goodput_grid_multi_arm_renders_one_polyline_per_arm(
+    tmp_path: Path, captured_fig: dict[str, Any]
+) -> None:
+    # I3 regression: TWO arms share (engine, model, budget_r). The pre-#131
+    # code selected curves by budget_r alone, silently concatenating both
+    # arms into ONE sawtooth polyline pair (2 lines); grouped by arm identity
+    # the facet must carry 2 arms × (G + Y) = 4 polylines — this assertion
+    # FAILS on the old code.
+    rows = []
+    for lam in (0.5, 0.7, 0.9):
+        rows.append(_f2_grid_row(_f2_arm("gold-fresh", "none", lam=lam),
+                                 lam, 0.9 - 0.2 * lam))
+        rows.append(_f2_grid_row(_f2_arm("retr-fresh", "dense", lam=lam),
+                                 lam, 0.8 - 0.2 * lam))
+    out = tmp_path / "goodput_multi_arm.png"
+    _assert_rendered(
+        fp.plot_goodput_grid(pd.DataFrame(rows), out,
+                             config=fp.GoodputGridConfig()),
+        out,
+    )
+    assert captured_fig["n_lines_per_axes"][0] == 4
+
+
+def test_plot_goodput_grid_refuses_duplicate_arm_budget_rate_points(
+    tmp_path: Path,
+) -> None:
+    # The same arm twice at one (budget, rate) grid point: replicated rows
+    # must fail loud (with the count), never concatenate into a sawtooth.
+    spec = _f2_arm("gold-fresh", "none", lam=0.5)
+    rows = [_f2_grid_row(spec, 0.5, 0.8), _f2_grid_row(spec, 0.5, 0.7)]
+    with pytest.raises(fp.FigureDataError, match="1 duplicate rate_frac"):
+        fp.plot_goodput_grid(pd.DataFrame(rows), tmp_path / "x.png",
+                             config=fp.GoodputGridConfig())
+
+
+def test_plot_goodput_grid_more_than_eight_arms_fails_loud(
+    tmp_path: Path,
+) -> None:
+    # 9 arm identities exceed the colorblind categorical budget: fail loud
+    # with the count instead of truncating the encoding (I3/I11).
+    specs = [_f2_arm("gold-fresh", "none", lam=0.5)]
+    for arm in ("retr-fresh", "retr-comp"):
+        for retriever in ("dense", "rerank", "bm25", "rrf"):
+            specs.append(_f2_arm(arm, retriever, lam=0.5))
+    rows = [_f2_grid_row(s, 0.5, 0.8) for s in specs]
+    with pytest.raises(fp.FigureDataError, match="9 categorical levels"):
+        fp.plot_goodput_grid(pd.DataFrame(rows), tmp_path / "x.png",
+                             config=fp.GoodputGridConfig())
+
+
+# ---------------------------------------------------------------------------
+# Categorical encoding helpers (audit I11: no tab10, no silent truncation)
+# ---------------------------------------------------------------------------
+
+
+def test_categorical_colors_deterministic_and_colorblind() -> None:
+    mapping = ps.categorical_colors(["b", "a", "b"], "test")
+    assert list(mapping) == ["b", "a"]  # first-appearance order, deduped
+    assert set(mapping.values()) <= set(ps.CATEGORICAL_PALETTE)
+
+
+def test_categorical_colors_fail_loud_past_palette() -> None:
+    with pytest.raises(ValueError, match="9 categorical levels"):
+        ps.categorical_colors([f"lv{i}" for i in range(9)], "test")
+
+
+def test_categorical_markers_fail_loud_past_cycle() -> None:
+    with pytest.raises(ValueError, match="exceed"):
+        ps.categorical_markers([f"lv{i}" for i in range(9)], "test")
+
+
+def test_truth_tax_no_longer_uses_tab10() -> None:
+    # I11 regression pin: the truth-tax encoding maps through the style
+    # layer's colorblind helpers, never matplotlib's tab10.
+    assert "tab10" not in inspect.getsource(fp.plot_truth_tax)
 
 
 # ---------------------------------------------------------------------------

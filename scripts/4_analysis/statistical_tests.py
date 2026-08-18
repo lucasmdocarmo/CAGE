@@ -3,11 +3,20 @@
 Statistical significance testing for CAGE experiments.
 
 .. deprecated:: 2026-08-02
-    LEGACY — superseded by ``src/analysis/stats/`` (the D9 engine: registered
+    PILOT-ERA — superseded by ``src/analysis/stats/`` (the D9 engine: registered
     family map, gatekeeping, conditional TOST, McNemar, batch-means, and a
     CORRECTLY PAIRED Cliff's delta — this script's delta is computed unpaired
     on paired data and MUST NOT be cited). Kept runnable only so pre-charter
-    pilot reports can be regenerated. New analyses import ``src.analysis.stats``.
+    pilot reports can be regenerated. New analyses import ``src.analysis.stats``;
+    campaign trees are analyzed by ``run_campaign_analysis.py``.
+
+    Task #135 fences (findings I9/I11): every invocation prints a deprecation
+    banner to stderr; the JSON summary is stamped ``{"engine": "pilot-era
+    statistical_tests.py — NOT the registered D9 artifact"}``; the output
+    artifact is named ``pilot_stats.json`` (an ``--output`` basename of
+    ``stats.json`` — the registered D9 namesake — is REFUSED); and a
+    RESULTS_LAYOUT-v2 campaign tree (``manifest.json``/``cells/``) as
+    ``--results-dir`` is REFUSED with a pointer to the campaign pipeline.
 
 WHY THIS EXISTS
 ---------------
@@ -43,7 +52,8 @@ USAGE
   python3 scripts/4_analysis/statistical_tests.py --results-dir results/<phase>/<run-id>/stats/all_results \
       --reference no_cache \
       --metrics ttft_ms latency_ms faithfulness grounding_score f1_score \
-      --output results/<phase>/<run-id>/stats/stats.json --latex-out results/<phase>/<run-id>/stats/stats.tex
+      --output results/<phase>/<run-id>/stats/pilot_stats.json \
+      --latex-out results/<phase>/<run-id>/stats/pilot_stats.tex
 """
 
 from __future__ import annotations
@@ -65,6 +75,39 @@ try:  # optional, preferred
 except Exception:  # pragma: no cover - cluster without scipy
     _scipy_stats = None
     _HAVE_SCIPY = False
+
+
+# --------------------------------------------------------------------------- #
+# Pilot-era fences (task #135, findings I9/I11)
+# --------------------------------------------------------------------------- #
+
+#: Stamped verbatim into every JSON summary this script writes, so a pilot
+#: artifact can never masquerade as the registered D9 stats.json.
+PILOT_ENGINE_STAMP = (
+    "pilot-era statistical_tests.py — NOT the registered D9 artifact"
+)
+
+#: The registered D9 artifact name this script must never mint (I9: the
+#: deprecated engine used to write an unstamped stats.json NAMESAKE).
+REGISTERED_ARTIFACT_NAME = "stats.json"
+
+DEPRECATION_BANNER = (
+    "DEPRECATED: scripts/4_analysis/statistical_tests.py is the PILOT-ERA "
+    "engine (unpaired Cliff's delta, two-sided Wilcoxon, per-metric Holm) — "
+    "NOT the registered D9 engine. Its output is pilot_stats.json, design "
+    "input only; do not cite as campaign results. Campaign trees: "
+    "organize_results.py -> run_campaign_analysis.py (src.analysis.stats)."
+)
+
+
+def _print_deprecation_banner() -> None:
+    print(f"[statistical_tests] {DEPRECATION_BANNER}", file=sys.stderr)
+
+
+def is_campaign_tree(root: Path) -> bool:
+    """RESULTS_LAYOUT v2 heuristic: a campaign run root carries manifest.json
+    and/or cells/; pilot (Phase-2) trees carry neither."""
+    return (root / "manifest.json").is_file() or (root / "cells").is_dir()
 
 
 # Metric direction: True => higher is better, False => lower is better.
@@ -369,9 +412,28 @@ def compare_pair(
 
 
 def run(args: argparse.Namespace) -> int:
+    _print_deprecation_banner()
+
     results_dir = Path(args.results_dir)
     if not results_dir.exists():
         print(f"ERROR: results dir not found: {results_dir}")
+        return 2
+    if is_campaign_tree(results_dir):
+        print(
+            f"ERROR: {results_dir} is a CAMPAIGN run root (RESULTS_LAYOUT v2: "
+            "manifest.json/cells/ present). This pilot-era script must not "
+            "analyze campaign trees — use scripts/4_analysis/organize_results.py "
+            "-> run_campaign_analysis.py instead.",
+            file=sys.stderr,
+        )
+        return 2
+    if args.output and Path(args.output).name == REGISTERED_ARTIFACT_NAME:
+        print(
+            "ERROR: refusing to write the registered D9 artifact name "
+            f"'{REGISTERED_ARTIFACT_NAME}' from the pilot-era engine (finding I9). "
+            "Name the output pilot_stats.json.",
+            file=sys.stderr,
+        )
         return 2
 
     baselines = discover_baselines(results_dir)
@@ -427,6 +489,9 @@ def run(args: argparse.Namespace) -> int:
     _print_table(results, metrics)
 
     summary = {
+        # Task #135 (finding I9): stamp FIRST, so no consumer can mistake this
+        # pilot artifact for the registered D9 stats.json.
+        "engine": PILOT_ENGINE_STAMP,
         "results_dir": str(results_dir),
         "reference": reference,
         "alpha": args.alpha,
@@ -473,6 +538,8 @@ def _to_latex(results: List[ComparisonResult], reference: str,
               label: str = "tab:significance") -> str:
     lines = [
         "% Auto-generated by scripts/4_analysis/statistical_tests.py",
+        "% PILOT DATA -- design input only, do not cite as campaign results "
+        "(pilot-era engine, NOT the registered D9 artifact; task #135).",
         "\\begin{table}[t]",
         "\\centering",
         # BOTH caption lines must be f-strings: a plain-string continuation leaves "}}" as

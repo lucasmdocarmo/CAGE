@@ -29,6 +29,32 @@ fi
 if [ -z "$RUN_ROOT" ] || [ ! -d "$RUN_ROOT" ]; then
   die "no run root to aggregate. Set CAGE_RUN_ID/CAGE_RUN_ROOT (same as the sweep), or pass it explicitly: bash scripts/4_analysis/run_phase2_stats.sh results/<phase>/<run-id>"
 fi
+
+# --- PILOT-TREE GUARD (task #135, findings I9/I11) ---------------------------
+# This script MUTATES $RUN_ROOT/stats (rm -rf + mkdir + symlinks) and only
+# understands the PILOT (Phase-2) layout. Validate the layout BEFORE any
+# mutation. Heuristic (RESULTS_LAYOUT v2): a campaign run root carries
+# manifest.json and/or cells/ — a pilot root carries neither, and holds at
+# least one of the pilot arm trees instead.
+if [ -f "$RUN_ROOT/manifest.json" ] || [ -d "$RUN_ROOT/cells" ]; then
+  die "refusing CAMPAIGN run root '$RUN_ROOT' (RESULTS_LAYOUT v2: manifest.json/cells/ present). This pilot-era aggregator must never touch a campaign tree -- use scripts/4_analysis/organize_results.py -> run_campaign_analysis.py."
+fi
+_pilot_tree_found=0
+for _t in baselines compression speculative envelope kv_store; do
+  [ -d "$RUN_ROOT/$_t" ] && { _pilot_tree_found=1; break; }
+done
+if [ "$_pilot_tree_found" != "1" ]; then
+  die "'$RUN_ROOT' does not look like a pilot run root (none of baselines/ compression/ speculative/ envelope/ kv_store/ exist) -- refusing to mutate it."
+fi
+warn "PILOT-ERA aggregation: output is pilot_stats.json (design input only; NOT the registered D9 stats.json). Campaign runs: organize_results.py -> run_campaign_analysis.py."
+# Test seam (tests/test_pilot_fences.py): validate the guard, then stop before
+# any mutation or GCS log-guard side effect.
+if [ "${CAGE_PILOT_GUARD_ONLY:-0}" = "1" ]; then
+  log "pilot-tree guard PASSED for $RUN_ROOT (guard-only mode; no mutation)"
+  exit 0
+fi
+# ---------------------------------------------------------------------------
+
 export CAGE_SYNC_DIR="${CAGE_SYNC_DIR:-${RUN_ROOT#"$PROJECT_DIR/"}}"
 # Continuous log+results mirror to GCS + full collect on exit (no built-in sync loop).
 source scripts/lib/_log_guard.sh
@@ -86,7 +112,7 @@ if [ ! -d "$ALL_Q/no_cache" ]; then
 fi
 python3 scripts/4_analysis/statistical_tests.py --results-dir "$ALL_Q" --reference no_cache \
     --metrics $METRICS \
-    --output "$ALL_Q/phase2_stats.json" --latex-out "$ALL_Q/phase2_stats.tex" 2>&1 | tail -50 \
+    --output "$ALL_Q/pilot_stats.json" --latex-out "$ALL_Q/pilot_stats.tex" 2>&1 | tail -50 \
     || echo "STATS_FAILED (qwen)"
 
 # --- cag_true paired mechanism pass (audit fix M4): on vs off, the run's cleanest pair,
@@ -108,7 +134,7 @@ fi
 if [ -d "$ALL_M/no_cache_mimo7b" ]; then
   python3 scripts/4_analysis/statistical_tests.py --results-dir "$ALL_M" --reference no_cache_mimo7b \
       --metrics $METRICS --latex-label tab:significance-mimo \
-      --output "$ALL_M/phase2_stats.json" --latex-out "$ALL_M/phase2_stats.tex" 2>&1 | tail -50 \
+      --output "$ALL_M/pilot_stats.json" --latex-out "$ALL_M/pilot_stats.tex" 2>&1 | tail -50 \
       || echo "STATS_FAILED (mimo)"
 elif [ -n "$(ls -A "$ALL_M" 2>/dev/null)" ]; then
   echo "[stats] MiMo arms present but no no_cache_mimo7b reference (MiMo was speculative-only)."
@@ -207,7 +233,7 @@ fi
 
 # Regenerate the run's figures from the SAME canonical loader/estimand as the stats
 # (pooled per-example medians + trial-level throughput), so plots and tables cannot
-# disagree in sign. Also renders delta_vs_no_cache_forest.png from phase2_stats.json.
+# disagree in sign. Also renders the forest figures from pilot_stats.json.
 python3 scripts/4_analysis/generate_plots.py --results-dir "$RUN_ROOT" --plots-dir "$RUN_ROOT/plots" || echo "PLOTS_FAILED"
 
 bash scripts/5_observability/sync_results_to_gcs.sh "$CAGE_SYNC_DIR" || true

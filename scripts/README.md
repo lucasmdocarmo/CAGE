@@ -8,7 +8,9 @@ scripts/
   1_setup/          provision the box + pull data      setup_gpu_cloud.sh  download_datasets.py
   2_serving/        start / manage vLLM                manage_vllm_server.sh  manage_vllm_cluster.py  deploy_cluster.sh
   3_run/            run the experiments                cloud_run.sh  run_baselines.sh  run_compression.sh  run_experiment.py
-  4_analysis/       stats + plots + verify             run_phase2_stats.sh  statistical_tests.py  token_divergence.py  generate_plots.py  verify_results.py
+  4_analysis/       verify + index + stats             verify_results.py  organize_results.py  run_campaign_analysis.py
+                    (campaign, D9)                     run_calibration.py  run_power_sim.py  score_instrument_b.py  rescore_quality.py
+                    (pilot archive, 2026-07)           run_phase2_stats.sh  statistical_tests.py  token_divergence.py  generate_plots.py
   5_observability/  live monitor + durable GCS mirror  observe_run.py  watch_run.sh  sync_results_to_gcs.sh  log_sync_daemon.sh  collect_logs.sh  gcp_shutdown_hook.sh  run_status_logger.sh
   6_teardown/       sentinel-verified $0 teardown       teardown_vm.sh
   checks/           gates & tests (run as needed)      preflight_check.sh  check_fp8_prefix_cache.sh  smoke_staleness.sh  run_tests.sh  simulate_network.sh
@@ -20,31 +22,54 @@ The numbered folders are the **happy-path order**; `checks/` and `5_observabilit
 *alongside* the numbered stages (a gate before, a monitor during), not at a fixed position —
 which is why they aren't numbered. `lib/` is sourced, never executed directly.
 
-## Live path (phase2, single-node GPU)
+## Live analysis path (campaign, RESULTS_LAYOUT v2)
+
+Campaign runs land as `results/<campaign>/<session>/<run_id>/` trees carrying `manifest.json`,
+`cells/<row_key>/window_<dataset>-<k>/`, and the §5 sha256 ledger (`cloud/RESULTS_LAYOUT.md` is
+the layout authority). After the fail-closed pull (`pull_run.sh`), the analysis chain is:
 
 ```
-# 1. provision (once per VM)
-bash scripts/1_setup/setup_gpu_cloud.sh
-# (checks/preflight_check.sh gates before you spend the sweep)
+# 1. gate the pulled tree (schema, reconciliation, dup detection, ledger + EXTRA sweep;
+#    report written OUTSIDE the tree; exit 0 only on PASS)
+python3 scripts/4_analysis/verify_results.py results/<campaign>/<session>/<run_id>
 
-# 2-3. run — cloud_run.sh mints the run-id, starts vLLM, runs the core suite, auto-plots
-nohup bash scripts/3_run/cloud_run.sh Qwen/Qwen3-8B 500 3 > run.log 2>&1 &
-bash scripts/3_run/run_compression.sh        Qwen/Qwen3-8B        # 2x2, shares the run-id
-# (speculative 2x2 RETIRED per charter §7.5 -> scripts/deprecated/)
+# 2. validate the layout + parse every cell -> index/cells_index.csv + coverage report
+python3 scripts/4_analysis/organize_results.py results/<campaign>/<session>/<run_id>
 
-# 4. aggregate + stats (reads the shared run root)
-bash scripts/4_analysis/run_phase2_stats.sh
-
-# 6. teardown to $0
-bash scripts/6_teardown/teardown_vm.sh <instance> <zone>
+# 3. the D9 stats engine (src.analysis.stats) over the index — design-input by default;
+#    the ONE confirmatory look needs the §9.11 flags + the frozen registration SHA
+python3 scripts/4_analysis/run_campaign_analysis.py results/<campaign>/<session>/<run_id>
 ```
 
-**All run outputs go to `results/<phase>/<run-id>/`** (`run-id = <YYYY-MM-DD_HHMM>_<model-slug>_<Q>x<T>`),
-minted once by `cloud_run.sh` and exported as `CAGE_RUN_ROOT` / `CAGE_RUN_ID` / `CAGE_PHASE`. Every
-tree (core / compression / speculative), the stats, the plots, and observability nest under that one
-root, so runs never mix and the GCS bucket mirrors it verbatim. To keep the three run trees in ONE
-root, export `CAGE_RUN_ID` once and reuse it across the invocations (or let `run_phase2_stats.sh`
-default to the newest run under `results/<phase>/`). Never write to the legacy `analysis/`.
+`run_campaign_analysis.py` writes the registered `stats.json` (per-dataset contrast rows,
+gatekeeping, equivalence, exploratory BH-FDR) and, with `figure_pipeline.py`, the campaign
+figures. No pilot-era tool below may touch these trees — each one refuses a root that carries
+`manifest.json`/`cells/`.
+
+## Pilot archive (2026-07) tools — design input only
+
+These aggregate the retired PILOT (Phase-2) layout (`results/<phase>/<run-id>/{baselines,
+compression,speculative,envelope,kv_store}/<cell>/trial_*/results.csv`). They are kept runnable
+so the 2026-07 pilot reports can be regenerated, and for nothing else: their numbers are design
+input, never citable as campaign results (charter: pilots inform design only). Their stats
+artifact is `pilot_stats.json`, stamped `"engine": "pilot-era statistical_tests.py — NOT the
+registered D9 artifact"` — the registered `stats.json` name is refused.
+
+```
+# aggregate a pilot run root + per-query Wilcoxon/Holm stats + figures
+bash scripts/4_analysis/run_phase2_stats.sh results/<phase>/<run-id>
+# pieces it drives (all pilot-layout-bound, all deprecation-bannered):
+#   statistical_tests.py   pilot Wilcoxon engine  -> pilot_stats.json / pilot_stats.tex
+#   token_divergence.py    §8.9 T=0 divergence over the pilot layout
+#   generate_plots.py      pilot figure/table set (via _results_loader/_pub_tables)
+# pilot-mode verification: verify_results.py --pilot --results-dir <dir>
+```
+
+The historical pilot run flow (provision → `cloud_run.sh` → `run_compression.sh` →
+`run_phase2_stats.sh` → `teardown_vm.sh`) is retired with the pilot era; see git history for
+the full recipe. Pilot outputs live under `results/<phase>/<run-id>/` (`run-id =
+<YYYY-MM-DD_HHMM>_<model-slug>_<Q>x<T>`), minted by `cloud_run.sh` and exported as
+`CAGE_RUN_ROOT` / `CAGE_RUN_ID` / `CAGE_PHASE`. Never write to the legacy `analysis/`.
 
 Env knobs: `PHASE` (default `phase2`), `CAGE_RUN_ID` (override the auto run-id), `CAGE_AUTO_PLOTS=0`
 (skip end-of-run plotting), `ENABLE_DISTRIBUTED=1` (opt into the local 3-replica arm), `VLLM_TELEMETRY=0`.

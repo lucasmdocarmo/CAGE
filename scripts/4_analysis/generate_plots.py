@@ -14,7 +14,7 @@ Generate the run's publication figure set from the canonical results loader.
 - No figure is wider than ~7.2 in at 300 dpi (ABNT text block); anything with all
   ~20 baselines uses horizontal bars or forest panels.
 - The single overloaded forest + speedup chart is replaced by two forest figures
-  (serving vs quality deltas) rendered straight from phase2_stats.json.
+  (serving vs quality deltas) rendered straight from pilot_stats.json.
 - Grounding is saturated at the median (1.0), so grounding is always plotted as a
   MEAN with a bootstrap CI, never as a bar of medians.
 - NLI faithfulness is invalid for the cells in NLI_INVALID_CELLS (premise exceeds
@@ -39,7 +39,8 @@ replaced; the Pareto figures drop the numbered key for family color+marker
 encoding with selective direct labels; a tri-lemma set (serving x quality x
 KV-memory) is added as the centerpiece. MEMORY is a per-query KV context
 footprint PROXY: resident = median prompt tokens, marginal = median new KV
-tokens materialized per query (prompt - cached, missing cached = 0); a swept
+tokens materialized per query (prompt - cached; rows missing cached-token
+telemetry are dropped and counted, never zero-filled); a swept
 memory-pressure axis is future work.
 
 2026-07-16 review passes: the tri-lemma set was simplified twice on reviewer
@@ -157,13 +158,38 @@ DELETED_FIGURES = (
     "trilemma_parallel.png",       # too complex -> trilemma_column_line
 )
 
-CAVEAT_LINE = (
-    "All per-query aggregates are pooled per-example statistics (same per-example "
-    "estimand as the Wilcoxon tables); medians for serving metrics, means with "
-    "bootstrap CIs for saturating quality metrics; throughput is trial-level. "
-    "N = 300 valid paired queries per cell (3 trials x 100 questions, repeat-0 "
-    "rows; every example_id is a distinct per-example unit)."
-)
+# Task #135 (finding I11): the caption N is DERIVED from the loaded data — the
+# old hardcoded pilot constants ("N = 300", "3 trials x 100 questions") rendered
+# stale captions on any other run shape.
+def run_shape(long_df: pd.DataFrame) -> dict[str, str]:
+    """Run-shape strings derived from the loaded rows (valid, rep-0).
+
+    Keys: 'rows' (valid measurements per cell), 'trials', 'questions'
+    (distinct example_ids per cell). Cells that differ render as 'lo-hi'.
+    """
+    v = headline_rows(long_df)
+
+    def _rng(series: pd.Series) -> str:
+        lo, hi = int(series.min()), int(series.max())
+        return str(hi) if lo == hi else f"{lo}-{hi}"
+
+    per_cell = v.groupby("cell")
+    return {
+        "rows": _rng(per_cell.size()),
+        "trials": _rng(per_cell["trial"].nunique()),
+        "questions": _rng(per_cell["example_id"].nunique()),
+    }
+
+
+def caveat_line(shape: dict[str, str]) -> str:
+    return (
+        "All per-query aggregates are pooled per-example statistics (same per-example "
+        "estimand as the Wilcoxon tables); medians for serving metrics, means with "
+        "bootstrap CIs for saturating quality metrics; throughput is trial-level. "
+        f"N = {shape['rows']} valid measurements per cell ({shape['trials']} trials x "
+        f"{shape['questions']} questions, repeat-0 rows; every example_id is a "
+        "distinct per-example unit)."
+    )
 
 SIG_COLOR = "#0173b2"   # colorblind-safe blue for Holm-significant markers
 NS_COLOR = "0.55"       # grey for non-significant
@@ -192,7 +218,8 @@ TRILEMMA_AXES_NOTE = (
     "answerable (mean; valid for all arms; higher is better). MEMORY: per-query "
     "KV context footprint -- resident = median prompt tokens held in KV; "
     "marginal = median NEW KV tokens materialized per query "
-    "(prompt - cached, missing cached = 0). " + KV_PROXY_NOTE)
+    "(prompt - cached; rows missing cached-token telemetry are dropped "
+    "and counted, never zero-filled). " + KV_PROXY_NOTE)
 
 
 def _bootstrap_median_ci(values: np.ndarray, iters: int = 10000, seed: int = 42,
@@ -248,22 +275,37 @@ def build_summary(results_dir: Path, bootstrap_iters: int = 10000,
             r[f"{col}_n"] = int(len(vals))
 
     # Mechanism columns from the valid rep-0 rows.
+    # Task #135 (finding I11): cached_prompt_tokens was fillna(0)-ed here, so
+    # ABSENT cache telemetry rendered as a measured 0% KV reuse. Missing rows
+    # are now DROPPED AND COUNTED (dataviz doctrine: missing data is
+    # dropped-and-counted, never zero-filled). A cell with no cached-token
+    # telemetry at all gets NO cached_pct/marginal_kv (renders as "--"/absent),
+    # never 0. A genuine reported 0 stays 0.
     h = headline_rows(long_df).copy()
-    h["_cached"] = pd.to_numeric(h.get("cached_prompt_tokens"), errors="coerce").fillna(0.0)
+    h["_cached"] = pd.to_numeric(h.get("cached_prompt_tokens"), errors="coerce")
     h["_prompt"] = pd.to_numeric(h.get("prompt_tokens"), errors="coerce")
     for cell, g in h.groupby("cell"):
         if cell not in rows:
             continue
-        prompt_total = float(g["_prompt"].sum())
-        if prompt_total > 0:
-            rows[cell]["cached_pct"] = 100.0 * float(g["_cached"].sum()) / prompt_total
+        r = rows[cell]
         prompts = g["_prompt"].dropna()
+        both = g.dropna(subset=["_prompt", "_cached"])
+        n_missing_cached = int(len(prompts) - len(both))
+        r["n_rows"] = int(len(g))
+        r["cached_missing_n"] = n_missing_cached
+        if n_missing_cached:
+            print(f"  [build_summary] {cell}: cached_prompt_tokens telemetry "
+                  f"missing on {n_missing_cached}/{len(prompts)} rows -- dropped "
+                  "from cached_pct/marginal_kv (absent telemetry must not "
+                  "render as 0% KV reuse)")
+        prompt_total = float(both["_prompt"].sum())
+        if prompt_total > 0:
+            r["cached_pct"] = 100.0 * float(both["_cached"].sum()) / prompt_total
         if not prompts.empty:
             # Tri-lemma memory proxies (per-query KV context footprint).
-            rows[cell]["resident_kv"] = float(prompts.median())
-            marginal = (g["_prompt"] - g["_cached"]).dropna()
-            rows[cell]["marginal_kv"] = float(marginal.median())
-        rows[cell]["n_rows"] = int(len(g))
+            r["resident_kv"] = float(prompts.median())
+        if not both.empty:
+            r["marginal_kv"] = float((both["_prompt"] - both["_cached"]).median())
     pe_abst = per_example(long_df, "predicted_no_answer")
     for cell, g in pe_abst.groupby("cell"):
         if cell in rows:
@@ -448,7 +490,7 @@ def plot_metric_by_baseline(
 
 
 # ---------------------------------------------------------------------------
-# F2: forest panels (serving / quality) straight from phase2_stats.json
+# F2: forest panels (serving / quality) straight from pilot_stats.json
 # ---------------------------------------------------------------------------
 
 def _stats_entries(stats_payload: dict, metric: str) -> dict[str, tuple]:
@@ -663,7 +705,8 @@ def plot_mechanism_reuse_vs_ttft(df: pd.DataFrame, filename: Path) -> bool:
     axl.invert_yaxis()  # shared axis: inverts both panels; row 0 (most reuse) on top
     axl.yaxis.grid(False)
     axl.set_xlabel("Cached prompt tokens (%, token-weighted)\n"
-                   "= total cached / total prompt; missing cached = 0", fontsize=8)
+                   "= total cached / total prompt; missing-telemetry rows "
+                   "dropped and counted", fontsize=8)
     axl.set_title("KV-cache reuse", fontsize=9.5)
 
     axr.barh(y, ttft, height=0.66, color=palette[1])
@@ -1249,7 +1292,7 @@ def plot_memory_resident_vs_marginal(df: pd.DataFrame, filename: Path) -> bool:
     axr.set_xlim(0, xmax)
     axr.yaxis.grid(False)
     axr.set_xlabel("Marginal KV tokens/query\n(median prompt - cached; "
-                   "missing cached = 0)", fontsize=8)
+                   "missing-telemetry rows dropped and counted)", fontsize=8)
     axr.set_title("Marginal (new) KV per query", fontsize=9.5)
 
     story = ""
@@ -1373,7 +1416,8 @@ def plot_latency_breakdown(df: pd.DataFrame, title: str, filename: Path) -> bool
 # Explanations + main
 # ---------------------------------------------------------------------------
 
-def write_plot_explanations(plots_dir: Path, plots: list[tuple[str, str]]) -> None:
+def write_plot_explanations(plots_dir: Path, plots: list[tuple[str, str]],
+                            caveat: str) -> None:
     lines = [
         "Plot explanations (publication set, 2026-07-16 overhaul)",
         "=" * 56,
@@ -1387,11 +1431,36 @@ def write_plot_explanations(plots_dir: Path, plots: list[tuple[str, str]]) -> No
         lines.append(f"- {fname}:")
         lines.append(f"  {desc}")
         lines.append("")
-    lines += [f"Caveat: {CAVEAT_LINE}", "", NLI_DAGGER_NOTE, ""]
+    lines += [f"Caveat: {caveat}", "", NLI_DAGGER_NOTE, ""]
     (plots_dir / "plots_explained.txt").write_text("\n".join(lines), encoding="utf-8")
 
 
+DEPRECATION_BANNER = (
+    "PILOT-ERA: generate_plots.py renders the PILOT (Phase-2 layout) figure "
+    "set only — design input, not campaign results. Campaign trees "
+    "(RESULTS_LAYOUT v2) are rendered by run_campaign_analysis.py + "
+    "figure_pipeline.py."
+)
+
+
+def is_campaign_tree(root: Path) -> bool:
+    """RESULTS_LAYOUT v2 heuristic: a campaign run root carries manifest.json
+    and/or cells/; pilot (Phase-2) trees carry neither (task #135)."""
+    return (root / "manifest.json").is_file() or (root / "cells").is_dir()
+
+
+def _pilot_stats_path(stats_dir: Path) -> Path:
+    """The pilot Wilcoxon summary path: pilot_stats.json (task #135 rename),
+    falling back to the pre-rename phase2_stats.json on frozen archives."""
+    renamed = stats_dir / "pilot_stats.json"
+    legacy = stats_dir / "phase2_stats.json"
+    if not renamed.is_file() and legacy.is_file():
+        return legacy
+    return renamed
+
+
 def main() -> None:
+    print(f"[generate_plots] {DEPRECATION_BANNER}", file=sys.stderr)
     parser = argparse.ArgumentParser(
         description="Generate the publication figure set from the canonical loader.")
     parser.add_argument(
@@ -1407,6 +1476,13 @@ def main() -> None:
     args = parser.parse_args()
 
     results_dir = Path(args.results_dir)
+    if is_campaign_tree(results_dir):
+        raise SystemExit(
+            f"ERROR: {results_dir} is a CAMPAIGN run root (RESULTS_LAYOUT v2: "
+            "manifest.json/cells/ present). This pilot-era tool must not render "
+            "campaign trees — use run_campaign_analysis.py + figure_pipeline.py "
+            "instead (task #135)."
+        )
     plots_dir = Path(args.plots_dir)
     plots_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1425,7 +1501,7 @@ def main() -> None:
             print(f"  removed stale artifact {stale} (deleted by 2026-07-16 overhaul)")
 
     stats_payload = load_stats(
-        results_dir / "stats" / "all_results" / "phase2_stats.json", "phase2_stats")
+        _pilot_stats_path(results_dir / "stats" / "all_results"), "pilot_stats")
     cagtrue_payload = load_stats(
         results_dir / "stats" / "all_results_cagtrue" / "cagtrue_stats.json",
         "cagtrue_stats")
@@ -1437,6 +1513,10 @@ def main() -> None:
     def _n(col: str) -> int:
         c = f"{col}_n"
         return int(df[c].max()) if c in df.columns and df[c].notna().any() else 0
+
+    # Caption N derived from the loaded data, never hardcoded (task #135, I11).
+    shape = run_shape(long_df)
+    shape_note = f"{shape['trials']} trials x {shape['questions']} questions"
 
     pq_note = "pooled per-example median; whiskers = 95% bootstrap CI"
     explained: list[tuple[str, str]] = []
@@ -1473,10 +1553,10 @@ def main() -> None:
     by_baseline = [
         ("ttft_ms", "TTFT by arm", "Time to first token (ms; lower is better)",
          "ttft_by_baseline.png",
-         f"{pq_note} (n={_n('ttft_ms')} queries: 3 trials x 100 questions)"),
+         f"{pq_note} (n={_n('ttft_ms')} per-example units; {shape_note})"),
         ("latency_ms", "End-to-end latency by arm", "Latency (ms; lower is better)",
          "latency_by_baseline.png",
-         f"{pq_note} (n={_n('latency_ms')} queries: 3 trials x 100 questions)"),
+         f"{pq_note} (n={_n('latency_ms')} per-example units; {shape_note})"),
     ]
     for col, title, xlabel, fname, note in by_baseline:
         if plot_metric_by_baseline(df, col, title, xlabel, plots_dir / fname,
@@ -1509,11 +1589,12 @@ def main() -> None:
                 serving_panels, plots_dir / "forest_serving.png",
                 "Serving deltas vs No Cache (paired Wilcoxon; negative = faster)",
                 "Median of per-example paired differences; whiskers = 95% CI; "
-                "filled = Holm-significant (p < 0.05). N = 300 pairs per cell."):
+                "filled = Holm-significant (p < 0.05). "
+                f"N = {shape['questions']} paired examples per cell."):
             explained.append(("forest_serving.png",
                 "Forest plot of the paired median serving differences (TTFT, "
                 "latency, TPOT) of every arm vs No Cache, rendered straight from "
-                "phase2_stats.json so it cannot disagree with the stats tables. "
+                "pilot_stats.json so it cannot disagree with the stats tables. "
                 "Points left of zero are faster than No Cache; filled markers are "
                 "Holm-significant, open grey markers are not."))
 
@@ -1598,7 +1679,8 @@ def main() -> None:
         explained.append(("mechanism_reuse_vs_ttft.png",
             "Mechanism figure, two ALIGNED horizontal panels sharing one arm "
             "axis sorted by cache reuse: left = token-weighted cached-prompt "
-            "share (total cached / total prompt tokens, missing cached = 0), "
+            "share (total cached / total prompt tokens; rows missing "
+            "cached-token telemetry dropped and counted), "
             "right = TTFT median (log scale). Read top-to-bottom: arms at the "
             "top reuse the most KV cache and post the lowest TTFT; the 0%-reuse "
             "arms at the bottom (No Cache, RAG, Redis Cold, CAG True Off) anchor "
@@ -1715,7 +1797,8 @@ def main() -> None:
             "The memory axis unpacked: aligned two-panel horizontal bars on one "
             "arm axis sorted by resident footprint -- left = resident KV "
             "tokens/query (median prompt tokens), right = marginal KV "
-            "tokens/query (median prompt - cached tokens, missing cached = 0), "
+            "tokens/query (median prompt - cached tokens; missing-telemetry "
+            "rows dropped and counted), "
             "both panels on the same x-range. The CAG story is the top row: "
             "CAG True (On) keeps the whole corpus resident yet materializes "
             "almost no new KV per query, while CAG True (Off) pays the full "
@@ -1730,7 +1813,7 @@ def main() -> None:
             "it to look values up, not to compare colors across columns. NLI "
             "faithfulness is blanked (†) where invalid."))
 
-    write_plot_explanations(plots_dir, explained)
+    write_plot_explanations(plots_dir, explained, caveat_line(shape))
     print("  wrote plots_explained.txt")
 
     summary_path = plots_dir / "latest_metrics_summary.csv"
