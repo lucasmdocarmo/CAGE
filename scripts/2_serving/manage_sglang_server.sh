@@ -20,9 +20,10 @@
 # and SGLang sizes against memory available at init (= device total only on
 # an empty GPU; co-resident metric models shrink it). See
 # cage_sglang_mem_fraction() in _serving_config.sh for the full rationale.
-# The mapping sets the dial; the preflight iso-bytes gate -- run WITH the
-# co-resident stack loaded -- asserts the REALIZED KV-pool bytes across
-# engines (never assumed from the dial).
+# The mapping sets the dial; preflight gate (j) -- the CAGE-ISO-BYTES-GATE in
+# scripts/checks/preflight_check.sh, run WITH the co-resident stack loaded --
+# parses this launcher's startup log and asserts the REALIZED KV-pool bytes
+# across engines (never assumed from the dial).
 #
 # [VERIFY-LIVE at S0]: every SGLang CLI flag below follows SGLang's documented
 # server CLI, but none has been exercised by this codebase yet (SGLang is not

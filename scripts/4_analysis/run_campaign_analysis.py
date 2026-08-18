@@ -99,7 +99,12 @@ Guards (§9.4 unit-of-analysis rules):
   #13's fingerprint superiority legs run per
   ``families.FINGERPRINT_SUB_HYPOTHESES`` (3 one-sided legs, Holm at the
   registered m=3, intersection-union p as the chain endpoint contribution);
-  #14 (truth_tax) is a fail-loud stub naming its #119 dependency; #12
+  #14 (truth_tax) runs ``compute_truth_tax`` (task #119): per in-regime F2
+  window, G − Y from ``goodput.evaluate_window`` over the requests ⋈
+  §8.5-predicate join (predicate/<scoring_run_id>/ table, ms→s conversion at
+  this one seam), batch-means contrast per cross-engine leg vs the vLLM
+  anchor — with the SAME loud refusal when the predicate table, SLO floors,
+  or regime artifacts are missing (naming exactly what is absent); #12
   (lambda_star_onset) computes the interpolated Chiu-Jain argmax from the
   F2 rate grid or fails loud naming the missing artifact.
 - Sidedness (owner decision a, 2026-08-16): each row EXECUTES its REGISTERED
@@ -186,6 +191,13 @@ from src.analysis.stats.tests_by_unit import (  # noqa: E402
     paired_wilcoxon,
 )
 from src.analysis.stats.wlt import win_loss_tie  # noqa: E402
+from src.analysis.goodput import (  # noqa: E402
+    GoodputError,
+    IN_REGIME,
+    SLOBaseline,
+    evaluate_window,
+)
+from src.analysis.predicate import PREDICATE_DATASETS  # noqa: E402
 from src.observability.provenance import (  # noqa: E402
     git_dirty as _prov_git_dirty,
     git_sha as _prov_git_sha,
@@ -291,6 +303,43 @@ LAMBDA_STAR_MIN_GRID_POINTS: int = 3
 #: Per-window inputs of the Chiu-Jain power metric (goodput-weighted offered
 #: rate over response time).
 _LAMBDA_STAR_REQUIRED_COLUMNS: tuple[str, ...] = ("goodput_frac", "latency_ms")
+
+#: Task #119 (§8.5): the joined predicate table — a post-seal sibling tree
+#: produced by scripts/4_analysis/build_predicate_table.py, mirroring
+#: cells/<row_key>/window_<k>/ so the per-query loader can join
+#: ``predicate.jsonl`` beside requests.jsonl/qa_evidence.jsonl.
+PREDICATE_DIRNAME = "predicate"
+PREDICATE_ROWS_NAME = "predicate.jsonl"
+PREDICATE_MANIFEST_NAME = "predicate_manifest.json"
+_PREDICATE_MANIFEST_REQUIRED_KEYS: tuple[str, ...] = (
+    "schema_version",
+    "scoring_run_id",
+    "raw_run_ledger_entries_sha256",
+    "config",
+    "counts",
+)
+#: The one honest producer-naming hint for a missing predicate column/table.
+_PREDICATE_FIX_HINT = (
+    "no §8.5 predicate table is joined for this run — build one from a "
+    "sealed scoring pass: scripts/4_analysis/build_predicate_table.py "
+    "<run> --scoring-run-id <id> --max-null-fraction <bound>"
+)
+
+#: #14 (truth_tax) executor inputs (G4c, task #119). Window pairs contrast
+#: the ENGINE slot at identical pressure coordinates; the anchor engine is
+#: vLLM (§7.3: the within-vLLM frontier #13 and the cross-engine bundles #14
+#: share the anchor). Per-request serving columns required per window; the
+#: ms→s conversion into ``goodput.evaluate_window`` happens HERE, at the one
+#: registered seam (Topic-6 F2: no conversion existed anywhere).
+_TRUTH_TAX_ANCHOR_ENGINE = "vllm"
+_TRUTH_TAX_GROUP_AXES: tuple[str, ...] = (
+    "model", "arm", "retriever", "policy", "topology", "budget_r", "rate_frac",
+)
+_TRUTH_TAX_REQUEST_COLUMNS: tuple[str, ...] = ("ok", "ttft_ms", "tpot_ms")
+#: §3-extra manifest key carrying the §6.1 single-stream floors per engine:
+#: {"slo_floors": {"<engine>": {"ttft_s": ..., "tpot_s": ...}}} — produced by
+#: the E3 floor calibration (src/orchestration/calibration.summarize_floor).
+_SLO_FLOORS_MANIFEST_KEY = "slo_floors"
 
 #: #13 fingerprint superiority legs (G4a): the policy-axis pairings for the
 #: 3 registered Holm legs. 'truncate' is NOT a policy value (§7.3) — the
@@ -436,8 +485,8 @@ def classify_contrast(contrast: Contrast) -> str | None:
     on loaded rows via window-level batch means
     (``tests_by_unit.batch_means_contrast``, §9.4). Selector contrasts (no
     single baseline pair — e.g. the gated #6, the engine-slot #10) remain
-    labeled skips. The estimand primaries never reach this classifier: #13
-    and #12 have executors, #14 is a fail-loud stub (G4).
+    labeled skips. The estimand primaries never reach this classifier: #13,
+    #12 and #14 have executors (G4).
     """
     if contrast.baseline_a is None or contrast.baseline_b is None:
         return (
@@ -736,20 +785,29 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def load_per_query(
-    run_dir: Path, index: pd.DataFrame, row_keys: Iterable[str]
+    run_dir: Path,
+    index: pd.DataFrame,
+    row_keys: Iterable[str],
+    *,
+    predicate_root: Path | None = None,
 ) -> pd.DataFrame:
     """Long per-query table for the given cells across ALL their index windows.
 
     Joins ``requests.jsonl`` + ``qa_evidence.jsonl`` per window on
     ``example_id`` (numeric fields; duplicate example_id lines within a
     window are multiple trials — disambiguated by ``record_index`` — and are
-    averaged, matching the figure-pipeline convention). Output columns:
+    averaged, matching the figure-pipeline convention). With a
+    ``predicate_root`` (task #119: predicate/<scoring_run_id>/, resolved by
+    ``resolve_predicate_root``), each window's ``predicate.jsonl`` joins as a
+    third per-query artifact from the mirrored path — its JSON-null
+    predicates stay ABSENT for that example (None-propagation: counted
+    downstream as dropped pairs, never fabricated). Output columns:
     row_key, dataset, window_key, example_id, plus every numeric field seen.
     A window with zero joinable records fails loud.
 
     G11 (2026-08-16): JSON booleans are COERCED to 1.0/0.0 instead of being
-    silently dropped (the future #119 predicate producer may emit
-    true/false); the coerced field names are surfaced on the returned frame
+    silently dropped (the #119 predicate producer emits true/false);
+    the coerced field names are surfaced on the returned frame
     as ``frame.attrs['bool_coerced_fields']``. Two records in ONE artifact
     file sharing the same ``(example_id, record_index)`` key (including both
     missing ``record_index``) are a duplicate-row hazard (H3: replay rows
@@ -766,8 +824,12 @@ def load_per_query(
         window_dir = run_dir / str(rec.window_dir)
         merged: dict[str, dict[str, list[float]]] = {}
         n_unjoined = 0
-        for name in _PER_QUERY_ARTIFACTS:
-            path = window_dir / name
+        artifact_paths = [window_dir / name for name in _PER_QUERY_ARTIFACTS]
+        if predicate_root is not None:
+            artifact_paths.append(
+                predicate_root / str(rec.window_dir) / PREDICATE_ROWS_NAME
+            )
+        for path in artifact_paths:
             if not path.is_file():
                 continue  # qa_evidence is dataset-exempt for load donors (§1)
             seen_keys: set[tuple[str, Any]] = set()
@@ -814,6 +876,103 @@ def load_per_query(
     frame = pd.DataFrame(rows)
     frame.attrs["bool_coerced_fields"] = sorted(bool_coerced)
     return frame
+
+
+def _verify_predicate_tree(run_dir: Path, pred_dir: Path) -> dict[str, Any]:
+    """Fail-loud schema/seal guard on one predicate/<scoring_run_id>/ tree.
+
+    Task #119 wiring: the joined table is CONSUMED only when its manifest
+    carries the required keys, it names THIS run's raw seal, and it verifies
+    against its OWN ledger — a predicate table derived from a different tree
+    (or tampered after the build) must never feed Y.
+    """
+    manifest_path = pred_dir / PREDICATE_MANIFEST_NAME
+    if not manifest_path.is_file():
+        raise AnalysisError(
+            f"{manifest_path} missing — not a predicate table "
+            "(scripts/4_analysis/build_predicate_table.py writes it)"
+        )
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise AnalysisError(f"{manifest_path}: invalid JSON: {exc}") from exc
+    missing = [k for k in _PREDICATE_MANIFEST_REQUIRED_KEYS if k not in manifest]
+    if missing:
+        raise AnalysisError(
+            f"{manifest_path}: missing required key(s) {missing} — refuse "
+            "to consume a predicate table without its provenance"
+        )
+    raw_ledger = run_dir / LEDGER_NAME
+    if raw_ledger.is_file():
+        try:
+            read_ledger(raw_ledger)
+            raw_sha = json.loads(raw_ledger.read_text(encoding="utf-8"))[
+                "entries_sha256"
+            ]
+        except (LedgerError, json.JSONDecodeError, KeyError) as exc:
+            raise AnalysisError(
+                f"raw ledger unusable for predicate-table verification: {exc}"
+            ) from exc
+        if manifest["raw_run_ledger_entries_sha256"] != raw_sha:
+            raise AnalysisError(
+                f"predicate table {pred_dir.name!r} was built against a "
+                "DIFFERENT raw seal "
+                f"({manifest['raw_run_ledger_entries_sha256']!r} != "
+                f"{raw_sha!r}) — its rows do not describe this tree"
+            )
+    own_ledger = pred_dir / LEDGER_NAME
+    if not own_ledger.is_file():
+        raise AnalysisError(
+            f"{own_ledger} missing — a predicate table is sealed at build "
+            "time (build_predicate_table.py); an unsealed table proves nothing"
+        )
+    try:
+        mismatches = verify_ledger(own_ledger, pred_dir)
+    except LedgerError as exc:
+        raise AnalysisError(f"{own_ledger}: {exc}") from exc
+    if mismatches:
+        raise AnalysisError(
+            f"predicate table {pred_dir.name!r} fails its own seal: "
+            + "; ".join(mismatches)
+        )
+    return manifest
+
+
+def resolve_predicate_root(
+    run_dir: Path, predicate_run_id: str | None
+) -> tuple[Path | None, dict[str, Any] | None]:
+    """Locate + verify the §8.5 predicate table this analysis joins (#119).
+
+    Explicit ``predicate_run_id`` names predicate/<id>/ and refuses when
+    absent. Without it: zero tables -> (None, None) — the registered
+    predicate legs then surface through the existing missing-column
+    refusals; exactly one -> auto-selected; more than one -> refusal naming
+    --predicate-run-id (never guess which verdicts feed Y).
+    """
+    root = run_dir / PREDICATE_DIRNAME
+    if predicate_run_id is not None:
+        pred_dir = root / predicate_run_id
+        if not pred_dir.is_dir():
+            raise AnalysisError(
+                f"--predicate-run-id {predicate_run_id!r}: no predicate table "
+                f"at {pred_dir} — {_PREDICATE_FIX_HINT}"
+            )
+        return pred_dir, _verify_predicate_tree(run_dir, pred_dir)
+    if not root.is_dir():
+        return None, None
+    candidates = sorted(
+        p for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")
+    )
+    if not candidates:
+        return None, None
+    if len(candidates) > 1:
+        raise AnalysisError(
+            f"multiple predicate tables under {root} "
+            f"({[p.name for p in candidates]}) — name the one this analysis "
+            "consumes via --predicate-run-id (refusing to guess which "
+            "verdicts feed Y)"
+        )
+    return candidates[0], _verify_predicate_tree(run_dir, candidates[0])
 
 
 # ---------------------------------------------------------------------------
@@ -1930,8 +2089,8 @@ def _annotate_missing_leg(leg: str) -> str:
     """Human reason for a registered co-primary leg with no outcome (G5)."""
     if leg.endswith(f"|{PREDICATE_METRIC}"):
         return (
-            f"registered co-primary leg {leg!r} has no outcome: the §8.5 Y "
-            "predicate producer (task #119) has not landed — the set FAILS, "
+            f"registered co-primary leg {leg!r} has no outcome: "
+            f"{_PREDICATE_FIX_HINT} — the set FAILS, "
             "it never shrinks (G5, 2026-08-16)"
         )
     return (
@@ -1970,8 +2129,8 @@ def run_gatekeeping(
     REGISTERED ``upstream`` endpoint from the map — never a driver hard-code.
     With a family context the chain is BOUND to the registration (G5):
     ``registered_sets`` (a missing registered co-primary leg FAILS the set —
-    the predicate leg's absence pre-#119 fails #4's set with a reason naming
-    #119), ``registered_family_sizes`` (Holm at the REGISTERED m), and
+    the predicate leg's absence fails #4's set with a reason naming the
+    producer command), ``registered_family_sizes`` (Holm at the REGISTERED m), and
     ``upstream_by_family`` (topology enforced). Rows with no computable
     upstream outcome are listed under ``ungated`` — never silently dropped.
     """
@@ -2837,6 +2996,392 @@ def compute_falsification_suite(
 
 
 # ---------------------------------------------------------------------------
+# G4c: #14 truth_tax (the §9.2 estimand executor — task #119 replaces the
+# fail-loud stub; the loud refusals for trees that predate the predicate
+# REMAIN, naming exactly which artifact is missing)
+# ---------------------------------------------------------------------------
+
+
+def _predicate_join_key(obj: Mapping[str, Any]) -> tuple[Any, str, Any]:
+    """The #127 identity triple (mirrors src.analysis.predicate)."""
+    return (
+        obj.get("example_id"),
+        str(obj.get("repeat_index") or "0"),
+        obj.get("record_index"),
+    )
+
+
+def _window_truth_tax(
+    run_dir: Path,
+    rec: Any,
+    predicate_root: Path,
+    floors: Mapping[str, Any],
+) -> tuple[float | None, str | None]:
+    """One window's §9.2 variable G − Y, or (None, exclusion reason).
+
+    - §9.2 population = IN-REGIME cells: the window's ``regime.json`` (§6.1
+      referee, campaign_layout.write_window_regime) must label it IN_REGIME;
+      any other label EXCLUDES the window (counted upstream, per the
+      registered population — an exclusion, not a failure). A missing/refused
+      regime artifact fails loud: an uncertifiable window has no population
+      membership.
+    - Y = timely ∧ veridical via ``goodput.evaluate_window`` on the requests ⋈
+      predicate join; ttft_ms/tpot_ms convert to seconds HERE (F2's one
+      registered ms→s seam); duration = cell.json windows[] t_end − t_start.
+    - An ok request without a predicate row fails loud (§9.10: the predicate
+      must be scored for every completion); not-ok rows are non-veridical by
+      registration (audit §2.6).
+    """
+    window_dir = run_dir / str(rec.window_dir)
+    window_label = str(rec.window_dir)
+
+    regime_path = window_dir / "regime.json"
+    if not regime_path.is_file():
+        raise AnalysisError(
+            f"contrast #14 (truth_tax): MISSING ARTIFACT — {regime_path} "
+            "absent; the §9.2 population is in-regime cells and needs the "
+            "§6.1 regime referee per window "
+            "(src.orchestration.campaign_layout.write_window_regime, #126)"
+        )
+    regime = json.loads(regime_path.read_text(encoding="utf-8"))
+    label = regime.get("label")
+    if label != IN_REGIME:
+        return None, f"regime label {label!r} (population = in-regime cells, §9.2)"
+
+    engine = str(rec.engine)
+    floor = floors.get(engine)
+    if not isinstance(floor, Mapping) or not {"ttft_s", "tpot_s"} <= set(floor):
+        raise AnalysisError(
+            f"contrast #14 (truth_tax): MISSING ARTIFACT — manifest "
+            f"{_SLO_FLOORS_MANIFEST_KEY!r} carries no ttft_s/tpot_s floor "
+            f"for engine {engine!r}; the §6.1 primary SLO pair is relative "
+            "to the measured single-stream floor (E3 calibration, "
+            "src/orchestration/calibration.summarize_floor)"
+        )
+
+    cell_meta = json.loads(
+        (run_dir / str(rec.cell_json)).read_text(encoding="utf-8")
+    )
+    window_meta = (cell_meta.get("windows") or {}).get(str(rec.window_key))
+    if (
+        not isinstance(window_meta, Mapping)
+        or window_meta.get("t_start") is None
+        or window_meta.get("t_end") is None
+    ):
+        raise AnalysisError(
+            f"contrast #14 (truth_tax): MISSING ARTIFACT — cell.json "
+            f"windows[{rec.window_key!r}] carries no t_start/t_end for "
+            f"{window_label}; the §1 windows[] table (campaign_layout, #126) "
+            "supplies the pre-costed window duration"
+        )
+    duration_s = float(window_meta["t_end"]) - float(window_meta["t_start"])
+
+    requests = _read_jsonl(window_dir / "requests.jsonl")
+    if not requests:
+        raise AnalysisError(
+            f"contrast #14 (truth_tax): {window_dir / 'requests.jsonl'} has "
+            "no rows — an empty window has no G or Y"
+        )
+    missing_cols = sorted(
+        c for c in _TRUTH_TAX_REQUEST_COLUMNS
+        if not any(c in r for r in requests)
+    )
+    if missing_cols:
+        raise AnalysisError(
+            f"contrast #14 (truth_tax): MISSING ARTIFACT — requests.jsonl "
+            f"rows in {window_label} carry no {missing_cols} column(s); Y "
+            "needs the #127 ok stamp and per-request ttft_ms/tpot_ms for "
+            "the §6.1 SLO gate"
+        )
+
+    predicate_by_key: dict[tuple[Any, str, Any], Any] = {}
+    pred_path = predicate_root / str(rec.window_dir) / PREDICATE_ROWS_NAME
+    if not pred_path.is_file():
+        raise AnalysisError(
+            f"contrast #14 (truth_tax): MISSING ARTIFACT — {pred_path} "
+            f"absent; {_PREDICATE_FIX_HINT}"
+        )
+    for obj in _read_jsonl(pred_path):
+        predicate_by_key[_predicate_join_key(obj)] = obj.get("predicate")
+
+    records: list[dict[str, Any]] = []
+    unscored_ok: list[tuple[Any, str, Any]] = []
+    for req in requests:
+        key = _predicate_join_key(req)
+        ok = bool(req.get("ok"))
+        if key not in predicate_by_key:
+            if ok:
+                unscored_ok.append(key)
+                continue
+            verid: Any = float("nan")  # non-completion: non-veridical (§2.6)
+        else:
+            pred = predicate_by_key[key]
+            verid = float("nan") if pred is None else bool(pred)
+        ttft_ms = req.get("ttft_ms")
+        tpot_ms = req.get("tpot_ms")
+        records.append(
+            {
+                "ok": ok,
+                "veridical": verid,
+                # F2: THE ms→s conversion seam (evaluate_window is seconds).
+                "ttft_s": (
+                    float("nan") if ttft_ms is None else float(ttft_ms) / 1000.0
+                ),
+                "tpot_s": (
+                    float("nan") if tpot_ms is None else float(tpot_ms) / 1000.0
+                ),
+            }
+        )
+    if unscored_ok:
+        raise AnalysisError(
+            f"contrast #14 (truth_tax): {len(unscored_ok)} completed (ok) "
+            f"request(s) in {window_label} have NO predicate row (first: "
+            f"{unscored_ok[:3]}) — the §8.5 predicate must be scored for "
+            "every completion (§9.10); rebuild the predicate table against "
+            "this tree"
+        )
+
+    baseline = SLOBaseline(
+        ttft_s=float(floor["ttft_s"]), tpot_s=float(floor["tpot_s"])
+    )
+    try:
+        metrics = evaluate_window(
+            pd.DataFrame(records), baseline, duration_s=duration_s
+        )
+    except GoodputError as exc:
+        raise AnalysisError(
+            f"contrast #14 (truth_tax): {window_label}: {exc}"
+        ) from exc
+    return float(metrics.truth_tax_frac), None
+
+
+def compute_truth_tax(
+    run_dir: Path,
+    index: pd.DataFrame,
+    family_ctx: FamilyContext | None,
+    *,
+    predicate_root: Path | None,
+    alpha: float = 0.05,
+) -> tuple[dict[str, Any], list[PrimaryOutcome]]:
+    """#14 executor: the §9.2 truth-tax estimand (G4c, task #119).
+
+    Registered estimand (§9.2, verbatim): population = in-regime cells (§6.1
+    3-layer referee); variable = G − Y; population summary = batch-means
+    contrast across windows. The contrast rides the ENGINE slot ("cross-
+    engine policy bundles at same NORMALIZED pressure", §7.8 #14): F2 cells
+    agreeing on every non-engine axis + pressure coordinates pair each
+    non-anchor engine against the vLLM anchor; per dataset the leg p-values
+    are Holm-adjusted and the intersection-union p (max) is the chain
+    endpoint contribution keyed ``<dataset>|truth_tax`` (the #13 executor's
+    IU convention; ``ESTIMAND_HIGHER_IS_BETTER['truth_tax'] = False`` is the
+    direction registry, untouched).
+
+    Sidedness: the registry row says one-sided but NO engine-slot tail is
+    registered anywhere (REGISTERED_CELL_DIRECTION has no #14 entry; §7.8 /
+    §9.2 pin none) — the executor therefore runs the Welch contrast
+    two-sided (the §9.6 power-sim precedent: run_power_sim's window stage
+    runs batch_means_contrast two-sided), which can only be CONSERVATIVE
+    (a two-sided p is never smaller than its one-sided half). The executed
+    alternative and this note are recorded on every leg; registering the
+    tail is an open pre-freeze owner item.
+
+    FAIL-LOUD (G4): a run without the required inputs names exactly which
+    artifact is missing — the §8.5 predicate table (task #119's producer),
+    the manifest ``slo_floors`` (E3), per-window ``regime.json`` (#126) and
+    cell.json windows[] t-bounds. Trees that predate the predicate get the
+    same loud refusal the stub gave, now naming the producer command.
+    """
+    if predicate_root is None:
+        raise AnalysisError(
+            "contrast #14 (truth-tax estimand, §9.2) cannot be computed: its "
+            "registered variable truth_tax = G − Y requires the per-query "
+            f"§8.5 Y predicate, and {_PREDICATE_FIX_HINT}"
+        )
+    f2 = index[index["family"] == "F2"]
+    if f2.empty:
+        raise AnalysisError(
+            "contrast #14 (truth_tax): MISSING ARTIFACT — no F2 pressure "
+            "cells in this run's index; the §6.1 pressure grid (S0 campaign "
+            "producer, task #116) has not landed"
+        )
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    floors = manifest.get(_SLO_FLOORS_MANIFEST_KEY)
+    if not isinstance(floors, Mapping) or not floors:
+        raise AnalysisError(
+            f"contrast #14 (truth_tax): MISSING ARTIFACT — {manifest_path} "
+            f"carries no {_SLO_FLOORS_MANIFEST_KEY!r} mapping "
+            "({engine: {ttft_s, tpot_s}}); the §6.1 SLO pair is relative to "
+            "the measured single-stream floor (E3 calibration, "
+            "src/orchestration/calibration.summarize_floor)"
+        )
+
+    section: dict[str, Any] = {
+        "contrast_id": 14,
+        "tier": "primary",
+        "estimand": "truth_tax",
+        "estimand_text": (
+            "§9.2: population = in-regime cells (§6.1 3-layer referee); "
+            "variable = G − Y; population summary = batch-means contrast "
+            "across windows; slot = engine (policy bundle) at normalized "
+            "pressure"
+        ),
+        "higher_is_better": ESTIMAND_HIGHER_IS_BETTER["truth_tax"],
+        "anchor_engine": _TRUTH_TAX_ANCHOR_ENGINE,
+        "registered_sidedness": "one-sided",
+        "executed_alternative": "two-sided",
+        "sidedness_note": (
+            "registry sidedness is one-sided but no engine-slot tail is "
+            "registered (REGISTERED_CELL_DIRECTION has no #14 entry; "
+            "§7.8/§9.2 pin none) — executed two-sided per the §9.6 "
+            "power-sim precedent (conservative); tail registration is an "
+            "open pre-freeze owner item"
+        ),
+        "predicate_table": predicate_root.name,
+        "legs": [],
+        "per_dataset_intersection": [],
+        "excluded_windows": [],
+        "skipped": [],
+    }
+
+    def skip(reason: str) -> None:
+        section["skipped"].append({"reason": reason})
+
+    #: (dataset, leg-engine) -> p, guarded against duplicate supply.
+    leg_p: dict[str, dict[str, float]] = {}
+    tt_cache: dict[str, float | None] = {}
+
+    def window_values(grp: pd.DataFrame) -> list[float]:
+        values: list[float] = []
+        for rec in grp.itertuples(index=False):
+            cache_key = f"{rec.window_dir}"
+            if cache_key not in tt_cache:
+                value, excluded = _window_truth_tax(
+                    run_dir, rec, predicate_root, floors
+                )
+                tt_cache[cache_key] = value
+                if excluded is not None:
+                    section["excluded_windows"].append(
+                        {"window": str(rec.window_dir), "reason": excluded}
+                    )
+            if tt_cache[cache_key] is not None:
+                values.append(float(tt_cache[cache_key]))  # type: ignore[arg-type]
+        return values
+
+    keyed = _coord_keyed(f2)
+    for dataset, ds_grp in keyed.groupby("dataset"):
+        if str(dataset) not in PREDICATE_DATASETS:
+            skip(
+                f"dataset {dataset!r} is outside the §8.5 predicate universe "
+                "— never feeds Y"
+            )
+            continue
+        if family_ctx is not None and str(dataset) not in family_ctx.datasets:
+            skip(f"dataset {dataset!r} is not a §9.3 family-map dataset")
+            continue
+        for axes_key, grp in ds_grp.groupby(
+            list(_TRUTH_TAX_GROUP_AXES), dropna=False
+        ):
+            engines = sorted(grp["engine"].dropna().unique())
+            if _TRUTH_TAX_ANCHOR_ENGINE not in engines:
+                skip(
+                    f"{dataset} @ {dict(zip(_TRUTH_TAX_GROUP_AXES, axes_key))}: "
+                    f"no {_TRUTH_TAX_ANCHOR_ENGINE!r} anchor cell among "
+                    f"engines {engines}"
+                )
+                continue
+            others = [e for e in engines if e != _TRUTH_TAX_ANCHOR_ENGINE]
+            if not others:
+                skip(
+                    f"{dataset} @ {dict(zip(_TRUTH_TAX_GROUP_AXES, axes_key))}: "
+                    "anchor engine only — no cross-engine partner"
+                )
+                continue
+            anchor_grp = grp[grp["engine"] == _TRUTH_TAX_ANCHOR_ENGINE]
+            anchor_values = window_values(anchor_grp)
+            for engine in others:
+                cell_grp = grp[grp["engine"] == engine]
+                cell_values = window_values(cell_grp)
+                if len(cell_values) < 2 or len(anchor_values) < 2:
+                    skip(
+                        f"{dataset}: {engine} vs "
+                        f"{_TRUTH_TAX_ANCHOR_ENGINE}: needs >= 2 in-regime "
+                        f"windows per side for a Welch variance estimate; "
+                        f"got cell={len(cell_values)}, "
+                        f"anchor={len(anchor_values)} (in-regime population, "
+                        "§9.2)"
+                    )
+                    continue
+                result = batch_means_contrast(
+                    cell_values, anchor_values, alternative="two-sided"
+                )
+                if engine in leg_p.get(str(dataset), {}):
+                    raise AnalysisError(
+                        f"contrast #14: engine leg {engine!r} × {dataset} is "
+                        "supplied by two matched pressure groups — "
+                        "ambiguous; refusing to guess"
+                    )
+                leg_p.setdefault(str(dataset), {})[engine] = result.p_value
+                section["legs"].append(
+                    {
+                        "dataset": str(dataset),
+                        "engine": engine,
+                        "anchor_engine": _TRUTH_TAX_ANCHOR_ENGINE,
+                        "axes": {
+                            k: str(v)
+                            for k, v in zip(_TRUTH_TAX_GROUP_AXES, axes_key)
+                        },
+                        "n_windows_cell": result.n_windows_a,
+                        "n_windows_anchor": result.n_windows_b,
+                        "mean_truth_tax_cell": result.mean_a,
+                        "mean_truth_tax_anchor": result.mean_b,
+                        "mean_diff": result.mean_diff,
+                        "statistic": result.statistic,
+                        "df": result.df,
+                        "p_value": result.p_value,
+                        "ci95_low": result.ci95_low,
+                        "ci95_high": result.ci95_high,
+                        "executed_alternative": "two-sided",
+                    }
+                )
+
+    primaries: list[PrimaryOutcome] = []
+    for dataset in sorted(leg_p):
+        supplied = leg_p[dataset]
+        adjusted = holm(list(supplied.values()))
+        p_iu = float(max(adjusted))
+        for leg_row in section["legs"]:
+            if leg_row["dataset"] != dataset:
+                continue
+            leg_idx = list(supplied).index(leg_row["engine"])
+            leg_row["p_holm_within_dataset"] = float(adjusted[leg_idx])
+        section["per_dataset_intersection"].append(
+            {
+                "dataset": dataset,
+                "p_intersection_union": p_iu,
+                "n_legs": len(supplied),
+                "engines": sorted(supplied),
+            }
+        )
+        primaries.append(
+            PrimaryOutcome(
+                endpoint=_primary_endpoint(14),
+                dataset=f"{dataset}|truth_tax",
+                p_value=p_iu,
+            )
+        )
+    if not primaries:
+        raise AnalysisError(
+            "contrast #14 (truth_tax): no computable cross-engine leg — "
+            + (
+                "; ".join(s["reason"] for s in section["skipped"])
+                or "no F2 window pair matched"
+            )
+        )
+    return section, primaries
+
+
+# ---------------------------------------------------------------------------
 # G3: exploratory tier (BH-FDR, separated, non-confirmatory)
 # ---------------------------------------------------------------------------
 
@@ -3186,6 +3731,35 @@ def build_summary_md(stats: Mapping[str, Any]) -> str:
             )
         lines.append("")
 
+    truth_tax = stats.get("truth_tax")
+    if truth_tax and "suppressed" not in truth_tax:
+        lines.append("## Truth-tax estimand (#14, §9.2 — chain primary)")
+        lines.append("")
+        lines.append(f"- {truth_tax['estimand_text']}")
+        lines.append(f"- sidedness: {truth_tax['sidedness_note']}")
+        lines.append("")
+        for leg in truth_tax.get("legs", ()):
+            lines.append(
+                f"- {leg['dataset']}: `{leg['engine']}` vs "
+                f"`{leg['anchor_engine']}`: Δ(G−Y) = {leg['mean_diff']:+.4f} "
+                f"(p={leg['p_value']:.3g}, windows "
+                f"{leg['n_windows_cell']}/{leg['n_windows_anchor']})"
+            )
+        for iu in truth_tax.get("per_dataset_intersection", ()):
+            lines.append(
+                f"- **{iu['dataset']}: IU p = "
+                f"{iu['p_intersection_union']:.3g}** "
+                f"({iu['n_legs']} engine leg(s))"
+            )
+        for skipped_leg in truth_tax.get("skipped", ()):
+            lines.append(f"- SKIPPED — {skipped_leg['reason']}")
+        if truth_tax.get("excluded_windows"):
+            lines.append(
+                f"- excluded windows (§9.2 in-regime population): "
+                f"{len(truth_tax['excluded_windows'])} (counted in stats.json)"
+            )
+        lines.append("")
+
     falsification = stats.get("falsification")
     if falsification:
         lines.append(
@@ -3425,6 +3999,7 @@ def run_analysis(
     equivalence_metric: str | None = None,
     alpha: float = 0.05,
     accepted_step_down: int | None = None,
+    predicate_run_id: str | None = None,
 ) -> AnalysisResult:
     """Execute the pipeline; the CLI wraps this with the one-look flag checks.
 
@@ -3463,16 +4038,6 @@ def run_analysis(
     metrics = resolved_metrics
     for metric in metrics:
         _metric_direction(metric)  # fail before any I/O on unknown direction
-
-    # G4c: the truth-tax estimand (#14) has no computable inputs until the
-    # §8.5 Y predicate producer lands — a fail-loud stub, never a silent skip.
-    if 14 in contrast_ids:
-        raise AnalysisError(
-            "contrast #14 (truth-tax estimand, §9.2) cannot be computed: its "
-            "registered variable truth_tax = G − Y requires the §8.5 Y "
-            "predicate producer (task #119), which has not landed — "
-            "chain_complete stays honestly False until it does (G4)"
-        )
 
     stamp = CONFIRMATORY_STAMP if mode == "confirmatory" else DESIGN_STAMP
     preconditions: dict[str, Any] = {
@@ -3541,6 +4106,13 @@ def run_analysis(
     try:
         index = load_index(run_dir)
 
+        # Task #119: locate + verify the §8.5 predicate table (the joined
+        # decoupled-scoring output). None is legal — the registered predicate
+        # legs then refuse/record through the existing missing-column paths.
+        predicate_root, predicate_manifest = resolve_predicate_root(
+            run_dir, predicate_run_id
+        )
+
         # §9.8: a sealed arm map means the pipeline output stays scrambled
         # until the one-time logged unblinding (which the confirmatory look
         # performs). Tampered seals raise here, before anything is computed.
@@ -3571,11 +4143,12 @@ def run_analysis(
 
         # Executor-backed ids (G4) never enter the baseline-pair pipeline:
         # #13 runs through compute_fingerprint (always), #12 through
-        # compute_falsification_suite (when requested), #14 raised above.
+        # compute_falsification_suite and #14 through compute_truth_tax
+        # (each when requested).
         pair_ids = [
             cid
             for cid in contrast_ids
-            if cid not in (FINGERPRINT_CONTRAST_ID, FLOOR_SUITE_CONTRAST_ID)
+            if cid not in (FINGERPRINT_CONTRAST_ID, FLOOR_SUITE_CONTRAST_ID, 14)
         ]
         computable, skipped_contrasts = resolve_contrasts(pair_ids)
         per_query_contrasts = [
@@ -3619,7 +4192,9 @@ def run_analysis(
             for k in (p.cell_row_key, p.reference_row_key)
         }
         per_query = (
-            load_per_query(run_dir, index, wanted_keys)
+            load_per_query(
+                run_dir, index, wanted_keys, predicate_root=predicate_root
+            )
             if wanted_keys
             else pd.DataFrame()
         )
@@ -3682,9 +4257,8 @@ def run_analysis(
                         f"registered metric {metric!r} appears in no "
                         "per-query artifact"
                         + (
-                            " — the §8.5 Y predicate producer (task #119) "
-                            "has not landed; the co-primary set FAILS on "
-                            "the missing legs (G5), it never shrinks"
+                            f" — {_PREDICATE_FIX_HINT}; the co-primary set "
+                            "FAILS on the missing legs (G5), it never shrinks"
                             if metric == PREDICATE_METRIC
                             else " — the registered leg is missing; the "
                             "co-primary set FAILS on it (G5)"
@@ -3752,7 +4326,9 @@ def run_analysis(
         )
         pressure_block = pressure_row_skip(index, consumed)
 
-        per_query_loader = lambda keys: load_per_query(run_dir, index, keys)  # noqa: E731
+        per_query_loader = lambda keys: load_per_query(  # noqa: E731
+            run_dir, index, keys, predicate_root=predicate_root
+        )
 
         # G4a: the #13 fingerprint superiority legs — their per-dataset
         # intersection-union p is the endpoint's chain contribution.
@@ -3764,12 +4340,26 @@ def run_analysis(
             alpha=alpha,
         )
 
+        # G4c (task #119): the #14 truth-tax estimand executor — only when
+        # requested (fail-loud on missing inputs by design; the pre-predicate
+        # refusal REMAINS, naming the producer command).
+        truth_tax_section: dict[str, Any] | None = None
+        truth_tax_primaries: list[PrimaryOutcome] = []
+        if 14 in contrast_ids:
+            truth_tax_section, truth_tax_primaries = compute_truth_tax(
+                run_dir,
+                index,
+                family_ctx,
+                predicate_root=predicate_root,
+                alpha=alpha,
+            )
+
         # §9.3 wiring: the registered chain + Holm-within-family corrections.
         gatekeeping_section = run_gatekeeping(
             contrast_stats,
             family_ctx,
             alpha=alpha,
-            extra_primaries=fingerprint_primaries,
+            extra_primaries=[*fingerprint_primaries, *truth_tax_primaries],
         )
 
         # §9.5 wiring: conditional TOST for the declared equivalence legs.
@@ -3829,6 +4419,24 @@ def run_analysis(
                 )
                 if not per_query.empty
                 else [],
+                # Task #119: which §8.5 predicate table (if any) was joined.
+                "predicate_table": (
+                    None
+                    if predicate_root is None
+                    else {
+                        "path": f"{PREDICATE_DIRNAME}/{predicate_root.name}",
+                        "scoring_run_id": (
+                            predicate_manifest.get("scoring_run_id")
+                            if predicate_manifest is not None
+                            else None
+                        ),
+                        "config": (
+                            predicate_manifest.get("config")
+                            if predicate_manifest is not None
+                            else None
+                        ),
+                    }
+                ),
             },
             "family_map": (
                 {
@@ -3849,6 +4457,17 @@ def run_analysis(
             "gatekeeping": gatekeeping_section,
             "equivalence": equivalence_section,
             "fingerprint": fingerprint_section,
+            "truth_tax": (
+                {
+                    "suppressed": (
+                        "§9.8 blinding active — the #14 section carries "
+                        "row_key/arm-bearing axes; suppressed until the "
+                        "logged unblinding"
+                    )
+                }
+                if blinding_active and truth_tax_section is not None
+                else truth_tax_section
+            ),
             "exploratory": exploratory_section,
             "falsification": falsification_section,
             "blinding": blinding_section,
@@ -4044,6 +4663,17 @@ def _build_parser() -> argparse.ArgumentParser:
         f"step-down to this ladder rung ({ADR0086_REALIZED_N_LADDER}); "
         "recorded in stats.json — never silent (G16)",
     )
+    parser.add_argument(
+        "--predicate-run-id",
+        type=str,
+        default=None,
+        metavar="ID",
+        help="which predicate/<scoring_run_id>/ table joins the §8.5 "
+        "'predicate' metric (task #119; built by build_predicate_table.py). "
+        "Default: auto-select when exactly ONE table exists; multiple tables "
+        "refuse without this flag; none -> the registered predicate legs "
+        "surface through the missing-column refusals",
+    )
     return parser
 
 
@@ -4098,6 +4728,7 @@ def main(argv: list[str] | None = None) -> int:
             equivalence_metric=args.equivalence_metric,
             alpha=args.alpha,
             accepted_step_down=args.accept_step_down,
+            predicate_run_id=args.predicate_run_id,
         )
     except AnalysisError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

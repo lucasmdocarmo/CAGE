@@ -591,6 +591,16 @@ def verify_run(run_dir: Path) -> dict[str, Any]:
     accounting_rows = _walk_cells(run_dir, findings)
     ledger_summary = _check_ledger(run_dir, findings)
 
+    # Task #119: the §8.5 predicate tables (predicate/<scoring_run_id>/) —
+    # schema-guarded exactly like organize time (mirror-only rule, manifest
+    # keys, seal cross-match, tri-state predicate values, own ledger).
+    try:
+        predicate_summary = org.validate_predicate_trees(run_dir)
+    except org.LayoutError as exc:
+        predicate_summary = []
+        for problem in exc.problems:
+            findings.append(Finding("FAIL", "predicate", "predicate/", problem))
+
     totals: dict[str, Any] = {"n_windows": len(accounting_rows)}
     for key in (
         "n_requests_rows",
@@ -622,6 +632,7 @@ def verify_run(run_dir: Path) -> dict[str, Any]:
         "findings": [asdict(f) for f in findings],
         "accounting": {"per_window": accounting_rows, "totals": totals},
         "ledger": ledger_summary,
+        "predicate_tables": predicate_summary,
     }
 
 

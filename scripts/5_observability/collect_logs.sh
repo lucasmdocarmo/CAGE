@@ -1,13 +1,15 @@
 #!/bin/bash
-# CAGE log collector. Gather EVERY run + system log into logs/ and mirror to GCS, so
-# nothing is lost when a VM is torn down or preempted. Host-namespaced (vm_logs/<host>/)
-# for multi-node Phase 3.
+# CAGE log collector. Gather EVERY run + system log into logs/ and mirror to the
+# off-box backup target (provider-neutral via sync_results.sh: gs:// | s3:// |
+# ssh:// | file://), so nothing is lost when a box is torn down or preempted.
+# Host-namespaced (vm_logs/<host>/) for multi-node runs.
 #
 # On success in full mode it writes a per-run SENTINEL object as the LAST upload
-# (vm_logs/<host>/COLLECT_OK_<token>), AFTER the content sync, so teardown_vm.sh can
-# verify robustly that THIS collection actually completed before deleting the VM.
+# (vm_logs/<host>/COLLECT_OK_<token>), AFTER the content sync, so the teardown
+# scripts (teardown_pod.sh / teardown_vm.sh) can verify robustly that THIS
+# collection actually completed before deleting the box.
 #
-# Captures what sync_results_to_gcs.sh (results/ only) does NOT:
+# Captures what sync_results.sh (results/ only) does NOT:
 #   - vLLM server logs   (logs/vllm/*.log)
 #   - run stdout / stats (HOME, repo root, and extra dirs; depth<=2; *.log/*.out/nohup.out)
 #   - status timeline    (status_timeline*.log)
@@ -18,14 +20,16 @@
 #   bash scripts/5_observability/collect_logs.sh           # full: logs + forensics + sync (+ success sentinel)
 #   bash scripts/5_observability/collect_logs.sh --light   # logs + sync only (cheap; periodic use; no sentinel)
 # Env:
-#   CAGE_RESULTS_BUCKET   override bucket (default gs://<project>-cage-results)
-#   CAGE_COLLECT_TOKEN    unique token for the success sentinel (teardown_vm.sh sets this)
+#   CAGE_BACKUP_TARGET    provider-neutral target (gs://|s3://|ssh://|file://)
+#   CAGE_RESULTS_BUCKET   legacy GCS override (bare name or gs://); on a GCP box
+#                         the metadata-derived default still applies (GCS port)
+#   CAGE_COLLECT_TOKEN    unique token for the success sentinel (teardown scripts set this)
 #   CAGE_EXTRA_LOG_DIRS   extra ':'-separated dirs to also scan for *.log/*.out
-#   CAGE_LOG_NO_SYNC=1    gather + manifest only, skip GCS upload (for local testing)
+#   CAGE_LOG_NO_SYNC=1    gather + manifest only, skip the upload (for local testing)
 #
 # Deliberately NOT `set -e`: collection is best-effort by design -- one unreadable
 # forensic source must never abort the gather; each step is individually guarded and
-# only the GCS sync result decides the exit code (fail-closed for teardown).
+# only the (provider-neutral) backup sync result decides the exit code (fail-closed for teardown).
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -80,7 +84,12 @@ if ! is_light; then
     ( pip freeze 2>/dev/null )                            > "$SYS/pip_freeze.txt"      2>&1 || true
     ( python3 -c "import vllm,torch;print('vllm',vllm.__version__);print('torch',torch.__version__)" 2>/dev/null ) \
                                                           > "$SYS/versions.txt"        2>&1 || true
-    ( env | grep -iE "VLLM|CAGE|CUDA|REDIS|HF_HOME|HUGGING" | sort ) \
+    # Env forensics with SECRET REDACTION (finding J9): the raw dump captured
+    # HUGGING_FACE_HUB_TOKEN / VLLM_API_KEY values VERBATIM and uploaded them to the
+    # bucket on every collect. Keep the variable NAMES (presence is the forensic
+    # signal) but replace the VALUE of any name matching the secret pattern.
+    ( env | grep -iE "VLLM|CAGE|CUDA|REDIS|HF_HOME|HUGGING" | sort \
+        | awk -F= 'BEGIN{OFS="="} toupper($1) ~ /TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL/ {print $1, "***REDACTED***"; next} {print}' ) \
                                                           > "$SYS/cage_env.txt"        2>&1 || true
     ( redis-cli ping 2>/dev/null )                        > "$SYS/redis.txt"           2>&1 || true
     # docker / redis container logs (cloud_run starts a cage-redis container) - best effort
@@ -98,20 +107,22 @@ find "$LOGROOT" -type f 2>/dev/null | sort > "$LOGROOT/COLLECTED_MANIFEST_${HOST
 N=$(find "$LOGROOT" -type f 2>/dev/null | wc -l | tr -d ' ')
 echo "[collect_logs] gathered $N files under $LOGROOT/ (host=$HOST mode=$MODE)"
 
-# --- 4. Mirror to GCS, host-namespaced (unless CAGE_LOG_NO_SYNC=1) -----------------
+# --- 4. Mirror to the backup target, host-namespaced (unless CAGE_LOG_NO_SYNC=1) ---
 if [ "${CAGE_LOG_NO_SYNC:-0}" = "1" ]; then
-  echo "[collect_logs] CAGE_LOG_NO_SYNC=1 -> skipping GCS upload (local gather only)"
+  echo "[collect_logs] CAGE_LOG_NO_SYNC=1 -> skipping upload (local gather only)"
   echo "COLLECT_LOGS_DONE host=$HOST (no-sync)"
   exit 0
 fi
-if ! bash "$SCRIPT_DIR/sync_results_to_gcs.sh" "$LOGROOT" "${CAGE_RESULTS_BUCKET:-}" "vm_logs/$HOST"; then
+# Provider-neutral sync (task #137): target resolution + per-backend markers live
+# in sync_results.sh; a failure exits nonzero here — fail-closed for teardown.
+if ! bash "$SCRIPT_DIR/sync_results.sh" "$LOGROOT" "${CAGE_BACKUP_TARGET:-${CAGE_RESULTS_BUCKET:-}}" "vm_logs/$HOST"; then
   echo "COLLECT_LOGS_SYNC_FAILED host=$HOST" >&2
   exit 1
 fi
 
 # Success sentinel (full mode only): written + uploaded in a SECOND sync, i.e. AFTER the
-# content sync above succeeded, so its presence in GCS proves the content is there too.
-# teardown_vm.sh checks for this exact token before it will delete the VM (fail-closed).
+# content sync above succeeded, so its presence off-box proves the content is there too.
+# The teardown scripts check for this exact token before deleting the box (fail-closed).
 if is_light; then
   echo "COLLECT_LOGS_DONE host=$HOST -> vm_logs/$HOST/ (light, no sentinel)"
   exit 0
@@ -121,7 +132,7 @@ TOKEN="$(printf '%s' "$TOKEN" | tr -c 'A-Za-z0-9_.-' '_')"   # sentinel name mus
 SENT="$LOGROOT/COLLECT_OK_${TOKEN}"
 { echo "host=$HOST"; echo "token=$TOKEN"; echo "files=$N"; date -u; } > "$SENT" \
   || { echo "COLLECT_LOGS_SENTINEL_WRITE_FAILED host=$HOST" >&2; exit 1; }
-if bash "$SCRIPT_DIR/sync_results_to_gcs.sh" "$LOGROOT" "${CAGE_RESULTS_BUCKET:-}" "vm_logs/$HOST" >/dev/null 2>&1; then
+if bash "$SCRIPT_DIR/sync_results.sh" "$LOGROOT" "${CAGE_BACKUP_TARGET:-${CAGE_RESULTS_BUCKET:-}}" "vm_logs/$HOST" >/dev/null 2>&1; then
   echo "COLLECT_LOGS_DONE host=$HOST sentinel=COLLECT_OK_${TOKEN}"
 else
   echo "COLLECT_LOGS_SENTINEL_SYNC_FAILED host=$HOST" >&2

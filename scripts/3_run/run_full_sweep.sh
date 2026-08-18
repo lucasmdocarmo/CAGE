@@ -10,7 +10,8 @@
 #
 # RESUME SEMANTICS
 #   The run-id is taken from an exported CAGE_RUN_ID if present (resume), else minted here
-#   with cloud_run.sh's exact convention: <YYYY-MM-DD_HHMM>_<model-slug>_<Q>x<T>.
+#   with cloud_run.sh's exact convention (mint_run_id in scripts/lib/_common.sh):
+#   <YYYY-MM-DD_HHMMSS>_<model-slug>_<Q>x<T>_<4-hex>_<dataset>.
 #   Every tree skips cells that are already COMPLETE (all trial_1..NUM_TRIALS/metrics.json
 #   present) and continues past failed cells (STATUS=failed sentinels). After a crash,
 #   preemption, or partial failure:
@@ -47,15 +48,24 @@ source "$SCRIPT_DIR/../lib/_serving_config.sh"
 # to restore inline scoring.
 export CAGE_SKIP_QUALITY="${CAGE_SKIP_QUALITY:-1}"
 
-# ONE run-id for the whole matrix. Reuses cloud_run.sh's minting convention (cloud_run.sh:47)
-# and EXPORTS it before delegating, so cloud_run.sh + both lever trees + stats all resolve
-# the SAME results/<phase>/<run-id>/ root instead of each minting a fresh one.
+# ONE run-id for the whole matrix. Reuses cloud_run.sh's minting convention (_common.sh
+# mint_run_id: seconds + random suffix + dataset, finding J3 -- minute-granular ids could
+# fragment/converge runs) and EXPORTS it before delegating, so cloud_run.sh + both lever
+# trees + stats all resolve the SAME results/<phase>/<run-id>/ root instead of each
+# minting a fresh one.
 PHASE="${PHASE:-phase2}"
 _model_slug="$(printf '%s' "$MODEL" | tr '[:upper:]' '[:lower:]' | sed -E 's|.*/||; s|[^a-z0-9]+|-|g; s|^-+||; s|-+$||')"
 export CAGE_PHASE="$PHASE"
-export CAGE_RUN_ID="${CAGE_RUN_ID:-$(date +%Y-%m-%d_%H%M)_${_model_slug}_${NUM_QUERIES}x${NUM_TRIALS}}"
+export CAGE_RUN_ID="${CAGE_RUN_ID:-$(mint_run_id "$_model_slug" "$NUM_QUERIES" "$NUM_TRIALS" "${DATASET:-squad_v2}")}"
 export CAGE_RUN_ROOT="$PROJECT_DIR/results/${PHASE}/${CAGE_RUN_ID}"
 mkdir -p "$CAGE_RUN_ROOT"
+
+# One orchestrator per run root (finding J3): a second resume instance on the same root
+# could rm -rf a cell a live tree is writing. The child runners re-enter via
+# CAGE_RUN_LOCK_HELD instead of re-acquiring. MUST happen BEFORE the backup daemon
+# start below: detached daemons are launched with the lock fd closed (200>&-), and a
+# daemon that inherited the fd would hold the lock after this orchestrator died.
+acquire_run_lock "$CAGE_RUN_ROOT"
 
 # Redundant cloud backup of the WHOLE results/<phase>/ tree (every run-id + every tree,
 # including the lever trees / scoring / stats that cloud_run.sh's core-only syncer misses).

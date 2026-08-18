@@ -53,6 +53,81 @@ require_env() {
   done
 }
 
+# --- runner-hardening helpers (Topic-10 walkthrough J-series, task #136) ------
+
+# metrics_json_valid <file> — 0 iff <file> exists AND parses as JSON.
+# The shell resume gates (cell_complete in every runner) must never treat a
+# corrupt/truncated/foreign metrics.json as "complete" (finding J2): existence
+# is not validity. An unparseable file is announced LOUDLY and the cell is
+# treated as incomplete, so it re-runs instead of freezing corrupt data in.
+metrics_json_valid() {
+  local f="$1"
+  [ -f "$f" ] || return 1
+  if ! python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$f" >/dev/null 2>&1; then
+    warn "invalid metrics.json (unparseable JSON) -> treating cell as INCOMPLETE: $f"
+    return 1
+  fi
+  return 0
+}
+
+# mint_run_id <model-slug> <num-queries> <num-trials> <dataset> — unique run-id:
+#   <YYYY-MM-DD_HHMMSS>_<slug>_<Q>x<T>_<4-hex-random>_<dataset>
+# Seconds + a random suffix close the J3 fragment/converge hazard of the old
+# minute-granular ids (two runners minting in the same minute CONVERGED on one
+# root; a resumed runner one minute later FRAGMENTED onto a new one). The
+# dataset lands LAST because the pilot bridge (build_legacy_index.infer_dataset)
+# reads the dataset from a run name's `_<dataset>` suffix, fail-closed.
+mint_run_id() {
+  printf '%s_%s_%sx%s_%04x_%s' "$(date +%Y-%m-%d_%H%M%S)" "$1" "$2" "$3" "$((RANDOM % 65536))" "$4"
+}
+
+# acquire_run_lock <run_root> — exclusive NON-BLOCKING flock on
+# <run_root>/.cage_run.lock (finding J3: two resume instances on one root can
+# rm -rf a live cell). Fail-LOUD if another runner holds it. Re-entrant across
+# the orchestrator chain (run_full_sweep -> cloud_run -> run_baselines): the
+# first acquirer exports CAGE_RUN_LOCK_HELD=<lockfile>, children on the SAME
+# root skip re-acquisition (the parent's fd keeps the lock alive). The lock fd
+# (200) is deliberately inherited by FOREGROUND children (a live run_experiment
+# keeps blocking a second instance even if the runner shell dies) but must be
+# closed (200>&-) when launching DETACHED daemons, or a surviving daemon would
+# hold the lock forever. flock(1) is util-linux: absent on macOS, where we warn
+# LOUDLY and continue (GPU runs happen on Linux VMs; flock exists there).
+acquire_run_lock() {
+  local root="$1" lockf="$1/.cage_run.lock"
+  if [ "${CAGE_RUN_LOCK_HELD:-}" = "$lockf" ]; then
+    log "run lock already held by a parent process: $lockf"
+    return 0
+  fi
+  mkdir -p "$root" || die "cannot create run root for lock: $root"
+  if ! command -v flock >/dev/null 2>&1; then
+    warn "flock(1) not found (macOS?) -- concurrent-runner exclusion NOT enforced on $lockf"
+    return 0
+  fi
+  exec 200>>"$lockf" || die "cannot open run lock file: $lockf"
+  if ! flock -n 200; then
+    die "another runner already holds the run lock $lockf -- a second resume instance can rm -rf a live cell (J3). Wait for it to finish or stop it first."
+  fi
+  export CAGE_RUN_LOCK_HELD="$lockf"
+  log "acquired exclusive run lock: $lockf"
+}
+
+# pidfile_alive <pidfile> <identity-substring> — 0 iff <pidfile> holds a live
+# pid whose `ps` command line contains <identity-substring>. The identity check
+# is the J8 PID-reuse guard: a recycled pid from a rebooted/busy VM must never
+# be treated as (or KILLED as) our daemon just because a stale pidfile names it.
+pidfile_alive() {
+  local pf="$1" ident="$2" pid cmd
+  [ -f "$pf" ] || return 1
+  pid="$(cat "$pf" 2>/dev/null || true)"
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  # -ww: NEVER truncate the command line (BSD ps clips otherwise; the gcs loop's
+  # identity token -- its pidfile path -- sits AFTER the ~700-char loop body).
+  cmd="$(ps -ww -p "$pid" -o command= 2>/dev/null || true)"
+  case "$cmd" in *"$ident"*) return 0 ;; esac
+  return 1
+}
+
 # confirm "<prompt>" -> 0 = yes, 1 = no.  FAIL-CLOSED in non-interactive shells:
 # with no TTY the answer is NO unless CAGE_ASSUME_YES=1 was exported deliberately.
 # Use before every destructive / cost-starting action (terraform apply/destroy,

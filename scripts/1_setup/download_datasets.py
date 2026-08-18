@@ -40,11 +40,17 @@ from typing import Dict, List, Optional, Tuple
 # a key must succeed for the key to count as staged.
 DatasetSpecs = Dict[str, List[Tuple[str, Optional[str]]]]
 
-#: Charter campaign roster (what `--dataset all` stages).
+#: Charter campaign roster (what `--dataset all` stages) — the charter D5
+#: downloadable set (#139 reconciliation, 2026-08-19). RULER is GENERATED at
+#: run time (never downloaded); CRAG is cite-only in the charter. Preflight
+#: gate (p) builds its known-roster set from this list.
 CAMPAIGN_KEYS = [
-    "hotpotqa", "qasper", "squad_v2", "trivia_qa", "natural_questions",
-    "musique", "crag", "sharegpt", "scbench",
+    "hotpotqa", "musique", "qasper", "scbench", "sharegpt", "squad_v2",
 ]
+#: Pilot-era extras: stageable ONLY by explicit `--dataset <key>`, never part
+#: of `all`, and NOT in preflight gate (p)'s charter roster — a campaign run
+#: requesting one refuses loudly.
+PILOT_EXTRA_KEYS = ["crag", "natural_questions", "trivia_qa"]
 #: Instrument-calibration anchors (staged only on explicit request).
 CALIBRATION_KEYS = ["ragtruth", "true"]
 
@@ -123,11 +129,14 @@ def main() -> int:
     )
     parser.add_argument(
         "--dataset",
-        choices=sorted(set(CAMPAIGN_KEYS + CALIBRATION_KEYS)) + ["all", "calibration"],
+        choices=sorted(set(CAMPAIGN_KEYS + PILOT_EXTRA_KEYS + CALIBRATION_KEYS))
+        + ["all", "calibration"],
         default="all",
         help=(
             "Dataset to stage. 'all' = the charter campaign roster "
-            f"({', '.join(CAMPAIGN_KEYS)}); 'calibration' = the D8 §8.6(a) "
+            f"({', '.join(CAMPAIGN_KEYS)}); pilot-era extras "
+            f"({', '.join(PILOT_EXTRA_KEYS)}) stage only by explicit key; "
+            f"'calibration' = the D8 §8.6(a) "
             f"instrument anchors ({', '.join(CALIBRATION_KEYS)})."
         ),
     )

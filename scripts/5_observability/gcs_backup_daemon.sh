@@ -21,7 +21,11 @@
 #   gcs_backup_daemon.sh status [phase_dir]  # running check + last sync line; exit 0=running,1=not
 #
 # ENV
-#   CAGE_RESULTS_BUCKET   REQUIRED. gs://bucket (or bare name). LOUD no-op if unset.
+#   CAGE_BACKUP_TARGET    provider-neutral target: gs://|s3://|ssh://|file://
+#                         (task #137; RunPod-primary). Takes precedence.
+#   CAGE_RESULTS_BUCKET   legacy GCS spelling: gs://bucket (or bare name).
+#                         With NEITHER set, `start` DIES (J4) unless
+#                         CAGE_ALLOW_NO_BACKUP=1 explicitly accepts no backup.
 #   CAGE_BACKUP_INTERVAL  seconds between syncs (default 300)
 #   CAGE_PHASE            phase segment (default phase2)
 #
@@ -42,13 +46,25 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # shellcheck source=scripts/lib/_common.sh
 source "$PROJECT_DIR/scripts/lib/_common.sh"
+# shellcheck source=scripts/lib/transport.sh
+source "$PROJECT_DIR/scripts/lib/transport.sh"
 cd "$PROJECT_DIR" || die "cannot cd to $PROJECT_DIR"
 
 ACTION="${1:-}"
 PHASE_DIR="${2:-results/${CAGE_PHASE:-phase2}}"
 INTERVAL="${CAGE_BACKUP_INTERVAL:-300}"
-BUCKET="${CAGE_RESULTS_BUCKET:-}"
-SYNC_SH="$SCRIPT_DIR/sync_results_to_gcs.sh"
+# Provider-neutral (task #137): CAGE_BACKUP_TARGET (gs://|s3://|ssh://|file://)
+# is primary; CAGE_RESULTS_BUCKET is the legacy GCS spelling.
+BUCKET="${CAGE_BACKUP_TARGET:-${CAGE_RESULTS_BUCKET:-}}"
+SYNC_SH="$SCRIPT_DIR/sync_results.sh"
+
+# Legacy bare bucket name -> gs:// (scheme'd targets pass through untouched).
+normalize_target() {
+  case "$1" in
+    "" | gs://* | s3://* | ssh://* | file://* | /*) printf '%s\n' "$1" ;;
+    *) printf 'gs://%s\n' "$1" ;;
+  esac
+}
 
 # Run-scoped state dir: one daemon per watched tree.
 SCOPE="$(printf '%s' "$PHASE_DIR" | tr -c 'A-Za-z0-9_.-' '_')"
@@ -62,18 +78,21 @@ mkdir -p "$STATE_DIR"
 log()  { printf '[gcs-backup] %s\n' "$*"; }
 warn() { printf '[gcs-backup] WARNING: %s\n' "$*" >&2; }
 
-pid_alive() {  # pid_alive <pidfile> -> 0 iff pidfile holds a live pid
-  local pf="$1" pid
-  [ -f "$pf" ] || return 1
-  pid="$(cat "$pf" 2>/dev/null || true)"
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+# pid_alive <pidfile> -> 0 iff pidfile holds a live pid THAT IS OUR LOOP.
+# Identity = the pidfile path itself: the loop is launched with $PIDF as a positional
+# arg, so it appears verbatim on the loop's command line. A recycled pid (VM reboot /
+# PID wraparound, finding J8) fails the ps-command match and is treated as dead.
+pid_alive() {
+  pidfile_alive "$1" "$1"
 }
 
 stop_pidfile() {  # stop_pidfile <pidfile> -> stop the daemon it names (idempotent)
   local pf="$1" pid
   [ -f "$pf" ] || return 0
   pid="$(cat "$pf" 2>/dev/null || true)"
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+  # pid_alive (identity-checked) guards the kill: NEVER kill a recycled pid that
+  # merely appears in a stale pidfile (finding J8).
+  if [ -n "$pid" ] && pid_alive "$pf"; then
     kill "$pid" 2>/dev/null || true
     # Bounded wait (<=5s) for the loop's EXIT trap to remove its pidfile.
     local i
@@ -116,16 +135,21 @@ LOOP_BODY='
 case "$ACTION" in
   start)
     if [ -z "$BUCKET" ]; then
-      warn "CAGE_RESULTS_BUCKET is unset -> NO cloud backup this run"
-      warn "         (data will exist ONLY on the VM disk until the local pull)."
-      exit 0
+      # J4 LOUD degradation: an unset target used to warn + exit 0, so a whole
+      # sweep could run with ZERO off-box persistence and nothing said so.
+      if [ "${CAGE_ALLOW_NO_BACKUP:-0}" = "1" ]; then
+        warn "no backup target and CAGE_ALLOW_NO_BACKUP=1 -> NO off-box backup this run"
+        warn "         (data will exist ONLY on the box disk until the local pull)."
+        exit 0
+      fi
+      die "no backup target (J4): set CAGE_BACKUP_TARGET (gs://|s3://|ssh://|file://) or CAGE_RESULTS_BUCKET — or export CAGE_ALLOW_NO_BACKUP=1 to explicitly accept a run with NO off-box backup"
     fi
-    case "$BUCKET" in gs://*) ;; *) BUCKET="gs://$BUCKET" ;; esac
+    BUCKET="$(normalize_target "$BUCKET")"
     case "$INTERVAL" in ''|*[!0-9]*) warn "CAGE_BACKUP_INTERVAL='$INTERVAL' not a positive integer"; exit 2 ;; esac
-    if ! gcloud storage ls "$BUCKET" >/dev/null 2>&1; then
-      warn "bucket $BUCKET is not reachable -> NO cloud backup this run."
-      warn "         Create it / fix the VM SA's storage.objectAdmin, then restart."
-      exit 0
+    if ! transport_ensure "$BUCKET"; then
+      # A CONFIGURED-but-unreachable target is a misconfiguration, not a choice:
+      # fail LOUD (never exit 0) so the launcher aborts instead of running bare.
+      die "backup target $BUCKET is not reachable/usable (create the bucket / fix credentials / check CAGE_S3_ENDPOINT or CAGE_SSH_OPTS, then restart)"
     fi
     # Idempotent start: a live daemon for this scope is left alone.
     if pid_alive "$PIDF"; then
@@ -137,13 +161,16 @@ case "$ACTION" in
     # exiting (a plain `( ) &` is SIGHUP-killed when an `ssh --command` session closes).
     # setsid is Linux-only (util-linux; the VMs have it): on macOS fall back LOUDLY to
     # nohup+disown, which also survives the parent shell (no ssh-session concern locally).
+    # 200>&-: never let the detached loop inherit a caller's J3 run-lock fd
+    # (acquire_run_lock in _common.sh) -- a daemon outliving its runner would
+    # otherwise hold the run lock and block every resume.
     if command -v setsid >/dev/null 2>&1; then
       setsid bash -c "$LOOP_BODY" _ "$PIDF" "$SYNC_SH" "$PHASE_DIR" "$BUCKET" "$LOGF" "$INTERVAL" \
-        >/dev/null 2>&1 &
+        >/dev/null 2>&1 200>&- &
     else
       warn "setsid not found (macOS?) -> falling back to nohup+disown for the loop"
       nohup bash -c "$LOOP_BODY" _ "$PIDF" "$SYNC_SH" "$PHASE_DIR" "$BUCKET" "$LOGF" "$INTERVAL" \
-        >/dev/null 2>&1 &
+        >/dev/null 2>&1 200>&- &
       disown %+ 2>/dev/null || true
     fi
     sleep 1
@@ -169,7 +196,7 @@ case "$ACTION" in
       if [ "$found" -eq 0 ]; then log "no daemon pidfile found (nothing to stop)"; fi
     fi
     if [ -n "$BUCKET" ]; then
-      case "$BUCKET" in gs://*) ;; *) BUCKET="gs://$BUCKET" ;; esac
+      BUCKET="$(normalize_target "$BUCKET")"
       log "final authoritative sync..."
       sync_once || warn "final sync returned nonzero"
     fi

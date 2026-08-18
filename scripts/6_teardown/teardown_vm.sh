@@ -1,4 +1,14 @@
 #!/bin/bash
+# GCP PORT (task #137, 2026-08-18): RunPod is the PRIMARY campaign provider —
+# pods are torn down with scripts/6_teardown/teardown_pod.sh (same fail-closed
+# ordering, ledger-gated pull first). This script is RETAINED for GCP VMs.
+# DELIBERATE: the internal transport below (gcloud storage ls/rsync in the
+# sentinel check and the step-[4/6] bulk pull) stays gcloud-native rather than
+# going through scripts/lib/transport.sh — this script IS the GCS backend
+# (ssh_vm, instance delete, and sentinel verification are all gcloud-only, so a
+# transport indirection here adds risk, not portability). The provider-neutral
+# path is teardown_pod.sh + pull_run.sh.
+#
 # SAFE teardown. Collect ALL logs + a final results sync to GCS, VERIFY via a UNIQUE per-run
 # sentinel that THIS collection actually completed, PULL every result down to the local
 # results/ folder, and only THEN delete the VM. Fails CLOSED (refuses to delete) if the
@@ -7,7 +17,9 @@
 #
 # The local pull is step [4/6] and is deliberately BEFORE the delete: teardown is
 # irreversible, so the run must exist in THREE places (VM + GCS + local) before anything
-# is destroyed. Set CAGE_SKIP_LOCAL_PULL=1 to skip it (you then have no local copy).
+# is destroyed. Skipping it needs a DOUBLE ceremony (finding J10): CAGE_SKIP_LOCAL_PULL=1
+# AND CAGE_SKIP_LOCAL_PULL_CONFIRM=I-ACCEPT-DATA-LOSS; a bypass marker file is recorded
+# under results/ before proceeding (you then have no local copy).
 #
 # Why a sentinel and not a file count: SSH to these VMs drops AFTER the command runs, so
 # the collect step's exit code is unreliable, and a bucket-wide file count can be
@@ -67,7 +79,7 @@ echo "[1/6] final results sync (results/) ..."
 # Forward CAGE_RESULTS_BUCKET into the SSH shell: a non-login `ssh --command` does NOT inherit
 # the run's env, so without this the VM-side scripts fall back to the project-default bucket
 # (gs://<project>-cage-results) which may not exist -> silent 404 -> sentinel never written.
-ssh_vm "cd ~/CAGE && CAGE_RESULTS_BUCKET='$BUCKET' bash scripts/5_observability/sync_results_to_gcs.sh results" | tail -3 || true
+ssh_vm "cd ~/CAGE && CAGE_RESULTS_BUCKET='$BUCKET' bash scripts/5_observability/sync_results.sh results" | tail -3 || true
 
 echo "[2/6] collecting ALL logs + forensics -> GCS (writes success sentinel) ..."
 ssh_vm "cd ~/CAGE && CAGE_RESULTS_BUCKET='$BUCKET' CAGE_COLLECT_TOKEN='$TOKEN' bash scripts/5_observability/collect_logs.sh" | tail -6 || true
@@ -95,7 +107,25 @@ fi
 # (/results/ is gitignored, so a local copy never pollutes the repo.)
 echo "[4/6] pulling ALL results GCS -> local results/ (3rd copy, BEFORE the delete) ..."
 if [ "${CAGE_SKIP_LOCAL_PULL:-0}" = "1" ]; then
-  echo "    SKIPPED (CAGE_SKIP_LOCAL_PULL=1) -- no local copy will exist after this delete"
+  # Finding J10: CAGE_SKIP_LOCAL_PULL=1 used to bypass the fail-closed pull gate
+  # SILENTLY. Skipping the pull means NO local copy survives the delete, so it now
+  # requires a second explicit ceremony (a typed phrase, not another 1) and records
+  # a durable bypass marker into the local results/ root as evidence.
+  if [ "${CAGE_SKIP_LOCAL_PULL_CONFIRM:-}" != "I-ACCEPT-DATA-LOSS" ]; then
+    echo "[teardown] ABORT (fail-closed): CAGE_SKIP_LOCAL_PULL=1 without the confirmation ceremony." >&2
+    echo "           Skipping the local pull leaves NO local copy after the irreversible delete." >&2
+    echo "           To accept that, ALSO export CAGE_SKIP_LOCAL_PULL_CONFIRM=I-ACCEPT-DATA-LOSS" >&2
+    echo "           (or unset CAGE_SKIP_LOCAL_PULL and let the pull run)." >&2
+    exit 1
+  fi
+  mkdir -p results
+  MARKER="results/PULL_BYPASSED_${TOKEN}"
+  { echo "bypass=CAGE_SKIP_LOCAL_PULL"; echo "confirm=I-ACCEPT-DATA-LOSS"
+    echo "vm=$VM"; echo "zone=$ZONE"; echo "bucket=$BUCKET"; echo "token=$TOKEN"
+    date -u; } > "$MARKER" \
+    || { echo "[teardown] ABORT: cannot write bypass marker $MARKER" >&2; exit 1; }
+  echo "    SKIPPED (CAGE_SKIP_LOCAL_PULL=1, ceremony confirmed) -- no local copy will exist after this delete"
+  echo "    bypass marker recorded: $MARKER"
 else
   mkdir -p results
   PULL_OUT="$(gcloud storage rsync -r "$BUCKET/results" results 2>&1)"; PULL_RC=$?
@@ -121,6 +151,16 @@ fi
 echo "[5/6] deleting instance $VM ($ZONE) ... (cost-stopping action)"
 gcloud compute instances delete "$VM" --zone="$ZONE" --quiet
 
-echo "[6/6] confirming \$0 (no instances should remain) ..."
-gcloud compute instances list 2>&1 | head -3
+# Finding J10: the $0 sweep used to list instances ONLY -- surviving disks, static
+# addresses, and buckets kept billing invisibly. All listings are READ-ONLY
+# (report-only): this script deletes nothing but the instance above.
+echo "[6/6] confirming \$0 (read-only sweep: instances, disks, static addresses, buckets) ..."
+echo "  -- instances (should be empty):"
+gcloud compute instances list 2>&1 | head -5
+echo "  -- disks (a survivor here still bills; delete via gcloud compute disks delete):"
+gcloud compute disks list 2>&1 | head -5
+echo "  -- static addresses (a reserved-but-unattached address bills; gcloud compute addresses delete):"
+gcloud compute addresses list 2>&1 | head -5
+echo "  -- storage buckets (bucket deletion is terraform/manual AFTER the local pull is verified):"
+gcloud storage buckets list --format="value(name)" 2>&1 | head -5
 echo "TEARDOWN_COMPLETE  logs=$BUCKET/vm_logs/  results=$BUCKET/results/  sentinel=COLLECT_OK_${TOKEN}"

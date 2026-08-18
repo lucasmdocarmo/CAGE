@@ -117,6 +117,35 @@ _SCORING_MANIFEST_REQUIRED_KEYS: tuple[str, ...] = (
     "raw_run_ledger_entries_sha256",
 )
 
+#: Task #119 — the §8.5 predicate-table sibling (predicate/<scoring_run_id>/,
+#: produced by scripts/4_analysis/build_predicate_table.py): a post-seal
+#: derived tree, validated like a scoring pass, never indexed, never inside
+#: cells/.
+PREDICATE_DIRNAME = "predicate"
+PREDICATE_MANIFEST_NAME = "predicate_manifest.json"
+PREDICATE_ROWS_NAME = "predicate.jsonl"
+_PREDICATE_MANIFEST_REQUIRED_KEYS: tuple[str, ...] = (
+    "schema_version",
+    "scoring_run_id",
+    "raw_run_ledger_entries_sha256",
+    "scoring_ledger_entries_sha256",
+    "config",
+    "counts",
+    "created_utc",
+)
+#: The predicate-table row contract (schema guard; JSON null is legal for
+#: predicate/record_index — None-propagation is counted, never fabricated).
+_PREDICATE_ROW_REQUIRED_KEYS: tuple[str, ...] = (
+    "example_id",
+    "repeat_index",
+    "record_index",
+    "ok",
+    "dataset",
+    "predicate",
+    "predicate_rule",
+    "predicate_null_reason",
+)
+
 #: §1 dataset ids — the ONLY legal window-name datasets.
 DATASET_IDS: frozenset[str] = frozenset(
     {"squad_v2", "hotpotqa", "musique", "qasper", "ruler", "scbench", "sharegpt"}
@@ -733,7 +762,9 @@ def _sweep_contamination(run_dir: Path) -> list[str]:
             continue
         visited.add(real)
         for name in filenames:
-            if name in REQUIRED_SCORING_WINDOW_ARTIFACTS:
+            # Predicate tables (#119) are §6-forbidden inside cells/ exactly
+            # like scoring outputs — the raw tree stays sealed.
+            if name in REQUIRED_SCORING_WINDOW_ARTIFACTS or name == PREDICATE_ROWS_NAME:
                 hits.add(
                     Path(os.path.relpath(Path(dirpath) / name, run_dir)).as_posix()
                 )
@@ -923,6 +954,190 @@ def validate_scoring_tree(run_dir: Path) -> list[str]:
     return summary
 
 
+def validate_predicate_trees(run_dir: Path) -> list[str]:
+    """Validate every ``predicate/<scoring_run_id>/`` table (task #119).
+
+    Rules (mirroring the §6 scoring-pass discipline — the table is a derived
+    post-seal sibling, never indexed):
+    - each table carries ``predicate_manifest.json`` with the required keys,
+      whose ``raw_run_ledger_entries_sha256`` matches THIS run's seal and
+      whose ``scoring_run_id`` names an existing scoring pass;
+    - its ``cells/<row_key>/window_<k>/`` mirror only windows that exist in
+      the raw tree, each carrying ``predicate.jsonl`` rows that parse and
+      hold the required keys with ``predicate`` in {true, false, null};
+    - the table verifies against its OWN sealed ledger.
+
+    Returns coverage-report summary lines ("none" when no table exists —
+    the predicate build is optional at organize time).
+    """
+    problems: list[str] = []
+    summary: list[str] = []
+    predicate_root = run_dir / PREDICATE_DIRNAME
+    if not predicate_root.is_dir():
+        return summary
+
+    raw_entries_sha256: str | None = None
+    raw_ledger_path = run_dir / "ledger.json"
+    if raw_ledger_path.is_file():
+        try:
+            read_ledger(raw_ledger_path)
+            raw_entries_sha256 = json.loads(
+                raw_ledger_path.read_text(encoding="utf-8")
+            )["entries_sha256"]
+        except (LedgerError, json.JSONDecodeError, KeyError) as exc:
+            problems.append(f"ledger.json unusable for predicate validation: {exc}")
+
+    for pred_dir in sorted(
+        p for p in predicate_root.iterdir() if not p.name.startswith(".")
+    ):
+        pid = pred_dir.name
+        prefix = f"{PREDICATE_DIRNAME}/{pid}"
+        if not pred_dir.is_dir():
+            problems.append(f"{prefix}: not a directory (stray file in predicate/)")
+            continue
+        if not SCORING_RUN_ID_RE.match(pid):
+            problems.append(
+                f"{prefix}: predicate table id violates the §6 id grammar "
+                f"{SCORING_RUN_ID_RE.pattern} (the table is named after the "
+                "scoring pass it joins)"
+            )
+            continue
+        manifest_path = pred_dir / PREDICATE_MANIFEST_NAME
+        if not manifest_path.is_file():
+            problems.append(f"{prefix}: missing {PREDICATE_MANIFEST_NAME} (#119)")
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            problems.append(f"{prefix}/{PREDICATE_MANIFEST_NAME}: invalid JSON: {exc}")
+            continue
+        if not isinstance(manifest, dict):
+            problems.append(f"{prefix}/{PREDICATE_MANIFEST_NAME}: root must be an object")
+            continue
+        missing_keys = [
+            k for k in _PREDICATE_MANIFEST_REQUIRED_KEYS if manifest.get(k) is None
+        ]
+        if missing_keys:
+            problems.append(
+                f"{prefix}/{PREDICATE_MANIFEST_NAME}: missing required "
+                f"key(s) {missing_keys}"
+            )
+            continue
+        if manifest["scoring_run_id"] != pid:
+            problems.append(
+                f"{prefix}/{PREDICATE_MANIFEST_NAME}: scoring_run_id "
+                f"{manifest['scoring_run_id']!r} != directory name {pid!r}"
+            )
+        if not (run_dir / SCORING_DIRNAME / pid).is_dir():
+            problems.append(
+                f"{prefix}: names scoring pass {pid!r} but "
+                f"{SCORING_DIRNAME}/{pid}/ does not exist — a predicate "
+                "table joins a real sealed scoring pass"
+            )
+        if (
+            raw_entries_sha256 is not None
+            and manifest["raw_run_ledger_entries_sha256"] != raw_entries_sha256
+        ):
+            problems.append(
+                f"{prefix}: raw_run_ledger_entries_sha256 does not match this "
+                "run's sealed ledger — the table was built against a "
+                "DIFFERENT seal"
+            )
+
+        n_windows = 0
+        n_rows = 0
+        pred_cells = pred_dir / "cells"
+        if pred_cells.is_dir():
+            for cell_dir in sorted(
+                p for p in pred_cells.iterdir() if not p.name.startswith(".")
+            ):
+                raw_cell = run_dir / "cells" / cell_dir.name
+                if not raw_cell.is_dir():
+                    problems.append(
+                        f"{prefix}/cells/{cell_dir.name}: no such cell in the "
+                        "raw tree — a predicate table cannot invent cells"
+                    )
+                    continue
+                for window_dir in sorted(
+                    p for p in cell_dir.iterdir() if not p.name.startswith(".")
+                ):
+                    if not window_dir.is_dir() or not WINDOW_DIR_RE.match(window_dir.name):
+                        problems.append(
+                            f"{prefix}/cells/{cell_dir.name}/{window_dir.name}: "
+                            "expected a window_<dataset>-<ordinal> directory"
+                        )
+                        continue
+                    if not (raw_cell / window_dir.name).is_dir():
+                        problems.append(
+                            f"{prefix}/cells/{cell_dir.name}/{window_dir.name}: "
+                            "no such window in the raw tree (mirror-only rule)"
+                        )
+                        continue
+                    rows_path = window_dir / PREDICATE_ROWS_NAME
+                    if not rows_path.is_file():
+                        problems.append(
+                            f"{prefix}/cells/{cell_dir.name}/{window_dir.name}: "
+                            f"missing {PREDICATE_ROWS_NAME}"
+                        )
+                        continue
+                    n_windows += 1
+                    for lineno, line in enumerate(
+                        rows_path.read_text(encoding="utf-8").splitlines(), 1
+                    ):
+                        if not line.strip():
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except json.JSONDecodeError as exc:
+                            problems.append(f"{rows_path}:{lineno}: invalid JSON: {exc}")
+                            continue
+                        if not isinstance(row, dict):
+                            problems.append(
+                                f"{rows_path}:{lineno}: row must be an object"
+                            )
+                            continue
+                        n_rows += 1
+                        missing_row_keys = [
+                            k for k in _PREDICATE_ROW_REQUIRED_KEYS if k not in row
+                        ]
+                        if missing_row_keys:
+                            problems.append(
+                                f"{rows_path}:{lineno}: missing key(s) "
+                                f"{missing_row_keys} (predicate row contract)"
+                            )
+                        if row.get("predicate") not in (True, False, None):
+                            problems.append(
+                                f"{rows_path}:{lineno}: predicate value "
+                                f"{row.get('predicate')!r} outside "
+                                "{true, false, null} — None-propagation is "
+                                "tri-state, never a number"
+                            )
+
+        pred_ledger = pred_dir / "ledger.json"
+        if not pred_ledger.is_file():
+            problems.append(
+                f"{prefix}: missing its own ledger.json — a predicate table "
+                "is sealed at build time (#119)"
+            )
+        else:
+            try:
+                mismatches = verify_ledger(pred_ledger, pred_dir)
+            except LedgerError as exc:
+                problems.append(f"{prefix}/ledger.json: {exc}")
+            else:
+                for line in mismatches:
+                    problems.append(f"{prefix}: ledger mismatch — {line}")
+
+        summary.append(
+            f"- `{pid}`: {n_windows} predicate window(s), {n_rows} row(s), "
+            f"sealed={'yes' if pred_ledger.is_file() else 'NO'}"
+        )
+
+    if problems:
+        raise LayoutError(problems)
+    return summary
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -990,6 +1205,7 @@ def organize_run(
     manifest = load_manifest(run_dir)
     records = walk_run_tree(run_dir, manifest)
     scoring_summary = validate_scoring_tree(run_dir)
+    predicate_summary = validate_predicate_trees(run_dir)
     ledger_line = verify_run_ledger(run_dir)
     index = build_index(manifest, records)
     report = build_coverage_report(manifest, index)
@@ -1002,6 +1218,10 @@ def organize_run(
             "## Scoring passes (RESULTS_LAYOUT §6)",
             "",
             *(scoring_summary or ["none"]),
+            "",
+            "## Predicate tables (§8.5 join chain, task #119)",
+            "",
+            *(predicate_summary or ["none"]),
             "",
         ]
     )

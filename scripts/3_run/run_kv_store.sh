@@ -41,9 +41,23 @@ DATASET="${DATASET:-squad_v2}"
 NUM_QUERIES=${NUM_QUERIES:-500}
 NUM_TRIALS=${NUM_TRIALS:-3}
 SEED=${SEED:-42}
-OUTPUT_DIR="${CAGE_RUN_ROOT:-results/phase2/local}/kv_store"
+# Run root: NEVER a shared static dir (finding J3 -- the old results/phase2/local fallback
+# let two standalone runs interleave/wipe each other's cells). Either inherit the
+# orchestrator's CAGE_RUN_ROOT or mint a FRESH unique standalone root, loudly.
+if [ -n "${CAGE_RUN_ROOT:-}" ]; then
+    RUN_ROOT="$CAGE_RUN_ROOT"
+else
+    _slug="$(printf '%s' "$MODEL" | tr '[:upper:]' '[:lower:]' | sed -E 's|.*/||; s|[^a-z0-9]+|-|g; s|^-+||; s|-+$||')"
+    RUN_ROOT="results/${CAGE_PHASE:-phase2}/$(mint_run_id "$_slug" "$NUM_QUERIES" "$NUM_TRIALS" "$DATASET")"
+    warn "CAGE_RUN_ROOT unset -- minted FRESH standalone run root: $RUN_ROOT (cloud_run.sh mints the canonical root for cloud runs)"
+fi
+OUTPUT_DIR="$RUN_ROOT/kv_store"
 LABEL="lmcache_rag"
 mkdir -p "$OUTPUT_DIR"
+
+# One runner per run root (finding J3): a second resume instance on the same root could
+# rm -rf a cell the live instance is writing. Re-entrant under an orchestrator.
+acquire_run_lock "$RUN_ROOT"
 
 # Array so the empty case expands to zero argv words (safe under set -u via ${arr[@]+...}).
 TELEMETRY_FLAG=()
@@ -54,15 +68,16 @@ trap cleanup EXIT
 
 fail_cell() {  # <reason>
     mkdir -p "$OUTPUT_DIR/$LABEL"
-    echo "STATUS=failed reason=$1 model=$MODEL $(date)" > "$OUTPUT_DIR/$LABEL/STATUS"
+    echo "STATUS=failed reason=$1 model=$MODEL dataset=$DATASET $(date)" > "$OUTPUT_DIR/$LABEL/STATUS"
     echo "KV_STORE_FAILED: $LABEL ($1)"
     exit 1
 }
 
 cell_complete() {
+    # Existence is not validity (finding J2): metrics_json_valid JSON-parses each file.
     local t
     for ((t = 1; t <= NUM_TRIALS; t++)); do
-        [ -f "$OUTPUT_DIR/$LABEL/trial_${t}/metrics.json" ] || return 1
+        metrics_json_valid "$OUTPUT_DIR/$LABEL/trial_${t}/metrics.json" || return 1
     done
     return 0
 }

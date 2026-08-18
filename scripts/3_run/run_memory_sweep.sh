@@ -69,17 +69,38 @@ export CAGE_SKIP_QUALITY="${CAGE_SKIP_QUALITY:-1}"
 CORPUS_BUDGET=${CORPUS_BUDGET:-2800}
 MEM_UTILS=${MEM_UTILS:-"0.90 0.84 0.815"}
 PORT=${VLLM_PORT:-8000}
-OUTPUT_DIR="${CAGE_RUN_ROOT:-results/phase2/local}/memory_sweep"
+# Run root: NEVER a shared static dir (finding J3 -- the old results/phase2/local fallback
+# let two standalone sweeps interleave/wipe each other's cells). Either inherit the
+# orchestrator's CAGE_RUN_ROOT or mint a FRESH unique standalone root, loudly.
+if [ -n "${CAGE_RUN_ROOT:-}" ]; then
+    RUN_ROOT="$CAGE_RUN_ROOT"
+else
+    _slug="$(printf '%s' "$MODEL" | tr '[:upper:]' '[:lower:]' | sed -E 's|.*/||; s|[^a-z0-9]+|-|g; s|^-+||; s|-+$||')"
+    RUN_ROOT="results/${CAGE_PHASE:-phase2}/$(mint_run_id "$_slug" "$NUM_QUERIES" "$NUM_TRIALS" "$DATASET")"
+    warn "CAGE_RUN_ROOT unset -- minted FRESH standalone run root: $RUN_ROOT (cloud_run.sh mints the canonical root for cloud runs)"
+fi
+OUTPUT_DIR="$RUN_ROOT/memory_sweep"
 mkdir -p "$OUTPUT_DIR"
 
-# Redundant cloud backup of the whole results/<phase>/ tree for the memory sweep's
-# duration too (mirrors the full-sweep behavior). LOUD no-op if CAGE_RESULTS_BUCKET unset.
+# One runner per run root (finding J3): a second resume instance on the same root could
+# rm -rf a cell the live instance is writing. Re-entrant under an orchestrator.
+acquire_run_lock "$RUN_ROOT"
+
+# Redundant off-box backup of the whole results/<phase>/ tree for the memory sweep's
+# duration too (mirrors the full-sweep behavior). The daemon start is FAIL-CLOSED
+# (J4, task #137): with no backup target it dies and so does this sweep — the old
+# `|| true` let a whole sweep run with ZERO off-box persistence silently. Export
+# CAGE_ALLOW_NO_BACKUP=1 to explicitly accept a no-backup run.
 _MS_PHASE="${CAGE_PHASE:-phase2}"
-bash scripts/5_observability/gcs_backup_daemon.sh start "results/${_MS_PHASE}" || true
+bash scripts/5_observability/gcs_backup_daemon.sh start "results/${_MS_PHASE}" \
+  || die "backup daemon failed to start (J4) — refusing to sweep with no off-box backup (fix CAGE_BACKUP_TARGET/CAGE_RESULTS_BUCKET, or export CAGE_ALLOW_NO_BACKUP=1 to accept none)"
 # INTERIM trap: covers an exit in the window before `trap cleanup EXIT` below, which
 # REPLACES this one (bash keeps ONE handler per signal). cleanup() therefore repeats
-# this daemon stop -- keep the two in lockstep.
-trap 'bash scripts/5_observability/gcs_backup_daemon.sh stop "results/'"${_MS_PHASE}"'" >/dev/null 2>&1 || true' EXIT
+# this daemon stop -- keep the two in lockstep. It must ALSO chain __lg_cleanup
+# (finding J8): registering this trap already REPLACED the log-guard's EXIT trap, so
+# without the chain an exit in this window orphans the log_sync daemon _log_guard.sh
+# started above -- BOTH daemon stops belong in EVERY trap version.
+trap 'bash scripts/5_observability/gcs_backup_daemon.sh stop "results/'"${_MS_PHASE}"'" >/dev/null 2>&1 || true; type __lg_cleanup >/dev/null 2>&1 && __lg_cleanup' EXIT
 
 # Telemetry defaults ON here (unlike the baseline trees): the phase-time counters,
 # preemptions_total, and telemetry_series.jsonl ARE this sweep's readout.
@@ -114,10 +135,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cell_complete() {  # <cell_dir>
+cell_complete() {  # <cell_dir> -> 0 iff trial_1..NUM_TRIALS all have VALID (parseable) metrics.json
+    # Existence is not validity (finding J2): metrics_json_valid JSON-parses each file.
     local dir="$1" t
     for ((t = 1; t <= NUM_TRIALS; t++)); do
-        [ -f "$dir/trial_${t}/metrics.json" ] || return 1
+        metrics_json_valid "$dir/trial_${t}/metrics.json" || return 1
     done
     return 0
 }
@@ -138,7 +160,7 @@ mark_failed() {  # <reason> <cell...>
     for c in "$@"; do
         cell_complete "$OUTPUT_DIR/$c" && continue
         mkdir -p "$OUTPUT_DIR/$c"
-        echo "STATUS=failed reason=$reason model=$MODEL $(date)" > "$OUTPUT_DIR/$c/STATUS"
+        echo "STATUS=failed reason=$reason model=$MODEL dataset=$DATASET $(date)" > "$OUTPUT_DIR/$c/STATUS"
         FAILED+=("$c($reason)")
     done
 }
@@ -197,6 +219,7 @@ PY
   "kv_capacity_tokens": $cap,
   "corpus_budget_tokens": $CORPUS_BUDGET,
   "model": "$MODEL",
+  "dataset": "$DATASET",
   "utc_timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
@@ -220,7 +243,7 @@ run_cell() {  # <cell> <baseline_type> [extra run_experiment args...]
         ${TELEMETRY_FLAG[@]+"${TELEMETRY_FLAG[@]}"} \
         "$@"; then
         mkdir -p "$OUTPUT_DIR/$cell"
-        echo "STATUS=failed reason=run_experiment model=$MODEL $(date)" > "$OUTPUT_DIR/$cell/STATUS"
+        echo "STATUS=failed reason=run_experiment model=$MODEL dataset=$DATASET $(date)" > "$OUTPUT_DIR/$cell/STATUS"
         FAILED+=("$cell(run)")
     fi
 }
@@ -280,7 +303,7 @@ for UTIL in $MEM_UTILS; do
             echo "SKIP (complete): $C_LMCACHE"
         else
             mkdir -p "$OUTPUT_DIR/$C_LMCACHE"
-            echo "STATUS=skipped reason=lmcache_disabled model=$MODEL $(date)" > "$OUTPUT_DIR/$C_LMCACHE/STATUS"
+            echo "STATUS=skipped reason=lmcache_disabled model=$MODEL dataset=$DATASET $(date)" > "$OUTPUT_DIR/$C_LMCACHE/STATUS"
             echo "SKIP (CAGE_ENABLE_LMCACHE!=1): $C_LMCACHE"
         fi
     elif cell_complete "$OUTPUT_DIR/$C_LMCACHE" && [ "${CAGE_FORCE_RERUN:-0}" != "1" ]; then

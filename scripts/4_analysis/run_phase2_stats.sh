@@ -236,5 +236,8 @@ fi
 # disagree in sign. Also renders the forest figures from pilot_stats.json.
 python3 scripts/4_analysis/generate_plots.py --results-dir "$RUN_ROOT" --plots-dir "$RUN_ROOT/plots" || echo "PLOTS_FAILED"
 
-bash scripts/5_observability/sync_results_to_gcs.sh "$CAGE_SYNC_DIR" || true
+# Sync failure is ANNOUNCED, never `|| true`-swallowed (J4): the stats are
+# still complete locally, but the operator must sync before any teardown.
+bash scripts/5_observability/sync_results.sh "$CAGE_SYNC_DIR" \
+  || warn "final stats sync FAILED (rc=$?) — sync manually BEFORE any teardown"
 echo "STATS_DONE"

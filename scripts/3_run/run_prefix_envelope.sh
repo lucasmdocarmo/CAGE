@@ -43,8 +43,22 @@ NUM_TRIALS=${NUM_TRIALS:-3}
 SEED=${SEED:-42}
 CORPUS_BUDGET=${CORPUS_BUDGET:-2800}
 REPEAT_QUERIES=${REPEAT_QUERIES:-3}
-OUTPUT_DIR="${CAGE_RUN_ROOT:-results/phase2/local}/envelope"
+# Run root: NEVER a shared static dir (finding J3 -- the old results/phase2/local fallback
+# let two standalone runs interleave/wipe each other's cells). Either inherit the
+# orchestrator's CAGE_RUN_ROOT or mint a FRESH unique standalone root, loudly.
+if [ -n "${CAGE_RUN_ROOT:-}" ]; then
+    RUN_ROOT="$CAGE_RUN_ROOT"
+else
+    _slug="$(printf '%s' "$MODEL" | tr '[:upper:]' '[:lower:]' | sed -E 's|.*/||; s|[^a-z0-9]+|-|g; s|^-+||; s|-+$||')"
+    RUN_ROOT="results/${CAGE_PHASE:-phase2}/$(mint_run_id "$_slug" "$NUM_QUERIES" "$NUM_TRIALS" "$DATASET")"
+    warn "CAGE_RUN_ROOT unset -- minted FRESH standalone run root: $RUN_ROOT (cloud_run.sh mints the canonical root for cloud runs)"
+fi
+OUTPUT_DIR="$RUN_ROOT/envelope"
 mkdir -p "$OUTPUT_DIR"
+
+# One runner per run root (finding J3): a second resume instance on the same root could
+# rm -rf a cell the live instance is writing. Re-entrant under an orchestrator.
+acquire_run_lock "$RUN_ROOT"
 
 # Array so the empty case expands to zero argv words (safe under set -u via ${arr[@]+...}).
 TELEMETRY_FLAG=()
@@ -55,10 +69,11 @@ FAILED=()
 cleanup() { ./scripts/2_serving/manage_vllm_server.sh stop >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
-cell_complete() {  # <cell_dir>
+cell_complete() {  # <cell_dir> -> 0 iff trial_1..NUM_TRIALS all have VALID (parseable) metrics.json
+    # Existence is not validity (finding J2): metrics_json_valid JSON-parses each file.
     local dir="$1" t
     for ((t = 1; t <= NUM_TRIALS; t++)); do
-        [ -f "$dir/trial_${t}/metrics.json" ] || return 1
+        metrics_json_valid "$dir/trial_${t}/metrics.json" || return 1
     done
     return 0
 }
@@ -91,7 +106,7 @@ run_cell() {  # <label> <baseline_type> [extra run_experiment args...]
         ${TELEMETRY_FLAG[@]+"${TELEMETRY_FLAG[@]}"} \
         "$@"; then
         mkdir -p "$OUTPUT_DIR/$label"
-        echo "STATUS=failed reason=run_experiment model=$MODEL $(date)" > "$OUTPUT_DIR/$label/STATUS"
+        echo "STATUS=failed reason=run_experiment model=$MODEL dataset=$DATASET $(date)" > "$OUTPUT_DIR/$label/STATUS"
         FAILED+=("$label(run)")
     fi
 }
@@ -112,7 +127,7 @@ mark_failed() {  # <reason> <cell...>
     for c in "$@"; do
         cell_complete "$OUTPUT_DIR/$c" && continue
         mkdir -p "$OUTPUT_DIR/$c"
-        echo "STATUS=failed reason=$reason model=$MODEL $(date)" > "$OUTPUT_DIR/$c/STATUS"
+        echo "STATUS=failed reason=$reason model=$MODEL dataset=$DATASET $(date)" > "$OUTPUT_DIR/$c/STATUS"
         FAILED+=("$c($reason)")
     done
 }

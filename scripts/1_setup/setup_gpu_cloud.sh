@@ -1,7 +1,13 @@
 #!/bin/bash
 # =============================================================================
-# CAGE GPU cloud bootstrap  (Phase 2 single-GPU driver / Phase 3 router driver)
+# CAGE GPU cloud bootstrap — GCP PORT  (Phase 2 single-GPU / Phase 3 router)
 # =============================================================================
+# PROVIDER STATUS (task #137, 2026-08-18): RunPod is the PRIMARY campaign
+# provider (FINAL SCOPE v2, MyDocs/COST_NEBIUS_RUNPOD_2026-08-16.md) — on
+# RunPod pods use scripts/1_setup/setup_runpod.sh (container-shaped: no sudo/
+# systemctl/PPA). This script is RETAINED as the GCP portability backend; its
+# DLVM assumptions (sudo, systemd, deadsnakes) hold only there.
+#
 # Run ONCE on a fresh GCP GPU VM (Deep Learning VM image, CUDA already present)
 # to make the box ready to run scripts/3_run/cloud_run.sh. This sets up the full CAGE
 # Python environment so that EVERYTHING the dissertation describes runs on GCP:
@@ -109,20 +115,26 @@ pip install -r requirements.txt
 echo "[cage] [3b] reconciling openai for vLLM ${VLLM_VERSION}..."
 pip install -U "openai>=2.0"
 
-# 4. Stage the Phase-2 datasets so they are not lazy-downloaded mid-run.
-echo "[cage] [4/5] staging datasets (squad_v2, natural_questions, musique)..."
+# 4. HF download robustness FIRST (finding J7: this export used to sit AFTER
+#    the dataset staging, so staging was still exposed to the dead-socket hang
+#    the export exists to prevent). Observed 2026-07-13: a plain
+#    snapshot_download hung ~57 min at 12/15 GB on a dead socket with no
+#    timeout. HF_HUB_DOWNLOAD_TIMEOUT makes a stalled read RAISE (then hf_hub
+#    resumes); the 4b retry loop covers a shard that dies mid-transfer.
+export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-30}"
+
+# 4a. Stage the pilot datasets so they are not lazy-downloaded mid-run.
+#     (GCP-port pilot roster; the RunPod-primary setup_runpod.sh stages the
+#     FULL charter D5 roster.)
+echo "[cage] [4/5] staging datasets (squad_v2, natural_questions, musique; HF_HUB_DOWNLOAD_TIMEOUT=${HF_HUB_DOWNLOAD_TIMEOUT}s)..."
 # Loud fallbacks: a failed stage is announced (the run would lazy-download mid-sweep).
 python scripts/1_setup/download_datasets.py --dataset squad_v2 || warn "dataset stage failed: squad_v2 (will lazy-download mid-run)"
 python scripts/1_setup/download_datasets.py --dataset natural_questions || warn "dataset stage failed: natural_questions (will lazy-download mid-run)"
 python scripts/1_setup/download_datasets.py --dataset musique || warn "dataset stage failed: musique (will lazy-download mid-run)"
 
-# 4b. Prefetch model weights ROBUSTLY so a stalled Hugging Face connection cannot hang the timed
-#     vLLM server start mid-sweep. Observed 2026-07-13: a plain snapshot_download hung ~57 min at
-#     12/15 GB on a dead socket with no timeout, wasting GPU time. HF_HUB_DOWNLOAD_TIMEOUT makes a
-#     stalled read RAISE (then hf_hub resumes); the retry loop covers a shard that dies mid-transfer.
+# 4b. Prefetch model weights ROBUSTLY (bounded by HF_HUB_DOWNLOAD_TIMEOUT above).
 #     Non-fatal by design: the server start is the backstop. Override PREFETCH_MODELS, or set
 #     SKIP_MODEL_PREFETCH=1 to bypass (e.g. a single-model run).
-export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-30}"
 PREFETCH_MODELS="${PREFETCH_MODELS:-Qwen/Qwen3-8B XiaomiMiMo/MiMo-7B-RL AngelSlim/Qwen3-8B_eagle3}"
 if [ "${SKIP_MODEL_PREFETCH:-0}" != "1" ]; then
   echo "[cage] [4b] prefetching model weights (HF_HUB_DOWNLOAD_TIMEOUT=${HF_HUB_DOWNLOAD_TIMEOUT}s): ${PREFETCH_MODELS}"

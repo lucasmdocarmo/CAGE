@@ -30,8 +30,10 @@ exercises the driver:
   (registered per-row sidedness EXECUTED), decision b (pratt + n_nonzero),
   decision c (window-block TOST/ROPE + MIN_UNIQUE_WINDOWS floor), decision d
   (registered upstream topology + registered-m Holm + set completeness
-  naming #119), G4 (#13 fingerprint executor, #12 lambda-star executor,
-  #14 fail-loud stub), G6 (policy_event exclusion counting), G11 (bool
+  naming the producer command), G4 (#13 fingerprint executor, #12
+  lambda-star executor, #14 truth-tax executor — task #119; the end-to-end
+  chain fixtures live in tests/test_predicate_chain.py), G6
+  (policy_event exclusion counting), G11 (bool
   coercion + duplicate keys), G14 (atomic outputs + provenance), G16
   (ADR-0086 realized-n ladder);
 - the PILOT-ERA fences stand on generate_plots.py / run_phase2_stats.sh.
@@ -710,18 +712,31 @@ def test_selector_contrast_is_skipped_labeled(organized_run: Path) -> None:
     assert "baseline pair" in skipped[0]["reason"]
 
 
-def test_contrast_14_truth_tax_stub_raises_naming_119(
+def test_contrast_14_pre_predicate_refusal_no_longer_names_119_unbuilt(
     organized_run: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # G4c: requesting the truth-tax estimand (#14) is a FAIL-LOUD stub — the
-    # old behavior (a labeled NOT-IMPLEMENTED skip) understated a missing
-    # chain PRIMARY; the refusal names the #119 dependency explicitly.
+    # Task #119 pin: the executor replaced the stub. On a tree WITHOUT a
+    # predicate table the request still FAILS LOUD (a missing chain PRIMARY
+    # input is never a silent skip) — but the refusal now names the PRODUCER
+    # COMMAND, not "#119 has not landed" (the producer exists).
     rc = rca.main([str(organized_run), "--contrasts", "14"])
     assert rc == 1
     err = capsys.readouterr().err
-    assert "#119" in err
     assert "truth_tax" in err or "truth-tax" in err
+    assert "build_predicate_table.py" in err  # the fix, named
+    assert "has not landed" not in err  # the unbuilt claim is GONE
     assert not (organized_run / "analysis").exists()
+
+
+def test_driver_source_no_longer_claims_119_unbuilt() -> None:
+    # Task #119 pin: no refusal in the driver may still claim the §8.5
+    # predicate producer "has not landed" — it landed with this build.
+    source = (
+        REPO_ROOT / "scripts" / "4_analysis" / "run_campaign_analysis.py"
+    ).read_text(encoding="utf-8")
+    for chunk in source.split('"'):
+        if "#119" in chunk:
+            assert "has not landed" not in chunk
 
 
 def test_contrast_12_lambda_star_fails_loud_naming_missing_inputs(
@@ -1421,15 +1436,17 @@ def test_confirmatory_registered_set_fails_on_missing_predicate_leg(
     calibration_ok: Path,
     confirmatory_env: dict[str, Path],
 ) -> None:
-    # G5 + decision d: the fixture has no per-query `predicate` column (the
-    # #119 producer state), so the registered co-primary SET of #4 must FAIL
-    # on the missing legs with a reason naming #119 — never shrink to the
+    # G5 + decision d: the fixture has no per-query `predicate` column (no
+    # predicate table was built), so the registered co-primary SET of #4 must
+    # FAIL on the missing legs with a reason naming the PRODUCER COMMAND
+    # (task #119's build_predicate_table.py) — never shrink to the
     # supplied TTFT conjunction.
     assert rca.main(_confirmatory_argv(organized_run, calibration_ok)) == 0
     _, stats = _load_stats(organized_run)
     exclusions = stats["skipped"]["confirmatory_exclusions"]
     assert any(
-        e["metric"] == "predicate" and "#119" in e["reason"] for e in exclusions
+        e["metric"] == "predicate" and "build_predicate_table.py" in e["reason"]
+        for e in exclusions
     )
     gate = stats["gatekeeping"]
     decision = next(
@@ -1439,7 +1456,9 @@ def test_confirmatory_registered_set_fails_on_missing_predicate_leg(
     assert decision["missing_legs"] == sorted(
         f"{ds}|predicate" for ds in DATASETS
     )
-    assert any("#119" in r for r in decision["missing_leg_reasons"])
+    assert any(
+        "build_predicate_table.py" in r for r in decision["missing_leg_reasons"]
+    )
     # Per-leg TTFT decisions keep the registered per-dataset semantics
     # (audit §2.2): the supplied legs individually passed.
     for p in gate["primaries"]:

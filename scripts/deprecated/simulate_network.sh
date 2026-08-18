@@ -1,4 +1,12 @@
 #!/bin/bash
+# =============================================================================
+# DEPRECATED (2026-08-18): retired per the Topic-10 code walkthrough (J12,
+# MyDocs/registration/CODE_ASSERTION_2026-08.md). The campaign design
+# (MyDocs/PUBLICATION.md) has no tc-based network-emulation arm: pilot phases
+# never ran it, and Phase-3 interconnect work uses REAL RDMA/RoCE hardware, not
+# netem. Kept only so any historical reference stays auditable. Do NOT run
+# against campaign data. See scripts/deprecated/README.md.
+# =============================================================================
 # Network Emulation Script for CAGE Framework
 # Uses Linux Traffic Control (tc) to simulate HPC network conditions.
 # Intended to be run inside Docker containers (privileged mode required).

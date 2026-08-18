@@ -1,38 +1,45 @@
 #!/usr/bin/env bash
-# pull_run.sh — pull ONE campaign run from its clean-room GCS bucket and
+# pull_run.sh — pull ONE campaign run from its clean-room backup target and
 # ledger-verify it locally. THE fail-closed pre-teardown gate.
 #
 # Usage:
-#   scripts/5_observability/pull_run.sh <bucket> <local_run_dir>
-#     <bucket>         gs://bucket[/prefix] (bare bucket name accepted). The object
-#                      tree under it must BE the run tree per cloud/RESULTS_LAYOUT.md:
+#   scripts/5_observability/pull_run.sh <target> <local_run_dir>
+#     <target>         gs://bucket[/prefix] | s3://bucket[/prefix] |
+#                      ssh://[user@]host/path | file:///path | /path
+#                      (bare names = legacy gs:// buckets). The tree under it
+#                      must BE the run tree per cloud/RESULTS_LAYOUT.md:
 #                      manifest.json, ledger.json, cells/<row_key>/window_<k>/...,
 #                      scoring/...
-#     <local_run_dir>  local destination, mirroring the bucket structure — normally
+#     <local_run_dir>  local destination, mirroring the remote structure — normally
 #                      results/<campaign>/<session>/<run_id>
 #
 # STANDING DISCIPLINE (binding, see MEMORY "Pull results local BEFORE teardown"):
 #   results are pulled LOCAL and ledger-verified BEFORE any teardown. This script
-#   is that gate. ANY failure — rsync error, missing/tampered ledger, hash
+#   is that gate. ANY failure — transfer error, missing/tampered ledger, hash
 #   mismatch — exits nonzero and prints DO-NOT-TEARDOWN. Only the literal
-#   "SAFE TO TEARDOWN" line authorizes proceeding to teardown_vm.sh / bucket delete.
+#   "SAFE TO TEARDOWN" line authorizes proceeding to teardown_pod.sh /
+#   teardown_vm.sh / bucket delete.
 #
-# Transfer tool: gcloud storage rsync -r (modern surface, parallel by default);
-# loud fallback to gsutil -m rsync -r only when the gcloud storage surface is
-# absent. No silent fallbacks. Integrity is NOT delegated to rsync checksums —
-# the sha256 content-hash ledger (src.analysis.stats.ledger, §9.10 UPGRADE 5)
-# re-hashes every sealed artifact after the pull.
+# Transfer: scripts/lib/transport.sh (task #137, finding J4 — the pull path was
+# gsutil/gcloud-only, so a RunPod campaign had NO pull path at all). The gcs
+# backend keeps the historical tool choice (gcloud storage rsync preferred,
+# LOUD gsutil fallback); s3/ssh/file are first-class. No silent fallbacks.
+# Integrity is NOT delegated to transfer checksums — the sha256 content-hash
+# ledger (src.analysis.stats.ledger, §9.10 UPGRADE 5) re-hashes every sealed
+# artifact after the pull.
 #
-# Cost note (report cost on every cloud action): GCS -> local download is network
-# egress (~\$0.12/GB order of magnitude, region-dependent); the actual pulled byte
-# count and an egress estimate are printed on success. GET/list op costs are noise
-# at run-tree object counts.
+# Cost note (report cost on every cloud action): provider egress is
+# ~\$0.12/GB order of magnitude for GCS (region-dependent; RunPod network
+# volumes bill storage, not egress); the pulled byte count and that estimate
+# are printed on success. GET/list op costs are noise at run-tree object counts.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # shellcheck source=scripts/lib/_common.sh
 source "${REPO_ROOT}/scripts/lib/_common.sh"
+# shellcheck source=scripts/lib/transport.sh
+source "${REPO_ROOT}/scripts/lib/transport.sh"
 PY="${REPO_ROOT}/.venv/bin/python"
 
 _verified=0
@@ -51,45 +58,31 @@ on_exit() {
 trap on_exit EXIT
 
 usage() {
-  echo "usage: $0 <bucket (gs://bucket[/prefix] or bare name)> <local_run_dir>" >&2
+  echo "usage: $0 <target (gs://|s3://|ssh://[user@]host/path|file:///path, or a bare gs bucket name)> <local_run_dir>" >&2
   exit 64
 }
 
 [ $# -eq 2 ] || usage
-BUCKET="$1"
+TARGET="$1"
 DEST="$2"
-[ -n "${BUCKET}" ] && [ -n "${DEST}" ] || usage
-case "${BUCKET}" in
-  gs://*) ;;
-  *) BUCKET="gs://${BUCKET}" ;;
+[ -n "${TARGET}" ] && [ -n "${DEST}" ] || usage
+case "${TARGET}" in
+  gs://* | s3://* | ssh://* | file://* | /*) ;;
+  *) TARGET="gs://${TARGET}" ;;   # legacy bare bucket name
 esac
 # rsync semantics need a prefix with no trailing slash
-BUCKET="${BUCKET%/}"
+TARGET="${TARGET%/}"
 
 if [ ! -x "${PY}" ]; then
   echo "ERROR: ${PY} not found/executable — the repo venv is required for ledger verification." >&2
   exit 3
 fi
 
-# --- [1/3] transfer tool selection (loud, never silent) ---------------------
-TOOL=""
-if command -v gcloud >/dev/null 2>&1 && gcloud storage --help >/dev/null 2>&1; then
-  TOOL="gcloud"
-elif command -v gsutil >/dev/null 2>&1; then
-  TOOL="gsutil"
-  echo "[pull_run] WARN: 'gcloud storage' surface unavailable — falling back to 'gsutil -m rsync -r'." >&2
-else
-  echo "ERROR: neither 'gcloud storage' nor 'gsutil' is available; cannot pull ${BUCKET}." >&2
-  exit 3
-fi
-
+# --- [1/3] transfer (provider-neutral, loud, never silent) ------------------
+BACKEND="$(transport_resolve "${TARGET}")"
 mkdir -p "${DEST}"
-echo "[pull_run] [1/3] mirroring ${BUCKET} -> ${DEST} (tool: ${TOOL})"
-if [ "${TOOL}" = "gcloud" ]; then
-  gcloud storage rsync -r "${BUCKET}" "${DEST}"
-else
-  gsutil -m rsync -r "${BUCKET}" "${DEST}"
-fi
+echo "[pull_run] [1/3] mirroring ${TARGET} -> ${DEST} (backend: ${BACKEND})"
+transport_pull "${TARGET}" "${DEST}"
 
 # --- [2/3] ledger verification (fail-closed) --------------------------------
 # verify_ledger re-hashes the pulled tree against the sealed sha256 ledger;

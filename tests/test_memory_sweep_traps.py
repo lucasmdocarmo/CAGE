@@ -74,7 +74,9 @@ def test_daemon_start_still_paired_with_interim_trap() -> None:
     text = _sweep_text()
     start_at = text.find("gcs_backup_daemon.sh start")
     assert start_at != -1, "run_memory_sweep.sh must start the gcs backup daemon"
-    window = text[start_at : start_at + 600]
+    # 1200 (was 600): the interim trap's comment grew when task #136 (Topic-10 J8)
+    # made it chain __lg_cleanup too; the pinned contract itself is unchanged.
+    window = text[start_at : start_at + 1200]
     assert re.search(r"trap 'bash scripts/5_observability/gcs_backup_daemon\.sh stop ", window), (
         "the daemon start must be followed by the interim EXIT stop trap covering the "
         "gap before `trap cleanup EXIT` replaces it"

@@ -58,9 +58,11 @@ printf '[cage] serving config: enforce_eager=%s max_model_len=%s gpu_mem_util=%s
 # have DIFFERENT denominators, so passing F through verbatim would hand each
 # engine a different byte budget and break §6.5 fairness. These helpers derive
 # each engine's native dial value so all engines TARGET the same byte budget.
-# The mapping is first-order: the preflight iso-bytes gate reads each engine's
-# REALIZED KV-pool size from its startup telemetry and asserts parity — the
-# helper sets the dial, the gate proves the bytes. Consumed by
+# The mapping is first-order: preflight gate (j) — the CAGE-ISO-BYTES-GATE in
+# scripts/checks/preflight_check.sh (built by task #138; fixture-tested in
+# tests/test_preflight_gates.py) — reads each engine's REALIZED KV-pool size
+# from its startup log and asserts pairwise parity within CAGE_ISO_BYTES_TOL —
+# the helper sets the dial, the gate proves the bytes. Consumed by
 # scripts/2_serving/manage_sglang_server.sh and manage_lmdeploy_server.sh.
 
 # Total VRAM of GPU 0 in MiB (single-GPU groups A/B + S0 scope; the multi-GPU

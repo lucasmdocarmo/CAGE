@@ -9,7 +9,7 @@
 #     organize_results.py has built it; else directory counts only)
 #   - latest cage-stats heartbeat age (newest cells/*/window_*/cage_stats.jsonl mtime)
 #   - GCS sync lag: last-good-sync marker (.agent/last_gcs_sync_ok, written by
-#     sync_results_to_gcs.sh on every successful pass; daemon logs as fallback) vs the
+#     sync_results.sh on every successful pass; daemon logs as fallback) vs the
 #     newest local artifact mtime. NO gcloud/gsutil call unless CAGE_WATCH_REMOTE=1.
 #   - elapsed wall clock (manifest.json mtime = run start; §3: written once at start)
 #     + estimated cost when CAGE_HOURLY_USD is set
@@ -156,6 +156,7 @@ print_status() {  # sets VERDICT (and VERDICT_RC) for the caller
   # 3) GCS sync lag — markers only, no gcloud (unless CAGE_WATCH_REMOTE=1) ----
   marker_path="" marker_m=""
   for c in "$PROJECT_DIR/.agent/last_gcs_sync_ok" \
+           "$PROJECT_DIR"/.agent/last_sync_ok_* \
            "$PROJECT_DIR"/.agent/daemons/*/gcs_backup.log \
            "$PROJECT_DIR/.agent/gcs_backup.log"; do
     [ -f "$c" ] || continue
@@ -169,7 +170,7 @@ print_status() {  # sets VERDICT (and VERDICT_RC) for the caller
     log "gcs sync : last good sync $(fmt_dur $(( now - marker_m ))) ago -> lag $(fmt_dur "$lag_s") behind newest local artifact (marker: ${marker_path#"$PROJECT_DIR/"})"
   else
     lag_note="no-marker"
-    log "gcs sync : NO sync marker found (.agent/last_gcs_sync_ok) — daemons not started, or never synced"
+    log "gcs sync : NO sync marker found (.agent/last_sync_ok_<backend> or legacy .agent/last_gcs_sync_ok) — daemons not started, or never synced"
   fi
   if [ "${CAGE_WATCH_REMOTE:-0}" = "1" ]; then
     local bucket tmo rc

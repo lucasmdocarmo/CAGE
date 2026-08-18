@@ -32,14 +32,16 @@ SKIP_GATE="${SKIP_GATE:-0}"
 
 # Outputs land under the shared run root minted by cloud_run.sh (CAGE_RUN_ROOT/compression) so the
 # core + compression + speculative trees for ONE sweep cell aggregate together; a standalone run
-# self-mints the SAME date_HHMM_model_NxT run-id under results/<phase>/<run-id>/.
+# self-mints a FRESH unique run-id (mint_run_id: seconds + random suffix + dataset, finding J3
+# -- never a shared static dir) under results/<phase>/<run-id>/.
 if [ -n "${CAGE_RUN_ROOT:-}" ]; then
     RUN_ROOT="$CAGE_RUN_ROOT"
 else
     _phase="${CAGE_PHASE:-phase2}"
     _slug="$(printf '%s' "$MODEL" | tr '[:upper:]' '[:lower:]' | sed -E 's|.*/||; s|[^a-z0-9]+|-|g; s|^-+||; s|-+$||')"
-    _rid="${CAGE_RUN_ID:-$(date +%Y-%m-%d_%H%M)_${_slug}_${NUM_QUERIES}x${NUM_TRIALS}}"
+    _rid="${CAGE_RUN_ID:-$(mint_run_id "$_slug" "$NUM_QUERIES" "$NUM_TRIALS" "$DATASET")}"
     RUN_ROOT="$PROJECT_DIR/results/$_phase/$_rid"
+    warn "CAGE_RUN_ROOT unset -- minted FRESH standalone run root: $RUN_ROOT (cloud_run.sh mints the canonical root for cloud runs)"
 fi
 OUTPUT_DIR="$RUN_ROOT/compression"
 # Point the sourced log guard's GCS mirror at this run root (relative to PROJECT_DIR), not analysis/.
@@ -79,6 +81,27 @@ if [ -z "${VIRTUAL_ENV:-}" ]; then
 fi
 mkdir -p "$OUTPUT_DIR"
 
+# One runner per run root (finding J3): a second resume instance on the same root could
+# rm -rf a cell the live instance is writing. Re-entrant under run_full_sweep/cloud_run.
+acquire_run_lock "$RUN_ROOT"
+
+# EXIT trap (finding J8): without it, a signal (Ctrl-C, preemption SIGTERM) left the vLLM
+# server RUNNING and holding the GPU. Mirrors run_baselines.sh's cleanup pattern, and
+# chains the log-guard's __lg_cleanup because `trap cleanup EXIT` REPLACES the EXIT trap
+# _log_guard.sh registered above (bash keeps ONE handler per signal -- the same
+# trap-replacement mechanism test_memory_sweep_traps.py pins for the memory sweep).
+_cleanup_ran=0
+cleanup() {
+    if [ "$_cleanup_ran" -eq 1 ]; then
+        return
+    fi
+    _cleanup_ran=1
+    ./scripts/2_serving/manage_vllm_server.sh stop >/dev/null 2>&1 || true
+    # Chain the log-guard's EXIT handler (our trap replaced it): final results sync.
+    type __lg_cleanup >/dev/null 2>&1 && __lg_cleanup
+}
+trap cleanup EXIT
+
 # Model tag so a second model (MiMo) through the same 2x2 never collides with Qwen's dirs.
 case "$MODEL" in *MiMo*|*mimo*) MTAG="_mimo7b" ;; *) MTAG="" ;; esac
 
@@ -89,10 +112,12 @@ case "$MODEL" in *MiMo*|*mimo*) MTAG="_mimo7b" ;; *) MTAG="" ;; esac
 # ---------------------------------------------------------------------------
 FAILED=()
 
-cell_complete() {  # <cell_dir> -> 0 iff trial_1..NUM_TRIALS all have metrics.json
+cell_complete() {  # <cell_dir> -> 0 iff trial_1..NUM_TRIALS all have VALID (parseable) metrics.json
+    # Existence is not validity (finding J2): a truncated/corrupt/foreign metrics.json
+    # must not make a cell resume-proof "complete" -- metrics_json_valid JSON-parses each.
     local dir="$1" t
     for ((t = 1; t <= NUM_TRIALS; t++)); do
-        [ -f "$dir/trial_${t}/metrics.json" ] || return 1
+        metrics_json_valid "$dir/trial_${t}/metrics.json" || return 1
     done
     return 0
 }
@@ -135,7 +160,7 @@ mark_cells_failed() {  # <reason> <bare-label...> sentinel the cells a dead serv
         full="${lbl}${MTAG}"
         cell_complete "$OUTPUT_DIR/$full" && continue  # keep a previously-complete cell
         mkdir -p "$OUTPUT_DIR/$full"
-        echo "STATUS=failed reason=$reason model=$MODEL $(date)" > "$OUTPUT_DIR/$full/STATUS"
+        echo "STATUS=failed reason=$reason model=$MODEL dataset=$DATASET $(date)" > "$OUTPUT_DIR/$full/STATUS"
         FAILED+=("$full($reason)")
     done
 }
@@ -154,7 +179,7 @@ run_baseline() {  # <baseline> <label> [extra args...]
         --vllm-telemetry --output-dir "$OUTPUT_DIR/$label" "$@"; then
         echo "    CELL $label RUN-FAIL"
         mkdir -p "$OUTPUT_DIR/$label"
-        echo "STATUS=failed reason=run model=$MODEL baseline=$baseline $(date)" > "$OUTPUT_DIR/$label/STATUS"
+        echo "STATUS=failed reason=run model=$MODEL dataset=$DATASET baseline=$baseline $(date)" > "$OUTPUT_DIR/$label/STATUS"
         FAILED+=("$label(run)")
         return 0
     fi

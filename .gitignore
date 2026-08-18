@@ -220,3 +220,7 @@ phase2_archive/
 
 # Runtime logs collected on the VM (vLLM server, run stdout, forensics). Mirrored to GCS.
 /logs/
+
+# macOS Finder metadata (Topic-10 walkthrough J12: 11 were TRACKED with no ignore rule).
+# Deliberately UNanchored: Finder drops these at every depth.
+.DS_Store

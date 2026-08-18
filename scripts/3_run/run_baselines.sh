@@ -40,16 +40,19 @@ NUM_QUERIES=${NUM_QUERIES:-500}
 NUM_TRIALS=${NUM_TRIALS:-3}
 
 # Outputs land under the run root minted by cloud_run.sh (CAGE_RUN_ROOT/baselines). A DIRECT
-# invocation with no run root self-mints the SAME date_HHMM_model_NxT run-id so results still
-# land in the standardized results/<phase>/<run-id>/ tree and never pollute the legacy analysis/.
+# invocation with no run root self-mints a FRESH unique run-id (mint_run_id: seconds + random
+# suffix + dataset, finding J3 -- never a shared static dir) so results still land in the
+# standardized results/<phase>/<run-id>/ tree and never pollute the legacy analysis/.
 if [ -n "${CAGE_RUN_ROOT:-}" ]; then
-    OUTPUT_DIR="$CAGE_RUN_ROOT/baselines"
+    RUN_ROOT="$CAGE_RUN_ROOT"
 else
     _phase="${CAGE_PHASE:-phase2}"
     _slug="$(printf '%s' "$MODEL" | tr '[:upper:]' '[:lower:]' | sed -E 's|.*/||; s|[^a-z0-9]+|-|g; s|^-+||; s|-+$||')"
-    _rid="${CAGE_RUN_ID:-$(date +%Y-%m-%d_%H%M)_${_slug}_${NUM_QUERIES}x${NUM_TRIALS}}"
-    OUTPUT_DIR="$PROJECT_DIR/results/$_phase/$_rid/baselines"
+    _rid="${CAGE_RUN_ID:-$(mint_run_id "$_slug" "$NUM_QUERIES" "$NUM_TRIALS" "$DATASET")}"
+    RUN_ROOT="$PROJECT_DIR/results/$_phase/$_rid"
+    warn "CAGE_RUN_ROOT unset -- minted FRESH standalone run root: $RUN_ROOT (cloud_run.sh mints the canonical root for cloud runs)"
 fi
+OUTPUT_DIR="$RUN_ROOT/baselines"
 SEED=${SEED:-42}
 VLLM_PORT=${VLLM_PORT:-8000}
 CLUSTER_BASE_PORT=${CLUSTER_BASE_PORT:-8001}
@@ -74,6 +77,10 @@ echo "=============================================="
 # No -e in this script (fault-tolerant cells): guard the cd or everything below runs elsewhere.
 cd "$PROJECT_DIR" || exit 1
 mkdir -p "$PROJECT_DIR/logs" "$OUTPUT_DIR"
+
+# One runner per run root (finding J3): a second resume instance on the same root could
+# rm -rf a cell the live instance is writing. Re-entrant under cloud_run/run_full_sweep.
+acquire_run_lock "$RUN_ROOT"
 
 # Activate the project venv regardless of its name (.venv locally, cage-env on the GPU VM).
 # Without this a fresh shell / automation falls back to system python -> ImportError on
@@ -119,10 +126,12 @@ redis_prefix_for() {
 # ---------------------------------------------------------------------------
 FAILED=()
 
-cell_complete() {  # <cell_dir> -> 0 iff trial_1..NUM_TRIALS all have metrics.json
+cell_complete() {  # <cell_dir> -> 0 iff trial_1..NUM_TRIALS all have VALID (parseable) metrics.json
+    # Existence is not validity (finding J2): a truncated/corrupt/foreign metrics.json
+    # must not make a cell resume-proof "complete" -- metrics_json_valid JSON-parses each.
     local dir="$1" t
     for ((t = 1; t <= NUM_TRIALS; t++)); do
-        [ -f "$dir/trial_${t}/metrics.json" ] || return 1
+        metrics_json_valid "$dir/trial_${t}/metrics.json" || return 1
     done
     return 0
 }
@@ -166,21 +175,26 @@ mark_cells_failed() {  # <reason> <bare-label...> sentinel the cells a dead serv
         # never clobber a cell already complete from a previous (resumed) run
         cell_complete "$OUTPUT_DIR/$full" && continue
         mkdir -p "$OUTPUT_DIR/$full"
-        echo "STATUS=failed reason=$reason model=$MODEL $(date)" > "$OUTPUT_DIR/$full/STATUS"
+        echo "STATUS=failed reason=$reason model=$MODEL dataset=$DATASET $(date)" > "$OUTPUT_DIR/$full/STATUS"
         FAILED+=("$full($reason)")
     done
 }
 
+# Both helpers MUST propagate a restart failure (finding J1, CRITICAL): they used to end
+# with `sleep 10`, so the function returned sleep's 0 even when the restart FAILED --
+# making every SERVER-FAIL -> mark_cells_failed branch below unreachable dead code and
+# letting a dead engine proceed into cells. `|| return 1` restores the contract; the
+# settle wait runs only after a SUCCESSFUL restart.
 start_server_without_prefix_cache() {
     echo "[1/4] Starting Server WITHOUT Prefix Caching..."
-    ./scripts/2_serving/manage_vllm_server.sh restart "$MODEL" --no-prefix-cache
+    ./scripts/2_serving/manage_vllm_server.sh restart "$MODEL" --no-prefix-cache || return 1
     echo "Waiting 10 seconds for stability..."
     sleep 10
 }
 
 start_server_with_prefix_cache() {
     echo "$1"
-    ./scripts/2_serving/manage_vllm_server.sh restart "$MODEL"
+    ./scripts/2_serving/manage_vllm_server.sh restart "$MODEL" || return 1
     echo "Waiting 10 seconds for stability..."
     sleep 10
 }
@@ -212,7 +226,7 @@ run_baseline() {
         "$@"; then
         echo "    CELL $baseline_label RUN-FAIL"
         mkdir -p "$OUTPUT_DIR/$baseline_label"
-        echo "STATUS=failed reason=run model=$MODEL baseline=$baseline $(date)" > "$OUTPUT_DIR/$baseline_label/STATUS"
+        echo "STATUS=failed reason=run model=$MODEL dataset=$DATASET baseline=$baseline $(date)" > "$OUTPUT_DIR/$baseline_label/STATUS"
         FAILED+=("$baseline_label(run)")
         return 0
     fi
@@ -245,7 +259,7 @@ run_distributed_variant() {
         ${TELEMETRY_FLAG[@]+"${TELEMETRY_FLAG[@]}"}; then
         echo "    CELL $baseline_label RUN-FAIL"
         mkdir -p "$OUTPUT_DIR/$baseline_label"
-        echo "STATUS=failed reason=run model=$MODEL baseline=distributed $(date)" > "$OUTPUT_DIR/$baseline_label/STATUS"
+        echo "STATUS=failed reason=run model=$MODEL dataset=$DATASET baseline=distributed $(date)" > "$OUTPUT_DIR/$baseline_label/STATUS"
         FAILED+=("$baseline_label(run)")
         return 0
     fi
@@ -326,7 +340,7 @@ if [ "$ENABLE_DISTRIBUTED" != "0" ]; then
         else
             echo "[5/5] CLUSTER-FAIL -> marking distributed cell failed and continuing"
             mkdir -p "$OUTPUT_DIR/distributed_router_replicated"
-            echo "STATUS=failed reason=server model=$MODEL $(date)" > "$OUTPUT_DIR/distributed_router_replicated/STATUS"
+            echo "STATUS=failed reason=server model=$MODEL dataset=$DATASET $(date)" > "$OUTPUT_DIR/distributed_router_replicated/STATUS"
             FAILED+=("distributed_router_replicated(server)")
         fi
     fi

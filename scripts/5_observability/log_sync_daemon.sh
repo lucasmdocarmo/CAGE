@@ -33,11 +33,11 @@ STATE_DIR="$PROJECT_DIR/.agent/daemons/$RUN_SCOPE"
 PIDF="$STATE_DIR/log_sync.pid"
 mkdir -p "$STATE_DIR"
 
+# Identity-checked liveness (finding J8): the pid must be a live process whose command
+# line actually names this script -- a recycled pid in a stale pidfile (VM reboot / PID
+# wraparound) must be neither trusted as running nor KILLED by `stop`.
 pid_alive() {
-  local pid
-  [ -f "$PIDF" ] || return 1
-  pid="$(cat "$PIDF" 2>/dev/null || true)"
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+  pidfile_alive "$PIDF" "log_sync_daemon.sh"
 }
 
 # --- subcommands (non-numeric first arg; numeric first arg = legacy interval) --
@@ -90,10 +90,14 @@ trap 'exit 130' INT
 
 echo "[log_sync_daemon] every ${INTERVAL}s: collect_logs --light$([ "$SYNC_RESULTS" = 1 ] && echo ' + results sync') (pid $$, scope=$RUN_SCOPE)"
 while true; do
+  # Failures ANNOUNCED, never `|| true`-swallowed (finding J4: a silently failing
+  # mirror let a run end with an empty bucket); the loop keeps retrying.
   if [ "$SYNC_RESULTS" = "1" ]; then
-    bash "$SCRIPT_DIR/sync_results_to_gcs.sh" "${CAGE_SYNC_DIR:-results}" >/dev/null 2>&1 || true
+    bash "$SCRIPT_DIR/sync_results.sh" "${CAGE_SYNC_DIR:-results}" >/dev/null 2>&1 \
+      || echo "[log_sync_daemon] WARNING: results sync FAILED (rc=$?; see .agent/last_sync_fail_*) — retrying in ${INTERVAL}s" >&2
   fi
-  bash "$SCRIPT_DIR/collect_logs.sh" --light >/dev/null 2>&1 || true
+  bash "$SCRIPT_DIR/collect_logs.sh" --light >/dev/null 2>&1 \
+    || echo "[log_sync_daemon] WARNING: log collection FAILED (rc=$?) — retrying in ${INTERVAL}s" >&2
   sleep "$INTERVAL" & _SLEEP_PID=$!
   wait "$_SLEEP_PID" || true
   _SLEEP_PID=""

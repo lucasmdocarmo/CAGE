@@ -32,8 +32,11 @@ D8 additions (build pass 2026-08-04):
 - Real batching: ``batch_evaluate`` accumulates NLI pairs and BERTScore texts
   across rows into single batched model calls with identical per-row outputs.
 - Instrument B seams (D8 §8.5): MiniCheck/AlignScore claim checkers, lazily
-  loaded fail-closed, selected via CAGE_CLAIM_CHECKER (default 'alignscore'
-  since the 2026-08-05 owner decision -- see MyDocs/registration/
+  loaded fail-closed, selected via CAGE_CLAIM_CHECKER (default 'nli' since the
+  2026-08-19 owner decision #120/F8 -- in-process-safe; AlignScore remains the
+  selected Instrument B via its dedicated out-of-process runner
+  scripts/4_analysis/score_instrument_b.py; instrument selection history in
+  MyDocs/registration/
   instrument_selection_2026-08-05/DECISION.md; in the project venv the
   alignscore package can never install, so the default fails closed and
   points to the out-of-process runner scripts/4_analysis/score_instrument_b.py).
@@ -151,8 +154,13 @@ class SentenceClaimDecomposer:
 # calibration" with generic DeBERTa-MNLI demoted to legacy fallback. These
 # classes are the SEAMS: lazily loaded, fail-closed (InstrumentUnavailableError
 # when the package is absent -- never a silent skip), selected via the
-# CAGE_CLAIM_CHECKER env var. DEFAULT = "alignscore" since 2026-08-05 (owner
-# decision, MyDocs/registration/instrument_selection_2026-08-05/DECISION.md;
+# CAGE_CLAIM_CHECKER env var. DEFAULT = "nli" since 2026-08-19 (owner decision
+# #120/F8: the default must be in-process-loadable so as-scripted preflight and
+# rescore paths work; 'alignscore' by design cannot load in this venv and is
+# requested EXPLICITLY by its dedicated out-of-process runner,
+# scripts/4_analysis/score_instrument_b.py). Instrument selection itself is
+# unchanged (2026-08-05 owner decision,
+# MyDocs/registration/instrument_selection_2026-08-05/DECISION.md;
 # charter stamp PUBLICATION.md §8.6(c)): AlignScore-large won the selection
 # calibration. Its 2023 stack can NEVER install into the project venv, so the
 # in-process default fails closed and every unavailability message points to
@@ -289,9 +297,10 @@ class AlignScoreClaimChecker:
         return [float(s) for s in scores]
 
 
-# Valid CAGE_CLAIM_CHECKER values. DEFAULT = 'alignscore' (flipped 2026-08-05,
-# owner decision: MyDocs/registration/instrument_selection_2026-08-05/DECISION.md,
-# charter stamp PUBLICATION.md §8.6(c)); 'nli' (legacy DeBERTa-MNLI path) and
+# Valid CAGE_CLAIM_CHECKER values. DEFAULT = 'nli' (flipped 2026-08-19, owner
+# decision #120/F8 — in-process-safe; 'alignscore' is requested explicitly by
+# scripts/4_analysis/score_instrument_b.py, the Instrument-B runner); 'nli'
+# (DeBERTa-MNLI path) and
 # 'minicheck' (documented runner-up) remain selectable.
 _CLAIM_CHECKER_NAMES: Tuple[str, ...] = ("nli", "minicheck", "alignscore")
 
@@ -673,8 +682,8 @@ class QualityEvaluator:
         # raise (fail-closed).
         checker_name = (
             claim_checker
-            or os.getenv("CAGE_CLAIM_CHECKER", "alignscore")
-            or "alignscore"
+            or os.getenv("CAGE_CLAIM_CHECKER", "nli")
+            or "nli"
         ).strip().lower()
         if checker_name not in _CLAIM_CHECKER_NAMES:
             raise ValueError(
@@ -1325,9 +1334,10 @@ class QualityEvaluator:
         claim-checker id+version consulted; None on early-outs) and ``method``
         (e.g. 'nli_claim_max'; None when no score was produced). Claims come
         from the pluggable ``claim_decomposer`` (default: sentence split); the
-        checker is the CAGE_CLAIM_CHECKER selection (default: 'alignscore'
-        since 2026-08-05 -- see DECISION.md; in-process it fails closed and
-        points to scripts/4_analysis/score_instrument_b.py).
+        checker is the CAGE_CLAIM_CHECKER selection (default: 'nli' since
+        2026-08-19, owner decision #120/F8 -- in-process-safe; 'alignscore'
+        runs via scripts/4_analysis/score_instrument_b.py, which requests it
+        explicitly).
 
         D8 §8.5 3-class reporting: when ``nli_three_class`` is on (CAGE_NLI_
         THREE_CLASS) and the NLI path scored, the dict ALSO carries

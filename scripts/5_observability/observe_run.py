@@ -166,7 +166,16 @@ def main() -> int:
         kv_cache_dtype=kv_cache_dtype, speculative_config=args.speculative_config,
         enforce_eager=enforce_eager, max_model_len=max_model_len,
         gpu_memory_utilization=gpu_mem_util,
-        extra={"run_dir": str(run_dir)},
+        extra={
+            "run_dir": str(run_dir),
+            # Off-box persistence provenance (task #137, finding J4): record the
+            # provider-neutral backup target, and make a run that started under
+            # the CAGE_ALLOW_NO_BACKUP=1 override unmissable in the manifest
+            # (cloud_run.sh also records <run-root>/NO_BACKUP_OVERRIDE durably).
+            "backup_target": (os.environ.get("CAGE_BACKUP_TARGET")
+                              or os.environ.get("CAGE_RESULTS_BUCKET") or None),
+            "no_backup_override": os.environ.get("CAGE_ALLOW_NO_BACKUP") == "1",
+        },
     )
     write_manifest(manifest, str(out_dir / "run_manifest.json"))
     logger.info("manifest written: sha=%s vllm=%s gpu=%s zone=%s",

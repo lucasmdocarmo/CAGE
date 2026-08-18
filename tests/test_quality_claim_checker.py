@@ -4,7 +4,8 @@ The charter demotes generic DeBERTa-MNLI to "legacy fallback only"; the
 2026-08-05 selection calibration decided AlignScore-large (owner decision:
 MyDocs/registration/instrument_selection_2026-08-05/DECISION.md; charter
 stamp PUBLICATION.md §8.6(c)). These tests prove the SEAMS: selection via
-CAGE_CLAIM_CHECKER whose DEFAULT is now 'alignscore' (the flip), lazy
+CAGE_CLAIM_CHECKER whose DEFAULT is 'nli' since 2026-08-19 (#120/F8 —
+in-process-safe; alignscore is selected explicitly by its runner), lazy
 fail-closed loading (absent package / unpinned checkpoint raises
 InstrumentUnavailableError whose message points to the sanctioned
 out-of-process runner scripts/4_analysis/score_instrument_b.py -- never a
@@ -105,25 +106,30 @@ def _block_import(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Default: 'alignscore' since 2026-08-05 (DECISION.md; PUBLICATION.md §8.6(c))
+# Default: 'nli' since 2026-08-19 (#120/F8 — in-process-safe; alignscore is
+# requested EXPLICITLY by its dedicated runner, score_instrument_b.py)
 # --------------------------------------------------------------------------- #
 RUNNER_POINTER = "scripts/4_analysis/score_instrument_b.py"
 
 
-def test_default_checker_is_alignscore(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_default_checker_is_nli(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#120/F8 (2026-08-19): the in-code default must be in-process-loadable —
+    unset env resolves to 'nli' (the DeBERTa-MNLI path; no ClaimChecker
+    object), never to the venv-unloadable alignscore."""
     monkeypatch.delenv("CAGE_CLAIM_CHECKER", raising=False)
     ev = _evaluator()
-    assert ev.claim_checker_name == "alignscore"
-    assert isinstance(ev._claim_checker, AlignScoreClaimChecker)
+    assert ev.claim_checker_name == "nli"
+    assert ev._claim_checker is None
 
 
-def test_default_alignscore_unavailable_strict_points_to_runner(
+def test_explicit_alignscore_unavailable_strict_points_to_runner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Project-venv reality: alignscore can NEVER install there. The default
-    checker must fail closed AND its message must point the operator to the
-    sanctioned out-of-process runner."""
-    monkeypatch.delenv("CAGE_CLAIM_CHECKER", raising=False)
+    """Project-venv reality: alignscore can NEVER install there. An EXPLICIT
+    alignscore selection (#120/F8: the default no longer selects it) must fail
+    closed AND its message must point the operator to the sanctioned
+    out-of-process runner."""
+    monkeypatch.setenv("CAGE_CLAIM_CHECKER", "alignscore")
     monkeypatch.setenv("CAGE_ALIGNSCORE_CKPT", "/models/alignscore.ckpt")
     _block_import(monkeypatch, "alignscore")
     ev = _evaluator(strict=True)
@@ -133,12 +139,12 @@ def test_default_alignscore_unavailable_strict_points_to_runner(
     assert RUNNER_POINTER in ei.value.cause
 
 
-def test_default_alignscore_unavailable_nonstrict_labels_and_sticks(
+def test_explicit_alignscore_unavailable_nonstrict_labels_and_sticks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Non-strict: unavailability recorded exactly as before the flip --
-    score=None + sticky 'claim_checker:unavailable:' row token."""
-    monkeypatch.delenv("CAGE_CLAIM_CHECKER", raising=False)
+    """Non-strict, explicit alignscore selection (#120/F8): unavailability
+    recorded -- score=None + sticky 'claim_checker:unavailable:' row token."""
+    monkeypatch.setenv("CAGE_CLAIM_CHECKER", "alignscore")
     monkeypatch.setenv("CAGE_ALIGNSCORE_CKPT", "/models/alignscore.ckpt")
     _block_import(monkeypatch, "alignscore")
     ev = _evaluator(strict=False)

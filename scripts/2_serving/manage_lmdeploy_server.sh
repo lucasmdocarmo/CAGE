@@ -26,8 +26,10 @@
 # weight footprint W: set CAGE_MODEL_WEIGHTS_GIB (fp16/bf16 ~ 2 x params-in-B,
 # e.g. ~28 for Qwen3-14B), or set LMDEPLOY_CACHE_MAX_ENTRY_COUNT explicitly as
 # a RECORDED deviation. No mapping -> refuse to launch (fail-closed): an
-# unmapped dial silently breaks §6.5 budget parity. The preflight iso-bytes
-# gate asserts the REALIZED KV-pool bytes; the mapping only sets the dial.
+# unmapped dial silently breaks §6.5 budget parity. Preflight gate (j) -- the
+# CAGE-ISO-BYTES-GATE in scripts/checks/preflight_check.sh -- parses this
+# launcher's startup log ([BlockManager] block_size/max_block_count) and
+# asserts the REALIZED KV-pool bytes; the mapping only sets the dial.
 #
 # [VERIFY-LIVE at S0]: every LMDeploy CLI flag below follows LMDeploy's
 # documented api_server CLI, but none has been exercised by this codebase yet

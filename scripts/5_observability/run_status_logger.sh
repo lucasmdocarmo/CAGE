@@ -29,11 +29,11 @@ STATE_DIR="$PROJECT_DIR/.agent/daemons/$RUN_SCOPE"
 PIDF="$STATE_DIR/run_status_logger.pid"
 mkdir -p "$STATE_DIR"
 
+# Identity-checked liveness (finding J8): the pid must be a live process whose command
+# line actually names this script -- a recycled pid in a stale pidfile (VM reboot / PID
+# wraparound) must be neither trusted as running nor KILLED by `stop`.
 pid_alive() {
-  local pid
-  [ -f "$PIDF" ] || return 1
-  pid="$(cat "$PIDF" 2>/dev/null || true)"
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+  pidfile_alive "$PIDF" "run_status_logger.sh"
 }
 
 case "${1:-}" in
