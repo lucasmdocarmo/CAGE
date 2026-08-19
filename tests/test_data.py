@@ -45,16 +45,7 @@ def test_get_loader_valid_datasets():
         assert hasattr(loader, "sample")
 
 
-# Note: Full dataset loading tests require network access and are slow
-# These would be better as integration tests
-@pytest.mark.slow
-@pytest.mark.skipif(True, reason="Requires network access and dataset download")
-def test_squad_v2_loader():
-    """Test loading SQuAD v2 dataset (integration test)."""
-    loader = get_loader("squad_v2", split="validation")
-    examples = loader.load(max_examples=5)
-    
-    assert len(examples) <= 5
-    assert all(isinstance(ex, CAGExample) for ex in examples)
-    assert all(ex.question for ex in examples)
-    assert all(ex.context for ex in examples)
+# The old skipif(True) test_squad_v2_loader placeholder was DELETED (task #141,
+# K-led7): it could never run (unconditional skip counted as "environmental" in
+# the suite headline) and the real squad_v2 loader behavior is pinned offline in
+# tests/test_dataset_loaders.py against schema-faithful synthetic rows.

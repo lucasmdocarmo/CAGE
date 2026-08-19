@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -54,6 +55,7 @@ _GATE_ENV_VARS = (
     "CAGE_REGIME_GATE_SAMPLES", "CAGE_REGIME_GATE_INTERVAL",
     "CAGE_REGIME_KV_METRIC", "CAGE_REGIME_PREEMPT_METRIC",
     "HF_DATASETS_CACHE", "HF_HOME",
+    "CAGE_SCBENCH_HF_PATH", "CAGE_SHAREGPT_HF_PATH",
     "CAGE_TELEMETRY_MOCK", "CAGE_DISABLE_LETTUCEDETECT",
     "CAGE_DISABLE_COMPRESSION", "CAGE_ALLOW_NO_COMPRESSION",
     "CAGE_ALLOW_REPLAY", "CAGE_ALLOW_NO_BACKUP",
@@ -632,12 +634,57 @@ def _datasets_env(stub: Path, cache: Path, **extra: str) -> Dict[str, str]:
     return _clean_env(PYTHONPATH=str(stub), HF_DATASETS_CACHE=str(cache), **extra)
 
 
-def test_datasets_gate_skips_when_nothing_requested(fake_datasets_path: Path,
-                                                    tmp_path: Path) -> None:
+# The default campaign roster's HF-cache directory names ("/" -> "___"), from
+# download_datasets.dataset_specs() at the default (un-overridden) HF paths.
+_DEFAULT_ROSTER_CACHE_DIRS = (
+    "hotpot_qa",                # hotpotqa
+    "dgslibisey___MuSiQue",     # musique
+    "allenai___qasper",         # qasper
+    "microsoft___SCBench",      # scbench (both configs share the dir)
+    "RyokoAI___ShareGPT52K",    # sharegpt
+    "squad_v2",                 # squad_v2
+)
+
+
+def test_datasets_gate_unset_env_evaluates_default_roster_and_refuses(
+        fake_datasets_path: Path, tmp_path: Path) -> None:
+    """K-led4 fix (task #141): with CAGE_DATASETS and DATASET both unset the
+    gate must NOT silently skip -- it evaluates the full default campaign
+    roster and, with nothing staged, REFUSES loudly."""
     proc = _run_gate("CAGE-DATASET-STALENESS-GATE",
                      env=_datasets_env(fake_datasets_path, tmp_path / "cache"))
-    assert proc.returncode == 3, proc.stdout + proc.stderr
-    assert "[SKIP] no dataset request declared" in proc.stdout
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "[INFO] no explicit dataset request" in proc.stdout
+    assert "DEFAULT campaign roster" in proc.stdout
+    assert "REFUSING" in proc.stdout and "No silent subset" in proc.stdout
+    # Every charter campaign key must be named in the refusal.
+    for key in ("hotpotqa", "musique", "qasper", "scbench", "sharegpt",
+                "squad_v2"):
+        assert key in proc.stdout, f"default-roster refusal lost {key}"
+    assert "[SKIP]" not in proc.stdout
+
+
+def test_datasets_gate_unset_env_passes_when_default_roster_staged(
+        fake_datasets_path: Path, tmp_path: Path) -> None:
+    """K-led4 fix (task #141): unset env + fully staged default roster PASSES
+    (loud INFO line, one PASS per key, never a skip)."""
+    cache = tmp_path / "cache"
+    for dirname in _DEFAULT_ROSTER_CACHE_DIRS:
+        _stage(cache, dirname)
+    proc = _run_gate("CAGE-DATASET-STALENESS-GATE",
+                     env=_datasets_env(fake_datasets_path, cache))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "[INFO] no explicit dataset request" in proc.stdout
+    assert proc.stdout.count("[PASS] dataset") == len(_DEFAULT_ROSTER_CACHE_DIRS)
+    assert "[SKIP]" not in proc.stdout
+
+
+def test_datasets_gate_has_no_silent_skip_path() -> None:
+    """K-led4 wiring pin: the staleness gate source must carry NO skip exit --
+    every path is PASS/INFO or FAIL (exit 3 = the gate_rc skip code)."""
+    snippet = _snippet("CAGE-DATASET-STALENESS-GATE")
+    assert "[SKIP]" not in snippet
+    assert "exit(3)" not in snippet
 
 
 def test_datasets_gate_passes_when_requested_sets_are_staged(
@@ -695,3 +742,185 @@ def test_datasets_gate_honors_runner_dataset_fallback(
         env=_datasets_env(fake_datasets_path, cache, DATASET="squad_v2"))
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "dataset 'squad_v2' staged" in proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# (q) cage-stats pin parity gate (task #143, finding L-A CRITICAL): the
+# installed cage-stats must be EXACTLY the requirements.txt pinned commit --
+# one commit of lag fabricated rho_KV=0.0 from an absent occupancy gauge (E2b).
+# Parse/channel fixtures via the exec'd namespace (iso-gate pattern) plus
+# end-to-end runs against the LIVE venv and synthetic requirements files.
+# ---------------------------------------------------------------------------
+
+_PIN_SHA = "df0eab4697aff133ff9dc76a7d45d8be706d89c0"
+
+
+def test_preflight_declares_pin_parity_gate() -> None:
+    text = PREFLIGHT.read_text(encoding="utf-8")
+    assert "CAGE-STATS-PIN-PARITY-GATE" in text, "preflight lost gate (q)"
+    assert 'echo "(q)' in text, "gate (q) echo line missing"
+    # (q) is a hard gate on required infra: it must NEVER use the skip code 3.
+    assert "sys.exit(3)" not in _snippet("CAGE-STATS-PIN-PARITY-GATE")
+
+
+@pytest.fixture(scope="module")
+def pinq() -> dict:
+    ns: dict = {"__name__": "cage_pin_parity_gate_under_test"}
+    exec(compile(_snippet("CAGE-STATS-PIN-PARITY-GATE"),
+                 "CAGE-STATS-PIN-PARITY-GATE", "exec"), ns)
+    return ns
+
+
+def _req(sha_or_line: str) -> str:
+    line = (f"cage-stats @ git+https://github.com/lucasmdocarmo/"
+            f"cage-stats.git@{sha_or_line}"
+            if re.fullmatch(r"[0-9A-Fa-f]+", sha_or_line) else sha_or_line)
+    return f"# comment line\nnumpy==1.26.4\n{line}\n"
+
+
+def test_pinq_parses_full_sha_and_normalizes_case(pinq: dict) -> None:
+    assert pinq["pinned_sha"](_req(_PIN_SHA)) == _PIN_SHA
+    assert pinq["pinned_sha"](_req(_PIN_SHA.upper())) == _PIN_SHA
+
+
+def test_pinq_short_sha_is_refused(pinq: dict) -> None:
+    with pytest.raises(pinq["PinParityError"], match="FULL 40-char"):
+        pinq["pinned_sha"](_req("df0eab4"))
+
+
+def test_pinq_missing_pin_is_refused(pinq: dict) -> None:
+    with pytest.raises(pinq["PinParityError"], match="NO cage-stats pin"):
+        pinq["pinned_sha"]("numpy==1.26.4\n")
+
+
+def test_pinq_commented_out_pin_does_not_count(pinq: dict) -> None:
+    text = f"# cage-stats @ git+https://github.com/x/cage-stats.git@{_PIN_SHA}\n"
+    with pytest.raises(pinq["PinParityError"], match="NO cage-stats pin"):
+        pinq["pinned_sha"](text)
+
+
+def test_pinq_duplicate_pins_are_refused(pinq: dict) -> None:
+    with pytest.raises(pinq["PinParityError"], match="exactly one"):
+        pinq["pinned_sha"](_req(_PIN_SHA) + _req("0" * 40))
+
+
+def test_pinq_non_git_pin_is_refused(pinq: dict) -> None:
+    with pytest.raises(pinq["PinParityError"], match="not a parseable"):
+        pinq["pinned_sha"](_req("cage-stats==0.1.0"))
+
+
+def test_pinq_channel_extractors(pinq: dict) -> None:
+    assert pinq["commit_from_direct_url"](
+        {"url": "x", "vcs_info": {"vcs": "git", "commit_id": _PIN_SHA.upper()}}
+    ) == _PIN_SHA
+    assert pinq["commit_from_direct_url"](
+        {"url": "x", "archive_info": {"hash": "sha256=aa"}}) is None
+    assert pinq["commit_from_direct_url"](None) is None
+    assert pinq["commit_from_version"](f"0.1.0+g{_PIN_SHA}") == _PIN_SHA
+    assert pinq["commit_from_version"]("0.1.0") is None
+    assert pinq["commit_from_version"]("2.0.0+cu118") is None
+    assert pinq["commit_from_freeze_line"](
+        f"cage-stats @ git+https://github.com/x/cage-stats.git@{_PIN_SHA}"
+    ) == _PIN_SHA
+    assert pinq["commit_from_freeze_line"]("cage-stats==0.1.0") is None
+
+
+class _StubDist:
+    """Minimal importlib.metadata.Distribution stand-in for channel tests."""
+
+    def __init__(self, version: str, direct_url: Optional[str]) -> None:
+        self.version = version
+        self._direct_url = direct_url
+
+    def read_text(self, name: str) -> Optional[str]:
+        return self._direct_url if name == "direct_url.json" else None
+
+
+def test_pinq_channels_prefer_direct_url_and_skip_freeze(pinq: dict) -> None:
+    dist = _StubDist(
+        f"0.1.0+g{_PIN_SHA}",
+        json.dumps({"url": "x", "vcs_info": {"commit_id": _PIN_SHA}}))
+
+    def _freeze_must_not_run():
+        raise AssertionError("freeze fallback consulted despite direct_url")
+        yield  # pragma: no cover -- generator: raises only if iterated
+
+    channels = pinq["installed_commits"](dist, freeze_lines=_freeze_must_not_run())
+    assert channels == {"direct_url.vcs_info": _PIN_SHA, "version.+g": _PIN_SHA}
+
+
+def test_pinq_freeze_fallback_engages_without_direct_url(pinq: dict) -> None:
+    dist = _StubDist("0.5.0", None)
+    channels = pinq["installed_commits"](
+        dist,
+        freeze_lines=[f"cage-stats @ git+https://github.com/x/y.git@{_PIN_SHA}"])
+    assert channels == {"pip.freeze": _PIN_SHA}
+
+
+def test_pinq_no_channel_yields_empty(pinq: dict) -> None:
+    assert pinq["installed_commits"](_StubDist("0.5.0", None),
+                                     freeze_lines=[]) == {}
+
+
+def test_pinq_corrupt_direct_url_is_loud(pinq: dict) -> None:
+    with pytest.raises(pinq["PinParityError"], match="corrupt"):
+        pinq["installed_commits"](_StubDist("0.5.0", "{not json"),
+                                  freeze_lines=[])
+
+
+def test_pinq_main_disagreeing_channels_fail(pinq: dict, monkeypatch,
+                                             capsys) -> None:
+    dist = _StubDist(
+        "0.1.0+g" + "0" * 40,
+        json.dumps({"url": "x", "vcs_info": {"commit_id": _PIN_SHA}}))
+    monkeypatch.setattr(pinq["md"], "distribution", lambda name: dist)
+    rc = pinq["main"](["gate", str(REPO_ROOT / "requirements.txt")])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "DISAGREE" in out
+
+
+def test_pinq_main_missing_install_fails(pinq: dict, monkeypatch,
+                                         capsys) -> None:
+    def _absent(name: str):
+        raise pinq["md"].PackageNotFoundError(name)
+
+    monkeypatch.setattr(pinq["md"], "distribution", _absent)
+    rc = pinq["main"](["gate", str(REPO_ROOT / "requirements.txt")])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "NOT installed" in out and "required infra" in out
+
+
+def test_pinq_end_to_end_parity_passes_on_this_venv() -> None:
+    """The real deal: the ACTUAL requirements.txt pin against the ACTUAL venv
+    install. This is the assertion the L-A finding said no test made."""
+    proc = _run_gate("CAGE-STATS-PIN-PARITY-GATE",
+                     str(REPO_ROOT / "requirements.txt"))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "[PASS] cage-stats installed commit == requirements.txt pin" in proc.stdout
+
+
+def test_pinq_end_to_end_mismatch_fails(tmp_path: Path) -> None:
+    req = tmp_path / "requirements.txt"
+    req.write_text(_req("0" * 40), encoding="utf-8")
+    proc = _run_gate("CAGE-STATS-PIN-PARITY-GATE", str(req))
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "cage-stats pin parity" in proc.stdout
+    assert "E2b" in proc.stdout  # the WHY travels with the failure
+
+
+def test_pinq_end_to_end_unparseable_pin_fails(tmp_path: Path) -> None:
+    req = tmp_path / "requirements.txt"
+    req.write_text(_req("df0eab4"), encoding="utf-8")
+    proc = _run_gate("CAGE-STATS-PIN-PARITY-GATE", str(req))
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "FULL 40-char" in proc.stdout
+
+
+def test_pinq_end_to_end_missing_pin_fails(tmp_path: Path) -> None:
+    req = tmp_path / "requirements.txt"
+    req.write_text("numpy==1.26.4\n", encoding="utf-8")
+    proc = _run_gate("CAGE-STATS-PIN-PARITY-GATE", str(req))
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "NO cage-stats pin" in proc.stdout

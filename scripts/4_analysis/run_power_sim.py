@@ -139,6 +139,27 @@ DEFAULT_N_GRID: tuple[int, ...] = (50, 100, 200, 300, 500, 800, 1200, 1600, 2000
 DEFAULT_W_GRID: tuple[int, ...] = (25, 50, 100, 200)
 DEFAULT_NW_GRID: tuple[int, ...] = (3, 5, 8, 12, 20)
 
+# --smoke: wiring-sanity mode (seconds, not minutes) through the IDENTICAL
+# stage code — tiny grids and sim counts for every stage INCLUDING the TOST
+# stage (whose full-run sizes are otherwise module constants the CLI cannot
+# shrink). The output is stamped SMOKE in config/report and must NEVER feed
+# the registration; the §9.6 artifact is the full default-grid run.
+SMOKE_N_SIMS = 8
+SMOKE_N_GRID: tuple[int, ...] = (50, 100)
+SMOKE_W_GRID: tuple[int, ...] = (25,)
+SMOKE_NW_GRID: tuple[int, ...] = (3, 5)
+SMOKE_TOST_N_GRID: tuple[int, ...] = (100, 300)
+SMOKE_TOST_N_SIMS = 4
+# equivalence.conditional_tost refuses bootstrap_iters < 100 (its registered
+# floor) — the smoke uses exactly that floor, never below it.
+SMOKE_TOST_BOOTSTRAP_ITERS = 100
+SMOKE_STAMP = (
+    "SMOKE ARTIFACT: tiny grids/sim counts for wiring sanity ONLY — every "
+    "number here is statistically meaningless and this output must NEVER be "
+    "embedded in the registration (the §9.6 artifact is the full "
+    "default-grid run at the final pre-freeze SHA)."
+)
+
 # Real pilot arm-pair regimes for the per-query null (2026-08-07 fix: the null
 # must reproduce the REAL paired tie/discordant structure, not a cross-pair
 # independence fiction). The binding regime is the headline-#4 analog.
@@ -348,11 +369,20 @@ def wilcoxon_diff_p(diffs: np.ndarray) -> float:
     """Continuous paired path: ``tests_by_unit.paired_wilcoxon`` on the diffs.
 
     Passing (diffs, 0) reproduces the campaign computation exactly —
-    ``paired_wilcoxon`` differences its inputs then runs Wilcoxon
-    (zero_method="wilcox", two-sided).
+    ``paired_wilcoxon`` differences its inputs then runs Wilcoxon with the
+    REGISTERED ``zero_method="pratt"`` (owner decision 2026-08-16 b,
+    ADR-0088: zeros kept in the ranking; pinned normal approximation with
+    continuity correction) — the exact path ``run_campaign_analysis``
+    executes, never the back-compat ``wilcox`` default the pre-restamp
+    simulation used.
     """
     return float(
-        paired_wilcoxon(diffs, np.zeros_like(diffs), alternative="two-sided").p_value
+        paired_wilcoxon(
+            diffs,
+            np.zeros_like(diffs),
+            alternative="two-sided",
+            zero_method="pratt",
+        ).p_value
     )
 
 
@@ -926,6 +956,7 @@ def run_tost_stage(
     seed: int,
     n_grid: Sequence[int] = TOST_N_GRID,
     n_sims: int = TOST_N_SIMS,
+    bootstrap_iters: int = TOST_BOOTSTRAP_ITERS,
     pair_regimes: Mapping[str, tuple[str, str]] = PAIR_REGIMES,
     specs: Sequence[tuple[str, str, float, tuple[float, ...], bool, str]] = TOST_SPECS,
 ) -> pd.DataFrame:
@@ -949,6 +980,7 @@ def run_tost_stage(
                 table = simulate_tost_power(
                     diffs, n_grid, fracs, n_sims, point_seed,
                     margin=margin, binary=binary,
+                    bootstrap_iters=bootstrap_iters,
                 )
                 table.insert(0, "stage", "tost_conditional")
                 table.insert(1, "dataset", dataset)
@@ -1311,12 +1343,17 @@ def _markdown_report(
     translation: list[dict[str, Any]],
 ) -> str:
     repo = config["repo_state"]
+    tost_cfg = config.get("tost") or {}
+    tost_n_sims = tost_cfg.get("n_sims", TOST_N_SIMS)
+    tost_bootstrap_iters = tost_cfg.get("bootstrap_iters", TOST_BOOTSTRAP_ITERS)
     lines: list[str] = [
         "# §9.6 simulation-based power — design-input report",
         "",
         f"> **{STAMP}**",
         "",
     ]
+    if config.get("smoke"):
+        lines += [f"> **{SMOKE_STAMP}**", ""]
     if repo["dirty"]:
         lines += [
             "> **PROVISIONAL ARTIFACT:** generated on a DIRTY working tree "
@@ -1329,7 +1366,7 @@ def _markdown_report(
         f"Generated {config['generated_utc']} at repo HEAD `{repo['head']}` "
         f"(dirty={repo['dirty']}); seed `{config['seed']}`; "
         f"n_sims/grid-point={config['n_sims']} (per-query & window stages; "
-        f"TOST stage: {TOST_N_SIMS}); target power {TARGET_POWER} "
+        f"TOST stage: {tost_n_sims}); target power {TARGET_POWER} "
         f"(§9.6). Secondary Holm worst case = α/{config['secondary_holm_m']} "
         f"(largest compiled Holm family: `{config['secondary_holm_worst_family']}`).",
         "",
@@ -1338,7 +1375,8 @@ def _markdown_report(
         "Null models resample SYMMETRIZED REAL pilot arm-pair differences "
         f"(binding regime `{BINDING_REGIME}` = headline-#4 analog; "
         "`same_family` = low-discordance sensitivity floor). Tests are the "
-        "registered §9.4 paths (`paired_wilcoxon` / `mcnemar_binary`); the "
+        "registered §9.4 paths (`paired_wilcoxon` with the registered "
+        "`zero_method='pratt'`, ADR-0088 / `mcnemar_binary`); the "
         "binary family uses the honest tie-flip injection on the REAL paired "
         "tie mass (audit §2.5). Continuous required_n is an UPPER bound "
         "(symmetrized dispersion keeps treatment-effect heterogeneity); the "
@@ -1387,7 +1425,7 @@ def _markdown_report(
         "",
         f"P(two-layer equivalence declared | equivalence TRUE) via the "
         f"REGISTERED `conditional_tost` (min_events={DEFAULT_MIN_EVENTS}; "
-        f"dominance bootstrap {TOST_BOOTSTRAP_ITERS} iters, reduced + "
+        f"dominance bootstrap {tost_bootstrap_iters} iters, reduced + "
         "labeled). The NONE-leg family models the CONDITIONAL policy-touched "
         "population (§9.5 hazard); the headline families (amendment A2) run "
         "unconditional (f=1.0) at their declared margins = the family MDEs.",
@@ -1570,7 +1608,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--datasets", nargs="+", default=list(cal.DEFAULT_DATASETS),
         choices=sorted(cal.DEFAULT_DATASETS),
     )
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help=(
+            "Wiring-sanity mode (seconds): run every stage — including the "
+            "TOST stage, whose full-run sizes are module constants — on tiny "
+            "grids/sim counts through the identical code. Output is stamped "
+            "SMOKE and is NEVER a registration input. Explicit --n-sims/"
+            "--n-grid/--w-grid/--nw-grid are overridden by the smoke sizes."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    if args.smoke:
+        args.n_sims = SMOKE_N_SIMS
+        args.n_grid = list(SMOKE_N_GRID)
+        args.w_grid = list(SMOKE_W_GRID)
+        args.nw_grid = list(SMOKE_NW_GRID)
+    tost_n_grid: tuple[int, ...] = SMOKE_TOST_N_GRID if args.smoke else TOST_N_GRID
+    tost_n_sims: int = SMOKE_TOST_N_SIMS if args.smoke else TOST_N_SIMS
+    tost_bootstrap_iters: int = (
+        SMOKE_TOST_BOOTSTRAP_ITERS if args.smoke else TOST_BOOTSTRAP_ITERS
+    )
 
     out_dir = cal._check_out_dir(args.out_dir)
     dataset_runs: dict[str, Path] = {}
@@ -1581,6 +1641,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         dataset_runs[ds] = run_root
 
     print(f"[run_power_sim] {STAMP}", flush=True)
+    if args.smoke:
+        print(f"[run_power_sim] {SMOKE_STAMP}", flush=True)
     repo_state = _git_state()
     if repo_state["dirty"]:
         print(
@@ -1591,6 +1653,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     config: dict[str, Any] = {
         "generated_utc": datetime.now(timezone.utc).isoformat(),
         "repo_state": repo_state,
+        "smoke": bool(args.smoke),
         "seed": args.seed,
         "n_sims": args.n_sims,
         "n_grid": [int(n) for n in args.n_grid],
@@ -1616,7 +1679,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "effect_unit_reconciliation": EFFECT_UNIT_RECONCILIATION,
         "loader_validity_rule": cal.LOADER_VALIDITY_RULE,
         "registered_test_paths": {
-            "per_query_continuous": "tests_by_unit.paired_wilcoxon (two-sided)",
+            "per_query_continuous": (
+                "tests_by_unit.paired_wilcoxon (two-sided, "
+                "zero_method='pratt' — the ADR-0088 registered execution: "
+                "zeros kept in the ranking, pinned normal approximation "
+                "with continuity correction)"
+            ),
             "per_query_binary": (
                 "tests_by_unit.mcnemar_binary (two-sided, exact) — "
                 + EXACT_MATCH_PROXY_NOTE
@@ -1636,9 +1704,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 }
                 for fam, metric, margin, fracs, binary, note in TOST_SPECS
             ],
-            "n_grid": list(TOST_N_GRID),
-            "n_sims": TOST_N_SIMS,
-            "bootstrap_iters": TOST_BOOTSTRAP_ITERS,
+            "n_grid": [int(n) for n in tost_n_grid],
+            "n_sims": tost_n_sims,
+            "bootstrap_iters": tost_bootstrap_iters,
             "min_events": DEFAULT_MIN_EVENTS,
         },
         "window_caveat": (
@@ -1657,7 +1725,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         nw_grid=args.nw_grid,
         n_sims=args.n_sims,
     )
-    tost_table = run_tost_stage(dataset_runs, seed=args.seed)
+    tost_table = run_tost_stage(
+        dataset_runs,
+        seed=args.seed,
+        n_grid=tost_n_grid,
+        n_sims=tost_n_sims,
+        bootstrap_iters=tost_bootstrap_iters,
+    )
     paths = write_outputs(
         pq_table, win_table, tost_table, config, refusals, out_dir
     )

@@ -23,10 +23,12 @@
 #
 # Usage (inside the pod, from the repo root):
 #   bash scripts/1_setup/setup_runpod.sh
-# Then:
+# Then (the cloud/RUNBOOK.md lifecycle — the preflight gate is NOT optional):
 #   source cage-env/bin/activate
-#   export CAGE_BACKUP_TARGET=s3://<network-volume>[/prefix]   # or ssh://...
-#   nohup bash scripts/3_run/cloud_run.sh <model> <N> <T> > run.log 2>&1 &
+#   export CAGE_BACKUP_TARGET=s3://<network-volume>[/prefix]   # or ssh://... (J4 gate)
+#   <start the serving engine: scripts/2_serving/manage_vllm_server.sh>
+#   bash scripts/checks/preflight_check.sh <MODEL> <API_BASE>   # gates (a)-(p); red = do NOT launch
+#   nohup bash scripts/3_run/run_full_sweep.sh <model> <N> <T> > sweep.log 2>&1 &
 #
 # Env:
 #   VLLM_VERSION          vLLM pin override (default: the campaign pin below)
@@ -37,7 +39,7 @@
 # =============================================================================
 set -euo pipefail
 
-# Keep in sync with Cloud/VLLM_COMPATIBILITY.md (the single pinned version).
+# Keep in sync with cloud/VLLM_COMPATIBILITY.md (the single pinned version).
 VLLM_VERSION="${VLLM_VERSION:-0.19.1}"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$PROJECT_DIR"
@@ -223,12 +225,18 @@ PY
 
 echo
 echo "[cage] ============================================================"
-echo "[cage]  RunPod bootstrap complete. Next:"
+echo "[cage]  RunPod bootstrap complete. Next (cloud/RUNBOOK.md lifecycle):"
 echo "[cage]    source cage-env/bin/activate"
 echo "[cage]    export CAGE_BACKUP_TARGET=s3://<network-volume>[/prefix]   # or ssh://[user@]host/path"
 echo "[cage]    #   (s3 backend: also export CAGE_S3_ENDPOINT + AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY"
 echo "[cage]    #    from the RunPod network-volume S3 API credentials)"
-echo "[cage]    nohup bash scripts/3_run/cloud_run.sh <model> <N> <T> > run.log 2>&1 &"
-echo "[cage]  A run with NO backup target REFUSES to start (J4); teardown goes"
-echo "[cage]  through scripts/6_teardown/teardown_pod.sh (ledger-gated pull first)."
+echo "[cage]    # 1. start the serving engine (scripts/2_serving/manage_vllm_server.sh)"
+echo "[cage]    # 2. GATE the launch -- a red gate means do NOT launch:"
+echo "[cage]    bash scripts/checks/preflight_check.sh <MODEL> <API_BASE>"
+echo "[cage]    # 3. run (one run-id for the whole matrix; resume via CAGE_RUN_ID):"
+echo "[cage]    nohup bash scripts/3_run/run_full_sweep.sh <model> <N> <T> > sweep.log 2>&1 &"
+echo "[cage]  A run with NO backup target REFUSES to start (J4). Teardown goes"
+echo "[cage]  through scripts/6_teardown/teardown_pod.sh (ledger-gated pull first;"
+echo "[cage]  NOTE: harness trees carry no ledger.json until the campaign driver"
+echo "[cage]  lands -- see cloud/RUNBOOK.md section 5 for the teardown contract)."
 echo "[cage] ============================================================"

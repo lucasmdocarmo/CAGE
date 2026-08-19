@@ -526,7 +526,14 @@ class GPUMetrics:
 
 class GPUMetricsTracker:
     """Tracks GPU metrics using pynvml (NVIDIA Management Library).
-    
+
+    [VERIFY-LIVE at S0] (K-COV5, task #141): the NVML acquisition side
+    (init, device handles, sampling loop, PCIe counters) can only execute on
+    a real NVIDIA GPU — the offline suite pins the pure aggregation
+    arithmetic (tests/test_cov_performance_trackers.py, #142) but never this
+    stack. S0 checklist row S0-10 (MyDocs/S0_CHECKLIST.md) forces the live
+    proof.
+
     This provides nvidia-smi equivalent functionality programmatically.
     Gracefully handles systems without NVIDIA GPUs.
     

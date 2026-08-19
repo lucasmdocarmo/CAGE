@@ -3,7 +3,18 @@ paper/
 docs/
 my-article/
 Documentation/
-MyDocs/
+
+# MyDocs stays private (ADR-0079) EXCEPT the two registration freeze artifacts,
+# which MUST be trackable: the confirmatory driver binds the one look to the
+# tracked PRE_REGISTRATION.md + registered_margins.json (G1 binding, ADR-0089;
+# paths pinned in scripts/4_analysis/run_campaign_analysis.py). A wholesale
+# `MyDocs/` ignore made them untrackable — walkthrough Topic 13 finding L-B(iii),
+# fixed 2026-08-19 (#144). Pinned by tests/test_gitignore_freeze_artifacts.py.
+MyDocs/*
+!MyDocs/registration/
+MyDocs/registration/*
+!MyDocs/registration/PRE_REGISTRATION.md
+!MyDocs/registration/registered_margins.json
 
 # Local Claude Code harness config, skills, and settings (machine-local, not shared)
 .claude/

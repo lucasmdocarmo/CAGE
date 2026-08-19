@@ -1,231 +1,103 @@
-# CAGE: Cache-Augmented Generation Evaluation Framework
+# CAGE — Cache-Augmented Generation Evaluation
 
-A comprehensive benchmarking framework for evaluating Cache-Augmented Generation (CAG) systems with distributed KV cache management.
+A mechanism-attribution harness for context reuse in LLM serving: it measures, under
+one controlled protocol, what KV-cache reuse (CAG), retrieval (RAG), and their hybrids
+actually buy — serving performance (TTFT, latency, throughput, KV telemetry) *jointly*
+with answer quality (grounding, faithfulness, abstention) — across engines, models,
+and memory-pressure regimes.
 
-> 📖 **Start here:** [`cloud/RUNBOOK.md`](cloud/RUNBOOK.md) (setup / deploy / run) ·
-> [`documentation/KNOWLEDGE_BASE.md`](documentation/KNOWLEDGE_BASE.md) (project reference) ·
-> [`docs/README.md`](docs/README.md) (doc index). The repo is a single-level tree at the
-> project root; some sections below predate the June 2026 reorg — trust the docs above for
-> current commands and paths.
+> **Start here**
+> - [`cloud/RUNBOOK.md`](cloud/RUNBOOK.md) — execution authority: setup → preflight →
+>   run → sync → verified pull + teardown (RunPod-first; env contract table inside)
+> - [`scripts/README.md`](scripts/README.md) — the script tree by lifecycle stage +
+>   the campaign analysis chain
+> - [`cloud/RESULTS_LAYOUT.md`](cloud/RESULTS_LAYOUT.md) — results tree spec v2
+>   (cells, windows, sha256 ledger seal)
+> - [`cloud/VLLM_COMPATIBILITY.md`](cloud/VLLM_COMPATIBILITY.md) — engine pins +
+>   VERIFY-LIVE matrix
+>
+> The design authority (groups, arms, matrices, statistics) is the publication
+> charter, `MyDocs/PUBLICATION.md` — an untracked working document until the
+> registration freeze embeds it.
 
-## Overview
+## Status (honest)
 
-CAGE is the first framework dedicated to holistically benchmarking CAG systems, measuring trade-offs between system performance and semantic quality in distributed environments. Unlike RAG evaluation tools, CAGE specifically evaluates how cache distribution policies, network placement, and memory tiering impact both retrieval correctness and generated output quality.
+- The **charter campaign has not run yet.** Earlier CPU/L4 sweeps are **pilots**:
+  their data is read-only under `results/` and informs design only — no pilot number
+  is citable as a result.
+- **RunPod is the primary cloud** (owner directive 2026-08-18); GCP support is a
+  retained port (`terraform/`, `scripts/1_setup/setup_gpu_cloud.sh`,
+  `scripts/6_teardown/teardown_vm.sh`).
+- The campaign results producer (`src/orchestration/campaign_layout.py`: manifest,
+  cell/window tree, run-end ledger seal) is built and tested; the CellSpec-native
+  campaign driver that wires it into the run loop is in progress. The runnable
+  `scripts/3_run/` harness is pilot-era and fenced as such in its headers.
 
-## Key Features
-
-- **Multi-Dimensional Evaluation**: System performance (throughput, latency) + Quality metrics (faithfulness, relevance, completeness)
-- **Distributed Testing**: Multi-replica orchestration with prefix-aware routing
-- **Multiple Baselines**: No-cache, prefix-cache, Redis, RAG, hybrid CAG↔RAG
-- **Cloud-Ready**: Terraform configs for GCP GPU deployment
-- **Reproducible**: Docker, pinned dependencies, experiment manifests
-
-## Architecture
-
-```
-Workload Generator → CAGE Orchestrator → [vLLM Replicas] → Monitoring → Analysis
-                                              ↓
-                                       Quality Evaluator
-```
-
-## Quick Start
-
-### Prerequisites
-- macOS with Apple Silicon (or Linux with CUDA GPUs for full features)
-- Python 3.12
-- 16GB+ RAM (24GB+ recommended)
-- 20GB+ free disk space
-
-### Installation
+## What a campaign run looks like
 
 ```bash
-# 1. Clone repository
-git clone <repo-url>
-cd cag-llm-kvcache
+# on the pod (see cloud/RUNBOOK.md for the full contract)
+bash scripts/1_setup/setup_runpod.sh                          # container-shaped bootstrap
+source cage-env/bin/activate
+export CAGE_BACKUP_TARGET=s3://<network-volume>[/prefix]      # J4: no backup target -> run refuses
+bash scripts/checks/preflight_check.sh <MODEL> <API_BASE>     # gates (a)-(p); non-zero = do NOT launch
+nohup bash scripts/3_run/run_full_sweep.sh <MODEL> <N> <T> > sweep.log 2>&1 &
 
-# 2. Create environment
-conda create -n cage-vllm python=3.12 -y
-conda activate cage-vllm
-
-# 3. Install dependencies
-pip install -r requirements.txt
-
-# 4. Build vLLM (macOS)
-cd ~/projects
-git clone https://github.com/vllm-project/vllm.git
-cd vllm
-pip install -r requirements/cpu.txt --index-strategy unsafe-best-match
-pip install -e .
-
-# 5. Configure environment
-export VLLM_CPU_KVCACHE_SPACE=10
-export VLLM_CPU_OMP_THREADS_BIND=auto
+# from the workstation, when the run is drained
+scripts/6_teardown/teardown_pod.sh <pod_id> <backup_target> <local_run_dir>
+#   -> ledger-gated pull FIRST, pod delete LAST, read-only $0 listing
 ```
 
-### Run First Experiment
+## Campaign analysis chain
+
+Pulled campaign trees (`results/<campaign>/<session>/<run_id>/`) flow through:
 
 ```bash
-# Download dataset
-python3 scripts/1_setup/download_datasets.py
-
-# Run baseline comparison
-python3 scripts/3_run/run_experiment.py --baseline no_cache --model Qwen/Qwen3-4B
-python3 scripts/3_run/run_experiment.py --baseline prefix_cache --model Qwen/Qwen3-4B
-
-# Analyze results
-jupyter notebook experiments/notebooks/analysis.ipynb
+python3 scripts/4_analysis/verify_results.py   <run_root>   # schema/reconciliation/ledger gate
+python3 scripts/4_analysis/organize_results.py <run_root>   # layout validation -> cells index
+python3 scripts/4_analysis/run_campaign_analysis.py <run_root>   # the registered stats engine
 ```
 
-## Project Structure
+Quality scoring is offline and decoupled (`scripts/4_analysis/rescore_quality.py`;
+Instrument B via `scripts/4_analysis/score_instrument_b.py`); scoring passes never
+write into sealed raw trees. Pilot-era analysis tools are kept runnable but refuse
+campaign trees — see `scripts/README.md`.
+
+## Repository layout
 
 ```
-cag-llm-kvcache/
-├── src/                      # Core framework code
-│   ├── data/                 # Dataset loaders
-│   ├── inference/            # Inference engines (vLLM adapter)
-│   ├── evaluation/           # Quality & performance metrics
-│   ├── orchestration/        # Router, workload gen, baselines
-│   ├── monitoring/           # Telemetry & metrics collection
-│   └── utils/                # Config, logging, helpers
-├── configs/                  # Hydra configs (model, dataset, experiment)
-├── experiments/              # Jupyter notebooks, results
-├── scripts/                  # Setup and execution scripts
-├── docker/                   # Dockerfiles (CPU + CUDA)
-├── terraform/                # Infrastructure-as-code (GCP)
-├── docs/                     # Implementation guides
-└── tests/                    # Unit tests
+cloud/         execution docs: RUNBOOK, results-layout spec, engine compatibility
+configs/       dataset / model / experiment configs
+data/          dataset manifests (query/corpus builds are pinned by sha256)
+scripts/       lifecycle-numbered operator scripts (1_setup ... 6_teardown, checks/, lib/, ops/)
+src/           the framework: analysis/ (cellspec, stats), data/, evaluation/,
+               inference/ (engine adapters), monitoring/, observability/, orchestration/
+terraform/     GCP port infrastructure (retained; apply is approval-gated)
+tests/         pytest suite (offline; fixtures replace GPUs and clouds)
+results/       run data (gitignored; pilot trees are read-only design input)
 ```
 
-## Documentation
-
-- [Implementation Guide](docs/IMPLEMENTATION_GUIDE.md) - Step-by-step setup with feasibility analysis
-- [Dataset Guide](docs/datasets.md) - Dataset preparation and formatting
-- [API Reference](docs/api.md) - Framework API documentation
-
-## Supported Baselines
-
-1. **No Caching**: Worst-case, full context reprocessing
-2. **Single-Node CAG**: Prefix caching on single instance
-3. **Centralized Cache**: Redis-backed cache server
-4. **Standard RAG**: FAISS vector store + retrieval
-5. **Distributed Cache**: Tensor parallelism (GPU only)
-6. **Hybrid CAG↔RAG**: Fallback strategy
-7. **Speculative Decoding**: Draft model acceleration with KV cache management
-
-## Datasets
-
-Recommended HuggingFace datasets for CAG evaluation:
-- `hotpotqa` - Multi-hop reasoning (primary)
-- `allenai/qasper` - Scientific papers (HPC-relevant)
-- `squad_v2` - Reading comprehension
-- `trivia_qa` - Multi-evidence questions
-
-## Metrics
-
-### System Performance
-- Throughput (QPS, tokens/sec)
-- Time-To-First-Token (TTFT)
-- End-to-end latency
-- Resource utilization
-
-### Cache-Specific
-- Prompt cached token ratio (via vLLM `usage.prompt_tokens_details.cached_tokens` when enabled)
-- Local/remote hit ratios
-- Inter-node data transfer
-- Remote fetch latency
-
-### Quality
-- Faithfulness (NLI-based)
-- Relevance (embedding similarity)
-- Completeness (BERTScore, ROUGE)
-
-### Speculative Decoding
-- Acceptance rate (accepted/proposed draft tokens)
-- Draft tokens per step
-- Rollback overhead
-- Speedup ratio vs non-speculative
-
-## Speculative Decoding
-
-CAGE supports evaluating speculative decoding's impact on CAG systems:
+## Development
 
 ```bash
-# N-gram speculation (no draft model needed)
-vllm serve Qwen/Qwen3-4B --port 8000 --enable-prefix-caching \
-  --speculative_config '{"method": "ngram", "num_speculative_tokens": 5}'
-
-python3 scripts/3_run/run_experiment.py \
-  --model Qwen/Qwen3-4B \
-  --baseline speculative \
-  --speculative-method ngram \
-  --num-speculative-tokens 5
-
-# Draft model speculation (requires compatible model pair)
-# vllm serve Qwen/Qwen3-4B --speculative_config '{"model": "Qwen/Qwen3-0.6B", "num_speculative_tokens": 5}'
+# local venv (canonical interpreter; see requirements.txt pins)
+.venv/bin/python -m pytest                    # the suite runs offline, no GPU needed
 ```
 
-Supported methods: `draft_model`, `ngram`, `suffix`, `medusa`, `eagle`
-
-## Cloud Deployment
-
-```bash
-# Provision GCP GPU instance
-cd terraform/gcp
-terraform init
-terraform apply
-
-# Deploy vLLM with tensor parallelism
-vllm serve meta-llama/Llama-3.1-8B-Instruct \
-  --tensor-parallel-size 4 \
-  --enable-prefix-caching \
-  --enable-prompt-tokens-details
-```
-
-## Requirements
-
-See [requirements.txt](requirements.txt) for complete list:
-- torch, transformers, datasets
-- sentence-transformers, bert-score, ragas
-- mlflow, hydra-core, fastapi
-- redis, ray, prometheus-client
-
-## Hardware Requirements
-
-### Local Development (macOS)
-- M1/M2/M3/M4 chip
-- 16GB+ unified memory
-- CPU-only inference
-
-### Production (Cloud)
-- NVIDIA A100/H100 GPUs
-- 40GB+ VRAM per GPU
-- NVLink interconnect recommended
-
-## Contributing
-
-[Contributing guidelines to be added]
-
-## License
-
-[License to be determined]
+Every deployable script/source file must be tracked by git — the deploy artifact is a
+`git archive` tarball with `BUILD_INFO` provenance (`scripts/ops/package_repo.sh`).
 
 ## Citation
 
 ```bibtex
-@article{carmo2025cage,
-  title={CAGE: A Framework for Holistic Evaluation of Cache-Augmented Generation Models},
-  author={Carmo, Lucas Mariano do},
-  year={2025},
-  institution={Pontifícia Universidade Católica de Minas Gerais}
+@misc{carmo2026cage,
+  title  = {CAGE: A Mechanism-Attribution Harness for Cache-Augmented Generation},
+  author = {Carmo, Lucas Mariano do},
+  year   = {2026},
+  note   = {Pontif\'icia Universidade Cat\'olica de Minas Gerais},
 }
 ```
 
 ## Contact
 
-Lucas Mariano do Carmo - lucas.mariano.carmo@gmail.com
-
-## Acknowledgments
-
-- vLLM team for the inference engine
-- HuggingFace for datasets and models
-- Research based on [original paper](docs/Artigo-Lucas-Mariano.pdf)
+Lucas Mariano do Carmo — lucas.mariano.carmo@gmail.com

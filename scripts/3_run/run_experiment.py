@@ -576,11 +576,15 @@ def build_reranker(reranker_model: Optional[str], reranker_device: str) -> Optio
 def _adapter_env_extras(engine_key: str) -> Dict[str, Any]:
     """Optional adapter kwargs sourced from environment variables (ADR-0007).
 
-    ``CAGE_<ENGINE>_CHAT_TEMPLATE_KWARGS`` (JSON object; pass only after
-    preflight verifies the server honors the kwarg -- charter D2.1
-    [VERIFY-LIVE]) and ``CAGE_ADAPTER_MAX_RETRIES`` (int). Malformed values
-    raise (fail-closed): a silently-dropped chat-template pin would serve
-    measured rows under unverified prompt semantics.
+    ``CAGE_<ENGINE>_CHAT_TEMPLATE_KWARGS`` (JSON object) and
+    ``CAGE_ADAPTER_MAX_RETRIES`` (int). NO preflight gate probes whether the
+    server honors the chat-template kwarg (K-led5, task #141: an earlier
+    version of this docstring named a phantom probe) -- the ONLY verification
+    is the live S0 check, MyDocs/S0_CHECKLIST.md row S0-5 (deferral-ledger
+    item V8): pass the kwarg only after that row has proven the serving
+    engine honors it. Malformed values raise (fail-closed): a
+    silently-dropped chat-template pin would serve measured rows under
+    unverified prompt semantics.
     """
     extras: Dict[str, Any] = {}
     raw = os.getenv(f"CAGE_{engine_key}_CHAT_TEMPLATE_KWARGS", "").strip()

@@ -6,6 +6,12 @@ This script is intentionally separate from manage_vllm_server.sh because the
 distributed baseline needs to treat the replica set as one unit: start N
 isolated vLLM backends, validate them, then start the router pointed at those
 distinct endpoints.
+
+[VERIFY-LIVE at S0] (K-COV6, task #141): 0% offline coverage and no prior
+marker — the start/validate/stop lifecycle, replica health-gating, and the
+state-file contract execute nowhere in the offline suite. S0 checklist row
+S0-9 (MyDocs/S0_CHECKLIST.md) forces the live proof (start -> status ->
+routed traffic -> stop with no orphan replica) before any DIST-topology cell.
 """
 
 from __future__ import annotations

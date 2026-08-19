@@ -94,7 +94,7 @@ _ARTIFACT_SEP = ";"
 #: never diverge (the pilot "synced to a bucket that didn't exist" bug class).
 RUN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,40}$")
 
-#: §1 session vocabulary (RUNBOOK §1).
+#: §1 session vocabulary (RUNBOOK §1.1).
 SESSIONS: frozenset[str] = frozenset({"a", "b", "cd-act1", "cd-act2"})
 
 #: §6 scoring-tree contract (offline quality passes; validated, never indexed).

@@ -23,7 +23,7 @@
 #   source cage-env/bin/activate
 #   nohup bash scripts/3_run/cloud_run.sh Qwen/Qwen3-8B 500 3 > run.log 2>&1 &
 #
-# See Cloud/RUNBOOK.md for the full ordered procedure.
+# See cloud/RUNBOOK.md for the full ordered procedure.
 #
 # PROVISIONING (2026-08-02 charter): the GCP campaign path now PROVISIONS via
 # terraform/ (sessions/*.tfvars; `terraform apply` gated by explicit user
@@ -32,7 +32,7 @@
 # =============================================================================
 set -euo pipefail
 
-# Keep in sync with Cloud/VLLM_COMPATIBILITY.md (the single pinned version).
+# Keep in sync with cloud/VLLM_COMPATIBILITY.md (the single pinned version).
 # 0.19.1 is the Phase-3 pin (2026-07-26). Phase-2 numbers were measured under 0.11.0
 # and are NOT comparable across pins (0.19.0 turned the async scheduler on by default).
 # Export VLLM_VERSION=0.11.0 to reproduce the Phase-2 environment.
@@ -187,5 +187,5 @@ echo "[cage]    nohup bash scripts/3_run/cloud_run.sh Qwen/Qwen3-8B 500 3 > run.
 echo "[cage]  Launch-time levers (run from their own scripts, they restart the server):"
 echo "[cage]    bash scripts/3_run/run_compression.sh Qwen/Qwen3-8B   # FP8 2x2 (gates FP8 x prefix-cache)"
 echo "[cage]  (speculative 2x2 RETIRED per charter §7.5 -> scripts/deprecated/)"
-echo "[cage]  Full procedure + definition of done: Cloud/RUNBOOK.md"
+echo "[cage]  Full procedure + definition of done: cloud/RUNBOOK.md"
 echo "[cage] ============================================================"

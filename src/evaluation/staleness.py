@@ -1,4 +1,4 @@
-"""Staleness/freshness metrics for the CAGE staleness baseline (SCAFFOLD).
+"""Staleness/freshness metrics for the CAGE staleness baseline.
 
 These quantify the GROUNDING cost of serving stale-but-cheap cache hits. They are ported
 from GroundedCache ("Grounded Cache Routing for RAG: When Is It Safe to Reuse an Answer?",
@@ -24,7 +24,10 @@ A per-query record is a mapping with (at least):
     evidence_version  : str    "v0" (stale) | "v1" (fresh) | None (no cache hit)
 
 This module is dependency-free (stdlib only) so it is unit-testable without model loads.
-Wiring into the run loop is pending; see documentation/STALENESS_BASELINE_DESIGN.md.
+It IS wired into the run loop: scripts/3_run/run_experiment.py imports staleness_metrics/
+select_stale/make_stale_context and drives the deterministic stale_fraction serving path
+(the original standalone design note was retired with the old docs tree; the staleness
+arm's design is governed by MyDocs/PUBLICATION.md).
 """
 
 from __future__ import annotations

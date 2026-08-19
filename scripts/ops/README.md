@@ -3,11 +3,12 @@
 Unnumbered on purpose. The numbered stages (`1_setup` … `6_teardown`) are the happy path of a run;
 these are tools that run **alongside** any stage — same rationale as `checks/` and `lib/`.
 
-> **Provisioning (2026-08-02 charter):** the GCP campaign path now provisions via **`terraform/`**
+> **Provisioning:** RunPod is the PRIMARY provider (owner directive 2026-08-18; lifecycle in
+> `cloud/RUNBOOK.md`). On the retained GCP port, provisioning goes via **`terraform/`**
 > (`sessions/*.tfvars`; `terraform apply` gated by explicit user approval — see `terraform/main.tf`).
-> The scripts here remain the **SSH-config + neocloud-manual** path: `gpu_vm.sh create` is the
-> pilot-era L4 zone-hunt, `remote_job.sh` drives work on an existing box either way, and
-> `gpu_vm.sh sweep` stays the universal prove-$0 check.
+> The scripts here are provider-agnostic-over-SSH operator tools: `gpu_vm.sh create` is the
+> pilot-era GCP L4 zone-hunt, `remote_job.sh` drives work on any existing box, and
+> `gpu_vm.sh sweep` stays the universal prove-$0 check on GCP.
 
 Grounded in the `gcp-background-tasks` skill. The rule it exists to enforce:
 
@@ -71,9 +72,12 @@ scripts/ops/gpu_vm.sh sweep          # PROVE $0
   ~40 snapshots. `git archive` → one tarball is faster and reproducible.
 - **Enforce the deadline.** A task past its deadline gets cancelled, not "it's probably nearly done".
 - **Pull results local BEFORE teardown, never after.** Teardown is irreversible; until the run exists
-  in a third place (VM + GCS + **local**), it is one failed sync away from gone. Pulling afterwards
+  in a third place (VM + bucket + **local**), it is one failed sync away from gone. Pulling afterwards
   only works if the mirror happened to be complete. `teardown_vm.sh` step `[4/6]` does this and fails
-  closed; `CAGE_SKIP_LOCAL_PULL=1` opts out (and leaves you with no local copy).
+  closed; skipping it needs the J10 **double ceremony** — `CAGE_SKIP_LOCAL_PULL=1` **and**
+  `CAGE_SKIP_LOCAL_PULL_CONFIRM=I-ACCEPT-DATA-LOSS` (a bypass marker is recorded under `results/`,
+  and you are left with no local copy). One var alone aborts. On the RunPod primary,
+  `teardown_pod.sh` has no env bypass at all — `--force` is the single, loud override.
 
 ## Shape note (matters for sweep planning)
 

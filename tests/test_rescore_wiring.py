@@ -268,6 +268,15 @@ def test_scoring_manifest_records_instrument_provenance(tmp_path: Path) -> None:
 
     # Fast mode consults no model stack: honest empty mapping, key present.
     assert man["instrument_models"] == {}
+    # F9/#147 revision provenance rides along: all four instruments keyed as
+    # {model, revision}; revision honestly None on a fast pass (nothing was
+    # lazy-loaded, so no HF commit hash was ever resolved).
+    assert set(man["instrument_revisions"]) == {
+        "nli", "embedding", "bertscore", "lettucedetect"
+    }
+    for inst, entry in man["instrument_revisions"].items():
+        assert set(entry) == {"model", "revision"}, inst
+        assert entry["model"] and entry["revision"] is None, inst
     assert "calibration_id" in man
     assert man["batch_size"] is None
     # Renamed, not duplicated: the old full-mode-only field is gone.

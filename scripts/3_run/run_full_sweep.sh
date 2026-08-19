@@ -131,8 +131,9 @@ run_tree envelope bash scripts/3_run/run_prefix_envelope.sh "$MODEL"
 
 # 4b. OPT-IN: LMCache/CacheBlend kv_store arm (EXPERIMENTAL until its live gates pass;
 #     needs `pip install lmcache "transformers>=4.36,<5"` on the VM -- the pin re-assert
-#     stops lmcache dragging in transformers 5.x, which breaks vLLM 0.11.0's tokenizer
-#     path). Enable with CAGE_ENABLE_LMCACHE=1.
+#     stops lmcache dragging in transformers 5.x, which broke the pilot-pin vLLM
+#     0.11.0 tokenizer path; the campaign-pin 0.19.1 pairing is NOT live-validated --
+#     see the STATUS note in run_kv_store.sh). Enable with CAGE_ENABLE_LMCACHE=1.
 if [ "${CAGE_ENABLE_LMCACHE:-0}" = "1" ]; then
     run_tree kv_store bash scripts/3_run/run_kv_store.sh "$MODEL"
 fi

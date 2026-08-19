@@ -6,12 +6,12 @@ path lives in [`deprecated/`](deprecated/README.md) (untouched by the ordering).
 ```
 scripts/
   1_setup/          provision the box + pull data      setup_runpod.sh (RunPod PRIMARY)  setup_gpu_cloud.sh (GCP port)  download_datasets.py
-  2_serving/        start / manage vLLM                manage_vllm_server.sh  manage_vllm_cluster.py  deploy_cluster.sh
-  3_run/            run the experiments                cloud_run.sh  run_baselines.sh  run_compression.sh  run_experiment.py
+  2_serving/        start / manage the engines         manage_vllm_server.sh  manage_sglang_server.sh  manage_lmdeploy_server.sh  manage_vllm_cluster.py  deploy_cluster.sh
+  3_run/            run the experiments                cloud_run.sh  run_full_sweep.sh  run_baselines.sh  run_compression.sh  run_kv_store.sh  run_experiment.py
   4_analysis/       verify + index + stats             verify_results.py  organize_results.py  run_campaign_analysis.py
                     (campaign, D9)                     run_calibration.py  run_power_sim.py  score_instrument_b.py  rescore_quality.py
                     (pilot archive, 2026-07)           run_phase2_stats.sh  statistical_tests.py  token_divergence.py  generate_plots.py
-  5_observability/  live monitor + durable off-box mirror  observe_run.py  watch_run.sh  sync_results.sh (provider-neutral; sync_results_to_gcs.sh = compat shim)  pull_run.sh  log_sync_daemon.sh  collect_logs.sh  gcp_shutdown_hook.sh  run_status_logger.sh
+  5_observability/  live monitor + durable off-box mirror  observe_run.py  watch_run.sh  watch_campaign.sh  sync_results.sh (provider-neutral; sync_results_to_gcs.sh = compat shim)  gcs_backup_daemon.sh  pull_run.sh  log_sync_daemon.sh  collect_logs.sh  gcp_shutdown_hook.sh  run_status_logger.sh
   6_teardown/       pull-verified $0 teardown           teardown_pod.sh (RunPod PRIMARY)  teardown_vm.sh (GCP port)
   checks/           gates & tests (run as needed)      preflight_check.sh  check_fp8_prefix_cache.sh  smoke_staleness.sh  run_tests.sh
   lib/              sourced by drivers (not run)        _common.sh  _serving_config.sh  _log_guard.sh  transport.sh (gs://|s3://|ssh://|file:// backends)

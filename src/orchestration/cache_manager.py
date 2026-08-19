@@ -3,6 +3,11 @@ Abstract interface for Pluggable KV Cache Managers.
 
 This defines the contract for implementing different cache distribution policies
 (Sharding, Offloading, Replication) as described in the CAGE proposal.
+
+[VERIFY-LIVE at S0] (K-COV4, task #141): 0% offline coverage and wired into the
+serving path via the router/cluster stack; no test executes it outside
+live-gated skips. S0 checklist row S0-9 (MyDocs/S0_CHECKLIST.md) forces the
+live proof; offline tests for the pure policy logic are task #142.
 """
 
 from abc import ABC, abstractmethod

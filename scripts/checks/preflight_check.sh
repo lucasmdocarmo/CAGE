@@ -21,6 +21,8 @@
 #   (n) calibration artifact (cal-v1) presence/shape               [#118 item]
 #   (o) regime-inputs bridge on live telemetry (live-only; skips)  [#118 item]
 #   (p) dataset staleness refusal (requested charter datasets staged on disk)
+#   (q) cage-stats pin parity (requirements.txt pinned SHA == installed commit;
+#       task #143, finding L-A -- a lagging install fabricates rho_KV readings)
 #
 # Exit 0 = all green, safe to launch. Non-zero = at least one gate failed (do NOT launch).
 # Usage: bash scripts/checks/preflight_check.sh [MODEL] [API_BASE]
@@ -971,24 +973,23 @@ gate_rc $?
 # ---------------------------------------------------------------------------
 echo "(p) dataset staleness refusal (requested charter datasets staged on disk)"
 python3 - <<'PY'
-# CAGE-DATASET-STALENESS-GATE (task #138 gate e). A run request naming a
-# charter dataset that is NOT staged on disk must REFUSE here -- never launch
-# and silently serve a subset. Requested set: CAGE_DATASETS (comma-separated
-# roster keys) falling back to the runner's exported DATASET. Staging ground
-# truth: the HF datasets cache filled by scripts/1_setup/download_datasets.py
-# (HF_DATASETS_CACHE > HF_HOME/datasets > ~/.cache/huggingface/datasets); the
-# cache-directory layout convention is [VERIFY-LIVE at S0].
+# CAGE-DATASET-STALENESS-GATE (task #138 gate e; K-led4 fix, task #141). A run
+# request naming a charter dataset that is NOT staged on disk must REFUSE here
+# -- never launch and silently serve a subset. Requested set: CAGE_DATASETS
+# (comma-separated roster keys) falling back to the runner's exported DATASET.
+# K-led4 (Topic 12): nothing in the launch path exports either variable, so the
+# old exit-3 skip default meant an operator got NO staleness protection
+# silently. With neither set, this gate now evaluates the FULL default
+# campaign roster (download_datasets.py CAMPAIGN_KEYS -- the charter D5 set
+# that `--dataset all` stages) and says so loudly; it never silently skips.
+# Staging ground truth: the HF datasets cache filled by
+# scripts/1_setup/download_datasets.py (HF_DATASETS_CACHE > HF_HOME/datasets >
+# ~/.cache/huggingface/datasets); the cache-directory layout convention is
+# [VERIFY-LIVE at S0].
 import importlib.util
 import os
 import sys
 from pathlib import Path
-
-raw = os.environ.get("CAGE_DATASETS") or os.environ.get("DATASET") or ""
-requested = [t.strip() for t in raw.split(",") if t.strip()]
-if not requested:
-    print("  [SKIP] no dataset request declared (export CAGE_DATASETS=<key,...> "
-          "or DATASET=<key>) -- nothing to check against the staged roster")
-    sys.exit(3)
 
 spec = importlib.util.spec_from_file_location(
     "cage_download_datasets",
@@ -1000,6 +1001,14 @@ except Exception as exc:
     print(f"  [FAIL] cannot load the staging roster "
           f"(scripts/1_setup/download_datasets.py): {exc}")
     sys.exit(1)
+
+raw = os.environ.get("CAGE_DATASETS") or os.environ.get("DATASET") or ""
+requested = [t.strip() for t in raw.split(",") if t.strip()]
+if not requested:
+    requested = list(mod.CAMPAIGN_KEYS)
+    print("  [INFO] no explicit dataset request (CAGE_DATASETS/DATASET unset) "
+          f"-- evaluating the DEFAULT campaign roster {requested} instead of "
+          "skipping (K-led4: this gate never silently skips)")
 
 known = set(mod.CAMPAIGN_KEYS) | set(mod.CALIBRATION_KEYS) | {"ruler"}
 unknown = [k for k in requested if k not in known]
@@ -1042,6 +1051,191 @@ if missing:
           f"scripts/1_setup/download_datasets.py --dataset <key> (cache: {cache})")
     sys.exit(1)
 sys.exit(0)
+PY
+gate_rc $?
+
+# ---------------------------------------------------------------------------
+# (q) cage-stats pin parity (task #143, finding L-A CRITICAL).
+# The E2b lesson: an installed cage-stats one commit behind the requirements
+# pin fabricated rho_KV=0.0 from an ABSENT occupancy gauge -- run-validity
+# critical and invisible to the test suite (which runs on fixtures /
+# CAGE_STATS_HOME, never the installed dist). This gate proves the venv's
+# INSTALLED cage-stats commit equals the requirements.txt pinned SHA.
+# Fail-closed: missing install, unparseable pin, or no recorded install
+# commit all FAIL (cage-stats is required infra). Never exits 3.
+# ---------------------------------------------------------------------------
+echo "(q) cage-stats pin parity (requirements.txt pin == installed commit)"
+python3 - "$PROJECT_DIR/requirements.txt" <<'PY'
+# CAGE-STATS-PIN-PARITY-GATE (task #143, finding L-A). Extracted and exercised
+# for real by tests/test_preflight_gates.py (parse fixtures + end-to-end runs
+# against the live venv and synthetic requirements files).
+#
+# Installed-commit evidence channels, all recorded AT INSTALL TIME (this gate
+# refuses to guess -- no channel, or disagreeing channels, is a FAILURE):
+#   1. PEP 610 direct_url.json vcs_info.commit_id -- pip's own record for a
+#      `git+...@sha` install (the S0/GPU-box channel).
+#   2. `pip freeze` fallback: the `cage-stats @ git+...@sha` line (derived
+#      from the same PEP 610 record; kept as a belt-and-braces channel).
+#   3. PEP 440 local version `+g<full sha>` -- minted from `git rev-parse` by
+#      the offline local-wheel build (no-network dev boxes, task #143).
+import importlib.metadata as md
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+_SHA40 = re.compile(r"^[0-9a-f]{40}$")
+_PIN = re.compile(r"^cage-stats\s*@\s*git\+\S+@([0-9A-Fa-f]+)\s*$")
+_FREEZE = re.compile(r"^cage-stats\s*@\s*git\+\S+@([0-9A-Fa-f]{40})")
+_LOCAL_G = re.compile(r"\+g([0-9a-f]{40})$")
+
+
+class PinParityError(ValueError):
+    """Loud parse failure -- the pin-parity gate must never guess."""
+
+
+def pinned_sha(requirements_text):
+    """The full 40-char SHA pinned for cage-stats in requirements.txt.
+
+    Exactly one non-comment `cage-stats @ git+...@<sha>` line must exist and
+    its SHA must be full-length: a missing, duplicated, or short/branch pin is
+    unparseable and REFUSED (a short pin cannot be compared to an installed
+    commit without guessing)."""
+    hits = []
+    for raw in requirements_text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line.startswith("cage-stats"):
+            hits.append(line)
+    if not hits:
+        raise PinParityError(
+            "requirements.txt has NO cage-stats pin line -- cage-stats is "
+            "required infra (rho_KV telemetry); restore the "
+            "`cage-stats @ git+...@<full-sha>` pin")
+    if len(hits) > 1:
+        raise PinParityError(
+            f"requirements.txt has {len(hits)} cage-stats lines -- exactly one "
+            f"pin must exist (found: {hits!r})")
+    m = _PIN.match(hits[0])
+    if not m:
+        raise PinParityError(
+            f"cage-stats pin is not a parseable `cage-stats @ git+...@<sha>` "
+            f"line: {hits[0]!r}")
+    sha = m.group(1).lower()
+    if not _SHA40.match(sha):
+        raise PinParityError(
+            f"cage-stats pin ref {m.group(1)!r} is not a FULL 40-char commit "
+            f"SHA -- short/branch refs are ambiguous; pin the full SHA")
+    return sha
+
+
+def commit_from_direct_url(doc):
+    """PEP 610 vcs_info.commit_id (lowered), or None when not a vcs install."""
+    if not isinstance(doc, dict):
+        return None
+    commit = doc.get("vcs_info", {}).get("commit_id")
+    return commit.lower() if isinstance(commit, str) and commit else None
+
+
+def commit_from_version(version):
+    """Full SHA from a `+g<40-hex>` PEP 440 local segment, or None."""
+    m = _LOCAL_G.search(version)
+    return m.group(1) if m else None
+
+
+def commit_from_freeze_line(line):
+    """Full SHA from a `cage-stats @ git+...@<sha>` pip-freeze line, or None."""
+    m = _FREEZE.match(line.strip())
+    return m.group(1).lower() if m else None
+
+
+def installed_commits(dist, freeze_lines=None):
+    """{channel_name: sha} for every evidence channel present on the dist.
+
+    `freeze_lines` (an iterable of pip-freeze output lines) is only consulted
+    when the direct_url channel yields nothing -- pip freeze derives its git
+    line from the same PEP 610 record."""
+    channels = {}
+    try:
+        raw = dist.read_text("direct_url.json")
+    except Exception:
+        raw = None
+    if raw:
+        try:
+            doc = json.loads(raw)
+        except ValueError as exc:
+            raise PinParityError(f"installed direct_url.json is corrupt: {exc}")
+        commit = commit_from_direct_url(doc)
+        if commit:
+            channels["direct_url.vcs_info"] = commit
+    local = commit_from_version(dist.version)
+    if local:
+        channels["version.+g"] = local
+    if "direct_url.vcs_info" not in channels and freeze_lines is not None:
+        for line in freeze_lines:
+            commit = commit_from_freeze_line(line)
+            if commit:
+                channels["pip.freeze"] = commit
+                break
+    return channels
+
+
+def main(argv):
+    req_path = Path(argv[1]) if len(argv) > 1 else Path("requirements.txt")
+    try:
+        pin = pinned_sha(req_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        print(f"  [FAIL] cannot read {req_path}: {exc}")
+        return 1
+    except PinParityError as exc:
+        print(f"  [FAIL] {exc}")
+        return 1
+
+    try:
+        dist = md.distribution("cage-stats")
+    except md.PackageNotFoundError:
+        print(f"  [FAIL] cage-stats is NOT installed in this venv but "
+              f"requirements.txt pins {pin} -- required infra (the rho_KV "
+              f"telemetry source); install it at the pinned commit")
+        return 1
+
+    def freeze_lines():
+        # Generator: the pip subprocess only runs if the fallback is consulted.
+        res = subprocess.run(
+            [sys.executable, "-m", "pip", "freeze"],
+            capture_output=True, text=True)
+        yield from (res.stdout.splitlines() if res.returncode == 0 else [])
+
+    try:
+        channels = installed_commits(dist, freeze_lines=freeze_lines())
+    except PinParityError as exc:
+        print(f"  [FAIL] {exc}")
+        return 1
+    if not channels:
+        print(f"  [FAIL] installed cage-stats {dist.version} records NO "
+              f"install commit (no direct_url vcs_info, no git+ pip-freeze "
+              f"line, no +g<sha> local version) -- cannot certify it matches "
+              f"the pinned {pin}; reinstall from the pinned commit")
+        return 1
+    if len(set(channels.values())) > 1:
+        print(f"  [FAIL] installed cage-stats commit channels DISAGREE: "
+              f"{channels} -- corrupted install metadata; reinstall from the "
+              f"pinned {pin}")
+        return 1
+    channel, installed = next(iter(channels.items()))
+    if installed != pin:
+        print(f"  [FAIL] cage-stats pin parity: requirements.txt pins {pin} "
+              f"but the venv has {installed} (channel: {channel}) -- a "
+              f"lagging install fabricates telemetry (E2b: absent KV gauge "
+              f"-> rho_KV=0.0); reinstall at the pinned commit before launch")
+        return 1
+    print(f"  [PASS] cage-stats installed commit == requirements.txt pin "
+          f"({pin}; channel: {channel})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
 PY
 gate_rc $?
 

@@ -1190,7 +1190,24 @@ def resolve_registered_margin(
                 "the confirmatory look (G1d)"
             )
         return None, record
-    registered = float(margins[equivalence_metric])
+    raw_margin = margins[equivalence_metric]
+    # K-COV2 (task #140): the registered value must BE a margin — a typed
+    # refusal, never a float() crash (string) or a silent NaN/<=0 consumption.
+    if isinstance(raw_margin, bool) or not isinstance(raw_margin, (int, float)):
+        raise AnalysisError(
+            f"registered §9.5 margin for {equivalence_metric!r} in "
+            f"{REGISTERED_MARGINS_PATH.name} is not a number "
+            f"({raw_margin!r}) — a TOST margin is a finite positive number "
+            "(G1d); fix the registered artifact at the freeze, not at the look"
+        )
+    registered = float(raw_margin)
+    if not math.isfinite(registered) or registered <= 0:
+        raise AnalysisError(
+            f"registered §9.5 margin for {equivalence_metric!r} in "
+            f"{REGISTERED_MARGINS_PATH.name} is {registered!r} — a TOST "
+            "margin must be finite and > 0 (G1d); fix the registered "
+            "artifact at the freeze, not at the look"
+        )
     if tost_margin is not None and tost_margin != registered:
         raise AnalysisError(
             f"--tost-margin={tost_margin} contradicts the REGISTERED margin "

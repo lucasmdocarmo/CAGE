@@ -6,12 +6,13 @@
 # =============================================================================
 # Run the CAGE baseline suite on a SINGLE GPU machine with continuous result persistence.
 #
-# IMPORTANT: run this ON A GPU VM (it starts a local vLLM server via run_baselines.sh).
-# Do NOT run it on the CPU router of the multi-VM Terraform cluster. For the *distributed*
-# baseline against that cluster, use run_experiment.py + sync_results.sh instead
-# (see Cloud/RUNBOOK.md §9, Path B).
+# IMPORTANT: run this ON A GPU box (it starts a local vLLM server via run_baselines.sh).
+# Do NOT run it on the CPU router of a multi-VM cluster. For the *distributed* baseline
+# against a cluster, use run_experiment.py + sync_results.sh directly (a pilot-era path;
+# the cluster recipe it pointed at was retired with the pilot runbook — see git history
+# of cloud/RUNBOOK.md).
 #
-# Results are mirrored to the durable GCS bucket every SYNC_INTERVAL seconds (and at exit),
+# Results are mirrored to the durable backup target every SYNC_INTERVAL seconds (and at exit),
 # so an SSH drop, VM preemption, or VM delete cannot lose a finished baseline. Pair with
 # `nohup ... &` so it survives disconnects.
 #
@@ -40,7 +41,7 @@
 # so run those via their own scripts instead of this suite:
 #     compression 2x2:  bash scripts/3_run/run_compression.sh $MODEL   (gates FP8 x prefix-caching)
 #     (speculative 2x2 RETIRED per charter §7.5 -> scripts/deprecated/run_speculative_matrix.sh)
-# The vLLM pin is v0.19.1 (Phase-3; Phase-2 ran v0.11.0) — see Cloud/VLLM_COMPATIBILITY.md.
+# The vLLM pin is v0.19.1 (Phase-3; Phase-2 ran v0.11.0) — see cloud/VLLM_COMPATIBILITY.md.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

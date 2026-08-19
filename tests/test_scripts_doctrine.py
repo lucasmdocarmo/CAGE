@@ -62,6 +62,28 @@ def _rel(p: Path) -> str:
     return str(p.relative_to(REPO_ROOT))
 
 
+_HEREDOC_OPEN = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
+
+
+def _strip_heredoc_bodies(text: str) -> str:
+    """Drop heredoc BODY lines so doctrine regexes cannot be satisfied by
+    quoted script text (K-PIN3, task #140: a `source ... _common.sh` line
+    inside a `cat <<EOF` template counted as real sourcing)."""
+    out: list[str] = []
+    terminator: Optional[str] = None
+    for line in text.splitlines():
+        if terminator is not None:
+            # <<- strips leading TABS from the terminator line (bash semantics).
+            if line.lstrip("\t") == terminator:
+                terminator = None
+            continue
+        out.append(line)
+        m = _HEREDOC_OPEN.search(line)
+        if m:
+            terminator = m.group(2)
+    return "\n".join(out)
+
+
 def _sources_file(text: str, name: str) -> bool:
     """True only for an actual `source` / `.` STATEMENT naming the file.
 
@@ -70,8 +92,16 @@ def _sources_file(text: str, name: str) -> bool:
     mirror-drift the doctrine exists to prevent (adversarial review
     2026-08-12 on the D1 launcher test). The path portion may contain spaces
     (e.g. `source "$(cd "$(dirname ...)" && pwd)/_common.sh"`), so match any
-    non-comment run after the source keyword rather than a single \\S+ token."""
-    return re.search(rf"^\s*(?:source|\.)\s+[^#\n]*{re.escape(name)}", text, re.M) is not None
+    non-comment run after the source keyword rather than a single \\S+ token.
+
+    Anchored per K-PIN3 (task #140): heredoc bodies are stripped first (quoted
+    script text is not sourcing), and the name must END the path token — a
+    trailing lookahead rejects `_common.sh.bak` / `_common.sh2` substrings."""
+    return re.search(
+        rf"^\s*(?:source|\.)\s+[^#\n]*{re.escape(name)}(?![A-Za-z0-9_.])",
+        _strip_heredoc_bodies(text),
+        re.M,
+    ) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +292,69 @@ def test_deployable_code_is_tracked_by_git() -> None:
     assert not missing, (
         "on disk but NOT tracked by git — these will silently NOT ship in the "
         f"deploy tarball (git archive HEAD): {missing}"
+    )
+
+
+def _all_tracked_paths() -> List[str]:
+    """EVERY tracked path (unscoped, index-inclusive) — for repo-wide doctrine pins."""
+    if not (REPO_ROOT / ".git").exists():
+        pytest.skip("not a git checkout (tarball deploy)")
+    if shutil.which("git") is None:
+        pytest.skip("git unavailable")
+    out = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "ls-files"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    return out.splitlines()
+
+
+def test_no_tracked_paths_differ_only_by_case() -> None:
+    """L-E (Topic 13): `Cloud/` and `cloud/` were BOTH tracked — invisible on
+    case-insensitive APFS, but every case-sensitive checkout (the RunPod pod via
+    git archive, GitHub, reviewers) splits them into TWO directories and every
+    cross-reference dangles exactly at deploy. No two tracked paths (or their
+    parent directories) may collide case-insensitively."""
+    tracked = _all_tracked_paths()
+    seen: Dict[str, str] = {}
+    collisions = []
+    for path in tracked:
+        # Check the full path AND every ancestor directory (dir-level collisions
+        # like Cloud/ vs cloud/ are the actual L-E failure mode).
+        parts = path.split("/")
+        for depth in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:depth])
+            folded = prefix.lower()
+            if folded in seen and seen[folded] != prefix:
+                collisions.append(f"{seen[folded]} <-> {prefix}")
+            else:
+                seen.setdefault(folded, prefix)
+    assert not collisions, (
+        "tracked paths differ only by case — a case-sensitive checkout splits "
+        f"these into separate files/dirs (finding L-E): {sorted(set(collisions))}"
+    )
+
+
+def test_no_tracked_file_references_capital_cloud_dir() -> None:
+    """L-E sweep guard: the docs dir is `cloud/` (lowercase). A reference to
+    `Cloud/` resolves on APFS and dangles on every case-sensitive checkout."""
+    offenders = []
+    self_path = str(Path(__file__).resolve().relative_to(REPO_ROOT))
+    for path in _all_tracked_paths():
+        if path == self_path:
+            continue  # this test names the forbidden spelling in its own strings
+        p = REPO_ROOT / path
+        if not p.is_file() or p.suffix not in (".md", ".sh", ".py", ".txt", ".tf", ".yaml", ".yml"):
+            continue
+        try:
+            text = p.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        for i, line in enumerate(text.splitlines(), start=1):
+            if "Cloud/" in line:
+                offenders.append(f"{path}:{i}: {line.strip()[:80]}")
+    assert not offenders, (
+        "tracked files reference the retired capital-C `Cloud/` path (finding "
+        "L-E; the tracked dir is lowercase `cloud/`): " + "; ".join(offenders)
     )
 
 

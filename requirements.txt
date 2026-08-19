@@ -151,5 +151,9 @@ pytest-asyncio>=0.21.0
 # Tier 4: PINNED to an exact commit (2026-07-15): an unpinned git dep installs whatever
 # main is at setup time, making two runs weeks apart silently non-comparable. Bump
 # deliberately.
-cage-stats @ git+https://github.com/lucasmdocarmo/cage-stats.git@1cb902e2881a22fe2580ed264bd8a8ce16eb43fb
+# 2026-08-18 (task #143, finding L-A): bumped 1cb902e2 -> df0eab46, the E2b fix --
+# the old commit computed `kv_usage = ... or 0.0`, FABRICATING an "unpressured"
+# reading when the KV-occupancy gauge is absent; df0eab46 makes it None end-to-end.
+# Preflight gate (q) asserts installed-commit == this pin before every launch.
+cage-stats @ git+https://github.com/lucasmdocarmo/cage-stats.git@df0eab4697aff133ff9dc76a7d45d8be706d89c0
 # Local dev alternative (no install): set CAGE_STATS_HOME=/Users/lucasmariano/cage-stats

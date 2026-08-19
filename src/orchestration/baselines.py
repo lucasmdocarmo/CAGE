@@ -13,8 +13,8 @@ list in sync with it):
 8.  compressed_rag  - RAG with LLMLingua-2 text compression of retrieved docs
 9.  compressed_cag  - measures a server LAUNCHED with fp8 KV cache; runner records an analytical footprint
 
-Staleness axis (serving path wired; run a live smoke pass before a full sweep; see
-Documentation/STALENESS_BASELINE_DESIGN.md):
+Staleness axis (serving path wired via run_experiment's version mode; run a live smoke
+pass before a full sweep; mechanism documented in src/evaluation/staleness.py):
     staleness       - holds cache warmth fixed and sweeps a stale_fraction knob to plot the
                       serving-win vs grounding-loss curve on CAGE's joint axis.
 """
@@ -39,7 +39,7 @@ class BaselineType(Enum):
     COMPRESSED_RAG = "compressed_rag"  # retrieved docs text-compressed (LLMLingua)
     COMPRESSED_CAG = "compressed_cag"  # cached context KV-compressed (fp8 KV / MLA)
     # Staleness/freshness axis: sweeps cache-entry AGE at fixed warmth (gold evidence redacted
-    # for the stale fraction). See Documentation/STALENESS_BASELINE_DESIGN.md.
+    # for the stale fraction); mechanism documented in src/evaluation/staleness.py.
     STALE = "staleness"
 
 
@@ -84,7 +84,7 @@ class BaselineConfig:
     compress_target_ratio: float = 0.5         # fraction of tokens to KEEP (0.5 = 2x compression)
     kv_cache_dtype: Optional[str] = None        # server-side KV compression: "fp8" | None (compressed_cag)
 
-    # Staleness/freshness axis (scaffold; see Documentation/STALENESS_BASELINE_DESIGN.md).
+    # Staleness/freshness axis (WIRED via run_experiment's version mode; see src/evaluation/staleness.py).
     # stale_fraction = fraction of served cache hits deliberately bound to an OUTDATED
     # evidence version; warmth/hit-rate held constant so ONLY cache AGE varies.
     stale_fraction: float = 0.0                 # 0.0 = all-fresh; 1.0 = all-stale
@@ -229,7 +229,7 @@ def get_baseline_config(baseline_name: str, **overrides) -> BaselineConfig:
         # WIRED: run_experiment serves v0 (stale, answer span redacted) vs v1 (fresh) evidence
         # on the fly for the chosen stale_fraction (version mode). The "ttl" mode is NOT
         # implemented (run_experiment raises). Run a live 5-query smoke before a full sweep.
-        # See Documentation/STALENESS_BASELINE_DESIGN.md.
+        # Mechanism documented in src/evaluation/staleness.py.
         "staleness": BaselineConfig(
             baseline_type=BaselineType.STALE,
             description="Staleness/freshness baseline: warm cache held constant, stale_fraction "

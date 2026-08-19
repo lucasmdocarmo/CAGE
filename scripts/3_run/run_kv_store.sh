@@ -15,13 +15,16 @@
 #                 of position -- the literature's answer to the fact that per-query
 #                 context breaks vanilla prefix caching (CAGE's measured -3.3%).
 #
-# STATUS: EXPERIMENTAL until live-validated. The LMCache<->vLLM 0.11.0 pairing is
-# verified by the gates below at run time (import + server health with the connector),
-# NOT assumed. First live validation: the 100x3 validation-run preflight.
-# Install on the VM first:  pip install lmcache "transformers>=4.36,<5"
-#   (re-assert the transformers pin IN THE SAME CALL: lmcache alone pulls transformers 5.x,
-#   which breaks vLLM 0.11.0's tokenizer path. Not in requirements.txt on purpose --
-# optional heavy dep; setup_gpu_cloud.sh stays lean).
+# STATUS: EXPERIMENTAL until live-validated. The LMCache<->vLLM pairing is verified
+# by the gates below at run time (import + server health with the connector), NOT
+# assumed. NOTE (pilot-era pairing): the install recipe + transformers pin below were
+# validated against the PILOT pin vLLM 0.11.0; the campaign pin is 0.19.1
+# (cloud/VLLM_COMPATIBILITY.md sec 0) and the LMCache<->0.19.1 pairing has NOT been
+# live-validated -- the run-time gates are what stand between this arm and a silent
+# mispairing. Install on the box first:  pip install lmcache "transformers>=4.36,<5"
+#   (re-assert the transformers pin IN THE SAME CALL: lmcache alone pulls transformers
+#   5.x, which broke the 0.11.0-era tokenizer path. Not in requirements.txt on purpose
+#   -- optional heavy dep; the setup scripts stay lean).
 #
 # Outputs: $CAGE_RUN_ROOT/kv_store/lmcache_rag/trial_*/  (tree "kv_store" in _results_loader)
 # Resume: complete cell skipped; CAGE_FORCE_RERUN=1 wipes and re-runs.

@@ -16,5 +16,8 @@ arms; the pilot 9-name taxonomy these scripts drive is likewise retired (alias m
 `run_full_sweep.sh` no longer runs the speculative tree by default; pilot re-scoring can
 opt back in with `CAGE_RUN_RETIRED_SPECULATIVE=1` (which calls the script at this path).
 
-Rollback: these files were moved with plain `mv` from `scripts/3_run/` and
-`scripts/checks/`; `git checkout -- <old path>` restores the pre-move copy.
+Rollback: these files were moved here from `scripts/3_run/` and `scripts/checks/`.
+Once the move is committed the old paths no longer exist in HEAD, so restore from
+history: `git log --follow -- scripts/deprecated/<name>` to find the pre-move commit,
+then `git show <sha>:scripts/3_run/<name> > scripts/3_run/<name>` (or simply
+`git mv scripts/deprecated/<name> scripts/3_run/<name>` to un-retire it).

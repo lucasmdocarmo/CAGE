@@ -26,11 +26,11 @@ from src.analysis.stats.power_sim import (  # noqa: E402
     PowerSimError,
     simulate_campaign,
     tie_flip_injection,
-    wilcoxon_signed_p,
 )
 from src.analysis.stats.tests_by_unit import (  # noqa: E402
     DEFAULT_MAX_WINDOWS,
     mcnemar_binary,
+    paired_wilcoxon,
 )
 
 RNG = np.random.default_rng(20260807)
@@ -96,11 +96,36 @@ def pair_archive(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 class TestAdapters:
-    def test_wilcoxon_diff_p_equals_skeleton_default(self) -> None:
+    def test_wilcoxon_diff_p_equals_registered_pratt_path(self) -> None:
+        # ADR-0088(b): the campaign executes zero_method='pratt' everywhere,
+        # so the simulated continuous test must be that exact path (the old
+        # pin against the wilcox-default skeleton is superseded).
         diffs = RNG.normal(0.3, 1.0, size=80)
-        assert rps.wilcoxon_diff_p(diffs) == pytest.approx(
-            wilcoxon_signed_p(diffs), abs=1e-12
-        )
+        expected = paired_wilcoxon(
+            diffs,
+            np.zeros_like(diffs),
+            alternative="two-sided",
+            zero_method="pratt",
+        ).p_value
+        assert rps.wilcoxon_diff_p(diffs) == pytest.approx(expected, abs=1e-12)
+
+    def test_wilcoxon_diff_p_is_pratt_not_wilcox_under_ties(self) -> None:
+        # Behavioral discrimination: with real tie mass the Pratt and wilcox
+        # paths genuinely differ (zeros penalize the statistic vs silently
+        # shrinking n) — the adapter must track the registered Pratt value.
+        diffs = np.concatenate([RNG.normal(0.4, 1.0, size=40), np.zeros(40)])
+        RNG.shuffle(diffs)
+        zeros = np.zeros_like(diffs)
+        pratt = paired_wilcoxon(
+            diffs, zeros, alternative="two-sided", zero_method="pratt"
+        ).p_value
+        wilcox = paired_wilcoxon(
+            diffs, zeros, alternative="two-sided", zero_method="wilcox"
+        ).p_value
+        got = rps.wilcoxon_diff_p(diffs)
+        assert got == pytest.approx(pratt, abs=1e-12)
+        assert abs(pratt - wilcox) > 1e-6  # the two paths are distinct here
+        assert abs(got - wilcox) > 1e-6  # back-compat path is NOT simulated
 
     def test_wilcoxon_diff_p_all_zero_is_one(self) -> None:
         assert rps.wilcoxon_diff_p(np.zeros(50)) == 1.0
@@ -627,3 +652,140 @@ class TestConfig:
         bad = tmp_path / "results" / "power"
         with pytest.raises(Exception, match="read-only"):
             rps.cal._check_out_dir(bad)
+
+
+# --------------------------------------------------------------------------- #
+# --smoke mode (2026-08-19 #111 prep): wiring sanity through the identical
+# stage code, offline, on a synthetic three-arm pilot archive.
+# --------------------------------------------------------------------------- #
+
+
+def _write_smoke_archive(results_root: Path, rng: np.random.Generator) -> Path:
+    """One dataset (squad_v2) under the REAL pilot run-dir naming, with the
+    three arms every stage needs (rag / prefix_cache / no_cache)."""
+    run_root = results_root / rps.cal.RUN_OF_DATASET["squad_v2"]
+    base: dict[str, dict[str, float]] = {}
+    for trial in range(1, N_TRIALS + 1):
+        for i in range(EXAMPLES_PER_TRIAL):
+            ex = f"t{trial}_ex{i}"
+            base[ex] = {
+                "trial": trial,
+                "ttft_ms": float(rng.normal(500.0, 100.0)),
+                "faithfulness": float(rng.uniform(0.2, 0.8)),
+                "exact_match": float(rng.integers(0, 2)),
+            }
+    arms = (
+        ("rag", 40.0, 0.15),
+        ("prefix_cache", 0.0, 0.0),
+        ("no_cache", 5.0, 0.05),
+    )
+    for arm, ttft_shift, em_flip_p in arms:
+        cell = run_root / "baselines" / arm
+        for trial in range(1, N_TRIALS + 1):
+            rows = []
+            for ex, vals in base.items():
+                if vals["trial"] != trial:
+                    continue
+                em = vals["exact_match"]
+                if em_flip_p and rng.random() < em_flip_p:
+                    em = 1.0 - em
+                rows.append(
+                    {
+                        "example_id": ex,
+                        "error": "",
+                        "empty_generation": "",
+                        "repeat_index": "0",
+                        "ttft_ms": vals["ttft_ms"]
+                        + ttft_shift
+                        + float(rng.normal(0, 20)),
+                        "faithfulness": vals["faithfulness"]
+                        + float(rng.normal(0, 0.05)),
+                        "exact_match": em,
+                        "f1_score": float(rng.uniform(0.0, 1.0)),
+                    }
+                )
+            trial_dir = cell / f"trial_{trial}"
+            trial_dir.mkdir(parents=True)
+            pd.DataFrame(rows).to_csv(trial_dir / "results.csv", index=False)
+    return results_root
+
+
+@pytest.fixture(scope="module")
+def smoke_results_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    root = tmp_path_factory.mktemp("smoke_pilot_root")
+    return _write_smoke_archive(root, np.random.default_rng(23))
+
+
+class TestSmokeMode:
+    def test_smoke_sizes_are_tiny_and_within_guards(self) -> None:
+        assert rps.SMOKE_N_SIMS < rps.DEFAULT_N_SIMS
+        assert rps.SMOKE_TOST_N_SIMS < rps.TOST_N_SIMS
+        assert rps.SMOKE_TOST_BOOTSTRAP_ITERS < rps.TOST_BOOTSTRAP_ITERS
+        assert max(rps.SMOKE_NW_GRID) <= DEFAULT_MAX_WINDOWS
+        assert min(rps.SMOKE_NW_GRID) >= 2  # Welch needs 2+ windows
+        assert set(rps.SMOKE_N_GRID) < set(rps.DEFAULT_N_GRID)
+        assert set(rps.SMOKE_TOST_N_GRID) < set(rps.TOST_N_GRID)
+
+    def test_markdown_smoke_banner_only_when_stamped(self) -> None:
+        cfg = _minimal_config()
+        rec = {"qasper_policy": "zero pilot data (test)"}
+        md_full = rps._markdown_report(cfg, [], [], [], rec, [], [])
+        assert "SMOKE ARTIFACT" not in md_full
+        cfg_smoke = {**_minimal_config(), "smoke": True}
+        md_smoke = rps._markdown_report(cfg_smoke, [], [], [], rec, [], [])
+        assert "SMOKE ARTIFACT" in md_smoke
+        assert "NEVER" in md_smoke
+
+    def test_smoke_main_end_to_end_offline_and_deterministic(
+        self, smoke_results_root: Path, tmp_path: Path
+    ) -> None:
+        import json as _json
+
+        outs = []
+        for name in ("run_a", "run_b"):
+            out_dir = tmp_path / name
+            rc = rps.main(
+                [
+                    "--results-root", str(smoke_results_root),
+                    "--out-dir", str(out_dir),
+                    "--datasets", "squad_v2",
+                    "--seed", "777",
+                    "--smoke",
+                ]
+            )
+            assert rc == 0
+            outs.append(out_dir)
+        for out_dir in outs:
+            for artifact in (
+                "power_tables.csv",
+                "power_sim_report.json",
+                "POWER_SIM_REPORT.md",
+                "provenance.json",
+            ):
+                assert (out_dir / artifact).is_file()
+            assert list((out_dir / "plots").glob("*.png"))
+            cfg = _json.loads((out_dir / "provenance.json").read_text())
+            # Smoke is stamped and the RUN sizes (not the module full-run
+            # constants) are what provenance records.
+            assert cfg["smoke"] is True
+            assert cfg["seed"] == 777
+            assert cfg["n_sims"] == rps.SMOKE_N_SIMS
+            assert cfg["n_grid"] == list(rps.SMOKE_N_GRID)
+            assert cfg["w_grid"] == list(rps.SMOKE_W_GRID)
+            assert cfg["nw_grid"] == list(rps.SMOKE_NW_GRID)
+            assert cfg["tost"]["n_grid"] == list(rps.SMOKE_TOST_N_GRID)
+            assert cfg["tost"]["n_sims"] == rps.SMOKE_TOST_N_SIMS
+            assert (
+                cfg["tost"]["bootstrap_iters"]
+                == rps.SMOKE_TOST_BOOTSTRAP_ITERS
+            )
+            # ADR-0088(b) provenance: the simulated continuous path names the
+            # registered pratt execution.
+            assert "pratt" in cfg["registered_test_paths"]["per_query_continuous"]
+            md = (out_dir / "POWER_SIM_REPORT.md").read_text()
+            assert "SMOKE ARTIFACT" in md
+        # Seeded end-to-end determinism: identical bytes for the full tables.
+        assert (
+            (outs[0] / "power_tables.csv").read_bytes()
+            == (outs[1] / "power_tables.csv").read_bytes()
+        )

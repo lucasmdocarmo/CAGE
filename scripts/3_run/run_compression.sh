@@ -14,7 +14,7 @@
 #
 # Read the 2x2 DOWN (CAG vs RAG) or ACROSS (full vs compressed), never on the diagonal.
 # FP8 KV is GPU-meaningful. A pre-flight gate verifies FP8 does NOT disable prefix caching
-# (else compressed_cag is confounded — see Cloud/VLLM_COMPATIBILITY.md sec 4).
+# (else compressed_cag is confounded — see cloud/VLLM_COMPATIBILITY.md sec 4).
 # =============================================================================
 # No -e: one failed cell must NOT abort the 2x2. Cells write a STATUS sentinel on failure,
 # are recorded in FAILED, and the script exits nonzero at the END (after attempting all).
@@ -195,7 +195,7 @@ if [ "$SKIP_GATE" != "1" ]; then
     echo ">>> Pre-flight: FP8 x prefix-caching gate"
     if ! bash "$SCRIPT_DIR/../checks/check_fp8_prefix_cache.sh" "$MODEL"; then
         echo "GATE FAILED -> compressed_cag would be 'no-reuse + compression'."
-        echo "Pin a compatible vLLM (Cloud/VLLM_COMPATIBILITY.md sec 4) or SKIP_GATE=1 to override."
+        echo "Pin a compatible vLLM (cloud/VLLM_COMPATIBILITY.md sec 4) or SKIP_GATE=1 to override."
         exit 1
     fi
 fi

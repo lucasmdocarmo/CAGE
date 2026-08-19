@@ -32,7 +32,7 @@ results/<campaign>/<session>/<run_id>/
 
 - `<campaign>`: lowercase slug minted once per campaign. Current campaign: **`camp1`**
   (the PUBLICATION.md charter campaign). Pilot data is NOT migrated into it (§7).
-- `<session>`: `a` | `b` | `cd-act1` | `cd-act2` (RUNBOOK §1).
+- `<session>`: `a` | `b` | `cd-act1` | `cd-act2` (RUNBOOK §1.1).
 - `<run_id>`: lowercase, bucket-name-safe (`[a-z0-9-]` only, since it names the GCS
   bucket): `YYYYMMDD-hhmm-<session>-<model-slug>`, e.g. `20260815-0230-a-qwen3-14b`.
   Minted once at run start by the run wrapper; everything downstream reads it from the
@@ -92,15 +92,19 @@ Required fields:
 | `cellspec_schema_version` | so a future axis change cannot silently re-key old data |
 | `created_utc` | ISO-8601 |
 
-## 4. GCS mirror — identical tree, fresh bucket per run
+## 4. Off-box mirror — identical tree, fresh destination per run (provider-neutral)
 
-`gs://cage-<run_id>/results/<campaign>/<session>/<run_id>/...` — the object tree under
-the bucket is **byte-identical in structure** to the local tree (that is what lets
-`teardown_vm.sh` / `pull_run.sh` reconstruct locally with a plain recursive copy).
-Clean-room rule (RUNBOOK §0): one bucket per run_id, created at provision, labeled
-`agent-run=<run_id>`, deleted at TRUE-$0 teardown after the local pull + ledger verify.
-The sync daemon (`scripts/5_observability/gcs_backup_daemon.sh`) mirrors continuously
-during the run; no `--delete` is ever used.
+`<CAGE_BACKUP_TARGET>/results/<campaign>/<session>/<run_id>/...` — the remote tree
+under the backup target (`gs://` | `s3://` | `ssh://` | `file://`, resolved by
+`scripts/lib/transport.sh`) is **byte-identical in structure** to the local tree
+(that is what lets `teardown_pod.sh` / `teardown_vm.sh` / `pull_run.sh` reconstruct
+locally with a plain recursive copy). On the RunPod primary the target is normally the
+network-volume S3 API (`s3://<volume>[/prefix]` + `CAGE_S3_ENDPOINT`); on the GCP port
+it is the run's bucket `gs://cage-<run_id>`. Clean-room rule (RUNBOOK §0): one fresh
+destination per run_id, created at provision (labeled `agent-run=<run_id>` where the
+provider supports labels), deleted at TRUE-$0 teardown after the local pull + ledger
+verify. The sync daemon (`scripts/5_observability/gcs_backup_daemon.sh`) mirrors
+continuously during the run; no `--delete` is ever used.
 
 ## 5. `ledger.json` — the seal (implementation: `src/analysis/stats/ledger.py`)
 
@@ -115,7 +119,8 @@ during the run; no `--delete` is ever used.
 - Verification (`verify_ledger(ledger_path, base_dir)`) re-hashes the tree and returns
   mismatch lines (`MISSING <relpath>` / `HASH-MISMATCH <relpath> ...`); empty = intact.
   It runs at minimum: (a) on the node right after sealing, (b) **locally after the
-  pull, before teardown** (RUNBOOK §5 step [3] — fail-closed), (c) at analysis load.
+  pull, before teardown** (RUNBOOK §5 end sequence [2], `teardown_pod.sh` step
+  [2/5] — ledger-gated `pull_run.sh`, fail-closed), (c) at analysis load.
 
 ## 6. Scoring runs — reruns never touch raw trees
 
@@ -160,5 +165,5 @@ Invariants behind the guarantees:
    per-run / per-model / per-dataset slice is a glob, never a scan.
 3. Raw trees are append-only until sealed, then immutable (§5); scoring is additive
    under `scoring/` (§6) — so no analysis rerun can invalidate another's inputs.
-4. Local tree ≡ GCS tree (§4) — any pattern above works with `gs://cage-<run_id>/`
-   prefixed, unchanged.
+4. Local tree ≡ remote tree (§4) — any pattern above works with the backup target
+   (e.g. `s3://<volume>/` or `gs://cage-<run_id>/`) prefixed, unchanged.

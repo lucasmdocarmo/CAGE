@@ -104,6 +104,46 @@ def _package_version(package: str) -> str:
         return "unknown"
 
 
+# --------------------------------------------------------------------------- #
+# F9/#147 instrument revision provenance (quality-module review 2026-08-19)
+# --------------------------------------------------------------------------- #
+# The four in-process HF checkpoints are pinned by repo NAME only -- a silent
+# upstream repo update changes the instrument under the same provenance id.
+# Each lazy load best-effort captures the RESOLVED HF commit hash; the optional
+# CAGE_*_REVISION env pins turn a mismatch (or an unresolvable hash) into a
+# standard fail-closed LOAD failure. Unpinned runs are record-only.
+_REVISION_PIN_ENVS: Dict[str, str] = {
+    "nli": "CAGE_NLI_REVISION",
+    "embedding": "CAGE_EMBEDDING_REVISION",
+    "bertscore": "CAGE_BERTSCORE_REVISION",
+    "lettucedetect": "CAGE_LETTUCEDETECT_REVISION",
+}
+
+
+def _hf_commit_hash(*candidates: Any) -> Optional[str]:
+    """Best-effort resolved HF commit hash from loaded-model internals.
+
+    transformers stamps the resolved repo revision on every loaded config as
+    ``config._commit_hash``; each candidate is a model-like object whose
+    ``.config`` is walked (a config object itself also works). Provenance
+    METADATA, not a score: never raises -- unresolvable internals (test stubs,
+    local checkpoints, older library versions) record ``None``. The fail-closed
+    path is the CAGE_*_REVISION pin check, which treats pinned+None as a load
+    failure; unpinned runs record-only.
+    """
+    for obj in candidates:
+        if obj is None:
+            continue
+        try:
+            cfg = getattr(obj, "config", obj)
+            rev = getattr(cfg, "_commit_hash", None)
+        except Exception:
+            continue
+        if isinstance(rev, str) and rev.strip():
+            return rev
+    return None
+
+
 def _split_sentences(text: str) -> List[str]:
     """Sentence-level split shared by claim decomposition and window building.
 
@@ -669,16 +709,18 @@ class QualityEvaluator:
             ).strip().lower() in {"1", "true", "yes"}
         self.nli_three_class = bool(nli_three_class)
         # D8 §8.5 Instrument B seam: which claim checker scores faithfulness.
-        # DEFAULT 'alignscore' -- flipped from 'nli' on 2026-08-05 by owner
-        # decision (MyDocs/registration/instrument_selection_2026-08-05/
+        # DEFAULT 'nli' -- in-process-safe default since the 2026-08-19 owner
+        # decision #120/F8 (as-scripted preflight and rescore paths must be
+        # loadable in-process). Instrument SELECTION is unchanged (2026-08-05
+        # owner decision, MyDocs/registration/instrument_selection_2026-08-05/
         # DECISION.md; charter stamp PUBLICATION.md §8.6(c)): AlignScore-large
-        # won the selection calibration (pooled AUC 0.8275 vs MiniCheck 0.7734).
-        # In the project venv the alignscore package can never install, so the
-        # default fails closed (unavailability recorded, message pointing to
-        # scripts/4_analysis/score_instrument_b.py -- the sanctioned
-        # out-of-process runner). 'nli' (legacy DeBERTa-MNLI) and 'minicheck'
-        # remain selectable; the DeBERTa continuous-faithfulness columns are a
-        # separate charter role and are untouched by this flip. Invalid names
+        # remains the selected Instrument B (pooled AUC 0.8275 vs MiniCheck
+        # 0.7734) and is requested EXPLICITLY by its out-of-process runner,
+        # scripts/4_analysis/score_instrument_b.py -- its 2023 dependency stack
+        # can never install into this venv, so 'alignscore' here fails closed
+        # with a message pointing at that runner. 'minicheck' (documented
+        # runner-up) remains selectable; the DeBERTa continuous-faithfulness
+        # columns are a separate charter role and are untouched. Invalid names
         # raise (fail-closed).
         checker_name = (
             claim_checker
@@ -753,6 +795,17 @@ class QualityEvaluator:
         # Short-circuits reload attempts (the old code retried the full model load on
         # EVERY row) and drives the 'unavailable:' row-status tokens.
         self._instrument_unavailable: Dict[str, str] = {}
+        # F9/#147 revision provenance: instrument -> resolved HF commit hash,
+        # captured best-effort at each lazy load (None when unresolvable or not
+        # yet loaded). Read via instrument_provenance(); never a row column.
+        self._instrument_revisions: Dict[str, Optional[str]] = {}
+        # Optional fail-closed pins (CAGE_NLI_REVISION & co). Unset -> None ->
+        # record-only, zero behavior change; set -> a resolved hash that differs
+        # (or cannot be resolved) is a LOAD failure via _mark_unavailable.
+        self._revision_pins: Dict[str, Optional[str]] = {
+            inst: (os.getenv(env, "").strip() or None)
+            for inst, env in _REVISION_PIN_ENVS.items()
+        }
         # Per-row status tokens; reset at the top of evaluate().
         self._row_status_tokens: List[str] = []
         # One-shot console alert for the D8 §8.5 windowed grounding pass (the
@@ -773,6 +826,44 @@ class QualityEvaluator:
                 f"score=None -- never a substitute model's score."
             )
             self._instrument_unavailable[instrument] = model
+
+    def _enforce_revision_pin(
+        self, instrument: str, model: str, model_attr: str
+    ) -> None:
+        """F9/#147 optional fail-closed revision pin (CAGE_*_REVISION).
+
+        Called immediately after a successful lazy load, once the resolved HF
+        commit hash has been recorded in ``_instrument_revisions``. With the
+        pin env unset this is a no-op (record-only). With it set, a resolved
+        hash that differs from the pin -- or one that could not be resolved --
+        is treated as a LOAD failure: the just-loaded model is discarded
+        (never score with an unpinned instrument) and the standard
+        _mark_unavailable machinery fires (strict raises
+        InstrumentUnavailableError; non-strict rows carry the usual
+        'X:unavailable:<model>' token).
+        """
+        pinned = self._revision_pins.get(instrument)
+        if not pinned:
+            return
+        resolved = self._instrument_revisions.get(instrument)
+        if resolved == pinned:
+            return
+        setattr(self, model_attr, None)  # discard BEFORE the strict raise
+        detail = (
+            f"loaded checkpoint resolved to revision {resolved!r}"
+            if resolved
+            else "loaded checkpoint's revision could not be resolved"
+        )
+        self._mark_unavailable(
+            instrument,
+            model,
+            ValueError(
+                f"revision pin {_REVISION_PIN_ENVS[instrument]}={pinned} "
+                f"failed: {detail} (fail-closed: a silent upstream repo "
+                f"update would change the instrument under the same "
+                f"provenance id)"
+            ),
+        )
 
     def _note_row_status(self, instrument: str, kind: str, detail: str) -> None:
         self._row_status_tokens.append(f"{instrument}:{kind}:{detail}")
@@ -827,6 +918,13 @@ class QualityEvaluator:
                 )
             except Exception as e:
                 self._mark_unavailable("nli", self.nli_model_name, e)
+            else:
+                # F9/#147: capture the resolved HF commit hash (record-only
+                # unless CAGE_NLI_REVISION pins it -- then fail-closed).
+                self._instrument_revisions["nli"] = _hf_commit_hash(
+                    getattr(self._nli_model, "model", None)
+                )
+                self._enforce_revision_pin("nli", self.nli_model_name, "_nli_model")
         return self._nli_model
 
     @property
@@ -846,6 +944,19 @@ class QualityEvaluator:
                 )
             except Exception as e:
                 self._mark_unavailable("embedding", self.embedding_model_name, e)
+            else:
+                # F9/#147: sentence-transformers wraps the HF checkpoint in its
+                # first module's auto_model; walk there for the resolved hash.
+                try:
+                    first = self._embedding_model._first_module()
+                except Exception:
+                    first = None
+                self._instrument_revisions["embedding"] = _hf_commit_hash(
+                    getattr(first, "auto_model", None)
+                )
+                self._enforce_revision_pin(
+                    "embedding", self.embedding_model_name, "_embedding_model"
+                )
         return self._embedding_model
 
     @property
@@ -904,7 +1015,15 @@ class QualityEvaluator:
             self._mark_unavailable("bertscore", self.bertscore_model_name, e)
             return None
         self._bertscore_model = scorer
-        return scorer
+        # F9/#147: BERTScorer keeps the underlying transformers model on
+        # ``_model``; capture its resolved hash, then enforce any pin.
+        self._instrument_revisions["bertscore"] = _hf_commit_hash(
+            getattr(scorer, "_model", None)
+        )
+        self._enforce_revision_pin(
+            "bertscore", self.bertscore_model_name, "_bertscore_model"
+        )
+        return self._bertscore_model
 
     @property
     def rouge_scorer(self) -> Optional[Any]:
@@ -952,6 +1071,20 @@ class QualityEvaluator:
                 self._mark_unavailable(
                     "lettucedetect", self.lettucedetect_model_name, e
                 )
+            else:
+                # F9/#147: getattr-walk the detector internals (the transformer
+                # method nests the HF model at detector.model; tolerate either
+                # nesting depth -- unresolvable records None).
+                det = self._lettucedetect_model
+                self._instrument_revisions["lettucedetect"] = _hf_commit_hash(
+                    getattr(getattr(det, "detector", None), "model", None),
+                    getattr(det, "model", None),
+                )
+                self._enforce_revision_pin(
+                    "lettucedetect",
+                    self.lettucedetect_model_name,
+                    "_lettucedetect_model",
+                )
         return self._lettucedetect_model
 
     @staticmethod
@@ -968,6 +1101,27 @@ class QualityEvaluator:
     # ------------------------------------------------------------------ #
     # D8 §8.1 per-row instrument provenance ids
     # ------------------------------------------------------------------ #
+    def instrument_provenance(self) -> Dict[str, Dict[str, Optional[str]]]:
+        """F9/#147: instrument -> {model, revision} for the four HF checkpoints.
+
+        ``model`` is the resolved constructor-time repo id (env overrides
+        applied); ``revision`` is the HF commit hash captured best-effort at
+        lazy-load time -- ``None`` until that instrument has actually loaded,
+        or when the hash is unresolvable (test stubs, local paths). Manifest
+        METADATA only: no row column is derived from this mapping, and the
+        _grounding_instrument_id / _faithfulness_instrument_id row strings are
+        deliberately untouched (their formats are pinned by tests).
+        """
+        return {
+            inst: {"model": model, "revision": self._instrument_revisions.get(inst)}
+            for inst, model in (
+                ("nli", self.nli_model_name),
+                ("embedding", self.embedding_model_name),
+                ("bertscore", self.bertscore_model_name),
+                ("lettucedetect", self.lettucedetect_model_name),
+            )
+        }
+
     def _grounding_instrument_id(self) -> str:
         """Instrument A id+version: '<model>@lettucedetect-<pkg-version>'."""
         return (

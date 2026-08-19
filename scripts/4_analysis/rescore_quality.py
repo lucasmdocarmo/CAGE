@@ -1132,6 +1132,12 @@ def run_scoring_tree(root: Path, scoring_run_id: str, args: argparse.Namespace) 
         # evidence in a lean analysis venv) and the instrument model ids in use.
         "instrument_versions": instrument_versions(),
         "instrument_models": _instrument_models(evaluator),
+        # F9/#147 revision provenance: instrument -> {model, revision} with the
+        # resolved HF commit hash captured at lazy-load time (None when the
+        # instrument never loaded this pass or the hash was unresolvable) --
+        # a repo NAME alone lets a silent upstream update change the
+        # instrument under the same provenance id.
+        "instrument_revisions": evaluator.instrument_provenance(),
         "calibration_id": evaluator.calibration_id,
         "raw_run_id": raw_run_id,
         "raw_run_ledger_entries_sha256": entries_sha256,

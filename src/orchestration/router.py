@@ -3,6 +3,14 @@ Prefix-aware router for distributed vLLM replicas.
 
 Routes requests based on prefix hash to maximize cache hits.
 
+[VERIFY-LIVE at S0] (K-COV4, task #141): this module is wired into the serving
+path but has ~0% offline coverage — every test that exercises it is a
+live-gated skip (tests/test_router_integration.py). S0 checklist row S0-9
+(MyDocs/S0_CHECKLIST.md) is the forcing function: routing decisions, SSE
+passthrough, and /v1/models proxying must be proven against a live cluster
+before any DIST-topology cell. Offline unit tests for the pure routing/parsing
+logic are task #142.
+
 Notes:
 - Supports both non-streaming JSON responses and streaming (SSE) passthrough.
 - Uses a permissive request model (extra fields allowed) so new OpenAI params
