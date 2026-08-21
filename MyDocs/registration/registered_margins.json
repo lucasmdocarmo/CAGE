@@ -1,0 +1,9 @@
+{
+  "binary_predicate": 0.05,
+  "quality_continuous": 0.05,
+  "serving_continuous": 25.0,
+  "window_faithfulness_mean": 0.05,
+  "window_pass_rate": 0.05,
+  "window_truth_tax": 0.05,
+  "window_ttft_ms": 25.0
+}
