@@ -1,9 +1,14 @@
 #!/bin/bash
+# Order:     alongside stage 3 — started by run_full_sweep.sh at launch; stop does the final authoritative sync
+# Objective: Interval-mirror a whole results tree to the backup target for the run's duration (legacy GCS name; provider-neutral transports)
+# Cloud:     both
 # =============================================================================
-# Full-run GCS backup daemon — a redundant cloud copy of EVERY cell we grab.
+# Full-run backup daemon — a redundant off-box copy of EVERY cell we grab.
+# (Legacy GCS name kept for callers; transports are provider-neutral: the
+# target may be gs://, s3://, ssh:// or file:// via sync_results.sh.)
 # =============================================================================
 # WHY THIS EXISTS
-#   cloud_run.sh already mirrors its run root to GCS, but only during the CORE tree:
+#   cloud_run.sh already mirrors its run root off-box, but only during the CORE tree:
 #   the lever trees (compression/speculative/envelope/kv_store), the scoring + stats
 #   passes, and the whole memory sweep run OUTSIDE that syncer, so they were never
 #   backed up. Worse, when CAGE_RESULTS_BUCKET was unset the sync targeted a default
@@ -11,9 +16,10 @@
 #   full multi-dataset run finished with an EMPTY bucket and nobody noticed.
 #
 #   This daemon mirrors the ENTIRE results/<phase>/ tree (every run-id: squad, musique,
-#   hotpotqa, memsweep, ...) to CAGE_RESULTS_BUCKET on a fixed interval for the whole
-#   duration of the sweep, and fails LOUDLY (never silently) if the bucket is unset or
-#   unreachable. `stop` kills the loop and does one final authoritative sync.
+#   hotpotqa, memsweep, ...) to the backup target (CAGE_BACKUP_TARGET; legacy
+#   CAGE_RESULTS_BUCKET) on a fixed interval for the whole duration of the sweep, and
+#   fails LOUDLY (never silently) if the target is unset or unreachable. `stop` kills
+#   the loop and does one final authoritative sync.
 #
 # USAGE
 #   gcs_backup_daemon.sh start  [phase_dir]  # default phase_dir: results/<CAGE_PHASE|phase2>
@@ -36,7 +42,8 @@
 # removes its pidfile on TERM/INT via an EXIT trap, and sleeps interruptibly
 # (`sleep & wait`) so `stop` takes effect immediately, not after up to INTERVAL s.
 #
-# The remote layout is $BUCKET/results/<phase>/... so teardown_vm.sh (which pulls
+# The remote layout is <target>/results/<phase>/... so the pull side (pull_run.sh /
+# teardown_pod.sh; on the GCP port teardown_vm.sh, which pulls
 # $BUCKET/results -> results) reconstructs the exact local tree. No --delete is used
 # anywhere, so this is safe to run concurrently with cloud_run.sh's own syncer.
 # =============================================================================

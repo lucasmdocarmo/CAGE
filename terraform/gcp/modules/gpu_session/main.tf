@@ -131,7 +131,7 @@ resource "google_compute_instance" "node" {
       enable-oslogin = "TRUE"
     },
     # Startup hook stays EMPTY by default — provisioning lives in
-    # cloud/RUNBOOK's remote_job flow, not in instance metadata.
+    # docs/RUNBOOK's remote_job flow, not in instance metadata.
     var.startup_script == null ? {} : { startup-script = var.startup_script },
   )
 

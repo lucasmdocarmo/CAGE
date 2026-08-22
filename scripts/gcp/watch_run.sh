@@ -1,4 +1,7 @@
 #!/bin/bash
+# Order:     alongside stage 3 — laptop-side interval puller during a GCS-mirrored run
+# Objective: Pull the run's mirrored artifacts from the GCS bucket every INTERVAL seconds and print the sidecar's progress line
+# Cloud:     gcp
 # CAGE live-run watcher (laptop side of the observability GCS bus).
 #
 # Pulls the run's mirrored artifacts (results, logs, and the observability snapshots the
@@ -7,7 +10,7 @@
 # opened on the VM, and `gsutil rsync` transfers only deltas, so egress ~= artifact size once.
 #
 # Usage:
-#   bash scripts/5_observability/watch_run.sh [BUCKET] [LOCAL_DIR] [INTERVAL]
+#   bash scripts/gcp/watch_run.sh [BUCKET] [LOCAL_DIR] [INTERVAL]
 #     BUCKET     gs://... (default: $CAGE_RESULTS_BUCKET, else gs://<gcloud-project>-cage-results)
 #     LOCAL_DIR  local mirror dir (default: ./phase2_archive)
 #     INTERVAL   seconds between pulls (default: 30)
@@ -29,7 +32,7 @@ esac
 if [ -z "$BUCKET" ]; then
   _proj="$(gcloud config get-value project 2>/dev/null || true)"
   if [ -z "$_proj" ] || [ "$_proj" = "(unset)" ]; then
-    die "no bucket given and no gcloud project set. usage: bash scripts/5_observability/watch_run.sh gs://YOUR-BUCKET [local_dir] [interval]"
+    die "no bucket given and no gcloud project set. usage: bash scripts/gcp/watch_run.sh gs://YOUR-BUCKET [local_dir] [interval]"
   fi
   BUCKET="gs://${_proj}-cage-results"
 fi

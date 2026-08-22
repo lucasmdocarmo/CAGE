@@ -33,8 +33,10 @@ results/<campaign>/<session>/<run_id>/
 - `<campaign>`: lowercase slug minted once per campaign. Current campaign: **`camp1`**
   (the PUBLICATION.md charter campaign). Pilot data is NOT migrated into it (§7).
 - `<session>`: `a` | `b` | `cd-act1` | `cd-act2` (RUNBOOK §1.1).
-- `<run_id>`: lowercase, bucket-name-safe (`[a-z0-9-]` only, since it names the GCS
-  bucket): `YYYYMMDD-hhmm-<session>-<model-slug>`, e.g. `20260815-0230-a-qwen3-14b`.
+- `<run_id>`: lowercase, destination-name-safe (`[a-z0-9-]` only — it names the run's
+  fresh backup destination on EVERY scheme: the `s3://` prefix / volume path on the
+  RunPod primary, the `gs://cage-<run_id>` bucket on the GCP port):
+  `YYYYMMDD-hhmm-<session>-<model-slug>`, e.g. `20260815-0230-a-qwen3-14b`.
   Minted once at run start by the run wrapper; everything downstream reads it from the
   manifest, never re-derives it.
 - `window_<k>` with **`k = <dataset_id>-<ordinal>`** (e.g. `window_squad_v2-01`,
@@ -67,9 +69,9 @@ Rules:
 - `CellSpec.__post_init__` is the validity gate — an illegal tuple cannot mint a
   directory (fail-closed at write time; loaders re-parse names with
   `CellSpec.from_flat_dict`/`to_row_key` round-trips).
-- The `|` separator is legal in POSIX filenames and GCS object names; **always quote
-  it in shells** (`'gold-reuse|none|...'`). Windows checkouts of the raw tree are
-  unsupported.
+- The `|` separator is legal in POSIX filenames and in GCS/S3 object names (any
+  transport.sh backend); **always quote it in shells** (`'gold-reuse|none|...'`).
+  Windows checkouts of the raw tree are unsupported.
 - Axis vocabularies are mutually disjoint (no model name is ever an arm/engine/policy
   value), so a single-token glob like `*'|qwen3-14b|'*` is unambiguous (§8).
 - Pilot-era baseline names (`no_cache`, `prefix_cache`, `hybrid`, ...) never appear in
@@ -92,19 +94,85 @@ Required fields:
 | `cellspec_schema_version` | so a future axis change cannot silently re-key old data |
 | `created_utc` | ISO-8601 |
 
+## 3.1 Writers — who produces this tree (task #116)
+
+The ONE production writer is **`scripts/3_run/run_experiment.py` in campaign mode**
+(`--campaign-root`, or the `CAGE_CAMPAIGN_ROOT` env the shell runners export),
+writing **via `src/orchestration/campaign_layout.py`** (`CampaignRun` /
+`CellWriter.add_window` — atomic tmp+`os.replace` writes, fail-closed §2/§3
+validation) with `src/orchestration/campaign_session.py` as the runner↔layout
+bridge. No other code writes into a campaign tree's `cells/`.
+
+- **One runner trial = one measurement window** `window_<dataset>-<NN>`
+  (NN = trial number, `%02d`). The trial's per-request rows become
+  `requests.jsonl` — every row carrying the #127 join triple
+  (`example_id`/`repeat_index`/`record_index`, absent components explicit
+  `null`) plus the shared `ok` validity predicate and the ADR-0007
+  honesty/provenance columns; `qa_evidence.jsonl` is the staged evidence
+  chain re-emitted atomically; the telemetry series becomes `cage_stats.jsonl`;
+  backend metadata + the telemetry aggregate become `engine_metrics.json`.
+- **`metrics.json` per window** (auxiliary artifact, indexed by
+  organize_results like any extra window `*.json`): the runner's experiment
+  summary — it is the **completeness sentinel** the shell resume gates
+  (`cell_complete`, campaign branch) parse with `metrics_json_valid` rigor;
+  a missing/unparseable one makes the window incomplete → reset + re-emitted.
+- **`write_time_hashes.jsonl` at the run root** (beside `manifest.json`,
+  never under `cells/`): the append-only §9.10 write-time hash journal —
+  every emitted artifact is sha256-hashed at write time.
+  **`scripts/3_run/seal_campaign_run.py`** (run once at run end, before any
+  analysis) refuses to seal when any current sealed-scope artifact was never
+  journaled or hashes differently from its last journal entry, then writes
+  the one §5 `ledger.json` via `campaign_layout.seal_run`.
+- **`.staging/` at the run root** (dot-entry: invisible to the layout
+  walkers, the §5 seal, and the H7 EXTRA sweep): the pilot-format per-trial
+  staging the runner still writes (crash-preserving incremental evidence);
+  the sealed tree holds the canonical atomic copies.
+- Shell drivers: `run_full_sweep.sh` / `cloud_run.sh` mint the campaign root
+  (`mint_campaign_run_id` — `YYYYMMDD-hhmmss-<session>-<model-slug>`, a
+  seconds-granular instance of the §1 grammar closing the J3 converge
+  hazard; resume re-reads the exported `CAGE_RUN_ID`, never re-mints) and
+  `run_baselines.sh` / `run_compression.sh` resolve every cell dir through
+  `campaign_cell_dir` → `campaign_session cell-dir` (CellSpec-minted row
+  keys — never hand-built in shell). Pilot labels that §7.5-merge onto one
+  tuple (redis≈rag, hybrid warm≈cold, cag_full≡prefix_cache) dedup through
+  the v2 resume gate: the second label sees the tuple's windows complete and
+  skips.
+
+Everything under `scoring/` is produced by `scripts/4_analysis/rescore_quality.py`
+(§6, offline, decoupled); `predicate/` by `scripts/4_analysis/build_predicate_table.py`
+(§8.5); `index/` by `scripts/4_analysis/organize_results.py` — all post-seal
+siblings, never inside `cells/`.
+
 ## 4. Off-box mirror — identical tree, fresh destination per run (provider-neutral)
 
-`<CAGE_BACKUP_TARGET>/results/<campaign>/<session>/<run_id>/...` — the remote tree
-under the backup target (`gs://` | `s3://` | `ssh://` | `file://`, resolved by
-`scripts/lib/transport.sh`) is **byte-identical in structure** to the local tree
-(that is what lets `teardown_pod.sh` / `teardown_vm.sh` / `pull_run.sh` reconstruct
-locally with a plain recursive copy). On the RunPod primary the target is normally the
-network-volume S3 API (`s3://<volume>[/prefix]` + `CAGE_S3_ENDPOINT`); on the GCP port
-it is the run's bucket `gs://cage-<run_id>`. Clean-room rule (RUNBOOK §0): one fresh
-destination per run_id, created at provision (labeled `agent-run=<run_id>` where the
-provider supports labels), deleted at TRUE-$0 teardown after the local pull + ledger
-verify. The sync daemon (`scripts/5_observability/gcs_backup_daemon.sh`) mirrors
-continuously during the run; no `--delete` is ever used.
+`<CAGE_BACKUP_TARGET>/results/<campaign>/<session>/<run_id>/...` — the remote tree is
+**byte-identical in structure** to the local tree for ANY scheme
+(`ssh://[user@]host/path`, `s3://bucket[/prefix]` + `CAGE_S3_ENDPOINT` on the RunPod
+primary, `gs://bucket` on the GCP port, `file:///path` — resolved by
+`scripts/lib/transport.sh`). It is written by
+`scripts/5_observability/sync_results.sh` (the one-shot mirror every daemon and run
+driver routes through; the interval daemon `gcs_backup_daemon.sh` — legacy name,
+provider-neutral transports — loops it for the run's duration, never with `--delete`)
+and pulled back by the **fail-closed** `scripts/5_observability/pull_run.sh` (ledger
+gate). Byte-identical structure is what lets `teardown_pod.sh` / `teardown_vm.sh` /
+`pull_run.sh` reconstruct locally with a plain recursive copy. On the RunPod primary
+the target is normally the network-volume S3 API (`s3://<volume>[/prefix]` +
+`CAGE_S3_ENDPOINT`); on the GCP port it is the run's bucket `gs://cage-<run_id>`.
+
+**Clean-room rule — one FRESH destination per run (binding operator procedure,
+RUNBOOK §0.2).** Give every run its own destination, named for the run — suffix the
+target with the run id (e.g. `ssh://host/cage-runs/<run_id>/`,
+`s3://<volume>/cage-<run_id>/`); on the GCP port `terraform/gcp/modules/bucket`
+creates the per-run bucket `gs://cage-<run_id>` at provision (labeled
+`agent-run=<run_id>`). Never reuse a past run's destination; delete it at TRUE-$0
+teardown only after the local pull + ledger verify. What the CODE enforces at run
+start is narrower than the rule: a backup target must **resolve or the run refuses to
+launch** (`require_backup_target`, the J4 gate in `transport.sh`, called by
+`cloud_run.sh` before any cell), and the sync daemon's `start` probes that the target
+root **exists / is reachable** (`transport_ensure` — provisioned buckets are never
+auto-created; ssh/file paths are `mkdir -p`'d). **No tool checks that the destination
+is EMPTY**, so per-run freshness off the GCP-terraform path rests on the operator's
+provision checklist: verify the destination is new (or empty) before launch.
 
 ## 5. `ledger.json` — the seal (implementation: `src/analysis/stats/ledger.py`)
 
@@ -167,3 +235,22 @@ Invariants behind the guarantees:
    under `scoring/` (§6) — so no analysis rerun can invalidate another's inputs.
 4. Local tree ≡ remote tree (§4) — any pattern above works with the backup target
    (e.g. `s3://<volume>/` or `gs://cage-<run_id>/`) prefixed, unchanged.
+
+## 9. `results/ops/` — LOCAL-ONLY operator metadata (not results)
+
+`results/ops/pod_ledger.jsonl` is the pod-ops ledger of the RunPod tooling
+(`scripts/runpod/provision_pod.sh` appends `create` events, `teardown_pod.sh` the
+matching `delete` events; `pod_status.sh` / `cost_report.sh` consume the pairs; path
+override `CAGE_POD_LEDGER`). It sits **beside** the campaign roots
+(`results/ops/`, next to `results/<campaign>/` and the pilot `results/<phase>/`) and
+is **never part of any run tree**:
+
+- **never synced off-box** — the mirror/pull tools operate on run and phase trees
+  (`results/<campaign>/...`, `results/<phase>/...`), which do not contain `ops/`.
+  Do not point `sync_results.sh` at bare `results/` (that would drag `ops/` along);
+- **never sealed** — no `ledger.json` covers it; it is append-only local
+  bookkeeping of pod cost/lifecycle, useless to reproduce and cheap to keep;
+- **ignored by the analysis chain** — `verify_results.py` and
+  `organize_results.py` take ONE explicit run root and walk only inside it, so
+  `results/ops/` is structurally invisible to them (pointing either AT it refuses
+  fail-closed on the missing `manifest.json`).

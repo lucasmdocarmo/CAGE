@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Order:     after stage 3, before teardown — THE fail-closed pre-teardown gate (called by runpod/teardown_pod.sh and gcp/teardown_vm.sh)
+# Objective: Pull ONE campaign run from its backup target and ledger-verify it locally; only its literal SAFE-TO-TEARDOWN line authorizes destruction
+# Cloud:     both
 # pull_run.sh — pull ONE campaign run from its clean-room backup target and
 # ledger-verify it locally. THE fail-closed pre-teardown gate.
 #
@@ -7,7 +10,7 @@
 #     <target>         gs://bucket[/prefix] | s3://bucket[/prefix] |
 #                      ssh://[user@]host/path | file:///path | /path
 #                      (bare names = legacy gs:// buckets). The tree under it
-#                      must BE the run tree per cloud/RESULTS_LAYOUT.md:
+#                      must BE the run tree per docs/RESULTS_LAYOUT.md:
 #                      manifest.json, ledger.json, cells/<row_key>/window_<k>/...,
 #                      scoring/...
 #     <local_run_dir>  local destination, mirroring the remote structure — normally
@@ -18,7 +21,7 @@
 #   is that gate. ANY failure — transfer error, missing/tampered ledger, hash
 #   mismatch — exits nonzero and prints DO-NOT-TEARDOWN. Only the literal
 #   "SAFE TO TEARDOWN" line authorizes proceeding to teardown_pod.sh /
-#   teardown_vm.sh / bucket delete.
+#   teardown_vm.sh / backup-destination (volume/bucket) delete.
 #
 # Transfer: scripts/lib/transport.sh (task #137, finding J4 — the pull path was
 # gsutil/gcloud-only, so a RunPod campaign had NO pull path at all). The gcs
@@ -49,7 +52,7 @@ on_exit() {
     echo "" >&2
     echo "########################################################################" >&2
     echo "# PULL/VERIFY FAILED (exit ${rc}) — DO NOT TEARDOWN.                    " >&2
-    echo "# The bucket/VM copy may be the ONLY intact copy of this run's data.    " >&2
+    echo "# The backup-target/box copy may be the ONLY intact copy of this run.   " >&2
     echo "# Fix the pull or the mismatch, re-run pull_run.sh, and proceed only    " >&2
     echo "# after it prints SAFE TO TEARDOWN.                                     " >&2
     echo "########################################################################" >&2

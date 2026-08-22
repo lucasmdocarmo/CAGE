@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """
+Order:     stage 4 — pilot re-renders only; driven by run_phase2_stats.sh (campaign stats = run_campaign_analysis.py)
+Objective: Pilot-era per-query Wilcoxon/Holm stats engine -> pilot_stats.json (deprecated; refuses the registered stats.json name)
+Cloud:     local
+
 Statistical significance testing for CAGE experiments.
 
 .. deprecated:: 2026-08-02

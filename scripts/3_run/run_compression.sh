@@ -1,4 +1,7 @@
 #!/bin/bash
+# Order:     stage 3 — lever tree after the core suite; driven by run_full_sweep.sh or standalone
+# Objective: Run the ratio-matched compression 2x2 (CAG/RAG x full/compressed: client-side LLMLingua-2 vs server FP8 KV)
+# Cloud:     both
 # =============================================================================
 # PILOT HARNESS — drives the retired 9-name taxonomy via the alias map; the
 # campaign harness (CellSpec-native, D6 open-loop) lands at tranche P1; use for
@@ -14,7 +17,7 @@
 #
 # Read the 2x2 DOWN (CAG vs RAG) or ACROSS (full vs compressed), never on the diagonal.
 # FP8 KV is GPU-meaningful. A pre-flight gate verifies FP8 does NOT disable prefix caching
-# (else compressed_cag is confounded — see cloud/VLLM_COMPATIBILITY.md sec 4).
+# (else compressed_cag is confounded — see docs/VLLM_COMPATIBILITY.md sec 4).
 # =============================================================================
 # No -e: one failed cell must NOT abort the 2x2. Cells write a STATUS sentinel on failure,
 # are recorded in FAILED, and the script exits nonzero at the END (after attempting all).
@@ -43,7 +46,18 @@ else
     RUN_ROOT="$PROJECT_DIR/results/$_phase/$_rid"
     warn "CAGE_RUN_ROOT unset -- minted FRESH standalone run root: $RUN_ROOT (cloud_run.sh mints the canonical root for cloud runs)"
 fi
-OUTPUT_DIR="$RUN_ROOT/compression"
+# Campaign v2 output mode (task #116): with CAGE_CAMPAIGN_ROOT exported, cells land
+# in $CAGE_CAMPAIGN_ROOT/cells/<row_key>/window_<dataset>-<NN>/ via campaign_layout
+# and the per-label tree below is STAGING (.staging/, invisible to walkers + seal).
+# cag_full/rag_full share their tuples with the core suite's prefix_cache/rag cells
+# (§7.5 merges) and naturally SKIP through the v2 resume gate when those already ran.
+if [ -n "${CAGE_CAMPAIGN_ROOT:-}" ]; then
+    OUTPUT_DIR="$CAGE_CAMPAIGN_ROOT/.staging/compression"
+    RUN_ROOT="$CAGE_CAMPAIGN_ROOT"
+    log "CAMPAIGN MODE: v2 cells -> $CAGE_CAMPAIGN_ROOT/cells/ (staging: $OUTPUT_DIR)"
+else
+    OUTPUT_DIR="$RUN_ROOT/compression"
+fi
 # Point the sourced log guard's GCS mirror at this run root (relative to PROJECT_DIR), not analysis/.
 export CAGE_SYNC_DIR="${CAGE_SYNC_DIR:-${RUN_ROOT#"$PROJECT_DIR/"}}"
 # Continuous log+results mirror to GCS + full collect on exit (this script has no sync loop).
@@ -112,18 +126,40 @@ case "$MODEL" in *MiMo*|*mimo*) MTAG="_mimo7b" ;; *) MTAG="" ;; esac
 # ---------------------------------------------------------------------------
 FAILED=()
 
-cell_complete() {  # <cell_dir> -> 0 iff trial_1..NUM_TRIALS all have VALID (parseable) metrics.json
+cell_complete() {  # <cell_dir> -> 0 iff every expected per-trial metrics.json is VALID (parseable)
     # Existence is not validity (finding J2): a truncated/corrupt/foreign metrics.json
     # must not make a cell resume-proof "complete" -- metrics_json_valid JSON-parses each.
-    local dir="$1" t
+    # Campaign mode (task #116): trial t's sentinel lives in the v2 measurement window
+    # window_<DATASET>-<0t>/ under cells/<row_key>; pilot mode keeps trial_<t>/.
+    local dir="$1" t f
+    [ -n "$dir" ] || return 1
     for ((t = 1; t <= NUM_TRIALS; t++)); do
-        metrics_json_valid "$dir/trial_${t}/metrics.json" || return 1
+        if [ -n "${CAGE_CAMPAIGN_ROOT:-}" ]; then
+            f="$dir/$(printf 'window_%s-%02d' "$DATASET" "$t")/metrics.json"
+        else
+            f="$dir/trial_${t}/metrics.json"
+        fi
+        metrics_json_valid "$f" || return 1
     done
     return 0
 }
 
-prepare_cell() {  # <full label> -> 0 = run it (stale dir wiped), 1 = skip (already complete)
-    local label="$1" dir="$OUTPUT_DIR/$1"
+cell_dir_for() {  # <full label> [baseline] -> the cell's resume/completeness dir
+    # Campaign: cells/<row_key> minted by CellSpec (campaign_cell_dir, _common.sh) --
+    # never hand-built; nonzero for labels with no charter tuple. Pilot: OUTPUT_DIR/<label>.
+    if [ -n "${CAGE_CAMPAIGN_ROOT:-}" ]; then
+        campaign_cell_dir "${2:-$1}" "$1" "$MODEL"
+    else
+        printf '%s/%s' "$OUTPUT_DIR" "$1"
+    fi
+}
+
+prepare_cell() {  # <full label> [baseline] -> 0 = run it, 1 = skip (complete / no tuple)
+    local label="$1" dir
+    if ! dir="$(cell_dir_for "$label" "${2:-}")" || [ -z "$dir" ]; then
+        warn "campaign mode: '$label' has no charter cell tuple (cellspec.LEGACY_ALIASES) -- skipping this pilot-only cell"
+        return 1
+    fi
     if [ "${CAGE_FORCE_RERUN:-0}" = "1" ]; then
         [ -d "$dir" ] && echo "    FORCE RERUN (CAGE_FORCE_RERUN=1): wiping $label"
         rm -rf "${dir:?}"
@@ -133,7 +169,9 @@ prepare_cell() {  # <full label> -> 0 = run it (stale dir wiped), 1 = skip (alre
         echo "SKIP (complete): $label"
         return 1
     fi
-    if [ -d "$dir" ]; then
+    # Pilot cells wipe-and-rerun whole; campaign cells resume PER WINDOW inside
+    # run_experiment.py (complete windows skipped, half-written ones reset).
+    if [ -z "${CAGE_CAMPAIGN_ROOT:-}" ] && [ -d "$dir" ]; then
         echo "    PARTIAL: wiping incomplete $label and re-running"
         rm -rf "${dir:?}"
     fi
@@ -142,9 +180,10 @@ prepare_cell() {  # <full label> -> 0 = run it (stale dir wiped), 1 = skip (alre
 
 group_complete() {  # <bare-label...> -> 0 iff every cell is complete (server start unnecessary)
     [ "${CAGE_FORCE_RERUN:-0}" = "1" ] && return 1
-    local lbl
+    local lbl dir
     for lbl in "$@"; do
-        cell_complete "$OUTPUT_DIR/${lbl}${MTAG}" || return 1
+        dir="$(cell_dir_for "${lbl}${MTAG}")" || return 1
+        cell_complete "$dir" || return 1
     done
     return 0
 }
@@ -158,7 +197,9 @@ mark_cells_failed() {  # <reason> <bare-label...> sentinel the cells a dead serv
     local reason="$1" lbl full; shift
     for lbl in "$@"; do
         full="${lbl}${MTAG}"
-        cell_complete "$OUTPUT_DIR/$full" && continue  # keep a previously-complete cell
+        # campaign mode: completeness at the v2 window paths; STATUS stays in staging
+        # (a stray file inside a v2 cell dir would fail the layout walk).
+        cell_complete "$(cell_dir_for "$full")" && continue  # keep a previously-complete cell
         mkdir -p "$OUTPUT_DIR/$full"
         echo "STATUS=failed reason=$reason model=$MODEL dataset=$DATASET $(date)" > "$OUTPUT_DIR/$full/STATUS"
         FAILED+=("$full($reason)")
@@ -168,7 +209,7 @@ mark_cells_failed() {  # <reason> <bare-label...> sentinel the cells a dead serv
 run_baseline() {  # <baseline> <label> [extra args...]
     local baseline=$1 label="$2${MTAG}"; shift 2
     echo ""; echo ">>> $label ($baseline)  $(date)"
-    prepare_cell "$label" || return 0
+    prepare_cell "$label" "$baseline" || return 0
     # All 4 compression cells run on a prefix-caching-ON server, so cold-start each trial
     # (vLLM /reset_prefix_cache) for independent trials, consistent with the core suite.
     if ! python3 scripts/3_run/run_experiment.py \
@@ -195,7 +236,7 @@ if [ "$SKIP_GATE" != "1" ]; then
     echo ">>> Pre-flight: FP8 x prefix-caching gate"
     if ! bash "$SCRIPT_DIR/../checks/check_fp8_prefix_cache.sh" "$MODEL"; then
         echo "GATE FAILED -> compressed_cag would be 'no-reuse + compression'."
-        echo "Pin a compatible vLLM (cloud/VLLM_COMPATIBILITY.md sec 4) or SKIP_GATE=1 to override."
+        echo "Pin a compatible vLLM (docs/VLLM_COMPATIBILITY.md sec 4) or SKIP_GATE=1 to override."
         exit 1
     fi
 fi

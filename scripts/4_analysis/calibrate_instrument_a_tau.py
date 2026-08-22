@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Instrument-A (LettuceDetect) τ calibration for the Qasper Y predicate.
+"""Order:     stage 4 — registration-time calibration, before the #112 freeze embeds its τ
+Objective: Calibrate the REGISTERED Instrument-A (LettuceDetect) τ on the public RAGTruth/TRUE anchor pool (design input, not findings)
+Cloud:     local
+
+Instrument-A (LettuceDetect) τ calibration for the Qasper Y predicate.
 
 Task #146 (owner decision #120/F7, DECIDED 2026-08-19; ADR-0091): charter
 §8.5 defines the Qasper veridicality predicate as "groundedness-based

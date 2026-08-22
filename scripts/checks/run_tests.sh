@@ -1,4 +1,7 @@
 #!/bin/bash
+# Order:     gate — anytime; the offline suite before shipping/launching (--with-cluster is the live opt-in)
+# Objective: Run the CAGE test suite (plain local pytest by default; --with-cluster starts+stops a live vLLM cluster)
+# Cloud:     local
 # Run the CAGE test suite.
 #
 # DEFAULT (finding J12, Topic-10 walkthrough): plain LOCAL pytest -- no GPU, no vLLM

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Tuple-keyed campaign figure pipeline (audit P0-4; PUBLICATION.md D9/D10 figure specs).
+"""Order:     stage 4 — after run_campaign_analysis.py (consumes its registered stats rows + index)
+Objective: Tuple-keyed campaign figure pipeline (registered forest, pressure/goodput and coverage figures)
+Cloud:     local
+
+Tuple-keyed campaign figure pipeline (audit P0-4; PUBLICATION.md D9/D10 figure specs).
 
 Every figure in this module is keyed on ``CellSpec.to_row_key()`` strings — the D7
 tuple identity (``arm|retriever|policy|topology|engine|model|family[|r{g}|lam{g}]``),

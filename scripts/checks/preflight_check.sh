@@ -1,4 +1,7 @@
 #!/bin/bash
+# Order:     gate — after 2_serving is up, before EVERY 3_run launch (Gate 2; re-run after every engine relaunch)
+# Objective: Live infra preflight gates (a)-(q): serving health, quality stack, telemetry, retrieval, env poison, iso-bytes parity, layout round-trip
+# Cloud:     both
 # =============================================================================
 # Gate 2: live infra preflight — run BEFORE every GPU sweep (validate-before-run).
 # =============================================================================

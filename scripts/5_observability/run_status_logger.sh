@@ -1,4 +1,7 @@
 #!/bin/bash
+# Order:     alongside stage 3 — lightweight manual logger (observe_run.py is the superseding sidecar)
+# Objective: Append a compact one-line run-status snapshot to a timeline log every INTERVAL seconds
+# Cloud:     both
 # Continuous status logger for CAGE runs (Phase 2 / Phase 3 live tracking).
 # Appends a compact one-line status snapshot every INTERVAL seconds to a timeline
 # log, so progress is recorded at fine granularity without a held SSH connection.

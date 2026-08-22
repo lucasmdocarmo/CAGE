@@ -4,7 +4,7 @@ These are STATIC contract checks (no cloud, no terraform binary required except
 for the optional validate test): they pin the exact invariants whose drift
 caused two CONFIRMED campaign-blocking findings:
 
-1. run_id grammar: terraform/variables.tf must validate run_id against the
+1. run_id grammar: terraform/gcp/variables.tf must validate run_id against the
    SAME RESULTS_LAYOUT.md §1 bucket-name grammar the analysis layer uses
    (organize_results.RUN_ID_RE), and main.tf must use run_id VERBATIM as the
    slug — otherwise the bucket terraform creates (cage-<slug>) and the
@@ -35,7 +35,7 @@ for _p in (str(_SCRIPTS_DIR), str(REPO_ROOT)):
 
 import organize_results as org  # noqa: E402
 
-TF_DIR = REPO_ROOT / "terraform"
+TF_DIR = REPO_ROOT / "terraform" / "gcp"
 VARIABLES_TF = TF_DIR / "variables.tf"
 MAIN_TF = TF_DIR / "main.tf"
 TFVARS_EXAMPLE = TF_DIR / "terraform.tfvars.example"

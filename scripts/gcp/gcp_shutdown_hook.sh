@@ -1,4 +1,7 @@
 #!/bin/bash
+# Order:     teardown bracket — runs automatically at ACPI shutdown/spot preemption (installed as instance shutdown-script metadata)
+# Objective: Best-effort final results+logs mirror inside the ~30s preemption budget, as the run user, never exiting early
+# Cloud:     gcp
 # GCP shutdown-script for CAGE GPU VMs. GCP runs the instance's `shutdown-script` on ACPI
 # soft-off, which fires on a SPOT PREEMPTION (~30s budget) and on a normal `instances
 # delete`/`stop`. This guarantees results + logs are mirrored to GCS even when no operator
@@ -6,10 +9,10 @@
 #
 # Install at VM creation:
 #   gcloud compute instances create ... \
-#     --metadata-from-file shutdown-script=scripts/5_observability/gcp_shutdown_hook.sh
+#     --metadata-from-file shutdown-script=scripts/gcp/gcp_shutdown_hook.sh
 # Or attach to a running VM:
 #   gcloud compute instances add-metadata <vm> --zone <zone> \
-#     --metadata-from-file shutdown-script=scripts/5_observability/gcp_shutdown_hook.sh
+#     --metadata-from-file shutdown-script=scripts/gcp/gcp_shutdown_hook.sh
 #
 # It runs as ROOT with a MINIMAL environment (no profile, near-empty PATH), so it fixes
 # PATH itself, resolves the repo and the run user, and runs the sync as that user (whose
@@ -34,8 +37,8 @@ for d in /home/*/CAGE /home/*/cage /root/CAGE /root/cage /opt/cage /opt/CAGE; do
   echo "[hook] using repo $d as $USER_NAME" >> "$LOG" 2>&1
   # Run as the owning user so gcloud/gsutil pick up its ADC + config. The paths matched by
   # the glob above contain no quotes/spaces, so embedding $d in the -c string is safe.
-  su - "$USER_NAME" -c "cd '$d' && bash scripts/5_observability/sync_results_to_gcs.sh results && CAGE_COLLECT_TOKEN=shutdown_\$(date -u +%Y%m%d_%H%M%S) bash scripts/5_observability/collect_logs.sh" >> "$LOG" 2>&1 || \
-    ( cd "$d" && bash scripts/5_observability/sync_results_to_gcs.sh results && bash scripts/5_observability/collect_logs.sh ) >> "$LOG" 2>&1 || true
+  su - "$USER_NAME" -c "cd '$d' && bash scripts/gcp/sync_results_to_gcs.sh results && CAGE_COLLECT_TOKEN=shutdown_\$(date -u +%Y%m%d_%H%M%S) bash scripts/5_observability/collect_logs.sh" >> "$LOG" 2>&1 || \
+    ( cd "$d" && bash scripts/gcp/sync_results_to_gcs.sh results && bash scripts/5_observability/collect_logs.sh ) >> "$LOG" 2>&1 || true
   break
 done
 echo "=== cage shutdown hook done $(date -u) ===" >> "$LOG" 2>&1

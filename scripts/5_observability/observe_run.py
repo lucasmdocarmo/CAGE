@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""CAGE observability sidecar (Option 1: provenance + snapshots + live sync).
+"""Order:     alongside stage 3 — background sidecar launched with the run drivers
+Objective: Observability sidecar: run manifest + periodic GPU/serving/progress snapshots + exit-time artifact hashing, decoupled from the orchestrator
+Cloud:     both
+
+CAGE observability sidecar (Option 1: provenance + snapshots + live sync).
 
 Runs as a BACKGROUND process alongside a baseline sweep. It writes a run manifest, then
 periodically snapshots GPU / serving telemetry / progress as durable JSON + PNG, and on exit
@@ -8,8 +12,9 @@ for progress), so it is fully decoupled from the orchestrator and cannot perturb
 timings.
 
 Artifacts land under ``<run-dir>/observability/`` -- which cloud_run.sh already mirrors to
-GCS every interval -- so nothing extra is needed to stream them off the VM; a laptop pulls
-them with scripts/5_observability/watch_run.sh.
+the off-box backup target every interval -- so nothing extra is needed to stream them off
+the box; a laptop pulls them with transport_pull (or scripts/gcp/watch_run.sh on the GCS
+port).
 
 Launch (cloud_run.sh does this automatically):
     nohup python3 scripts/5_observability/observe_run.py --run-dir results/phase2/<run-id> --model Qwen/Qwen3-8B \

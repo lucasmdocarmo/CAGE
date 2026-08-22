@@ -1,11 +1,14 @@
 #!/bin/bash
+# Order:     stage 2 — multi-node cluster bring-up (side path), before 3_run
+# Objective: Deploy a multi-node vLLM cluster: local Docker Compose / generic-k8s side paths + the confirm-gated terraform/gcp stack (its only cloud surface; unused on RunPod)
+# Cloud:     gcp
 # CAGE Framework - Multi-Node Cluster Deployment Script
 # Supports: local (Docker), Kubernetes, GCP (Terraform)
 #
 # PROVISIONING (2026-08-02 charter): the GCP campaign path now provisions via
-# terraform/ at the repo root (sessions/*.tfvars; `terraform apply` is GATED by
-# explicit user approval — see terraform/main.tf header). The `gcp` command here
-# drives that same root stack interactively and fail-closed (confirm prompt);
+# terraform/gcp/ (sessions/*.tfvars; `terraform apply` is GATED by
+# explicit user approval — see terraform/gcp/main.tf header). The `gcp` command here
+# drives that same stack interactively and fail-closed (confirm prompt);
 # never wire it into automation. `local`/`k8s` remain the SSH-config +
 # neocloud-manual side paths.
 
@@ -16,8 +19,8 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # shellcheck source=scripts/lib/_common.sh
 source "$PROJECT_ROOT/scripts/lib/_common.sh"
 
-# Root terraform stack (the old terraform/gcp/ subdir is GONE; sessions tfvars select the shape).
-TF_DIR="$PROJECT_ROOT/terraform"
+# GCP terraform stack (terraform/gcp/ since the provider split; sessions tfvars select the shape).
+TF_DIR="$PROJECT_ROOT/terraform/gcp"
 
 usage() {
     cat << EOF
@@ -28,7 +31,7 @@ Usage: $0 <command> [options]
 Commands:
   local           Deploy locally with Docker Compose
   k8s             Deploy to Kubernetes cluster
-  gcp             Deploy to GCP with Terraform (terraform/ root stack; apply is confirm-gated)
+  gcp             Deploy to GCP with Terraform (terraform/gcp/ stack; apply is confirm-gated)
   status          Check deployment status
   destroy [tgt]   Tear down deployment (tgt: local|k8s|gcp|all, default all)
 
@@ -276,7 +279,7 @@ deploy_k8s() {
     log_info "Run experiments with: --api-base http://<node-ip>:$nodeport"
 }
 
-# Deploy to GCP with Terraform (root terraform/ stack; sessions tfvars select the shape).
+# Deploy to GCP with Terraform (terraform/gcp/ stack; sessions tfvars select the shape).
 deploy_gcp() {
     log_info "Deploying CAGE cluster to GCP with $REPLICAS replicas..."
 
@@ -287,8 +290,8 @@ deploy_gcp() {
 
     # Check for tfvars
     if [[ ! -f "terraform.tfvars" ]]; then
-        log_error "terraform.tfvars not found in terraform/. Copy terraform.tfvars.example and fill in your values."
-        log_error "Campaign sessions additionally use -var-file=sessions/<group>.tfvars (see terraform/main.tf)."
+        log_error "terraform.tfvars not found in terraform/gcp/. Copy terraform.tfvars.example and fill in your values."
+        log_error "Campaign sessions additionally use -var-file=sessions/<group>.tfvars (see terraform/gcp/main.tf)."
         exit 1
     fi
 
@@ -400,7 +403,7 @@ destroy_deployment() {
             cd "$TF_DIR"
             log_info "Terraform destroy of the root stack. Data flush on destroy relies on each"
             log_info "node's shutdown-script (metadata) syncing to GCS within its shutdown window."
-            log_info "For a single VM, prefer 'scripts/6_teardown/teardown_vm.sh <vm> <zone>', which"
+            log_info "For a single VM, prefer 'scripts/gcp/teardown_vm.sh <vm> <zone>', which"
             log_info "verifies this run's GCS log sentinel AND pulls results local BEFORE deleting"
             log_info "(fail-closed). PULL RESULTS LOCAL FIRST -- teardown is irreversible."
             # Fail-closed confirm replaces the old 'sleep 5 then destroy anyway' window.

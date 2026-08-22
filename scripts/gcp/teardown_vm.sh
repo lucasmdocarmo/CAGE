@@ -1,6 +1,9 @@
 #!/bin/bash
+# Order:     teardown bracket — after 5_observability's final collect; LAST step of a GCP session
+# Objective: Fail-closed VM teardown: sentinel-verified log collect + complete local results pull BEFORE the delete (step [4/6] enforced)
+# Cloud:     gcp
 # GCP PORT (task #137, 2026-08-18): RunPod is the PRIMARY campaign provider —
-# pods are torn down with scripts/6_teardown/teardown_pod.sh (same fail-closed
+# pods are torn down with scripts/runpod/teardown_pod.sh (same fail-closed
 # ordering, ledger-gated pull first). This script is RETAINED for GCP VMs.
 # DELIBERATE: the internal transport below (gcloud storage ls/rsync in the
 # sentinel check and the step-[4/6] bulk pull) stays gcloud-native rather than
@@ -28,7 +31,7 @@
 # so finding that exact object proves this teardown's collection finished.
 #
 # Usage (flags accepted in any position):
-#   scripts/6_teardown/teardown_vm.sh <instance> <zone> [--force]
+#   scripts/gcp/teardown_vm.sh <instance> <zone> [--force]
 # Env: CAGE_RESULTS_BUCKET (default gs://<project>-cage-results)
 set -uo pipefail
 # (Deliberately no -e: each step's exit status is handled explicitly and verified
@@ -50,7 +53,7 @@ for a in "$@"; do
   esac
 done
 if [ -z "$VM" ] || [ -z "$ZONE" ]; then
-  echo "usage: scripts/6_teardown/teardown_vm.sh <instance> <zone> [--force]" >&2
+  echo "usage: scripts/gcp/teardown_vm.sh <instance> <zone> [--force]" >&2
   exit 2
 fi
 

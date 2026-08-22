@@ -394,7 +394,7 @@ def test_j9_redaction_pipeline_behavior() -> None:
 # ---------------------------------------------------------------------------
 
 def test_j10_skip_local_pull_needs_typed_ceremony_and_marker() -> None:
-    text = _text(REPO_ROOT / "scripts/6_teardown/teardown_vm.sh")
+    text = _text(REPO_ROOT / "scripts/gcp/teardown_vm.sh")
     branch = re.search(r'if \[ "\$\{CAGE_SKIP_LOCAL_PULL:-0\}" = "1" \]; then(.*?)\nelse', text, re.S)
     assert branch, "the CAGE_SKIP_LOCAL_PULL branch is gone"
     body = branch.group(1)
@@ -408,7 +408,7 @@ def test_j10_skip_local_pull_needs_typed_ceremony_and_marker() -> None:
 
 
 def test_j10_zero_dollar_sweep_covers_disks_addresses_buckets_readonly() -> None:
-    text = _text(REPO_ROOT / "scripts/6_teardown/teardown_vm.sh")
+    text = _text(REPO_ROOT / "scripts/gcp/teardown_vm.sh")
     tail = text[text.index("[6/6]"):]
     for needle in ("instances list", "disks list", "addresses list", "buckets list"):
         assert needle in tail, f"$0 sweep must include read-only `{needle}` (J10)"

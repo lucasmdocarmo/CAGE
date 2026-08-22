@@ -1,6 +1,8 @@
-# Dissertation / paper sources + docs (kept local, not uploaded)
+# Dissertation / paper sources (kept local, not uploaded). docs/ itself is
+# TRACKED since the cloud/ dissolution (RUNBOOK, RESULTS_LAYOUT,
+# VLLM_COMPATIBILITY live there); only its local plugin content stays ignored.
 paper/
-docs/
+docs/superpowers/
 my-article/
 Documentation/
 

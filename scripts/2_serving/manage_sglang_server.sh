@@ -1,4 +1,7 @@
 #!/bin/bash
+# Order:     stage 2 — after 1_setup, before any 3_run driver; charter engine #2 launcher
+# Objective: Start/stop/status the SGLang server under the SAME uniform regime as vLLM (iso-bytes dial mapping)
+# Cloud:     both
 # =============================================================================
 # SGLang Server Management Script   (charter D2 engine #2 -- RadixAttention)
 # =============================================================================

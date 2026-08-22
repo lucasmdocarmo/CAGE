@@ -1,4 +1,7 @@
 #!/bin/bash
+# Order:     gate — before any compressed_cag run (3_run/run_compression.sh)
+# Objective: Verify FP8 KV cache still coexists with prefix caching on the pulled vLLM (else compressed_cag is confounded)
+# Cloud:     both
 # =============================================================================
 # Gate: does FP8 KV cache coexist with prefix caching on the CURRENT vLLM?
 # =============================================================================
@@ -9,7 +12,7 @@
 # This launches vLLM with fp8 + prefix caching, sends a long repeated prefix twice, and checks
 # that usage.prompt_tokens_details.cached_tokens > 0 on the second request.
 #   PASS (exit 0) = safe to run compressed_cag.   FAIL (exit 1) = do NOT trust compressed_cag.
-# GPU-only (FP8 KV needs a CUDA device). See cloud/VLLM_COMPATIBILITY.md sec 4.
+# GPU-only (FP8 KV needs a CUDA device). See docs/VLLM_COMPATIBILITY.md sec 4.
 # =============================================================================
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -56,6 +59,6 @@ if [ "$RESULT" -gt 0 ]; then
     exit 0
 else
     echo ">>> [gate] FAIL — cached_tokens=0 under FP8: prefix caching is OFF, so compressed_cag would be confounded."
-    echo "          Pin a vLLM where they coexist (cloud/VLLM_COMPATIBILITY.md sec 4)."
+    echo "          Pin a vLLM where they coexist (docs/VLLM_COMPATIBILITY.md sec 4)."
     exit 1
 fi

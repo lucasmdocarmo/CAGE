@@ -1,4 +1,7 @@
 #!/bin/bash
+# Order:     alongside/after stage 3 — final full run BEFORE teardown (its COLLECT_OK sentinel gates the teardown scripts)
+# Objective: Gather every run/system log + forensics into logs/, mirror off-box host-namespaced, and write a per-run success sentinel
+# Cloud:     both
 # CAGE log collector. Gather EVERY run + system log into logs/ and mirror to the
 # off-box backup target (provider-neutral via sync_results.sh: gs:// | s3:// |
 # ssh:// | file://), so nothing is lost when a box is torn down or preempted.
@@ -40,7 +43,7 @@ cd "$PROJECT_DIR" || die "cannot cd to $PROJECT_DIR"
 
 MODE="${1:-full}"
 HOST="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo vm)"
-HOST="$(printf '%s' "$HOST" | tr -c 'A-Za-z0-9_.-' '_')"   # sanitize for a safe GCS path
+HOST="$(printf '%s' "$HOST" | tr -c 'A-Za-z0-9_.-' '_')"   # sanitize for a safe remote path (any backend)
 TS="$(date +%Y%m%d_%H%M%S 2>/dev/null || echo run)"
 LOGROOT="logs"
 mkdir -p "$LOGROOT/vllm" "$LOGROOT/runs" "$LOGROOT/system" \

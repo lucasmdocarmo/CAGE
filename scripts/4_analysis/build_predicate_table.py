@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Build the §8.5 predicate table for one sealed run + one sealed scoring pass.
+"""Order:     stage 4 — after a sealed run AND a sealed scoring pass; before stats consume predicates
+Objective: Join the scoring sidecar onto evidence rows and compute the §8.5 per-query veridicality predicate table (seal-verified, fail-closed)
+Cloud:     local
+
+Build the §8.5 predicate table for one sealed run + one sealed scoring pass.
 
 Task #119 (Topic-6 F1-F4): the missing producer of the registered per-query
 ``predicate`` metric (families.DEFAULT_METRICS) and the missing join from the

@@ -1,4 +1,7 @@
 #!/bin/bash
+# Order:     stage 4 — final tree of run_full_sweep.sh (on-box) or a standalone pilot re-render
+# Objective: Aggregate a pilot run root and drive the pilot stats -> divergence -> plots chain, then sync the run off-box
+# Cloud:     both
 # PILOT-ERA — campaign analysis = run_campaign_analysis.py; kept for pilot re-renders.
 # This script aggregates the PILOT (Phase-2) results layout and its retired flat
 # baseline names. Campaign runs (RESULTS_LAYOUT v2 cell trees) go through

@@ -1,4 +1,7 @@
 #!/bin/bash
+# Order:     alongside stages 3-5 — the one-shot mirror building block every sync caller routes through
+# Objective: Mirror a local dir to the off-box backup target (gs://|s3://|ssh://|file:// via lib/transport.sh) with per-backend markers; loud on failure
+# Cloud:     both
 # Mirror a local directory to the durable off-box backup target — provider-
 # neutral (task #137, finding J4). Canonical name since 2026-08-18; the old
 # sync_results_to_gcs.sh remains as a deprecated forwarding shim.

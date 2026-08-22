@@ -1,4 +1,7 @@
 #!/bin/bash
+# Order:     stage 3 — core tree of run_full_sweep.sh (or standalone); starts its own vLLM via run_baselines.sh
+# Objective: Pilot-harness core-suite driver for ONE GPU box with continuous off-box result mirroring (J4 backup-target gate at start)
+# Cloud:     both
 # =============================================================================
 # PILOT HARNESS — drives the retired 9-name taxonomy via the alias map; the
 # campaign harness (CellSpec-native, D6 open-loop) lands at tranche P1; use for
@@ -10,7 +13,7 @@
 # Do NOT run it on the CPU router of a multi-VM cluster. For the *distributed* baseline
 # against a cluster, use run_experiment.py + sync_results.sh directly (a pilot-era path;
 # the cluster recipe it pointed at was retired with the pilot runbook — see git history
-# of cloud/RUNBOOK.md).
+# of docs/RUNBOOK.md).
 #
 # Results are mirrored to the durable backup target every SYNC_INTERVAL seconds (and at exit),
 # so an SSH drop, VM preemption, or VM delete cannot lose a finished baseline. Pair with
@@ -41,7 +44,7 @@
 # so run those via their own scripts instead of this suite:
 #     compression 2x2:  bash scripts/3_run/run_compression.sh $MODEL   (gates FP8 x prefix-caching)
 #     (speculative 2x2 RETIRED per charter §7.5 -> scripts/deprecated/run_speculative_matrix.sh)
-# The vLLM pin is v0.19.1 (Phase-3; Phase-2 ran v0.11.0) — see cloud/VLLM_COMPATIBILITY.md.
+# The vLLM pin is v0.19.1 (Phase-3; Phase-2 ran v0.11.0) — see docs/VLLM_COMPATIBILITY.md.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -61,8 +64,26 @@ NUM_TRIALS="${3:-3}"
 # FRAGMENT onto a new one; the dataset suffix carries the run's dataset identity).
 PHASE="${PHASE:-phase2}"
 _model_slug="$(printf '%s' "$MODEL" | tr '[:upper:]' '[:lower:]' | sed -E 's|.*/||; s|[^a-z0-9]+|-|g; s|^-+||; s|-+$||')"
-RUN_ID="${CAGE_RUN_ID:-$(mint_run_id "$_model_slug" "$NUM_QUERIES" "$NUM_TRIALS" "${DATASET:-squad_v2}")}"
-RUN_ROOT="results/${PHASE}/${RUN_ID}"
+# Campaign v2 mode (task #116): CAGE_CAMPAIGN_ROOT preset (run_full_sweep.sh), or
+# CAGE_CAMPAIGN + CAGE_SESSION set -> mint the §1 campaign run-id
+# (mint_campaign_run_id) and run under results/<campaign>/<session>/<run_id>/ —
+# the RESULTS_LAYOUT tree run_experiment.py writes through campaign_layout.
+# Pilot mode (default) keeps the results/<phase>/<run-id>/ convention verbatim.
+if [ -n "${CAGE_CAMPAIGN_ROOT:-}" ] || [ -n "${CAGE_CAMPAIGN:-}" ]; then
+  if [ -n "${CAGE_CAMPAIGN_ROOT:-}" ]; then
+    RUN_ID="$(basename "$CAGE_CAMPAIGN_ROOT")"
+    RUN_ROOT="${CAGE_CAMPAIGN_ROOT#"$PROJECT_DIR/"}"
+  else
+    [ -n "${CAGE_SESSION:-}" ] || die "campaign mode needs CAGE_SESSION (a|b|cd-act1|cd-act2) alongside CAGE_CAMPAIGN"
+    RUN_ID="${CAGE_RUN_ID:-$(mint_campaign_run_id "$CAGE_SESSION" "$_model_slug")}"
+    RUN_ROOT="results/${CAGE_CAMPAIGN}/${CAGE_SESSION}/${RUN_ID}"
+  fi
+  export CAGE_RUN_ID="$RUN_ID" CAGE_RUN_ROOT="$PROJECT_DIR/$RUN_ROOT" CAGE_CAMPAIGN_ROOT="$PROJECT_DIR/$RUN_ROOT"
+  echo "[cage] CAMPAIGN MODE (task #116): v2 run root $RUN_ROOT (cells/<row_key>/window_<dataset>-NN)"
+else
+  RUN_ID="${CAGE_RUN_ID:-$(mint_run_id "$_model_slug" "$NUM_QUERIES" "$NUM_TRIALS" "${DATASET:-squad_v2}")}"
+  RUN_ROOT="results/${PHASE}/${RUN_ID}"
+fi
 # Exported for run_baselines.sh (+ the whole run tree) to inherit the SAME root.
 export CAGE_PHASE="$PHASE" CAGE_RUN_ID="$RUN_ID" CAGE_RUN_ROOT="$PROJECT_DIR/$RUN_ROOT"
 mkdir -p "$CAGE_RUN_ROOT"
@@ -173,7 +194,7 @@ source "$SCRIPT_DIR/../lib/_serving_config.sh"
 # Observability sidecar (provenance + snapshots): writes run_manifest.json, periodic GPU/
 # serving/progress JSON+PNG snapshots, and provenance hashes under $SYNC_DIR/observability/ --
 # which the periodic sync above already mirrors to GCS, so a laptop can watch live via
-# scripts/5_observability/watch_run.sh. It observes from OUTSIDE the run (reads STATUS/results.csv), so it can
+# scripts/gcp/watch_run.sh. It observes from OUTSIDE the run (reads STATUS/results.csv), so it can
 # never perturb serving timings. Set OBSERVE=0 to disable.
 OBSERVE="${OBSERVE:-1}"
 OBSERVE_PID=""
@@ -231,7 +252,11 @@ NUM_QUERIES="$NUM_QUERIES" NUM_TRIALS="$NUM_TRIALS" \
 
 # Auto-generate figures for the finished run (best-effort; a plot error never fails the run).
 # The EXIT trap's final sync below then mirrors plots/ to GCS with the rest of the run root.
-if [ "${CAGE_AUTO_PLOTS:-1}" != "0" ]; then
+# Campaign mode skips them: generate_plots.py reads the PILOT layout; the campaign chain is
+# seal_campaign_run.py -> verify_results.py -> organize_results.py -> run_campaign_analysis.py.
+if [ -n "${CAGE_CAMPAIGN_ROOT:-}" ]; then
+  echo "[cage] campaign mode: skipping pilot auto-plots (use the v2 chain: seal_campaign_run.py -> verify_results.py -> organize_results.py)"
+elif [ "${CAGE_AUTO_PLOTS:-1}" != "0" ]; then
   echo "[cage] generating plots -> $RUN_ROOT/plots/"
   python3 "$SCRIPT_DIR/../4_analysis/generate_plots.py" --results-dir "$CAGE_RUN_ROOT" --plots-dir "$CAGE_RUN_ROOT/plots" \
     > logs/generate_plots.log 2>&1 || echo "[cage] WARNING: plot generation failed (see logs/generate_plots.log)"

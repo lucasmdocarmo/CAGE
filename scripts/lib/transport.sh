@@ -1,4 +1,7 @@
 # shellcheck shell=bash
+# Order:     sourced library, never executed
+# Objective: Provider-neutral off-box transport verbs (resolve/join/push/pull/ls/exists/ensure) over gs://|s3://|ssh://|file:// + the J4 require_backup_target gate
+# Cloud:     both
 # =============================================================================
 # scripts/lib/transport.sh — provider-neutral off-box transport (task #137, J4)
 # =============================================================================

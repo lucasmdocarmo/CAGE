@@ -1,4 +1,7 @@
 #!/bin/bash
+# Order:     provisioning bracket — before 1_setup (ship step; workstation side)
+# Objective: Package the repo as a provenance-stamped tarball (BUILD_INFO) for deploy onto a box without git
+# Cloud:     local
 # Package the repo for GPU-VM deploy WITH provenance. The VM tree is a tarball, not a
 # git clone, so `git rev-parse` fails there and run_manifest.json recorded sha=null for
 # the whole 2026-07-15 smoke run. This script stamps BUILD_INFO into the archive;

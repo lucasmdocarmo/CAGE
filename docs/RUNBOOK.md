@@ -36,26 +36,26 @@
 
 ```
 [ship]      scripts/ops/package_repo.sh  ->  tarball + BUILD_INFO  ->  pod ~/CAGE
-[setup]     bash scripts/1_setup/setup_runpod.sh              (container-shaped, B1 interpreter)
+[setup]     bash scripts/runpod/setup_runpod.sh              (container-shaped, B1 interpreter)
 [preflight] bash scripts/checks/preflight_check.sh <MODEL> <API_BASE>   (gates (a)-(q))
 [run]       nohup bash scripts/3_run/run_full_sweep.sh <model> <N> <T> > sweep.log 2>&1 &
             (or cloud_run.sh for the core tree alone — see the honesty note in §4)
 [sync]      scripts/5_observability/sync_results.sh + gcs_backup_daemon.sh + collect_logs.sh
             (all through scripts/lib/transport.sh: gs:// | s3:// | ssh:// | file://)
-[pull+$0]   scripts/6_teardown/teardown_pod.sh <pod_id> <backup_target> <local_run_dir>
+[pull+$0]   scripts/runpod/teardown_pod.sh <pod_id> <backup_target> <local_run_dir>
             (ledger-gated pull_run.sh FIRST, delete LAST, read-only $0 listing)
 ```
 
 Sessions and cell carriage are `MyDocs/PUBLICATION.md` §7.6/§7.6.1; FINAL SCOPE v2
 (the RunPod plan: which runs, which pods, the L40S S0 gate) is
 `MyDocs/COST_NEBIUS_RUNPOD_2026-08-16.md`. Engine pins and the engine×model
-VERIFY-LIVE matrix: `cloud/VLLM_COMPATIBILITY.md` (§7; act-2 RDMA preflight §8).
+VERIFY-LIVE matrix: `docs/VLLM_COMPATIBILITY.md` (§7; act-2 RDMA preflight §8).
 
 ### 1.1 Session vocabulary — the four session ids (tracked definition)
 
 The campaign runs as **three provisioning sessions**; C and D share one session in
 two acts. The session id is a path level of every results tree
-(`results/<campaign>/<session>/<run_id>/`, `cloud/RESULTS_LAYOUT.md` §1) and is
+(`results/<campaign>/<session>/<run_id>/`, `docs/RESULTS_LAYOUT.md` §1) and is
 pinned in code as `SESSIONS` (`scripts/4_analysis/organize_results.py` /
 `src/orchestration/campaign_layout.py`). The **only legal values**:
 
@@ -69,7 +69,7 @@ pinned in code as `SESSIONS` (`scripts/4_analysis/organize_results.py` /
 Each session: approval → provision → preflight → run cells → pull-verify →
 teardown-$0. Act-1 → act-2 transition: preflight ONCE on the first node (act 1),
 then scale out for act 2 — act 2 has its OWN additional gate (the RDMA preflight,
-`cloud/VLLM_COMPATIBILITY.md` §8) and its own user approval. Hardware shapes and
+`docs/VLLM_COMPATIBILITY.md` §8) and its own user approval. Hardware shapes and
 pod choices are FINAL SCOPE v2 (`MyDocs/COST_NEBIUS_RUNPOD_2026-08-16.md`); the
 GCP-fallback shapes live in Appendix A.
 
@@ -85,7 +85,7 @@ scp ${CAGE_SSH_OPTS:-} /tmp/cage_<sha8>.tar.gz <user@pod>:~   # RunPod SSH, ofte
 # pod
 mkdir -p ~/CAGE && tar xzf cage_*.tar.gz -C ~/CAGE
 head -3 ~/CAGE/BUILD_INFO                      # verify sha/dirty/packaged_at
-cd ~/CAGE && bash scripts/1_setup/setup_runpod.sh
+cd ~/CAGE && bash scripts/runpod/setup_runpod.sh
 source cage-env/bin/activate
 ```
 
@@ -95,10 +95,10 @@ installs the pinned vLLM + `requirements.txt` into `cage-env` built from the
 than fall back to bare `python3`; never hand-build the venv with `python3 -m venv`),
 exports `HF_HUB_DOWNLOAD_TIMEOUT` BEFORE dataset staging and model prefetch, stages the
 full charter dataset roster (D5), and prefetches the FINAL-SCOPE model roster
-(override per pod role: `PREFETCH_MODELS="Qwen/Qwen3-14B" bash scripts/1_setup/setup_runpod.sh`).
+(override per pod role: `PREFETCH_MODELS="Qwen/Qwen3-14B" bash scripts/runpod/setup_runpod.sh`).
 
 Long-job discipline (kept from the pilots — still true): never run a long command
-through a blocking SSH. `scripts/ops/remote_job.sh` gives submit/status/tail/wait/kill
+through a blocking SSH. `scripts/gcp/remote_job.sh` gives submit/status/tail/wait/kill
 with a durable remote PID + state file; pair every run with `nohup ... &`.
 
 ## 3. Preflight — Gate 2, gates (a)–(q) (a failing gate = do NOT launch)
@@ -125,7 +125,7 @@ round-trip, (m) open-loop schedule + measured-replay guard, (n) calibration arti
 (o) regime-inputs bridge on live telemetry, (p) dataset staleness refusal.
 
 Version pins: record the actually-served engine versions into the run manifest; the
-engine×model VERIFY-LIVE matrix is `cloud/VLLM_COMPATIBILITY.md` §7. Re-run gate (a)
+engine×model VERIFY-LIVE matrix is `docs/VLLM_COMPATIBILITY.md` §7. Re-run gate (a)
 after **every** engine relaunch (prefix ON/OFF, policy knobs, and topology are
 launch-time levers — relaunches between cells are normal).
 
@@ -176,13 +176,13 @@ bash scripts/5_observability/collect_logs.sh
 
 The daemon mirrors on an interval (default 300 s, `CAGE_BACKUP_INTERVAL`), survives
 SSH drops (setsid), never uses `--delete`, and `stop` does one final authoritative
-sync. The remote layout mirrors the local tree exactly (`cloud/RESULTS_LAYOUT.md` §4).
+sync. The remote layout mirrors the local tree exactly (`docs/RESULTS_LAYOUT.md` §4).
 
 **End sequence — teardown is irreversible; never reorder these steps:**
 
 ```
 [1] final sync + stop daemon    gcs_backup_daemon.sh stop   (final authoritative sync)
-[2] VERIFIED PULL + TEARDOWN    scripts/6_teardown/teardown_pod.sh <pod_id> <backup_target> <local_run_dir>
+[2] VERIFIED PULL + TEARDOWN    scripts/runpod/teardown_pod.sh <pod_id> <backup_target> <local_run_dir>
                                   [1/5] final on-pod sync (needs CAGE_POD_SSH; else skipped loudly)
                                   [2/5] ledger-gated pull_run.sh -> ONLY its literal
                                         "SAFE TO TEARDOWN" line authorizes destruction
@@ -247,18 +247,18 @@ remembered number. Session-level dollar totals go into `MyDocs/LEDGER.md` at EOD
 | Goal | Command |
 |---|---|
 | Package repo for ship | `scripts/ops/package_repo.sh` |
-| Bootstrap the pod | `bash scripts/1_setup/setup_runpod.sh` |
+| Bootstrap the pod | `bash scripts/runpod/setup_runpod.sh` |
 | Live preflight (gates a–p) | `bash scripts/checks/preflight_check.sh <MODEL> <API_BASE>` |
 | Full sweep (one run-id) | `nohup bash scripts/3_run/run_full_sweep.sh <MODEL> <N> <T> > sweep.log 2>&1 &` |
-| Submit long remote job | `scripts/ops/remote_job.sh submit <name> '<cmd>' [deadline_s]` |
+| Submit long remote job | `scripts/gcp/remote_job.sh submit <name> '<cmd>' [deadline_s]` |
 | One-shot sync | `bash scripts/5_observability/sync_results.sh <dir> [target]` |
 | Start/stop backup daemon | `bash scripts/5_observability/gcs_backup_daemon.sh start\|stop [phase_dir]` |
 | Collect logs + forensics | `bash scripts/5_observability/collect_logs.sh` |
 | Verified pull (ledger gate) | `bash scripts/5_observability/pull_run.sh <target> <local_run_dir>` |
-| Fail-closed teardown + $0 | `scripts/6_teardown/teardown_pod.sh <pod_id> <target> <local_run_dir>` |
+| Fail-closed teardown + $0 | `scripts/runpod/teardown_pod.sh <pod_id> <target> <local_run_dir>` |
 
-Compatibility gates and pins: `cloud/VLLM_COMPATIBILITY.md`.
-Results tree + ledger spec: `cloud/RESULTS_LAYOUT.md`.
+Compatibility gates and pins: `docs/VLLM_COMPATIBILITY.md`.
+Results tree + ledger spec: `docs/RESULTS_LAYOUT.md`.
 Design authority: `MyDocs/PUBLICATION.md` (§7.6 groups, §7.6.1 matrix, §7.7f lifecycle).
 
 ---
@@ -268,29 +268,29 @@ Design authority: `MyDocs/PUBLICATION.md` (§7.6 groups, §7.6.1 matrix, §7.7f 
 GCP is kept as a **portability backend**: everything below works, none of it is the
 primary path, and nothing here weakens the §0 disciplines.
 
-- **Provision**: `terraform/` with one tfvars file per session
-  (`terraform/sessions/group-a.tfvars`, `group-b.tfvars`, `group-cd.tfvars` — each sets
+- **Provision**: `terraform/gcp/` with one tfvars file per session
+  (`terraform/gcp/sessions/group-a.tfvars`, `group-b.tfvars`, `group-cd.tfvars` — each sets
   the terraform `session` variable, which is also the `session` label stamped on every
   resource). `terraform plan` is always allowed; `terraform apply` is GATED by the
   §0.1 user approval. Label everything `agent-run=<run_id>` so the orphan sweep can
   find strays.
-- **Setup**: `bash scripts/1_setup/setup_gpu_cloud.sh` (DLVM-shaped: sudo/systemd; the
+- **Setup**: `bash scripts/gcp/setup_gpu_cloud.sh` (DLVM-shaped: sudo/systemd; the
   RunPod script is the container-shaped primary). Same canonical-interpreter rule (B1).
-- **Ops**: `scripts/ops/gpu_vm.sh create` (pilot-era L4 zone-hunt) and
-  `scripts/ops/remote_job.sh` (provider-agnostic over SSH). SSH flags that keep agents
+- **Ops**: `scripts/gcp/gpu_vm.sh create` (pilot-era L4 zone-hunt) and
+  `scripts/gcp/remote_job.sh` (provider-agnostic over SSH). SSH flags that keep agents
   sane: `-o StrictHostKeyChecking=no -o ConnectTimeout=25 -o BatchMode=yes`, plus
   `CLOUDSDK_CORE_DISABLE_PROMPTS=1` (a TTY-less prompt hangs forever). Kill by the
   RECORDED PID, never `pkill -f <script>`. A non-login `ssh --command` does NOT
   inherit the run's env — forward `CAGE_BACKUP_TARGET` (etc.) explicitly.
 - **Backup default**: on a GCP box (and only there) the metadata server derives
   `gs://<project>-cage-results` when no target is set (`transport_default_target`).
-- **Teardown**: `scripts/6_teardown/teardown_vm.sh <vm> <zone>` — same fail-closed
+- **Teardown**: `scripts/gcp/teardown_vm.sh <vm> <zone>` — same fail-closed
   ordering (COLLECT_OK sentinel + complete local pull before delete). Skipping the
   pull needs the J10 double ceremony (`CAGE_SKIP_LOCAL_PULL=1` AND
   `CAGE_SKIP_LOCAL_PULL_CONFIRM=I-ACCEPT-DATA-LOSS`, bypass marker recorded).
   Prove $0 by label: instances, disks, buckets all empty for
-  `labels.agent-run=<run_id>`; `scripts/ops/gpu_vm.sh sweep` is the universal check.
+  `labels.agent-run=<run_id>`; `scripts/gcp/gpu_vm.sh sweep` is the universal check.
 - **RDMA path (C/D act 2, [Extension])**: H200 capacity via `a3-ultragpu-8g`
   (typically DWS Flex-start / calendar reservation) needs an RDMA-network-profile VPC;
-  the act-2 gate is the `cloud/VLLM_COMPATIBILITY.md` §8 RDMA preflight. No
+  the act-2 gate is the `docs/VLLM_COMPATIBILITY.md` §8 RDMA preflight. No
   RDMA-capable fabric → the RDMA rung cannot run there (the TCP rung still can).

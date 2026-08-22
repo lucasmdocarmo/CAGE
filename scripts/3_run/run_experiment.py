@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """
+Order:     stage 3 — the per-cell workhorse every tree driver invokes; after 2_serving
+Objective: Run ONE experiment cell (model x dataset x baseline config) against the serving stack and persist per-trial results; --campaign-root/CAGE_CAMPAIGN_ROOT emits each trial as a RESULTS_LAYOUT-v2 window via campaign_layout (task #116)
+Cloud:     both
+
 CAGE Experiment Runner
 
 Runs baseline experiments with specified model, dataset, and configuration.
@@ -45,6 +49,7 @@ from src.evaluation.quality import QualityEvaluator
 from src.evaluation.performance import PerformanceEvaluator, CacheMetricsTracker
 from src.evaluation.code_evaluator import CodeQualityEvaluator
 from src.orchestration.baselines import get_baseline_config, check_baseline_requirements
+from src.orchestration.campaign_session import CampaignCellSession, CampaignSessionError
 from src.orchestration.ir import (
     IRDocument,
     IRHit,
@@ -1219,6 +1224,14 @@ def run_experiment(
     kv_cache_dtype: Optional[str] = None,
     # vLLM serving telemetry via cage-stats (one-shot snapshot + dashboard)
     vllm_telemetry: bool = False,
+    # Campaign-layout output mode (task #116): when a CampaignCellSession is
+    # passed, this trial is ALSO emitted as RESULTS_LAYOUT-v2 measurement
+    # window window_<dataset>-<ordinal> through campaign_layout's atomic
+    # writers (requests.jsonl carrying the #127 join triple, qa_evidence,
+    # engine_metrics, cage_stats, the metrics.json sentinel, write-time
+    # hashes). None (the default) leaves the pilot path byte-identical.
+    campaign_session: Optional[CampaignCellSession] = None,
+    campaign_window_ordinal: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Run a single baseline experiment.
@@ -2631,6 +2644,11 @@ def run_experiment(
         except Exception as e:
             print(f"[telemetry] sampler not started: {e}")
 
+    # Measurement-window bounds on the SAME clock as the telemetry sampler's
+    # per-tick `ts` (epoch seconds, time.time() — see VllmTelemetrySampler._run):
+    # the campaign window's [t_start, t_end) is what the §6.1 regime bridge
+    # slices the cage_stats series against.
+    measured_window_t_start = time.time()
     performance_evaluator.start()
     try:
         if workload_mode == "open_loop":
@@ -2657,6 +2675,7 @@ def run_experiment(
         raise
     finally:
         performance_evaluator.stop()
+    measured_window_t_end = time.time()
 
     if gpu_monitoring:
         gpu_tracker.stop_monitoring()
@@ -3142,15 +3161,49 @@ def run_experiment(
 
     # Atomic writes (task #127, audit H10): metrics.json is the completeness
     # sentinel the resume gates key on -- it must exist fully-formed or not at all.
+    # Measured-stage wall-clock bounds (epoch seconds, telemetry clock) — the
+    # campaign window's [t_start, t_end) for the §6.1 regime bridge (task #116).
+    # CAMPAIGN-ONLY by contract: the pilot path stays byte-identical to the
+    # pre-#116 output (2026-08-21 verifier finding 1 — unconditional insertion
+    # falsified the byte-identity claim; no pilot consumer reads this key).
+    if campaign_session is not None:
+        experiment_summary["measured_window"] = {
+            "t_start": measured_window_t_start,
+            "t_end": measured_window_t_end,
+        }
+
     write_json_atomic(metrics_file, experiment_summary)
     write_json_atomic(stable_metrics_file, experiment_summary)
     
     print(f"Metrics saved to: {metrics_file}")
     print("=" * 70)
-    
+
+    # Campaign-layout emission (task #116): the pilot artifacts above are the
+    # STAGING copies; the sealed v2 tree gets this trial as one measurement
+    # window via campaign_layout's atomic writers + the write-time hash journal.
+    # A failed emission propagates (the shell marks the cell failed; the
+    # per-window resume re-emits it) — never a silent pilot-only fallback.
+    if campaign_session is not None:
+        if campaign_window_ordinal is None:
+            raise ValueError(
+                "campaign_session requires campaign_window_ordinal (the trial "
+                "number that names window_<dataset>-<NN>)"
+            )
+        campaign_session.emit_window(
+            ordinal=campaign_window_ordinal,
+            trial_seed=seed,
+            results_rows=results,
+            staging_dir=output_path,
+            experiment_summary=experiment_summary,
+            backend_metadata=backend_metadata,
+            telemetry_snapshot=vllm_telemetry_snapshot,
+            t_start=measured_window_t_start,
+            t_end=measured_window_t_end,
+        )
+
     # Cleanup
     engine.shutdown()
-    
+
     return experiment_summary
 
 
@@ -3340,6 +3393,17 @@ def main():
         "--baseline-label",
         default=None,
         help="Optional label used for artifacts and summaries when multiple runs share one baseline family.",
+    )
+    parser.add_argument(
+        "--campaign-root",
+        default=None,
+        help="Campaign-layout output mode (task #116): the RESULTS_LAYOUT-v2 run root "
+             "results/<campaign>/<session>/<run_id>. Each trial is emitted as a sealed-tree "
+             "measurement window cells/<CellSpec row key>/window_<dataset>-<NN>/ via "
+             "src/orchestration/campaign_layout.py, with --output-dir demoted to staging. "
+             "Cell identity derives from --baseline/--baseline-label/--backend/--model "
+             "(CAGE_CELL_*/CAGE_MODEL_SLUG env overrides). Equivalent to CAGE_CAMPAIGN_ROOT "
+             "(what the shell runners export); unset = the unchanged pilot path.",
     )
     parser.add_argument(
         "--seed",
@@ -3639,6 +3703,24 @@ def main():
     if reranker_model and str(reranker_model).lower() in {"none", "null", "false", "0"}:
         reranker_model = None
 
+    # Campaign-layout output mode (task #116): activated by --campaign-root or
+    # the CAGE_CAMPAIGN_ROOT env the shell runners export; None = pilot path,
+    # byte-identical. Construction is fail-closed and runs BEFORE any dataset/
+    # engine work: an unmappable cell identity or non-roster dataset must never
+    # burn a GPU run.
+    try:
+        campaign_session = CampaignCellSession.from_cli(args)
+    except CampaignSessionError as e:
+        print(f"\nError activating campaign mode: {e}", file=sys.stderr)
+        sys.exit(2)
+    if campaign_session is not None:
+        print(
+            f"CAMPAIGN MODE (task #116): run root {campaign_session.run_root}\n"
+            f"  cell: cells/{campaign_session.row_key}\n"
+            f"  windows: window_{campaign_session.dataset}-01..{args.num_trials:02d} "
+            f"(one per trial); --output-dir is STAGING"
+        )
+
     def _run_with_top_k(top_k_value: int) -> None:
         run_experiment(
             baseline=args.baseline,
@@ -3693,32 +3775,61 @@ def main():
 
     def _run_trials(top_k_value: int) -> None:
         """Run multiple trials and aggregate results."""
-        if args.num_trials == 1:
-            # Single trial - run normally
+        if args.num_trials == 1 and campaign_session is None:
+            # Single trial - run normally (pilot path). Campaign mode always
+            # takes the trial loop below so trial 1 gets its per-window resume
+            # skip, its staging trial dir, and its window emission (task #116).
             _run_with_top_k(top_k_value)
             return
-        
+
         # Multiple trials - collect results and compute statistics
         print(f"\n{'='*60}")
         print(f"Running {args.num_trials} independent trials for statistical rigor")
         print(f"{'='*60}\n")
-        
+
         trial_results = []
-        
+
+        if campaign_session is not None:
+            # Resume hygiene (task #116): drop half-written windows (dir and/or
+            # cell.json declaration) so CellWriter can re-emit them without
+            # ordinal collisions; complete windows stay untouched and are
+            # SKIPPED below — re-invoking on a half-written cell completes it
+            # without re-serving (or duplicating) a single row.
+            campaign_session.reset_incomplete_windows()
+
         for trial in range(1, args.num_trials + 1):
             print(f"\n--- Trial {trial}/{args.num_trials} (seed={args.seed + trial - 1}) ---\n")
             # Manifest mode reads the trial's pre-drawn query ids by trial NUMBER (the
             # seed offset stays for generation-side reproducibility).
             os.environ["CAGE_MANIFEST_TRIAL"] = str(trial)
 
+            # Create trial-specific output directory
+            trial_output_dir = os.path.join(args.output_dir, f"trial_{trial}")
+
+            if campaign_session is not None:
+                if campaign_session.window_complete(trial):
+                    # v2 resume: this trial's window is already sealed-tree
+                    # complete (valid metrics.json sentinel — the same
+                    # metrics_json_valid semantics the shell gates apply).
+                    # Load its summary for cross-trial aggregation; NO
+                    # re-serving, NO duplicate rows.
+                    print(
+                        f"SKIP (window complete): "
+                        f"window_{campaign_session.window_key(trial)} of "
+                        f"cells/{campaign_session.row_key}"
+                    )
+                    trial_results.append(campaign_session.load_window_summary(trial))
+                    continue
+                # A stale staging dir from a crashed attempt would double the
+                # appended qa_evidence rows at emission — clear it first
+                # (campaign staging only; the pilot path keeps its semantics).
+                shutil.rmtree(trial_output_dir, ignore_errors=True)
+
             # Cold-start-per-trial: flush the vLLM prefix cache between trials so each
             # trial measures from a known (empty) cache state. Requires the server to be
             # started with VLLM_SERVER_DEV_MODE=1 (enables POST /reset_prefix_cache).
             if args.reset_cache_between_trials and trial > 1:
                 _reset_prefix_cache(args.api_base, backend=args.backend, model=args.model)
-
-            # Create trial-specific output directory
-            trial_output_dir = os.path.join(args.output_dir, f"trial_{trial}")
 
             # Run with different seed for each trial
             run_experiment(
@@ -3769,8 +3880,10 @@ def main():
                 compress_ratio=args.compress_ratio,
                 kv_cache_dtype=args.kv_cache_dtype,
                 vllm_telemetry=args.vllm_telemetry,
+                campaign_session=campaign_session,
+                campaign_window_ordinal=trial,
             )
-            
+
             # Load trial results. A metrics.json that EXISTS but does not parse is
             # an INCOMPLETE trial (task #127, audit H10: existence is not validity)
             # -- excluded from aggregation, loudly, so the cell reads as needing a

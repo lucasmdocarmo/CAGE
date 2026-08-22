@@ -28,7 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO_ROOT / "scripts"
 TRANSPORT = SCRIPTS / "lib" / "transport.sh"
 SYNC = SCRIPTS / "5_observability" / "sync_results.sh"
-SYNC_SHIM = SCRIPTS / "5_observability" / "sync_results_to_gcs.sh"
+SYNC_SHIM = SCRIPTS / "gcp" / "sync_results_to_gcs.sh"
 PULL = SCRIPTS / "5_observability" / "pull_run.sh"
 COLLECT = SCRIPTS / "5_observability" / "collect_logs.sh"
 BACKUP_DAEMON = SCRIPTS / "5_observability" / "gcs_backup_daemon.sh"
@@ -38,10 +38,10 @@ WATCH_CAMPAIGN = SCRIPTS / "5_observability" / "watch_campaign.sh"
 CLOUD_RUN = SCRIPTS / "3_run" / "cloud_run.sh"
 MEMORY_SWEEP = SCRIPTS / "3_run" / "run_memory_sweep.sh"
 STATS_SH = SCRIPTS / "4_analysis" / "run_phase2_stats.sh"
-TEARDOWN_POD = SCRIPTS / "6_teardown" / "teardown_pod.sh"
-TEARDOWN_VM = SCRIPTS / "6_teardown" / "teardown_vm.sh"
-SETUP_RUNPOD = SCRIPTS / "1_setup" / "setup_runpod.sh"
-SETUP_GCP = SCRIPTS / "1_setup" / "setup_gpu_cloud.sh"
+TEARDOWN_POD = SCRIPTS / "runpod" / "teardown_pod.sh"
+TEARDOWN_VM = SCRIPTS / "gcp" / "teardown_vm.sh"
+SETUP_RUNPOD = SCRIPTS / "runpod" / "setup_runpod.sh"
+SETUP_GCP = SCRIPTS / "gcp" / "setup_gpu_cloud.sh"
 DOWNLOAD_DATASETS = SCRIPTS / "1_setup" / "download_datasets.py"
 
 # Charter D5 staging roster (MyDocs/PUBLICATION.md, DECIDED 2026-07-27):
@@ -345,8 +345,13 @@ def test_sync_results_failure_writes_failure_marker_and_propagates(tmp_path: Pat
 def test_sync_shim_forwards_to_canonical() -> None:
     text = _text(SYNC_SHIM)
     assert "DEPRECATED" in text
-    assert re.search(r'^exec bash "\$SCRIPT_DIR/sync_results\.sh" "\$@"$', text, re.M), (
-        "the old name must FORWARD (exec) to sync_results.sh with identical args"
+    assert re.search(
+        r'^exec bash "\$PROJECT_DIR/scripts/5_observability/sync_results\.sh" "\$@"$',
+        text, re.M,
+    ), (
+        "the old name must FORWARD (exec) to the canonical "
+        "scripts/5_observability/sync_results.sh with identical args (the shim "
+        "lives in scripts/gcp/, so the target is repo-rooted, not sibling)"
     )
     # Behavioral: the shim really execs the canonical script (override path, no cloud).
     proc = _bash(f'bash "{SYNC_SHIM}" data', env=_clean_env(CAGE_ALLOW_NO_BACKUP="1"))
@@ -484,8 +489,10 @@ def test_teardown_pod_ordering_and_fail_closed_doctrine() -> None:
     code = "\n".join(_code_lines(text))
     pull_at = code.find("pull_run.sh")
     confirm_at = code.find('confirm "Delete RunPod pod')
-    delete_at = code.find("runpodctl remove pod")
-    listing_at = code.find("runpodctl get pod")
+    # CLI v2 verbs (runpodctl 2.x; the v1 `remove pod`/`get pod` are GONE —
+    # MyDocs/runpod-cli-reference.md §2; migrated 2026-08-21).
+    delete_at = code.find("runpodctl pod delete")
+    listing_at = code.find("runpodctl pod list --all")
     assert -1 not in (pull_at, confirm_at, delete_at, listing_at), (
         f"missing step: pull={pull_at} confirm={confirm_at} delete={delete_at} list={listing_at}"
     )
@@ -499,7 +506,7 @@ def test_teardown_pod_ordering_and_fail_closed_doctrine() -> None:
     assert "rm -rf" not in text, "teardown must not delete local data"
     # The [5/5] $0 proof is READ-ONLY: no destructive call after it.
     tail = text[text.index("[5/5]"):]
-    assert "remove pod" not in tail and "-X DELETE" not in tail, (
+    assert "pod delete " not in tail and "-X DELETE" not in tail, (
         "the $0 sweep must stay report-only"
     )
 

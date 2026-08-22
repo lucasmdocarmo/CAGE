@@ -1,4 +1,7 @@
 #!/bin/bash
+# Order:     stage 3 — standalone sweep with its own server lifecycle; after 1_setup
+# Objective: Sweep gpu_memory_utilization so KV capacity brackets the CAG corpus block (prefix-eviction mechanism readout + telemetry deltas)
+# Cloud:     both
 # =============================================================================
 # PILOT HARNESS — drives the retired 9-name taxonomy via the alias map; the
 # campaign harness (CellSpec-native, D6 open-loop) lands at tranche P1; use for
@@ -49,6 +52,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/../.." || exit 1
 # shellcheck source=scripts/lib/_common.sh
 source scripts/lib/_common.sh
+
+# Pilot-only tree: REFUSE under campaign env (#116 verifier finding 6) — with
+# CAGE_CAMPAIGN_ROOT exported, run_experiment would enter campaign mode and
+# mint these variant windows as ordinary campaign cells. Campaign runs go
+# through run_full_sweep.sh/cloud_run.sh, which skip this tree loudly.
+if [[ -n "${CAGE_CAMPAIGN_ROOT:-}" || -n "${CAGE_CAMPAIGN:-}" ]]; then
+  die "pilot-only runner: refusing under CAGE_CAMPAIGN_ROOT/CAGE_CAMPAIGN (unset them; campaign mode never runs this tree)"
+fi
 source scripts/lib/_serving_config.sh
 source scripts/lib/_log_guard.sh
 

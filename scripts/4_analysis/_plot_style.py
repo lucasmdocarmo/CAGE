@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Shared figure style, canonical naming, ordering and helpers for CAGE analysis plots.
+"""Order:     stage 4 helper — imported by the plotting/table tools, never run directly
+Objective: Shared figure style, canonical display names, family ordering and save helpers
+Cloud:     local
+
+Shared figure style, canonical naming, ordering and helpers for CAGE analysis plots.
 
 Publication conventions (2026-07-16 overhaul, supersedes the 2026-07-15 abbrev scheme):
 - DISPLAY_NAME / display(): THE canonical cell-id -> human-readable label mapping.

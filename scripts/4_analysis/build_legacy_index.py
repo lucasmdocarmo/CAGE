@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Bridge the READ-ONLY pilot 100x3 archive into a driver-consumable index.
+"""Order:     stage 4 — bridge step; feeds run_campaign_analysis.py design-input dry-runs
+Objective: Re-key the read-only pilot 100x3 archive into a v2-shaped bridge index (cells_index.csv + provenance + skip report)
+Cloud:     local
+
+Bridge the READ-ONLY pilot 100x3 archive into a driver-consumable index.
 
 Purpose (PUBLICATION.md §8.13 "$0 machinery dry-run" / §9.13 "dry-runs clean on
 the pilot 100x3 archive"): re-key the legacy pilot tree

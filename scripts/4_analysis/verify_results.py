@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""verify_results v2 — the campaign-tree verification gate (task #129, H6).
+"""Order:     stage 4 — FIRST gate on a pulled campaign run, before organize_results.py (pilot mode: --pilot)
+Objective: Fail-closed campaign-tree verification (schema, reconciliation, duplicates, coverage, ledger, contamination) -> report OUTSIDE the tree
+Cloud:     local
 
-Given ONE pulled campaign run root (cloud/RESULTS_LAYOUT.md §1 — THE layout
+verify_results v2 — the campaign-tree verification gate (task #129, H6).
+
+Given ONE pulled campaign run root (docs/RESULTS_LAYOUT.md §1 — THE layout
 authority), this gate checks, collecting EVERY problem instead of stopping at
 the first:
 
@@ -623,7 +627,7 @@ def verify_run(run_dir: Path) -> dict[str, Any]:
     n_warn = sum(1 for f in findings if f.severity == "WARN")
     return {
         "verifier": "verify_results v2 (task #129)",
-        "layout_authority": "cloud/RESULTS_LAYOUT.md",
+        "layout_authority": "docs/RESULTS_LAYOUT.md",
         "run_dir": str(run_dir),
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "ok": n_fail == 0,
@@ -867,7 +871,7 @@ def _run_pilot(results_dir: Path, out: Path | None) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Verify a campaign run tree (cloud/RESULTS_LAYOUT.md) as the "
+            "Verify a campaign run tree (docs/RESULTS_LAYOUT.md) as the "
             "pre-analysis gate: schema, reconciliation, duplicates, windows[] "
             "coverage, §9.10 accounting, §5 ledger + EXTRA sweep. Exit 0 only "
             "on PASS. --pilot preserves the pilot-era metrics-vs-CSV check."

@@ -35,7 +35,7 @@ SOURCING_EXEMPT: Dict[str, str] = {
     # content, run as root from /var/lib/google): no repo tree exists relative to
     # the script at run time, so sourcing would fail; and its contract forbids
     # exiting early inside the ~30s preemption budget, which die() would do.
-    "scripts/5_observability/gcp_shutdown_hook.sh": "runs standalone from GCP metadata; must never exit early",
+    "scripts/gcp/gcp_shutdown_hook.sh": "runs standalone from GCP metadata; must never exit early",
 }
 
 # Scientific instruments (review §5.1 tool table + statistical/analysis peers):
@@ -219,7 +219,7 @@ def test_canonical_python_single_source_of_truth() -> None:
         f"(expected 'Python {CANONICAL_PYTHON} required')"
     )
 
-    setup = (SCRIPTS_DIR / "1_setup" / "setup_gpu_cloud.sh").read_text(encoding="utf-8")
+    setup = (SCRIPTS_DIR / "gcp" / "setup_gpu_cloud.sh").read_text(encoding="utf-8")
     assert 'PYBIN="python${CAGE_CANONICAL_PYTHON}"' in setup, (
         "setup_gpu_cloud.sh must derive its interpreter from CAGE_CANONICAL_PYTHON"
     )
@@ -335,8 +335,11 @@ def test_no_tracked_paths_differ_only_by_case() -> None:
 
 
 def test_no_tracked_file_references_capital_cloud_dir() -> None:
-    """L-E sweep guard: the docs dir is `cloud/` (lowercase). A reference to
-    `Cloud/` resolves on APFS and dangles on every case-sensitive checkout."""
+    """L-E sweep guard: the retired docs dir was `cloud/` (lowercase; its three
+    docs now live under docs/ — test_no_tracked_file_under_top_level_cloud_dir
+    pins the dissolution). A reference to
+    `Cloud/` resolves on APFS and dangles on every case-sensitive checkout, so
+    the capital-C spelling stays banned even after the dissolution."""
     offenders = []
     self_path = str(Path(__file__).resolve().relative_to(REPO_ROOT))
     for path in _all_tracked_paths():
@@ -354,7 +357,65 @@ def test_no_tracked_file_references_capital_cloud_dir() -> None:
                 offenders.append(f"{path}:{i}: {line.strip()[:80]}")
     assert not offenders, (
         "tracked files reference the retired capital-C `Cloud/` path (finding "
-        "L-E; the tracked dir is lowercase `cloud/`): " + "; ".join(offenders)
+        "L-E; the lowercase `cloud/` dir itself was dissolved into docs/): "
+        + "; ".join(offenders)
+    )
+
+
+# ---------------------------------------------------------------------------
+# 4. Provider-compatibility layout (owner directive, restructure phase 1):
+#    GCP-vs-RunPod compatibility must be STRUCTURALLY visible — provider-only
+#    scripts live in scripts/gcp/ and scripts/runpod/, terraform (GCP-port IaC,
+#    ADR-0090) lives only under terraform/gcp/, and the old top-level cloud/
+#    docs dir is gone (its three docs moved to docs/).
+# ---------------------------------------------------------------------------
+
+
+def test_provider_script_dirs_exist_and_are_populated() -> None:
+    """scripts/gcp/ and scripts/runpod/ hold the provider-ONLY scripts (a script
+    that hard-depends on gcloud/gsutil/GCE vs runpodctl/RunPod REST). Neutral
+    scripts — anything going through scripts/lib/transport.sh — stay in the
+    numbered lifecycle dirs."""
+    for provider in ("gcp", "runpod"):
+        d = SCRIPTS_DIR / provider
+        assert d.is_dir(), f"scripts/{provider}/ missing (provider split regressed)"
+        scripts = sorted(d.glob("*.sh"))
+        assert scripts, f"scripts/{provider}/ holds no shell scripts"
+    # The anchor scripts of each provider must live in their provider dir.
+    assert (SCRIPTS_DIR / "gcp" / "teardown_vm.sh").is_file()
+    assert (SCRIPTS_DIR / "runpod" / "teardown_pod.sh").is_file()
+    assert (SCRIPTS_DIR / "runpod" / "setup_runpod.sh").is_file()
+
+
+def test_no_tracked_file_under_top_level_cloud_dir() -> None:
+    """cloud/ was dissolved (RUNBOOK/RESULTS_LAYOUT/VLLM_COMPATIBILITY moved to
+    docs/). Nothing may creep back in under a top-level cloud/."""
+    offenders = [p for p in _all_tracked_paths() if p.startswith("cloud/")]
+    assert not offenders, (
+        "tracked files under the dissolved top-level cloud/ dir (docs belong "
+        f"in docs/): {offenders}"
+    )
+
+
+def test_terraform_tracked_files_live_only_under_gcp() -> None:
+    """terraform/ is provider-labeled: the GCP port's IaC lives in
+    terraform/gcp/ (retained per ADR-0090 — RunPod primary, no terraform), and
+    the only tracked file directly under terraform/ is the README saying so."""
+    offenders = [
+        p for p in _all_tracked_paths()
+        if p.startswith("terraform/")
+        and not p.startswith("terraform/gcp/")
+        and p != "terraform/README.md"
+    ]
+    assert not offenders, (
+        "tracked terraform files outside terraform/gcp/ (provider-split "
+        f"doctrine; only terraform/README.md may sit at the top): {offenders}"
+    )
+    readme = REPO_ROOT / "terraform" / "README.md"
+    assert readme.is_file(), "terraform/README.md missing (provider-split pointer)"
+    assert "runpodctl" in readme.read_text(encoding="utf-8"), (
+        "terraform/README.md must state that RunPod is provisioned via "
+        "runpodctl (no terraform) — ADR-0090"
     )
 
 

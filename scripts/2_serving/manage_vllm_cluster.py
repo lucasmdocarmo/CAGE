@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """
+Order:     stage 2 — after 1_setup, before the distributed 3_run arm
+Objective: Start/validate/stop a local multi-replica vLLM cluster plus the CAGE router as one unit
+Cloud:     both
+
 Manage a local multi-replica vLLM cluster plus the CAGE router.
 
 This script is intentionally separate from manage_vllm_server.sh because the

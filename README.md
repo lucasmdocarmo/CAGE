@@ -7,13 +7,13 @@ with answer quality (grounding, faithfulness, abstention) — across engines, mo
 and memory-pressure regimes.
 
 > **Start here**
-> - [`cloud/RUNBOOK.md`](cloud/RUNBOOK.md) — execution authority: setup → preflight →
+> - [`docs/RUNBOOK.md`](docs/RUNBOOK.md) — execution authority: setup → preflight →
 >   run → sync → verified pull + teardown (RunPod-first; env contract table inside)
 > - [`scripts/README.md`](scripts/README.md) — the script tree by lifecycle stage +
 >   the campaign analysis chain
-> - [`cloud/RESULTS_LAYOUT.md`](cloud/RESULTS_LAYOUT.md) — results tree spec v2
+> - [`docs/RESULTS_LAYOUT.md`](docs/RESULTS_LAYOUT.md) — results tree spec v2
 >   (cells, windows, sha256 ledger seal)
-> - [`cloud/VLLM_COMPATIBILITY.md`](cloud/VLLM_COMPATIBILITY.md) — engine pins +
+> - [`docs/VLLM_COMPATIBILITY.md`](docs/VLLM_COMPATIBILITY.md) — engine pins +
 >   VERIFY-LIVE matrix
 >
 > The design authority (groups, arms, matrices, statistics) is the publication
@@ -26,8 +26,8 @@ and memory-pressure regimes.
   their data is read-only under `results/` and informs design only — no pilot number
   is citable as a result.
 - **RunPod is the primary cloud** (owner directive 2026-08-18); GCP support is a
-  retained port (`terraform/`, `scripts/1_setup/setup_gpu_cloud.sh`,
-  `scripts/6_teardown/teardown_vm.sh`).
+  retained port (`terraform/gcp/`, `scripts/gcp/setup_gpu_cloud.sh`,
+  `scripts/gcp/teardown_vm.sh`).
 - The campaign results producer (`src/orchestration/campaign_layout.py`: manifest,
   cell/window tree, run-end ledger seal) is built and tested; the CellSpec-native
   campaign driver that wires it into the run loop is in progress. The runnable
@@ -36,15 +36,15 @@ and memory-pressure regimes.
 ## What a campaign run looks like
 
 ```bash
-# on the pod (see cloud/RUNBOOK.md for the full contract)
-bash scripts/1_setup/setup_runpod.sh                          # container-shaped bootstrap
+# on the pod (see docs/RUNBOOK.md for the full contract)
+bash scripts/runpod/setup_runpod.sh                          # container-shaped bootstrap
 source cage-env/bin/activate
 export CAGE_BACKUP_TARGET=s3://<network-volume>[/prefix]      # J4: no backup target -> run refuses
 bash scripts/checks/preflight_check.sh <MODEL> <API_BASE>     # gates (a)-(p); non-zero = do NOT launch
 nohup bash scripts/3_run/run_full_sweep.sh <MODEL> <N> <T> > sweep.log 2>&1 &
 
 # from the workstation, when the run is drained
-scripts/6_teardown/teardown_pod.sh <pod_id> <backup_target> <local_run_dir>
+scripts/runpod/teardown_pod.sh <pod_id> <backup_target> <local_run_dir>
 #   -> ledger-gated pull FIRST, pod delete LAST, read-only $0 listing
 ```
 
@@ -66,13 +66,15 @@ campaign trees — see `scripts/README.md`.
 ## Repository layout
 
 ```
-cloud/         execution docs: RUNBOOK, results-layout spec, engine compatibility
 configs/       dataset / model / experiment configs
 data/          dataset manifests (query/corpus builds are pinned by sha256)
-scripts/       lifecycle-numbered operator scripts (1_setup ... 6_teardown, checks/, lib/, ops/)
+docs/          execution docs: RUNBOOK, results-layout spec, engine compatibility
+scripts/       operator scripts: lifecycle-numbered stages (1_setup ... 5_observability,
+               checks/, lib/, ops/) + provider-only dirs gcp/ and runpod/
 src/           the framework: analysis/ (cellspec, stats), data/, evaluation/,
                inference/ (engine adapters), monitoring/, observability/, orchestration/
-terraform/     GCP port infrastructure (retained; apply is approval-gated)
+terraform/     provider IaC — gcp/ holds the retained GCP-port stack (apply is
+               approval-gated); RunPod uses runpodctl, no terraform
 tests/         pytest suite (offline; fixtures replace GPUs and clouds)
 results/       run data (gitignored; pilot trees are read-only design input)
 ```

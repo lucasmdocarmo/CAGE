@@ -1,4 +1,7 @@
 #!/bin/bash
+# Order:     provisioning bracket — on the fresh pod, before/as stage 1 (it stages datasets + prefetches models itself)
+# Objective: Container-shaped RunPod bootstrap (root, no sudo/systemd/PPA): canonical-CPython venv, pinned vLLM, charter datasets, model prefetch
+# Cloud:     runpod
 # =============================================================================
 # CAGE RunPod bootstrap — PRIMARY provider setup (task #137, finding J7)
 # =============================================================================
@@ -22,8 +25,8 @@
 #   - prefetches the FINAL-SCOPE model roster, not the pilot-era one.
 #
 # Usage (inside the pod, from the repo root):
-#   bash scripts/1_setup/setup_runpod.sh
-# Then (the cloud/RUNBOOK.md lifecycle — the preflight gate is NOT optional):
+#   bash scripts/runpod/setup_runpod.sh
+# Then (the docs/RUNBOOK.md lifecycle — the preflight gate is NOT optional):
 #   source cage-env/bin/activate
 #   export CAGE_BACKUP_TARGET=s3://<network-volume>[/prefix]   # or ssh://... (J4 gate)
 #   <start the serving engine: scripts/2_serving/manage_vllm_server.sh>
@@ -39,7 +42,7 @@
 # =============================================================================
 set -euo pipefail
 
-# Keep in sync with cloud/VLLM_COMPATIBILITY.md (the single pinned version).
+# Keep in sync with docs/VLLM_COMPATIBILITY.md (the single pinned version).
 VLLM_VERSION="${VLLM_VERSION:-0.19.1}"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$PROJECT_DIR"
@@ -177,7 +180,7 @@ fi
 #     anchor Qwen3-14B; Session B scale runs Llama-3.3-70B. Qwen3-Next +
 #     DeepSeek-V3 are [Extension] and deliberately NOT prefetched. Override per
 #     pod role — a 1xA100 Session-A pod needs only the anchor:
-#       PREFETCH_MODELS="Qwen/Qwen3-14B" bash scripts/1_setup/setup_runpod.sh
+#       PREFETCH_MODELS="Qwen/Qwen3-14B" bash scripts/runpod/setup_runpod.sh
 PREFETCH_MODELS="${PREFETCH_MODELS:-Qwen/Qwen3-14B meta-llama/Llama-3.3-70B-Instruct}"
 if [ "${SKIP_MODEL_PREFETCH:-0}" != "1" ]; then
   echo "[cage] [4b/5] prefetching model weights (HF_HUB_DOWNLOAD_TIMEOUT=${HF_HUB_DOWNLOAD_TIMEOUT}s): ${PREFETCH_MODELS}"
@@ -225,7 +228,7 @@ PY
 
 echo
 echo "[cage] ============================================================"
-echo "[cage]  RunPod bootstrap complete. Next (cloud/RUNBOOK.md lifecycle):"
+echo "[cage]  RunPod bootstrap complete. Next (docs/RUNBOOK.md lifecycle):"
 echo "[cage]    source cage-env/bin/activate"
 echo "[cage]    export CAGE_BACKUP_TARGET=s3://<network-volume>[/prefix]   # or ssh://[user@]host/path"
 echo "[cage]    #   (s3 backend: also export CAGE_S3_ENDPOINT + AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY"
@@ -236,7 +239,7 @@ echo "[cage]    bash scripts/checks/preflight_check.sh <MODEL> <API_BASE>"
 echo "[cage]    # 3. run (one run-id for the whole matrix; resume via CAGE_RUN_ID):"
 echo "[cage]    nohup bash scripts/3_run/run_full_sweep.sh <model> <N> <T> > sweep.log 2>&1 &"
 echo "[cage]  A run with NO backup target REFUSES to start (J4). Teardown goes"
-echo "[cage]  through scripts/6_teardown/teardown_pod.sh (ledger-gated pull first;"
+echo "[cage]  through scripts/runpod/teardown_pod.sh (ledger-gated pull first;"
 echo "[cage]  NOTE: harness trees carry no ledger.json until the campaign driver"
-echo "[cage]  lands -- see cloud/RUNBOOK.md section 5 for the teardown contract)."
+echo "[cage]  lands -- see docs/RUNBOOK.md section 5 for the teardown contract)."
 echo "[cage] ============================================================"

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Publication tables for CAGE analysis (Markdown + booktabs LaTeX).
+"""Order:     stage 4 helper — imported by generate_plots.py, never run directly
+Objective: Publication tables (Markdown + booktabs LaTeX) for the pilot figure set, PILOT-stamped
+Cloud:     local
+
+Publication tables for CAGE analysis (Markdown + booktabs LaTeX).
 
 Consumed only by generate_plots.py. Two artifacts:
 

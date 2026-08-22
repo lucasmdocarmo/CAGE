@@ -16,7 +16,7 @@ backend choice is made server-side at launch (``lmdeploy serve api_server
 --backend turbomind``); this adapter is transport-only and CANNOT observe
 which backend the server actually selected -- the preflight gate must verify
 TurboMind is running (not the silent PyTorch fallback) before any measured
-row is served (cloud/VLLM_COMPATIBILITY.md section 7 engine matrix).
+row is served (docs/VLLM_COMPATIBILITY.md section 7 engine matrix).
 
 Telemetry honesty (charter D2.1): LMDeploy is the "weakest documented
 telemetry" engine and its cached-token fields are [VERIFY-LIVE] -- a failed

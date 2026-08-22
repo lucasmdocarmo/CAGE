@@ -1,4 +1,7 @@
 # shellcheck shell=bash
+# Order:     sourced library, never executed
+# Objective: Auto-start log_sync_daemon.sh + EXIT-trap final collect for run scripts that have no sync loop of their own
+# Cloud:     both
 # Sourceable log guard for standalone run scripts that have NO sync loop of their own
 # (run_compression.sh, run_memory_sweep.sh; historically the now-retired
 # scripts/deprecated/run_speculative_matrix.sh, and run_phase2_stats.sh).

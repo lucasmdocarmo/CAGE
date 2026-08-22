@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""PILOT-ERA — campaign analysis = run_campaign_analysis.py; kept for pilot re-renders.
+"""Order:     stage 4 — pilot re-renders only; after run_phase2_stats.sh aggregation (campaign figures = figure_pipeline.py)
+Objective: Render the PILOT figure/table set from the canonical loader + pilot_stats.json
+Cloud:     local
+
+PILOT-ERA — campaign analysis = run_campaign_analysis.py; kept for pilot re-renders.
 
 This module renders the PILOT (Phase-2 layout) figure set via _results_loader.py
-and the retired flat baseline names. Campaign runs (cloud/RESULTS_LAYOUT.md v2,
+and the retired flat baseline names. Campaign runs (docs/RESULTS_LAYOUT.md v2,
 cells/<row_key>/window_<dataset>-<k>) are analyzed by
 scripts/4_analysis/run_campaign_analysis.py + figure_pipeline.py instead.
 

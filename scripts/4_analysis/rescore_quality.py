@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Offline quality re-scorer: re-run QualityEvaluator over saved qa_evidence.jsonl.
+"""Order:     stage 4 — decoupled scoring pass over a pulled tree; before build_predicate_table.py on campaign runs
+Objective: Offline quality re-scorer over saved qa_evidence.jsonl (model-free --fast default; --full loads the metric stack)
+Cloud:     local
+
+Offline quality re-scorer: re-run QualityEvaluator over saved qa_evidence.jsonl.
 
 Why this exists (2026-07-15 audit): metric fixes (abstention regex, abstention-aware
 grounding) must apply RETROACTIVELY to completed runs without a GPU or a re-run. The
@@ -19,7 +23,7 @@ Output layouts:
       qa_evidence.jsonl (same trial dir), with example_id/baseline/trial provenance,
       the fresh QualityMetrics columns, and old_grounding_score copied from the
       evidence for before/after comparison. Never overwrites results.csv.
-  SCORING TREE (--scoring-run-id, campaign v2 trees): cloud/RESULTS_LAYOUT.md §6 —
+  SCORING TREE (--scoring-run-id, campaign v2 trees): docs/RESULTS_LAYOUT.md §6 —
       writes scoring/<scoring_run_id>/ under the run root with a
       scoring_manifest.json (scorer ids+versions, code SHA, the raw-run ledger's
       entries_sha256 it scored against), per-cell outputs mirroring
@@ -146,7 +150,7 @@ def parse_args() -> argparse.Namespace:
                         "scoring step of decoupled mode (run_experiment --skip-quality). "
                         "LEGACY layout only — incompatible with --scoring-run-id.")
     p.add_argument("--scoring-run-id", default=None,
-                   help="Campaign v2 mode (cloud/RESULTS_LAYOUT.md §6): write "
+                   help="Campaign v2 mode (docs/RESULTS_LAYOUT.md §6): write "
                         "scoring/<scoring_run_id>/ under the run root (manifest + "
                         "per-cell qa_scores.jsonl/quality.json + own ledger) instead "
                         "of beside-the-evidence CSVs. Never writes into cells/.")
@@ -876,7 +880,7 @@ def _build_evaluator(args: argparse.Namespace) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Campaign v2 scoring tree (cloud/RESULTS_LAYOUT.md §6)
+# Campaign v2 scoring tree (docs/RESULTS_LAYOUT.md §6)
 # ---------------------------------------------------------------------------
 
 

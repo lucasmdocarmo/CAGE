@@ -38,7 +38,7 @@ variable "alert_email" {
 # ---------------------------------------------------------------------------
 
 variable "run_id" {
-  description = "Run id minted by the run wrapper (cloud/RESULTS_LAYOUT.md §1: YYYYMMDD-hhmm-<session>-<model-slug>). Names bucket cage-<run_id> VERBATIM, plus the SA id and the agent-run label."
+  description = "Run id minted by the run wrapper (docs/RESULTS_LAYOUT.md §1: YYYYMMDD-hhmm-<session>-<model-slug>). Names bucket cage-<run_id> VERBATIM, plus the SA id and the agent-run label."
   type        = string
 
   # RESULTS_LAYOUT.md §1 grammar — lowercase bucket-name-safe [a-z0-9-] ONLY.
@@ -138,7 +138,7 @@ variable "max_run_duration_hours" {
 }
 
 variable "startup_script" {
-  description = "Optional metadata startup-script hook. Default none — provisioning stays in cloud/RUNBOOK's remote_job flow; this exists only for smoke bootstraps."
+  description = "Optional metadata startup-script hook. Default none — provisioning stays in docs/RUNBOOK's remote_job flow; this exists only for smoke bootstraps."
   type        = string
   default     = null
 }

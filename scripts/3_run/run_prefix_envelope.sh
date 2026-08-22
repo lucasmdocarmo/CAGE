@@ -1,4 +1,7 @@
 #!/bin/bash
+# Order:     stage 3 — envelope cells on a served GPU box; after 2_serving
+# Objective: Run the prefix-cache workload-envelope cells + the true-CAG baseline (cag_true on/off, grouped/multiturn/repeat)
+# Cloud:     both
 # =============================================================================
 # PILOT HARNESS — drives the retired 9-name taxonomy via the alias map; the
 # campaign harness (CellSpec-native, D6 open-loop) lands at tranche P1; use for
@@ -34,6 +37,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/../.." || exit 1
 # shellcheck source=scripts/lib/_common.sh
 source scripts/lib/_common.sh
+
+# Pilot-only tree: REFUSE under campaign env (#116 verifier finding 6) — with
+# CAGE_CAMPAIGN_ROOT exported, run_experiment would enter campaign mode and
+# mint these variant windows as ordinary campaign cells. Campaign runs go
+# through run_full_sweep.sh/cloud_run.sh, which skip this tree loudly.
+if [[ -n "${CAGE_CAMPAIGN_ROOT:-}" || -n "${CAGE_CAMPAIGN:-}" ]]; then
+  die "pilot-only runner: refusing under CAGE_CAMPAIGN_ROOT/CAGE_CAMPAIGN (unset them; campaign mode never runs this tree)"
+fi
 source scripts/lib/_serving_config.sh
 
 MODEL=${1:-"Qwen/Qwen3-8B"}

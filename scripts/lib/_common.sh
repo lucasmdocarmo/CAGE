@@ -1,4 +1,7 @@
 # shellcheck shell=bash
+# Order:     sourced library, never executed
+# Objective: Shared helpers for every CAGE script: die/log/warn/require_cmd/confirm, CAGE_ROOT, mint_run_id, run locks, identity-checked pidfiles
+# Cloud:     both
 # =============================================================================
 # scripts/lib/_common.sh — shared shell helpers for every CAGE script
 # =============================================================================
@@ -79,6 +82,28 @@ metrics_json_valid() {
 # reads the dataset from a run name's `_<dataset>` suffix, fail-closed.
 mint_run_id() {
   printf '%s_%s_%sx%s_%04x_%s' "$(date +%Y-%m-%d_%H%M%S)" "$1" "$2" "$3" "$((RANDOM % 65536))" "$4"
+}
+
+# mint_campaign_run_id <session> <model-slug> — RESULTS_LAYOUT §1 campaign run-id:
+#   <YYYYMMDD>-<hhmmss>-<session>-<model-slug>   (lowercase [a-z0-9-] ONLY: it names
+# the run's fresh backup destination verbatim, e.g. gs://cage-<run_id>). Seconds
+# granularity keeps the J3 fragment/converge hazard closed for back-to-back mints
+# (the §1 example shows hhmm; seconds is a stricter superset of that grammar).
+# Campaign resume NEVER re-mints: the orchestrator exports CAGE_RUN_ID once and
+# every tree + every re-run reads it back.
+mint_campaign_run_id() {
+  printf '%s-%s-%s' "$(date -u +%Y%m%d-%H%M%S)" "$1" "$2"
+}
+
+# campaign_cell_dir <baseline> <label> <model> [backend] — print the v2 cell dir
+# $CAGE_CAMPAIGN_ROOT/cells/<row_key> for one runner cell (task #116). The row
+# key is minted by CellSpec via src/orchestration/campaign_session — NEVER
+# hand-built in shell (RESULTS_LAYOUT §2) — so the resume gates and the writer
+# share ONE derivation and cannot drift. Nonzero exit (and no output) when the
+# label has no charter tuple; callers must skip such cells LOUDLY.
+campaign_cell_dir() {
+  ( cd "$CAGE_ROOT" && python3 -m src.orchestration.campaign_session cell-dir \
+      --baseline "$1" ${2:+--baseline-label "$2"} --model "$3" --backend "${4:-vllm}" )
 }
 
 # acquire_run_lock <run_root> — exclusive NON-BLOCKING flock on

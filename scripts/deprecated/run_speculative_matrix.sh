@@ -177,7 +177,7 @@ run_cell() {  # <spec_json> <label> <context_source>
     echo "STATUS=failed reason=run model=$MODEL spec=$spec $(date)" > "$OUT/$label/STATUS"
     FAILED+=("$label(run)")
   fi
-  bash scripts/5_observability/sync_results_to_gcs.sh "$CAGE_SYNC_DIR" || true
+  bash scripts/gcp/sync_results_to_gcs.sh "$CAGE_SYNC_DIR" || true
   echo "=== CELL $label DONE  $(date) ==="
 }
 
@@ -230,7 +230,7 @@ if [ "$DRAFT_OK" = "1" ]; then
   run_cell "$DRAFT" "spec_${MTAG}_${DRAFT_LABEL}_rag" retrieved
 fi
 
-bash scripts/5_observability/sync_results_to_gcs.sh "$CAGE_SYNC_DIR" || true
+bash scripts/gcp/sync_results_to_gcs.sh "$CAGE_SYNC_DIR" || true
 if [ "${#FAILED[@]}" -gt 0 ]; then
   echo "MATRIX INCOMPLETE: ${#FAILED[@]} cell(s) failed: ${FAILED[*]}"
   echo "SPECULATIVE_MATRIX_DONE (model=$MODEL)"

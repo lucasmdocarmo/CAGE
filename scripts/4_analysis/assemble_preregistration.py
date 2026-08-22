@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Assemble the ONE tracked registration document (freeze task #112 — assembler).
+"""Order:     stage 4 — the #112 freeze step, after every calibration/resolution input exists
+Objective: Assemble the ONE tracked PRE_REGISTRATION.md from the draft skeleton + resolutions JSON (embed-at-freeze doctrine)
+Cloud:     local
+
+Assemble the ONE tracked registration document (freeze task #112 — assembler).
 
 Reads a draft skeleton (default: MyDocs/registration/PRE_REGISTRATION_DRAFT.md)
 plus a resolutions JSON and produces the final, frozen

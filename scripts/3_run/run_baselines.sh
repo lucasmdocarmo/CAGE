@@ -1,4 +1,7 @@
 #!/bin/bash
+# Order:     stage 3 — invoked by cloud_run.sh after 2_serving concepts are in place (manages the vLLM server itself)
+# Objective: Run the core pilot baselines (no_cache/rag/redis/prefix_cache/hybrid[/distributed]) fault-tolerantly for one model
+# Cloud:     both
 # =============================================================================
 # PILOT HARNESS — drives the retired 9-name taxonomy via the alias map; the
 # campaign harness (CellSpec-native, D6 open-loop) lands at tranche P1; use for
@@ -52,7 +55,21 @@ else
     RUN_ROOT="$PROJECT_DIR/results/$_phase/$_rid"
     warn "CAGE_RUN_ROOT unset -- minted FRESH standalone run root: $RUN_ROOT (cloud_run.sh mints the canonical root for cloud runs)"
 fi
-OUTPUT_DIR="$RUN_ROOT/baselines"
+# Campaign v2 output mode (task #116): with CAGE_CAMPAIGN_ROOT exported (by
+# cloud_run.sh/run_full_sweep.sh, or the operator), run_experiment.py writes every
+# cell through src/orchestration/campaign_layout.py into
+# $CAGE_CAMPAIGN_ROOT/cells/<CellSpec row key>/window_<dataset>-<NN>/ (docs/RESULTS_LAYOUT.md)
+# and the pilot-style per-label tree below becomes STAGING under .staging/ (dot-entries
+# are invisible to the layout walkers and the §5 seal). Resume detection moves to the
+# v2 window paths (cell_complete below); pilot labels that share one cell tuple
+# (redis≈rag, hybrid warm≈cold — §7.5 retirements) naturally dedup through the gate:
+# the second label sees the tuple's windows complete and SKIPs.
+if [ -n "${CAGE_CAMPAIGN_ROOT:-}" ]; then
+    OUTPUT_DIR="$CAGE_CAMPAIGN_ROOT/.staging/baselines"
+    log "CAMPAIGN MODE: v2 cells -> $CAGE_CAMPAIGN_ROOT/cells/ (staging: $OUTPUT_DIR)"
+else
+    OUTPUT_DIR="$RUN_ROOT/baselines"
+fi
 SEED=${SEED:-42}
 VLLM_PORT=${VLLM_PORT:-8000}
 CLUSTER_BASE_PORT=${CLUSTER_BASE_PORT:-8001}
@@ -80,7 +97,8 @@ mkdir -p "$PROJECT_DIR/logs" "$OUTPUT_DIR"
 
 # One runner per run root (finding J3): a second resume instance on the same root could
 # rm -rf a cell the live instance is writing. Re-entrant under cloud_run/run_full_sweep.
-acquire_run_lock "$RUN_ROOT"
+# Campaign mode locks the CAMPAIGN root (the tree actually being written).
+acquire_run_lock "${CAGE_CAMPAIGN_ROOT:-$RUN_ROOT}"
 
 # Activate the project venv regardless of its name (.venv locally, cage-env on the GPU VM).
 # Without this a fresh shell / automation falls back to system python -> ImportError on
@@ -126,18 +144,43 @@ redis_prefix_for() {
 # ---------------------------------------------------------------------------
 FAILED=()
 
-cell_complete() {  # <cell_dir> -> 0 iff trial_1..NUM_TRIALS all have VALID (parseable) metrics.json
+cell_complete() {  # <cell_dir> -> 0 iff every expected per-trial metrics.json is VALID (parseable)
     # Existence is not validity (finding J2): a truncated/corrupt/foreign metrics.json
     # must not make a cell resume-proof "complete" -- metrics_json_valid JSON-parses each.
-    local dir="$1" t
+    # Campaign mode (task #116): the cell dir is $CAGE_CAMPAIGN_ROOT/cells/<row_key> and
+    # trial t's sentinel lives in its v2 measurement window window_<DATASET>-<0t>/;
+    # pilot mode keeps the trial_<t>/ layout. Same J2 rigor either way.
+    local dir="$1" t f
+    [ -n "$dir" ] || return 1
     for ((t = 1; t <= NUM_TRIALS; t++)); do
-        metrics_json_valid "$dir/trial_${t}/metrics.json" || return 1
+        if [ -n "${CAGE_CAMPAIGN_ROOT:-}" ]; then
+            f="$dir/$(printf 'window_%s-%02d' "$DATASET" "$t")/metrics.json"
+        else
+            f="$dir/trial_${t}/metrics.json"
+        fi
+        metrics_json_valid "$f" || return 1
     done
     return 0
 }
 
-prepare_cell() {  # <full label> -> 0 = run it (stale dir wiped), 1 = skip (already complete)
-    local label="$1" dir="$OUTPUT_DIR/$1"
+cell_dir_for() {  # <full label> [baseline] -> the cell's resume/completeness dir
+    # Campaign mode: the v2 cells/<row_key> dir, row key minted by CellSpec via
+    # campaign_cell_dir (_common.sh) -- never hand-built. Nonzero (no output) for a
+    # label with no charter tuple; callers skip such cells loudly. Pilot: the
+    # per-label dir under OUTPUT_DIR, as ever.
+    if [ -n "${CAGE_CAMPAIGN_ROOT:-}" ]; then
+        campaign_cell_dir "${2:-$1}" "$1" "$MODEL"
+    else
+        printf '%s/%s' "$OUTPUT_DIR" "$1"
+    fi
+}
+
+prepare_cell() {  # <full label> [baseline] -> 0 = run it, 1 = skip (complete / no tuple)
+    local label="$1" dir
+    if ! dir="$(cell_dir_for "$label" "${2:-}")" || [ -z "$dir" ]; then
+        warn "campaign mode: '$label' has no charter cell tuple (cellspec.LEGACY_ALIASES) -- skipping this pilot-only cell"
+        return 1
+    fi
     if [ "${CAGE_FORCE_RERUN:-0}" = "1" ]; then
         [ -d "$dir" ] && echo "    FORCE RERUN (CAGE_FORCE_RERUN=1): wiping $label"
         rm -rf "${dir:?}"
@@ -147,7 +190,10 @@ prepare_cell() {  # <full label> -> 0 = run it (stale dir wiped), 1 = skip (alre
         echo "SKIP (complete): $label"
         return 1
     fi
-    if [ -d "$dir" ]; then
+    # Pilot cells are wiped-and-rerun whole; campaign cells resume PER WINDOW
+    # (run_experiment.py skips complete windows and resets half-written ones),
+    # so a partial v2 cell is left in place for the runner to complete.
+    if [ -z "${CAGE_CAMPAIGN_ROOT:-}" ] && [ -d "$dir" ]; then
         echo "    PARTIAL: wiping incomplete $label and re-running"
         rm -rf "${dir:?}"
     fi
@@ -156,9 +202,10 @@ prepare_cell() {  # <full label> -> 0 = run it (stale dir wiped), 1 = skip (alre
 
 group_complete() {  # <bare-label...> -> 0 iff every cell is complete (server start unnecessary)
     [ "${CAGE_FORCE_RERUN:-0}" = "1" ] && return 1
-    local lbl
+    local lbl dir
     for lbl in "$@"; do
-        cell_complete "$OUTPUT_DIR/${lbl}${MTAG:-}" || return 1
+        dir="$(cell_dir_for "${lbl}${MTAG:-}")" || return 1
+        cell_complete "$dir" || return 1
     done
     return 0
 }
@@ -173,7 +220,10 @@ mark_cells_failed() {  # <reason> <bare-label...> sentinel the cells a dead serv
     for lbl in "$@"; do
         full="${lbl}${MTAG:-}"
         # never clobber a cell already complete from a previous (resumed) run
-        cell_complete "$OUTPUT_DIR/$full" && continue
+        # (campaign mode: completeness lives at the v2 window paths; the STATUS
+        # sentinel stays in the pilot/staging tree, never inside cells/ -- a
+        # stray file in a v2 cell dir would fail the layout walk).
+        cell_complete "$(cell_dir_for "$full")" && continue
         mkdir -p "$OUTPUT_DIR/$full"
         echo "STATUS=failed reason=$reason model=$MODEL dataset=$DATASET $(date)" > "$OUTPUT_DIR/$full/STATUS"
         FAILED+=("$full($reason)")
@@ -211,7 +261,7 @@ run_baseline() {
 
     # Skip-completed resume, else model-scoped clean: remove ONLY this baseline's own dir so
     # re-running a model refreshes its arms without wiping the OTHER model's core results.
-    prepare_cell "$baseline_label" || return 0
+    prepare_cell "$baseline_label" "$baseline" || return 0
 
     if ! python3 scripts/3_run/run_experiment.py \
         --baseline "$baseline" \
@@ -323,7 +373,12 @@ else
     mark_cells_failed server hybrid_retrieval_cache_warm
 fi
 
-if [ "$ENABLE_DISTRIBUTED" != "0" ]; then
+if [ "$ENABLE_DISTRIBUTED" != "0" ] && [ -n "${CAGE_CAMPAIGN_ROOT:-}" ]; then
+    # Campaign mode: the router-simulated distributed pilot family is NOT a v2
+    # cell producer (the DIST overlay is real pd-topology act-2 machinery, not
+    # this simulation) -- skip it loudly instead of minting a lying DIST cell.
+    log "campaign mode: skipping the distributed pilot family (DIST cells come from the act-2 overlay, not the router simulation)"
+elif [ "$ENABLE_DISTRIBUTED" != "0" ]; then
     # 5. Distributed replicated router baseline (no simulated sharded core variant)
     # (label used verbatim -- no MTAG -- so the sentinel path below matches run_distributed_variant)
     if [ "${CAGE_FORCE_RERUN:-0}" != "1" ] && cell_complete "$OUTPUT_DIR/distributed_router_replicated"; then

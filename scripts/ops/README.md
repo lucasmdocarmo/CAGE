@@ -1,14 +1,20 @@
 # `scripts/ops/` — operator tooling
 
-Unnumbered on purpose. The numbered stages (`1_setup` … `6_teardown`) are the happy path of a run;
-these are tools that run **alongside** any stage — same rationale as `checks/` and `lib/`.
+Unnumbered on purpose. The numbered stages (`1_setup` … `5_observability`) are the happy path of
+a run; these are tools that run **alongside** any stage — same rationale as `checks/` and `lib/`.
+What lives HERE is provider-neutral (`package_repo.sh`, the `git archive` deploy tarball);
+the gcloud-hard operator tools this doc describes (`gpu_vm.sh`, `remote_job.sh`) moved to
+**`scripts/gcp/`** in the provider split — the background-job doctrine below is unchanged.
 
 > **Provisioning:** RunPod is the PRIMARY provider (owner directive 2026-08-18; lifecycle in
-> `cloud/RUNBOOK.md`). On the retained GCP port, provisioning goes via **`terraform/`**
-> (`sessions/*.tfvars`; `terraform apply` gated by explicit user approval — see `terraform/main.tf`).
-> The scripts here are provider-agnostic-over-SSH operator tools: `gpu_vm.sh create` is the
-> pilot-era GCP L4 zone-hunt, `remote_job.sh` drives work on any existing box, and
-> `gpu_vm.sh sweep` stays the universal prove-$0 check on GCP.
+> `docs/RUNBOOK.md`). RunPod pods are created via **`scripts/runpod/provision_pod.sh`**
+> (PLAN by default; `--yes` only after the recorded owner GO; `--terminate-after 12h`
+> seatbelt; ledger `results/ops/pod_ledger.jsonl` — see `scripts/runpod/README.md`).
+> On the retained GCP port, provisioning goes via **`terraform/gcp/`**
+> (`sessions/*.tfvars`; `terraform apply` gated by explicit user approval — see `terraform/gcp/main.tf`).
+> `scripts/gcp/gpu_vm.sh create` is the pilot-era GCP L4 zone-hunt, `scripts/gcp/remote_job.sh`
+> drives work on any existing box over gcloud SSH, and `gpu_vm.sh sweep` stays the prove-$0
+> check on GCP.
 
 Grounded in the `gcp-background-tasks` skill. The rule it exists to enforce:
 
@@ -30,8 +36,9 @@ REAP   → kill the process, verify with a read-only sweep that nothing is left 
 
 | File | Use it for |
 |---|---|
-| `remote_job.sh` | Any long command **on the GPU VM over SSH** (setup, sweeps, stats). Detaches it, records the remote PID/log/exit-status, writes `.agent/tasks/<name>.remote.json` storing `poll_cmd`/`cancel_cmd` **verbatim** so a later turn (or a compacted context) can resume knowing only the job name. |
-| `gpu_vm.sh` | `create` — L4 **zone-hunt + shape fallback** (capacity is scarce) with an `agent-run` label; `sweep` — prove we're at $0. |
+| `package_repo.sh` (here in `ops/`) | Build the `git archive` deploy tarball with `BUILD_INFO` provenance — the only artifact that ships to a box. |
+| `scripts/gcp/remote_job.sh` | Any long command **on the GPU VM over SSH** (setup, sweeps, stats). Detaches it, records the remote PID/log/exit-status, writes `.agent/tasks/<name>.remote.json` storing `poll_cmd`/`cancel_cmd` **verbatim** so a later turn (or a compacted context) can resume knowing only the job name. |
+| `scripts/gcp/gpu_vm.sh` | `create` — L4 **zone-hunt + shape fallback** (capacity is scarce) with an `agent-run` label; `sweep` — prove we're at $0. |
 
 **Local** background work (not on the VM): use the skill's helper, already in this repo at
 `.claude/skills/gcp-background-tasks/scripts/bgtask.sh` — deliberately not copied here (a vendored
@@ -41,20 +48,20 @@ duplicate drifts; same failure mode as the old `companion_images/`).
 
 ```bash
 # provision (labels + zone-hunt; writes .agent/cage_zone)
-scripts/ops/gpu_vm.sh create cage-gpu            # tries g2-standard-8, falls back to -4
+scripts/gcp/gpu_vm.sh create cage-gpu            # tries g2-standard-8, falls back to -4
 
 # long remote work — never blocks the turn
-scripts/ops/remote_job.sh submit setup 'cd ~/CAGE && env HF_HUB_DOWNLOAD_TIMEOUT=30 bash scripts/1_setup/setup_gpu_cloud.sh' 3600
-scripts/ops/remote_job.sh status setup           # RUNNING | DONE(0) | FAILED(n) | KILLED | CRASHED
-scripts/ops/remote_job.sh tail   setup 40        # bounded
-scripts/ops/remote_job.sh grep   setup           # error triage
-scripts/ops/remote_job.sh wait   setup 3600      # backoff → HARD deadline
-scripts/ops/remote_job.sh fetch  setup           # pull the log local for the record
+scripts/gcp/remote_job.sh submit setup 'cd ~/CAGE && env HF_HUB_DOWNLOAD_TIMEOUT=30 bash scripts/gcp/setup_gpu_cloud.sh' 3600
+scripts/gcp/remote_job.sh status setup           # RUNNING | DONE(0) | FAILED(n) | KILLED | CRASHED
+scripts/gcp/remote_job.sh tail   setup 40        # bounded
+scripts/gcp/remote_job.sh grep   setup           # error triage
+scripts/gcp/remote_job.sh wait   setup 3600      # backoff → HARD deadline
+scripts/gcp/remote_job.sh fetch  setup           # pull the log local for the record
 
 # teardown: syncs -> collects logs -> verifies sentinel -> PULLS results to local results/
 # -> only then deletes. Fail-closed on a missing sentinel OR an incomplete local pull.
-bash scripts/6_teardown/teardown_vm.sh cage-gpu "$(cat .agent/cage_zone)"
-scripts/ops/gpu_vm.sh sweep          # PROVE $0
+bash scripts/gcp/teardown_vm.sh cage-gpu "$(cat .agent/cage_zone)"
+scripts/gcp/gpu_vm.sh sweep          # PROVE $0
 ```
 
 ## Non-negotiables (each one cost us real time)

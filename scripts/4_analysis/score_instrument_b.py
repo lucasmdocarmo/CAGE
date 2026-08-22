@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Instrument-B (AlignScore-large) offline scorer over saved qa_evidence.jsonl.
+"""Order:     stage 4 — decoupled scoring pass (isolated AlignScore env), after the serving trees
+Objective: Instrument-B (AlignScore-large) out-of-process scorer -> per-item scores + provenance sidecar / §6 scoring tree
+Cloud:     local
+
+Instrument-B (AlignScore-large) offline scorer over saved qa_evidence.jsonl.
 
 Charter D8 §8.5: Instrument B is the SECONDARY claim checker selected by the
 2026-08-05 calibration — AlignScore-large, ``nli_sp`` (zha2023alignscore, Zha
@@ -16,7 +20,7 @@ Modes:
       ``{id, alignscore[, grounded_b]}`` go to --out, plus a sidecar
       ``<out>.provenance.json`` (env freeze, verified model shas, spec
       fingerprint, τ).
-  scoring tree (--scoring-run-id, cloud/RESULTS_LAYOUT.md §6): --evidence is
+  scoring tree (--scoring-run-id, docs/RESULTS_LAYOUT.md §6): --evidence is
       ONE sealed campaign run root; outputs land under
       ``scoring/<scoring_run_id>/cells/<row_key>/window_<k>/``
       as ``instrument_b_scores.jsonl`` with a ``scoring_manifest.json`` and
@@ -131,7 +135,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Only ensure the isolated environment (venv, pinned stack, "
                         "verified model downloads); score nothing.")
     p.add_argument("--scoring-run-id", default=None,
-                   help="Campaign v2 mode (cloud/RESULTS_LAYOUT.md §6): write "
+                   help="Campaign v2 mode (docs/RESULTS_LAYOUT.md §6): write "
                         "scoring/<scoring_run_id>/ under the run root instead of "
                         "--out. Never writes into cells/.")
     p.add_argument("--fresh", action="store_true",
@@ -442,7 +446,7 @@ def _rows_for(
 
 
 # ---------------------------------------------------------------------------
-# Scoring-tree mode (cloud/RESULTS_LAYOUT.md §6)
+# Scoring-tree mode (docs/RESULTS_LAYOUT.md §6)
 # ---------------------------------------------------------------------------
 
 

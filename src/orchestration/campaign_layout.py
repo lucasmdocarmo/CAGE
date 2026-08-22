@@ -1,4 +1,4 @@
-"""Campaign v2 results-tree PRODUCER — the write side of cloud/RESULTS_LAYOUT.md.
+"""Campaign v2 results-tree PRODUCER — the write side of docs/RESULTS_LAYOUT.md.
 
 Topic-8 finding H1/H5 (MyDocs/registration/CODE_ASSERTION_2026-08.md): the read
 side (scripts/4_analysis/organize_results.py) validates a §1 tree that nothing
@@ -165,7 +165,7 @@ class CampaignLayoutError(RuntimeError):
         lines = "\n".join(f"  [{i + 1}] {p}" for i, p in enumerate(self.problems))
         super().__init__(
             f"refusing write — {len(self.problems)} problem(s) vs "
-            f"cloud/RESULTS_LAYOUT.md:\n{lines}"
+            f"docs/RESULTS_LAYOUT.md:\n{lines}"
         )
 
 

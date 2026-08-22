@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""True-CAG reference-engine runner (HF transformers, greedy decoding).
+"""Order:     stage 3 — HF-oracle arm, standalone (no serving stack needed); after 1_setup
+Objective: True-CAG reference runner on HF transformers (greedy; corpus-KV precomputed once, cropped after every query) for the idea-gain/engine-gain decomposition
+Cloud:     both
+
+True-CAG reference-engine runner (HF transformers, greedy decoding).
 
 Implements Cache-Augmented Generation exactly as in Chan et al. 2024
 (arXiv 2412.15605, "Don't Do RAG"; reference impl github.com/hhhuang/CAG):

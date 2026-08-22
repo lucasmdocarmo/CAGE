@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Canonical results loader: ONE parser, ONE validity rule, ONE estimand.
+"""Order:     stage 4 helper — imported by the pilot analysis tools, never run directly
+Objective: Canonical pilot-layout results loader: ONE parser, ONE validity rule, ONE estimand (pooled per-example)
+Cloud:     local
+
+Canonical results loader: ONE parser, ONE validity rule, ONE estimand.
 
 Why (2026-07-15 audit): six independent CSV loaders with three different None/error
 policies let plots (equal-weight mean-of-trial-means) and stats (pooled per-query

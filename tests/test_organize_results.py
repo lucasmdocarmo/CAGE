@@ -1,6 +1,6 @@
 """Tests for scripts/4_analysis/organize_results.py + scripts/5_observability/pull_run.sh.
 
-Builds a synthetic campaign run tree following cloud/RESULTS_LAYOUT.md §1
+Builds a synthetic campaign run tree following docs/RESULTS_LAYOUT.md §1
 EXACTLY — window dirs named ``window_<dataset>-<ordinal>``, a ``cell.json`` per
 cell, the four per-window artifacts (requests.jsonl / qa_evidence.jsonl /
 engine_metrics.json / cage_stats.jsonl), NO window.json, singular ``model`` in

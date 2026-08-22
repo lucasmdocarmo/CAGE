@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""§9.6 simulation-based power CLI — sets the registered N the run-shape leaves open.
+"""Order:     stage 4 — §9.6 design-input pass, before the registration freeze; sets the registered N
+Objective: Simulation-based power analysis against pilot-calibrated noise over the exact registered test paths
+Cloud:     local
+
+§9.6 simulation-based power CLI — sets the registered N the run-shape leaves open.
 
 DESIGN-INPUT ONLY. Like the §9.7 calibration CLI, every number here is an
 operating characteristic of the measurement machinery measured against

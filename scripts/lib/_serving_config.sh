@@ -1,5 +1,8 @@
 #!/bin/bash
 # shellcheck shell=bash
+# Order:     sourced library, never executed
+# Objective: Single source of truth for the uniform serving regime (non-eager, max_len, mem-util + per-engine iso-bytes dial mappings)
+# Cloud:     both
 # =============================================================================
 # CAGE uniform serving configuration  (single source of truth; SOURCEABLE --
 # deliberately no set -e/-u here: this file must never change the caller's options)

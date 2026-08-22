@@ -2,7 +2,7 @@
 
 The charter's Layer 0 runs pre-campaign, once per dataset × retriever variant,
 and its columns are JOINED per cell by reference — cells are keyed by the
-``CellSpec`` row key (cloud/RESULTS_LAYOUT.md §2). The metrics are STAGE-TAGGED
+``CellSpec`` row key (docs/RESULTS_LAYOUT.md §2). The metrics are STAGE-TAGGED
 (AMENDED 2026-08-01 per IR audit):
 
 - **first-stage recall@100** — the candidate pool's job is to not lose the

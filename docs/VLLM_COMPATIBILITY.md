@@ -15,7 +15,7 @@
 ## 0. PIN BUMP 2026-07-26: v0.19.1 is the Phase-3 pin (v0.11.0 frozen as the Phase-2 anchor)
 
 **Decision.** The project pin moved `v0.11.0 → v0.19.1` (latest PyPI release, 2026-04-18) for all
-FUTURE runs (Phase 3). Already updated: `scripts/1_setup/setup_gpu_cloud.sh` (default
+FUTURE runs (Phase 3). Already updated: `scripts/gcp/setup_gpu_cloud.sh` (default
 `VLLM_VERSION`), `scripts/2_serving/deploy_cluster.sh` (image tag), `scripts/3_run/cloud_run.sh`
 (header). **v0.11.0 stays the frozen anchor for every published Phase-2 number** — never re-run
 Phase-2 cells on a newer pin and mix tables; `export VLLM_VERSION=0.11.0` reproduces that era.
@@ -49,7 +49,7 @@ deploy a **single pinned version** everywhere, exposed as one knob:
 | Where | Current (risk) | Pin to |
 |---|---|---|
 | `scripts/lib/_serving_config.sh` (the serving-uniformity source all launchers must source) | pilot pin `v0.11.0`-era | **`v0.19.1` (charter pin; see §7 matrix — SGLang/LMDeploy pins fixed at preflight)** |
-| ~~`terraform/gcp/*` (`vllm_image`)~~ | — | ROW RETIRED 2026-08-02: the old terraform/gcp was replaced; the new `terraform/` provisions bare GPU hosts (image family per `sessions/*.tfvars`) and engine pins live in the serving config, not IaC |
+| ~~`vllm_image` in the pre-2026-08 terraform~~ | — | ROW RETIRED 2026-08-02: that old module tree was replaced; the current stack (`terraform/gcp/` since the provider split) provisions bare GPU hosts (image family per `sessions/*.tfvars`) and engine pins live in the serving config, not IaC |
 | `docker/docker-compose.gpu.yml` | `:latest` | `:v0.11.0` |
 | `scripts/2_serving/deploy_cluster.sh` | `:latest` | `:v0.11.0` |
 | `k8s/vllm-replica.yaml` (×3) | `vllm/vllm-openai:latest` | `vllm/vllm-openai:v0.11.0` ✅ pinned |

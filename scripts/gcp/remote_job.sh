@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
+# Order:     alongside stages 1-4 — drives long-running commands on an EXISTING VM over SSH
+# Objective: Submit/poll/stream/reap long remote jobs with durable handles (remote PID, status file, resumable local state JSON)
+# Cloud:     gcp
 # remote_job.sh — submit / poll / reap a LONG-RUNNING command on a GCP VM over SSH.
 #
 # PROVISIONING (2026-08-02 charter): the GCP campaign path now provisions via
-# terraform/ (sessions/*.tfvars; apply gated by user approval). This script does
+# terraform/gcp/ (sessions/*.tfvars; apply gated by user approval). This script does
 # not provision — it drives work on an EXISTING VM and remains the SSH-config +
 # neocloud-manual path.
 #
@@ -102,7 +105,7 @@ cmd_submit() {
   [ -n "$pid" ] || die "failed to obtain a remote pid for '$name' (ssh problem?)"
 
   local poll_cmd="gcloud compute ssh $VM --zone=$ZONE --quiet --command='cat $RDIR/$name.status 2>/dev/null || (kill -0 $pid 2>/dev/null && echo RUNNING)'"
-  local cancel_cmd="scripts/ops/remote_job.sh kill $name"
+  local cancel_cmd="scripts/gcp/remote_job.sh kill $name"
   cat > "$DIR/$name.remote.json" <<EOF
 {
   "id": "$name",
@@ -160,7 +163,7 @@ cmd_wait() {
     esac
     if [ "$(now)" -ge "$deadline" ]; then
       echo "DEADLINE_EXCEEDED after ${limit}s -- '$name' still RUNNING on $VM (still billing)."
-      echo "  kill it:  scripts/ops/remote_job.sh kill $name"
+      echo "  kill it:  scripts/gcp/remote_job.sh kill $name"
       return 124
     fi
     sleep "$delay"

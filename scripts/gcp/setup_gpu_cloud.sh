@@ -1,10 +1,13 @@
 #!/bin/bash
+# Order:     provisioning bracket — on the fresh GCP VM, before/as stage 1 (it stages datasets itself)
+# Objective: One-shot GCP DLVM bootstrap (sudo/systemd-shaped): venv from the canonical interpreter, pinned vLLM wheel, datasets, telemetry deps
+# Cloud:     gcp
 # =============================================================================
 # CAGE GPU cloud bootstrap — GCP PORT  (Phase 2 single-GPU / Phase 3 router)
 # =============================================================================
 # PROVIDER STATUS (task #137, 2026-08-18): RunPod is the PRIMARY campaign
 # provider (FINAL SCOPE v2, MyDocs/COST_NEBIUS_RUNPOD_2026-08-16.md) — on
-# RunPod pods use scripts/1_setup/setup_runpod.sh (container-shaped: no sudo/
+# RunPod pods use scripts/runpod/setup_runpod.sh (container-shaped: no sudo/
 # systemctl/PPA). This script is RETAINED as the GCP portability backend; its
 # DLVM assumptions (sudo, systemd, deadsnakes) hold only there.
 #
@@ -18,21 +21,21 @@
 # from source), this installs the official pinned vLLM GPU wheel.
 #
 # Usage (on the GPU VM, from the repo root):
-#   bash scripts/1_setup/setup_gpu_cloud.sh
+#   bash scripts/gcp/setup_gpu_cloud.sh
 # Then:
 #   source cage-env/bin/activate
 #   nohup bash scripts/3_run/cloud_run.sh Qwen/Qwen3-8B 500 3 > run.log 2>&1 &
 #
-# See cloud/RUNBOOK.md for the full ordered procedure.
+# See docs/RUNBOOK.md for the full ordered procedure.
 #
 # PROVISIONING (2026-08-02 charter): the GCP campaign path now PROVISIONS via
-# terraform/ (sessions/*.tfvars; `terraform apply` gated by explicit user
+# terraform/gcp/ (sessions/*.tfvars; `terraform apply` gated by explicit user
 # approval). This script does NOT provision -- it bootstraps an ALREADY-CREATED
 # box, and remains the SSH-config + neocloud-manual path.
 # =============================================================================
 set -euo pipefail
 
-# Keep in sync with cloud/VLLM_COMPATIBILITY.md (the single pinned version).
+# Keep in sync with docs/VLLM_COMPATIBILITY.md (the single pinned version).
 # 0.19.1 is the Phase-3 pin (2026-07-26). Phase-2 numbers were measured under 0.11.0
 # and are NOT comparable across pins (0.19.0 turned the async scheduler on by default).
 # Export VLLM_VERSION=0.11.0 to reproduce the Phase-2 environment.
@@ -187,5 +190,5 @@ echo "[cage]    nohup bash scripts/3_run/cloud_run.sh Qwen/Qwen3-8B 500 3 > run.
 echo "[cage]  Launch-time levers (run from their own scripts, they restart the server):"
 echo "[cage]    bash scripts/3_run/run_compression.sh Qwen/Qwen3-8B   # FP8 2x2 (gates FP8 x prefix-cache)"
 echo "[cage]  (speculative 2x2 RETIRED per charter §7.5 -> scripts/deprecated/)"
-echo "[cage]  Full procedure + definition of done: cloud/RUNBOOK.md"
+echo "[cage]  Full procedure + definition of done: docs/RUNBOOK.md"
 echo "[cage] ============================================================"

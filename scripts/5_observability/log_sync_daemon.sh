@@ -1,5 +1,9 @@
 #!/bin/bash
-# Continuously mirror CAGE logs (and, by default, results) to GCS so an unexpected VM
+# Order:     alongside stage 3 — auto-started via lib/_log_guard.sh for run scripts with no sync loop of their own
+# Objective: Continuously mirror logs (and results) to the off-box backup target so a dying box never loses them
+# Cloud:     both
+# Continuously mirror CAGE logs (and, by default, results) to the off-box backup
+# target (gs://|s3://|ssh://|file:// via sync_results.sh) so an unexpected box
 # death (spot preemption, kernel panic, SSH loss) never loses logs. Use this with the
 # run scripts that do NOT have their own sync loop (via scripts/lib/_log_guard.sh).
 # cloud_run.sh already syncs on its own.

@@ -1,4 +1,7 @@
 #!/bin/bash
+# Order:     stage 2 — after 1_setup, before any 3_run driver; charter engine #3 launcher
+# Objective: Start/stop/status the LMDeploy TurboMind api_server under the uniform regime (fail-closed iso-bytes mapping; TurboMind asserted from the launch log)
+# Cloud:     both
 # =============================================================================
 # LMDeploy Server Management Script  (charter D2 engine #3 -- TurboMind)
 # =============================================================================

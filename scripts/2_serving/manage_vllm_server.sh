@@ -1,4 +1,7 @@
 #!/bin/bash
+# Order:     stage 2 — after 1_setup, before any 3_run driver; re-run per engine relaunch
+# Objective: Start/stop/restart/status the vLLM server under the uniform serving regime (lib/_serving_config.sh)
+# Cloud:     both
 # =============================================================================
 # vLLM Server Management Script
 # =============================================================================

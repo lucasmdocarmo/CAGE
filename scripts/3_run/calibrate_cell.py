@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Per-cell lambda*/SLO-floor calibration driver — [VERIFY-LIVE at S0].
+"""Order:     stage 3 — before the D6 campaign cells it calibrates; needs a live engine ([VERIFY-LIVE at S0])
+Objective: Per-cell lambda*/SLO-floor calibration (D6 §6.1): sequential floor + Poisson probe ladder -> calibration JSON for the campaign driver
+Cloud:     both
+
+Per-cell lambda*/SLO-floor calibration driver — [VERIFY-LIVE at S0].
 
 Runs the REGISTERED calibration procedure (src/orchestration/calibration.py,
 D6 §6.1) against ONE live engine cell and writes the calibration JSON

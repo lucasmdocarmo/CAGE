@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
+# Order:     alongside stage 3 — single-shot (or --loop) status read of a live layout-v2 campaign run dir
+# Objective: Bounded local-disk campaign status: cells/windows vs expected, heartbeat age, off-box sync lag, ONE verdict line
+# Cloud:     both
 # =============================================================================
 # watch_campaign.sh — bounded, single-shot campaign-run status (layout v2).
 # =============================================================================
-# Reads ONE campaign run directory (cloud/RESULTS_LAYOUT.md §1:
+# Reads ONE campaign run directory (docs/RESULTS_LAYOUT.md §1:
 #   results/<campaign>/<session>/<run_id>/{manifest.json, cells/<row_key>/window_<k>/...})
 # entirely from LOCAL disk and prints:
 #   - cells present / windows written vs expected (<run>/index/cells_index.csv when
 #     organize_results.py has built it; else directory counts only)
 #   - latest cage-stats heartbeat age (newest cells/*/window_*/cage_stats.jsonl mtime)
-#   - GCS sync lag: last-good-sync marker (.agent/last_gcs_sync_ok, written by
-#     sync_results.sh on every successful pass; daemon logs as fallback) vs the
-#     newest local artifact mtime. NO gcloud/gsutil call unless CAGE_WATCH_REMOTE=1.
+#   - off-box sync lag: last-good-sync markers (.agent/last_sync_ok_<backend>, one
+#     per transport, written by sync_results.sh on every successful pass; legacy
+#     .agent/last_gcs_sync_ok + daemon logs as fallback) vs the newest local
+#     artifact mtime. NO cloud call unless CAGE_WATCH_REMOTE=1 (GCS-port probe).
 #   - elapsed wall clock (manifest.json mtime = run start; §3: written once at start)
 #     + estimated cost when CAGE_HOURLY_USD is set
 #   - ONE verdict line: RUNNING-HEALTHY | STALLED>10min | SYNC-LAGGING
@@ -153,7 +157,7 @@ print_status() {  # sets VERDICT (and VERDICT_RC) for the caller
   mm="$(minmax_mtime_under "$RUN_DIR")"
   oldest="${mm%% *}"; newest="${mm##* }"
 
-  # 3) GCS sync lag — markers only, no gcloud (unless CAGE_WATCH_REMOTE=1) ----
+  # 3) off-box sync lag — per-backend markers only, no cloud call (unless CAGE_WATCH_REMOTE=1)
   marker_path="" marker_m=""
   for c in "$PROJECT_DIR/.agent/last_gcs_sync_ok" \
            "$PROJECT_DIR"/.agent/last_sync_ok_* \
@@ -167,10 +171,10 @@ print_status() {  # sets VERDICT (and VERDICT_RC) for the caller
   lag_s="" lag_note=""
   if [ -n "$marker_m" ]; then
     if [ -n "$newest" ] && [ "$newest" -gt "$marker_m" ]; then lag_s=$(( newest - marker_m )); else lag_s=0; fi
-    log "gcs sync : last good sync $(fmt_dur $(( now - marker_m ))) ago -> lag $(fmt_dur "$lag_s") behind newest local artifact (marker: ${marker_path#"$PROJECT_DIR/"})"
+    log "sync     : last good off-box sync $(fmt_dur $(( now - marker_m ))) ago -> lag $(fmt_dur "$lag_s") behind newest local artifact (marker: ${marker_path#"$PROJECT_DIR/"})"
   else
     lag_note="no-marker"
-    log "gcs sync : NO sync marker found (.agent/last_sync_ok_<backend> or legacy .agent/last_gcs_sync_ok) — daemons not started, or never synced"
+    log "sync     : NO sync marker found (.agent/last_sync_ok_<backend> or legacy .agent/last_gcs_sync_ok) — daemons not started, or never synced"
   fi
   if [ "${CAGE_WATCH_REMOTE:-0}" = "1" ]; then
     local bucket tmo rc
@@ -218,7 +222,7 @@ print_status() {  # sets VERDICT (and VERDICT_RC) for the caller
   elif { [ -n "$lag_s" ] && [ "$lag_s" -gt "$SYNC_LAG_MAX_S" ]; } || { [ "$lag_note" = "no-marker" ] && [ "${windows_n:-0}" -gt 0 ]; }; then
     VERDICT="SYNC-LAGGING"; VERDICT_RC=4
     if [ "$lag_note" = "no-marker" ]; then
-      log "VERDICT: SYNC-LAGGING (windows on disk but NO successful GCS sync recorded)"
+      log "VERDICT: SYNC-LAGGING (windows on disk but NO successful off-box sync recorded)"
     else
       log "VERDICT: SYNC-LAGGING (local data $(fmt_dur "$lag_s") ahead of last good sync; threshold $(fmt_dur "$SYNC_LAG_MAX_S"))"
     fi

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""§9.7 pipeline-calibration CLI — A/A split-half + effect-injection on the pilot archive.
+"""Order:     stage 4 — §9.7 design-input pass over the pilot archive, before the registration freeze
+Objective: Pipeline calibration: A/A split-half + effect-injection operating characteristics of the measurement machinery
+Cloud:     local
+
+§9.7 pipeline-calibration CLI — A/A split-half + effect-injection on the pilot archive.
 
 CALIBRATION / DESIGN-INPUT ONLY. Every number this tool produces is an operating
 characteristic of the measurement machinery (PUBLICATION.md §9.7 UPGRADE 1),

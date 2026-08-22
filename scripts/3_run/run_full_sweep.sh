@@ -1,4 +1,7 @@
 #!/bin/bash
+# Order:     stage 3 — THE top-level sweep entry; drives cloud_run.sh + lever trees + run_phase2_stats.sh under ONE run-id
+# Objective: Pilot-harness full-sweep orchestrator (core suite -> compression 2x2 -> opt-in trees -> consolidated stats) with skip-completed resume
+# Cloud:     both
 # =============================================================================
 # PILOT HARNESS — drives the retired 9-name taxonomy via the alias map; the
 # campaign harness (CellSpec-native, D6 open-loop) lands at tranche P1; use for
@@ -56,8 +59,27 @@ export CAGE_SKIP_QUALITY="${CAGE_SKIP_QUALITY:-1}"
 PHASE="${PHASE:-phase2}"
 _model_slug="$(printf '%s' "$MODEL" | tr '[:upper:]' '[:lower:]' | sed -E 's|.*/||; s|[^a-z0-9]+|-|g; s|^-+||; s|-+$||')"
 export CAGE_PHASE="$PHASE"
-export CAGE_RUN_ID="${CAGE_RUN_ID:-$(mint_run_id "$_model_slug" "$NUM_QUERIES" "$NUM_TRIALS" "${DATASET:-squad_v2}")}"
-export CAGE_RUN_ROOT="$PROJECT_DIR/results/${PHASE}/${CAGE_RUN_ID}"
+# Campaign v2 mode (task #116): CAGE_CAMPAIGN (+ CAGE_SESSION), or a preset
+# CAGE_CAMPAIGN_ROOT, routes the whole sweep into the RESULTS_LAYOUT tree
+# results/<campaign>/<session>/<run_id>/ — the core + compression trees write v2
+# cells through run_experiment's campaign mode, pilot-only trees are skipped, and
+# the run is SEALED (§5) + verified at the end. Pilot mode (default) is untouched.
+CAMPAIGN_MODE=0
+if [ -n "${CAGE_CAMPAIGN_ROOT:-}" ] || [ -n "${CAGE_CAMPAIGN:-}" ]; then
+    CAMPAIGN_MODE=1
+    if [ -z "${CAGE_CAMPAIGN_ROOT:-}" ]; then
+        [ -n "${CAGE_SESSION:-}" ] || die "campaign mode needs CAGE_SESSION (a|b|cd-act1|cd-act2) alongside CAGE_CAMPAIGN"
+        export CAGE_RUN_ID="${CAGE_RUN_ID:-$(mint_campaign_run_id "$CAGE_SESSION" "$_model_slug")}"
+        export CAGE_CAMPAIGN_ROOT="$PROJECT_DIR/results/${CAGE_CAMPAIGN}/${CAGE_SESSION}/${CAGE_RUN_ID}"
+    else
+        export CAGE_RUN_ID="${CAGE_RUN_ID:-$(basename "$CAGE_CAMPAIGN_ROOT")}"
+    fi
+    export CAGE_RUN_ROOT="$CAGE_CAMPAIGN_ROOT"
+    log "CAMPAIGN MODE (task #116): v2 run root $CAGE_CAMPAIGN_ROOT"
+else
+    export CAGE_RUN_ID="${CAGE_RUN_ID:-$(mint_run_id "$_model_slug" "$NUM_QUERIES" "$NUM_TRIALS" "${DATASET:-squad_v2}")}"
+    export CAGE_RUN_ROOT="$PROJECT_DIR/results/${PHASE}/${CAGE_RUN_ID}"
+fi
 mkdir -p "$CAGE_RUN_ROOT"
 
 # One orchestrator per run root (finding J3): a second resume instance on the same root
@@ -72,8 +94,12 @@ acquire_run_lock "$CAGE_RUN_ROOT"
 # Runs for the entire sweep; final sync + stop on exit. LOUD no-op if CAGE_RESULTS_BUCKET
 # is unset (set it to this run's bucket). Concurrent with cloud_run.sh's syncer is safe
 # (no --delete anywhere).
-bash "$SCRIPT_DIR/../5_observability/gcs_backup_daemon.sh" start "results/${PHASE}" || true
-trap 'bash "$SCRIPT_DIR/../5_observability/gcs_backup_daemon.sh" stop "results/'"${PHASE}"'" >/dev/null 2>&1 || true' EXIT
+_BACKUP_TREE="results/${PHASE}"
+if [ "$CAMPAIGN_MODE" = "1" ]; then
+    _BACKUP_TREE="${CAGE_RUN_ROOT#"$PROJECT_DIR/"}"   # the campaign run tree itself
+fi
+bash "$SCRIPT_DIR/../5_observability/gcs_backup_daemon.sh" start "$_BACKUP_TREE" || true
+trap 'bash "$SCRIPT_DIR/../5_observability/gcs_backup_daemon.sh" stop "'"${_BACKUP_TREE}"'" >/dev/null 2>&1 || true' EXIT
 
 echo "=============================================="
 echo "CAGE FULL SWEEP  model=$MODEL  Q=$NUM_QUERIES  trials=$NUM_TRIALS"
@@ -127,7 +153,12 @@ fi
 
 # 4. Prefix-cache workload envelope + true-CAG cells (cag_true_off/on, grouped,
 #    multiturn, repeat) -- the cells that let the prefix/CAG mechanism show itself.
-run_tree envelope bash scripts/3_run/run_prefix_envelope.sh "$MODEL"
+#    Campaign mode: NOT campaign-wired (pilot-only tree) -- skipped loudly.
+if [ "$CAMPAIGN_MODE" = "1" ]; then
+    log "TREE envelope SKIPPED -- pilot-only tree (not campaign-wired; task #116 wires core+compression)"
+else
+    run_tree envelope bash scripts/3_run/run_prefix_envelope.sh "$MODEL"
+fi
 
 # 4b. OPT-IN: LMCache/CacheBlend kv_store arm (EXPERIMENTAL until its live gates pass;
 #     needs `pip install lmcache "transformers>=4.36,<5"` on the VM -- the pin re-assert
@@ -135,21 +166,39 @@ run_tree envelope bash scripts/3_run/run_prefix_envelope.sh "$MODEL"
 #     0.11.0 tokenizer path; the campaign-pin 0.19.1 pairing is NOT live-validated --
 #     see the STATUS note in run_kv_store.sh). Enable with CAGE_ENABLE_LMCACHE=1.
 if [ "${CAGE_ENABLE_LMCACHE:-0}" = "1" ]; then
-    run_tree kv_store bash scripts/3_run/run_kv_store.sh "$MODEL"
+    if [ "$CAMPAIGN_MODE" = "1" ]; then
+        log "TREE kv_store SKIPPED -- pilot-only tree (not campaign-wired)"
+    else
+        run_tree kv_store bash scripts/3_run/run_kv_store.sh "$MODEL"
+    fi
 fi
 
-# 5. Post-serving quality scoring on the freed GPU (decoupled mode): re-scores every
-#    tree's qa_evidence.jsonl with the full metric stack and merges the quality columns
-#    back into each trial's results.csv (one-time .pre_rescore backups). Runs before
-#    stats so the Wilcoxon tables see the scored values.
-if [ "${CAGE_SKIP_QUALITY}" = "1" ]; then
-    run_tree scoring python3 scripts/4_analysis/rescore_quality.py \
-        --run-root "$CAGE_RUN_ROOT" --full --device cuda --apply
-fi
+if [ "$CAMPAIGN_MODE" = "1" ]; then
+    # 5c. Campaign run end (task #116): write-time-hash cross-check + the §5 seal
+    #     (ledger.json, ONCE, before any analysis), then the v2 verification gate
+    #     ON THE NODE (S0-15). Scoring stays offline/decoupled (§6:
+    #     rescore_quality.py --scoring-run-id into scoring/<id>/, never cells/),
+    #     and the pilot stats tree does not read v2 trees -- the analysis chain is
+    #     verify_results.py -> organize_results.py -> run_campaign_analysis.py.
+    run_tree seal python3 scripts/3_run/seal_campaign_run.py "$CAGE_RUN_ROOT"
+    run_tree verify python3 scripts/4_analysis/verify_results.py "$CAGE_RUN_ROOT" \
+        --out "${CAGE_RUN_ROOT}_verification"
+    log "TREE scoring SKIPPED in-sweep -- campaign scoring is decoupled (§6): rescore_quality.py --scoring-run-id <id> post-run"
+    log "TREE stats SKIPPED -- pilot stats do not read v2 trees; use organize_results.py + run_campaign_analysis.py on the pulled run"
+else
+    # 5. Post-serving quality scoring on the freed GPU (decoupled mode): re-scores every
+    #    tree's qa_evidence.jsonl with the full metric stack and merges the quality columns
+    #    back into each trial's results.csv (one-time .pre_rescore backups). Runs before
+    #    stats so the Wilcoxon tables see the scored values.
+    if [ "${CAGE_SKIP_QUALITY}" = "1" ]; then
+        run_tree scoring python3 scripts/4_analysis/rescore_quality.py \
+            --run-root "$CAGE_RUN_ROOT" --full --device cuda --apply
+    fi
 
-# 6. Consolidated per-query stats over the whole run root (also reads CAGE_RUN_ROOT from env);
-#    regenerates plots over ALL cells at the end (fixes the 6-of-14 stale-plots failure mode).
-run_tree stats bash scripts/4_analysis/run_phase2_stats.sh "$CAGE_RUN_ROOT"
+    # 6. Consolidated per-query stats over the whole run root (also reads CAGE_RUN_ROOT from env);
+    #    regenerates plots over ALL cells at the end (fixes the 6-of-14 stale-plots failure mode).
+    run_tree stats bash scripts/4_analysis/run_phase2_stats.sh "$CAGE_RUN_ROOT"
+fi
 
 echo ""
 echo "=============================================="

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Token-divergence metric: how often does an arm's greedy output differ from no_cache?
+"""Order:     stage 4 — §8.9 divergence pass over a pilot run root; driven by run_phase2_stats.sh or standalone
+Objective: Quantify T=0 output divergence vs the reference arm (agreement rate, first-divergence token position, answer-changing split)
+Cloud:     local
+
+Token-divergence metric: how often does an arm's greedy output differ from no_cache?
 
 Greedy (T=0) decoding is NEAR-lossless, not identical, across serving configs: floating-point
 non-associativity (prefix-cache reuse, eager-vs-compiled kernels, context-length changes) can

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """
+Order:     stage 1 — run by the provider bootstrap (runpod/setup_runpod.sh, gcp/setup_gpu_cloud.sh) or manually, before any serving
+Objective: Stage the charter HF datasets (+ RAGTruth/TRUE calibration anchors) with fail-closed non-empty-split checks
+Cloud:     both
+
 Download (stage) HuggingFace datasets for CAGE benchmarking.
 
 Campaign datasets (`--dataset all`):

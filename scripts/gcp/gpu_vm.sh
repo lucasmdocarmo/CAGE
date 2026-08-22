@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
+# Order:     provisioning bracket — before 1_setup (create/ip/zone); after teardown, `sweep` proves $0
+# Objective: Create/locate/sweep the labeled CAGE L4 GPU VM with zone-hunt + shape fallback (pilot-era path; terraform/gcp is the campaign path)
+# Cloud:     gcp
 # gpu_vm.sh — create / locate / sweep the CAGE L4 GPU VM.
 #
 # PROVISIONING (2026-08-02 charter): the GCP campaign path now provisions via
-# terraform/ (sessions/*.tfvars; `terraform apply` gated by explicit user
-# approval — see terraform/main.tf header). This script remains the SSH-config +
+# terraform/gcp/ (sessions/*.tfvars; `terraform apply` gated by explicit user
+# approval — see terraform/gcp/main.tf header). This script remains the SSH-config +
 # neocloud-manual path (pilot-era L4 zone-hunt); `sweep` stays universally useful
 # for proving $0.
 #
@@ -22,7 +25,7 @@
 #   gpu_vm.sh zone   [name]
 #   gpu_vm.sh sweep                          # PROVE $0: any labeled/unlabeled instances, disks, buckets
 #
-#   Deliberately NO delete: teardown goes through scripts/6_teardown/teardown_vm.sh, which
+#   Deliberately NO delete: teardown goes through scripts/gcp/teardown_vm.sh, which
 #   collects logs + syncs results and FAILS CLOSED on a missing sentinel before deleting.
 #   Duplicating a delete path here would be a footgun.
 #
@@ -49,7 +52,7 @@ IMAGE_FAMILY="${CAGE_IMAGE_FAMILY:-common-cu129-ubuntu-2204-nvidia-580}"
 IMAGE_PROJECT="${CAGE_IMAGE_PROJECT:-deeplearning-platform-release}"
 DISK_GB="${CAGE_DISK_GB:-200}"
 RUN_LABEL="${CAGE_RUN_LABEL:-cage-$(date -u +%Y%m%d)}"
-HOOK="scripts/5_observability/gcp_shutdown_hook.sh"
+HOOK="scripts/gcp/gcp_shutdown_hook.sh"
 
 # Zones where G2/L4 exists. Ordered: bucket-local (us-central1) first, then wider US.
 ZONES_DEFAULT="us-central1-a us-central1-b us-central1-c us-east1-b us-east1-c us-east1-d us-east4-c us-west1-a us-west1-b us-west1-c us-west4-a northamerica-northeast1-b"
@@ -123,7 +126,7 @@ cmd_sweep() {
   if [ "$n" = "0" ] && [ "$d" = "0" ]; then
     echo "  COMPUTE AT \$0 (0 instances, 0 disks). Buckets above bill separately (pennies)."
   else
-    echo "  !! STILL BILLING: $n instance(s), $d disk(s) -- teardown via scripts/6_teardown/teardown_vm.sh"
+    echo "  !! STILL BILLING: $n instance(s), $d disk(s) -- teardown via scripts/gcp/teardown_vm.sh"
   fi
 }
 

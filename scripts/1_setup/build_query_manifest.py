@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Build the uniform-yardstick query manifest for a dataset (see src/data/manifest.py).
+"""Order:     stage 1 — once per (dataset, N, T, seed), before any runner; consumed by every cell via CAGE_QUERY_MANIFEST
+Objective: Build the uniform-yardstick query manifest so all cells/engines/models measure the SAME query set
+Cloud:     both
+
+Build the uniform-yardstick query manifest for a dataset (see src/data/manifest.py).
 
 Run ONCE per (dataset, N, T, seed); every runner then loads the SAME measured query
 set via CAGE_QUERY_MANIFEST, so pairing holds across all cells/engines/models.

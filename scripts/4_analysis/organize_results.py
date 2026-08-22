@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""Validate, index, and coverage-report ONE pulled campaign run.
+"""Order:     stage 4 — after verify_results.py, before run_campaign_analysis.py
+Objective: Validate the layout and parse every cell of ONE campaign run -> index/cells_index.csv + coverage report
+Cloud:     local
 
-Layout contract (cloud/RESULTS_LAYOUT.md §1 — THE authority; the campaign tree,
+Validate, index, and coverage-report ONE pulled campaign run.
+
+Layout contract (docs/RESULTS_LAYOUT.md §1 — THE authority; the campaign tree,
 NOT the pilot layout — pilots stay on scripts/4_analysis/_results_loader.py):
 
     results/<campaign>/<session>/<run_id>/
@@ -88,7 +92,7 @@ PROVENANCE_JSON_NAME = "provenance.json"
 _ARTIFACT_SEP = ";"
 
 #: §1 run_id grammar: lowercase, bucket-name-safe [a-z0-9-] ONLY — it names the
-#: GCS bucket cage-<run_id> VERBATIM. terraform/variables.tf enforces the SAME
+#: GCS bucket cage-<run_id> VERBATIM. terraform/gcp/variables.tf enforces the SAME
 #: pattern (tests/test_terraform_contract.py pins the two together) so the
 #: bucket terraform creates and the gs://cage-<run_id> the RUNBOOK exports can
 #: never diverge (the pilot "synced to a bucket that didn't exist" bug class).
@@ -194,7 +198,7 @@ BASELINE_OF_CELL: dict[tuple[str, str], str] = {
 #: directory names (§1); an OPTIONAL `datasets` list may narrow coverage.
 _MANIFEST_STR_KEYS = ("campaign", "session", "run_id", "model")
 
-#: §3 REQUIRED manifest fields (cloud/RESULTS_LAYOUT.md §3 — task #129 / H8:
+#: §3 REQUIRED manifest fields (docs/RESULTS_LAYOUT.md §3 — task #129 / H8:
 #: a run without its provenance cannot be organized; fail loud, every gap
 #: listed). ``engine``/``engine_version`` structure is per-engine in the spec;
 #: this organizer requires engine_version and accepts str or mapping there and
@@ -229,7 +233,7 @@ class LayoutError(OrganizeError):
         self.problems = list(problems)
         lines = "\n".join(f"  [{i + 1}] {p}" for i, p in enumerate(self.problems))
         super().__init__(
-            f"run tree violates cloud/RESULTS_LAYOUT.md — {len(self.problems)} problem(s):\n{lines}"
+            f"run tree violates docs/RESULTS_LAYOUT.md — {len(self.problems)} problem(s):\n{lines}"
         )
 
 
@@ -292,7 +296,7 @@ def _validate_manifest_provenance(manifest: Mapping[str, Any]) -> list[str]:
     if missing:
         problems.append(
             f"manifest.json missing REQUIRED §3 field(s) {missing} "
-            "(cloud/RESULTS_LAYOUT.md §3 — provenance is not optional)"
+            "(docs/RESULTS_LAYOUT.md §3 — provenance is not optional)"
         )
     checks: tuple[tuple[str, str], ...] = (
         ("git_sha", "non-empty string"),
@@ -1250,7 +1254,7 @@ def organize_run(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Validate a pulled campaign run tree (cloud/RESULTS_LAYOUT.md), parse every "
+            "Validate a pulled campaign run tree (docs/RESULTS_LAYOUT.md), parse every "
             "cells/<row_key> through CellSpec, and emit index/cells_index.csv + "
             "index/coverage_report.md."
         )

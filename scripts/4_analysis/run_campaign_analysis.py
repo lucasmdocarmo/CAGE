@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Campaign analysis driver — the §9.11 ONE-LOOK policy in code (PUBLICATION.md D9).
+"""Order:     stage 4 — after organize_results.py; the final analysis step
+Objective: D9 stats driver over the run index (§9.11 one-look policy: design-input default, doubly-gated confirmatory mode + analysis lock)
+Cloud:     local
+
+Campaign analysis driver — the §9.11 ONE-LOOK policy in code (PUBLICATION.md D9).
 
 Input: ONE organized run directory (results/<campaign>/<session>/<run_id>) that
 already carries ``index/cells_index.csv`` from ``organize_results.py``. This

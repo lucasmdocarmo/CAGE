@@ -1,4 +1,7 @@
 #!/bin/bash
+# Order:     gate — before committing a staleness sweep (validate-before-run)
+# Objective: 5-query staleness smoke: assert the stale-serving injection fires and its metrics are computable
+# Cloud:     both
 # =============================================================================
 # 5-query staleness SMOKE: validate the staleness serving path end-to-end BEFORE
 # committing the full sweep (validate-before-run).
