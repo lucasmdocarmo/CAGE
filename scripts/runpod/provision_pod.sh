@@ -77,25 +77,73 @@ printf '%s' "$GPU_COUNT" | grep -qE '^[1-9][0-9]*$' || die "--gpu-count must be 
 [ -z "$PRICE" ] || printf '%s' "$PRICE" | grep -qE '^[0-9]+(\.[0-9]+)?$' || die "--price-per-hour must be numeric: $PRICE"
 [ -z "$HOURS" ] || printf '%s' "$HOURS" | grep -qE '^[0-9]+(\.[0-9]+)?$' || die "--hours must be numeric: $HOURS"
 
+# --- seatbelt resolution: operator duration -> absolute RFC3339 UTC ---------
+# runpodctl v2 `--terminate-after` takes an ABSOLUTE datetime, not a duration
+# (its --help: "auto-terminate datetime (e.g., 2026-04-15T00:00:00Z)"). Until
+# 2026-08-25 this script passed the raw "12h" default straight through, so the
+# seatbelt was never a valid deadline: the create either fails or the pod comes
+# up with NO server-side auto-delete and bills until a manual teardown. Keep the
+# duration form for the operator, resolve it to the wall-clock instant here, and
+# print that instant so the plan states exactly when RunPod will kill the pod.
+abs_from_secs() {  # BSD date (macOS workstation) first, GNU date (Linux) second
+  date -u -v+"$1"S +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+    || date -u -d "@$(( $(date -u +%s) + $1 ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+    || die "cannot resolve the seatbelt deadline: neither BSD nor GNU date available"
+}
+TERMINATE_AT=""
+if [ "$NO_SEATBELT" -eq 0 ]; then
+  if printf '%s' "$TERMINATE_AFTER" | grep -qE '^[0-9]+[hm]$'; then
+    _n="${TERMINATE_AFTER%[hm]}"
+    case "$TERMINATE_AFTER" in *h) _secs=$(( _n * 3600 )) ;; *) _secs=$(( _n * 60 )) ;; esac
+    [ "$_secs" -gt 0 ] || die "--terminate-after must be greater than zero: $TERMINATE_AFTER"
+    TERMINATE_AT="$(abs_from_secs "$_secs")"
+  elif printf '%s' "$TERMINATE_AFTER" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'; then
+    TERMINATE_AT="$TERMINATE_AFTER"   # already the absolute form the CLI wants
+  else
+    die "--terminate-after must be a duration (24h, 90m) or an RFC3339 UTC datetime (2026-08-26T01:40:00Z); got: $TERMINATE_AFTER"
+  fi
+fi
+
 LEDGER="${CAGE_POD_LEDGER:-$CAGE_ROOT/results/ops/pod_ledger.jsonl}"
 
 # --- price resolution (read-only; the ONLY optional network touch in plan mode)
 PRICE_NOTE="(from --price-per-hour)"
 if [ -z "$PRICE" ]; then
-  if command -v runpodctl >/dev/null 2>&1; then
-    GPU_ROW="$(runpodctl gpu list 2>/dev/null | grep -F -m1 -- "$GPU_ID" || true)"
-    PRICE="$(printf '%s\n' "$GPU_ROW" | grep -oE '[0-9]+\.[0-9]+' | head -1 || true)"
-    if [ -n "$PRICE" ]; then PRICE_NOTE="(best-effort from 'runpodctl gpu list' — verify; --price-per-hour overrides)"
-    else PRICE_NOTE="(unknown — no price derivable from 'runpodctl gpu list'; pass --price-per-hour)"; fi
-  else
+  if ! command -v runpodctl >/dev/null 2>&1; then
     PRICE_NOTE="(unknown — runpodctl not on PATH; pass --price-per-hour)"
+  elif ! command -v python3 >/dev/null 2>&1; then
+    PRICE_NOTE="(unknown — python3 absent, cannot parse the CLI's JSON; pass --price-per-hour)"
+  else
+    # CLI v2 emits JSON (global -o default), so the price for a gpuId lives on a
+    # DIFFERENT line than the id itself — the pre-2026-08-25 line-oriented grep
+    # matched '"gpuId": "NVIDIA L40S",' and found no number there, silently
+    # degrading every plan to price=unknown. Parse the document instead, and
+    # pick the field matching the cloud type actually being provisioned.
+    PRICE="$(runpodctl gpu list 2>/dev/null | CAGE_GPU_ID="$GPU_ID" CAGE_CLOUD="$CLOUD_TYPE" python3 -c '
+import json, os, sys
+want = os.environ["CAGE_GPU_ID"]
+field = "communityPricePerHr" if os.environ["CAGE_CLOUD"].upper() == "COMMUNITY" else "securePricePerHr"
+try:
+    gpus = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for g in gpus:
+    if g.get("gpuId") == want:
+        p = g.get(field)
+        if p:
+            print(p)
+        break
+' 2>/dev/null || true)"
+    if [ -n "$PRICE" ]; then PRICE_NOTE="(list price for $CLOUD_TYPE from 'runpodctl gpu list'; --price-per-hour overrides)"
+    else PRICE_NOTE="(unknown — no $CLOUD_TYPE price for '$GPU_ID' in 'runpodctl gpu list'; pass --price-per-hour)"; fi
   fi
 fi
 EST_TOTAL="unknown (need both a price and --hours <est>)"
 if [ -n "$PRICE" ] && [ -n "$HOURS" ]; then
   EST_TOTAL="\$$(awk -v p="$PRICE" -v h="$HOURS" -v g="$GPU_COUNT" 'BEGIN { printf "%.2f", p*h*g }') (${HOURS}h x \$${PRICE}/h x ${GPU_COUNT} GPU)"
 fi
-SEATBELT="$TERMINATE_AFTER"; [ "$NO_SEATBELT" -eq 0 ] || SEATBELT="DISABLED (--no-terminate-after)"
+SEATBELT="$TERMINATE_AFTER (deletes at $TERMINATE_AT)"
+[ "$NO_SEATBELT" -eq 0 ] || SEATBELT="DISABLED (--no-terminate-after)"
 
 log "=================== RunPod provisioning PLAN ==================="
 printf '  name              : %s\n' "$NAME"
@@ -106,7 +154,7 @@ printf '  ports             : %s\n' "$PORTS"
 if [ "$NO_SEATBELT" -eq 1 ]; then
   printf '  seatbelt          : DISABLED (--no-terminate-after) — NO server-side auto-delete\n'
 else
-  printf '  seatbelt          : --terminate-after %s (server-side auto-delete)\n' "$TERMINATE_AFTER"
+  printf '  seatbelt          : --terminate-after %s -> server-side auto-delete at %s\n' "$TERMINATE_AFTER" "$TERMINATE_AT"
 fi
 PRICE_DISPLAY="unknown"; [ -z "$PRICE" ] || PRICE_DISPLAY="\$$PRICE/h"
 printf '  price             : %s %s\n' "$PRICE_DISPLAY" "$PRICE_NOTE"
@@ -129,7 +177,7 @@ fi
 CREATE_ARGS=( pod create --name "$NAME" --image "$IMAGE" --gpu-id "$GPU_ID"
   --gpu-count "$GPU_COUNT" --container-disk-in-gb "$DISK_GB" --volume-in-gb "$VOL_GB"
   --volume-mount-path /workspace --ports "$PORTS" --cloud-type "$CLOUD_TYPE" )
-[ "$NO_SEATBELT" -eq 1 ] || CREATE_ARGS+=( --terminate-after "$TERMINATE_AFTER" )
+[ "$NO_SEATBELT" -eq 1 ] || CREATE_ARGS+=( --terminate-after "$TERMINATE_AT" )
 log "creating pod (cost-STARTING action): runpodctl$(printf ' %s' "${CREATE_ARGS[@]}")"
 OUT="$(runpodctl "${CREATE_ARGS[@]}" 2>&1)" || die "pod create FAILED (nothing should be billing; verify with 'runpodctl pod list --all'): $OUT"
 printf '%s\n' "$OUT"
@@ -140,7 +188,7 @@ POD_ID="$(printf '%s\n' "$OUT" | sed -nE 's/.*"id"[[:space:]]*:[[:space:]]*"([A-
 mkdir -p "$(dirname "$LEDGER")"
 LINE="$(CAGE_LJ_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)" CAGE_LJ_ID="$POD_ID" CAGE_LJ_NAME="$NAME" \
   CAGE_LJ_GPU="$GPU_ID" CAGE_LJ_COUNT="$GPU_COUNT" CAGE_LJ_PRICE="$PRICE" \
-  CAGE_LJ_TA="$([ "$NO_SEATBELT" -eq 1 ] || printf '%s' "$TERMINATE_AFTER")" \
+  CAGE_LJ_TA="$([ "$NO_SEATBELT" -eq 1 ] || printf '%s' "$TERMINATE_AT")" \
   CAGE_LJ_PURPOSE="$PURPOSE" python3 -c '
 import json, os
 e = os.environ
@@ -161,4 +209,4 @@ log "NEXT STEPS:"
 log "  1) ship the repo tarball (scripts/ops/package_repo.sh), then ON the pod: bash scripts/runpod/setup_runpod.sh"
 log "  2) monitor age/spend from the workstation: bash scripts/runpod/pod_status.sh   (cost table: cost_report.sh)"
 log "  3) after the run + verified pull: bash scripts/runpod/teardown_pod.sh $POD_ID <backup_target> <local_run_dir>"
-[ "$NO_SEATBELT" -eq 1 ] || log "  seatbelt: RunPod auto-deletes this pod after $TERMINATE_AFTER (server-side)"
+[ "$NO_SEATBELT" -eq 1 ] || log "  seatbelt: RunPod auto-deletes this pod at $TERMINATE_AT (server-side, in $TERMINATE_AFTER)"

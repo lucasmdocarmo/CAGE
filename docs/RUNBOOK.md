@@ -129,6 +129,38 @@ engine×model VERIFY-LIVE matrix is `docs/VLLM_COMPATIBILITY.md` §7. Re-run gat
 after **every** engine relaunch (prefix ON/OFF, policy knobs, and topology are
 launch-time levers — relaunches between cells are normal).
 
+### 3.1 Budget calibration — bytes → knobs → gate (j) (per engine × budget level)
+
+Charter P2 makes the pressure axis a BYTE quantity, but the engines take dialect
+knobs. The planner emits them; gate (j) verifies them; this loop binds the two.
+Run it once per (model, engine, budget level) BEFORE the level's first cell:
+
+```bash
+# 1. PLAN — bytes + per-engine knobs + the expected realized bytes
+.venv/bin/python -m src.orchestration.cache_budget \
+  --model qwen3-14b --engine vllm --r 0.5 \
+  --concurrency <target-c> --avg-seq-tokens <shape>   # → JSON plan (engine_args, gate_j)
+
+# 2. LAUNCH the engine with the plan's primary knob
+#    vllm:    --kv-cache-memory-bytes <B>     (fallback: --num-gpu-blocks-override)
+#    sglang:  --max-total-tokens <B // kv_per_token>
+#    lmdeploy: cache_max_entry_count <B / free-after-weights>  (config key)
+#    P/D (§6.5): TWO instances, one knob per pool; pd_split is EXPLICIT, never defaulted
+
+# 3. VERIFY — gate (j) against the startup logs; the plan's gate_j.expected_bytes_total
+#    must match realized bytes within CAGE_ISO_BYTES_TOL (default 0.05)
+CAGE_ISO_BYTES_LOGS="vllm=<log>,sglang=<log>" bash scripts/checks/preflight_check.sh <MODEL> <API_BASE>
+
+# 4. RECORD — append {model, engine, r, plan_bytes, realized_bytes, knob} to
+#    results/<run>/calibration/budget_knob_map.jsonl (operator-recorded; the
+#    manifest references it). Off-tolerance → adjust the knob, relaunch, re-verify —
+#    NEVER proceed on an unverified budget (the cell would mis-state its r).
+```
+
+The planner refuses HF (the oracle is excluded from pressure sweeps, P2), refuses
+P/D without an explicit split, and carries every live-only knob semantic as a
+`verify_live` entry — S0-19/S0-20 are where those close.
+
 ## 4. Run
 
 The J4 refusal gate applies at launch: a run with NO off-box backup target **refuses to

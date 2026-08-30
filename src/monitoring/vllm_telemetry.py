@@ -52,13 +52,42 @@ def capture_snapshot(
     metrics_path: str = "/metrics",
     api_key: Optional[str] = None,
     interval: float = 1.0,
+    dialect: str = "vllm",
 ) -> Optional[dict]:
-    """Return the full vLLM telemetry snapshot as a dict, or None if unavailable.
+    """Return the full serving telemetry snapshot as a dict, or None if unavailable.
 
-    Reads LIVE vLLM telemetry only. There is no synthetic/mock path: CAGE must never
+    Reads LIVE telemetry only. There is no synthetic/mock path: CAGE must never
     record fabricated numbers, so an unavailable server yields None, never fake data.
+
+    ``dialect``: ``"vllm"`` (default; byte-identical to the pre-dialect path) or
+    ``"sglang"`` (G-P2, 2026-08-26 — cage-stats scrapes SGLang's /metrics and
+    translates its families into the engine dialect). SGLang has NO vllm-named
+    fallback: the CLI and spec-decode scrapes below read vLLM series, so an
+    installed cage-stats without dialect support must FAIL LOUD here rather than
+    degrade into a fabricated-absence None.
     """
     api = _try_import_api()
+    if dialect != "vllm":
+        # Fail-closed support probe: the dialect module ships with the same
+        # cage-stats commit that added the `dialect` kwarg (pin df0eab4 lacks
+        # both). Probing the module is unambiguous where **kwargs are opaque.
+        import importlib.util
+
+        if api is None or importlib.util.find_spec("cage_stats.metrics.sglang_dialect") is None:
+            raise RuntimeError(
+                f"telemetry dialect {dialect!r} requires a cage-stats with SGLang "
+                "dialect support — the installed pin predates it; bump the "
+                "requirements.txt cage-stats pin (gate (q) enforces parity)"
+            )
+        try:
+            return api.snapshot_dict(
+                url, metrics_path=metrics_path, api_key=api_key,
+                interval=interval, dialect=dialect,
+            )
+        except Exception as e:
+            # vllm-named fallbacks below cannot serve sglang; absence stays absence.
+            print(f"[telemetry] cage_stats {dialect} capture failed: {e}")
+            return None
     if api is not None:
         try:
             return api.snapshot_dict(

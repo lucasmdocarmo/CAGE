@@ -42,6 +42,39 @@ COST_REPORT = SCRIPTS / "runpod" / "cost_report.sh"
 GPU = "NVIDIA GeForce RTX 4090"
 TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
+# `runpodctl gpu list` output as CLI v2 ACTUALLY emits it: a JSON document, with
+# the price on a different line than the gpuId. The pre-2026-08-25 fixture here
+# was a v1-style single table row, which let a real defect pass — the script's
+# line-oriented price grep matched the `"gpuId": ...` line, found no number on
+# it, and silently degraded every plan to price=unknown. Keep this shaped like
+# the live CLI so the price path is exercised for real.
+_GPU_LIST_JSON = json.dumps([
+    {
+        "available": True,
+        "communityCloud": True,
+        "communityPricePerHr": 0.34,
+        "dataCenterAvailability": [{"dataCenterId": "US-IL-1", "stockStatus": "Low"}],
+        "displayName": "RTX 4090",
+        "gpuId": GPU,
+        "memoryInGb": 24,
+        "secureCloud": True,
+        "securePricePerHr": 0.69,
+        "stockStatus": "Low",
+    },
+    {
+        "available": True,
+        "communityCloud": False,
+        "communityPricePerHr": None,
+        "dataCenterAvailability": [{"dataCenterId": "EU-RO-1", "stockStatus": "Low"}],
+        "displayName": "L40S",
+        "gpuId": "NVIDIA L40S",
+        "memoryInGb": 48,
+        "secureCloud": True,
+        "securePricePerHr": 0.99,
+        "stockStatus": "Low",
+    },
+], indent=2) + "\n"
+
 # Env vars that would leak state (a real ledger, a real pod SSH target, a
 # non-interactive auto-yes) into these hermetic tests.
 _LEAK_ENV = (
@@ -71,7 +104,7 @@ def _install_fake(
     tmp_path: Path,
     pod_list: str = "[]\n",
     nv_list: str = "[]\n",
-    gpu_list: str = f'"{GPU}"  RTX4090  24  $0.69/hr\n',
+    gpu_list: str = _GPU_LIST_JSON,
     pod_create: str = '{"id":"fakepod1234abcd"}\n',
     billing: str = "Account balance: $12.34\n",
     fail_all: bool = False,
@@ -242,9 +275,26 @@ def test_provision_plan_derives_price_from_gpu_list(tmp_path: Path) -> None:
     fake, log = _install_fake(tmp_path)
     proc = _bash(f'bash "{PROVISION}" --gpu-id "{GPU}" --hours 6', env=_env(fake))
     assert proc.returncode == 0
-    assert "$0.69/h" in proc.stdout, "price must be derived from the (fake) `runpodctl gpu list` row"
+    assert "$0.69/h" in proc.stdout, "price must be parsed out of the (fake) `runpodctl gpu list` JSON"
     assert re.search(r"estimated total\s+: \$4\.14", proc.stdout), "6h x $0.69 x 1 GPU = $4.14"
     assert any(c.startswith("gpu list") for c in _argv_lines(log))
+
+
+def test_provision_plan_price_follows_cloud_type(tmp_path: Path) -> None:
+    """COMMUNITY must quote the community price, not the secure one.
+
+    The two differ by ~2x, so picking the wrong field misstates the cost plan
+    the owner approves at the run-approval gate.
+    """
+    fake, _ = _install_fake(tmp_path)
+    proc = _bash(
+        f'bash "{PROVISION}" --gpu-id "{GPU}" --cloud-type COMMUNITY --hours 6',
+        env=_env(fake),
+    )
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    assert "$0.34/h" in proc.stdout, "COMMUNITY must quote communityPricePerHr"
+    assert "$0.69/h" not in proc.stdout, "the SECURE price must not leak into a COMMUNITY plan"
+    assert re.search(r"estimated total\s+: \$2\.04", proc.stdout), "6h x $0.34 x 1 GPU = $2.04"
 
 
 def test_provision_plan_degrades_to_null_price_when_cli_fails(tmp_path: Path) -> None:
@@ -255,6 +305,38 @@ def test_provision_plan_degrades_to_null_price_when_cli_fails(tmp_path: Path) ->
         "with no derivable price the plan must degrade to unknown + a note"
     )
     assert not any(c.startswith("pod create") for c in _argv_lines(log))
+
+
+@pytest.mark.parametrize("bad", ["twelve hours", "12", "12hh", "0h", "2026-08-26", "-5h"])
+def test_provision_refuses_unparseable_seatbelt(tmp_path: Path, bad: str) -> None:
+    """An unresolvable seatbelt must fail LOUDLY, never reach the CLI as-is.
+
+    Failing closed here is what keeps a malformed deadline from producing a pod
+    with no server-side auto-delete.
+    """
+    fake, log = _install_fake(tmp_path)
+    proc = _bash(
+        f'bash "{PROVISION}" --gpu-id "{GPU}" --terminate-after "{bad}" --yes',
+        env=_env(fake),
+    )
+    assert proc.returncode != 0, f"{bad!r} must be refused; stdout:\n{proc.stdout}"
+    assert "--terminate-after" in proc.stderr
+    assert not any(c.startswith("pod create") for c in _argv_lines(log)), (
+        f"nothing may be created when the seatbelt is unresolvable ({bad!r})"
+    )
+
+
+def test_provision_accepts_absolute_seatbelt_verbatim(tmp_path: Path) -> None:
+    """An operator may pass the CLI's own RFC3339 form; it passes through unchanged."""
+    fake, log = _install_fake(tmp_path)
+    proc = _bash(
+        f'bash "{PROVISION}" --gpu-id "{GPU}" --terminate-after 2099-01-01T00:00:00Z --yes',
+        env=_env(fake, CAGE_POD_LEDGER=str(tmp_path / "l.jsonl")),
+    )
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    creates = [c for c in _argv_lines(log) if c.startswith("pod create")]
+    assert len(creates) == 1
+    assert "--terminate-after 2099-01-01T00:00:00Z" in creates[0]
 
 
 def test_provision_requires_gpu_id(tmp_path: Path) -> None:
@@ -275,8 +357,22 @@ def test_provision_yes_passes_default_seatbelt_and_writes_ledger(tmp_path: Path)
     assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
     creates = [c for c in _argv_lines(log) if c.startswith("pod create")]
     assert len(creates) == 1
-    assert "--terminate-after 12h" in creates[0], (
-        "the 12h cost seatbelt must be passed by DEFAULT on every real create"
+    # The seatbelt must reach the CLI as an ABSOLUTE datetime. runpodctl v2's
+    # --terminate-after takes "auto-terminate datetime (e.g. 2026-04-15T00:00:00Z)";
+    # the raw "12h" this script passed until 2026-08-25 is not a valid deadline,
+    # so the pod could come up with NO server-side auto-delete and bill until a
+    # manual teardown. Pin the resolved instant, and pin that a bare duration
+    # never reaches the CLI again.
+    m = re.search(r"--terminate-after (\S+)", creates[0])
+    assert m, f"the cost seatbelt must be passed by DEFAULT on every real create: {creates[0]}"
+    passed = m.group(1)
+    assert not re.fullmatch(r"\d+[hm]", passed), (
+        f"a bare duration ({passed!r}) is NOT a valid --terminate-after value for runpodctl v2"
+    )
+    deadline = datetime.datetime.strptime(passed, TS_FMT).replace(tzinfo=datetime.timezone.utc)
+    ahead = (deadline - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+    assert 11.5 * 3600 < ahead < 12.5 * 3600, (
+        f"the default seatbelt must land ~12h out, got {ahead / 3600:.2f}h ({passed})"
     )
     assert "fakepod1234abcd" in proc.stdout and "teardown_pod.sh" in proc.stdout \
         and "setup_runpod.sh" in proc.stdout, "the create must print the id + next steps"
@@ -290,7 +386,10 @@ def test_provision_yes_passes_default_seatbelt_and_writes_ledger(tmp_path: Path)
     assert e["name"] == "cage-s0" and e["gpu_id"] == GPU and e["purpose"] == "s0-gate"
     assert isinstance(e["gpu_count"], int) and e["gpu_count"] == 1
     assert isinstance(e["price_per_hour_usd"], float) and e["price_per_hour_usd"] == 0.86
-    assert e["terminate_after"] == "12h"
+    # The ledger records the resolved instant, so cost_report.sh / pod_status.sh
+    # can compare it against a wall clock — a duration string cannot be compared.
+    assert e["terminate_after"] == passed
+    datetime.datetime.strptime(e["terminate_after"], TS_FMT)
     datetime.datetime.strptime(e["ts_utc"], TS_FMT)
 
 
