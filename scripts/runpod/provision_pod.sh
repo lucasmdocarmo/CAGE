@@ -18,6 +18,7 @@
 #   results/ops/pod_ledger.jsonl        (override: CAGE_POD_LEDGER)
 # schema: {"ts_utc","pod_id","name","gpu_id","gpu_count",
 #          "price_per_hour_usd"(number|null),"terminate_after"(string|null),
+#          "data_center_ids"(string|null),"network_volume_id"(string|null),
 #          "purpose","event":"create"}
 # teardown_pod.sh appends the matching {"event":"delete"} line;
 # pod_status.sh / cost_report.sh consume the pairs.
@@ -42,6 +43,7 @@ usage() {
   printf 'Options: --name <s> --image <s> --gpu-count <n> --disk-gb <n> --volume-gb <n>\n' >&2
   printf '         --ports <s> --cloud-type SECURE|COMMUNITY --terminate-after <dur>\n' >&2
   printf '         --no-terminate-after --price-per-hour <f> --hours <f> --purpose <s>\n' >&2
+  printf '         --data-center-ids <csv> --network-volume-id <id>\n' >&2
   printf 'Default is PLAN mode: prints the plan and creates NOTHING. --yes = the owner GO.\n' >&2
   exit 2
 }
@@ -51,6 +53,9 @@ IMAGE="${CAGE_POD_IMAGE:-runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubun
 GPU_ID=""; GPU_COUNT="1"; DISK_GB="60"; VOL_GB="100"; PORTS="22/tcp"
 CLOUD_TYPE="SECURE"; TERMINATE_AFTER="12h"; NO_SEATBELT=0
 PRICE=""; HOURS=""; PURPOSE="unspecified"; YES=0
+# _SET flags distinguish "flag never given" from "flag given an empty value":
+# the latter must be REFUSED, not silently treated as absent (fail-closed).
+DC_IDS=""; DC_IDS_SET=0; NET_VOL_ID=""; NET_VOL_SET=0
 need_val() { [ "$#" -ge 2 ] || die "flag $1 requires a value"; }
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -62,6 +67,8 @@ while [ $# -gt 0 ]; do
     --volume-gb)          need_val "$@"; VOL_GB="$2";          shift 2 ;;
     --ports)              need_val "$@"; PORTS="$2";           shift 2 ;;
     --cloud-type)         need_val "$@"; CLOUD_TYPE="$2";      shift 2 ;;
+    --data-center-ids)    need_val "$@"; DC_IDS="$2";     DC_IDS_SET=1;  shift 2 ;;
+    --network-volume-id)  need_val "$@"; NET_VOL_ID="$2"; NET_VOL_SET=1; shift 2 ;;
     --terminate-after)    need_val "$@"; TERMINATE_AFTER="$2"; shift 2 ;;
     --no-terminate-after) NO_SEATBELT=1;                       shift ;;
     --price-per-hour)     need_val "$@"; PRICE="$2";           shift 2 ;;
@@ -76,6 +83,12 @@ done
 printf '%s' "$GPU_COUNT" | grep -qE '^[1-9][0-9]*$' || die "--gpu-count must be a positive integer: $GPU_COUNT"
 [ -z "$PRICE" ] || printf '%s' "$PRICE" | grep -qE '^[0-9]+(\.[0-9]+)?$' || die "--price-per-hour must be numeric: $PRICE"
 [ -z "$HOURS" ] || printf '%s' "$HOURS" | grep -qE '^[0-9]+(\.[0-9]+)?$' || die "--hours must be numeric: $HOURS"
+# Siting flags are create-time-only levers (a network volume attaches ONLY at
+# create, and ONLY inside its own datacenter), so a malformed value here would
+# produce a mis-sited pod that cannot be fixed after the fact — refuse instead.
+[ "$DC_IDS_SET" -eq 0 ] || printf '%s' "$DC_IDS" | grep -qE '^[A-Za-z0-9-]+(,[A-Za-z0-9-]+)*$' \
+  || die "--data-center-ids must be a non-empty CSV of ids matching [A-Za-z0-9-]+ (e.g. US-IL-1,EU-RO-1); got: '$DC_IDS'"
+[ "$NET_VOL_SET" -eq 0 ] || [ -n "$NET_VOL_ID" ] || die "--network-volume-id must be non-empty when given"
 
 # --- seatbelt resolution: operator duration -> absolute RFC3339 UTC ---------
 # runpodctl v2 `--terminate-after` takes an ABSOLUTE datetime, not a duration
@@ -151,6 +164,16 @@ printf '  --gpu-id          : %s   (x%s, cloud-type %s)\n' "$GPU_ID" "$GPU_COUNT
 printf '  image             : %s\n' "$IMAGE"
 printf '  container disk    : %s GB   /workspace volume: %s GB\n' "$DISK_GB" "$VOL_GB"
 printf '  ports             : %s\n' "$PORTS"
+if [ "$DC_IDS_SET" -eq 1 ]; then
+  printf '  datacenter ids    : %s   (--data-center-ids pin)\n' "$DC_IDS"
+else
+  printf '  datacenter ids    : any (RunPod chooses; no --data-center-ids)\n'
+fi
+if [ "$NET_VOL_SET" -eq 1 ]; then
+  printf '  network volume    : %s   (--network-volume-id; attaches at create, same-datacenter only)\n' "$NET_VOL_ID"
+else
+  printf '  network volume    : none (no --network-volume-id)\n'
+fi
 if [ "$NO_SEATBELT" -eq 1 ]; then
   printf '  seatbelt          : DISABLED (--no-terminate-after) — NO server-side auto-delete\n'
 else
@@ -178,6 +201,8 @@ CREATE_ARGS=( pod create --name "$NAME" --image "$IMAGE" --gpu-id "$GPU_ID"
   --gpu-count "$GPU_COUNT" --container-disk-in-gb "$DISK_GB" --volume-in-gb "$VOL_GB"
   --volume-mount-path /workspace --ports "$PORTS" --cloud-type "$CLOUD_TYPE" )
 [ "$NO_SEATBELT" -eq 1 ] || CREATE_ARGS+=( --terminate-after "$TERMINATE_AT" )
+[ "$DC_IDS_SET" -eq 0 ]  || CREATE_ARGS+=( --data-center-ids "$DC_IDS" )
+[ "$NET_VOL_SET" -eq 0 ] || CREATE_ARGS+=( --network-volume-id "$NET_VOL_ID" )
 log "creating pod (cost-STARTING action): runpodctl$(printf ' %s' "${CREATE_ARGS[@]}")"
 OUT="$(runpodctl "${CREATE_ARGS[@]}" 2>&1)" || die "pod create FAILED (nothing should be billing; verify with 'runpodctl pod list --all'): $OUT"
 printf '%s\n' "$OUT"
@@ -189,16 +214,21 @@ mkdir -p "$(dirname "$LEDGER")"
 LINE="$(CAGE_LJ_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)" CAGE_LJ_ID="$POD_ID" CAGE_LJ_NAME="$NAME" \
   CAGE_LJ_GPU="$GPU_ID" CAGE_LJ_COUNT="$GPU_COUNT" CAGE_LJ_PRICE="$PRICE" \
   CAGE_LJ_TA="$([ "$NO_SEATBELT" -eq 1 ] || printf '%s' "$TERMINATE_AT")" \
+  CAGE_LJ_DC="$DC_IDS" CAGE_LJ_NV="$NET_VOL_ID" \
   CAGE_LJ_PURPOSE="$PURPOSE" python3 -c '
 import json, os
 e = os.environ
 price = e.get("CAGE_LJ_PRICE", "")
 ta = e.get("CAGE_LJ_TA", "")
+dc = e.get("CAGE_LJ_DC", "")
+nv = e.get("CAGE_LJ_NV", "")
 print(json.dumps({
     "ts_utc": e["CAGE_LJ_TS"], "pod_id": e["CAGE_LJ_ID"], "name": e["CAGE_LJ_NAME"],
     "gpu_id": e["CAGE_LJ_GPU"], "gpu_count": int(e["CAGE_LJ_COUNT"]),
     "price_per_hour_usd": float(price) if price else None,
     "terminate_after": ta if ta else None,
+    "data_center_ids": dc if dc else None,
+    "network_volume_id": nv if nv else None,
     "purpose": e["CAGE_LJ_PURPOSE"], "event": "create",
 }))')" || die "pod $POD_ID CREATED and BILLING but the ledger line could not be built — append the create event to $LEDGER manually NOW"
 printf '%s\n' "$LINE" >> "$LEDGER"

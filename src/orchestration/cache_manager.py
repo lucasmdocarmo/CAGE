@@ -142,12 +142,18 @@ class SimulatedKVCacheManager(KVCacheManager):
                 bw_bytes_sec = self.network_bandwidth_gbps * 1e9 / 8
                 transfer_latency = transfer_bytes / bw_bytes_sec
 
+        # Provenance stamp (T3.3): every dict this simulator emits is MODEL
+        # output, not measurement. run_experiment's campaign-mode distributed
+        # gate refuses source=="simulated" (and refuses a MISSING source —
+        # unknown provenance is not evidence). A real KV-connector integration
+        # (NIXL/LMCache/...) must stamp its own source, e.g. "nixl", when built.
         return {
             "target_node_id": target_node.node_id,
             "cached_tokens": num_tokens,
             "transfer_required": bool(transfer_bytes > 0),
             "transfer_bytes": int(transfer_bytes),
-            "transfer_latency_ms": transfer_latency * 1000.0
+            "transfer_latency_ms": transfer_latency * 1000.0,
+            "source": "simulated",
         }
 
     def invalidate(self, block_ids: List[str]):

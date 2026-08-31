@@ -37,14 +37,19 @@ never the retired v1 verbs (`get pod`/`remove pod`); the REST fallback targets
 
 ```json
 {"ts_utc": "…Z", "pod_id": "…", "name": "…", "gpu_id": "…", "gpu_count": 1,
- "price_per_hour_usd": 0.86, "terminate_after": "2026-08-26T22:00:00Z", "purpose": "…", "event": "create"}
+ "price_per_hour_usd": 0.86, "terminate_after": "2026-08-26T22:00:00Z",
+ "data_center_ids": "US-IL-1,EU-RO-1", "network_volume_id": null, "purpose": "…", "event": "create"}
 {"ts_utc": "…Z", "pod_id": "…", "event": "delete"}
 ```
 
 `price_per_hour_usd` is a number or `null` (pass `--price-per-hour` at provision to make
 spend estimates work); `terminate_after` is the RESOLVED absolute RFC3339 deadline
 (`…Z`) or `null` (seatbelt disabled) — an instant, so readers can compare it to a wall
-clock, which a duration string could not support. Writers: `provision_pod.sh` (create), `teardown_pod.sh` (delete). Readers:
+clock, which a duration string could not support. `data_center_ids` is the verbatim
+`--data-center-ids` CSV or `null` (no siting pin); `network_volume_id` is the
+`--network-volume-id` value or `null` — recorded because a network volume attaches ONLY
+at create time and ONLY in its own datacenter, so the ledger is the audit trail of
+where the pod (and its volume) were sited. Writers: `provision_pod.sh` (create), `teardown_pod.sh` (delete). Readers:
 `pod_status.sh`, `cost_report.sh` — the latter REFUSES malformed lines loudly with the
 line number rather than skipping them.
 

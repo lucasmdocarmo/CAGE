@@ -131,3 +131,63 @@ cage_lmdeploy_cache_fraction() {
         printf "%.4f\n", f
     }'
 }
+
+# =============================================================================
+# Bytes-denominated budget knobs  (T2.1 — CacheBudgetPlanner -> launcher wiring)
+# =============================================================================
+# src/orchestration/cache_budget.py PLANS a byte budget (charter P2: pressure =
+# bytes, the SAME physical quantity on every engine) and emits per-engine launch
+# knobs. The launchers consume them via env — the planner never launches:
+#   CAGE_KV_BUDGET_BYTES           vllm   --kv-cache-memory-bytes    (primary)
+#   CAGE_VLLM_GPU_BLOCKS_OVERRIDE  vllm   --num-gpu-blocks-override  (fallback)
+#   CAGE_SGLANG_MAX_TOTAL_TOKENS   sglang --max-total-tokens
+# Validators live HERE (one source of truth; launchers call `... || die`) so a
+# malformed budget is refused BEFORE any server is stopped or launched. Fail
+# closed: a bad value must never degrade to fraction-only serving, because the
+# run's data would then be LABELED with a budget the engine never had. Gate (j)
+# (CAGE-ISO-BYTES-GATE) verifies the REALIZED bytes from the startup logs.
+
+# cage_require_positive_int <ENV_NAME> <value> — 0 iff <value> is a positive
+# decimal integer. Pure string logic (no shell arithmetic): a byte budget can
+# exceed int64 territory where `[ .. -gt 0 ]` errors (exit 2, swallowed by an
+# if) instead of refusing. Empty/sign/decimal/whitespace all refuse — awk or
+# printf would silently coerce them into a confidently wrong flag value.
+cage_require_positive_int() {
+    case "$2" in
+        ''|*[!0-9]*)
+            printf '[cage] REFUSING launch: %s=%s is not a positive integer\n' \
+                "$1" "${2:-<empty>}" >&2
+            return 1
+            ;;
+    esac
+    case "$2" in
+        *[!0]*) return 0 ;;  # digits-only AND at least one nonzero digit
+    esac
+    printf '[cage] REFUSING launch: %s=%s must be > 0 (a zero budget is a refusal, not a config)\n' \
+        "$1" "$2" >&2
+    return 1
+}
+
+# vLLM budget knobs: bytes (primary) XOR blocks-override (fallback). BOTH set
+# is two different caps for the same KV pool — a refusal, never a precedence
+# rule (fail-closed doctrine: no silent pick).
+cage_validate_vllm_budget_env() {
+    if [ -n "${CAGE_KV_BUDGET_BYTES:-}" ] && [ -n "${CAGE_VLLM_GPU_BLOCKS_OVERRIDE:-}" ]; then
+        printf '[cage] REFUSING launch: CAGE_KV_BUDGET_BYTES and CAGE_VLLM_GPU_BLOCKS_OVERRIDE are BOTH set -- they cap the SAME KV pool in different units; unset one\n' >&2
+        return 1
+    fi
+    if [ -n "${CAGE_KV_BUDGET_BYTES:-}" ]; then
+        cage_require_positive_int CAGE_KV_BUDGET_BYTES "${CAGE_KV_BUDGET_BYTES}" || return 1
+    fi
+    if [ -n "${CAGE_VLLM_GPU_BLOCKS_OVERRIDE:-}" ]; then
+        cage_require_positive_int CAGE_VLLM_GPU_BLOCKS_OVERRIDE "${CAGE_VLLM_GPU_BLOCKS_OVERRIDE}" || return 1
+    fi
+    return 0
+}
+
+cage_validate_sglang_budget_env() {
+    if [ -n "${CAGE_SGLANG_MAX_TOTAL_TOKENS:-}" ]; then
+        cage_require_positive_int CAGE_SGLANG_MAX_TOTAL_TOKENS "${CAGE_SGLANG_MAX_TOTAL_TOKENS}" || return 1
+    fi
+    return 0
+}

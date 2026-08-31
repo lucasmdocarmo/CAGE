@@ -75,6 +75,20 @@ SLO_FLOORS = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _no_machine_freeze_artifact(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # T6.1: bpt.main now resolves the Qasper τ from the machine's freeze
+    # artifact by default (MyDocs/registration/freeze_resolutions.json —
+    # present on the analysis machine, absent on pods). This module pins the
+    # NO-artifact behaviors (τ unset, #120 refusal), so point the lookup at a
+    # nonexistent path to stay hermetic on both machines. The freeze-
+    # consumption rules themselves are pinned in
+    # tests/test_tau_freeze_consumption.py.
+    monkeypatch.setenv(bpt.FREEZE_ENV_VAR, str(tmp_path / "absent_freeze.json"))
+
+
 # ---------------------------------------------------------------------------
 # Row factories (synthetic #127-stamped evidence + sidecar score rows)
 # ---------------------------------------------------------------------------

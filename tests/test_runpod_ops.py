@@ -377,12 +377,22 @@ def test_provision_yes_passes_default_seatbelt_and_writes_ledger(tmp_path: Path)
     assert "fakepod1234abcd" in proc.stdout and "teardown_pod.sh" in proc.stdout \
         and "setup_runpod.sh" in proc.stdout, "the create must print the id + next steps"
 
+    # Siting flags absent -> they must NOT reach the CLI (runpodctl would take an
+    # empty pin as a real constraint) and must land as null in the ledger.
+    assert "--data-center-ids" not in creates[0]
+    assert "--network-volume-id" not in creates[0]
+
     lines = ledger.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1
     e = json.loads(lines[0])
     assert set(e) == {"ts_utc", "pod_id", "name", "gpu_id", "gpu_count",
-                      "price_per_hour_usd", "terminate_after", "purpose", "event"}
+                      "price_per_hour_usd", "terminate_after", "data_center_ids",
+                      "network_volume_id", "purpose", "event"}
     assert e["event"] == "create" and e["pod_id"] == "fakepod1234abcd"
+    assert e["data_center_ids"] is None and e["network_volume_id"] is None, (
+        "siting fields must be recorded as null when the flags were not given "
+        "(absent data is null, never a fabricated value)"
+    )
     assert e["name"] == "cage-s0" and e["gpu_id"] == GPU and e["purpose"] == "s0-gate"
     assert isinstance(e["gpu_count"], int) and e["gpu_count"] == 1
     assert isinstance(e["price_per_hour_usd"], float) and e["price_per_hour_usd"] == 0.86
@@ -408,6 +418,80 @@ def test_provision_no_terminate_after_warns_loud(tmp_path: Path) -> None:
     assert len(creates) == 1 and "--terminate-after" not in creates[0]
     e = json.loads(ledger.read_text(encoding="utf-8").splitlines()[0])
     assert e["terminate_after"] is None
+
+
+def test_provision_plan_shows_siting_pins(tmp_path: Path) -> None:
+    """The siting pins must be visible in the PLAN block the owner approves.
+
+    A network volume attaches ONLY at create time and ONLY in its own
+    datacenter, so where the pod lands IS part of the GO decision — a plan
+    that hides the pins would get an approval for a different pod.
+    """
+    fake, log = _install_fake(tmp_path)
+    proc = _bash(
+        f'bash "{PROVISION}" --gpu-id "{GPU}" --data-center-ids US-IL-1,EU-RO-1 '
+        f'--network-volume-id nvol1234abcd --hours 6',
+        env=_env(fake),
+    )
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    assert "US-IL-1,EU-RO-1" in proc.stdout, "the datacenter pin must appear in the plan"
+    assert "nvol1234abcd" in proc.stdout, "the network-volume pin must appear in the plan"
+    assert not any(c.startswith("pod create") for c in _argv_lines(log)), (
+        "PLAN mode must still create NOTHING when siting flags are given"
+    )
+
+
+def test_provision_create_passes_siting_flags_and_ledgers_them(tmp_path: Path) -> None:
+    """--yes must forward both siting flags verbatim to `pod create` and record
+    them in the create event, so the ledger is the audit trail of where the pod
+    (and its create-time-only volume attachment) were sited."""
+    fake, log = _install_fake(tmp_path)
+    ledger = tmp_path / "pod_ledger.jsonl"
+    proc = _bash(
+        f'bash "{PROVISION}" --gpu-id "{GPU}" --data-center-ids US-IL-1 '
+        f'--network-volume-id nvol1234abcd --yes',
+        env=_env(fake, CAGE_POD_LEDGER=str(ledger)),
+    )
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    creates = [c for c in _argv_lines(log) if c.startswith("pod create")]
+    assert len(creates) == 1
+    assert "--data-center-ids US-IL-1" in creates[0]
+    assert "--network-volume-id nvol1234abcd" in creates[0]
+    e = json.loads(ledger.read_text(encoding="utf-8").splitlines()[0])
+    assert e["data_center_ids"] == "US-IL-1"
+    assert e["network_volume_id"] == "nvol1234abcd"
+
+
+@pytest.mark.parametrize("bad", ["", "US-IL-1,", ",US-IL-1", "US-IL-1,,EU-RO-1",
+                                 "US_IL_1", "US-IL-1, EU-RO-1"])
+def test_provision_refuses_bad_data_center_ids(tmp_path: Path, bad: str) -> None:
+    """A malformed --data-center-ids must be refused BEFORE any create.
+
+    Siting is a create-time-only lever: a typo'd pin that reached the CLI could
+    site the pod away from its network volume, unfixably. Empty values count —
+    an explicitly-given empty pin must refuse, never silently mean "no pin".
+    """
+    fake, log = _install_fake(tmp_path)
+    proc = _bash(
+        f'bash "{PROVISION}" --gpu-id "{GPU}" --data-center-ids "{bad}" --yes',
+        env=_env(fake),
+    )
+    assert proc.returncode != 0, f"{bad!r} must be refused; stdout:\n{proc.stdout}"
+    assert "--data-center-ids" in proc.stderr
+    assert not any(c.startswith("pod create") for c in _argv_lines(log)), (
+        f"nothing may be created on a refused --data-center-ids ({bad!r})"
+    )
+
+
+def test_provision_refuses_empty_network_volume_id(tmp_path: Path) -> None:
+    fake, log = _install_fake(tmp_path)
+    proc = _bash(
+        f'bash "{PROVISION}" --gpu-id "{GPU}" --network-volume-id "" --yes',
+        env=_env(fake),
+    )
+    assert proc.returncode != 0, "an explicit empty volume id must refuse, not mean 'no volume'"
+    assert "--network-volume-id" in proc.stderr
+    assert not any(c.startswith("pod create") for c in _argv_lines(log))
 
 
 # ---------------------------------------------------------------------------

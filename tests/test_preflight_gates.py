@@ -51,6 +51,7 @@ MIB = 1024 ** 2
 # shell can never leak state into a test.
 _GATE_ENV_VARS = (
     "CAGE_ISO_BYTES_TOL", "CAGE_ISO_BYTES_LOGS", "CAGE_ISO_BYTES_LOG_ROOT",
+    "CAGE_ISO_POOL_SUM_BYTES",
     "CAGE_CALIBRATION_MANIFESTS", "CAGE_DATASETS", "DATASET",
     "CAGE_REGIME_GATE_SAMPLES", "CAGE_REGIME_GATE_INTERVAL",
     "CAGE_REGIME_KV_METRIC", "CAGE_REGIME_PREEMPT_METRIC",
@@ -378,6 +379,7 @@ def test_iso_cli_three_engine_parity_passes(iso: dict, tmp_path: Path,
     monkeypatch.setenv("CAGE_ISO_BYTES_LOG_ROOT", str(tmp_path))
     monkeypatch.delenv("CAGE_ISO_BYTES_TOL", raising=False)
     monkeypatch.delenv("CAGE_ISO_BYTES_LOGS", raising=False)
+    monkeypatch.delenv("CAGE_ISO_POOL_SUM_BYTES", raising=False)
     rc = iso["main"](["gate", "vllm,sglang,lmdeploy"])
     out = capsys.readouterr().out
     assert rc == 0, out
@@ -394,6 +396,7 @@ def test_iso_cli_out_of_tolerance_fails(iso: dict, tmp_path: Path,
     monkeypatch.setenv("CAGE_ISO_BYTES_LOG_ROOT", str(tmp_path))
     monkeypatch.delenv("CAGE_ISO_BYTES_TOL", raising=False)
     monkeypatch.delenv("CAGE_ISO_BYTES_LOGS", raising=False)
+    monkeypatch.delenv("CAGE_ISO_POOL_SUM_BYTES", raising=False)
     rc = iso["main"](["gate", "vllm,lmdeploy"])
     out = capsys.readouterr().out
     assert rc == 1
@@ -405,6 +408,7 @@ def test_iso_cli_missing_scoped_engine_log_fails(iso: dict, tmp_path: Path,
     _write_logs(tmp_path, vllm=VLLM_V1_LOG)
     monkeypatch.setenv("CAGE_ISO_BYTES_LOG_ROOT", str(tmp_path))
     monkeypatch.delenv("CAGE_ISO_BYTES_LOGS", raising=False)
+    monkeypatch.delenv("CAGE_ISO_POOL_SUM_BYTES", raising=False)
     rc = iso["main"](["gate", "vllm,sglang,lmdeploy"])
     out = capsys.readouterr().out
     assert rc == 1
@@ -416,6 +420,7 @@ def test_iso_cli_single_engine_scope_is_vacuous_pass(iso: dict, tmp_path: Path,
     _write_logs(tmp_path, vllm=VLLM_V1_LOG)
     monkeypatch.setenv("CAGE_ISO_BYTES_LOG_ROOT", str(tmp_path))
     monkeypatch.delenv("CAGE_ISO_BYTES_LOGS", raising=False)
+    monkeypatch.delenv("CAGE_ISO_POOL_SUM_BYTES", raising=False)
     rc = iso["main"](["gate", "vllm"])
     out = capsys.readouterr().out
     assert rc == 0
@@ -428,6 +433,7 @@ def test_iso_cli_explicit_log_pins_override_discovery(iso: dict, tmp_path: Path,
     pinned.write_text(VLLM_V0_LOG, encoding="utf-8")
     monkeypatch.setenv("CAGE_ISO_BYTES_LOG_ROOT", str(tmp_path / "empty"))
     monkeypatch.setenv("CAGE_ISO_BYTES_LOGS", f"vllm={pinned}")
+    monkeypatch.delenv("CAGE_ISO_POOL_SUM_BYTES", raising=False)
     rc = iso["main"](["gate", "vllm"])
     out = capsys.readouterr().out
     assert rc == 0
@@ -439,6 +445,7 @@ def test_iso_cli_bad_tolerance_fails(iso: dict, tmp_path: Path,
     monkeypatch.setenv("CAGE_ISO_BYTES_LOG_ROOT", str(tmp_path))
     monkeypatch.setenv("CAGE_ISO_BYTES_TOL", "1.5")
     monkeypatch.delenv("CAGE_ISO_BYTES_LOGS", raising=False)
+    monkeypatch.delenv("CAGE_ISO_POOL_SUM_BYTES", raising=False)
     rc = iso["main"](["gate", "vllm"])
     assert rc == 1
     assert "outside (0, 1)" in capsys.readouterr().out
@@ -449,10 +456,243 @@ def test_iso_cli_lmdeploy_turbomind_alias_normalizes(iso: dict, tmp_path: Path,
     _write_logs(tmp_path, lmdeploy=LMDEPLOY_LOG)
     monkeypatch.setenv("CAGE_ISO_BYTES_LOG_ROOT", str(tmp_path))
     monkeypatch.delenv("CAGE_ISO_BYTES_LOGS", raising=False)
+    monkeypatch.delenv("CAGE_ISO_POOL_SUM_BYTES", raising=False)
     rc = iso["main"](["gate", "lmdeploy-turbomind"])
     out = capsys.readouterr().out
     assert rc == 0
     assert "[pool] lmdeploy" in out
+
+
+# ---------------------------------------------------------------------------
+# (j) iso-bytes gate: role-split (P/D) grammar + pool-SUM assertion (T2.2).
+# Charter §6.5: under prefill/decode disaggregation the budget B is the SUM of
+# the role pools, so one engine legitimately owns TWO logs — pinned as
+# 'engine:role=path'. The old parser dict silently kept the LAST duplicate
+# key (verified defect); duplicates must now refuse. CAGE_ISO_POOL_SUM_BYTES
+# carries cache_budget.py's gate_j.expected_bytes_total.
+# ---------------------------------------------------------------------------
+
+VLLM_PREFILL_LOG = "INFO 08-30 [gpu_worker.py:276] Available KV cache memory: 10.00 GiB\n"
+VLLM_DECODE_LOG = "INFO 08-30 [gpu_worker.py:276] Available KV cache memory: 10.50 GiB\n"
+#: 20.5 GiB single pool — equals VLLM_PREFILL_LOG + VLLM_DECODE_LOG exactly.
+SGLANG_205_LOG = ("[x] KV Cache is allocated. #tokens: 430913, "
+                  "K size: 10.25 GB, V size: 10.25 GB\n")
+
+
+def _pin_roles(tmp_path: Path, monkeypatch, mapping: Dict[str, str],
+               pool_sum: Optional[object] = None) -> None:
+    """Write one log per 'engine[:role]' key and pin them via the env grammar."""
+    entries = []
+    for key, text in mapping.items():
+        p = tmp_path / f"{key.replace(':', '_')}.log"
+        p.write_text(text, encoding="utf-8")
+        entries.append(f"{key}={p}")
+    monkeypatch.setenv("CAGE_ISO_BYTES_LOG_ROOT", str(tmp_path / "empty"))
+    monkeypatch.setenv("CAGE_ISO_BYTES_LOGS", ",".join(entries))
+    monkeypatch.delenv("CAGE_ISO_BYTES_TOL", raising=False)
+    if pool_sum is None:
+        monkeypatch.delenv("CAGE_ISO_POOL_SUM_BYTES", raising=False)
+    else:
+        monkeypatch.setenv("CAGE_ISO_POOL_SUM_BYTES", str(pool_sum))
+
+
+def test_iso_cli_role_split_sums_pools_for_parity(iso: dict, tmp_path: Path,
+                                                  monkeypatch, capsys) -> None:
+    """Either vllm half alone gaps ~0.51 vs sglang; only the SUM passes, so a
+    PASS here proves the summed value enters cross-engine parity."""
+    _pin_roles(tmp_path, monkeypatch, {
+        "vllm:prefill": VLLM_PREFILL_LOG,   # 10.00 GiB
+        "vllm:decode": VLLM_DECODE_LOG,     # 10.50 GiB
+        "sglang": SGLANG_205_LOG,           # 20.50 GiB single pool
+    })
+    rc = iso["main"](["gate", "vllm,sglang"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "[pool] vllm:prefill: bytes=10.000 GiB" in out
+    assert "[pool] vllm:decode: bytes=10.500 GiB" in out
+    assert "[pool] vllm: SUM of 2 role pools -> bytes=20.500 GiB" in out
+    assert "[PASS] vllm vs sglang: bytes gap 0.0000" in out
+
+
+def test_iso_cli_role_split_token_only_sum_uses_proxy_basis(
+        iso: dict, tmp_path: Path, monkeypatch, capsys) -> None:
+    _pin_roles(tmp_path, monkeypatch, {
+        "vllm:prefill": "INFO: # GPU blocks: 1000, # CPU blocks: 0\n",  # 16000 tok
+        "vllm:decode": "INFO: # GPU blocks: 1200, # CPU blocks: 0\n",   # 19200 tok
+        "sglang": "[x] max_total_num_tokens=35200, chunked_prefill_size=8192\n",
+    })
+    rc = iso["main"](["gate", "vllm,sglang"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "vllm: SUM of 2 role pools -> bytes=n/a tokens=35200" in out
+    assert "tokens gap 0.0000" in out and "PROXY basis" in out
+
+
+def test_iso_cli_duplicate_bare_key_refuses(iso: dict, tmp_path: Path,
+                                            monkeypatch, capsys) -> None:
+    """The verified defect: 'vllm=a,vllm=b' silently kept b. Paths deliberately
+    nonexistent — the refusal must fire BEFORE any log is read."""
+    monkeypatch.setenv("CAGE_ISO_BYTES_LOGS", "vllm=a.log,vllm=b.log")
+    monkeypatch.delenv("CAGE_ISO_BYTES_TOL", raising=False)
+    monkeypatch.delenv("CAGE_ISO_POOL_SUM_BYTES", raising=False)
+    rc = iso["main"](["gate", "vllm"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "duplicate key 'vllm'" in out
+
+
+def test_iso_cli_duplicate_alias_normalized_key_refuses(
+        iso: dict, monkeypatch, capsys) -> None:
+    """'lmdeploy-turbomind' aliases to 'lmdeploy'; the duplicate check must see
+    through the alias or last-wins survives in disguise."""
+    monkeypatch.setenv("CAGE_ISO_BYTES_LOGS",
+                       "lmdeploy=a.log,lmdeploy-turbomind=b.log")
+    monkeypatch.delenv("CAGE_ISO_BYTES_TOL", raising=False)
+    monkeypatch.delenv("CAGE_ISO_POOL_SUM_BYTES", raising=False)
+    rc = iso["main"](["gate", "lmdeploy"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "duplicate key 'lmdeploy'" in out
+
+
+def test_iso_cli_duplicate_role_key_refuses(iso: dict, monkeypatch,
+                                            capsys) -> None:
+    monkeypatch.setenv("CAGE_ISO_BYTES_LOGS",
+                       "vllm:prefill=a.log,vllm:prefill=b.log")
+    monkeypatch.delenv("CAGE_ISO_BYTES_TOL", raising=False)
+    monkeypatch.delenv("CAGE_ISO_POOL_SUM_BYTES", raising=False)
+    rc = iso["main"](["gate", "vllm"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "duplicate key 'vllm:prefill'" in out
+
+
+def test_iso_cli_bare_plus_role_mix_refuses(iso: dict, monkeypatch,
+                                            capsys) -> None:
+    """Bare + role pins for one engine are ambiguous (whole pool or another
+    role?) — fail-closed instead of guessing."""
+    monkeypatch.setenv("CAGE_ISO_BYTES_LOGS", "vllm=a.log,vllm:decode=b.log")
+    monkeypatch.delenv("CAGE_ISO_BYTES_TOL", raising=False)
+    monkeypatch.delenv("CAGE_ISO_POOL_SUM_BYTES", raising=False)
+    rc = iso["main"](["gate", "vllm"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "mixes bare 'vllm'" in out
+
+
+def test_iso_cli_missing_pinned_role_log_fails(iso: dict, tmp_path: Path,
+                                               monkeypatch, capsys) -> None:
+    decode = tmp_path / "vllm_decode.log"
+    decode.write_text(VLLM_DECODE_LOG, encoding="utf-8")
+    monkeypatch.setenv("CAGE_ISO_BYTES_LOGS",
+                       f"vllm:prefill={tmp_path / 'absent.log'},vllm:decode={decode}")
+    monkeypatch.delenv("CAGE_ISO_BYTES_TOL", raising=False)
+    monkeypatch.delenv("CAGE_ISO_POOL_SUM_BYTES", raising=False)
+    rc = iso["main"](["gate", "vllm"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "vllm:prefill" in out and "does not exist" in out
+
+
+def test_iso_cli_role_logs_with_no_common_channel_fail(
+        iso: dict, tmp_path: Path, monkeypatch, capsys) -> None:
+    """prefill reports only bytes, decode only tokens: summing across a hole
+    would fabricate a pool size, so the SUM must refuse to form."""
+    _pin_roles(tmp_path, monkeypatch, {
+        "vllm:prefill": VLLM_V0_LOG,      # bytes only
+        "vllm:decode": VLLM_LEGACY_LOG,   # tokens only
+    })
+    rc = iso["main"](["gate", "vllm"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "share no common channel" in out
+
+
+def test_iso_cli_pool_sum_within_tol_passes(iso: dict, tmp_path: Path,
+                                            monkeypatch, capsys) -> None:
+    expected_total = int(20.5 * GIB)  # cache_budget gate_j.expected_bytes_total
+    _pin_roles(tmp_path, monkeypatch,
+               {"vllm:prefill": VLLM_PREFILL_LOG, "vllm:decode": VLLM_DECODE_LOG},
+               pool_sum=expected_total)
+    rc = iso["main"](["gate", "vllm"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert (f"[PASS] vllm: pool SUM {expected_total} vs declared "
+            f"CAGE_ISO_POOL_SUM_BYTES={expected_total}") in out
+
+
+def test_iso_cli_pool_sum_out_of_tol_fails(iso: dict, tmp_path: Path,
+                                           monkeypatch, capsys) -> None:
+    _pin_roles(tmp_path, monkeypatch,
+               {"vllm:prefill": VLLM_PREFILL_LOG, "vllm:decode": VLLM_DECODE_LOG},
+               pool_sum=int(30 * GIB))  # realized 20.5 GiB: gap ~0.32
+    rc = iso["main"](["gate", "vllm"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "do NOT sum to the planned budget B" in out
+
+
+def test_iso_cli_pool_sum_with_no_role_split_is_operator_error(
+        iso: dict, tmp_path: Path, monkeypatch, capsys) -> None:
+    """A declared pool sum with nothing to sum means the operator believes a
+    P/D split is running that the pins do not describe — refuse."""
+    _pin_roles(tmp_path, monkeypatch, {"vllm": VLLM_PREFILL_LOG},
+               pool_sum=int(20.5 * GIB))
+    rc = iso["main"](["gate", "vllm"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "nothing to sum is operator error" in out
+
+
+def test_iso_cli_pool_sum_non_integer_refuses(iso: dict, tmp_path: Path,
+                                              monkeypatch, capsys) -> None:
+    _pin_roles(tmp_path, monkeypatch,
+               {"vllm:prefill": VLLM_PREFILL_LOG, "vllm:decode": VLLM_DECODE_LOG},
+               pool_sum="20GiB")
+    rc = iso["main"](["gate", "vllm"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "is not an integer" in out
+
+
+def test_iso_cli_pool_sum_token_only_roles_refuses(iso: dict, tmp_path: Path,
+                                                   monkeypatch, capsys) -> None:
+    """CAGE_ISO_POOL_SUM_BYTES is bytes-denominated by definition; token-only
+    role logs cannot certify it and must not proxy silently."""
+    _pin_roles(tmp_path, monkeypatch, {
+        "vllm:prefill": "INFO: # GPU blocks: 1000, # CPU blocks: 0\n",
+        "vllm:decode": "INFO: # GPU blocks: 1200, # CPU blocks: 0\n",
+    }, pool_sum=int(20.5 * GIB))
+    rc = iso["main"](["gate", "vllm"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "cannot be certified from token-only logs" in out
+
+
+def test_iso_cli_legacy_single_log_output_byte_identical(
+        iso: dict, tmp_path: Path, monkeypatch, capsys) -> None:
+    """T2.2 compatibility pin: with no role suffix in play, the gate's stdout
+    is byte-for-byte the pre-PD format (run-log tooling and the S0 evidence
+    trail key on these exact lines)."""
+    _write_logs(tmp_path, vllm=VLLM_V1_LOG, sglang=SGLANG_205_LOG)
+    monkeypatch.setenv("CAGE_ISO_BYTES_LOG_ROOT", str(tmp_path))
+    monkeypatch.delenv("CAGE_ISO_BYTES_TOL", raising=False)
+    monkeypatch.delenv("CAGE_ISO_BYTES_LOGS", raising=False)
+    monkeypatch.delenv("CAGE_ISO_POOL_SUM_BYTES", raising=False)
+    rc = iso["main"](["gate", "vllm,sglang"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    vp = tmp_path / "vllm" / "vllm_probe_20260818.log"
+    sp = tmp_path / "sglang" / "sglang_probe_20260818.log"
+    vb, sb = int(20.93 * GIB), int((10.25 + 10.25) * GIB)
+    gap = (vb - sb) / vb
+    assert out == (
+        f"  [pool] vllm: bytes={vb / GIB:.3f} GiB tokens=457343 "
+        f"log={vp} mtime={vp.stat().st_mtime:.0f}\n"
+        f"  [pool] sglang: bytes={sb / GIB:.3f} GiB tokens=430913 "
+        f"log={sp} mtime={sp.stat().st_mtime:.0f}\n"
+        f"  [PASS] vllm vs sglang: bytes gap {gap:.4f} <= tol 0.05\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -752,7 +992,7 @@ def test_datasets_gate_honors_runner_dataset_fallback(
 # end-to-end runs against the LIVE venv and synthetic requirements files.
 # ---------------------------------------------------------------------------
 
-_PIN_SHA = "df0eab4697aff133ff9dc76a7d45d8be706d89c0"
+_PIN_SHA = "4be3319ca51902f9aa0b40bab507c4a7f16296e3"
 
 
 def test_preflight_declares_pin_parity_gate() -> None:

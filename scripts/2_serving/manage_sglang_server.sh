@@ -38,6 +38,16 @@
 #   ./scripts/2_serving/manage_sglang_server.sh stop
 #   ./scripts/2_serving/manage_sglang_server.sh restart <model> [--no-prefix-cache]
 #   ./scripts/2_serving/manage_sglang_server.sh status
+#
+# Budget env contract (T2.1 — CacheBudgetPlanner wiring; charter P2 iso-bytes):
+#   CAGE_SGLANG_MAX_TOTAL_TOKENS  positive integer; when set, the launch adds
+#                                 `--max-total-tokens <N>` — SGLang's
+#                                 token-capped budget dial, derived by
+#                                 src/orchestration/cache_budget.py FROM the
+#                                 byte budget (bytes / kv_bytes_per_token).
+# The value is validated BEFORE any server is stopped or launched
+# (cage_validate_sglang_budget_env in scripts/lib/_serving_config.sh);
+# preflight gate (j) verifies the REALIZED pool bytes from the startup log.
 # =============================================================================
 
 set -euo pipefail
@@ -52,6 +62,17 @@ source "$PROJECT_DIR/scripts/lib/_common.sh"
 # Serving-uniformity source of truth (Option A) + §6.5 budget-mapping helpers.
 # shellcheck source=scripts/lib/_serving_config.sh
 source "$PROJECT_DIR/scripts/lib/_serving_config.sh"
+
+# Budget-knob refusal gate (T2.1): a malformed budget env must be refused
+# BEFORE any server is touched — on `restart` it must not even tear down the
+# healthy server it would fail to replace. Gated to launch commands only:
+# `stop` must never be blocked by a bad budget (teardown discipline).
+case "${1:-}" in
+    start|restart)
+        cage_validate_sglang_budget_env \
+            || die "invalid KV-budget environment (see refusal above) -- not touching any server"
+        ;;
+esac
 
 PORT="${SGLANG_PORT:-30000}"   # SGLangAdapter's default api_base port
 LOG_DIR="$PROJECT_DIR/logs/sglang"
@@ -148,6 +169,17 @@ start_server() {
         dials_match=true
         [[ "$live_cmd" == *"--mem-fraction-static $mem_fraction"* ]] || dials_match=false
         [[ "$live_cmd" == *"--context-length ${VLLM_MAX_MODEL_LEN}"* ]] || dials_match=false
+        # The token-cap budget knob (T2.1) is a dial too: reusing a server
+        # launched under a DIFFERENT budget (or none) labels data with a pool
+        # it never had. Requested => exact value must be live; absent => flag
+        # must be absent from the live cmdline.
+        if [ -n "${CAGE_SGLANG_MAX_TOTAL_TOKENS:-}" ]; then
+            # Space-anchored: a token cap that is a decimal prefix of the live
+            # value must not false-match (decade sweeps; verifier minor).
+            [[ " $live_cmd " == *" --max-total-tokens ${CAGE_SGLANG_MAX_TOTAL_TOKENS} "* ]] || dials_match=false
+        else
+            [[ "$live_cmd" != *"--max-total-tokens"* ]] || dials_match=false
+        fi
 
         if [ "$loaded_model" = "$model" ] && [ "$has_prefix_cache" = "$want_prefix_cache" ] \
            && [ "$dials_match" = "true" ] \
@@ -176,6 +208,15 @@ start_server() {
     sglang_args+=( --mem-fraction-static "$mem_fraction" )
     # Uniform context length (vLLM --max-model-len analogue).
     sglang_args+=( --context-length "${VLLM_MAX_MODEL_LEN}" )
+
+    # Token-capped KV budget (T2.1; CacheBudgetPlanner SGLang knob, derived
+    # FROM the byte budget). Passed in addition to the fraction dial — the
+    # token cap is the binding budget; gate (j) verifies realized pool bytes.
+    # Value was validated positive-integer at the top-of-script gate.
+    if [ -n "${CAGE_SGLANG_MAX_TOTAL_TOKENS:-}" ]; then
+        sglang_args+=( --max-total-tokens "${CAGE_SGLANG_MAX_TOTAL_TOKENS}" )
+        echo "KV token budget enabled: --max-total-tokens ${CAGE_SGLANG_MAX_TOTAL_TOKENS}"
+    fi
 
     # RadixAttention is default-ON; the cache-off arm disables it explicitly.
     if [ "$want_prefix_cache" = "false" ]; then
@@ -221,6 +262,7 @@ start_server() {
         SC_BUDGET_F="${VLLM_GPU_MEMORY_UTILIZATION}" \
         SC_DIAL_FLAG="--mem-fraction-static" \
         SC_DIAL_VALUE="$mem_fraction" \
+        SC_MAX_TOTAL_TOKENS="${CAGE_SGLANG_MAX_TOTAL_TOKENS:-}" \
         SC_KV_DTYPE="${SGLANG_KV_CACHE_DTYPE:-auto}" \
         SC_EAGER="${VLLM_ENFORCE_EAGER:-0}" \
         SC_ARGS="python3 -m sglang.launch_server ${sglang_args[*]}" \
@@ -243,6 +285,12 @@ cfg = {
         "flag": os.environ["SC_DIAL_FLAG"],
         "value": float(os.environ["SC_DIAL_VALUE"]),
     },
+    # T2.1 token-cap budget knob; null = knob not requested (fraction-only
+    # launch), honest absence rather than a fabricated 0.
+    "max_total_tokens": (
+        int(os.environ["SC_MAX_TOTAL_TOKENS"])
+        if os.environ.get("SC_MAX_TOTAL_TOKENS") else None
+    ),
     "kv_cache_dtype": os.environ.get("SC_KV_DTYPE") or "auto",
     "enforce_eager": os.environ.get("SC_EAGER") == "1",
     "args": os.environ["SC_ARGS"],

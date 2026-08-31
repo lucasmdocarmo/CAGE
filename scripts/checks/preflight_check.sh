@@ -409,6 +409,18 @@ fi
 # pairwise parity within CAGE_ISO_BYTES_TOL (default 0.05 relative). Scope
 # follows CAGE_PREFLIGHT_BACKENDS; pin exact logs (e.g. one budget point of a
 # pressure sweep) with CAGE_ISO_BYTES_LOGS="vllm=/path/a.log,sglang=/path/b.log".
+# Role-split (prefill/decode disaggregation) logs pin as 'engine:role=path'
+# (roles are free-form tokens, e.g. vllm:prefill=a.log,vllm:decode=b.log):
+# each role log is parsed alone and the engine enters cross-engine parity with
+# its role pools SUMMED (charter §6.5: budget B = pools SUMMED). Optional
+# CAGE_ISO_POOL_SUM_BYTES=<int> (feed it gate_j.expected_bytes_total from
+# src/orchestration/cache_budget.py) additionally asserts each role-split
+# engine's summed realized bytes against that budget within CAGE_ISO_BYTES_TOL;
+# setting it with NO role-split logs pinned is operator error and FAILS.
+# Duplicate engine[:role] keys REFUSE loudly -- never silent last-wins.
+# NOTE: the RUNBOOK env-contract table does not yet carry the PD-grammar row
+# (engine[:role]= / CAGE_ISO_POOL_SUM_BYTES); this comment is the contract
+# until that row lands.
 # Parsers are fixture-tested locally (tests/test_preflight_gates.py); the LIVE
 # execution against real engine logs happens at S0.
 # ---------------------------------------------------------------------------
@@ -592,43 +604,172 @@ def main(argv):
               f"vacuous or impossible tolerance")
         return 1
 
+    # pins: engine -> {role_or_None: Path}. role None = the legacy bare
+    # 'engine=path' form (one whole-pool log); role tokens are free-form
+    # ('engine:role=path', split on the FIRST colon). Duplicate engine[:role]
+    # keys and a bare+role mix for one engine both REFUSE: either would make
+    # which log counts a silent coin-flip.
     pins = {}
+    seen_keys = set()
     for entry in os.environ.get("CAGE_ISO_BYTES_LOGS", "").split(","):
         entry = entry.strip()
         if not entry:
             continue
         if "=" not in entry:
-            print(f"  [FAIL] CAGE_ISO_BYTES_LOGS entry {entry!r} is not engine=path")
+            print(f"  [FAIL] CAGE_ISO_BYTES_LOGS entry {entry!r} is not engine[:role]=path")
             return 1
-        eng, _, path = entry.partition("=")
+        key, _, path = entry.partition("=")
+        eng, colon, role = key.strip().partition(":")
         eng = eng.strip()
-        pins["lmdeploy" if eng == "lmdeploy-turbomind" else eng] = Path(path.strip())
+        eng = "lmdeploy" if eng == "lmdeploy-turbomind" else eng
+        role = role.strip() if colon else None
+        if not eng or (colon and not role):
+            print(f"  [FAIL] CAGE_ISO_BYTES_LOGS key {key.strip()!r} is malformed "
+                  f"(want engine or engine:role)")
+            return 1
+        norm_key = eng if role is None else f"{eng}:{role}"
+        if norm_key in seen_keys:
+            print(f"  [FAIL] CAGE_ISO_BYTES_LOGS duplicate key {norm_key!r} -- each "
+                  f"engine[:role] may be pinned exactly once (silent last-wins "
+                  f"would hide a log from the §6.5 gate)")
+            return 1
+        seen_keys.add(norm_key)
+        pins.setdefault(eng, {})[role] = Path(path.strip())
+    for eng, eng_pins in pins.items():
+        if None in eng_pins and len(eng_pins) > 1:
+            print(f"  [FAIL] CAGE_ISO_BYTES_LOGS mixes bare {eng!r} with role-split "
+                  f"{eng}:<role> entries -- ambiguous whether the bare log is the "
+                  f"whole pool or another role; pin one form only")
+            return 1
+
+    pool_sum_raw = os.environ.get("CAGE_ISO_POOL_SUM_BYTES")
+    pool_sum = None
+    if pool_sum_raw is not None:
+        try:
+            pool_sum = int(pool_sum_raw.strip())
+        except ValueError:
+            print(f"  [FAIL] CAGE_ISO_POOL_SUM_BYTES={pool_sum_raw!r} is not an integer")
+            return 1
+        if pool_sum <= 0:
+            print(f"  [FAIL] CAGE_ISO_POOL_SUM_BYTES={pool_sum} is not a positive "
+                  f"byte count")
+            return 1
+        if not any(role is not None
+                   for eng in engines for role in pins.get(eng, {})):
+            print("  [FAIL] CAGE_ISO_POOL_SUM_BYTES is set but CAGE_ISO_BYTES_LOGS "
+                  "pins no role-split (engine:role) log in scope -- a declared "
+                  "pool sum with nothing to sum is operator error; drop the env "
+                  "or pin the role logs")
+            return 1
 
     log_root = Path(os.environ.get("CAGE_ISO_BYTES_LOG_ROOT", "logs"))
     readings, ok = [], True
     for engine in engines:
-        path = pins.get(engine) or newest_log(log_root, engine)
-        if path is None or not path.is_file():
-            print(f"  [FAIL] {engine}: no startup log under {log_root / engine}/ "
-                  f"-- launch the engine via scripts/2_serving/ first or pin "
-                  f"CAGE_ISO_BYTES_LOGS; scope down CAGE_PREFLIGHT_BACKENDS "
-                  f"ONLY as a recorded deviation")
+        engine_pins = pins.get(engine, {})
+        role_pins = {r: p for r, p in engine_pins.items() if r is not None}
+        if not role_pins:
+            path = engine_pins.get(None) or newest_log(log_root, engine)
+            if path is None or not path.is_file():
+                print(f"  [FAIL] {engine}: no startup log under {log_root / engine}/ "
+                      f"-- launch the engine via scripts/2_serving/ first or pin "
+                      f"CAGE_ISO_BYTES_LOGS; scope down CAGE_PREFLIGHT_BACKENDS "
+                      f"ONLY as a recorded deviation")
+                ok = False
+                continue
+            try:
+                reading = parse_engine_log(
+                    engine, path.read_text(encoding="utf-8", errors="replace"))
+            except IsoBytesError as exc:
+                print(f"  [FAIL] {engine}: {exc} (log: {path})")
+                ok = False
+                continue
+            reading["log"] = str(path)
+            readings.append(reading)
+            size = "n/a" if reading["bytes"] is None else f"{reading['bytes'] / GIB:.3f} GiB"
+            toks = "n/a" if reading["tokens"] is None else str(reading["tokens"])
+            # mtime printed so a STALE log (older budget point) is visible in the run log.
+            print(f"  [pool] {engine}: bytes={size} tokens={toks} "
+                  f"log={path} mtime={path.stat().st_mtime:.0f}")
+            continue
+        # Role-split (P/D disaggregation): parse each role log alone, then the
+        # engine enters cross-engine parity as the SUM of its role pools
+        # (charter §6.5: budget B = pools SUMMED). Role logs are always
+        # explicit pins -- newest-log discovery cannot tell roles apart.
+        parts, engine_ok = [], True
+        for role, path in role_pins.items():
+            label = f"{engine}:{role}"
+            if not path.is_file():
+                print(f"  [FAIL] {label}: pinned role log {path} does not exist -- "
+                      f"every engine:role entry in CAGE_ISO_BYTES_LOGS must point "
+                      f"at a real startup log")
+                engine_ok = False
+                continue
+            try:
+                part = parse_engine_log(
+                    engine, path.read_text(encoding="utf-8", errors="replace"))
+            except IsoBytesError as exc:
+                print(f"  [FAIL] {label}: {exc} (log: {path})")
+                engine_ok = False
+                continue
+            part["log"] = str(path)
+            parts.append(part)
+            size = "n/a" if part["bytes"] is None else f"{part['bytes'] / GIB:.3f} GiB"
+            toks = "n/a" if part["tokens"] is None else str(part["tokens"])
+            print(f"  [pool] {label}: bytes={size} tokens={toks} "
+                  f"log={path} mtime={path.stat().st_mtime:.0f}")
+        if not engine_ok:
             ok = False
             continue
-        try:
-            reading = parse_engine_log(
-                engine, path.read_text(encoding="utf-8", errors="replace"))
-        except IsoBytesError as exc:
-            print(f"  [FAIL] {engine}: {exc} (log: {path})")
+        # A channel sums only when EVERY role log carries it -- summing a
+        # present value with an absent one would fabricate a pool size.
+        agg_bytes = (None if any(p["bytes"] is None for p in parts)
+                     else sum(p["bytes"] for p in parts))
+        agg_tokens = (None if any(p["tokens"] is None for p in parts)
+                      else sum(p["tokens"] for p in parts))
+        if agg_bytes is None and agg_tokens is None:
+            print(f"  [FAIL] {engine}: role logs share no common channel (one "
+                  f"reports only bytes, another only tokens) -- the §6.5 pool "
+                  f"SUM cannot be formed; capture log variants carrying the "
+                  f"missing channel")
             ok = False
             continue
-        reading["log"] = str(path)
-        readings.append(reading)
-        size = "n/a" if reading["bytes"] is None else f"{reading['bytes'] / GIB:.3f} GiB"
-        toks = "n/a" if reading["tokens"] is None else str(reading["tokens"])
-        # mtime printed so a STALE log (older budget point) is visible in the run log.
-        print(f"  [pool] {engine}: bytes={size} tokens={toks} "
-              f"log={path} mtime={path.stat().st_mtime:.0f}")
+        readings.append({
+            "engine": engine,
+            "bytes": agg_bytes,
+            "tokens": agg_tokens,
+            "evidence": [line for p in parts for line in p["evidence"]],
+            "log": ",".join(p["log"] for p in parts),
+            "pd_roles": len(parts),
+        })
+        size = "n/a" if agg_bytes is None else f"{agg_bytes / GIB:.3f} GiB"
+        toks = "n/a" if agg_tokens is None else str(agg_tokens)
+        print(f"  [pool] {engine}: SUM of {len(parts)} role pools -> "
+              f"bytes={size} tokens={toks}")
+    if pool_sum is not None:
+        # Charter §6.5 budget assertion: each role-split engine's realized
+        # pools must SUM to the planned budget B (cache_budget.py emits it as
+        # gate_j.expected_bytes_total). Bytes-denominated by definition, so
+        # token-only role logs cannot certify it and FAIL.
+        for reading in readings:
+            if "pd_roles" not in reading:
+                continue
+            engine = reading["engine"]
+            if reading["bytes"] is None:
+                print(f"  [FAIL] {engine}: CAGE_ISO_POOL_SUM_BYTES declared but the "
+                      f"role logs carry no bytes channel -- a BYTES pool sum "
+                      f"cannot be certified from token-only logs")
+                ok = False
+                continue
+            gap = relative_gap(reading["bytes"], pool_sum)
+            if gap <= tol:
+                print(f"  [PASS] {engine}: pool SUM {reading['bytes']} vs declared "
+                      f"CAGE_ISO_POOL_SUM_BYTES={pool_sum}: gap {gap:.4f} <= tol {tol}")
+            else:
+                print(f"  [FAIL] {engine}: pool SUM {reading['bytes']} vs declared "
+                      f"CAGE_ISO_POOL_SUM_BYTES={pool_sum}: gap {gap:.4f} > tol {tol} "
+                      f"-- realized P/D pools do NOT sum to the planned budget B "
+                      f"(charter §6.5); fix the pool split before spending GPU time")
+                ok = False
     if not ok:
         return 1
     if len(readings) < 2:

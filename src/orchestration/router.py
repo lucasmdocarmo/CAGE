@@ -210,6 +210,7 @@ class PrefixAwareRouter:
                 "transfer_required": False,
                 "transfer_bytes": 0,
                 "transfer_latency_ms": 0.0,
+                "source": "simulated",
             }
             routing_mode = "prefix_hash" if self.strategy != "round_robin" else "round_robin"
         else:
@@ -236,6 +237,14 @@ class PrefixAwareRouter:
             "prefix_token_count": len(prefix_tokens),
             "tokenizer_name": self.tokenizer_name or None,
             "tokenization_mode": self.tokenization_mode,
+            # Provenance (T3.3): this payload feeds the x-kv-transfer-params
+            # header and the per-row kv_transfer_params column, which the
+            # campaign-mode distributed gate audits. The transfer cost here is
+            # asyncio.sleep-simulated, so an absent cache-manager stamp
+            # defaults to "simulated" (mislabeling real as simulated is the
+            # refusable direction; the reverse would green-light simulation as
+            # measurement). A real connector path must stamp e.g. "nixl".
+            "source": str(sim_result.get("source") or "simulated"),
         }
 
     def set_strategy(self, strategy: str):

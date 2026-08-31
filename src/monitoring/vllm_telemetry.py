@@ -158,37 +158,77 @@ class VllmTelemetrySampler:
              "spec_decode", "spec_active", "spec_acceptance", "spec_accepted_per_draft")
 
     def __init__(self, url: str, *, interval: float = 1.0,
-                 metrics_path: str = "/metrics"):
+                 metrics_path: str = "/metrics", dialect: str = "vllm"):
         self.url = url
         self.interval = max(0.25, float(interval))
         self.metrics_path = metrics_path
+        # Per-backend metrics dialect (T4.3), forwarded to capture_snapshot()
+        # every tick. "vllm" is byte-identical to the pre-dialect sampler;
+        # "sglang" makes cage-stats translate SGLang's /metrics families. A
+        # sampler pointed at an SGLang server WITHOUT this would silently
+        # aggregate vllm-named absence into an empty series.
+        self.dialect = dialect
         self._samples: list = []
         self._sample_ts: list = []  # wall-clock capture time, parallel to _samples
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._nvml_handle = None
+        self._nvml_handles: Optional[list] = None  # index-aligned; None slot = bad handle
         self._nvml_failed = False
 
-    def _read_energy_mj(self) -> Optional[float]:
-        """Cumulative GPU energy (millijoules) via NVML, or None when unavailable.
+    def _read_energy_mj(self) -> "tuple[Optional[float], Optional[list]]":
+        """Cumulative GPU energy (mJ) via NVML: (sum over ALL GPUs, per-GPU list).
 
-        Reads ``pynvml.nvmlDeviceGetTotalEnergyConsumption`` (mJ since driver load)
-        once per sampler tick so ``aggregate()`` can emit ``energy_delta_mj`` and
-        J/token = delta / 1000 / tokens is computable offline. ImportError (pynvml
-        absent) or NVMLError (e.g. NotSupported on this GPU/driver) permanently
-        disables the probe for this sampler -> None, never a fabricated number.
+        Reads ``pynvml.nvmlDeviceGetTotalEnergyConsumption`` (mJ since driver
+        load) for EVERY ``nvmlDeviceGetCount()`` device once per sampler tick.
+        Under tensor parallelism the model spans N GPUs, so the historical
+        index-0-only read under-counted energy by 1/N: the first element — the
+        value the existing ``energy_mj`` snapshot field now carries — is the
+        SUM across all devices (the TP-correct total), and the second is the
+        per-GPU breakdown, index-aligned with NVML device indices (None for a
+        device whose read failed this tick). One bad handle must not zero the
+        rest: each device is guarded individually and the sum spans whichever
+        devices answered (the list records which). ImportError (pynvml absent)
+        or nvmlInit/count failure permanently disables the probe for this
+        sampler -> (None, None), never a fabricated number.
         """
         if self._nvml_failed:
-            return None
+            return (None, None)
         try:
             import pynvml
-            if self._nvml_handle is None:
-                pynvml.nvmlInit()
-                self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-            return float(pynvml.nvmlDeviceGetTotalEnergyConsumption(self._nvml_handle))
         except Exception:
             self._nvml_failed = True
-            return None
+            return (None, None)
+        if self._nvml_handles is None:
+            try:
+                pynvml.nvmlInit()
+                count = int(pynvml.nvmlDeviceGetCount())
+            except Exception:
+                self._nvml_failed = True
+                return (None, None)
+            handles: list = []
+            for i in range(count):
+                try:
+                    handles.append(pynvml.nvmlDeviceGetHandleByIndex(i))
+                except Exception:
+                    handles.append(None)
+            self._nvml_handles = handles
+        if not self._nvml_handles:
+            return (None, None)  # zero devices: absence stays absence
+        per_gpu: list = []
+        for handle in self._nvml_handles:
+            if handle is None:
+                per_gpu.append(None)
+                continue
+            try:
+                per_gpu.append(
+                    float(pynvml.nvmlDeviceGetTotalEnergyConsumption(handle))
+                )
+            except Exception:
+                per_gpu.append(None)
+        readings = [v for v in per_gpu if v is not None]
+        if not readings:
+            return (None, per_gpu)
+        return (sum(readings), per_gpu)
 
     def start(self) -> "VllmTelemetrySampler":
         if self._thread is not None:
@@ -202,14 +242,26 @@ class VllmTelemetrySampler:
         while not self._stop.is_set():
             t0 = time.time()
             try:
-                snap = capture_snapshot(self.url, metrics_path=self.metrics_path)
+                snap = capture_snapshot(
+                    self.url, metrics_path=self.metrics_path, dialect=self.dialect
+                )
                 if snap:
-                    # Once per tick: cumulative NVML energy (mJ), None if unsupported.
-                    snap["energy_mj"] = self._read_energy_mj()
+                    # Once per tick: cumulative NVML energy (mJ), None if
+                    # unsupported. energy_mj = SUM across ALL visible GPUs
+                    # (TP-correct total); the per-GPU breakdown rides alongside.
+                    total_mj, per_gpu_mj = self._read_energy_mj()
+                    snap["energy_mj"] = total_mj
+                    snap["energy_mj_per_gpu"] = per_gpu_mj
                     self._samples.append(snap)
                     self._sample_ts.append(t0)
-            except Exception:
-                pass
+            except Exception as e:
+                # capture_snapshot swallows flaky-network internally (returns
+                # None); a raise reaching here is its fail-loud dialect-support
+                # probe. Surface it ONCE and stop the thread — a silent
+                # per-tick swallow would launder "unsupported dialect" into an
+                # empty-but-plausible telemetry absence.
+                print(f"[telemetry] sampler aborted: {e}")
+                return
             dt = self.interval - (time.time() - t0)
             if dt > 0:
                 self._stop.wait(dt)
@@ -272,12 +324,28 @@ class VllmTelemetrySampler:
             if vals:
                 agg[k] = max(vals)  # monotonic counters: final value
         # NVML energy: last-first of the cumulative mJ counter across the workload,
-        # so J/token = energy_delta_mj / 1000 / tokens is computable offline. Absent
-        # (pynvml missing / unsupported GPU) -> no key, never a fabricated zero.
+        # so J/token = energy_delta_mj / 1000 / tokens is computable offline. Since
+        # T4.4 the per-tick energy_mj is the SUM across ALL GPUs, so this delta is
+        # the TP-correct multi-GPU total (field name preserved; single-GPU hosts
+        # are numerically unchanged). Absent (pynvml missing / unsupported GPU)
+        # -> no key, never a fabricated zero.
         energies = [s.get("energy_mj") for s in samples
                     if isinstance(s.get("energy_mj"), (int, float))]
         if len(energies) >= 2:
             agg["energy_delta_mj"] = round(energies[-1] - energies[0], 3)
+        # Per-GPU attribution: last-first per NVML index, only where BOTH endpoint
+        # ticks carried a reading for that device; otherwise None for that slot
+        # (a partially-failing handle yields an honest hole, not a zero).
+        per_lists = [s.get("energy_mj_per_gpu") for s in samples
+                     if isinstance(s.get("energy_mj_per_gpu"), list)]
+        if len(per_lists) >= 2:
+            first, final = per_lists[0], per_lists[-1]
+            agg["energy_delta_mj_per_gpu"] = [
+                round(b - a, 3)
+                if isinstance(a, (int, float)) and isinstance(b, (int, float))
+                else None
+                for a, b in zip(first, final)
+            ]
         last = samples[-1]
         for k in self._LAST:
             if last.get(k) is not None:

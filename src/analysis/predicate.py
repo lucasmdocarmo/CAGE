@@ -23,11 +23,16 @@ freeze):
   analysis and the executed predicate agree. Continuous F1 stays the
   ADR-0087 exploratory companion, never the predicate.
 - **Qasper — groundedness-based**: Instrument A (LettuceDetect,
-  ``grounding_score``) at calibrated τ. The τ VALUE is an OPEN owner decision
-  (task #120 / Topic-6 F7: charter names "Instrument A at calibrated τ" but
-  the only registered τ, 0.817024, is Instrument B's) — so τ is an EXPLICIT
-  config field with NO default: qasper rows without a configured τ REFUSE,
-  never silently borrow a threshold.
+  ``grounding_score``) at the calibrated τ. The τ decision is EXECUTED
+  (task #120, calibration run 2026-08-19): τ* = 0.995516 (registered
+  decimal 0.9955156950672646), selected by rule
+  ``max_balanced_accuracy_pooled_v1`` and FROZEN in the registration
+  artifact ``MyDocs/registration/freeze_resolutions.json`` (key
+  ``QASPER_TAU``). τ stays an EXPLICIT config field with NO default here:
+  the value is CONSUMED from the freeze artifact
+  (``build_predicate_table.py`` — ``--freeze-file`` /
+  ``$CAGE_FREEZE_RESOLUTIONS``), never hard-coded, and qasper rows without
+  a configured τ still REFUSE rather than borrow a threshold.
 - **Contradiction and neutral reported separately** (§8.5 claim-pipeline
   protocol: misread evidence vs invented claim are different bugs): the
   3-class NLI columns (``faithfulness_contradiction`` /
@@ -118,9 +123,13 @@ class PredicateConfig:
     default — the caller states the bound.
 
     ``qasper_tau`` is the Instrument-A groundedness threshold for the Qasper
-    branch. Task #120 owns the value (Topic-6 F7: no Instrument-A τ is
-    registered anywhere), so there is NO default: ``None`` is legal only for
-    trees without qasper rows, and a qasper window under ``None`` refuses.
+    branch. The registered value (τ* = 0.9955156950672646, rule
+    max_balanced_accuracy_pooled_v1, calibrated 2026-08-19) lives in the
+    freeze artifact MyDocs/registration/freeze_resolutions.json and is
+    resolved from there by the build_predicate_table CLI (#120 executed).
+    This module keeps NO default: ``None`` is legal only for trees without
+    qasper rows, and a qasper window under ``None`` refuses — the value
+    arrives by consuming the artifact, never as a constant in code.
     """
 
     max_null_fraction: float
@@ -293,8 +302,11 @@ def compute_window_predicate(
         raise PredicateError(
             f"{window}: dataset {dataset!r} takes the §8.5 groundedness "
             "branch (Instrument A at calibrated τ) but no qasper_tau is "
-            "configured — the τ pairing is an OPEN owner decision (task "
-            "#120 / Topic-6 F7); refusing to default"
+            "configured — the registered τ (task #120, calibrated "
+            "2026-08-19) is frozen in MyDocs/registration/"
+            "freeze_resolutions.json (QASPER_TAU); consume it via "
+            "build_predicate_table --freeze-file / $CAGE_FREEZE_RESOLUTIONS "
+            "instead of defaulting in code"
         )
     if not any(column in row for row in joined_rows):
         raise PredicateError(

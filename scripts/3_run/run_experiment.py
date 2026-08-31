@@ -518,6 +518,111 @@ def validate_distributed_artifacts(
     }
 
 
+# The ONLY transfer sources that count as campaign evidence. Extending this
+# set is a deliberate act that accompanies a REAL connector integration
+# (Wave-3 T4.5) — never a convenience for an unrecognized stamp.
+_REAL_TRANSFER_SOURCES: frozenset = frozenset({"nixl"})
+
+
+def enforce_campaign_transfer_provenance(results: List[Dict[str, Any]]) -> None:
+    """Campaign-mode PD gate (T3.3, fail-closed): refuse non-real transfer data.
+
+    The ONLY producer of kv_transfer_params today is SimulatedKVCacheManager
+    (router-attached, asyncio.sleep latency). validate_distributed_artifacts
+    checks that transfer metadata EXISTS, so on its own it would green-light
+    simulation as measurement. In campaign mode every row's kv_transfer_params
+    must therefore prove REAL provenance (source normalized case/whitespace):
+
+      - source == "simulated"        -> RuntimeError (model output, not evidence)
+      - source missing/unparseable   -> RuntimeError (unknown provenance is not
+                                        evidence; a real KV-connector integration
+                                        must stamp source:"nixl" or similar)
+      - source not in the            -> RuntimeError (an unrecognized stamp is
+        _REAL_TRANSFER_SOURCES          unknown provenance too — the allowlist
+        allowlist                       grows only with a real integration)
+
+    Pilot (non-campaign) runs never reach this gate; their behavior is unchanged.
+    Rows accept the column as either the JSON string the results writer stores
+    or an already-parsed dict.
+    """
+    for idx, row in enumerate(results):
+        raw = row.get("kv_transfer_params")
+        if raw is None or raw == "":
+            # Row-level ABSENCE is handled by validate_distributed_artifacts
+            # (a run with zero nonempty rows already hard-fails there).
+            continue
+        row_id = row.get("example_id", f"row {idx}")
+        if isinstance(raw, dict):
+            payload: Any = raw
+        else:
+            try:
+                payload = json.loads(str(raw))
+            except Exception:
+                raise RuntimeError(
+                    f"CAMPAIGN PD GATE: kv_transfer_params for {row_id!r} is "
+                    f"unparseable ({str(raw)[:120]!r}) — unknown provenance is "
+                    "not evidence for a campaign distributed run."
+                )
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"CAMPAIGN PD GATE: kv_transfer_params for {row_id!r} is not an "
+                f"object ({type(payload).__name__}) — unknown provenance is not "
+                "evidence for a campaign distributed run."
+            )
+        source = payload.get("source")
+        # Case/whitespace-normalized so "Simulated"/"SIMULATED" cannot slip
+        # past the refusal as "real provenance" (2026-08-30 verifier minor).
+        src_norm = str(source).strip().lower() if source is not None else ""
+        if src_norm == "simulated":
+            raise RuntimeError(
+                f"CAMPAIGN PD GATE: kv_transfer_params for {row_id!r} carries "
+                'source=="simulated" (SimulatedKVCacheManager / router '
+                "asyncio.sleep latency). Campaign PD windows require REAL KV "
+                "connector metrics (e.g. NIXL) — simulated transfer data must "
+                "never be published as campaign measurement. Run this cell as a "
+                "pilot (no --campaign-root) or wire a real connector."
+            )
+        if not src_norm:
+            raise RuntimeError(
+                f"CAMPAIGN PD GATE: kv_transfer_params for {row_id!r} lacks a "
+                '"source" field — unknown provenance is not evidence. A real '
+                'connector integration must stamp source:"nixl" (or similar) '
+                "when built; the in-repo simulator stamps source:\"simulated\"."
+            )
+        if src_norm not in _REAL_TRANSFER_SOURCES:
+            raise RuntimeError(
+                f"CAMPAIGN PD GATE: kv_transfer_params for {row_id!r} carries "
+                f"unrecognized source {source!r} — only verified real-connector "
+                f"sources {sorted(_REAL_TRANSFER_SOURCES)} count as campaign "
+                "evidence. Extend the allowlist ONLY when a real integration "
+                "lands (unknown provenance is not evidence)."
+            )
+
+
+def resolve_telemetry_dialect(backend: str) -> Optional[str]:
+    """Metrics dialect for the serving-telemetry sampler, or None = LOUD skip.
+
+    T4.3 per-backend dialect. "sglang" makes cage-stats translate SGLang's own
+    /metrics families; every other sampled backend keeps the vllm-named
+    default. LMDeploy returns None because cage-stats has no LMDeploy dialect
+    and there is NO evidence it serves vLLM-named metric families — sampling
+    it with dialect="vllm" would fabricate an empty-but-plausible series, so
+    the honest outcome is an ABSENT telemetry series (regime labeling then
+    refuses those windows) announced by the print below, never a silent skip.
+    """
+    if backend in {"lmdeploy", "lmdeploy-turbomind"}:
+        print(
+            "[telemetry] LOUD SKIP: no telemetry sampler for backend "
+            f"'{backend}' — cage-stats has no LMDeploy dialect and vLLM-named "
+            "metrics were not verified on this engine. Telemetry series will "
+            "be ABSENT for this backend (regime labeling refuses such windows)."
+        )
+        return None
+    if backend == "sglang":
+        return "sglang"
+    return "vllm"
+
+
 def chunked(items: List[Any], size: int) -> List[List[Any]]:
     if size <= 0:
         return [items]
@@ -2634,15 +2739,22 @@ def run_experiment(
     # so throughput / KV-usage / prefix-hit reflect the ACTIVE run.
     vllm_sampler = None
     if vllm_telemetry:
-        try:
-            from src.monitoring.vllm_telemetry import VllmTelemetrySampler
-            # Start the sampler whenever telemetry is requested -- NOT gated on cage-stats.
-            # capture_snapshot() falls back to a dependency-free /metrics scraper, so
-            # speculative-decode acceptance is sampled even when cage-stats is absent
-            # (Phase-2 gap: the cage-stats gate skipped the scraper -> acceptance was None).
-            vllm_sampler = VllmTelemetrySampler(api_base, interval=1.0).start()
-        except Exception as e:
-            print(f"[telemetry] sampler not started: {e}")
+        # T4.3: dialect per backend; None = LOUD skip (LMDeploy — no dialect,
+        # no evidence of vLLM-named families; absent series is the honest
+        # outcome and regime labeling will refuse those windows).
+        _telemetry_dialect = resolve_telemetry_dialect(backend)
+        if _telemetry_dialect is not None:
+            try:
+                from src.monitoring.vllm_telemetry import VllmTelemetrySampler
+                # Start the sampler whenever telemetry is requested -- NOT gated on cage-stats.
+                # capture_snapshot() falls back to a dependency-free /metrics scraper, so
+                # speculative-decode acceptance is sampled even when cage-stats is absent
+                # (Phase-2 gap: the cage-stats gate skipped the scraper -> acceptance was None).
+                vllm_sampler = VllmTelemetrySampler(
+                    api_base, interval=1.0, dialect=_telemetry_dialect
+                ).start()
+            except Exception as e:
+                print(f"[telemetry] sampler not started: {e}")
 
     # Measurement-window bounds on the SAME clock as the telemetry sampler's
     # per-tick `ts` (epoch seconds, time.time() — see VllmTelemetrySampler._run):
@@ -3004,6 +3116,11 @@ def run_experiment(
 
     distributed_summary: Optional[Dict[str, Any]] = None
     if baseline_config.baseline_type.value == "distributed":
+        # Campaign mode ONLY (task #116 gating pattern): the provenance gate
+        # runs BEFORE validate_distributed_artifacts, which would otherwise
+        # green-light simulator-produced kv_transfer_params as measurement.
+        if campaign_session is not None:
+            enforce_campaign_transfer_provenance(results)
         require_distinct_replicas = (
             str(os.getenv("CAGE_REQUIRE_DISTINCT_REPLICAS", "0")).lower()
             in {"1", "true", "yes", "on"}

@@ -12,6 +12,23 @@
 #   ./scripts/2_serving/manage_vllm_server.sh stop
 #   ./scripts/2_serving/manage_vllm_server.sh restart <model>
 #   ./scripts/2_serving/manage_vllm_server.sh status
+#
+# Budget env contract (T2.1 — CacheBudgetPlanner wiring; charter P2 iso-bytes):
+#   CAGE_KV_BUDGET_BYTES          positive integer; when set, the launch adds
+#                                 `--kv-cache-memory-bytes <B>` (the planner's
+#                                 PRIMARY vLLM knob). The fraction flag below is
+#                                 still passed — the bytes knob is the BINDING
+#                                 cap on the KV pool. If the pinned vLLM rejects
+#                                 the flag the server fails to START: that is the
+#                                 acceptable fail-closed outcome, never a silent
+#                                 fraction-only fallback [VERIFY-LIVE at S0-19].
+#   CAGE_VLLM_GPU_BLOCKS_OVERRIDE positive integer; when set INSTEAD, the launch
+#                                 adds `--num-gpu-blocks-override <N>` (fallback
+#                                 knob). Setting BOTH is a refusal (they cap the
+#                                 same pool in different units).
+# Values are validated BEFORE any server is stopped or launched
+# (cage_validate_vllm_budget_env in scripts/lib/_serving_config.sh); preflight
+# gate (j) verifies the REALIZED bytes from the startup log, never the dial.
 # =============================================================================
 
 set -euo pipefail
@@ -31,6 +48,17 @@ source "$PROJECT_DIR/scripts/lib/_common.sh"
 # (vllm/sglang/lmdeploy) source it, pinned by test_scripts_doctrine.py.
 # shellcheck source=scripts/lib/_serving_config.sh
 source "$PROJECT_DIR/scripts/lib/_serving_config.sh"
+
+# Budget-knob refusal gate (T2.1): a malformed budget env must be refused
+# BEFORE any server is touched — on `restart` it must not even tear down the
+# healthy server it would fail to replace. Gated to launch commands only:
+# `stop` must never be blocked by a bad budget (teardown discipline).
+case "${1:-}" in
+    start|restart)
+        cage_validate_vllm_budget_env \
+            || die "invalid KV-budget environment (see refusal above) -- not touching any server"
+        ;;
+esac
 
 PORT="${VLLM_PORT:-8000}"
 LOG_DIR="$PROJECT_DIR/logs/vllm"
@@ -135,6 +163,22 @@ start_server() {
         dials_match=true
         [[ "$live_cmd" == *"--max-model-len ${VLLM_MAX_MODEL_LEN:-4096}"* ]] || dials_match=false
         [[ "$live_cmd" == *"--gpu-memory-utilization ${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"* ]] || dials_match=false
+        # The byte-budget knobs (T2.1) are dials too: reusing a server launched
+        # under a DIFFERENT budget (or none) labels data with a pool it never
+        # had. Requested => exact value must be live; absent => flag must be
+        # absent from the live cmdline.
+        if [ -n "${CAGE_KV_BUDGET_BYTES:-}" ]; then
+            # Space-anchored: 1000000000 must NOT match a live 10000000000 —
+            # decade budget sweeps make prefix pairs routine (verifier minor).
+            [[ " $live_cmd " == *" --kv-cache-memory-bytes ${CAGE_KV_BUDGET_BYTES} "* ]] || dials_match=false
+        else
+            [[ "$live_cmd" != *"--kv-cache-memory-bytes"* ]] || dials_match=false
+        fi
+        if [ -n "${CAGE_VLLM_GPU_BLOCKS_OVERRIDE:-}" ]; then
+            [[ " $live_cmd " == *" --num-gpu-blocks-override ${CAGE_VLLM_GPU_BLOCKS_OVERRIDE} "* ]] || dials_match=false
+        else
+            [[ "$live_cmd" != *"--num-gpu-blocks-override"* ]] || dials_match=false
+        fi
 
         # Reuse the running server ONLY when no serving lever is requested. The running
         # check cannot read back the live --speculative-config / --kv-cache-dtype, so if
@@ -215,6 +259,23 @@ start_server() {
     # silently diverged on manual restarts (2026-07-15 audit, serving-uniformity gap).
     vllm_args+=( --max-model-len "${VLLM_MAX_MODEL_LEN:-4096}" )
     vllm_args+=( --gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION:-0.90}" )
+
+    # Bytes-denominated KV budget (T2.1; CacheBudgetPlanner primary vLLM knob).
+    # Passed IN ADDITION to the fraction flag above: the bytes knob is the
+    # BINDING cap on the KV pool. If the pinned vLLM rejects the flag, the
+    # server fails to START — the acceptable fail-closed outcome (a run must
+    # never silently degrade to fraction-only pressure) [VERIFY-LIVE at S0-19].
+    # Values were validated positive-integer at the top-of-script gate.
+    if [ -n "${CAGE_KV_BUDGET_BYTES:-}" ]; then
+        vllm_args+=( --kv-cache-memory-bytes "${CAGE_KV_BUDGET_BYTES}" )
+        echo "KV byte budget enabled: --kv-cache-memory-bytes ${CAGE_KV_BUDGET_BYTES}"
+    fi
+    # Fallback knob (mutually exclusive with the bytes knob; both-set already
+    # refused at the top-of-script gate).
+    if [ -n "${CAGE_VLLM_GPU_BLOCKS_OVERRIDE:-}" ]; then
+        vllm_args+=( --num-gpu-blocks-override "${CAGE_VLLM_GPU_BLOCKS_OVERRIDE}" )
+        echo "KV block-budget override enabled: --num-gpu-blocks-override ${CAGE_VLLM_GPU_BLOCKS_OVERRIDE}"
+    fi
     # Optional eager mode: skip torch.compile + CUDA-graph capture for much faster,
     # more reliable startup (esp. on smaller GPUs like the L4, where compile takes
     # 2-3 min and recompiles per prefix-cache config). Serving is uniform across all
@@ -246,6 +307,8 @@ start_server() {
         SC_PREFIX="$want_prefix_cache" \
         SC_MAX_LEN="${VLLM_MAX_MODEL_LEN:-4096}" \
         SC_MEM_UTIL="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}" \
+        SC_KV_BUDGET_BYTES="${CAGE_KV_BUDGET_BYTES:-}" \
+        SC_BLOCKS_OVERRIDE="${CAGE_VLLM_GPU_BLOCKS_OVERRIDE:-}" \
         SC_EAGER="${VLLM_ENFORCE_EAGER:-0}" \
         SC_ARGS="vllm serve $model ${vllm_args[*]}" \
         SC_FILE="$cfg_file" \
@@ -274,6 +337,16 @@ cfg = {
     "enable_prefix_caching": os.environ.get("SC_PREFIX") == "true",
     "max_model_len": int(os.environ.get("SC_MAX_LEN", "4096")),
     "gpu_memory_utilization": float(os.environ.get("SC_MEM_UTIL", "0.90")),
+    # T2.1 byte-budget knobs; null = knob not requested (fraction-only launch),
+    # honest absence rather than a fabricated 0.
+    "kv_budget_bytes": (
+        int(os.environ["SC_KV_BUDGET_BYTES"])
+        if os.environ.get("SC_KV_BUDGET_BYTES") else None
+    ),
+    "num_gpu_blocks_override": (
+        int(os.environ["SC_BLOCKS_OVERRIDE"])
+        if os.environ.get("SC_BLOCKS_OVERRIDE") else None
+    ),
     "enforce_eager": os.environ.get("SC_EAGER") == "1",
     "args": os.environ["SC_ARGS"],
 }
