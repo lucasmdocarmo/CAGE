@@ -14,7 +14,7 @@ organizer's ``walk_run_tree`` + ``_read_cell_meta`` accept:
                 requests.jsonl
                 qa_evidence.jsonl         # sharegpt (load donor) exempt
                 engine_metrics.json
-                cage_stats.jsonl
+                cage_stats.jsonl          # records MAY carry "instance" (T4.1)
                 regime.json               # §6.1 regime bridge output (aux artifact)
 
 Reader-contract bindings (each constant below cites the organize_results
@@ -64,6 +64,7 @@ from src.analysis.goodput import classify_regime
 from src.analysis.regime_inputs import (
     REGIME_UNKNOWN,
     RegimeInputError,
+    compute_pd_window_regime_inputs,
     compute_window_regime_inputs,
 )
 from src.analysis.stats.ledger import hash_artifacts, verify_ledger, write_ledger
@@ -151,6 +152,19 @@ _BASELINE_OF_CELL: dict[tuple[str, str], str] = {
 _TS_FIELDS: tuple[str, ...] = ("ts_s", "ts")
 _KV_FIELDS: tuple[str, ...] = ("kv_cache_usage", "kv_usage")
 _PREEMPT_FIELD = "preemptions_total"
+
+#: Series-schema note (T4.1, Wave-3): records MAY carry an OPTIONAL
+#: ``instance`` role string ("single", "prefill", "decode", ...) stamped by
+#: VllmTelemetrySampler. ABSENT on every record = legacy single-instance
+#: series — the loader then returns EXACTLY the pre-T4.1 columns, so legacy
+#: files stay numerically identical through the loader. Present on ANY record
+#: -> the loader surfaces an "instance" column, and write_window_regime
+#: REFUSES a series with >=2 distinct instances (pooled single-series regime
+#: math over interleaved per-role gauges is fabrication) UNLESS the caller
+#: supplies per-role byte budgets — then T2.3's summed-pool lane
+#: (compute_pd_window_regime_inputs, §6.5) certifies it per role and pools
+#: byte-weighted.
+_INSTANCE_FIELD = "instance"
 
 _REGIME_SCHEMA_VERSION = 1
 
@@ -685,12 +699,21 @@ def load_telemetry_series(path: Path) -> pd.DataFrame:
     so ``compute_window_regime_inputs`` refuses them — absence is not zero.
     Returns a frame with exactly the canonical columns; an empty or
     all-blank-lines file yields an empty frame (0 samples -> refusal lane).
+
+    T4.1: when ANY record carries the optional ``instance`` role tag, the
+    frame gains an ``instance`` column (untagged records in such a file show
+    NaN there — surfaced, not hidden, so write_window_regime can refuse the
+    ambiguity). A fully legacy file returns EXACTLY the pre-T4.1 columns:
+    existing consumers see a numerically identical frame. A non-string or
+    empty ``instance`` value is corrupt and fails loud — a role that cannot
+    label anything must never ride along silently.
     """
     path = Path(path)
     if not path.is_file():
         raise CampaignLayoutError(f"telemetry series not found: {path}")
     rows: list[dict[str, Any]] = []
     problems: list[str] = []
+    saw_instance = False
     for lineno, line in enumerate(
         path.read_text(encoding="utf-8").splitlines(), start=1
     ):
@@ -712,16 +735,34 @@ def load_telemetry_series(path: Path) -> pd.DataFrame:
             )
             continue
         kv = next((rec[f] for f in _KV_FIELDS if f in rec), None)
+        instance = rec.get(_INSTANCE_FIELD)
+        if instance is not None:
+            if not isinstance(instance, str) or not instance:
+                problems.append(
+                    f"{path.name}:{lineno}: instance {instance!r} must be a "
+                    "non-empty role string — a role that cannot label anything "
+                    "is corrupt, not ignorable"
+                )
+                continue
+            saw_instance = True
         rows.append(
             {
                 "ts_s": ts,
                 "kv_cache_usage": kv,
                 "preemptions_total": rec.get(_PREEMPT_FIELD),
+                _INSTANCE_FIELD: instance,
             }
         )
     if problems:
         raise CampaignLayoutError(problems)
-    return pd.DataFrame(rows, columns=["ts_s", "kv_cache_usage", "preemptions_total"])
+    # Legacy frames keep EXACTLY the pre-T4.1 columns (differential pin in
+    # tests/test_multi_instance_telemetry.py); the instance column exists only
+    # when some record actually carried the tag. pd.DataFrame(columns=...)
+    # selects, so the always-present dict key is simply dropped for legacy.
+    columns = ["ts_s", "kv_cache_usage", "preemptions_total"]
+    if saw_instance:
+        columns.append(_INSTANCE_FIELD)
+    return pd.DataFrame(rows, columns=columns)
 
 
 def write_window_regime(
@@ -733,6 +774,7 @@ def write_window_regime(
     telemetry_path: Path | None = None,
     min_samples: int = 2,
     min_coverage: float = 0.8,
+    role_budgets: Mapping[str, int] | None = None,
 ) -> Path:
     """Compute one window's §6.1 regime inputs and write ``regime.json``.
 
@@ -751,7 +793,23 @@ def write_window_regime(
       until the caller's attainment exists — never fabricated).
 
     Bad window bounds are a CALLER bug, not telemetry absence: they raise
-    instead of being recorded as a refusal.
+    instead of being recorded as a refusal. So is a multi-instance series
+    (T4.1): >=2 distinct ``instance`` roles RAISE — single-series regime math
+    cannot certify a merged PD stream (per-role budgets:
+    compute_pd_window_regime_inputs, T2.3).
+
+    T2.3 routing: pass ``role_budgets`` (role -> B_r, that role's
+    sequence-state cache budget in BYTES — the recorded §6.5 split) to send a
+    role-tagged series down the summed-pool lane instead: the stream is split
+    per role, each role certified by the single-series machinery, and the
+    pooled inputs (byte-weighted rho, summed scarcity/n_samples, MIN
+    coverage) written under the SAME ``inputs`` field names plus a ``pd``
+    per-role breakdown. ``role_budgets=None`` (the default) leaves every
+    pre-T2.3 path byte-identical, including the T4.1 refusal above. Budget
+    contract violations — budgets on an untagged/empty stream, role keys not
+    exactly matching the roles present, a non-positive/non-int budget — are
+    CALLER bugs and raise; only genuine telemetry refusals inside a role's
+    series are recorded as ``UNKNOWN_TELEMETRY``.
     """
     window_dir = Path(window_dir)
     if not window_dir.is_dir():
@@ -774,6 +832,46 @@ def write_window_regime(
         Path(telemetry_path) if telemetry_path is not None else window_dir / "cage_stats.jsonl"
     )
     samples = load_telemetry_series(source)
+
+    # T2.3 routing (§6.5): per-role budgets supplied -> the summed-pool PD
+    # lane. Placed BEFORE the T4.1 gate so a budgeted multi-instance stream
+    # certifies instead of refusing; role_budgets=None leaves everything
+    # below byte-identical to the pre-T2.3 behavior.
+    if role_budgets is not None:
+        return _write_pd_window_regime(
+            window_dir,
+            samples=samples,
+            source=source,
+            t_start=float(t_start),
+            t_end=float(t_end),
+            attainment=attainment,
+            min_samples=min_samples,
+            min_coverage=min_coverage,
+            role_budgets=role_budgets,
+        )
+
+    # T4.1 fail-closed gate — the load-bearing refusal of the PD stack: a
+    # series carrying >=2 DISTINCT instance roles is a merged prefill+decode
+    # stream, and running single-series regime math over its interleaved
+    # gauges would average two different KV budgets into a fictional pooled
+    # instance. This RAISES (like the bad-bounds caller bug above, not the
+    # recorded UNKNOWN_TELEMETRY refusal): the telemetry is present and
+    # healthy — the CALLER reached for the wrong math, and a quiet
+    # regime.json would let the campaign limp on over fabricated inputs.
+    # Untagged records inside a tagged file count as their own unknown
+    # instance: pooling "prefill" with unattributed gauges is the same sin.
+    if _INSTANCE_FIELD in samples.columns:
+        instances = samples[_INSTANCE_FIELD]
+        distinct = set(instances.dropna().tolist())
+        if instances.isna().any():
+            distinct.add("<untagged>")
+        if len(distinct) >= 2:
+            raise CampaignLayoutError(
+                f"telemetry series {source.name} carries {len(distinct)} "
+                f"distinct instance roles {sorted(distinct)}: pooled PD "
+                "regime math requires per-role budgets — "
+                "compute_pd_window_regime_inputs, T2.3"
+            )
 
     document: dict[str, Any] = {
         "schema_version": _REGIME_SCHEMA_VERSION,
@@ -814,6 +912,152 @@ def write_window_regime(
                 "inputs": inputs.to_flat_dict(),
                 "label": label,
                 "refusal_reason": None,
+            }
+        )
+    return _atomic_write_json(window_dir / "regime.json", document)
+
+
+def _write_pd_window_regime(
+    window_dir: Path,
+    *,
+    samples: pd.DataFrame,
+    source: Path,
+    t_start: float,
+    t_end: float,
+    attainment: float | None,
+    min_samples: int,
+    min_coverage: float,
+    role_budgets: Mapping[str, int],
+) -> Path:
+    """T2.3 summed-pool lane of ``write_window_regime`` (§6.5).
+
+    Splits the role-tagged stream per role, certifies each role through the
+    single-series machinery, pools byte-weighted via
+    ``compute_pd_window_regime_inputs``, and writes regime.json with the SAME
+    top-level schema as the single-instance path PLUS a ``pd`` sub-document
+    (budgets split + per-role inputs — §6.5: split recorded).
+
+    Budget-contract violations RAISE (caller-bug lane, like bad bounds and
+    the T4.1 gate): budgets on an untagged or empty stream (the T4.1 multi
+    sampler ALWAYS stamps roles — an unattributable gauge under budgets is a
+    wiring bug, and pooling it into any role would fabricate occupancy);
+    untagged records mixed among tagged ones; role keys not EXACTLY the roles
+    present; a non-positive/non-int budget. Every problem is listed, none
+    skipped. Only a genuine per-role telemetry refusal (``RegimeInputError``
+    from certification) is RECORDED as ``UNKNOWN_TELEMETRY`` — absence stays
+    absence, never a numeric.
+    """
+    if not isinstance(role_budgets, Mapping):
+        raise CampaignLayoutError(
+            f"role_budgets must be a mapping role -> bytes, got "
+            f"{type(role_budgets).__name__}"
+        )
+    problems: list[str] = []
+    if len(role_budgets) == 0:
+        problems.append(
+            "role_budgets is empty — the §6.5 PD lane needs at least one "
+            "recorded role budget (single-instance certification takes NO "
+            "budgets)"
+        )
+    if _INSTANCE_FIELD not in samples.columns:
+        problems.append(
+            f"role_budgets given but telemetry series {source.name} carries "
+            "no instance role tags — per-role budgets cannot be attributed "
+            "to an untagged stream"
+        )
+        raise CampaignLayoutError(problems)
+    instances = samples[_INSTANCE_FIELD]
+    n_untagged = int(instances.isna().sum())
+    if n_untagged > 0:
+        problems.append(
+            f"telemetry series {source.name} has {n_untagged} untagged "
+            "record(s) among role-tagged ones — an unattributable gauge can "
+            "join no role's pool"
+        )
+    roles_present = sorted(set(instances.dropna().tolist()))
+    # key=str: a caller-supplied role_budgets with mixed-type keys must reach
+    # the CLEAN refusal below, not a TypeError inside the error path itself
+    # (2026-09-01 verifier minor).
+    missing_budget = sorted(set(roles_present) - set(role_budgets), key=str)
+    missing_series = sorted(set(role_budgets) - set(roles_present), key=str)
+    if missing_budget:
+        problems.append(
+            f"role(s) {missing_budget} present in {source.name} but absent "
+            "from role_budgets — §6.5 records the split for EVERY role"
+        )
+    if missing_series:
+        problems.append(
+            f"role_budgets carries {missing_series} but {source.name} has no "
+            "samples for them — a budgeted pool with no telemetry certifies "
+            "nothing"
+        )
+    for role in sorted(role_budgets, key=str):
+        budget = role_budgets[role]
+        if isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
+            problems.append(
+                f"role_budgets[{role!r}]={budget!r} must be a positive int "
+                "(bytes of that role's sequence-state pool, §6.5 B_r)"
+            )
+    if problems:
+        raise CampaignLayoutError(problems)
+
+    budgets = {role: int(role_budgets[role]) for role in roles_present}
+    series_by_role = {
+        role: samples.loc[instances == role].drop(columns=[_INSTANCE_FIELD])
+        for role in roles_present
+    }
+    document: dict[str, Any] = {
+        "schema_version": _REGIME_SCHEMA_VERSION,
+        "t_start": t_start,
+        "t_end": t_end,
+        "telemetry_source": source.name,
+        "attainment": None if attainment is None else float(attainment),
+    }
+    try:
+        inputs = compute_pd_window_regime_inputs(
+            series_by_role,
+            t_start,
+            t_end,
+            budgets_by_role=budgets,
+            min_samples=min_samples,
+            min_coverage=min_coverage,
+        )
+    except RegimeInputError as exc:
+        document.update(
+            {
+                "telemetry_ok": False,
+                "inputs": None,
+                "label": REGIME_UNKNOWN,
+                "refusal_reason": str(exc),
+                # Split recorded even on refusal; per_role stays None — a
+                # refused pool never carries partial numerics (E2b).
+                "pd": {"budgets_by_role": budgets, "per_role": None},
+            }
+        )
+    else:
+        label: str | None = None
+        if attainment is not None:
+            # GoodputError (attainment outside [0,1], ...) propagates: caller bug.
+            label = classify_regime(
+                rho_kv=inputs.rho_kv_time_avg,
+                scarcity_events=inputs.scarcity_events,
+                attainment=float(attainment),
+            )
+        document.update(
+            {
+                # Same field names as the single-instance path — the §6.1
+                # referee consumes PD windows unchanged (T2.3 contract).
+                "telemetry_ok": True,
+                "inputs": inputs.to_flat_dict(),
+                "label": label,
+                "refusal_reason": None,
+                "pd": {
+                    "budgets_by_role": dict(inputs.budgets_by_role),
+                    "per_role": {
+                        role: w.to_flat_dict()
+                        for role, w in inputs.per_role.items()
+                    },
+                },
             }
         )
     return _atomic_write_json(window_dir / "regime.json", document)

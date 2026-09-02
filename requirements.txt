@@ -159,5 +159,9 @@ pytest-asyncio>=0.21.0
 # dialect (providers/sglang.py + metrics/sglang_dialect.py + api dialect=),
 # so the regime labeler can see kv occupancy on SGLang cells; scarcity-counter
 # existence on the pinned SGLang build is [VERIFY-LIVE at S0-19].
-cage-stats @ git+https://github.com/lucasmdocarmo/cage-stats.git@4be3319ca51902f9aa0b40bab507c4a7f16296e3
+# 2026-08-30 (Wave-1 T4.2/T4.4): bumped 4be3319c -> 4ec296dd — Snapshot keeps
+# RAW prefix_cache_queries/hits_total (None-on-absence; contrast #19's raw
+# material) + multi-label-set occupancy refuses-over-averaging
+# (kv_usage=None + kv_usage_multi_engine flag).
+cage-stats @ git+https://github.com/lucasmdocarmo/cage-stats.git@4ec296ddc2ebceb2a4f8dbc61625747ff7f68638
 # Local dev alternative (no install): set CAGE_STATS_HOME=/Users/lucasmariano/cage-stats

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import statistics
 import subprocess
@@ -27,6 +28,13 @@ import sys
 import threading
 import time
 from typing import Optional
+
+#: T4.1 (Wave-3) role-token grammar for multi-instance telemetry. MUST stay
+#: identical to the CAGE_TELEMETRY_ENDPOINTS role grammar in
+#: scripts/3_run/run_experiment.py — a role that parses at the env boundary
+#: must be constructible here, and vice versa. "single" is the reserved
+#: default for the one-sampler (non-PD) path.
+_ROLE_RE = re.compile(r"^[a-z0-9_-]+$")
 
 
 def _try_import_api():
@@ -158,10 +166,23 @@ class VllmTelemetrySampler:
              "spec_decode", "spec_active", "spec_acceptance", "spec_accepted_per_draft")
 
     def __init__(self, url: str, *, interval: float = 1.0,
-                 metrics_path: str = "/metrics", dialect: str = "vllm"):
+                 metrics_path: str = "/metrics", dialect: str = "vllm",
+                 role: str = "single"):
         self.url = url
         self.interval = max(0.25, float(interval))
         self.metrics_path = metrics_path
+        # T4.1 multi-instance telemetry: every series record this sampler
+        # emits is stamped instance=<role>, so a prefill+decode sampler pair
+        # can be merged into ONE series without losing which endpoint each
+        # gauge came from (an unlabeled merged series is unattributable —
+        # the 2026-08-27 audit's foundation gap). Validated HERE, fail-closed:
+        # a malformed role must never reach a JSONL on disk.
+        if not isinstance(role, str) or not _ROLE_RE.match(role):
+            raise ValueError(
+                f"telemetry role {role!r} is invalid: must be a non-empty "
+                "[a-z0-9_-]+ token (e.g. 'single', 'prefill', 'decode')"
+            )
+        self.role = role
         # Per-backend metrics dialect (T4.3), forwarded to capture_snapshot()
         # every tick. "vllm" is byte-identical to the pre-dialect sampler;
         # "sglang" makes cage-stats translate SGLang's /metrics families. A
@@ -293,20 +314,47 @@ class VllmTelemetrySampler:
         the cage-stats sibling repo). Absence stays absence: ``kv_cache_usage``
         mirrors ``kv_usage`` only when the snapshot carried the gauge at all —
         a missing gauge is never coerced into a value.
+
+        T4.1: records additionally carry ``instance=<role>`` ("single" by
+        default) — see ``_series_records`` for the stamping contract.
         """
-        pairs = [(ts, s) for ts, s in zip(self._sample_ts, self._samples)
-                 if isinstance(s, dict)]
-        if not pairs:
+        records = self._series_records()
+        if not records:
             return None
         with open(path, "w") as fh:
-            for ts, snap in pairs:
-                rec = {"ts": round(ts, 3)}
-                rec.update(snap)
-                rec.setdefault("ts_s", rec["ts"])
-                if "kv_usage" in rec:
-                    rec.setdefault("kv_cache_usage", rec["kv_usage"])
+            for rec in records:
                 fh.write(json.dumps(rec, default=str) + "\n")
         return path
+
+    def _series_records(self) -> "list[dict]":
+        """Fully-shaped series records (oldest first), NOT yet serialized.
+
+        The ONE source of the series record schema, shared by ``save_series``
+        (single sampler) and ``save_merged_series`` (a PD sampler set):
+        re-shaping records at the merge site would let the two writers drift
+        on the canonical/legacy dual-field contract.
+
+        T4.1: every record carries ``instance=<self.role>`` — "single" on the
+        default path, the endpoint's role ("prefill"/"decode"/...) under
+        CAGE_TELEMETRY_ENDPOINTS. The sampler polled the endpoint, so its role
+        is the ground truth of which instance the gauges came from: a rogue
+        same-named key in a snapshot is OVERWRITTEN, never trusted (a
+        mis-tagged record would silently poison per-role regime math).
+        Legacy files (written before T4.1) simply lack the field; readers
+        treat absence as single-instance.
+        """
+        records: list = []
+        for ts, snap in zip(self._sample_ts, self._samples):
+            if not isinstance(snap, dict):
+                continue
+            rec = {"ts": round(ts, 3)}
+            rec.update(snap)
+            rec.setdefault("ts_s", rec["ts"])
+            if "kv_usage" in rec:
+                rec.setdefault("kv_cache_usage", rec["kv_usage"])
+            rec["instance"] = self.role
+            records.append(rec)
+        return records
 
     def aggregate(self) -> Optional[dict]:
         samples = [s for s in self._samples if isinstance(s, dict)]
@@ -361,6 +409,45 @@ class VllmTelemetrySampler:
                 agg["spec_decode_acceptance_rate"] = rate
         agg["final_snapshot"] = last
         return agg
+
+
+def save_merged_series(samplers: "list[VllmTelemetrySampler]", path: str) -> Optional[str]:
+    """Merge role-tagged samplers into ONE JSONL sorted by ``ts_s``; path or None.
+
+    T4.1 (Wave-3): the PD stack runs one sampler per role=url endpoint, but
+    downstream (campaign_session.emit_window -> the window's cage_stats.jsonl
+    -> the §6.1 regime bridge) reads exactly ONE telemetry_series.jsonl per
+    trial. Merging happens HERE, at write time, not per-tick: each sampler's
+    thread stays lock-free, and the record shaping is `_series_records` — the
+    same code path as the single-sampler ``save_series``, so the two writers
+    cannot drift. Records interleave by ``ts_s`` (all samplers stamp ts from
+    the same ``time.time()`` clock as the measurement-window bounds); ties
+    keep sampler order (Python's sort is stable).
+
+    Fail-closed:
+    - duplicate roles RAISE — two samplers claiming one role would make the
+      ``instance`` column silently ambiguous, the exact unattributability
+      this task exists to remove;
+    - NO samples across all samplers -> returns None and writes nothing (an
+      empty run never leaves a misleading empty artifact — the ``save_series``
+      contract).
+    """
+    roles = [s.role for s in samplers]
+    if len(set(roles)) != len(roles):
+        raise ValueError(
+            f"save_merged_series: duplicate sampler roles {roles} — every "
+            "sampler in a merge must carry a distinct instance role"
+        )
+    records: list = []
+    for sampler in samplers:
+        records.extend(sampler._series_records())
+    if not records:
+        return None
+    records.sort(key=lambda rec: rec["ts_s"])
+    with open(path, "w") as fh:
+        for rec in records:
+            fh.write(json.dumps(rec, default=str) + "\n")
+    return path
 
 
 def dashboard_text(

@@ -21,6 +21,17 @@ the now-real gate — and the J11 coverage gates — at three levels:
    default covers all three final-scope engines, and the three formerly
    deferring scripts now name the real gate.
 
+Wave-3 additions (tasks T8.1/T8.3, 2026-08-27 audit): gate (r)
+CAGE-BLINDNESS-MATRIX-GATE (engine x telemetry-field presence/granularity
+matrix -- absence is DATA, offline skips 3, unreachable-in-a-live-fleet and
+unwritable-artifact fail) is exercised against a loopback Prometheus stub;
+gate (s) CAGE-ENGINE-MODEL-GATE-MATRIX (the VLLM_COMPATIBILITY.md section-7
+cell-gate runner) is pinned on table structure, PENDING-never-fabricated-PASS
+discipline, the deterministic-probe PASS/FAIL arms (loopback /v1/completions
+stub: identical vs divergent T=0 completions), fp8-delegate invocation, and
+the rc mapping (1 on FAIL, 3 on all-PENDING, 0 when a check ran and none
+failed).
+
 No GPU, no network beyond 127.0.0.1, no cloud.
 """
 from __future__ import annotations
@@ -62,6 +73,11 @@ _GATE_ENV_VARS = (
     "CAGE_ALLOW_REPLAY", "CAGE_ALLOW_NO_BACKUP",
     "LMDEPLOY_CACHE_MAX_ENTRY_COUNT", "LMDEPLOY_QUANT_POLICY",
     "CAGE_QUALITY_STRICT", "CAGE_LMDEPLOY_BACKEND_CHECK", "CAGE_CLAIM_CHECKER",
+    # Gates (r)/(s) (tasks T8.1/T8.3): artifact path + run root, fp8-delegate
+    # opt-in/override, endpoint ports, and the scope var itself.
+    "CAGE_BLINDNESS_OUT", "CAGE_RUN_ROOT",
+    "CAGE_RUN_FP8_GATE", "CAGE_FP8_GATE_SCRIPT",
+    "SGLANG_PORT", "LMDEPLOY_PORT", "CAGE_PREFLIGHT_BACKENDS",
 )
 
 
@@ -109,10 +125,12 @@ def test_preflight_declares_every_new_lettered_gate() -> None:
         "CAGE-ISO-BYTES-GATE", "CAGE-BACKEND-ENDPOINTS-GATE",
         "CAGE-CAMPAIGN-LAYOUT-GATE", "CAGE-OPENLOOP-GATE",
         "CAGE-CALIBRATION-ARTIFACT-GATE", "CAGE-REGIME-BRIDGE-GATE",
-        "CAGE-DATASET-STALENESS-GATE",
+        "CAGE-DATASET-STALENESS-GATE", "CAGE-STATS-PIN-PARITY-GATE",
+        "CAGE-BLINDNESS-MATRIX-GATE", "CAGE-ENGINE-MODEL-GATE-MATRIX",
     ):
         assert marker in text, f"preflight lost the {marker} gate marker"
-    for letter in ("(j)", "(k)", "(l)", "(m)", "(n)", "(o)", "(p)"):
+    for letter in ("(j)", "(k)", "(l)", "(m)", "(n)", "(o)", "(p)", "(q)",
+                   "(r)", "(s)"):
         assert f'echo "{letter}' in text, f"gate {letter} echo line missing"
     # Skip-with-reason plumbing: exit code 3 must not count as a failure.
     assert "gate_rc() {" in text and "0|3) : ;;" in text
@@ -992,7 +1010,7 @@ def test_datasets_gate_honors_runner_dataset_fallback(
 # end-to-end runs against the LIVE venv and synthetic requirements files.
 # ---------------------------------------------------------------------------
 
-_PIN_SHA = "4be3319ca51902f9aa0b40bab507c4a7f16296e3"
+_PIN_SHA = "4ec296ddc2ebceb2a4f8dbc61625747ff7f68638"
 
 
 def test_preflight_declares_pin_parity_gate() -> None:
@@ -1164,3 +1182,497 @@ def test_pinq_end_to_end_missing_pin_fails(tmp_path: Path) -> None:
     proc = _run_gate("CAGE-STATS-PIN-PARITY-GATE", str(req))
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert "NO cage-stats pin" in proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# (r) blindness-matrix gate (task T8.1, audit item S4): loopback exposition
+# stub + exec'd-namespace unit tests. The contract under test: absence of a
+# telemetry field is DATA ("absent" recorded, gate still passes); the gate
+# fails ONLY on an unreachable backend while the fleet is live or an
+# unwritable artifact; fully offline -> exit 3 naming the live-only nature.
+# ---------------------------------------------------------------------------
+
+#: A realistic vLLM exposition carrying occupancy, preemption, raw prefix
+#: counters, all four phase histograms, and the aggregate cached-token
+#: counter -- but deliberately NO transfer-counter family, so the matrix must
+#: record transfer_counters as "absent" (data, not a failure).
+_RICH_EXPOSITION = """\
+# HELP vllm:kv_cache_usage_perc KV usage
+vllm:kv_cache_usage_perc{model_name="m"} 0.42
+vllm:num_preemptions_total{model_name="m"} 3.0
+vllm:prefix_cache_queries_total{model_name="m"} 100.0
+vllm:prefix_cache_hits_total{model_name="m"} 40.0
+vllm:request_prefill_time_seconds_bucket{le="0.1"} 1
+vllm:request_prefill_time_seconds_sum 0.5
+vllm:request_prefill_time_seconds_count 5
+vllm:request_decode_time_seconds_sum 1.0
+vllm:request_decode_time_seconds_count 5
+vllm:request_inference_time_seconds_sum 1.5
+vllm:request_inference_time_seconds_count 5
+vllm:request_queue_time_seconds_sum 0.1
+vllm:request_queue_time_seconds_count 5
+vllm:prompt_tokens_cached_total{model_name="m"} 900.0
+"""
+
+#: Every telemetry field the blindness matrix must cover -- the
+#: MECHANISM-CRITICAL subset of the cage-stats consumption surface
+#: (engine.py/sglang_dialect.py; queue gauges, token counters, latency
+#: histograms and cache_config_info are consumed but deliberately not
+#: blindness rows) plus the per-request cached-token capabilities probe.
+#: Losing a row here is losing coverage.
+_BLINDNESS_FIELDS = (
+    "occupancy_gauge", "preemption_counter", "prefix_query_counter",
+    "prefix_hit_counter", "transfer_counters", "phase_histograms",
+    "cached_token_aggregate", "cached_token_per_request",
+)
+
+
+class _ExpositionStub(BaseHTTPRequestHandler):
+    body = _RICH_EXPOSITION
+
+    def do_GET(self) -> None:  # noqa: N802 (http.server API)
+        payload = type(self).body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args) -> None:
+        pass
+
+
+@pytest.fixture()
+def exposition_server():
+    _ExpositionStub.body = _RICH_EXPOSITION
+    server = HTTPServer(("127.0.0.1", 0), _ExpositionStub)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+@pytest.fixture(scope="module")
+def blind() -> dict:
+    ns: dict = {"__name__": "cage_blindness_gate_under_test"}
+    exec(compile(_snippet("CAGE-BLINDNESS-MATRIX-GATE"),
+                 "CAGE-BLINDNESS-MATRIX-GATE", "exec"), ns)
+    return ns
+
+
+def test_blindness_field_table_pins_the_mechanism_critical_fields(
+        blind: dict) -> None:
+    """The explicit field table must keep one row per mechanism-critical field
+    (a deliberate subset of everything cage-stats consumes -- see the
+    _BLINDNESS_FIELDS note), and the per-request cached-token row must be the
+    capabilities probe (it is not scrapeable from /metrics)."""
+    keys = tuple(key for key, _, _ in blind["FIELDS"])
+    assert keys == _BLINDNESS_FIELDS
+    probes = {key: probe for key, probe, _ in blind["FIELDS"]}
+    assert probes["cached_token_per_request"] == "capabilities"
+    assert all(p == "metrics" for k, p in probes.items()
+               if k != "cached_token_per_request")
+
+
+def test_blindness_transfer_candidates_mirror_cage_stats_families(
+        blind: dict) -> None:
+    """Repair pin (verifier major): cage-stats engine.py captures connector
+    families via _TRANSFER_FAMILY_RE = ^vllm:(kv_transfer|nixl|kv_connector)
+    plus _TRANSFER_DOC_PREFIXES = ("nixl_",). The transfer_counters row must
+    carry ALL four prefix spellings, or a backend exposing e.g. the
+    vllm:kv_connector* KVConnector naming at the P/D rung would be recorded
+    false-absent in exactly the audit artifact this gate exists to make
+    accurate."""
+    row = {key: cands for key, _, cands in blind["FIELDS"]}["transfer_counters"]
+    prefixes = {cand for cand, kind, _ in row if kind == "prefix"}
+    assert prefixes == {"vllm:kv_transfer", "vllm:kv_connector",
+                        "vllm:nixl", "nixl_"}
+    exacts = {cand for cand, kind, _ in row if kind == "exact"}
+    assert exacts == {"vllm:external_prefix_cache_queries_total",
+                      "vllm:prompt_tokens_by_source_total"}
+    # Behavior, not just table shape: each family spelling flips the cell.
+    for name in ("vllm:kv_transfer_bytes_total",
+                 "vllm:kv_connector_requests_total",
+                 "vllm:nixl_transfers_total",
+                 "nixl_post_time_ms_sum"):
+        r = blind["match_field"]({name}, row)
+        assert r["status"] == "present", f"{name} must be a transfer hit"
+
+
+def test_blindness_match_field_kinds(blind: dict) -> None:
+    names = blind["sample_names"](_RICH_EXPOSITION)
+    # exact
+    r = blind["match_field"](names, (
+        ("vllm:kv_cache_usage_perc", "exact", "gauge"),))
+    assert r["status"] == "present" and r["granularity"] == "gauge"
+    # histogram: base name present only via _bucket/_sum/_count suffixes
+    r = blind["match_field"](names, (
+        ("vllm:request_prefill_time_seconds", "histogram", "histogram"),))
+    assert r["status"] == "present"
+    # prefix
+    r = blind["match_field"]({"vllm:nixl_transfers_total"}, (
+        ("vllm:nixl", "prefix", "nixl transfer family"),))
+    assert r["status"] == "present" and r["matched"][0]["name"] == "vllm:nixl*"
+    # absence is recorded, never an exception
+    r = blind["match_field"](names, (
+        ("vllm:external_prefix_cache_queries_total", "exact", "counter"),))
+    assert r == {"status": "absent", "granularity": None, "matched": [],
+                 "source": "metrics-scrape"}
+
+
+def test_blindness_unknown_candidate_kind_is_loud(blind: dict) -> None:
+    with pytest.raises(ValueError, match="unknown candidate kind"):
+        blind["match_field"](set(), (("x", "typo", "g"),))
+
+
+def test_blindness_gate_records_matrix_and_writes_artifact(
+        exposition_server: str, tmp_path: Path) -> None:
+    out = tmp_path / "obs" / "blindness_matrix.json"
+    proc = _run_gate("CAGE-BLINDNESS-MATRIX-GATE", "vllm", exposition_server,
+                     env=_clean_env(CAGE_BLINDNESS_OUT=str(out)))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    doc = json.loads(out.read_text(encoding="utf-8"))
+    assert doc["schema"] == "cage-blindness-matrix-v1"
+    fields = doc["matrix"]["vllm"]["fields"]
+    assert fields["occupancy_gauge"]["status"] == "present"
+    assert fields["preemption_counter"]["status"] == "present"
+    assert fields["phase_histograms"]["status"] == "present"
+    # ABSENCE IS DATA: no transfer family in the exposition, gate still green.
+    assert fields["transfer_counters"]["status"] == "absent"
+    # Capabilities probe: the vLLM adapter declares True (verified in-code).
+    assert fields["cached_token_per_request"]["status"] == "present"
+    assert fields["cached_token_per_request"]["source"] == "capabilities-probe"
+    # Rendered markdown table on stdout, absent cell included.
+    assert "| field | vllm |" in proc.stdout
+    assert "| transfer_counters | absent |" in proc.stdout
+    assert "[PASS] blindness matrix recorded" in proc.stdout
+
+
+def test_blindness_gate_sglang_verify_live_capabilities_row(
+        exposition_server: str, tmp_path: Path) -> None:
+    """Repair pin (verifier minor): the 'verify-live' arm of the capabilities
+    probe. The SGLang adapter declares cached_token_telemetry='verify-live'
+    (documented upstream, unverified in this codebase); the row must be
+    recorded as its own status -- never coerced to present OR absent -- and
+    rendered as such in the markdown table."""
+    port = exposition_server.rsplit(":", 1)[1]
+    out = tmp_path / "bm.json"
+    proc = _run_gate(
+        "CAGE-BLINDNESS-MATRIX-GATE", "sglang", "http://127.0.0.1:9",
+        env=_clean_env(CAGE_BLINDNESS_OUT=str(out), SGLANG_PORT=port))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    row = json.loads(out.read_text(encoding="utf-8"))["matrix"]["sglang"][
+        "fields"]["cached_token_per_request"]
+    assert row["status"] == "verify-live"
+    assert row["declared"] == "'verify-live'"
+    assert row["source"] == "capabilities-probe"
+    assert ("| cached_token_per_request | verify-live "
+            "(adapter-declared, unverified) |") in proc.stdout
+
+
+def test_blindness_gate_unreachable_backend_fails_when_fleet_live(
+        exposition_server: str, tmp_path: Path) -> None:
+    """vllm live, sglang scoped but dead: partial blindness about the FLEET is
+    a failure (scope down as a recorded deviation), and the artifact still
+    records reachable=false for the dead backend."""
+    out = tmp_path / "bm.json"
+    proc = _run_gate(
+        "CAGE-BLINDNESS-MATRIX-GATE", "vllm,sglang", exposition_server,
+        env=_clean_env(CAGE_BLINDNESS_OUT=str(out), SGLANG_PORT="9"))
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "backend 'sglang' unreachable" in proc.stdout
+    doc = json.loads(out.read_text(encoding="utf-8"))
+    assert doc["matrix"]["sglang"]["reachable"] is False
+    assert doc["matrix"]["vllm"]["reachable"] is True
+
+
+def test_blindness_gate_offline_skips_3_naming_live_only(tmp_path: Path) -> None:
+    out = tmp_path / "bm.json"
+    proc = _run_gate("CAGE-BLINDNESS-MATRIX-GATE", "vllm", "http://127.0.0.1:9",
+                     env=_clean_env(CAGE_BLINDNESS_OUT=str(out)))
+    assert proc.returncode == 3, proc.stdout + proc.stderr
+    assert "[SKIP] live-only gate" in proc.stdout
+    assert not out.exists()  # no artifact fabricated from thin air
+
+
+def test_blindness_gate_unwritable_artifact_fails(
+        exposition_server: str, tmp_path: Path) -> None:
+    blocker = tmp_path / "blocker"
+    blocker.write_text("", encoding="utf-8")  # a FILE where a dir must go
+    proc = _run_gate(
+        "CAGE-BLINDNESS-MATRIX-GATE", "vllm", exposition_server,
+        env=_clean_env(CAGE_BLINDNESS_OUT=str(blocker / "bm.json")))
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "cannot be written" in proc.stdout
+
+
+def test_blindness_gate_unknown_backend_token_fails(
+        exposition_server: str, tmp_path: Path) -> None:
+    proc = _run_gate(
+        "CAGE-BLINDNESS-MATRIX-GATE", "vllm,triton", exposition_server,
+        env=_clean_env(CAGE_BLINDNESS_OUT=str(tmp_path / "bm.json")))
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "no known endpoint/adapter mapping" in proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# (s) engine x model gate-matrix runner (task T8.3): table structure,
+# PENDING-never-fabricated-PASS discipline, fp8 delegation, rc mapping.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def gm() -> dict:
+    ns: dict = {"__name__": "cage_gate_matrix_under_test"}
+    exec(compile(_snippet("CAGE-ENGINE-MODEL-GATE-MATRIX"),
+                 "CAGE-ENGINE-MODEL-GATE-MATRIX", "exec"), ns)
+    return ns
+
+
+def test_gate_matrix_table_structure_matches_section7(gm: dict) -> None:
+    """The declarative table covers all three campaign engines x all four
+    checks, with the section-7 applicability pinned cell by cell."""
+    assert set(gm["TABLE"]) == {"vllm", "sglang", "lmdeploy"}
+    for engine, row in gm["TABLE"].items():
+        assert set(row) == set(gm["CHECKS"]), f"{engine} row lost a check"
+    # sec. 7: deterministic-mode gates SGLang (pin row) and vLLM (sec.-5.2
+    # T=0 smoke precondition); LMDeploy has no deterministic row.
+    assert gm["TABLE"]["sglang"]["deterministic_mode"] is True
+    assert gm["TABLE"]["vllm"]["deterministic_mode"] is True
+    assert gm["TABLE"]["lmdeploy"]["deterministic_mode"] is False
+    # sec. 7 P7: TurboMind-actually-selected is LMDeploy-only.
+    assert gm["TABLE"]["lmdeploy"]["turbomind_selected"] is True
+    assert gm["TABLE"]["vllm"]["turbomind_selected"] is False
+    assert gm["TABLE"]["sglang"]["turbomind_selected"] is False
+    # sec. 2/4: fp8 x prefix coexistence is the vLLM compressed_cag lever.
+    assert gm["TABLE"]["vllm"]["fp8_prefix_coexist"] is True
+    assert gm["TABLE"]["sglang"]["fp8_prefix_coexist"] is False
+    assert gm["TABLE"]["lmdeploy"]["fp8_prefix_coexist"] is False
+    # sec. 7 row A: cached-token telemetry gates every engine.
+    assert all(row["cached_token_telemetry"] for row in gm["TABLE"].values())
+
+
+class _CompletionsStub(BaseHTTPRequestHandler):
+    """Loopback /v1/completions stub for the deterministic-mode probe: replies
+    with the scripted texts in request order (last text repeats), recording
+    each (path, parsed body) so the T=0/seed pinning can be asserted."""
+
+    texts = [" 4"]
+    requests: list = []
+
+    def do_POST(self) -> None:  # noqa: N802 (http.server API)
+        length = int(self.headers.get("Content-Length", "0"))
+        body = json.loads(self.rfile.read(length))
+        cls = type(self)
+        cls.requests.append((self.path, body))
+        text = cls.texts[min(len(cls.requests) - 1, len(cls.texts) - 1)]
+        payload = json.dumps({"choices": [{"text": text}]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args) -> None:
+        pass
+
+
+@pytest.fixture()
+def completions_server():
+    _CompletionsStub.texts = [" 4"]
+    _CompletionsStub.requests = []
+    server = HTTPServer(("127.0.0.1", 0), _CompletionsStub)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_gate_matrix_deterministic_identical_completions_pass(
+        gm: dict, completions_server: str) -> None:
+    """Repair pin (verifier major): the PASS arm of check_deterministic. Two
+    byte-identical T=0 seed-pinned completions -> PASS; an always-PENDING stub
+    implementation must not survive this suite. Also pins the probe contract:
+    exactly two POSTs to /v1/completions, identical bodies, temperature 0,
+    seed pinned."""
+    _CompletionsStub.texts = [" 4"]
+    status, why = gm["check_deterministic"](completions_server, "test-model")
+    assert status == gm["PASS"], why
+    assert "byte-identical" in why
+    assert len(_CompletionsStub.requests) == 2
+    (path_a, body_a), (path_b, body_b) = _CompletionsStub.requests
+    assert path_a == path_b == "/v1/completions"
+    assert body_a == body_b  # identical requests -- the probe's precondition
+    assert body_a["temperature"] == 0
+    assert body_a["seed"] == 20260902
+    assert body_a["model"] == "test-model"
+
+
+def test_gate_matrix_deterministic_divergent_completions_fail(
+        gm: dict, completions_server: str) -> None:
+    """Repair pin (verifier major): the FAIL arm. Two identical T=0 requests
+    yielding DIFFERENT texts is a proven determinism break (sec. 7 pin row)
+    -- FAIL, never PENDING, never a silent pass."""
+    _CompletionsStub.texts = [" 4", " 5"]
+    status, why = gm["check_deterministic"](completions_server, "test-model")
+    assert status == gm["FAIL"], why
+    assert "DIVERGED" in why
+
+
+def test_gate_matrix_turbomind_check_states(gm: dict, tmp_path: Path) -> None:
+    check = gm["check_turbomind"]
+    # no launch log at all -> PENDING, never a fabricated verdict
+    status, why = check(tmp_path)
+    assert status == gm["PENDING"] and "VERIFY-LIVE" in why
+    log_dir = tmp_path / "lmdeploy"
+    log_dir.mkdir()
+    log = log_dir / "lmdeploy_20260902.log"
+    # TurboMind marker -> PASS
+    log.write_text("[TM][INFO] [BlockManager] block_size = 6 MB\n",
+                   encoding="utf-8")
+    assert check(tmp_path)[0] == gm["PASS"]
+    # explicit PyTorch fallback -> FAIL (P7 never-mixed)
+    log.write_text("WARNING autoget_backend: fallback to pytorch engine\n",
+                   encoding="utf-8")
+    assert check(tmp_path)[0] == gm["FAIL"]
+    # a log with NO backend marker -> PENDING (marker pattern is VERIFY-LIVE)
+    log.write_text("server started on port 23333\n", encoding="utf-8")
+    status, why = check(tmp_path)
+    assert status == gm["PENDING"] and "no backend marker" in why
+
+
+def _fp8_stub(tmp_path: Path, rc: int) -> Path:
+    marker = tmp_path / f"invoked_rc{rc}"
+    stub = tmp_path / f"fp8_stub_rc{rc}.sh"
+    stub.write_text(
+        "#!/bin/bash\n"
+        f'echo "fp8-stub invoked model=$1"\n'
+        f'touch "{marker}"\n'
+        f"exit {rc}\n",
+        encoding="utf-8",
+    )
+    return stub
+
+
+@pytest.mark.parametrize("rc,expected", [
+    (0, "PASS"), (1, "FAIL"), (2, "PENDING"), (9, "FAIL")])
+def test_gate_matrix_fp8_delegate_rc_mapping(gm: dict, tmp_path: Path,
+                                             monkeypatch, capsys, rc: int,
+                                             expected: str) -> None:
+    """Delegate rc 0/1 map to PASS/FAIL, the script's own INCONCLUSIVE code 2
+    maps to PENDING (never PASS), and a crash rc is a FAIL, never a skip."""
+    stub = _fp8_stub(tmp_path, rc)
+    monkeypatch.setenv("CAGE_RUN_FP8_GATE", "1")
+    monkeypatch.setenv("CAGE_FP8_GATE_SCRIPT", str(stub))
+    status, _why = gm["check_fp8_prefix"]("test-model")
+    assert status == gm[expected]
+    out = capsys.readouterr().out
+    assert "fp8-stub invoked model=test-model" in out  # stdout is echoed
+
+
+def test_gate_matrix_fp8_delegate_not_run_without_opt_in(
+        gm: dict, tmp_path: Path, monkeypatch) -> None:
+    """No opt-in -> PENDING with the reason; the delegate (which RESTARTS
+    vLLM) must NOT be launched as a preflight side effect."""
+    stub = _fp8_stub(tmp_path, 0)
+    monkeypatch.delenv("CAGE_RUN_FP8_GATE", raising=False)
+    monkeypatch.setenv("CAGE_FP8_GATE_SCRIPT", str(stub))
+    status, why = gm["check_fp8_prefix"]("test-model")
+    assert status == gm["PENDING"] and "CAGE_RUN_FP8_GATE=1" in why
+    assert not (tmp_path / "invoked_rc0").exists()
+
+
+def test_gate_matrix_fp8_missing_delegate_is_fail(gm: dict, tmp_path: Path,
+                                                  monkeypatch) -> None:
+    monkeypatch.setenv("CAGE_RUN_FP8_GATE", "1")
+    monkeypatch.setenv("CAGE_FP8_GATE_SCRIPT", str(tmp_path / "absent.sh"))
+    status, why = gm["check_fp8_prefix"]("test-model")
+    assert status == gm["FAIL"] and "does not exist" in why
+
+
+def _gate_s_env(tmp_path: Path, **extra: str) -> Dict[str, str]:
+    """Offline env for gate (s) subprocess runs: dead engine ports and an
+    empty engine-log root, so every live-only cell must go PENDING."""
+    return _clean_env(SGLANG_PORT="9", LMDEPLOY_PORT="9",
+                      CAGE_ISO_BYTES_LOG_ROOT=str(tmp_path / "empty-logs"),
+                      **extra)
+
+
+def test_gate_matrix_offline_all_pending_skips_3(tmp_path: Path) -> None:
+    """PENDING-not-PASS discipline: offline, with only verify-live cached-token
+    declarations in scope, NOTHING may report PASS and the gate skips 3."""
+    proc = _run_gate("CAGE-ENGINE-MODEL-GATE-MATRIX", "sglang,lmdeploy",
+                     "http://127.0.0.1:9", "test-model",
+                     env=_gate_s_env(tmp_path))
+    assert proc.returncode == 3, proc.stdout + proc.stderr
+    assert "PENDING-VERIFY-LIVE" in proc.stdout
+    assert ": PASS --" not in proc.stdout  # no fabricated PASS cell
+    assert "[SKIP]" in proc.stdout and "never fabricates a PASS" in proc.stdout
+
+
+def test_gate_matrix_passes_when_one_check_ran_and_none_failed(
+        tmp_path: Path) -> None:
+    """rc 0: the vLLM cached-token capabilities check runs even offline (it is
+    an in-code declaration), while the live-only cells stay PENDING."""
+    proc = _run_gate("CAGE-ENGINE-MODEL-GATE-MATRIX", "vllm",
+                     "http://127.0.0.1:9", "test-model",
+                     env=_gate_s_env(tmp_path))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "vllm x cached_token_telemetry: PASS" in proc.stdout
+    assert "vllm x deterministic_mode: PENDING-VERIFY-LIVE" in proc.stdout
+    assert "vllm x fp8_prefix_coexist: PENDING-VERIFY-LIVE" in proc.stdout
+    assert "vllm x turbomind_selected: N/A" in proc.stdout
+    assert "[PASS] gate matrix" in proc.stdout
+
+
+def test_gate_matrix_delegate_fail_fails_the_gate(tmp_path: Path) -> None:
+    """rc 1: an actual FAIL (fp8 confound proven by the delegate) fails the
+    gate even though other cells passed."""
+    stub = _fp8_stub(tmp_path, 1)
+    proc = _run_gate(
+        "CAGE-ENGINE-MODEL-GATE-MATRIX", "vllm", "http://127.0.0.1:9",
+        "test-model",
+        env=_gate_s_env(tmp_path, CAGE_RUN_FP8_GATE="1",
+                        CAGE_FP8_GATE_SCRIPT=str(stub)))
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "fp8-stub invoked model=test-model" in proc.stdout
+    assert "confounded" in proc.stdout
+
+
+def test_gate_matrix_delegate_invoked_only_for_applicable_cells(
+        tmp_path: Path) -> None:
+    """Opt-in set but vLLM NOT in scope: the fp8 cell is N/A for SGLang/
+    LMDeploy, so the delegate must never be launched."""
+    stub = _fp8_stub(tmp_path, 0)
+    proc = _run_gate(
+        "CAGE-ENGINE-MODEL-GATE-MATRIX", "sglang,lmdeploy",
+        "http://127.0.0.1:9", "test-model",
+        env=_gate_s_env(tmp_path, CAGE_RUN_FP8_GATE="1",
+                        CAGE_FP8_GATE_SCRIPT=str(stub)))
+    assert proc.returncode == 3, proc.stdout + proc.stderr
+    assert "fp8-stub invoked" not in proc.stdout
+    assert not (tmp_path / "invoked_rc0").exists()
+
+
+def test_gate_matrix_unknown_backend_fails(tmp_path: Path) -> None:
+    proc = _run_gate("CAGE-ENGINE-MODEL-GATE-MATRIX", "triton",
+                     "http://127.0.0.1:9", "test-model",
+                     env=_gate_s_env(tmp_path))
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "no row in the sec.-7 engine x check table" in proc.stdout
+
+
+def test_gate_matrix_renders_the_table(tmp_path: Path) -> None:
+    proc = _run_gate("CAGE-ENGINE-MODEL-GATE-MATRIX", "vllm",
+                     "http://127.0.0.1:9", "test-model",
+                     env=_gate_s_env(tmp_path))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert ("| engine | deterministic_mode | turbomind_selected | "
+            "fp8_prefix_coexist | cached_token_telemetry |") in proc.stdout
+    assert "| vllm | " in proc.stdout

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Order:     gate — after 2_serving is up, before EVERY 3_run launch (Gate 2; re-run after every engine relaunch)
-# Objective: Live infra preflight gates (a)-(q): serving health, quality stack, telemetry, retrieval, env poison, iso-bytes parity, layout round-trip
+# Objective: Live infra preflight gates (a)-(s): serving health, quality stack, telemetry, retrieval, env poison, iso-bytes parity, layout round-trip, blindness matrix, engine-model gate matrix
 # Cloud:     both
 # =============================================================================
 # Gate 2: live infra preflight — run BEFORE every GPU sweep (validate-before-run).
@@ -26,6 +26,13 @@
 #   (p) dataset staleness refusal (requested charter datasets staged on disk)
 #   (q) cage-stats pin parity (requirements.txt pinned SHA == installed commit;
 #       task #143, finding L-A -- a lagging install fabricates rho_KV readings)
+#   (r) engine blindness matrix (task T8.1, 2026-08-27 audit item S4): per-
+#       backend /metrics presence/granularity over the telemetry fields
+#       cage-stats consumes; absence is DATA, offline is skip-3 (live-only)
+#   (s) engine x model gate-matrix runner (task T8.3; VLLM_COMPATIBILITY.md
+#       section 7): deterministic-mode / TurboMind-selected / fp8xprefix /
+#       cached-token checks -- PASS/FAIL/PENDING-VERIFY-LIVE, never a
+#       fabricated PASS
 #
 # Exit 0 = all green, safe to launch. Non-zero = at least one gate failed (do NOT launch).
 # Usage: bash scripts/checks/preflight_check.sh [MODEL] [API_BASE]
@@ -1376,6 +1383,601 @@ def main(argv):
     print(f"  [PASS] cage-stats installed commit == requirements.txt pin "
           f"({pin}; channel: {channel})")
     return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+PY
+gate_rc $?
+
+# ---------------------------------------------------------------------------
+# (r) engine blindness matrix (task T8.1; 2026-08-27 audit item S4).
+# The S4 finding: the engine-x-telemetry-field "blindness matrix" existed only
+# as a doc table -- no code produced it. This gate scrapes every scoped
+# backend's live /metrics (same env-derived endpoints as gate (k)) and records
+# presence/granularity for the telemetry fields cage-stats consumes, plus the
+# adapter capabilities probe for the per-request cached-token channel.
+# ABSENCE of a field is DATA (recorded "absent"), never a failure; the gate
+# fails ONLY on an unreachable scoped backend (while the fleet is live) or an
+# unwritable artifact. Fully offline -> exit 3 (live-only gate). Artifact:
+# CAGE_BLINDNESS_OUT, default <CAGE_RUN_ROOT|results/preflight>/observability/
+# blindness_matrix.json.
+# ---------------------------------------------------------------------------
+echo "(r) engine blindness matrix (scope: $PREFLIGHT_BACKENDS; out: ${CAGE_BLINDNESS_OUT:-<run observability dir>})"
+python3 - "$PREFLIGHT_BACKENDS" "$API_BASE" <<'PY'
+# CAGE-BLINDNESS-MATRIX-GATE (task T8.1; 2026-08-27 audit item S4). Extracted
+# and executed by tests/test_preflight_gates.py against a loopback Prometheus
+# stub. Engine blindness is a REPORTED ecosystem finding (charter: absence
+# reported, never a silent hole), so "absent" cells are data; only an
+# unreachable backend or an unwritable artifact fails the gate, and a fully
+# offline preflight skips with reason (exit 3 -- this is a live-only gate).
+import json
+import os
+import re
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+#: Telemetry-field table -- the MECHANISM-CRITICAL subset of what cage-stats
+#: consumes (cage_stats/metrics/engine.py + sglang_dialect.py at the pinned
+#: commit) plus the per-request cached-token channel the vLLM adapter reads.
+#: Deliberately NOT rows here (consumed, but not blindness-gated: every
+#: engine exposes some spelling and their absence is not a mechanism hole):
+#: running/waiting queue gauges, generation/prompt token counters,
+#: ttft/tpot/e2e latency histograms, iteration_tokens_total,
+#: cache_config_info.
+#: Entry: (field_key, probe, candidates); a /metrics candidate is
+#: (sample_name, kind, granularity) where kind:
+#:   exact     -> the sample name itself appears in the scrape
+#:   histogram -> <name>_bucket/_sum/_count appears (Prometheus histogram)
+#:   prefix    -> any sample name starting with <name> appears
+#: Candidates are ordered richest-granularity-first; the FIRST match names
+#: the recorded granularity (every match is kept as evidence).
+FIELDS = (
+    # KV occupancy gauge: cage-stats engine.py kv_usage reads
+    # vllm:kv_cache_usage_perc (multi-label-set = refusal there);
+    # vllm:gpu_cache_usage_perc is the pre-rename spelling (gate (o)'s
+    # default), sglang:token_usage the pre-translation SGLang dialect
+    # (sglang_dialect.SGLANG_TO_VLLM).
+    ("occupancy_gauge", "metrics", (
+        ("vllm:kv_cache_usage_perc", "exact", "gauge (0..1 of the KV pool)"),
+        ("vllm:gpu_cache_usage_perc", "exact", "gauge (0..1 of the KV pool)"),
+        ("sglang:token_usage", "exact", "gauge (0..1 of the KV pool)"),
+    )),
+    # Preemption/retraction counter: engine.py preemptions_total; the SGLang
+    # retraction spellings (sglang_dialect.RETRACTION_CANDIDATES, preference
+    # order preserved) map onto vllm:num_preemptions_total.
+    ("preemption_counter", "metrics", (
+        ("vllm:num_preemptions_total", "exact", "cumulative counter"),
+        ("sglang:num_retracted_reqs_total", "exact", "cumulative counter"),
+        ("sglang:num_retracted_reqs", "exact", "cumulative counter"),
+        ("sglang:retracted_reqs_total", "exact", "cumulative counter"),
+        ("sglang:num_preempted_reqs", "exact", "cumulative counter"),
+    )),
+    # Raw prefix-cache QUERY counter (engine.py prefix_cache_queries_total):
+    # needed for exact windowed hit ratios; SGLang exposes no raw query
+    # counter that cage-stats models -- its absence here IS the blindness.
+    ("prefix_query_counter", "metrics", (
+        ("vllm:prefix_cache_queries_total", "exact", "cumulative counter"),
+    )),
+    # Raw prefix-cache HIT counter; sglang:cache_hit_rate is the explicitly
+    # coarser alternate (a rate gauge -- no raw counts to diff per window).
+    ("prefix_hit_counter", "metrics", (
+        ("vllm:prefix_cache_hits_total", "exact", "cumulative counter"),
+        ("sglang:cache_hit_rate", "exact", "rate gauge (coarser: no raw counts)"),
+    )),
+    # KV-transfer counters: engine.py external-KV attribution counters plus
+    # the connector families _transfer_counters() captures. The prefix rows
+    # MIRROR cage-stats engine.py exactly -- _TRANSFER_FAMILY_RE is
+    # ^vllm:(kv_transfer|nixl|kv_connector) and _TRANSFER_DOC_PREFIXES is
+    # ("nixl_",) -- so a backend exposing connector telemetry under ANY of
+    # the four spellings cage-stats consumes is recorded present, never
+    # false-absent in the audit artifact (VLLM_COMPATIBILITY.md sec. 8.4:
+    # without these the transfer-cost instrumentation is blind).
+    ("transfer_counters", "metrics", (
+        ("vllm:external_prefix_cache_queries_total", "exact", "cumulative counter"),
+        ("vllm:prompt_tokens_by_source_total", "exact", "cumulative counter by source"),
+        ("vllm:kv_transfer", "prefix", "kv-transfer connector family"),
+        ("vllm:kv_connector", "prefix", "kv-connector family"),
+        ("vllm:nixl", "prefix", "nixl transfer family"),
+        ("nixl_", "prefix", "nixl transfer family (bare doc spelling, sec. 8.4)"),
+    )),
+    # Per-phase request-time histograms (engine.py _PHASE_HIST): prefill-time
+    # growth under prefix-cache eviction is the mechanism readout.
+    ("phase_histograms", "metrics", (
+        ("vllm:request_prefill_time_seconds", "histogram", "histogram (_sum/_count/_bucket)"),
+        ("vllm:request_decode_time_seconds", "histogram", "histogram (_sum/_count/_bucket)"),
+        ("vllm:request_inference_time_seconds", "histogram", "histogram (_sum/_count/_bucket)"),
+        ("vllm:request_queue_time_seconds", "histogram", "histogram (_sum/_count/_bucket)"),
+    )),
+    # Aggregate cached-token counter (engine.py cached_tokens_total; a
+    # missing series must not fabricate a zero -- same rule here: absent
+    # stays absent).
+    ("cached_token_aggregate", "metrics", (
+        ("vllm:prompt_tokens_cached_total", "exact", "cumulative counter (aggregate)"),
+    )),
+    # Per-request cached-token field (usage.prompt_tokens_details.
+    # cached_tokens): NOT scrapeable from /metrics. The capabilities probe
+    # that exists is the adapter's capabilities()["cached_token_telemetry"]
+    # declaration: True = verified in this codebase, "verify-live" =
+    # documented upstream only (recorded as such, NEVER coerced to present),
+    # anything else = absent.
+    ("cached_token_per_request", "capabilities", ()),
+)
+
+_NAME = re.compile(r"([A-Za-z_:][A-Za-z0-9_:]*)")
+
+
+def sample_names(text):
+    """The set of Prometheus sample names in one /metrics exposition."""
+    names = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _NAME.match(line)
+        if m:
+            names.add(m.group(1))
+    return names
+
+
+def match_field(names, candidates):
+    """-> {'status', 'granularity', 'matched', 'source'} for one metrics field.
+
+    status 'present' when at least one candidate matched; 'absent' is DATA
+    (the scrape ran and the field is not exposed), never a failure."""
+    matched = []
+    for cand, kind, gran in candidates:
+        if kind == "exact":
+            hit = cand in names
+            label = cand
+        elif kind == "histogram":
+            hit = any(f"{cand}{sfx}" in names
+                      for sfx in ("_bucket", "_sum", "_count"))
+            label = cand
+        elif kind == "prefix":
+            hit = any(n.startswith(cand) for n in names)
+            label = f"{cand}*"
+        else:  # a typo in the FIELDS table is a code bug -- loud, never skipped
+            raise ValueError(f"unknown candidate kind {kind!r}")
+        if hit:
+            matched.append({"name": label, "granularity": gran})
+    return {
+        "status": "present" if matched else "absent",
+        "granularity": matched[0]["granularity"] if matched else None,
+        "matched": matched,
+        "source": "metrics-scrape",
+    }
+
+
+def capabilities_field(backend, adapters):
+    """Per-request cached-token row from the adapter capabilities() probe."""
+    caps = adapters[backend](
+        model_name="preflight-probe", api_base="http://localhost:1"
+    ).capabilities()
+    declared = caps.get("cached_token_telemetry")
+    if declared is True:
+        status = "present"
+    elif declared == "verify-live":
+        # [VERIFY-LIVE at Run-C-prime preflight]: documented upstream,
+        # unverified in this codebase -- surfaced as its own status.
+        status = "verify-live"
+    else:
+        status = "absent"
+    return {
+        "status": status,
+        "granularity": "per-request usage field (adapter-declared)",
+        "matched": [],
+        "source": "capabilities-probe",
+        "declared": repr(declared),
+    }
+
+
+def endpoint_for(backend, api_base):
+    """Same env-derived endpoint mapping as gate (k); None = unknown token."""
+    if backend == "vllm":
+        return api_base
+    if backend == "sglang":
+        return f"http://localhost:{os.environ.get('SGLANG_PORT', '30000')}"
+    if backend == "lmdeploy":
+        return f"http://localhost:{os.environ.get('LMDEPLOY_PORT', '23333')}"
+    return None
+
+
+def out_path():
+    """CAGE_BLINDNESS_OUT wins; default = the run's observability dir."""
+    explicit = os.environ.get("CAGE_BLINDNESS_OUT")
+    if explicit:
+        return Path(explicit)
+    root = os.environ.get("CAGE_RUN_ROOT")
+    base = Path(root) if root else Path("results/preflight")
+    return base / "observability" / "blindness_matrix.json"
+
+
+def cell_text(entry):
+    if entry is None:
+        return "unreachable"
+    if entry["status"] == "present":
+        return f"present ({entry['granularity']}): " + ",".join(
+            m["name"] for m in entry["matched"])
+    if entry["status"] == "verify-live":
+        return "verify-live (adapter-declared, unverified)"
+    return "absent"
+
+
+def main(argv):
+    raw = argv[1] if len(argv) > 1 else "vllm,sglang,lmdeploy"
+    api_base = (argv[2] if len(argv) > 2 else "http://localhost:8000").rstrip("/")
+    backends = []
+    for token in raw.split(","):
+        token = token.strip()
+        token = "lmdeploy" if token == "lmdeploy-turbomind" else token
+        if token and token not in backends:
+            backends.append(token)
+
+    # Adapter import is venv infrastructure (gate (h) proves the same path):
+    # a broken import is a real failure even offline, never a silent skip.
+    try:
+        from src.inference.lmdeploy_adapter import LMDeployAdapter
+        from src.inference.sglang_adapter import SGLangAdapter
+        from src.inference.vllm_adapter import VLLMAdapter
+    except Exception as exc:
+        print(f"  [FAIL] could not import adapter classes for the "
+              f"capabilities probe: {exc}")
+        return 1
+    adapters = {"vllm": VLLMAdapter, "sglang": SGLangAdapter,
+                "lmdeploy": LMDeployAdapter}
+
+    ok = True
+    matrix = {}
+    unreachable = []
+    for backend in backends:
+        url = endpoint_for(backend, api_base)
+        if url is None or backend not in adapters:
+            print(f"  [FAIL] backend '{backend}' has no known endpoint/adapter "
+                  f"mapping (add it here alongside gate (k))")
+            ok = False
+            continue
+        try:
+            with urllib.request.urlopen(f"{url}/metrics", timeout=5) as resp:
+                text = resp.read().decode("utf-8", "replace")
+        except Exception as exc:
+            matrix[backend] = {"endpoint": url, "reachable": False,
+                               "fields": {}}
+            unreachable.append((backend, url, f"{type(exc).__name__}: {exc}"))
+            continue
+        names = sample_names(text)
+        fields = {}
+        for key, probe, candidates in FIELDS:
+            if probe == "metrics":
+                fields[key] = match_field(names, candidates)
+            else:
+                fields[key] = capabilities_field(backend, adapters)
+        matrix[backend] = {"endpoint": url, "reachable": True,
+                           "fields": fields}
+
+    reachable = [b for b in matrix if matrix[b]["reachable"]]
+    if not reachable and ok:
+        # No fabricated matrix from thin air: with NO live backend there is
+        # nothing to record -- this is a live-only gate.
+        print(f"  [SKIP] live-only gate: no scoped backend reachable "
+              f"(scope: {raw!r}) -- the blindness matrix records what a LIVE "
+              f"/metrics exposes; executed for real at Run-C-prime preflight")
+        return 3
+
+    doc = {
+        "schema": "cage-blindness-matrix-v1",
+        "generated_at_unix": time.time(),
+        "scope": backends,
+        "fields": [key for key, _, _ in FIELDS],
+        "matrix": matrix,
+    }
+    out = out_path()
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n",
+                       encoding="utf-8")
+    except OSError as exc:
+        print(f"  [FAIL] blindness-matrix artifact cannot be written to "
+              f"{out}: {exc} (override via CAGE_BLINDNESS_OUT)")
+        return 1
+
+    # Rendered markdown table (rows = fields, columns = scoped backends).
+    cols = [b for b in backends if b in matrix]
+    print("  [matrix] engine x telemetry-field blindness matrix "
+          "(absent cells are DATA, not failures):")
+    print(f"| field | {' | '.join(cols)} |")
+    print(f"|---|{'---|' * len(cols)}")
+    for key, _, _ in FIELDS:
+        cells = [cell_text(matrix[b]["fields"].get(key)
+                           if matrix[b]["reachable"] else None)
+                 for b in cols]
+        print(f"| {key} | {' | '.join(cells)} |")
+    print(f"  [artifact] {out}")
+
+    for backend, url, why in unreachable:
+        print(f"  [FAIL] backend '{backend}' unreachable at {url}/metrics "
+              f"({why}) while the fleet is live -- scope down "
+              f"CAGE_PREFLIGHT_BACKENDS to the serving engine ONLY as a "
+              f"recorded deviation")
+        ok = False
+    if ok:
+        print(f"  [PASS] blindness matrix recorded for "
+              f"{', '.join(reachable)} -> {out}")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+PY
+gate_rc $?
+
+# ---------------------------------------------------------------------------
+# (s) engine x model gate-matrix runner (task T8.3).
+# The 2026-08-27 audit: the VLLM_COMPATIBILITY.md section-7 4x4 VERIFY-LIVE
+# cell gates existed only as a doc table -- no code ran them. This gate holds
+# the declarative engine x check table and runs every applicable cell:
+# PASS (proven here) / FAIL (proven broken) / PENDING-VERIFY-LIVE (offline,
+# backend not serving, or upstream-documented-only -- NEVER upgraded to a
+# fabricated PASS). rc: 1 only on an actual FAIL, 3 when every applicable
+# check is PENDING (reason printed), 0 when at least one check ran and none
+# failed. The fp8xprefix cell delegates to
+# scripts/checks/check_fp8_prefix_cache.sh (opt-in: it RESTARTS vLLM).
+# ---------------------------------------------------------------------------
+echo "(s) engine x model gate matrix (scope: $PREFLIGHT_BACKENDS; docs/VLLM_COMPATIBILITY.md section 7)"
+python3 - "$PREFLIGHT_BACKENDS" "$API_BASE" "$MODEL" <<'PY'
+# CAGE-ENGINE-MODEL-GATE-MATRIX (task T8.3; docs/VLLM_COMPATIBILITY.md
+# section 7). Extracted and executed by tests/test_preflight_gates.py.
+# Discipline: a check that cannot run HERE reports PENDING-VERIFY-LIVE with
+# its reason -- pending is surfaced in behavior, never silently defaulted to
+# PASS (fail-closed doctrine; every section-7 cell is VERIFY-LIVE until its
+# gate has run on the provisioned node at the pinned version).
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+from pathlib import Path
+
+PASS = "PASS"
+FAIL = "FAIL"
+PENDING = "PENDING-VERIFY-LIVE"
+
+CHECKS = ("deterministic_mode", "turbomind_selected", "fp8_prefix_coexist",
+          "cached_token_telemetry")
+
+#: Declarative engine x check table, sourced from VLLM_COMPATIBILITY.md
+#: section 7 (True = the check gates that engine's campaign cells, False =
+#: not applicable -- an N/A cell is reported, never silently omitted):
+#:   deterministic_mode -- sec. 7 SGLang pin row: "deterministic-mode
+#:     availability (T=0 reproducible sampling) per model"; the vLLM Group-C
+#:     cell carries the sec. 5.2 "mandatory T=0 token-identity smoke", whose
+#:     precondition is T=0 repeatability, so vLLM probes too. LMDeploy has no
+#:     sec.-7 deterministic row -> N/A.
+#:   turbomind_selected -- sec. 7 LMDeploy pin row: "TurboMind backend only
+#:     ... TurboMind is actually selected (not the silent PyTorch-engine
+#:     fallback)" (charter P7). vLLM/SGLang -> N/A.
+#:   fp8_prefix_coexist -- sec. 2 flag matrix + sec. 4: the compressed_cag
+#:     lever (--kv-cache-dtype fp8 x --enable-prefix-caching) is vLLM-only;
+#:     sec. 7 vLLM column D additionally flags fp8-KV-on-MLA [VERIFY-LIVE].
+#:     Delegates to scripts/checks/check_fp8_prefix_cache.sh.
+#:   cached_token_telemetry -- sec. 7 row A gates: vLLM "prefix telemetry
+#:     (cached_tokens)"; SGLang "radix-cache telemetry (per-request
+#:     granularity [VERIFY-LIVE])"; LMDeploy "blocked-KV pressure counters
+#:     (weakest documented telemetry -- a failed cache-telemetry gate ->
+#:     serving-only or excluded cells)".
+TABLE = {
+    "vllm": {"deterministic_mode": True, "turbomind_selected": False,
+             "fp8_prefix_coexist": True, "cached_token_telemetry": True},
+    "sglang": {"deterministic_mode": True, "turbomind_selected": False,
+               "fp8_prefix_coexist": False, "cached_token_telemetry": True},
+    "lmdeploy": {"deterministic_mode": False, "turbomind_selected": True,
+                 "fp8_prefix_coexist": False, "cached_token_telemetry": True},
+}
+
+# TurboMind detection patterns MIRROR scripts/2_serving/
+# manage_lmdeploy_server.sh assert_turbomind_selected (the P7 enforcement
+# point; the launcher dies at start in strict mode -- this runner reports).
+# The marker patterns themselves are [VERIFY-LIVE at Run-C-prime preflight].
+_TM_FALLBACK = re.compile(
+    r"fallback to pytorch|pytorch.{0,20}(engine|backend)|"
+    r"(engine|backend).{0,20}pytorch", re.I)
+_TM_POSITIVE = re.compile(
+    r"\[TM\]|turbomind.{0,30}(engine|backend|model|start)|"
+    r"(engine|backend).{0,30}turbomind", re.I)
+
+
+def endpoint_for(backend, api_base):
+    """Same env-derived endpoint mapping as gates (k)/(r)."""
+    if backend == "vllm":
+        return api_base
+    if backend == "sglang":
+        return f"http://localhost:{os.environ.get('SGLANG_PORT', '30000')}"
+    if backend == "lmdeploy":
+        return f"http://localhost:{os.environ.get('LMDEPLOY_PORT', '23333')}"
+    return None
+
+
+def check_deterministic(url, model):
+    """Two identical T=0 seed-pinned completions must be byte-identical.
+
+    Live-only: any transport/HTTP error is PENDING (with the reason), a real
+    divergence between two identical requests is a FAIL."""
+    def ask():
+        body = json.dumps({"model": model,
+                           "prompt": "Deterministic-mode probe: 2+2=",
+                           "max_tokens": 8, "temperature": 0,
+                           "seed": 20260902}).encode()
+        req = urllib.request.Request(f"{url}/v1/completions", body,
+                                     {"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.load(resp)["choices"][0]["text"]
+
+    try:
+        a, b = ask(), ask()
+    except Exception as exc:
+        return (PENDING, f"live-only probe could not run at {url} "
+                         f"({type(exc).__name__}: {exc}) "
+                         f"[VERIFY-LIVE at Run-C-prime preflight]")
+    if a == b:
+        return (PASS, f"two T=0 seed-pinned completions byte-identical ({a!r})")
+    return (FAIL, f"T=0 completions DIVERGED ({a!r} vs {b!r}) -- "
+                  f"deterministic mode is NOT holding (sec. 7 pin row)")
+
+
+def check_turbomind(log_root):
+    """TurboMind-actually-selected from the newest LMDeploy launch log."""
+    logs = sorted((log_root / "lmdeploy").glob("*.log"),
+                  key=lambda p: p.stat().st_mtime)
+    if not logs:
+        return (PENDING, f"no LMDeploy launch log under {log_root / 'lmdeploy'}/ "
+                         f"-- the launcher's assert_turbomind_selected runs at "
+                         f"server start [VERIFY-LIVE at Run-C-prime preflight]")
+    log = logs[-1]
+    text = log.read_text(encoding="utf-8", errors="replace")
+    if _TM_FALLBACK.search(text):
+        return (FAIL, f"PyTorch-engine fallback marker in {log} -- the P7 "
+                      f"never-mixed policy is violated (sec. 7 LMDeploy pin row)")
+    if _TM_POSITIVE.search(text):
+        return (PASS, f"TurboMind selection marker found in {log}")
+    return (PENDING, f"no backend marker in {log} (the marker pattern itself "
+                     f"is VERIFY-LIVE; the strict launcher is the enforcement "
+                     f"point) [VERIFY-LIVE at Run-C-prime preflight]")
+
+
+def check_fp8_prefix(model):
+    """Delegate to check_fp8_prefix_cache.sh -- opt-in, it RESTARTS vLLM.
+
+    Delegate rc mapping: 0 -> PASS, 1 -> FAIL (confound proven: fp8 KV turned
+    prefix caching off), 2 -> PENDING (the script's own INCONCLUSIVE code),
+    anything else -> FAIL (a crashed instrument is never a silent skip)."""
+    script = Path(os.environ.get("CAGE_FP8_GATE_SCRIPT",
+                                 "scripts/checks/check_fp8_prefix_cache.sh"))
+    if os.environ.get("CAGE_RUN_FP8_GATE", "") != "1":
+        return (PENDING, f"delegate {script} not run -- set CAGE_RUN_FP8_GATE=1 "
+                         f"to launch it (GPU-only; it RESTARTS vLLM with fp8 "
+                         f"KV) [VERIFY-LIVE at Run-C-prime preflight]")
+    if not script.is_file():
+        return (FAIL, f"CAGE_RUN_FP8_GATE=1 but delegate script {script} does "
+                      f"not exist")
+    proc = subprocess.run(["bash", str(script), model],
+                          capture_output=True, text=True)
+    for line in proc.stdout.splitlines():
+        print(f"    [fp8-delegate] {line}")
+    if proc.returncode == 0:
+        return (PASS, f"delegate {script.name} exit 0 (fp8 KV + prefix "
+                      f"caching coexist)")
+    if proc.returncode == 1:
+        return (FAIL, f"delegate {script.name} exit 1 -- fp8 KV disables "
+                      f"prefix caching: compressed_cag would be confounded "
+                      f"(sec. 4)")
+    if proc.returncode == 2:
+        return (PENDING, f"delegate {script.name} exit 2 (INCONCLUSIVE: "
+                         f"server/flag error) [VERIFY-LIVE at Run-C-prime "
+                         f"preflight]")
+    return (FAIL, f"delegate {script.name} crashed (exit {proc.returncode}): "
+                  f"{proc.stderr.strip()[:200]}")
+
+
+def check_cached_token(backend, adapters):
+    """Cached-token telemetry from the adapter capabilities() declaration.
+
+    True = verified in this codebase -> PASS; "verify-live" = documented
+    upstream only -> PENDING (never coerced); anything else = the adapter
+    declares NO cached-token channel -> FAIL (sec. 7: those cells go
+    serving-only or excluded -- loud, so the operator scopes them)."""
+    caps = adapters[backend](
+        model_name="preflight-probe", api_base="http://localhost:1"
+    ).capabilities()
+    declared = caps.get("cached_token_telemetry")
+    if declared is True:
+        return (PASS, "adapter declares cached_token_telemetry=True "
+                      "(verified in-codebase)")
+    if declared == "verify-live":
+        return (PENDING, "adapter declares 'verify-live' (documented "
+                         "upstream, unverified here) [VERIFY-LIVE at "
+                         "Run-C-prime preflight]")
+    return (FAIL, f"adapter declares cached_token_telemetry={declared!r} -- "
+                  f"no cached-token channel; scope those cells serving-only "
+                  f"(sec. 7)")
+
+
+def main(argv):
+    raw = argv[1] if len(argv) > 1 else "vllm,sglang,lmdeploy"
+    api_base = (argv[2] if len(argv) > 2 else "http://localhost:8000").rstrip("/")
+    model = argv[3] if len(argv) > 3 else "Qwen/Qwen3-8B"
+    backends = []
+    for token in raw.split(","):
+        token = token.strip()
+        token = "lmdeploy" if token == "lmdeploy-turbomind" else token
+        if token and token not in backends:
+            backends.append(token)
+
+    try:
+        from src.inference.lmdeploy_adapter import LMDeployAdapter
+        from src.inference.sglang_adapter import SGLangAdapter
+        from src.inference.vllm_adapter import VLLMAdapter
+    except Exception as exc:
+        print(f"  [FAIL] could not import adapter classes: {exc}")
+        return 1
+    adapters = {"vllm": VLLMAdapter, "sglang": SGLangAdapter,
+                "lmdeploy": LMDeployAdapter}
+
+    # Same logs tree gate (j) discovers from (one env var, already part of
+    # the gate-env contract).
+    log_root = Path(os.environ.get("CAGE_ISO_BYTES_LOG_ROOT", "logs"))
+
+    ok = True
+    results = {}
+    for backend in backends:
+        if backend not in TABLE:
+            print(f"  [FAIL] backend '{backend}' has no row in the sec.-7 "
+                  f"engine x check table -- add it before scoping it in")
+            ok = False
+            continue
+        row = {}
+        for check in CHECKS:
+            if not TABLE[backend][check]:
+                row[check] = ("N/A", "not applicable (sec. 7)")
+                continue
+            if check == "deterministic_mode":
+                row[check] = check_deterministic(
+                    endpoint_for(backend, api_base), model)
+            elif check == "turbomind_selected":
+                row[check] = check_turbomind(log_root)
+            elif check == "fp8_prefix_coexist":
+                row[check] = check_fp8_prefix(model)
+            else:
+                row[check] = check_cached_token(backend, adapters)
+        results[backend] = row
+
+    print("  [matrix] engine x check gate matrix (sec. 7; PENDING is a "
+          "pending check, never a pass):")
+    print(f"| engine | {' | '.join(CHECKS)} |")
+    print(f"|---|{'---|' * len(CHECKS)}")
+    for backend, row in results.items():
+        print(f"| {backend} | "
+              + " | ".join(row[c][0] for c in CHECKS) + " |")
+    for backend, row in results.items():
+        for check in CHECKS:
+            status, why = row[check]
+            print(f"  [cell] {backend} x {check}: {status} -- {why}")
+
+    statuses = [row[c][0] for row in results.values() for c in CHECKS]
+    if any(s == FAIL for s in statuses):
+        ok = False
+    if not ok:
+        return 1
+    if any(s == PASS for s in statuses):
+        print("  [PASS] gate matrix: at least one check ran and none failed "
+              "(PENDING cells above re-run live)")
+        return 0
+    print(f"  [SKIP] every applicable sec.-7 check is {PENDING} (offline "
+          f"preflight or engines not serving) -- re-run with the fleet up; "
+          f"this gate never fabricates a PASS")
+    return 3
 
 
 if __name__ == "__main__":

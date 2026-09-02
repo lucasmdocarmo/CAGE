@@ -569,6 +569,11 @@ def test_save_series_emits_canonical_alongside_legacy(tmp_path: Path) -> None:
         assert rec["ts_s"] == rec["ts"]
         assert rec["kv_cache_usage"] == rec["kv_usage"]
         assert "preemptions_total" in rec
+        # T4.1 (deliberate pin update): the single-sampler path now forward-
+        # writes the optional instance role tag; "single" is its reserved
+        # default. Legacy files without the field stay readable — see
+        # tests/test_multi_instance_telemetry.py for the differential pins.
+        assert rec["instance"] == "single"
 
 
 def test_save_series_absent_gauge_stays_absent(tmp_path: Path) -> None:

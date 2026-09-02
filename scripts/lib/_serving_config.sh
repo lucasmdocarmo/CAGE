@@ -161,6 +161,17 @@ cage_require_positive_int() {
             ;;
     esac
     case "$2" in
+        0?*)
+            # '01' parses as 1 engine-side but defeats the space-anchored
+            # textual dial-parity check (live '--flag 01' vs requested '1'
+            # never matches -> needless restarts, or worse a stale reuse) —
+            # refuse the ambiguous spelling outright (2026-09-01 verifier minor).
+            printf '[cage] REFUSING launch: %s=%s has a leading zero — write the plain decimal\n' \
+                "$1" "$2" >&2
+            return 1
+            ;;
+    esac
+    case "$2" in
         *[!0]*) return 0 ;;  # digits-only AND at least one nonzero digit
     esac
     printf '[cage] REFUSING launch: %s=%s must be > 0 (a zero budget is a refusal, not a config)\n' \
@@ -188,6 +199,39 @@ cage_validate_vllm_budget_env() {
 cage_validate_sglang_budget_env() {
     if [ -n "${CAGE_SGLANG_MAX_TOTAL_TOKENS:-}" ]; then
         cage_require_positive_int CAGE_SGLANG_MAX_TOTAL_TOKENS "${CAGE_SGLANG_MAX_TOTAL_TOKENS}" || return 1
+    fi
+    return 0
+}
+
+# =============================================================================
+# Tensor-parallel launch knobs  (T3.1 — Wave-3 distributed serving stack)
+# =============================================================================
+# The 2026-08-27 audit verified NO launcher passed any TP flag, so every
+# multi-GPU matrix cell (VLLM_COMPATIBILITY.md §7: Llama-3.3-70B TP=4,
+# DeepSeek-V3 TP=8, SGLang pure-TP V3 cells) would silently have served TP=1.
+# Env contract (validated here, one source of truth; launchers `|| die`):
+#   CAGE_VLLM_TENSOR_PARALLEL  positive int -> vllm `--tensor-parallel-size N`
+#   CAGE_SGLANG_TP             positive int -> sglang `--tp-size N`
+#                              [VERIFY-LIVE at Run-C-prime preflight: exact
+#                              SGLang flag spelling — docs say --tp-size with
+#                              --tp as alias, but no SGLang pin exists yet]
+# Value 1 is VALID and means the flag is OMITTED ENTIRELY: the single-GPU
+# argv must stay byte-identical to the pre-T3.1 launch (pinned differentially
+# in tests/test_tp_flags.py), so engine-default TP handling is untouched.
+# Fail closed: a malformed degree must refuse BEFORE any server is touched —
+# a launch that silently dropped to the engine default would label a TP=4
+# sweep cell with parallelism the server never had.
+
+cage_validate_vllm_tp_env() {
+    if [ -n "${CAGE_VLLM_TENSOR_PARALLEL:-}" ]; then
+        cage_require_positive_int CAGE_VLLM_TENSOR_PARALLEL "${CAGE_VLLM_TENSOR_PARALLEL}" || return 1
+    fi
+    return 0
+}
+
+cage_validate_sglang_tp_env() {
+    if [ -n "${CAGE_SGLANG_TP:-}" ]; then
+        cage_require_positive_int CAGE_SGLANG_TP "${CAGE_SGLANG_TP}" || return 1
     fi
     return 0
 }

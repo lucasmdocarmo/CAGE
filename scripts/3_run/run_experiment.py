@@ -15,6 +15,7 @@ import sys
 import json
 import csv
 import hashlib
+import re
 import time
 import platform
 import subprocess
@@ -599,6 +600,88 @@ def enforce_campaign_transfer_provenance(results: List[Dict[str, Any]]) -> None:
             )
 
 
+#: T4.1 role-token grammar for CAGE_TELEMETRY_ENDPOINTS. MUST stay identical
+#: to src.monitoring.vllm_telemetry._ROLE_RE — a role accepted here must be
+#: constructible as a sampler role, and vice versa.
+_TELEMETRY_ROLE_RE = re.compile(r"^[a-z0-9_-]+$")
+
+
+def parse_telemetry_endpoints(raw: Optional[str]) -> Optional[List[Tuple[str, str]]]:
+    """Parse CAGE_TELEMETRY_ENDPOINTS ("role=url[,role=url]") — T4.1, Wave-3.
+
+    Returns None ONLY when the variable is unset (the legacy single-sampler
+    wiring), else an ordered list of (role, url) pairs. Everything else is a
+    fail-closed refusal (ValueError listing EVERY problem, none skipped):
+    set-but-empty, an entry without '=', a role outside ^[a-z0-9_-]+$, a
+    duplicate role, or a url that is not http(s)://host... A prefill+decode
+    pair whose telemetry config is mistyped must refuse BEFORE any serving
+    work — the caller runs this at run START, never after the engine is up.
+    """
+    if raw is None:
+        return None
+    from urllib.parse import urlsplit
+
+    problems: List[str] = []
+    pairs: List[Tuple[str, str]] = []
+    seen_roles: set = set()
+    entries = raw.split(",")
+    if not raw.strip():
+        problems.append(
+            "CAGE_TELEMETRY_ENDPOINTS is set but empty — unset it for "
+            "single-instance telemetry, or provide role=url[,role=url]"
+        )
+        entries = []
+    for idx, entry in enumerate(entries):
+        entry = entry.strip()
+        if not entry:
+            problems.append(f"entry {idx}: empty (trailing/double comma?)")
+            continue
+        role, sep, url = entry.partition("=")
+        role, url = role.strip(), url.strip()
+        if not sep:
+            problems.append(f"entry {idx} ({entry!r}): expected role=url")
+            continue
+        if not _TELEMETRY_ROLE_RE.match(role):
+            problems.append(
+                f"entry {idx}: role {role!r} must match ^[a-z0-9_-]+$"
+            )
+        elif role in seen_roles:
+            problems.append(
+                f"entry {idx}: duplicate role {role!r} — the merged series "
+                "instance column would be ambiguous"
+            )
+        seen_roles.add(role)
+        split = urlsplit(url)
+        if split.scheme not in ("http", "https") or not split.netloc:
+            problems.append(
+                f"entry {idx}: url {url!r} must be http(s)://host[:port][/...]"
+            )
+        pairs.append((role, url))
+    if problems:
+        raise ValueError(
+            "CAGE_TELEMETRY_ENDPOINTS invalid — refusing before any serving "
+            "work: " + "; ".join(problems)
+        )
+    return pairs
+
+
+def resolve_telemetry_endpoints(vllm_telemetry_enabled: bool) -> Optional[List[Tuple[str, str]]]:
+    """Read + validate CAGE_TELEMETRY_ENDPOINTS at run START (T4.1).
+
+    Endpoints configured while --vllm-telemetry is off would be silently
+    unrecorded role telemetry — a PD run whose foundation artifact never
+    materializes. That mismatch REFUSES (fail-closed) instead of defaulting.
+    """
+    endpoints = parse_telemetry_endpoints(os.getenv("CAGE_TELEMETRY_ENDPOINTS"))
+    if endpoints is not None and not vllm_telemetry_enabled:
+        raise ValueError(
+            "CAGE_TELEMETRY_ENDPOINTS is set but --vllm-telemetry is off: "
+            "role-tagged telemetry would be silently dropped. Pass "
+            "--vllm-telemetry or unset the variable."
+        )
+    return endpoints
+
+
 def resolve_telemetry_dialect(backend: str) -> Optional[str]:
     """Metrics dialect for the serving-telemetry sampler, or None = LOUD skip.
 
@@ -621,6 +704,55 @@ def resolve_telemetry_dialect(backend: str) -> Optional[str]:
     if backend == "sglang":
         return "sglang"
     return "vllm"
+
+
+def build_multi_instance_snapshot(
+    per_role: "dict",
+) -> "Tuple[Optional[dict], Optional[str]]":
+    """Assemble the multi-endpoint vllm_telemetry.json payload (T4.1 repair).
+
+    PER-ROLE only, never pooled — peak/mean math over interleaved
+    prefill+decode gauges would fabricate a fictional single instance. A role
+    whose sampler collected zero samples stays None (absence is not zero).
+
+    Returns (snapshot, warning):
+    - any role has samples  -> ({"multi_instance": True, "instances": per_role}, None)
+    - EVERY role is empty   -> (None, LOUD warning text). The snapshot must
+      stay absent — the caller is hard-gated against the one-shot
+      capture(api_base) fallback in multi mode, so a dead PD sampler set
+      (role URLs pass grammar validation; reachability is only provable
+      live) yields NO artifact plus a printed refusal, never a
+      legacy-shaped file that masquerades as a healthy single instance.
+    """
+    if any(v is not None for v in per_role.values()):
+        return {"multi_instance": True, "instances": per_role}, None
+    return None, (
+        "[telemetry] WARNING: CAGE_TELEMETRY_ENDPOINTS set but EVERY role "
+        "sampler collected ZERO samples (" + ", ".join(sorted(per_role)) + ") "
+        "-- no vllm_telemetry.json will be written and the merged series is "
+        "absent (regime labeling will refuse these windows). Check that each "
+        "role URL points at a live /metrics endpoint."
+    )
+
+
+def speculative_acceptance_from_snapshot(snapshot: "Optional[dict]") -> "Optional[float]":
+    """Spec-decode acceptance for the DEGRADED sentinel, schema-aware (T4.1).
+
+    Single-instance snapshots carry it top-level. The multi-instance dict
+    NEVER does — acceptance lives inside instances[role] (promoted there by
+    VllmTelemetrySampler.aggregate()), and a PD pair drafts on one role, so
+    any role's sampled acceptance proves speculation engaged. Only real
+    sampled data clears the DEGRADED mark: no acceptance anywhere -> None.
+    """
+    if not snapshot:
+        return None
+    acc = snapshot.get("spec_decode_acceptance_rate")
+    if acc is not None or not snapshot.get("multi_instance"):
+        return acc
+    for inst in (snapshot.get("instances") or {}).values():
+        if isinstance(inst, dict) and inst.get("spec_decode_acceptance_rate") is not None:
+            return inst["spec_decode_acceptance_rate"]
+    return None
 
 
 def chunked(items: List[Any], size: int) -> List[List[Any]]:
@@ -1365,6 +1497,14 @@ def run_experiment(
             f"baselines (redis/hybrid): their cache keys pin the dense "
             f"embedding-model pipeline. Use the dense retriever for these arms."
         )
+
+    # T4.1 multi-instance telemetry endpoints (CAGE_TELEMETRY_ENDPOINTS):
+    # parsed + validated EARLY, same fail-closed slot as the retriever check
+    # above — a mistyped role=url list, a duplicate role, or endpoints
+    # configured without --vllm-telemetry must refuse BEFORE any dataset or
+    # serving work ever starts, never burn a GPU run. None = env unset = the
+    # legacy single-sampler wiring further down, untouched.
+    telemetry_endpoints = resolve_telemetry_endpoints(vllm_telemetry)
 
     # hf-oracle corpus-prefix preload is wired for the single/batched workload
     # modes only (the multi-turn prompt layout breaks the literal-prefix
@@ -2738,12 +2878,50 @@ def run_experiment(
     # cage-stats serving telemetry sampled DURING the workload (not one-shot at idle),
     # so throughput / KV-usage / prefix-hit reflect the ACTIVE run.
     vllm_sampler = None
+    # T4.1: role-tagged sampler set (one per CAGE_TELEMETRY_ENDPOINTS entry).
+    # Mutually exclusive with vllm_sampler — the env-absent path below is the
+    # pre-T4.1 wiring, unchanged.
+    vllm_role_samplers: Optional[List[Any]] = None
     if vllm_telemetry:
         # T4.3: dialect per backend; None = LOUD skip (LMDeploy — no dialect,
         # no evidence of vLLM-named families; absent series is the honest
         # outcome and regime labeling will refuse those windows).
         _telemetry_dialect = resolve_telemetry_dialect(backend)
-        if _telemetry_dialect is not None:
+        if _telemetry_dialect is not None and telemetry_endpoints is not None:
+            # T4.1: ONE sampler per role=url endpoint, all with the SAME
+            # resolved dialect (a PD pair runs one engine binary per role, so
+            # both /metrics speak the backend's dialect). Records are merged
+            # into ONE telemetry_series.jsonl at save time (save_merged_series
+            # below), not per-tick — each sampler thread stays lock-free and
+            # the record shaping is shared with the single path.
+            # A spawn failure PROPAGATES (after stopping any already-started
+            # sampler): the endpoints were explicitly configured, so degrading
+            # to a partial role set would emit a series that looks like a
+            # healthy single instance but is a broken PD pair — the exact
+            # laundering T4.1 exists to prevent. Contrast the env-absent
+            # branch, which keeps its historical best-effort print.
+            # [VERIFY-LIVE at Run-C-prime preflight] a real disaggregated
+            # deployment's per-role /metrics endpoints actually expose the
+            # sampled gauge families.
+            from src.monitoring.vllm_telemetry import VllmTelemetrySampler
+            vllm_role_samplers = []
+            try:
+                for _role, _url in telemetry_endpoints:
+                    vllm_role_samplers.append(
+                        VllmTelemetrySampler(
+                            _url, interval=1.0, dialect=_telemetry_dialect,
+                            role=_role,
+                        ).start()
+                    )
+            except Exception:
+                for _s in vllm_role_samplers:
+                    _s.stop()
+                raise
+            print(
+                "[telemetry] multi-instance samplers started: "
+                + ", ".join(f"{r}={u}" for r, u in telemetry_endpoints)
+            )
+        elif _telemetry_dialect is not None:
             try:
                 from src.monitoring.vllm_telemetry import VllmTelemetrySampler
                 # Start the sampler whenever telemetry is requested -- NOT gated on cage-stats.
@@ -2793,6 +2971,9 @@ def run_experiment(
         gpu_tracker.stop_monitoring()
     if vllm_sampler is not None:
         vllm_sampler.stop()
+    if vllm_role_samplers is not None:
+        for _s in vllm_role_samplers:
+            _s.stop()
 
     print("-" * 70)
     print("Experiment complete!")
@@ -2809,7 +2990,40 @@ def run_experiment(
     vllm_telemetry_snapshot = None
     if vllm_telemetry:
         try:
-            from src.monitoring.vllm_telemetry import available, capture, dashboard_text, scrape_spec_decode
+            from src.monitoring.vllm_telemetry import (
+                available,
+                capture,
+                dashboard_text,
+                save_merged_series,
+                scrape_spec_decode,
+            )
+            if vllm_role_samplers is not None:
+                # T4.1: PER-ROLE aggregates, never pooled — peak/mean math
+                # over interleaved prefill+decode gauges would fabricate a
+                # fictional single instance (the same sin the §6.1 regime
+                # bridge refuses on the series side). A role with no samples
+                # stays None: absence is not zero. All-empty -> snapshot
+                # stays None + LOUD warning (see build_multi_instance_snapshot).
+                _per_role = {s.role: s.aggregate() for s in vllm_role_samplers}
+                vllm_telemetry_snapshot, _all_empty_warning = (
+                    build_multi_instance_snapshot(_per_role)
+                )
+                if _all_empty_warning is not None:
+                    print(_all_empty_warning)
+                # Merge point (T4.1, deliberate): ONE telemetry_series.jsonl in
+                # the staging dir, sorted by ts_s, every record stamped with
+                # its role. Chosen because campaign_session.emit_window copies
+                # these staging rows VERBATIM into the window's
+                # cage_stats.jsonl — merging here means the role tags reach
+                # the regime bridge with zero further wiring, and the offline
+                # readers keep seeing exactly one series file per trial.
+                try:
+                    os.makedirs(output_dir, exist_ok=True)
+                    _series_path = os.path.join(output_dir, "telemetry_series.jsonl")
+                    if save_merged_series(vllm_role_samplers, _series_path):
+                        print(f"[telemetry] merged role series saved -> {_series_path}")
+                except Exception as _series_exc:
+                    print(f"[telemetry] merged series save failed: {_series_exc}")
             # Prefer the workload-sampled aggregate (works even without cage-stats: the
             # sampler falls back to the stdlib /metrics scraper for spec-decode acceptance).
             if vllm_sampler is not None:
@@ -2826,7 +3040,15 @@ def run_experiment(
                     print(f"[telemetry] series save failed: {_series_exc}")
             # If cage-stats is present, enrich with a one-shot snapshot + print the dashboard.
             if available():
-                if vllm_telemetry_snapshot is None:
+                # T4.1 repair: the one-shot capture(api_base) is a
+                # SINGLE-instance measurement, so it is hard-gated on the
+                # legacy path (vllm_role_samplers is None). In multi-endpoint
+                # mode a None snapshot means every role sampler was empty —
+                # falling back here would write a legacy-shaped
+                # vllm_telemetry.json in which a broken PD sampler set
+                # masquerades as a healthy single instance. Absence (plus the
+                # all-empty warning printed above) is the honest outcome.
+                if vllm_telemetry_snapshot is None and vllm_role_samplers is None:
                     vllm_telemetry_snapshot, _ = capture(api_base)
                 _dash = dashboard_text(api_base)
                 if _dash:
@@ -2836,7 +3058,13 @@ def run_experiment(
                     print(_dash)
             # Dependency-free backstop: ALWAYS ensure spec-decode acceptance is captured from
             # /metrics, even when cage-stats is absent or sampling missed the spec counters.
-            if (
+            # T4.1 repair: single-instance path ONLY — the multi-instance dict never
+            # carries a top-level spec_decode_acceptance_rate (per-role acceptance
+            # already lives inside instances[role] via aggregate()), so scraping
+            # api_base here would bolt unattributed single-endpoint spec fields onto
+            # the {multi_instance, instances} schema and it would ALSO resurrect the
+            # all-empty laundering path (snapshot None -> legacy-shaped dict).
+            if vllm_role_samplers is None and (
                 vllm_telemetry_snapshot is None
                 or vllm_telemetry_snapshot.get("spec_decode_acceptance_rate") is None
             ):
@@ -2853,7 +3081,10 @@ def run_experiment(
             # convention scripts/deprecated/run_speculative_matrix.sh used -- so the cell reads as DEGRADED,
             # not silently DONE, in the stats consolidation.
             if baseline_config.baseline_type.value == "speculative":
-                _acc = (vllm_telemetry_snapshot or {}).get("spec_decode_acceptance_rate")
+                # Schema-aware lookup (T4.1): top-level for the single path,
+                # instances[role] for the multi path. Only real sampled data
+                # clears the DEGRADED mark below.
+                _acc = speculative_acceptance_from_snapshot(vllm_telemetry_snapshot)
                 if _acc is None:
                     print("[telemetry] WARNING: speculative baseline but spec_decode_acceptance_rate "
                           "is None -- speculation may not have engaged, or /metrics lacks "

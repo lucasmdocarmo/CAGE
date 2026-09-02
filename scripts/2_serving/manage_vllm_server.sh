@@ -29,6 +29,19 @@
 # Values are validated BEFORE any server is stopped or launched
 # (cage_validate_vllm_budget_env in scripts/lib/_serving_config.sh); preflight
 # gate (j) verifies the REALIZED bytes from the startup log, never the dial.
+#
+# Tensor-parallel env contract (T3.1 — Wave-3 distributed serving; the
+# 2026-08-27 audit verified NO launcher passed any TP flag):
+#   CAGE_VLLM_TENSOR_PARALLEL     positive integer; when set >= 2, the launch
+#                                 adds `--tensor-parallel-size <N>` (flag per
+#                                 docs/VLLM_COMPATIBILITY.md §2/§3; this
+#                                 launcher's pass-through is unproven on a
+#                                 multi-GPU node until the session preflight
+#                                 [VERIFY-LIVE at Run-C-prime preflight]).
+#                                 Value 1 = flag OMITTED ENTIRELY (single-GPU
+#                                 argv stays byte-identical to pre-T3.1).
+# Validated BEFORE any server is stopped or launched
+# (cage_validate_vllm_tp_env in scripts/lib/_serving_config.sh).
 # =============================================================================
 
 set -euo pipefail
@@ -57,6 +70,11 @@ case "${1:-}" in
     start|restart)
         cage_validate_vllm_budget_env \
             || die "invalid KV-budget environment (see refusal above) -- not touching any server"
+        # Tensor-parallel refusal gate (T3.1): same before-any-teardown
+        # discipline — a malformed TP degree on `restart` must not tear down
+        # the healthy server it would fail to replace.
+        cage_validate_vllm_tp_env \
+            || die "invalid tensor-parallel environment (see refusal above) -- not touching any server"
         ;;
 esac
 
@@ -179,6 +197,16 @@ start_server() {
         else
             [[ "$live_cmd" != *"--num-gpu-blocks-override"* ]] || dials_match=false
         fi
+        # Tensor parallelism (T3.1) is a dial too: a TP=2 server must never be
+        # reused for a TP=4 sweep point (its data would be labeled with a
+        # parallelism degree the server never had). Requested >= 2 => exact
+        # space-anchored value must be live (2 must not prefix-match 24);
+        # unset OR =1 => the flag must be absent from the live cmdline.
+        if [ -n "${CAGE_VLLM_TENSOR_PARALLEL:-}" ] && [ "${CAGE_VLLM_TENSOR_PARALLEL}" != "1" ]; then
+            [[ " $live_cmd " == *" --tensor-parallel-size ${CAGE_VLLM_TENSOR_PARALLEL} "* ]] || dials_match=false
+        else
+            [[ "$live_cmd" != *"--tensor-parallel-size"* ]] || dials_match=false
+        fi
 
         # Reuse the running server ONLY when no serving lever is requested. The running
         # check cannot read back the live --speculative-config / --kv-cache-dtype, so if
@@ -276,6 +304,16 @@ start_server() {
         vllm_args+=( --num-gpu-blocks-override "${CAGE_VLLM_GPU_BLOCKS_OVERRIDE}" )
         echo "KV block-budget override enabled: --num-gpu-blocks-override ${CAGE_VLLM_GPU_BLOCKS_OVERRIDE}"
     fi
+    # Tensor parallelism (T3.1; Wave-3 distributed stack). Flag name per
+    # docs/VLLM_COMPATIBILITY.md §2/§3; this launcher's pass-through has never
+    # run on a multi-GPU node [VERIFY-LIVE at Run-C-prime preflight]. Value 1
+    # OMITS the flag entirely so the single-GPU argv stays byte-identical to
+    # pre-T3.1 (engine-default TP handling untouched); validated
+    # positive-integer at the top-of-script gate.
+    if [ -n "${CAGE_VLLM_TENSOR_PARALLEL:-}" ] && [ "${CAGE_VLLM_TENSOR_PARALLEL}" != "1" ]; then
+        vllm_args+=( --tensor-parallel-size "${CAGE_VLLM_TENSOR_PARALLEL}" )
+        echo "Tensor parallelism enabled: --tensor-parallel-size ${CAGE_VLLM_TENSOR_PARALLEL}"
+    fi
     # Optional eager mode: skip torch.compile + CUDA-graph capture for much faster,
     # more reliable startup (esp. on smaller GPUs like the L4, where compile takes
     # 2-3 min and recompiles per prefix-cache config). Serving is uniform across all
@@ -309,6 +347,7 @@ start_server() {
         SC_MEM_UTIL="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}" \
         SC_KV_BUDGET_BYTES="${CAGE_KV_BUDGET_BYTES:-}" \
         SC_BLOCKS_OVERRIDE="${CAGE_VLLM_GPU_BLOCKS_OVERRIDE:-}" \
+        SC_TENSOR_PARALLEL="${CAGE_VLLM_TENSOR_PARALLEL:-}" \
         SC_EAGER="${VLLM_ENFORCE_EAGER:-0}" \
         SC_ARGS="vllm serve $model ${vllm_args[*]}" \
         SC_FILE="$cfg_file" \
@@ -346,6 +385,14 @@ cfg = {
     "num_gpu_blocks_override": (
         int(os.environ["SC_BLOCKS_OVERRIDE"])
         if os.environ.get("SC_BLOCKS_OVERRIDE") else None
+    ),
+    # T3.1 tensor-parallel degree; null = knob not requested (engine-default
+    # single-GPU launch), honest absence rather than a fabricated 1. Note an
+    # EXPLICIT =1 request is recorded as 1 even though the flag is omitted:
+    # the field captures what was requested, the args line what was passed.
+    "tensor_parallel": (
+        int(os.environ["SC_TENSOR_PARALLEL"])
+        if os.environ.get("SC_TENSOR_PARALLEL") else None
     ),
     "enforce_eager": os.environ.get("SC_EAGER") == "1",
     "args": os.environ["SC_ARGS"],

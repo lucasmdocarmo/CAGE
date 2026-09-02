@@ -48,6 +48,20 @@
 # The value is validated BEFORE any server is stopped or launched
 # (cage_validate_sglang_budget_env in scripts/lib/_serving_config.sh);
 # preflight gate (j) verifies the REALIZED pool bytes from the startup log.
+#
+# Tensor-parallel env contract (T3.1 — Wave-3 distributed serving; the
+# 2026-08-27 audit verified NO launcher passed any TP flag):
+#   CAGE_SGLANG_TP                positive integer; when set >= 2, the launch
+#                                 adds `--tp-size <N>` — SGLang's documented
+#                                 TP flag spelling (--tp is its alias), chosen
+#                                 to match this launcher's long-form flag
+#                                 convention; unproven against any pinned
+#                                 SGLang (no pin exists yet, §7)
+#                                 [VERIFY-LIVE at Run-C-prime preflight].
+#                                 Value 1 = flag OMITTED ENTIRELY (single-GPU
+#                                 argv stays byte-identical to pre-T3.1).
+# Validated BEFORE any server is stopped or launched
+# (cage_validate_sglang_tp_env in scripts/lib/_serving_config.sh).
 # =============================================================================
 
 set -euo pipefail
@@ -71,6 +85,11 @@ case "${1:-}" in
     start|restart)
         cage_validate_sglang_budget_env \
             || die "invalid KV-budget environment (see refusal above) -- not touching any server"
+        # Tensor-parallel refusal gate (T3.1): same before-any-teardown
+        # discipline — a malformed TP degree on `restart` must not tear down
+        # the healthy server it would fail to replace.
+        cage_validate_sglang_tp_env \
+            || die "invalid tensor-parallel environment (see refusal above) -- not touching any server"
         ;;
 esac
 
@@ -180,6 +199,15 @@ start_server() {
         else
             [[ "$live_cmd" != *"--max-total-tokens"* ]] || dials_match=false
         fi
+        # Tensor parallelism (T3.1) is a dial too: a TP=2 server must never
+        # be reused for a TP=4 sweep point. Requested >= 2 => exact
+        # space-anchored value must be live (2 must not prefix-match 24);
+        # unset OR =1 => the flag must be absent from the live cmdline.
+        if [ -n "${CAGE_SGLANG_TP:-}" ] && [ "${CAGE_SGLANG_TP}" != "1" ]; then
+            [[ " $live_cmd " == *" --tp-size ${CAGE_SGLANG_TP} "* ]] || dials_match=false
+        else
+            [[ "$live_cmd" != *"--tp-size"* ]] || dials_match=false
+        fi
 
         if [ "$loaded_model" = "$model" ] && [ "$has_prefix_cache" = "$want_prefix_cache" ] \
            && [ "$dials_match" = "true" ] \
@@ -216,6 +244,18 @@ start_server() {
     if [ -n "${CAGE_SGLANG_MAX_TOTAL_TOKENS:-}" ]; then
         sglang_args+=( --max-total-tokens "${CAGE_SGLANG_MAX_TOTAL_TOKENS}" )
         echo "KV token budget enabled: --max-total-tokens ${CAGE_SGLANG_MAX_TOTAL_TOKENS}"
+    fi
+
+    # Tensor parallelism (T3.1; Wave-3 distributed stack). `--tp-size` is
+    # SGLang's documented long-form TP flag (--tp is its alias; long form
+    # matches this launcher's convention), but NO SGLang pin exists yet (§7)
+    # so the exact spelling is unproven [VERIFY-LIVE at Run-C-prime
+    # preflight]. Value 1 OMITS the flag entirely so the single-GPU argv
+    # stays byte-identical to pre-T3.1; validated positive-integer at the
+    # top-of-script gate.
+    if [ -n "${CAGE_SGLANG_TP:-}" ] && [ "${CAGE_SGLANG_TP}" != "1" ]; then
+        sglang_args+=( --tp-size "${CAGE_SGLANG_TP}" )
+        echo "Tensor parallelism enabled: --tp-size ${CAGE_SGLANG_TP}"
     fi
 
     # RadixAttention is default-ON; the cache-off arm disables it explicitly.
@@ -263,6 +303,7 @@ start_server() {
         SC_DIAL_FLAG="--mem-fraction-static" \
         SC_DIAL_VALUE="$mem_fraction" \
         SC_MAX_TOTAL_TOKENS="${CAGE_SGLANG_MAX_TOTAL_TOKENS:-}" \
+        SC_TENSOR_PARALLEL="${CAGE_SGLANG_TP:-}" \
         SC_KV_DTYPE="${SGLANG_KV_CACHE_DTYPE:-auto}" \
         SC_EAGER="${VLLM_ENFORCE_EAGER:-0}" \
         SC_ARGS="python3 -m sglang.launch_server ${sglang_args[*]}" \
@@ -290,6 +331,14 @@ cfg = {
     "max_total_tokens": (
         int(os.environ["SC_MAX_TOTAL_TOKENS"])
         if os.environ.get("SC_MAX_TOTAL_TOKENS") else None
+    ),
+    # T3.1 tensor-parallel degree; null = knob not requested (engine-default
+    # single-GPU launch), honest absence rather than a fabricated 1. Note an
+    # EXPLICIT =1 request is recorded as 1 even though the flag is omitted:
+    # the field captures what was requested, the args line what was passed.
+    "tensor_parallel": (
+        int(os.environ["SC_TENSOR_PARALLEL"])
+        if os.environ.get("SC_TENSOR_PARALLEL") else None
     ),
     "kv_cache_dtype": os.environ.get("SC_KV_DTYPE") or "auto",
     "enforce_eager": os.environ.get("SC_EAGER") == "1",

@@ -17,7 +17,15 @@ Charter bindings (PUBLICATION.md):
   nearest rate points.
 - Audit F1 scale note: G and Y ship in BOTH named scales — fraction-of-issued
   (``*_frac``) and per-window rate (``*_rps``) — and one figure never mixes
-  them. The per-GPU basis (§6.6b) is a downstream division by GPU count.
+  them.
+- §6.6 iso-basis machinery: distributed-vs-pressured comparisons run on one of
+  TWO pre-registered bases, never mixed in one figure — (a) iso-aggregate-bytes
+  (mechanism question; raw aggregate G/Y), and (b) per-GPU goodput =
+  completed-only goodput / GPU count (deployment question; transfer/protocol
+  contrasts #18/#19 ALWAYS report basis b). ``evaluate_window(gpu_count=...)``
+  computes the basis-(b) division here, ``WindowMetrics.bases`` labels which
+  basis every number belongs to, and ``assert_single_basis`` is the seam
+  figure code calls before pooling.
 
 Non-completions are non-veridical by registration (audit §2.6): a row with
 ``veridical=True`` while ``ok=False`` violates the scoring contract and raises.
@@ -27,6 +35,8 @@ Domain logic only: stdlib + numpy/pandas, no I/O, no plotting.
 from __future__ import annotations
 
 import math
+import operator
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
 from typing import Literal
 
@@ -35,6 +45,10 @@ import pandas as pd
 
 __all__ = [
     "ATTAINMENT_MIN",
+    "BASIS_AGGREGATE",
+    "BASIS_PER_GPU",
+    "BasisLabel",
+    "BasisRecord",
     "GoodputError",
     "IN_REGIME",
     "OnsetEstimate",
@@ -47,7 +61,9 @@ __all__ = [
     "SLOBaseline",
     "TPOT_SLO_MULTIPLIER",
     "TTFT_SLO_MULTIPLIER",
+    "WINDOW_BASES",
     "WindowMetrics",
+    "assert_single_basis",
     "classify_regime",
     "corrected_rate",
     "evaluate_window",
@@ -80,6 +96,49 @@ OnsetLabel = Literal[
     "ESTIMATED", "INCONCLUSIVE_AT_RESOLUTION", "NOT_BRACKETED", "NOT_OBSERVED"
 ]
 
+BasisLabel = Literal["aggregate", "per-gpu"]
+# THE §6.6 basis vocabulary (charter): two pre-registered bases for
+# distributed-vs-pressured comparison, never mixed in one figure. These are
+# machine labels — figure code imports THESE constants, never respells them
+# (the regime-label 2026-08-02 harmonization lesson applied to bases).
+BASIS_AGGREGATE: BasisLabel = "aggregate"  # §6.6a iso-aggregate-bytes: raw G/Y
+BASIS_PER_GPU: BasisLabel = "per-gpu"  # §6.6b deployment: G/gpu_count, Y/gpu_count
+
+# Which WindowMetrics fields live on which basis. The per-GPU basis is a RATE
+# normalization only: *_frac numbers are fractions of issued requests, a
+# dimensionless quantity with no per-GPU meaning, so they are deliberately
+# absent from the per-gpu tuple (dividing a fraction by GPU count would be the
+# silent-fabrication bug class this module refuses).
+_AGGREGATE_FIELDS: tuple[str, ...] = (
+    "goodput_rps",
+    "yield_rps",
+    "goodput_frac",
+    "yield_frac",
+)
+_PER_GPU_FIELDS: tuple[str, ...] = ("goodput_per_gpu", "yield_per_gpu")
+
+
+@dataclass(frozen=True)
+class BasisRecord:
+    """Immutable §6.6 basis declaration riding on every ``WindowMetrics``:
+    names the fields on each basis so no downstream consumer has to guess
+    (raw G/Y are aggregate; ``*_per_gpu`` fields are basis b). Defaults ARE
+    the canonical labeling; ``assert_single_basis`` refuses any record that
+    disagrees (a tampered/foreign record means the numbers can't be trusted
+    to the declared basis)."""
+
+    aggregate: tuple[str, ...] = _AGGREGATE_FIELDS
+    per_gpu: tuple[str, ...] = _PER_GPU_FIELDS
+
+
+#: Canonical record instance; evaluate_window stamps this on every window.
+WINDOW_BASES = BasisRecord()
+
+_BASIS_FIELDS: dict[str, tuple[str, ...]] = {
+    BASIS_AGGREGATE: _AGGREGATE_FIELDS,
+    BASIS_PER_GPU: _PER_GPU_FIELDS,
+}
+
 _WINDOW_COLUMNS: tuple[str, ...] = ("ttft_s", "tpot_s", "ok", "veridical")
 
 
@@ -101,6 +160,24 @@ def _check_positive_scalar(name: str, value: float) -> float:
     if not math.isfinite(value) or value <= 0.0:
         raise GoodputError(f"{name}={value!r} must be finite and > 0")
     return value
+
+
+def _check_gpu_count(value: object) -> int:
+    # Strict integer, not "integral number": 8.0 is refused because a float
+    # GPU count is always an upstream bookkeeping bug, and bool is refused
+    # because True==1 would silently pass as a 1-GPU cell. np.bool_ is the
+    # same bug arriving via pandas (it is NOT a bool subclass, yet implements
+    # __index__), so it is refused by name. operator.index then accepts int
+    # and numpy integers (pandas-sourced counts).
+    if isinstance(value, (bool, np.bool_)):
+        raise GoodputError(f"gpu_count={value!r} must be an integer >= 1")
+    try:
+        count = operator.index(value)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise GoodputError(f"gpu_count={value!r} must be an integer >= 1") from exc
+    if count < 1:
+        raise GoodputError(f"gpu_count={count!r} must be an integer >= 1")
+    return int(count)
 
 
 @dataclass(frozen=True)
@@ -125,6 +202,15 @@ class WindowMetrics:
     issued requests. covariance_gap = Cov(timely, veridical) over issued
     requests = yield_frac − goodput_frac·veridical_frac (dimensionless);
     covariance_gap_rps is the same gap on the rate scale (Y − G·E[v]).
+
+    §6.6 iso-basis fields: ``gpu_count`` is the number of GPUs serving the
+    window; ``goodput_per_gpu`` = goodput_rps / gpu_count and
+    ``yield_per_gpu`` = yield_rps / gpu_count are the §6.6b deployment basis
+    (rate scale only — see the basis-vocabulary note). Raw G/Y stay AGGREGATE
+    across all GPUs regardless of gpu_count; ``bases`` declares this labeling
+    so pooled figures can be audited (``assert_single_basis``). All fields are
+    required at construction: a hand-built WindowMetrics must state its basis
+    facts explicitly rather than inherit a silent 1-GPU default.
     """
 
     n_issued: int
@@ -146,9 +232,16 @@ class WindowMetrics:
     covariance_gap_rps: float
     truth_tax_rps: float
     truth_tax_frac: float
+    gpu_count: int
+    goodput_per_gpu: float
+    yield_per_gpu: float
+    bases: BasisRecord
 
-    def to_flat_dict(self) -> dict[str, int | float]:
-        """Flat mapping suitable as CSV columns (joins a CellSpec row key)."""
+    def to_flat_dict(self) -> dict[str, int | float | dict[str, tuple[str, ...]]]:
+        """One key per field, for JSON serialization (joins a CellSpec row
+        key). NOT flat-CSV-safe: ``bases`` is a nested mapping (tuple values;
+        JSON turns them into lists — ``assert_single_basis`` accepts both), so
+        a CSV writer must flatten or drop it explicitly (verifier minor)."""
         return asdict(self)
 
 
@@ -227,6 +320,7 @@ def evaluate_window(
     duration_s: float | None = None,
     ttft_multiplier: float = TTFT_SLO_MULTIPLIER,
     tpot_multiplier: float = TPOT_SLO_MULTIPLIER,
+    gpu_count: int = 1,
 ) -> WindowMetrics:
     """Compute the window currencies from per-request records (§6.1 + S1).
 
@@ -242,6 +336,11 @@ def evaluate_window(
     AND tpot_s ≤ tpot_multiplier·baseline.tpot_s; it counts toward Y iff
     timely AND veridical. Default multipliers are the §6.1 primary pair — the
     only pair inside Y; pass the §6.3 Sarathi settings for the secondary gate.
+
+    ``gpu_count`` (strict integer >= 1) is the number of GPUs serving this
+    window; it feeds ONLY the §6.6b per-GPU fields — every aggregate currency
+    is computed exactly as for a single GPU, so gpu_count=1 callers see
+    byte-identical values.
     """
     if records.empty:
         raise GoodputError("empty window: no issued requests")
@@ -250,6 +349,7 @@ def evaluate_window(
         raise GoodputError(f"window records missing required columns {missing}")
     ttft_multiplier = _check_positive_scalar("ttft_multiplier", ttft_multiplier)
     tpot_multiplier = _check_positive_scalar("tpot_multiplier", tpot_multiplier)
+    gpu_count = _check_gpu_count(gpu_count)
 
     ok = _ok_array(records["ok"])
     verid = _veridical_array(records["veridical"], ok)
@@ -301,7 +401,152 @@ def evaluate_window(
         covariance_gap_rps=yield_rps - independence_null_rps,
         truth_tax_rps=goodput_rps - yield_rps,
         truth_tax_frac=goodput_frac - yield_frac,
+        gpu_count=gpu_count,
+        # §6.6b: IEEE division by 1 is exact, so gpu_count=1 per-GPU values are
+        # byte-identical to the aggregates (the compatibility guarantee).
+        goodput_per_gpu=goodput_rps / gpu_count,
+        yield_per_gpu=yield_rps / gpu_count,
+        bases=WINDOW_BASES,
     )
+
+
+def _basis_item_value(item: object, name: str, idx: int) -> object:
+    if isinstance(item, Mapping):
+        if name in item:
+            return item[name]
+    else:
+        marker = object()
+        value = getattr(item, name, marker)
+        if value is not marker:
+            return value
+    raise GoodputError(
+        f"metrics_list[{idx}] carries no {name!r} — unlabeled metrics are "
+        "never pooled (§6.6: every pooled number must declare its basis; "
+        "legacy records must be rebuilt, not defaulted)"
+    )
+
+
+def _basis_item_number(item: object, name: str, idx: int) -> float:
+    value = _basis_item_value(item, name, idx)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise GoodputError(
+            f"metrics_list[{idx}].{name}={value!r} must be a number"
+        )
+    value = float(value)
+    if not math.isfinite(value):
+        raise GoodputError(
+            f"metrics_list[{idx}].{name}={value!r} must be finite"
+        )
+    return value
+
+
+def _basis_item_record(item: object, idx: int) -> None:
+    """Refuse any declared bases record that disagrees with the canonical
+    §6.6 labeling — a foreign/tampered record means the numbers cannot be
+    trusted to sit on the basis their field names claim."""
+    declared = _basis_item_value(item, "bases", idx)
+    if isinstance(declared, BasisRecord):
+        agg, per = declared.aggregate, declared.per_gpu
+    elif isinstance(declared, Mapping):
+        try:
+            agg, per = declared["aggregate"], declared["per_gpu"]
+        except KeyError as exc:
+            raise GoodputError(
+                f"metrics_list[{idx}].bases is missing key {exc} — expected "
+                "the BasisRecord mapping form with 'aggregate' and 'per_gpu'"
+            ) from exc
+    else:
+        raise GoodputError(
+            f"metrics_list[{idx}].bases={declared!r} is not a BasisRecord or "
+            "its mapping form"
+        )
+    try:
+        # JSON round-trips tuples as lists; normalize before comparing.
+        agg_t = tuple(str(f) for f in agg)
+        per_t = tuple(str(f) for f in per)
+    except TypeError as exc:
+        raise GoodputError(
+            f"metrics_list[{idx}].bases holds non-sequence field lists"
+        ) from exc
+    if agg_t != _AGGREGATE_FIELDS or per_t != _PER_GPU_FIELDS:
+        raise GoodputError(
+            f"metrics_list[{idx}] declares a different basis labeling "
+            f"(aggregate={agg_t!r}, per_gpu={per_t!r}) than the canonical "
+            f"§6.6 record — refusing to pool metrics with mixed declared bases"
+        )
+
+
+def assert_single_basis(
+    metrics_list: Iterable[object], basis: str
+) -> tuple[str, ...]:
+    """Refuse to pool window metrics unless EVERY item sits on one §6.6 basis.
+
+    The seam figure code calls (T6.2) before pooling/plotting: ``basis`` is
+    the single basis the figure declares (``BASIS_AGGREGATE`` = §6.6a
+    iso-aggregate-bytes, ``BASIS_PER_GPU`` = §6.6b deployment; transfer and
+    protocol contrasts #18/#19 always declare basis b). Items may be
+    ``WindowMetrics`` instances or their ``to_flat_dict``/JSON mapping form.
+
+    Raises ``GoodputError`` when: ``basis`` is not a §6.6 label; the list is
+    empty (pooling zero windows is a contract violation, not a no-op); any
+    item lacks the ``bases``/``gpu_count`` declaration; any item lacks ANY
+    field of the requested basis, or holds a non-number/non-finite value
+    there (the ``*_frac`` fields have no arithmetic invariant but presence
+    and finiteness are still enforced — the returned names must all be
+    readable); any item declares a labeling different from the canonical
+    record; or any item's values are internally mixed-basis — its per-GPU
+    numbers do not equal aggregate/gpu_count, the signature of a record
+    assembled from two bases (e.g. a forgotten division on a gpu_count>1
+    window, detectable because the two bases only coincide at gpu_count=1).
+    The rate-pair invariant is audited regardless of the requested basis, so
+    a mixed-basis record cannot slip into an aggregate-basis pool either.
+
+    Returns the tuple of WindowMetrics field names on the requested basis, so
+    callers read exactly the audited columns instead of respelling them.
+    The audit itself is plain-Python attribute/mapping access: items need not
+    be live dataclasses — JSON-loaded dict rows are first-class inputs. (The
+    hosting module does import numpy/pandas at top level, so importing this
+    seam is not dependency-free; only the per-item handling is.)
+    """
+    if basis not in _BASIS_FIELDS:
+        raise GoodputError(
+            f"basis={basis!r} is not a §6.6 basis label; expected "
+            f"{BASIS_AGGREGATE!r} (§6.6a iso-aggregate-bytes) or "
+            f"{BASIS_PER_GPU!r} (§6.6b per-GPU)"
+        )
+    items = list(metrics_list)
+    if not items:
+        raise GoodputError(
+            "metrics_list is empty — pooling zero windows is a contract "
+            "violation, not a no-op (fail-closed)"
+        )
+    for idx, item in enumerate(items):
+        _basis_item_record(item, idx)
+        gpu_count = _check_gpu_count(_basis_item_value(item, "gpu_count", idx))
+        # The returned tuple is exactly what callers will read: every field on
+        # the requested basis must exist and be a finite number BEFORE its name
+        # is handed out. The *_frac fields carry no arithmetic invariant
+        # (dimensionless, deliberately absent from basis b) but presence and
+        # finiteness still apply — a missing or NaN column reaching a figure
+        # is the silent-fabrication bug class this seam exists to refuse.
+        for name in _BASIS_FIELDS[basis]:
+            _basis_item_number(item, name, idx)
+        for agg_name, per_name in (
+            ("goodput_rps", "goodput_per_gpu"),
+            ("yield_rps", "yield_per_gpu"),
+        ):
+            agg = _basis_item_number(item, agg_name, idx)
+            per = _basis_item_number(item, per_name, idx)
+            # rel_tol absorbs float round-trips (CSV/JSON); at gpu_count=1 the
+            # bases coincide, so only gpu_count>1 windows can actually trip.
+            if not math.isclose(per * gpu_count, agg, rel_tol=1e-9, abs_tol=1e-12):
+                raise GoodputError(
+                    f"metrics_list[{idx}] mixes bases: {per_name}={per!r} × "
+                    f"gpu_count={gpu_count} != {agg_name}={agg!r} — per-GPU "
+                    "and aggregate values disagree, so this record was not "
+                    "produced on a single basis (§6.6: never pooled)"
+                )
+    return _BASIS_FIELDS[basis]
 
 
 @dataclass(frozen=True)

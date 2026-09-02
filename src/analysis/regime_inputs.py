@@ -20,6 +20,12 @@ Charter bindings (PUBLICATION.md):
   enter in-regime aggregates and are never one of the three grid labels.
 - A negative counter delta means the server restarted mid-window; a restart
   invalidates the window (the counter reset destroys the delta's meaning).
+- §6.5 PD (summed-pool) regime, T2.3: under prefill/decode disaggregation the
+  budget B is the TOTAL bytes of sequence-state cache with the split recorded
+  per role. Per-role occupancy FRACTIONS have DIFFERENT byte denominators, so
+  a naive sum or mean of fractions is meaningless (>1 sums are already refused
+  upstream); the honest pooled occupancy is the byte-weighted mean
+  ``sum_r(rho_r * B_r) / sum_r(B_r)`` — ``compute_pd_window_regime_inputs``.
 
 Domain logic only: stdlib + numpy/pandas, no I/O, no plotting.
 """
@@ -28,7 +34,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -36,9 +42,11 @@ import pandas as pd
 from src.analysis.goodput import label_regime as _goodput_label_regime
 
 __all__ = [
+    "PDWindowRegimeInputs",
     "REGIME_UNKNOWN",
     "RegimeInputError",
     "WindowRegimeInputs",
+    "compute_pd_window_regime_inputs",
     "compute_regime_inputs",
     "compute_window_regime_inputs",
     "label_regime_with_refusal",
@@ -250,6 +258,202 @@ def compute_window_regime_inputs(
         coverage=float(coverage),
         window_start_s=window_start_s,
         window_end_s=window_end_s,
+    )
+
+
+# ---------------------------------------------------------------------------
+# §6.5 PD (summed-pool) certification — T2.3
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PDWindowRegimeInputs:
+    """One PD window's pooled §6.5 regime inputs + the per-role breakdown.
+
+    The six leading fields carry ``WindowRegimeInputs`` SEMANTICS under the
+    SAME names, so the §6.1 referee (``goodput.classify_regime`` /
+    ``label_regime``) and every flat-CSV join consume a PD window exactly like
+    a single-instance one:
+
+    - ``rho_kv_time_avg``: byte-weighted pool ``sum_r(rho_r * B_r) / B`` with
+      ``B = sum_r(B_r)`` — occupancy fractions with different byte
+      denominators cannot be summed or averaged naively; the budget-weighted
+      mean IS the occupancy of the summed pool (§6.5: B = TOTAL bytes, pools
+      summed, split recorded).
+    - ``scarcity_events``: SUM of per-role cumulative-counter deltas — a
+      preemption on either role is scarcity of the one budget B.
+    - ``n_samples``: SUM of per-role in-window sample counts.
+    - ``coverage``: MIN of per-role coverages — conservative: the pool is only
+      certified where EVERY role is; the weakest telemetry bounds the claim.
+
+    ``per_role`` maps role -> that role's certified ``WindowRegimeInputs``;
+    ``budgets_by_role`` records the §6.5 split (bytes) that produced the pool.
+    """
+
+    rho_kv_time_avg: float
+    scarcity_events: int
+    n_samples: int
+    coverage: float
+    window_start_s: float
+    window_end_s: float
+    per_role: Mapping[str, WindowRegimeInputs]
+    budgets_by_role: Mapping[str, int]
+
+    def to_flat_dict(self) -> dict[str, int | float]:
+        """Flat mapping with EXACTLY the ``WindowRegimeInputs`` keys.
+
+        The per-role breakdown is deliberately NOT flattened here: the §6.1
+        referee and the CSV joins see one schema for PD and single-instance
+        windows alike (T2.3 contract); callers wanting the split read
+        ``per_role`` / ``budgets_by_role`` explicitly.
+        """
+        return {
+            "rho_kv_time_avg": self.rho_kv_time_avg,
+            "scarcity_events": self.scarcity_events,
+            "n_samples": self.n_samples,
+            "coverage": self.coverage,
+            "window_start_s": self.window_start_s,
+            "window_end_s": self.window_end_s,
+        }
+
+
+def _check_role_keys(name: str, mapping: object) -> None:
+    """Role keys must be non-empty strings, unique after normalization.
+
+    Two spellings of one role ("prefill"/"Prefill"/" prefill") would budget or
+    certify the same pool twice — refused, never silently merged.
+    """
+    if not isinstance(mapping, Mapping):
+        raise RegimeInputError(
+            f"{name} must be a mapping keyed by role, got {type(mapping).__name__}"
+        )
+    seen: dict[str, str] = {}
+    for key in mapping:
+        if not isinstance(key, str) or not key.strip():
+            raise RegimeInputError(
+                f"{name} role key {key!r} must be a non-empty string — a role "
+                "that cannot label anything cannot key a pool"
+            )
+        normalized = key.strip().lower()
+        if normalized in seen:
+            raise RegimeInputError(
+                f"{name} role keys {seen[normalized]!r} and {key!r} are "
+                "duplicate/overlapping spellings of one role — one pool must "
+                "never be counted twice"
+            )
+        seen[normalized] = key
+
+
+def compute_pd_window_regime_inputs(
+    series_by_role: Mapping[str, pd.DataFrame],
+    window_start_s: float,
+    window_end_s: float,
+    *,
+    budgets_by_role: Mapping[str, int],
+    ts_col: str = "ts_s",
+    kv_col: str = "kv_cache_usage",
+    preempt_col: str = "preemptions_total",
+    min_samples: int = 2,
+    min_coverage: float = 0.8,
+) -> PDWindowRegimeInputs:
+    """Certify one PD (summed-pool, §6.5) window from per-role telemetry.
+
+    ``series_by_role`` maps role -> that role's OWN cage-stats time series
+    (same schema as ``compute_window_regime_inputs``); ``budgets_by_role``
+    maps role -> that role's sequence-state cache budget B_r in BYTES (the
+    recorded §6.5 split of the total B). Each role is certified through
+    ``compute_window_regime_inputs`` — the ONE ZOH implementation, reused not
+    duplicated — then pooled:
+
+    - rho = sum_r(rho_r * B_r) / sum_r(B_r)  (byte-weighted; a single role
+      gets weight B_r/B == 1.0 exactly, so the one-role case is field-for-
+      field IDENTICAL to the single-series function — differential pin in
+      tests/test_pd_regime.py)
+    - scarcity_events = SUM of per-role deltas; n_samples = SUM;
+      coverage = MIN of per-role coverages (conservative).
+
+    Fail-closed: an empty ``series_by_role``; any role present on one side of
+    the series/budgets pair but not the other (EXACT key match — a budget
+    without telemetry certifies nothing, telemetry without a recorded budget
+    cannot be weighted); a non-int/bool or non-positive budget;
+    duplicate/overlapping role spellings; a non-DataFrame series — each raises
+    ``RegimeInputError``. A role's own certification refusal PROPAGATES
+    (re-raised with the role named, message intact — never softened).
+    """
+    _check_role_keys("series_by_role", series_by_role)
+    if len(series_by_role) == 0:
+        raise RegimeInputError(
+            "series_by_role is empty: a PD window with no role series "
+            "certifies nothing"
+        )
+    _check_role_keys("budgets_by_role", budgets_by_role)
+    missing_budgets = sorted(set(series_by_role) - set(budgets_by_role))
+    missing_series = sorted(set(budgets_by_role) - set(series_by_role))
+    if missing_budgets or missing_series:
+        raise RegimeInputError(
+            "series_by_role and budgets_by_role must carry EXACTLY the same "
+            f"role keys (§6.5: the split is recorded for EVERY role): role(s) "
+            f"without a budget {missing_budgets}, budget(s) without a series "
+            f"{missing_series}"
+        )
+    for role in sorted(budgets_by_role):
+        budget = budgets_by_role[role]
+        if isinstance(budget, bool) or not isinstance(budget, int):
+            raise RegimeInputError(
+                f"budgets_by_role[{role!r}]={budget!r} must be an int "
+                "(bytes of that role's sequence-state pool, §6.5 B_r)"
+            )
+        if budget < 1:
+            raise RegimeInputError(
+                f"budgets_by_role[{role!r}]={budget!r} must be positive — a "
+                "pool with no bytes can hold no sequence state"
+            )
+
+    # Deterministic role order (sorted) so the float pooling sum is
+    # reproducible regardless of the caller's mapping order.
+    per_role: dict[str, WindowRegimeInputs] = {}
+    for role in sorted(series_by_role):
+        series = series_by_role[role]
+        if not isinstance(series, pd.DataFrame):
+            raise RegimeInputError(
+                f"series_by_role[{role!r}] must be a DataFrame, got "
+                f"{type(series).__name__}"
+            )
+        try:
+            per_role[role] = compute_window_regime_inputs(
+                series,
+                window_start_s,
+                window_end_s,
+                ts_col=ts_col,
+                kv_col=kv_col,
+                preempt_col=preempt_col,
+                min_samples=min_samples,
+                min_coverage=min_coverage,
+            )
+        except RegimeInputError as exc:
+            # Propagate, never soften: same type, original message intact,
+            # the failing role named so the refusal is actionable.
+            raise RegimeInputError(f"role {role!r}: {exc}") from exc
+
+    total_bytes = sum(budgets_by_role[role] for role in per_role)
+    # Byte-weighted pool. B_r/B == 1.0 EXACTLY for a lone role, keeping the
+    # single-role differential pin bit-exact (rho * 1.0 == rho in IEEE-754).
+    rho_pooled = float(
+        sum(
+            per_role[role].rho_kv_time_avg * (budgets_by_role[role] / total_bytes)
+            for role in per_role
+        )
+    )
+    reference = next(iter(per_role.values()))
+    return PDWindowRegimeInputs(
+        rho_kv_time_avg=rho_pooled,
+        scarcity_events=sum(w.scarcity_events for w in per_role.values()),
+        n_samples=sum(w.n_samples for w in per_role.values()),
+        coverage=min(w.coverage for w in per_role.values()),
+        window_start_s=reference.window_start_s,
+        window_end_s=reference.window_end_s,
+        per_role=per_role,
+        budgets_by_role={role: int(budgets_by_role[role]) for role in per_role},
     )
 
 

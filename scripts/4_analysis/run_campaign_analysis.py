@@ -71,7 +71,20 @@ Pipeline per run:
    mask exist — and listed as labeled skips otherwise.
 6. Emit ``<run>/analysis/<timestamp>/{stats.json, summary.md,
    forest_<metric>.png, wlt_<metric>.png,
-   wlt_<metric>_pooled_supplementary.png}``. Figures CONSUME the registered
+   wlt_<metric>_pooled_supplementary.png}`` — plus, when the #14 executor
+   evaluated goodput windows, the ADDITIVE T6.2 charter-S1 ladder artifact
+   ``yield_ladder.{json,md}`` (``yield_ladder.py``: Y with raw throughput,
+   G, the independence null G·E[v] and the covariance gap beside it, §6.6
+   single-basis audited; loud skip otherwise, suppressed under blinding).
+   Wave-3 T1.1/T7.2 additive artifacts land beside it: ``dist_contrasts.json``
+   (the #18/#19 DIST executors via ``src.analysis.dist_contrasts`` — #18
+   tp-vs-pd per-GPU deltas on §6.6 basis b, gated on the #13 outcome READ
+   from the gatekeeping trace and reported PENDING when absent; #19 raw
+   per-instance prefix-hit accounting; request-gated like #12/#14, labeled
+   skips naming every missing input) and ``pressure_alignment.json`` (the
+   #14 cross-engine bundles aligned on the OWN-accounting rho axis, §8.8 —
+   consumes the own-accounting artifacts and the #14 executor's window
+   metrics; loud skip otherwise, both suppressed under blinding). Figures CONSUME the registered
    statistics (audit I1): ``render_figures`` feeds
    ``figure_pipeline.plot_forest_registered`` /
    ``plot_win_loss_tie_registered`` from the same contrast dicts written into
@@ -150,6 +163,7 @@ for _p in (str(_HERE), str(_REPO_ROOT)):
 
 import figure_pipeline as fp  # noqa: E402
 from organize_results import GROUP_OF_MODEL  # noqa: E402
+from yield_ladder import write_yield_ladder  # noqa: E402
 from src.analysis.stats import blinding as blinding_mod  # noqa: E402
 from src.analysis.stats.blinding import (  # noqa: E402
     AlreadyUnblindedError,
@@ -199,9 +213,24 @@ from src.analysis.goodput import (  # noqa: E402
     GoodputError,
     IN_REGIME,
     SLOBaseline,
+    WindowMetrics,
     evaluate_window,
 )
+from src.analysis.own_accounting import (  # noqa: E402
+    OwnAccountingError,
+    compute_own_occupancy,
+    compute_own_reuse,
+    divergence_report,
+    window_bounds_from_requests,
+)
+from src.analysis.dist_contrasts import (  # noqa: E402
+    DIST_EXECUTOR_IDS,
+    align_pressure_bundles,
+    execute_contrast_18,
+    execute_contrast_19,
+)
 from src.analysis.predicate import PREDICATE_DATASETS  # noqa: E402
+from src.orchestration.cache_budget import CacheBudgetError  # noqa: E402
 from src.observability.provenance import (  # noqa: E402
     git_dirty as _prov_git_dirty,
     git_sha as _prov_git_sha,
@@ -419,6 +448,37 @@ CONTRAST_BY_ID: dict[int, Contrast] = {c.id: c for c in CONTRASTS}
 #: presence, not by name.
 _PER_QUERY_ARTIFACTS: tuple[str, ...] = ("requests.jsonl", "qa_evidence.jsonl")
 
+#: T2.5/T8.2 own-accounting pass (audit §2.6/§8.8): per-window
+#: own_accounting.json artifacts land under <analysis_dir>/own_accounting/,
+#: MIRRORING each window's run-relative path (the predicate-table pattern) —
+#: the raw tree is sealed at write time (§9.10) and an analysis product must
+#: never be written into it.
+OWN_ACCOUNTING_DIRNAME = "own_accounting"
+OWN_ACCOUNTING_NAME = "own_accounting.json"
+OWN_ACCOUNTING_SCHEMA_VERSION = 1
+#: cell.json key the producer will persist its cache_budget.BudgetPlan under
+#: ([WAVE-3 wiring] — no producer writes it yet, so today the ρ_own leg skips
+#: loudly naming this gap). The plan's own field names are consumed verbatim.
+_BUDGET_PLAN_CELL_KEY = "budget_plan"
+
+#: T1.1/T7.2 (Wave 3): the DIST-contrast artifacts, written beside the stats
+#: outputs like the own-accounting/yield-ladder passes (additive; the raw
+#: tree is sealed and never receives an analysis product).
+DIST_CONTRASTS_NAME = "dist_contrasts.json"
+PRESSURE_ALIGNMENT_NAME = "pressure_alignment.json"
+DIST_CONTRASTS_SCHEMA_VERSION = 1
+#: cell.json key the DIST producer will persist the window's GPU count under
+#: ([VERIFY-LIVE at Run-C-prime preflight] — no producer writes it yet, so
+#: today every #18 window skips loudly naming this gap; the pending state
+#: reports a labeled skip, never a computed pair).
+_GPU_COUNT_CELL_KEY = "gpu_count"
+#: The #19 telemetry series file per window (T4.1 role-tagged samples with
+#: the raw T4.2 cumulative counters ride the §1 cage_stats stream).
+_DIST_TELEMETRY_NAME = "cage_stats.jsonl"
+#: T7.2: |rho_own − r| tolerance (absolute) for the #14 pressure alignment;
+#: recorded in the artifact by align_pressure_bundles.
+PRESSURE_ALIGNMENT_TOL: float = 0.10
+
 
 class AnalysisError(RuntimeError):
     """Any refusal or data violation in the driver (fail loud, message first)."""
@@ -490,8 +550,20 @@ def classify_contrast(contrast: Contrast) -> str | None:
     (``tests_by_unit.batch_means_contrast``, §9.4). Selector contrasts (no
     single baseline pair — e.g. the gated #6, the engine-slot #10) remain
     labeled skips. The estimand primaries never reach this classifier: #13,
-    #12 and #14 have executors (G4).
+    #12 and #14 have executors (G4). The DIST contrasts #18/#19 are likewise
+    executor-backed (T1.1, ``src.analysis.dist_contrasts``) — the dispatch in
+    ``run_analysis`` routes them to ``run_dist_contrasts_pass`` before this
+    classifier ever sees them; the branch here is the defensive answer for a
+    direct caller and is never a NOT-IMPLEMENTED label.
     """
+    if contrast.id in DIST_EXECUTOR_IDS:
+        return (
+            f"executor-backed (T1.1): contrast #{contrast.id} runs through "
+            "the dist-contrasts pass (src.analysis.dist_contrasts via "
+            f"run_dist_contrasts_pass -> {DIST_CONTRASTS_NAME}); incomplete "
+            "inputs there become labeled skips naming the missing inputs — "
+            "never the baseline-pair pipeline"
+        )
     if contrast.baseline_a is None or contrast.baseline_b is None:
         return (
             f"selector (slot={contrast.slot!r}) is not a single baseline pair; "
@@ -529,7 +601,15 @@ def resolve_contrasts(
                 SkippedContrast(
                     contrast_id=cid,
                     name=contrast.name,
-                    label=NOT_IMPLEMENTED_LABEL,
+                    # T1.1: #18/#19 are EXECUTOR-BACKED now — a direct caller
+                    # gets the delegation label, never NOT-IMPLEMENTED (their
+                    # incomplete-input states are labeled skips in
+                    # dist_contrasts.json listing exactly what is missing).
+                    label=(
+                        "EXECUTOR-BACKED"
+                        if cid in DIST_EXECUTOR_IDS
+                        else NOT_IMPLEMENTED_LABEL
+                    ),
                     reason=reason,
                 )
             )
@@ -3037,8 +3117,12 @@ def _window_truth_tax(
     rec: Any,
     predicate_root: Path,
     floors: Mapping[str, Any],
-) -> tuple[float | None, str | None]:
-    """One window's §9.2 variable G − Y, or (None, exclusion reason).
+) -> tuple[WindowMetrics | None, str | None]:
+    """One window's FULL ladder metrics (the §9.2 variable G − Y rides on
+    ``truth_tax_frac``), or (None, exclusion reason). Returning the whole
+    ``WindowMetrics`` — not just the tax — is what lets the T6.2 yield-ladder
+    pass render throughput/G/Y/G·E[v]/covariance-gap per window without a
+    second evaluate_window pass (S1: the ladder is BINDING on every table).
 
     - §9.2 population = IN-REGIME cells: the window's ``regime.json`` (§6.1
       referee, campaign_layout.write_window_regime) must label it IN_REGIME;
@@ -3173,7 +3257,7 @@ def _window_truth_tax(
         raise AnalysisError(
             f"contrast #14 (truth_tax): {window_label}: {exc}"
         ) from exc
-    return float(metrics.truth_tax_frac), None
+    return metrics, None
 
 
 def compute_truth_tax(
@@ -3183,8 +3267,13 @@ def compute_truth_tax(
     *,
     predicate_root: Path | None,
     alpha: float = 0.05,
-) -> tuple[dict[str, Any], list[PrimaryOutcome]]:
+) -> tuple[dict[str, Any], list[PrimaryOutcome], dict[str, WindowMetrics]]:
     """#14 executor: the §9.2 truth-tax estimand (G4c, task #119).
+
+    Third return element (T6.2): the per-window ``WindowMetrics`` of every
+    in-regime window this executor evaluated, keyed by window dir — the S1
+    yield-ladder pass renders these; excluded (out-of-regime) windows carry
+    no metrics and appear only in ``section['excluded_windows']``.
 
     Registered estimand (§9.2, verbatim): population = in-regime cells (§6.1
     3-layer referee); variable = G − Y; population summary = batch-means
@@ -3270,23 +3359,25 @@ def compute_truth_tax(
 
     #: (dataset, leg-engine) -> p, guarded against duplicate supply.
     leg_p: dict[str, dict[str, float]] = {}
-    tt_cache: dict[str, float | None] = {}
+    #: window dir -> full ladder metrics (None = excluded from population).
+    tt_cache: dict[str, WindowMetrics | None] = {}
 
     def window_values(grp: pd.DataFrame) -> list[float]:
         values: list[float] = []
         for rec in grp.itertuples(index=False):
             cache_key = f"{rec.window_dir}"
             if cache_key not in tt_cache:
-                value, excluded = _window_truth_tax(
+                metrics, excluded = _window_truth_tax(
                     run_dir, rec, predicate_root, floors
                 )
-                tt_cache[cache_key] = value
+                tt_cache[cache_key] = metrics
                 if excluded is not None:
                     section["excluded_windows"].append(
                         {"window": str(rec.window_dir), "reason": excluded}
                     )
-            if tt_cache[cache_key] is not None:
-                values.append(float(tt_cache[cache_key]))  # type: ignore[arg-type]
+            cached = tt_cache[cache_key]
+            if cached is not None:
+                values.append(float(cached.truth_tax_frac))
         return values
 
     keyed = _coord_keyed(f2)
@@ -3399,7 +3490,12 @@ def compute_truth_tax(
                 or "no F2 window pair matched"
             )
         )
-    return section, primaries
+    ladder_metrics = {
+        window: metrics
+        for window, metrics in tt_cache.items()
+        if metrics is not None
+    }
+    return section, primaries, ladder_metrics
 
 
 # ---------------------------------------------------------------------------
@@ -4008,6 +4104,819 @@ class AnalysisResult:
     figures: tuple[str, ...] = field(default_factory=tuple)
 
 
+# ---------------------------------------------------------------------------
+# T2.5/T8.2: own-accounting pass (audit §2.6/§8.8 — Layer-1 from OUR records)
+# ---------------------------------------------------------------------------
+
+
+def _load_workload_manifest_prefixes(
+    manifest_path: Path,
+) -> tuple[str, dict[int, int]]:
+    """(dataset, {block_id -> shared-prefix token count}) from a query manifest.
+
+    The manifest (src/data/manifest.py) records each corpus block's
+    ``token_count`` — the manifest tokenizer's count of the block text that
+    corpus-prefix arms prepend verbatim, i.e. the known shared-prefix length
+    per ``group_id``. Malformed manifests fail loud: a wrong prefix map
+    would silently mislabel reuse for every window.
+    """
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AnalysisError(f"--workload-manifest {manifest_path}: {exc}") from exc
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("blocks"), list):
+        raise AnalysisError(
+            f"--workload-manifest {manifest_path}: not a query manifest "
+            "(expected an object with a 'blocks' list — "
+            "scripts/1_setup/build_query_manifest.py writes it)"
+        )
+    prefixes: dict[int, int] = {}
+    for i, block in enumerate(manifest["blocks"]):
+        if (
+            not isinstance(block, dict)
+            or not isinstance(block.get("block_id"), int)
+            or isinstance(block.get("block_id"), bool)
+            or not isinstance(block.get("token_count"), int)
+            or isinstance(block.get("token_count"), bool)
+            or block["token_count"] < 0
+        ):
+            raise AnalysisError(
+                f"--workload-manifest {manifest_path}: blocks[{i}] lacks "
+                "int block_id/token_count — refusing a partial prefix map"
+            )
+        prefixes[block["block_id"]] = block["token_count"]
+    return str(manifest.get("dataset") or ""), prefixes
+
+
+def run_own_accounting_pass(
+    run_dir: Path,
+    index: pd.DataFrame,
+    analysis_dir: Path,
+    *,
+    workload_manifest: Path | None = None,
+) -> dict[str, Any]:
+    """Emit per-window ``own_accounting.json`` (T2.5 ρ_own + T8.2 ρ_reuse_own).
+
+    ADDITIVE diagnostic pass: for every indexed window whose inputs exist it
+    writes ``<analysis_dir>/own_accounting/<window_dir>/own_accounting.json``
+    carrying {rho_own, rho_engine, gaps, rho_reuse_own,
+    cached_tokens_corroboration} — mirroring the window path like the
+    predicate table, because the RAW tree is sealed (§9.10) and no analysis
+    product may be written into it. Each leg that cannot be computed is a
+    LOUD skip line naming exactly what is absent (never a fabricated value):
+
+    - ρ_own needs the producer-persisted cache_budget.BudgetPlan in
+      cell.json ([WAVE-3 wiring] — absent today ⇒ the leg skips naming it)
+      plus the open-loop dispatcher timestamps in requests.jsonl (windows
+      from closed-loop trials skip via own_accounting's field refusal);
+      window bounds are DERIVED from the rows themselves
+      (window_bounds_from_requests) because request timestamps are on the
+      dispatcher's monotonic clock while cell.json t_start/t_end are epoch —
+      mixing the clocks would misplace every interval;
+    - ρ_engine is the DEMOTED corroboration gauge, read from the window's
+      regime.json (§6.1 bridge output); absent/uncertified ⇒ None, and the
+      divergence gaps stay None (never 0);
+    - ρ_reuse_own needs ``--workload-manifest`` (the query manifest whose
+      corpus blocks define the shared prefixes) matching the window's
+      dataset; engine cached_prompt_tokens ride along ONLY as the
+      corroboration column.
+
+    Returns (and writes, as own_accounting/summary.json) a per-window status
+    summary. Never raises for a skippable window; malformed inputs that
+    would poison every window (a bad manifest file) fail loud.
+    """
+    manifest_dataset: str | None = None
+    manifest_prefixes: dict[int, int] | None = None
+    if workload_manifest is not None:
+        manifest_dataset, manifest_prefixes = _load_workload_manifest_prefixes(
+            Path(workload_manifest)
+        )
+
+    out_root = analysis_dir / OWN_ACCOUNTING_DIRNAME
+    statuses: list[dict[str, Any]] = []
+    n_emitted = 0
+    for rec in index.itertuples(index=False):
+        window = str(rec.window_dir)
+        window_dir = run_dir / window
+        legs: dict[str, str | None] = {"occupancy": None, "reuse": None}
+
+        requests: list[dict[str, Any]] | None = None
+        requests_path = window_dir / "requests.jsonl"
+        if requests_path.is_file():
+            requests = _read_jsonl(requests_path)
+        else:
+            reason = f"{requests_path} missing — no per-request basis"
+            legs["occupancy"] = legs["reuse"] = reason
+
+        # --- ρ_own (T2.5): OWN byte accounting against the planned budget --
+        occupancy = None
+        if requests is not None:
+            try:
+                cell_path = run_dir / str(rec.cell_json)
+                try:
+                    cell_meta = json.loads(cell_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise OwnAccountingError(f"{cell_path}: {exc}") from exc
+                plan = cell_meta.get(_BUDGET_PLAN_CELL_KEY)
+                if not isinstance(plan, dict):
+                    raise OwnAccountingError(
+                        f"{cell_path} carries no {_BUDGET_PLAN_CELL_KEY!r} "
+                        "object — the producer does not yet persist its "
+                        "cache_budget.BudgetPlan [WAVE-3 wiring]; rho_own "
+                        "needs budget_bytes_total + kv_dtype from the plan"
+                    )
+                budget_bytes = plan.get("budget_bytes_total")
+                kv_dtype = plan.get("kv_dtype")
+                if (
+                    isinstance(budget_bytes, bool)
+                    or not isinstance(budget_bytes, int)
+                    or not isinstance(kv_dtype, str)
+                ):
+                    raise OwnAccountingError(
+                        f"{cell_path}: {_BUDGET_PLAN_CELL_KEY}.budget_bytes_total"
+                        " (int) and .kv_dtype (str) are both required — a "
+                        "partial plan cannot anchor rho_own"
+                    )
+                w0, w1 = window_bounds_from_requests(requests)
+                occupancy = compute_own_occupancy(
+                    requests,
+                    model=str(rec.model),
+                    budget_bytes=budget_bytes,
+                    window_start_s=w0,
+                    window_end_s=w1,
+                    kv_dtype=kv_dtype,
+                )
+            except (OwnAccountingError, CacheBudgetError) as exc:
+                legs["occupancy"] = str(exc)
+
+        # --- ρ_engine: the DEMOTED corroboration gauge (regime.json) -------
+        rho_engine: float | None = None
+        engine_reason: str | None = None
+        regime_path = window_dir / "regime.json"
+        if not regime_path.is_file():
+            engine_reason = "no regime.json (§6.1 bridge not run for this window)"
+        else:
+            try:
+                regime = json.loads(regime_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                engine_reason = f"regime.json unreadable: {exc}"
+            else:
+                inputs = regime.get("inputs")
+                if regime.get("telemetry_ok") and isinstance(inputs, dict):
+                    rho_engine = inputs.get("rho_kv_time_avg")
+                    if (
+                        isinstance(rho_engine, bool)
+                        or not isinstance(rho_engine, (int, float))
+                        or not math.isfinite(rho_engine)
+                    ):
+                        # telemetry_ok with a missing/non-numeric gauge must be a
+                        # NAMED absence, never reason=null (2026-08-31 verifier
+                        # minor — silent absence is the E2b bug class).
+                        engine_reason = (
+                            "regime.json says telemetry_ok but "
+                            f"inputs.rho_kv_time_avg is {rho_engine!r} — "
+                            "absence recorded, not defaulted"
+                        )
+                        rho_engine = None
+                else:
+                    engine_reason = (
+                        "engine telemetry not certified: "
+                        f"{regime.get('refusal_reason')!r}"
+                    )
+
+        gaps: dict[str, float | None] | None = None
+        if occupancy is not None:
+            try:
+                gaps = divergence_report(occupancy.rho_own_time_avg, rho_engine)
+            except OwnAccountingError as exc:
+                # A NaN engine gauge is an upstream None-honesty bug — surface
+                # it on the gauge, keep the own-accounting artifact.
+                engine_reason = str(exc)
+                rho_engine = None
+                gaps = divergence_report(occupancy.rho_own_time_avg, None)
+
+        # --- ρ_reuse_own (T8.2): manifest shared prefixes are the PRIMARY --
+        reuse = None
+        if requests is not None and legs["reuse"] is None:
+            if manifest_prefixes is None:
+                legs["reuse"] = (
+                    "no --workload-manifest supplied — the manifest's corpus "
+                    "blocks define the shared prefixes (T8.2 primary); "
+                    "engine cached_tokens alone are corroboration, never a "
+                    "substitute"
+                )
+            elif manifest_dataset and manifest_dataset != str(rec.dataset):
+                legs["reuse"] = (
+                    f"--workload-manifest is for dataset {manifest_dataset!r},"
+                    f" window is {str(rec.dataset)!r} — a cross-dataset "
+                    "prefix map would mislabel reuse"
+                )
+            else:
+                try:
+                    reuse = compute_own_reuse(requests, manifest_prefixes)
+                except OwnAccountingError as exc:
+                    legs["reuse"] = str(exc)
+
+        for leg, reason in legs.items():
+            if reason is not None:
+                print(f"[own-accounting] SKIP {window} ({leg}): {reason}")
+
+        if occupancy is None and reuse is None:
+            statuses.append(
+                {"window": window, "emitted": False, "skipped_legs": dict(legs)}
+            )
+            continue
+
+        document: dict[str, Any] = {
+            "schema_version": OWN_ACCOUNTING_SCHEMA_VERSION,
+            "window_dir": window,
+            "row_key": str(rec.row_key),
+            "dataset": str(rec.dataset),
+            "window_key": str(rec.window_key),
+            "model": str(rec.model),
+            "rho_own": (
+                occupancy.rho_own_time_avg if occupancy is not None else None
+            ),
+            "rho_engine": rho_engine,
+            "gaps": gaps,
+            "rho_reuse_own": reuse.rho_reuse_own if reuse is not None else None,
+            "cached_tokens_corroboration": (
+                reuse.cached_tokens_corroboration if reuse is not None else None
+            ),
+            "occupancy": (
+                occupancy.to_dict()
+                if occupancy is not None
+                else {"skipped": legs["occupancy"]}
+            ),
+            "engine_gauge": {
+                "source": "regime.json",
+                "value": rho_engine,
+                "reason": engine_reason,
+                "role": "corroboration — demoted, never the referee (§2.6/§8.8)",
+            },
+            "reuse": (
+                reuse.to_dict() if reuse is not None else {"skipped": legs["reuse"]}
+            ),
+            "clock_note": (
+                "occupancy window bounds derived from the requests' own "
+                "dispatcher-clock timestamps (time.monotonic); cell.json "
+                "t_start/t_end are epoch-clock and were NOT used"
+            ),
+        }
+        out_path = out_root / window / OWN_ACCOUNTING_NAME
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(out_path, json.dumps(document, indent=2) + "\n")
+        n_emitted += 1
+        print(f"[own-accounting] emitted {out_path}")
+        statuses.append(
+            {"window": window, "emitted": True, "skipped_legs": dict(legs)}
+        )
+
+    summary = {
+        "schema_version": OWN_ACCOUNTING_SCHEMA_VERSION,
+        "n_windows": int(len(statuses)),
+        "n_emitted": n_emitted,
+        "n_skipped_entirely": int(len(statuses)) - n_emitted,
+        "workload_manifest": (
+            str(workload_manifest) if workload_manifest is not None else None
+        ),
+        "windows": statuses,
+    }
+    if statuses:
+        out_root.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(
+            out_root / "summary.json", json.dumps(summary, indent=2) + "\n"
+        )
+    return summary
+
+
+def run_yield_ladder_pass(
+    analysis_dir: Path,
+    window_metrics: Mapping[str, WindowMetrics],
+    stamp: str,
+    *,
+    blinding_active: bool,
+) -> dict[str, Any] | None:
+    """T6.2 — emit the charter-S1 yield-ladder artifact beside the stats
+    outputs (``<analysis_dir>/yield_ladder.{json,md}``).
+
+    ADDITIVE pass (the own-accounting pattern): existing outputs keep their
+    shape; the ladder lands next to them. ``window_metrics`` is the per-
+    window ``WindowMetrics`` map compute_truth_tax evaluated — today the
+    ONLY place the analysis computes goodput windows, so a look without
+    contrast #14 has no ladder inputs and skips LOUDLY (never a fabricated
+    or empty table; ``yield_ladder`` refuses empty pools by contract).
+    Blinding (§9.8): window dirs embed row keys, i.e. arm-bearing axes, so
+    an active seal suppresses the artifact loudly — the same rationale that
+    suppresses the stats['truth_tax'] section. The renderer itself enforces
+    S1(a)+(b) and the §6.6 single-basis pool audit.
+    """
+    if not window_metrics:
+        print(
+            "[yield-ladder] SKIP: no per-window goodput metrics were "
+            "computed in this look — the S1 ladder rides the #14 truth-tax "
+            "executor's evaluate_window pass (request --contrasts 14 on a "
+            "tree with the §8.5 predicate table to produce it)"
+        )
+        return None
+    if blinding_active:
+        print(
+            "[yield-ladder] SUPPRESSED: §9.8 blinding active — ladder rows "
+            "are keyed by window dirs, which carry arm-bearing axes; the "
+            "artifact is withheld until the logged unblinding (same rule as "
+            "the stats truth_tax section)"
+        )
+        return None
+    result = write_yield_ladder(
+        Path(analysis_dir), list(window_metrics.items()), stamp=stamp
+    )
+    print(
+        f"[yield-ladder] emitted {result['json']} and {result['markdown']} "
+        f"({result['n_rows']} window(s), "
+        f"{result['n_pre_ladder']} pre-ladder)"
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# T1.1 — the #18/#19 DIST-contrast pass (src.analysis.dist_contrasts executors)
+# ---------------------------------------------------------------------------
+
+
+def _coord_or_none(value: Any) -> float | None:
+    """Index budget_r/rate_frac -> float or None (NaN/'' are legal absences
+    per cellspec; the dist_contrasts matcher keys absence as absence)."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    return float(value)
+
+
+def _dist_window_metrics(
+    run_dir: Path,
+    rec: Any,
+    predicate_root: Path | None,
+    floors: Mapping[str, Any] | None,
+) -> tuple[WindowMetrics | None, int | None, str | None]:
+    """One DIST window's (WindowMetrics, gpu_count) for #18, or a labeled
+    skip reason naming exactly the missing input.
+
+    Mirrors ``_window_truth_tax``'s Y assembly (requests ⋈ §8.5 predicate,
+    ms→s at this seam, §6.1 relative SLO floors) with two registered
+    differences: (a) NO in-regime gate — #18's population is the matched
+    DIST grid, not §9.2's in-regime cells; (b) ``gpu_count`` feeds
+    ``evaluate_window`` so the §6.6b per-GPU basis exists on every metric.
+    Unlike the #14 executor this pass is ADDITIVE: every missing input is a
+    LABELED skip (returned, printed, and carried into dist_contrasts.json),
+    never a crash of the whole analysis — DIST cells are Wave-3 data and
+    most trees predate them.
+
+    gpu_count source: cell.json's top-level ``gpu_count`` key
+    ([VERIFY-LIVE at Run-C-prime preflight] — no producer persists it yet,
+    so on today's trees every window returns the labeled skip naming it;
+    the pending state is a skip that lists the gap, never a PASS).
+    """
+    window_dir = run_dir / str(rec.window_dir)
+    label = str(rec.window_dir)
+
+    try:
+        cell_meta = json.loads(
+            (run_dir / str(rec.cell_json)).read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, None, f"{rec.cell_json}: unreadable cell.json ({exc})"
+    gpu_count = cell_meta.get(_GPU_COUNT_CELL_KEY)
+    if isinstance(gpu_count, bool) or not isinstance(gpu_count, int):
+        return None, None, (
+            f"cell.json carries no int {_GPU_COUNT_CELL_KEY!r} for {label} — "
+            "the §6.6b per-GPU basis is undefined without the window's GPU "
+            "count [VERIFY-LIVE at Run-C-prime preflight: the DIST producer "
+            "must persist it]"
+        )
+
+    if not isinstance(floors, Mapping) or not floors:
+        return None, None, (
+            f"manifest.json carries no {_SLO_FLOORS_MANIFEST_KEY!r} mapping — "
+            "G/Y need the §6.1 single-stream floors (E3 calibration)"
+        )
+    engine = str(rec.engine)
+    floor = floors.get(engine)
+    if not isinstance(floor, Mapping) or not {"ttft_s", "tpot_s"} <= set(floor):
+        return None, None, (
+            f"manifest {_SLO_FLOORS_MANIFEST_KEY!r} has no ttft_s/tpot_s "
+            f"floor for engine {engine!r} — the §6.1 SLO pair is relative to "
+            "the measured single-stream floor"
+        )
+
+    window_meta = (cell_meta.get("windows") or {}).get(str(rec.window_key))
+    if (
+        not isinstance(window_meta, Mapping)
+        or window_meta.get("t_start") is None
+        or window_meta.get("t_end") is None
+    ):
+        return None, None, (
+            f"cell.json windows[{str(rec.window_key)!r}] carries no "
+            f"t_start/t_end for {label} — no pre-costed window duration"
+        )
+    duration_s = float(window_meta["t_end"]) - float(window_meta["t_start"])
+
+    requests_path = window_dir / "requests.jsonl"
+    if not requests_path.is_file():
+        return None, None, f"{requests_path} missing — no per-request basis"
+    requests = _read_jsonl(requests_path)
+    if not requests:
+        return None, None, f"{requests_path} has no rows — an empty window has no G or Y"
+    missing_cols = sorted(
+        c for c in _TRUTH_TAX_REQUEST_COLUMNS if not any(c in r for r in requests)
+    )
+    if missing_cols:
+        return None, None, (
+            f"requests.jsonl rows in {label} carry no {missing_cols} "
+            "column(s) — Y needs the ok stamp and per-request ttft_ms/tpot_ms"
+        )
+
+    if predicate_root is None:
+        return None, None, (
+            f"no §8.5 predicate table joined for this run — Y is undefined "
+            f"without per-request verdicts; {_PREDICATE_FIX_HINT}"
+        )
+    pred_path = predicate_root / str(rec.window_dir) / PREDICATE_ROWS_NAME
+    if not pred_path.is_file():
+        return None, None, f"{pred_path} missing — {_PREDICATE_FIX_HINT}"
+    predicate_by_key: dict[tuple[Any, str, Any], Any] = {}
+    for obj in _read_jsonl(pred_path):
+        predicate_by_key[_predicate_join_key(obj)] = obj.get("predicate")
+
+    records: list[dict[str, Any]] = []
+    unscored_ok = 0
+    for req in requests:
+        key = _predicate_join_key(req)
+        ok = bool(req.get("ok"))
+        if key not in predicate_by_key:
+            if ok:
+                unscored_ok += 1
+                continue
+            verid: Any = float("nan")  # non-completion: non-veridical (§2.6)
+        else:
+            pred = predicate_by_key[key]
+            verid = float("nan") if pred is None else bool(pred)
+        ttft_ms = req.get("ttft_ms")
+        tpot_ms = req.get("tpot_ms")
+        records.append(
+            {
+                "ok": ok,
+                "veridical": verid,
+                # The one registered ms→s seam, same as the #14 executor.
+                "ttft_s": (
+                    float("nan") if ttft_ms is None else float(ttft_ms) / 1000.0
+                ),
+                "tpot_s": (
+                    float("nan") if tpot_ms is None else float(tpot_ms) / 1000.0
+                ),
+            }
+        )
+    if unscored_ok:
+        return None, None, (
+            f"{unscored_ok} completed (ok) request(s) in {label} have NO "
+            "predicate row — the §8.5 predicate must be scored for every "
+            "completion (§9.10); rebuild the predicate table against this tree"
+        )
+
+    baseline = SLOBaseline(
+        ttft_s=float(floor["ttft_s"]), tpot_s=float(floor["tpot_s"])
+    )
+    try:
+        metrics = evaluate_window(
+            pd.DataFrame(records),
+            baseline,
+            duration_s=duration_s,
+            gpu_count=gpu_count,
+        )
+    except GoodputError as exc:
+        return None, None, f"{label}: {exc}"
+    return metrics, gpu_count, None
+
+
+def _dist_axes(rec: Any) -> dict[str, Any]:
+    """The dist_contrasts MATCH_AXES identity from one index row (replicate
+    = the organize_results window ordinal)."""
+    return {
+        "arm": str(rec.arm),
+        "retriever": str(rec.retriever),
+        "policy": str(rec.policy),
+        "engine": str(rec.engine),
+        "model": str(rec.model),
+        "dataset": str(rec.dataset),
+        "budget_r": _coord_or_none(rec.budget_r),
+        "rate_frac": _coord_or_none(rec.rate_frac),
+        "replicate": int(rec.window),
+    }
+
+
+def run_dist_contrasts_pass(
+    run_dir: Path,
+    index: pd.DataFrame,
+    analysis_dir: Path,
+    stamp: str,
+    *,
+    requested_ids: Sequence[int],
+    gate_13: Mapping[str, Any] | None,
+    predicate_root: Path | None,
+    blinding_active: bool,
+) -> dict[str, Any] | None:
+    """T1.1 — execute the registered DIST contrasts #18/#19 and write
+    ``<analysis_dir>/dist_contrasts.json`` (mode-stamped, additive — the
+    own-accounting/yield-ladder pattern).
+
+    Runs only when #18 or #19 was requested (executor request-gating, like
+    #12/#14). Every missing input is a LOUD labeled skip line AND a skip
+    entry inside the artifact naming exactly what is absent — never a
+    NOT-IMPLEMENTED label and never a fabricated value. §9.8: window dirs
+    carry arm-bearing axes, so an active seal suppresses the artifact loudly
+    (the yield-ladder rule). The #13 gate outcome arrives as ``gate_13``
+    (from stats['gatekeeping']) — accepted as input, never recomputed; an
+    absent outcome reports PENDING inside the artifact, never PASS.
+    """
+    wanted = DIST_EXECUTOR_IDS & set(requested_ids)
+    if not wanted:
+        return None
+    if blinding_active:
+        print(
+            "[dist-contrasts] SUPPRESSED: §9.8 blinding active — DIST rows "
+            "are keyed by window dirs, which carry arm-bearing axes; the "
+            "artifact is withheld until the logged unblinding"
+        )
+        return None
+
+    dist_rows = index[index["family"] == "DIST"]
+    input_skips: list[dict[str, str]] = []
+    document: dict[str, Any] = {
+        "schema_version": DIST_CONTRASTS_SCHEMA_VERSION,
+        "mode_stamp": stamp,
+        "generated_utc": datetime.now(timezone.utc).isoformat(),
+        "requested": sorted(wanted),
+        "contrast_18": {"not_requested": True},
+        "contrast_19": {"not_requested": True},
+        "input_skips": input_skips,
+    }
+
+    manifest_floors: Mapping[str, Any] | None = None
+    manifest_path = run_dir / "manifest.json"
+    if manifest_path.is_file():
+        try:
+            manifest_floors = json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            ).get(_SLO_FLOORS_MANIFEST_KEY)
+        except json.JSONDecodeError as exc:
+            raise AnalysisError(f"{manifest_path}: invalid JSON: {exc}") from exc
+
+    if 18 in wanted:
+        windows_18: list[dict[str, Any]] = []
+        if dist_rows.empty:
+            input_skips.append(
+                {
+                    "contrast_id": "18",
+                    "reason": (
+                        "no DIST-family rows in this run's index — the "
+                        "tp/pd topology overlay has not been measured "
+                        "(Wave-3 producer)"
+                    ),
+                }
+            )
+        for rec in dist_rows.itertuples(index=False):
+            if str(rec.topology) not in ("tp", "pd"):
+                continue  # the executor labels non-sides; only sides need Y
+            metrics, gpu_count, reason = _dist_window_metrics(
+                run_dir, rec, predicate_root, manifest_floors
+            )
+            if reason is not None:
+                input_skips.append(
+                    {
+                        "contrast_id": "18",
+                        "window": str(rec.window_dir),
+                        "reason": reason,
+                    }
+                )
+                continue
+            windows_18.append(
+                {
+                    **_dist_axes(rec),
+                    "topology": str(rec.topology),
+                    "window": str(rec.window_dir),
+                    "gpu_count": gpu_count,
+                    "metrics": metrics,
+                }
+            )
+        document["contrast_18"] = execute_contrast_18(
+            windows_18, gate_13=gate_13
+        )
+
+    if 19 in wanted:
+        windows_19: list[dict[str, Any]] = []
+        pd_rows = dist_rows[dist_rows["topology"] == "pd"]
+        if pd_rows.empty:
+            input_skips.append(
+                {
+                    "contrast_id": "19",
+                    "reason": (
+                        "no pd-topology DIST rows in this run's index — "
+                        "nothing crossed the wire (Wave-3 producer)"
+                    ),
+                }
+            )
+        # #19 candidates: every pd DIST row plus its matched single/tp B3
+        # comparators (B3 under pressure lives in F3, so the comparator
+        # filter is baseline-based, not family-based — the executor pins
+        # baseline B3 on both sides).
+        candidates = pd.concat(
+            [
+                pd_rows,
+                index[
+                    (index["baseline"] == "B3")
+                    & index["topology"].isin(["single", "tp"])
+                ],
+            ]
+        ).drop_duplicates(subset=["window_dir"])
+        for rec in candidates.itertuples(index=False):
+            series_path = run_dir / str(rec.window_dir) / _DIST_TELEMETRY_NAME
+            series: list[dict[str, Any]] | None = None
+            series_source = str(series_path)
+            if series_path.is_file():
+                series = _read_jsonl(series_path)
+            else:
+                series_source = f"{series_path} missing"
+            windows_19.append(
+                {
+                    **_dist_axes(rec),
+                    "topology": str(rec.topology),
+                    "baseline": str(rec.baseline),
+                    "window": str(rec.window_dir),
+                    "series": series,
+                    "series_source": series_source,
+                }
+            )
+        document["contrast_19"] = execute_contrast_19(windows_19)
+
+    for entry in input_skips:
+        print(
+            f"[dist-contrasts] SKIP #{entry['contrast_id']} "
+            f"{entry.get('window', '(run)')}: {entry['reason']}"
+        )
+    for cid in sorted(wanted):
+        section = document[f"contrast_{cid}"]
+        for skip_row in section.get("skips", []):
+            print(
+                f"[dist-contrasts] SKIP #{cid} {skip_row['window']}: "
+                f"{skip_row['reason']}"
+            )
+
+    out_path = analysis_dir / DIST_CONTRASTS_NAME
+    _atomic_write_text(
+        out_path, json.dumps(document, indent=2, default=_json_metrics) + "\n"
+    )
+    print(f"[dist-contrasts] emitted {out_path}")
+    return document
+
+
+def _json_metrics(obj: Any) -> Any:
+    """JSON hook: WindowMetrics (and other flat-dict dataclasses) serialize
+    through their own contract, never a repr."""
+    if isinstance(obj, WindowMetrics):
+        return obj.to_flat_dict()
+    raise TypeError(f"not JSON serializable: {type(obj).__name__}")
+
+
+# ---------------------------------------------------------------------------
+# T7.2 — the #14 normalized-pressure alignment pass (rho_own axis, §8.8)
+# ---------------------------------------------------------------------------
+
+
+def run_pressure_alignment_pass(
+    analysis_dir: Path,
+    index: pd.DataFrame,
+    window_metrics: Mapping[str, WindowMetrics],
+    stamp: str,
+    *,
+    blinding_active: bool,
+    tol: float = PRESSURE_ALIGNMENT_TOL,
+) -> dict[str, Any] | None:
+    """T7.2 — write ``<analysis_dir>/pressure_alignment.json``: cross-engine
+    #14 bundles aligned on the CAGE-OWN rho axis (mode-stamped, additive).
+
+    Consumes (a) the per-window ``WindowMetrics`` the #14 executor evaluated
+    (the only evaluate_window pass in this driver — a look without #14 has
+    no Y inputs and skips loudly) and (b) the per-window
+    ``own_accounting.json`` artifacts the T2.5 pass wrote under THIS
+    analysis dir — so this pass MUST run after ``run_own_accounting_pass``.
+    §8.8: the alignment axis is ``rho_own`` from those artifacts; engine
+    self-reported gauges never feed the alignment (see
+    ``dist_contrasts.align_pressure_bundles``). Windows without an
+    own-accounting artifact become labeled skips citing §8.8. The registered
+    r levels are this run's distinct F2/F3 ``budget_r`` grid points (the
+    §6.1 grid as indexed); none present ⇒ loud skip. §9.8: suppressed under
+    an active seal (window dirs carry arm-bearing axes).
+    """
+    if blinding_active:
+        print(
+            "[pressure-alignment] SUPPRESSED: §9.8 blinding active — "
+            "alignment rows are keyed by window dirs (arm-bearing axes); "
+            "withheld until the logged unblinding"
+        )
+        return None
+    if not window_metrics:
+        print(
+            "[pressure-alignment] SKIP: no per-window goodput metrics were "
+            "computed in this look — the T7.2 alignment rides the #14 "
+            "executor's evaluate_window pass (request --contrasts 14)"
+        )
+        return None
+    r_levels = sorted(
+        {
+            float(v)
+            for v in index.loc[
+                index["family"].isin(["F2", "F3"]), "budget_r"
+            ].dropna()
+        }
+    )
+    if not r_levels:
+        print(
+            "[pressure-alignment] SKIP: the index carries no F2/F3 budget_r "
+            "grid points — no registered r level to align on (§6.1 grid)"
+        )
+        return None
+
+    row_by_window = {
+        str(rec.window_dir): rec for rec in index.itertuples(index=False)
+    }
+    windows: list[dict[str, Any]] = []
+    for window, metrics in sorted(window_metrics.items()):
+        rec = row_by_window.get(window)
+        if rec is None:
+            # An executor window absent from the index is a driver bug, not
+            # an input absence — refuse loud.
+            raise AnalysisError(
+                f"pressure alignment: window {window!r} has metrics but no "
+                "index row — the executor and the index disagree"
+            )
+        own_path = (
+            analysis_dir / OWN_ACCOUNTING_DIRNAME / window / OWN_ACCOUNTING_NAME
+        )
+        rho_own: float | None = None
+        rho_own_reason: str | None = None
+        if own_path.is_file():
+            own_doc = json.loads(own_path.read_text(encoding="utf-8"))
+            raw = own_doc.get("rho_own")
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                rho_own = float(raw)
+            elif raw is not None:
+                # Present-but-malformed is a NAMED defect, never a silent
+                # coercion to "missing" (2026-09-01 verifier minor — the E2b
+                # bug class): the labeled skip must say what was found.
+                rho_own_reason = (
+                    f"own_accounting.json rho_own is {raw!r} (non-numeric) — "
+                    "malformed artifact; regenerate the own-accounting pass"
+                )
+        # rho_own None ⇒ align_pressure_bundles emits the §8.8-citing
+        # labeled skip; the engine gauge is NEVER consulted as a fallback.
+        windows.append(
+            {
+                "window": window,
+                "engine": str(rec.engine),
+                "dataset": str(rec.dataset),
+                "rho_own": rho_own,
+                "rho_own_reason": rho_own_reason,
+                "metrics": metrics,
+            }
+        )
+
+    section = align_pressure_bundles(windows, r_levels=r_levels, tol=tol)
+    document = {
+        "schema_version": DIST_CONTRASTS_SCHEMA_VERSION,
+        "mode_stamp": stamp,
+        "generated_utc": datetime.now(timezone.utc).isoformat(),
+        **section,
+    }
+    for skip_row in section["skips"]:
+        print(
+            f"[pressure-alignment] SKIP {skip_row['window']}: "
+            f"{skip_row['reason']}"
+        )
+    for out_row in section["labeled_out"]:
+        print(
+            f"[pressure-alignment] OUT {out_row['window']}: {out_row['reason']}"
+        )
+    out_path = analysis_dir / PRESSURE_ALIGNMENT_NAME
+    _atomic_write_text(
+        out_path, json.dumps(document, indent=2, default=_json_metrics) + "\n"
+    )
+    print(
+        f"[pressure-alignment] emitted {out_path} "
+        f"({len(section['rows'])} row(s), tol={tol:g})"
+    )
+    return document
+
+
 def run_analysis(
     run_dir: Path,
     *,
@@ -4021,6 +4930,7 @@ def run_analysis(
     alpha: float = 0.05,
     accepted_step_down: int | None = None,
     predicate_run_id: str | None = None,
+    workload_manifest: Path | None = None,
 ) -> AnalysisResult:
     """Execute the pipeline; the CLI wraps this with the one-look flag checks.
 
@@ -4162,14 +5072,17 @@ def run_analysis(
             ),
         }
 
-        # Executor-backed ids (G4) never enter the baseline-pair pipeline:
-        # #13 runs through compute_fingerprint (always), #12 through
-        # compute_falsification_suite and #14 through compute_truth_tax
-        # (each when requested).
+        # Executor-backed ids (G4 + T1.1) never enter the baseline-pair
+        # pipeline: #13 runs through compute_fingerprint (always), #12
+        # through compute_falsification_suite and #14 through
+        # compute_truth_tax (each when requested), and the DIST contrasts
+        # #18/#19 through run_dist_contrasts_pass (when requested) — so no
+        # NOT-IMPLEMENTED label can ever attach to them again.
         pair_ids = [
             cid
             for cid in contrast_ids
             if cid not in (FINGERPRINT_CONTRAST_ID, FLOOR_SUITE_CONTRAST_ID, 14)
+            and cid not in DIST_EXECUTOR_IDS
         ]
         computable, skipped_contrasts = resolve_contrasts(pair_ids)
         per_query_contrasts = [
@@ -4366,13 +5279,19 @@ def run_analysis(
         # refusal REMAINS, naming the producer command).
         truth_tax_section: dict[str, Any] | None = None
         truth_tax_primaries: list[PrimaryOutcome] = []
+        #: T6.2: per-window ladder metrics from the truth-tax executor — the
+        #: ONLY evaluate_window pass in this driver; feeds the S1 ladder
+        #: artifact written beside the stats outputs below.
+        ladder_metrics: dict[str, WindowMetrics] = {}
         if 14 in contrast_ids:
-            truth_tax_section, truth_tax_primaries = compute_truth_tax(
-                run_dir,
-                index,
-                family_ctx,
-                predicate_root=predicate_root,
-                alpha=alpha,
+            truth_tax_section, truth_tax_primaries, ladder_metrics = (
+                compute_truth_tax(
+                    run_dir,
+                    index,
+                    family_ctx,
+                    predicate_root=predicate_root,
+                    alpha=alpha,
+                )
             )
 
         # §9.3 wiring: the registered chain + Holm-within-family corrections.
@@ -4555,6 +5474,60 @@ def run_analysis(
         summary_path = analysis_dir / SUMMARY_MD_NAME
         _atomic_write_text(summary_path, build_summary_md(stats))
 
+        # T2.5/T8.2 (audit §2.6/§8.8): the own-accounting pass — ADDITIVE
+        # diagnostics beside the stats outputs, per-window loud skips when
+        # inputs are absent, nothing fabricated, raw tree untouched.
+        run_own_accounting_pass(
+            run_dir, index, analysis_dir, workload_manifest=workload_manifest
+        )
+
+        # T6.2 (charter S1 a+b): the yield-ladder artifact — Y with raw
+        # throughput, G, the independence null G·E[v] and the covariance gap
+        # beside it, per evaluated window, on ONE §6.6-audited basis. Also
+        # additive; loud skip/suppression when there are no ladder inputs or
+        # the §9.8 seal is active.
+        run_yield_ladder_pass(
+            analysis_dir, ladder_metrics, stamp, blinding_active=blinding_active
+        )
+
+        # T1.1 (Wave 3): the #18/#19 DIST executors — additive artifact
+        # dist_contrasts.json, request-gated like #12/#14. The #18 gate
+        # outcome is READ from the executed gatekeeping trace (families.py
+        # topology: DIST secondaries gate on the #13 endpoint) — accepted as
+        # an input, never recomputed; absent ⇒ the artifact reports PENDING.
+        gate_13_outcome: dict[str, Any] | None = None
+        for decision in gatekeeping_section.get("set_decisions", []) or []:
+            if decision.get("endpoint") == chain_endpoint(
+                FINGERPRINT_CONTRAST_ID
+            ):
+                gate_13_outcome = {
+                    "endpoint": decision["endpoint"],
+                    "passed": bool(decision["passed"]),
+                    "source": "stats['gatekeeping']['set_decisions']",
+                }
+                break
+        run_dist_contrasts_pass(
+            run_dir,
+            index,
+            analysis_dir,
+            stamp,
+            requested_ids=list(contrast_ids),
+            gate_13=gate_13_outcome,
+            predicate_root=predicate_root,
+            blinding_active=blinding_active,
+        )
+
+        # T7.2 (Wave 3): the #14 normalized-pressure alignment on the
+        # OWN-accounting rho axis — additive artifact pressure_alignment.json;
+        # MUST follow run_own_accounting_pass (it reads those artifacts).
+        run_pressure_alignment_pass(
+            analysis_dir,
+            index,
+            ladder_metrics,
+            stamp,
+            blinding_active=blinding_active,
+        )
+
         if mode == "confirmatory":
             assert registered_sha is not None
             write_lock(run_dir, registered_sha, analysis_dir, stats_path)
@@ -4695,6 +5668,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "refuse without this flag; none -> the registered predicate legs "
         "surface through the missing-column refusals",
     )
+    parser.add_argument(
+        "--workload-manifest",
+        type=Path,
+        default=None,
+        metavar="JSON",
+        help="query manifest (scripts/1_setup/build_query_manifest.py) whose "
+        "corpus blocks define the known shared prefixes — feeds the T8.2 "
+        "own-accounting rho_reuse leg; without it that leg is a loud "
+        "per-window skip (engine cached_tokens stay corroboration-only)",
+    )
     return parser
 
 
@@ -4750,6 +5733,7 @@ def main(argv: list[str] | None = None) -> int:
             alpha=args.alpha,
             accepted_step_down=args.accept_step_down,
             predicate_run_id=args.predicate_run_id,
+            workload_manifest=args.workload_manifest,
         )
     except AnalysisError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
