@@ -84,7 +84,16 @@ Pipeline per run:
    skips naming every missing input) and ``pressure_alignment.json`` (the
    #14 cross-engine bundles aligned on the OWN-accounting rho axis, §8.8 —
    consumes the own-accounting artifacts and the #14 executor's window
-   metrics; loud skip otherwise, both suppressed under blinding). Figures CONSUME the registered
+   metrics; loud skip otherwise, both suppressed under blinding). W4.10/W4.11
+   additive surfaces: the per-query loader THREADS the §8.11 degradation-label
+   columns (``src.analysis.degradation`` — deterministic per-trial classifiers;
+   unjudgeable labels stay absent with counted named reasons in
+   ``frame.attrs['degradation_reasons']``) so a ``deg_*`` column can serve as
+   the #13 fingerprint/equivalence instrument, and
+   ``run_conditioned_curves_pass`` writes ``conditioned_curves.json`` + figures
+   (§8.12 quality|ρ_own and quality|evidence-position×pressure joins via
+   ``src.analysis.conditioned_curves``; quality|policy-event stays the named
+   OWNER-GATED S2 stub; suppressed under blinding). Figures CONSUME the registered
    statistics (audit I1): ``render_figures`` feeds
    ``figure_pipeline.plot_forest_registered`` /
    ``plot_win_loss_tie_registered`` from the same contrast dicts written into
@@ -223,6 +232,22 @@ from src.analysis.own_accounting import (  # noqa: E402
     divergence_report,
     window_bounds_from_requests,
 )
+from src.analysis.conditioned_curves import (  # noqa: E402
+    CONDITIONED_QUALITY_METRICS,
+    EVIDENCE_POSITION_BINS,
+    RHO_OWN_BIN_EDGES,
+    ConditionedCurveError,
+    evidence_position_bin,
+    policy_event_curve,
+    pressure_bin_of,
+    quality_by_evidence_position,
+    quality_by_rho_own,
+)
+from src.analysis.degradation import (  # noqa: E402
+    LABEL_COLUMNS as DEGRADATION_LABEL_COLUMNS,
+    classify_request,
+    column_of as degradation_column_of,
+)
 from src.analysis.dist_contrasts import (  # noqa: E402
     DIST_EXECUTOR_IDS,
     align_pressure_bundles,
@@ -325,6 +350,18 @@ ESTIMAND_HIGHER_IS_BETTER: dict[str, bool] = {
     "lambda_star_onset": True,
     # fingerprint legs test harm on a quality instrument (higher better).
     "fingerprint": True,
+}
+
+#: W4.10 (§8.11): the per-query degradation-label columns the loader threads
+#: (``load_per_query`` classifies every trial row via
+#: ``src.analysis.degradation.classify_request``). Each is a per-request
+#: FAILURE indicator — lower is better. Kept OUTSIDE ``HIGHER_IS_BETTER``
+#: for the same reason the estimand variables are: the G7 cross-check pins
+#: ``families.REGISTERED_METRICS`` equal to the HIGHER_IS_BETTER keys, and a
+#: label column is a fingerprint instrument (``--equivalence-metric``), never
+#: a caller-suppliable family-map metric.
+DEGRADATION_HIGHER_IS_BETTER: dict[str, bool] = {
+    column: False for column in DEGRADATION_LABEL_COLUMNS
 }
 
 #: §6.1/§9.2 floor suite (#12): rates are FRACTIONS of the predicted λ*, so
@@ -478,6 +515,13 @@ _DIST_TELEMETRY_NAME = "cage_stats.jsonl"
 #: T7.2: |rho_own − r| tolerance (absolute) for the #14 pressure alignment;
 #: recorded in the artifact by align_pressure_bundles.
 PRESSURE_ALIGNMENT_TOL: float = 0.10
+
+#: W4.11 (§8.12): the Layer-5 conditioned-curve artifact — additive, written
+#: beside the stats outputs like the own-accounting/yield-ladder passes. The
+#: quality|ρ_own leg CONSUMES the T2.5 own_accounting.json artifacts, so its
+#: pass MUST run after ``run_own_accounting_pass``.
+CONDITIONED_CURVES_NAME = "conditioned_curves.json"
+CONDITIONED_CURVES_SCHEMA_VERSION = 1
 
 
 class AnalysisError(RuntimeError):
@@ -897,6 +941,18 @@ def load_per_query(
     missing ``record_index``) are a duplicate-row hazard (H3: replay rows
     are duplicated BY DESIGN and must carry the disambiguating key) — the
     loader REFUSES naming the window.
+
+    W4.10 (§8.11): every trial's MERGED raw record (the artifacts share the
+    ``(example_id, record_index)`` identity) is run through the deterministic
+    degradation classifiers (``src.analysis.degradation.classify_request``)
+    and the judged labels ride the SAME per-example mean path as any numeric
+    field, under the ``deg_*`` columns — so the #13 fingerprint/equivalence
+    executors can take a label rate as their instrument. An unjudgeable
+    trial's label stays ABSENT (None-with-provenance): its NAMED reason is
+    counted into ``frame.attrs['degradation_reasons']`` (column ->
+    {reason: count}), never coerced to a value. A raw row that already
+    carries a ``deg_*`` field REFUSES (label columns must never be shadowed
+    by producer data).
     """
     wanted = set(row_keys)
     selection = index[index["row_key"].isin(wanted)]
@@ -904,9 +960,13 @@ def load_per_query(
         raise AnalysisError(f"no index rows for row keys {sorted(wanted)}")
     rows: list[dict[str, Any]] = []
     bool_coerced: set[str] = set()
+    label_reasons: dict[str, dict[str, int]] = {}
     for rec in selection.itertuples(index=False):
         window_dir = run_dir / str(rec.window_dir)
         merged: dict[str, dict[str, list[float]]] = {}
+        #: (example_id, record_index) -> the trial's raw record merged across
+        #: artifacts — the classify_request input (W4.10).
+        trial_raw: dict[tuple[str, Any], dict[str, Any]] = {}
         n_unjoined = 0
         artifact_paths = [window_dir / name for name in _PER_QUERY_ARTIFACTS]
         if predicate_root is not None:
@@ -931,6 +991,17 @@ def load_per_query(
                         "indistinguishable rows (G11)"
                     )
                 seen_keys.add(dup_key)
+                shadowed = sorted(
+                    set(obj) & set(DEGRADATION_LABEL_COLUMNS)
+                )
+                if shadowed:
+                    raise AnalysisError(
+                        f"{path}: raw record carries reserved degradation-"
+                        f"label column(s) {shadowed} — the deg_* namespace "
+                        "is minted by the loader's classifiers (W4.10), "
+                        "never by a producer artifact"
+                    )
+                trial_raw.setdefault(dup_key, {}).update(obj)
                 bucket = merged.setdefault(example_id, {})
                 for field_name, value in obj.items():
                     if isinstance(value, bool):
@@ -947,6 +1018,20 @@ def load_per_query(
                 f"{'/'.join(_PER_QUERY_ARTIFACTS)} — cannot pair anything "
                 f"({n_unjoined} record(s) lacked example_id)"
             )
+        # W4.10: classify each merged trial record; judged labels join the
+        # per-example mean buckets, unjudgeable ones stay absent with their
+        # counted NAMED reason (absence is never a 0.0 label).
+        for (example_id, _record_index), raw in trial_raw.items():
+            bucket = merged[example_id]
+            for label_name, result in classify_request(raw).items():
+                column = degradation_column_of(label_name)
+                if result.value is None:
+                    counts = label_reasons.setdefault(column, {})
+                    counts[result.reason] = counts.get(result.reason, 0) + 1
+                    continue
+                bucket.setdefault(column, []).append(
+                    1.0 if result.value else 0.0
+                )
         for example_id, fields in merged.items():
             rows.append(
                 {
@@ -959,6 +1044,10 @@ def load_per_query(
             )
     frame = pd.DataFrame(rows)
     frame.attrs["bool_coerced_fields"] = sorted(bool_coerced)
+    frame.attrs["degradation_reasons"] = {
+        column: dict(sorted(counts.items()))
+        for column, counts in sorted(label_reasons.items())
+    }
     return frame
 
 
@@ -1069,11 +1158,15 @@ def _metric_direction(metric: str) -> bool:
         return HIGHER_IS_BETTER[metric]
     if metric in ESTIMAND_HIGHER_IS_BETTER:
         return ESTIMAND_HIGHER_IS_BETTER[metric]
+    if metric in DEGRADATION_HIGHER_IS_BETTER:
+        # W4.10: §8.11 label rates — failure indicators, lower is better.
+        return DEGRADATION_HIGHER_IS_BETTER[metric]
     raise AnalysisError(
         f"metric {metric!r} has no registered direction — add it to "
-        f"HIGHER_IS_BETTER (caller roster) or ESTIMAND_HIGHER_IS_BETTER "
-        f"(estimand variables) in run_campaign_analysis.py (known: "
-        f"{sorted(HIGHER_IS_BETTER) + sorted(ESTIMAND_HIGHER_IS_BETTER)}). "
+        f"HIGHER_IS_BETTER (caller roster), ESTIMAND_HIGHER_IS_BETTER "
+        f"(estimand variables) or DEGRADATION_HIGHER_IS_BETTER (§8.11 label "
+        f"columns) in run_campaign_analysis.py (known: "
+        f"{sorted(HIGHER_IS_BETTER) + sorted(ESTIMAND_HIGHER_IS_BETTER) + sorted(DEGRADATION_HIGHER_IS_BETTER)}). "
         "Guessing a direction flips W/L/T."
     )
 
@@ -2529,6 +2622,33 @@ def _paired_pivot(
     return wide
 
 
+def _absent_instrument_detail(per_query: pd.DataFrame, metric: str) -> str:
+    """Skip-reason enrichment for an instrument column missing from a frame.
+
+    W4.10: the §8.11 degradation-label columns are THREADED by
+    ``load_per_query``, so "labels missing" is no longer the honest refusal —
+    when a label column is absent it is because every trial row was
+    unjudgeable, and the loader's counted NAMED reasons say exactly what raw
+    input remains genuinely missing. Non-label metrics get no enrichment
+    (the plain absent-column text already names the artifact set)."""
+    if metric not in DEGRADATION_HIGHER_IS_BETTER:
+        return ""
+    reasons = (per_query.attrs.get("degradation_reasons") or {}).get(metric)
+    if reasons:
+        detail = "; ".join(
+            f"{reason} (x{count})" for reason, count in sorted(reasons.items())
+        )
+        return (
+            " — the §8.11 label IS threaded by the loader (W4.10); no trial "
+            f"row was judgeable, for these recorded reason(s): {detail}"
+        )
+    return (
+        " — the §8.11 label IS threaded by the loader (W4.10) but the "
+        "pair's windows produced no judged trial and recorded no refusal "
+        "reason (the artifacts carry no classifier input rows at all)"
+    )
+
+
 def compute_equivalence(
     per_query_loader: Any,
     index: pd.DataFrame,
@@ -2619,7 +2739,8 @@ def compute_equivalence(
                 skip(
                     policy,
                     f"metric {metric!r} absent from the pair's per-query "
-                    f"records ({cell_key} vs {ref_key})",
+                    f"records ({cell_key} vs {ref_key})"
+                    + _absent_instrument_detail(per_query, metric),
                 )
                 continue
             if POLICY_EVENT_COLUMN not in per_query.columns:
@@ -2788,9 +2909,10 @@ def compute_fingerprint(
         for leg in declared:
             skip(
                 leg["leg"],
-                "no fingerprint quality instrument supplied "
-                "(--equivalence-metric; the §9.5 instrument is the "
-                "fingerprint instrument)",
+                "no fingerprint instrument supplied (--equivalence-metric; "
+                "the §9.5 instrument is the fingerprint instrument — a "
+                "quality metric or one of the threaded §8.11 degradation-"
+                f"label columns {list(DEGRADATION_LABEL_COLUMNS)})",
             )
         return section, []
 
@@ -2842,7 +2964,8 @@ def compute_fingerprint(
                 skip(
                     leg,
                     f"metric {metric!r} absent from the pair's per-query "
-                    f"records ({cell_key} vs {ref_key})",
+                    f"records ({cell_key} vs {ref_key})"
+                    + _absent_instrument_detail(per_query, metric),
                 )
                 continue
             for dataset in datasets:
@@ -4917,6 +5040,339 @@ def run_pressure_alignment_pass(
     return document
 
 
+# ---------------------------------------------------------------------------
+# W4.11 — §8.12 Layer-5 conditioned quality curves (additive pass)
+# ---------------------------------------------------------------------------
+
+
+def run_conditioned_curves_pass(
+    run_dir: Path,
+    index: pd.DataFrame,
+    analysis_dir: Path,
+    stamp: str,
+    *,
+    blinding_active: bool,
+    metrics: Sequence[str] = CONDITIONED_QUALITY_METRICS,
+) -> dict[str, Any] | None:
+    """W4.11 — write ``<analysis_dir>/conditioned_curves.json`` (+ figures):
+    the §8.12 Layer-5 output surface, mode-stamped and additive.
+
+    Three registered curves:
+
+    - **quality | ρ_own** — per-window quality means (from requests.jsonl)
+      binned on ``rho_own`` read from the T2.5 ``own_accounting.json``
+      artifacts under THIS analysis dir (so the pass MUST run after
+      ``run_own_accounting_pass``; §8.8: engine gauges never substitute for
+      the axis), ONE curve per coordinate-free cell identity
+      (``conditioned_curves.mechanism_engine_key`` — §8.12 registers the
+      curve per mechanism × engine; cells are never pooled into one line).
+      A window without a usable ρ or metric column is a labeled
+      skip naming exactly what is absent.
+    - **quality | evidence-position × pressure** — per-trial quality crossed
+      with the producer's ``gold_position_in_prompt`` served-containment
+      column (normalized by the evidence row's ``used_contexts`` count) and
+      the cell's registered pressure-grid coordinates
+      (``conditioned_curves.pressure_bin_of``; F1 cells get the labeled
+      no-coords bin). Unbinnable trials are COUNTED per named reason;
+      pooled across cells by registration (§8.12 names only
+      evidence-position × pressure for this curve). Duplicate
+      ``(example_id, record_index)`` rows within ONE artifact file REFUSE
+      exactly like ``load_per_query`` (H3/#127: replay rows must carry the
+      disambiguating key — never silently merged into a phantom trial).
+    - **quality | policy-event** — the OWNER-GATED S2 stub: recorded as
+      unavailable with the one named §8.11/§8.12 refusal, never computed.
+
+    Purely descriptive joins (§8.12: "pure joins over L0-L4 + the ledger") —
+    no p-values, no chain contribution. §9.8: suppressed under an active
+    seal (rows carry row_key/arm-bearing axes).
+    """
+    if blinding_active:
+        print(
+            "[conditioned-curves] SUPPRESSED: §9.8 blinding active — the "
+            "§8.12 joins are keyed by row_key/window dirs (arm-bearing "
+            "axes); withheld until the logged unblinding"
+        )
+        return None
+
+    rho_rows: list[dict[str, Any]] = []
+    rho_skips: list[dict[str, Any]] = []
+    evidence_rows: list[dict[str, Any]] = []
+    evidence_reason_counts: dict[str, int] = {}
+
+    def count_evidence(reason: str) -> None:
+        evidence_reason_counts[reason] = evidence_reason_counts.get(reason, 0) + 1
+
+    for rec in index.itertuples(index=False):
+        window = str(rec.window_dir)
+        window_dir = run_dir / window
+        requests_path = window_dir / "requests.jsonl"
+        if not requests_path.is_file():
+            rho_skips.append(
+                {
+                    "window": window,
+                    "metric": None,
+                    "reason": f"{requests_path} missing — no per-request "
+                    "quality rows for any conditioned curve",
+                }
+            )
+            count_evidence(f"{requests_path} missing — no per-request rows")
+            continue
+        requests = _read_jsonl(requests_path)
+
+        # --- quality | rho_own: the window's OWN pressure coordinate -------
+        own_path = (
+            analysis_dir / OWN_ACCOUNTING_DIRNAME / window / OWN_ACCOUNTING_NAME
+        )
+        rho_own: float | None = None
+        rho_reason: str | None = None
+        if not own_path.is_file():
+            rho_reason = (
+                "no own_accounting.json for this window — the T2.5 pass "
+                "(run_own_accounting_pass) emitted none (its loud skip named "
+                "why); §8.8: rho_own is the ONLY alignment axis, the engine "
+                "gauge never substitutes"
+            )
+        else:
+            own_doc = json.loads(own_path.read_text(encoding="utf-8"))
+            raw = own_doc.get("rho_own")
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                rho_own = float(raw)
+            elif raw is None:
+                occupancy = own_doc.get("occupancy")
+                skipped = (
+                    occupancy.get("skipped")
+                    if isinstance(occupancy, dict)
+                    else None
+                )
+                rho_reason = (
+                    "own_accounting.json carries rho_own=null — the "
+                    f"occupancy leg was skipped at emission: {skipped!r}"
+                )
+            else:
+                rho_reason = (
+                    f"own_accounting.json rho_own is {raw!r} (non-numeric) — "
+                    "malformed artifact; regenerate the own-accounting pass"
+                )
+        for metric in metrics:
+            values = [
+                float(row[metric])
+                for row in requests
+                if isinstance(row.get(metric), (int, float))
+                and not isinstance(row.get(metric), bool)
+                and math.isfinite(float(row[metric]))
+            ]
+            if not values:
+                rho_skips.append(
+                    {
+                        "window": window,
+                        "metric": metric,
+                        "reason": f"metric column {metric!r} absent from "
+                        "every requests.jsonl row (unscored window)",
+                    }
+                )
+                continue
+            if rho_reason is not None:
+                rho_skips.append(
+                    {"window": window, "metric": metric, "reason": rho_reason}
+                )
+                continue
+            rho_rows.append(
+                {
+                    "window": window,
+                    "row_key": str(rec.row_key),
+                    "dataset": str(rec.dataset),
+                    "window_key": str(rec.window_key),
+                    "rho_own": rho_own,
+                    "metric": metric,
+                    "value": float(np.mean(values)),
+                    "n": len(values),
+                }
+            )
+
+        # --- quality | evidence-position × pressure ------------------------
+        pressure_bin = pressure_bin_of(
+            getattr(rec, "budget_r", None), getattr(rec, "rate_frac", None)
+        )
+        trial_raw: dict[tuple[str, Any], dict[str, Any]] = {}
+        qa_path = window_dir / "qa_evidence.jsonl"
+        for path in (requests_path, qa_path):
+            if not path.is_file():
+                continue  # qa_evidence is dataset-exempt for load donors (§1)
+            # Cross-FILE key collisions are the join (requests ⋈ qa_evidence
+            # on the shared trial identity); a repeat within ONE file is the
+            # H3 replay hazard and refuses exactly like load_per_query —
+            # last-row-wins merging would fabricate a phantom single trial.
+            seen_keys: set[tuple[str, Any]] = set()
+            for obj in _read_jsonl(path):
+                example_id = obj.get("example_id")
+                if not isinstance(example_id, str) or not example_id:
+                    continue
+                dup_key = (example_id, obj.get("record_index"))
+                if dup_key in seen_keys:
+                    raise AnalysisError(
+                        f"{path}: duplicate (example_id, record_index) = "
+                        f"{dup_key!r} — replayed rows must carry a distinct "
+                        "record_index (H3/#127); refusing to merge "
+                        "indistinguishable rows into one trial (G11, "
+                        "matching load_per_query)"
+                    )
+                seen_keys.add(dup_key)
+                trial_raw.setdefault(dup_key, {}).update(obj)
+        for _key, raw_trial in trial_raw.items():
+            used = raw_trial.get("used_contexts")
+            n_contexts = len(used) if isinstance(used, list) else None
+            bin_label, bin_reason = evidence_position_bin(
+                raw_trial.get("gold_position_in_prompt"), n_contexts
+            )
+            if bin_label is None:
+                count_evidence(bin_reason)
+                continue
+            for metric in metrics:
+                value = raw_trial.get(metric)
+                if not isinstance(value, (int, float)) or isinstance(
+                    value, bool
+                ) or not math.isfinite(float(value)):
+                    count_evidence(
+                        f"metric column {metric!r} absent from the trial row"
+                    )
+                    continue
+                evidence_rows.append(
+                    {
+                        "dataset": str(rec.dataset),
+                        "evidence_bin": bin_label,
+                        "pressure_bin": pressure_bin,
+                        "metric": metric,
+                        "value": float(value),
+                    }
+                )
+
+    rho_curve = (
+        quality_by_rho_own(pd.DataFrame(rho_rows)) if rho_rows else None
+    )
+    evidence_curve = (
+        quality_by_evidence_position(pd.DataFrame(evidence_rows))
+        if evidence_rows
+        else None
+    )
+
+    # quality | policy-event: the OWNER-GATED S2 stub — recorded, never faked.
+    try:
+        policy_event_curve()
+    except (ConditionedCurveError, ValueError) as exc:
+        policy_event_reason = str(exc)
+    else:  # pragma: no cover — the stub refuses by contract
+        raise AnalysisError(
+            "policy_event_curve returned instead of refusing — the S2 stub "
+            "contract is broken"
+        )
+
+    # Figures AFTER the aggregates, from the SAME frames serialized below.
+    figures: list[dict[str, Any]] = []
+    for curve, plot_fn, config_cls, prefix, curve_name in (
+        (
+            rho_curve,
+            fp.plot_quality_vs_rho_own,
+            fp.RhoOwnCurveConfig,
+            "conditioned_rho_own",
+            "quality|rho_own",
+        ),
+        (
+            evidence_curve,
+            fp.plot_quality_vs_evidence_position,
+            fp.EvidencePositionConfig,
+            "conditioned_evidence_position",
+            "quality|evidence_position×pressure",
+        ),
+    ):
+        if curve is None:
+            figures.append(
+                {
+                    "curve": curve_name,
+                    "skipped": "no computable join rows (see the section's "
+                    "skips/skipped_trials for the named reasons)",
+                }
+            )
+            continue
+        for metric in sorted(set(curve["metric"])):
+            outpath = analysis_dir / f"{prefix}_{metric}.png"
+            plot_fn(
+                curve[curve["metric"] == metric],
+                outpath,
+                config=config_cls(
+                    metric=metric,
+                    title=f"{curve_name} — {metric} [{stamp}]",
+                ),
+            )
+            figures.append(
+                {"curve": curve_name, "metric": metric, "file": outpath.name}
+            )
+
+    document: dict[str, Any] = {
+        "schema_version": CONDITIONED_CURVES_SCHEMA_VERSION,
+        "mode_stamp": stamp,
+        "generated_utc": datetime.now(timezone.utc).isoformat(),
+        "source": "§8.12 Layer-5 conditioned quality curves (W4.11)",
+        "metrics": list(metrics),
+        "quality_vs_rho_own": {
+            "axis": (
+                "rho_own from own_accounting.json (§8.8 PRIMARY pressure "
+                "axis; the engine self-reported gauge never substitutes)"
+            ),
+            "conditioning": (
+                "one curve per coordinate-free cell identity curve_key = "
+                "arm|retriever|policy|topology|engine|model|family (§8.12: "
+                "per mechanism × engine); pressure coordinates are the "
+                "swept variable, never part of a curve's identity"
+            ),
+            "bin_edges": list(RHO_OWN_BIN_EDGES),
+            "windows": rho_rows,
+            "curve": (
+                rho_curve.to_dict("records") if rho_curve is not None else []
+            ),
+            "skips": rho_skips,
+        },
+        "quality_vs_evidence_position": {
+            "pressure_axis": (
+                "registered cell grid coordinates (budget_r × rate_frac; "
+                "F1 cells carry the labeled no-pressure-coords bin)"
+            ),
+            "conditioning": (
+                "pooled across cells — §8.12 registers this curve as "
+                "evidence-position × pressure only (the per-mechanism×"
+                "engine conditioning is registered on quality|rho_own)"
+            ),
+            "position_bins": list(EVIDENCE_POSITION_BINS),
+            "n_trials_joined": len(evidence_rows),
+            "curve": (
+                evidence_curve.to_dict("records")
+                if evidence_curve is not None
+                else []
+            ),
+            "skipped_trials": dict(sorted(evidence_reason_counts.items())),
+        },
+        "quality_vs_policy_event": {
+            "available": False,
+            "reason": policy_event_reason,
+        },
+        "figures": figures,
+    }
+    for skip_row in rho_skips:
+        print(
+            f"[conditioned-curves] SKIP {skip_row['window']} "
+            f"({skip_row['metric']}): {skip_row['reason']}"
+        )
+    for reason, count in sorted(evidence_reason_counts.items()):
+        print(f"[conditioned-curves] evidence-join skip x{count}: {reason}")
+    out_path = analysis_dir / CONDITIONED_CURVES_NAME
+    _atomic_write_text(out_path, json.dumps(document, indent=2) + "\n")
+    print(
+        f"[conditioned-curves] emitted {out_path} "
+        f"({len(rho_rows)} rho window-row(s), {len(evidence_rows)} evidence "
+        f"trial-row(s), policy-event: S2-gated)"
+    )
+    return document
+
+
 def run_analysis(
     run_dir: Path,
     *,
@@ -5524,6 +5980,18 @@ def run_analysis(
             analysis_dir,
             index,
             ladder_metrics,
+            stamp,
+            blinding_active=blinding_active,
+        )
+
+        # W4.11 (§8.12): the Layer-5 conditioned quality curves — additive
+        # artifact conditioned_curves.json + figures; MUST follow
+        # run_own_accounting_pass (the quality|rho_own leg reads its
+        # artifacts); the policy-event curve stays the named S2-gated stub.
+        run_conditioned_curves_pass(
+            run_dir,
+            index,
+            analysis_dir,
             stamp,
             blinding_active=blinding_active,
         )

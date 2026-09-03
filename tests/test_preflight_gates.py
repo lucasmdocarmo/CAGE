@@ -895,12 +895,12 @@ def _datasets_env(stub: Path, cache: Path, **extra: str) -> Dict[str, str]:
 # The default campaign roster's HF-cache directory names ("/" -> "___"), from
 # download_datasets.dataset_specs() at the default (un-overridden) HF paths.
 _DEFAULT_ROSTER_CACHE_DIRS = (
-    "hotpot_qa",                # hotpotqa
+    "hotpotqa___hotpot_qa",     # hotpotqa (namespaced 2026-09-02)
     "dgslibisey___MuSiQue",     # musique
     "allenai___qasper",         # qasper
     "microsoft___SCBench",      # scbench (both configs share the dir)
     "RyokoAI___ShareGPT52K",    # sharegpt
-    "squad_v2",                 # squad_v2
+    "rajpurkar___squad_v2",     # squad_v2 (namespaced 2026-09-02)
 )
 
 
@@ -948,7 +948,7 @@ def test_datasets_gate_has_no_silent_skip_path() -> None:
 def test_datasets_gate_passes_when_requested_sets_are_staged(
         fake_datasets_path: Path, tmp_path: Path) -> None:
     cache = tmp_path / "cache"
-    _stage(cache, "squad_v2")
+    _stage(cache, "rajpurkar___squad_v2")
     _stage(cache, "allenai___qasper")
     proc = _run_gate(
         "CAGE-DATASET-STALENESS-GATE",
@@ -961,7 +961,7 @@ def test_datasets_gate_passes_when_requested_sets_are_staged(
 def test_datasets_gate_refuses_unstaged_charter_dataset(
         fake_datasets_path: Path, tmp_path: Path) -> None:
     cache = tmp_path / "cache"
-    _stage(cache, "squad_v2")  # qasper deliberately NOT staged
+    _stage(cache, "rajpurkar___squad_v2")  # qasper deliberately NOT staged
     proc = _run_gate(
         "CAGE-DATASET-STALENESS-GATE",
         env=_datasets_env(fake_datasets_path, cache,
@@ -994,7 +994,7 @@ def test_datasets_gate_ruler_is_synthetic_and_always_ok(
 def test_datasets_gate_honors_runner_dataset_fallback(
         fake_datasets_path: Path, tmp_path: Path) -> None:
     cache = tmp_path / "cache"
-    _stage(cache, "squad_v2")
+    _stage(cache, "rajpurkar___squad_v2")
     proc = _run_gate(
         "CAGE-DATASET-STALENESS-GATE",
         env=_datasets_env(fake_datasets_path, cache, DATASET="squad_v2"))
@@ -1010,7 +1010,7 @@ def test_datasets_gate_honors_runner_dataset_fallback(
 # end-to-end runs against the LIVE venv and synthetic requirements files.
 # ---------------------------------------------------------------------------
 
-_PIN_SHA = "4ec296ddc2ebceb2a4f8dbc61625747ff7f68638"
+_PIN_SHA = "fcc74f261e9a6be034d63ba4373907ec4f72b1db"
 
 
 def test_preflight_declares_pin_parity_gate() -> None:

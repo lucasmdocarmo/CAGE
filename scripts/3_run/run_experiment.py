@@ -3667,9 +3667,12 @@ def main():
     )
     parser.add_argument(
         "--ruler-task",
-        choices=["niah_single", "niah_multikey"],
+        choices=["niah_single", "niah_multikey", "niah_multiquery",
+                 "variable_tracking", "qa"],
         default=None,
-        help="RULER task variant (loader default niah_single). Equivalent to "
+        help="RULER task variant (loader default niah_single; charter D5#5 "
+             "subset = niah_multikey/niah_multiquery/variable_tracking/qa, "
+             "reported per task, never aggregated). Equivalent to "
              "CAGE_RULER_TASK.",
     )
     parser.add_argument(

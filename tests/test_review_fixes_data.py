@@ -92,7 +92,7 @@ def test_download_datasets_main_exits_nonzero_on_partial_failure(monkeypatch):
     not just print a warning and report blanket success.
     """
     def flaky(name, config=None, split=None):
-        if name == "squad_v2":
+        if name == "rajpurkar/squad_v2":
             raise RuntimeError("simulated failure for squad_v2 only")
         return _FakeDatasetDict({"validation": list(range(3))})
 

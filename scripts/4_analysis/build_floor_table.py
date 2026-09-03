@@ -28,8 +28,15 @@ Prediction recipe (charter §6.1, pinned 2026-08-02 = §9.2):
 Registered grids (§6.1 budgets; §6.8 pruning rule; rate fractions imported
 from load_generator so this artifact can never drift from the dispatcher):
 
-- full    (Group A anchor): r ∈ {1.5, 1.0, 0.75, 0.5, 0.25} × 6 rates
-- reduced (Groups B/C/D):   r ∈ {1.0, 0.5, 0.25} × 3 rates
+- full        (Group A anchor): r ∈ {1.5, 1.0, 0.75, 0.5, 0.25} × 6 rates
+- reduced     (Groups B/C/D):   r ∈ {1.0, 0.5, 0.25} × 3 rates
+- anchor-fine (Group A + §6.4): the full factorial's 5 levels PLUS the §6.4
+  fine additions {1.25, 0.375} — 7 budget rows. Per-row rate fractions: the
+  full 6-rate factorial on the 5 factorial levels, the two §6.4 chassis
+  rates {0.85, 1.05} on the fine-only levels (a fine-only row never serves
+  the other 4 rates, so predicting them would over-claim). This is the grid
+  a session-'a' campaign plan requires (run_campaign pre-resolves every
+  registered r, fine levels included).
 
 Fail-closed doctrine: unknown model/engine/grid/kv_dtype and non-positive
 numerics REFUSE with the knowns named; an existing --out REFUSES without
@@ -66,6 +73,8 @@ __all__ = [
     "SCHEMA",
     "FULL_BUDGET_LEVELS",
     "REDUCED_BUDGET_LEVELS",
+    "ANCHOR_FINE_BUDGET_LEVELS",
+    "ANCHOR_FINE_RATE_FRACTIONS",
     "GRID_BUDGET_LEVELS",
     "GRID_RATE_FRACTIONS",
     "PRESSURE_ENGINES",
@@ -79,16 +88,36 @@ SCHEMA: Final[str] = "floor-table-v1"
 FULL_BUDGET_LEVELS: Final[Tuple[float, ...]] = (1.5, 1.0, 0.75, 0.5, 0.25)
 # §6.8 pruning rule (2026-08-02): Groups B, C, D run the reduced 3×3 grid.
 REDUCED_BUDGET_LEVELS: Final[Tuple[float, ...]] = (1.0, 0.5, 0.25)
+# §6.4 Graft C (W4.3): the anchor fine 7-level r-grid — the full factorial's
+# 5 levels plus {1.25, 0.375}, run at the two chassis-validated rates below.
+# Mirrors run_campaign.ANCHOR_FINE_* (each module registers the charter
+# literal, matching the FULL/REDUCED convention above).
+ANCHOR_FINE_BUDGET_LEVELS: Final[Tuple[float, ...]] = (
+    1.5, 1.25, 1.0, 0.75, 0.5, 0.375, 0.25,
+)
+ANCHOR_FINE_RATE_FRACTIONS: Final[Tuple[float, ...]] = (0.85, 1.05)
+assert set(ANCHOR_FINE_RATE_FRACTIONS) <= set(D6_RATE_FRACTIONS), (
+    "§6.4 fine rates drifted outside load_generator.D6_RATE_FRACTIONS"
+)
+assert set(FULL_BUDGET_LEVELS) <= set(ANCHOR_FINE_BUDGET_LEVELS), (
+    "§6.4 fine levels no longer cover the §6.1 factorial — the anchor-fine "
+    "grid must serve a session-'a' plan's every registered r"
+)
 
 GRID_BUDGET_LEVELS: Final[Dict[str, Tuple[float, ...]]] = {
     "full": FULL_BUDGET_LEVELS,
     "reduced": REDUCED_BUDGET_LEVELS,
+    "anchor-fine": ANCHOR_FINE_BUDGET_LEVELS,
 }
 # Rate fractions come from the dispatcher's registered constants — the floor
-# table and the load generator can never disagree about the grid.
+# table and the load generator can never disagree about the grid. The
+# anchor-fine grid maps to the FULL factorial here (its factorial rows serve
+# all 6 rates); the fine-ONLY rows override per row to the two §6.4 rates —
+# see the per-row selection inside build_floor_table.
 GRID_RATE_FRACTIONS: Final[Dict[str, Tuple[float, ...]]] = {
     "full": D6_RATE_FRACTIONS,
     "reduced": D6_REDUCED_RATE_FRACTIONS,
+    "anchor-fine": D6_RATE_FRACTIONS,
 }
 
 # HF Transformers is the correctness oracle, excluded from pressure sweeps by
@@ -157,7 +186,9 @@ def build_floor_table(
     if grid not in GRID_BUDGET_LEVELS:
         raise FloorTableError(
             f"unknown grid {grid!r} — known: {sorted(GRID_BUDGET_LEVELS)} "
-            "(full = Group-A anchor §6.1; reduced = Groups B/C/D §6.8)"
+            "(full = Group-A anchor §6.1; reduced = Groups B/C/D §6.8; "
+            "anchor-fine = full + the §6.4 fine levels — what a session-'a' "
+            "campaign plan requires)"
         )
     if kv_dtype not in KV_DTYPE_FACTOR:
         raise FloorTableError(
@@ -183,9 +214,15 @@ def build_floor_table(
         kv_dtype=kv_dtype,
     )
 
-    fractions = list(GRID_RATE_FRACTIONS[grid])
     rows: List[Dict[str, Any]] = []
     for r in GRID_BUDGET_LEVELS[grid]:
+        # Per-row rate fractions: uniform per grid, EXCEPT the anchor-fine
+        # grid's fine-ONLY levels (§6.4: those coordinates run at exactly the
+        # two chassis rates — predicting the other 4 would over-claim).
+        if grid == "anchor-fine" and r not in FULL_BUDGET_LEVELS:
+            fractions = list(ANCHOR_FINE_RATE_FRACTIONS)
+        else:
+            fractions = list(GRID_RATE_FRACTIONS[grid])
         budget = math.floor(r * demand)
         kv_token_capacity = budget // eff_kv_per_token
         concurrency_ceiling = budget // per_seq_bytes
@@ -243,9 +280,12 @@ def build_floor_table(
             "rate_fractions_source": (
                 "load_generator.D6_RATE_FRACTIONS"
                 if grid == "full"
+                else "load_generator.D6_RATE_FRACTIONS + "
+                "ANCHOR_FINE_RATE_FRACTIONS (§6.4 fine-only rows)"
+                if grid == "anchor-fine"
                 else "load_generator.D6_REDUCED_RATE_FRACTIONS"
             ),
-            "charter_refs": ["P6", "6.1", "6.8"],
+            "charter_refs": ["P6", "6.1", "6.4", "6.8"],
             "generated_at_utc": datetime.now(timezone.utc).isoformat(
                 timespec="seconds"
             ),
@@ -271,7 +311,13 @@ def _main(argv: Optional[List[str]] = None) -> int:
     p.add_argument(
         "--kv-dtype", default="bf16", help=f"one of {sorted(KV_DTYPE_FACTOR)} (P5: BF16 first)"
     )
-    p.add_argument("--grid", required=True, help="full (Group-A anchor) | reduced (Groups B/C/D)")
+    p.add_argument(
+        "--grid",
+        required=True,
+        help="full (Group-A anchor §6.1) | reduced (Groups B/C/D §6.8) | "
+        "anchor-fine (full + the §6.4 fine levels; required by a session-'a' "
+        "campaign plan)",
+    )
     p.add_argument(
         "--service-time-s",
         required=True,

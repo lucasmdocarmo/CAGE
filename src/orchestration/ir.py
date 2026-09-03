@@ -118,14 +118,28 @@ class FaissIRIndex:
         if self._faiss is None:
             import faiss
 
+            # Single-threaded faiss: torch and faiss-cpu each bundle an OpenMP
+            # runtime on macOS, and their thread pools may not coexist safely in
+            # long-lived processes. Flat-index add/search at CAGE corpus scale is
+            # memory-bandwidth-bound, so this costs nothing measurable.
+            faiss.omp_set_num_threads(1)
             self._faiss = faiss
 
     @property
     def documents(self) -> Sequence[IRDocument]:
         return self._documents
 
-    def build(self, documents: Sequence[IRDocument], *, batch_size: int = 64) -> None:
-        """Build the FAISS index from documents."""
+    def build(self, documents: Sequence[IRDocument], *, batch_size: int = 64,
+              slab_size: int = 4096) -> None:
+        """Build the FAISS index from documents.
+
+        Encoding and indexing proceed in ``slab_size`` slabs: one monolithic
+        ``encode()`` over a large corpus holds every batch output plus the full
+        concatenated matrix in memory at once, and that single giant call is
+        where two full-corpus runs (~66k docs) died with SIGSEGV on macOS.
+        Slabs bound peak memory and produce an identical index (same vectors,
+        same insertion order).
+        """
         self._ensure_deps()
         if not documents:
             raise ValueError("No documents provided to build IR index")
@@ -133,24 +147,27 @@ class FaissIRIndex:
         self._documents = list(documents)
         texts = [self._format_passage(d.text) for d in self._documents]
 
-        # SentenceTransformers returns np.ndarray if convert_to_numpy=True
-        embeddings = self._st_model.encode(
-            texts,
-            batch_size=batch_size,
-            show_progress_bar=True,
-            convert_to_numpy=True,
-            normalize_embeddings=self.normalize_embeddings,
-        ).astype("float32")
+        index = None
+        for start in range(0, len(texts), slab_size):
+            # SentenceTransformers returns np.ndarray if convert_to_numpy=True
+            embeddings = self._st_model.encode(
+                texts[start:start + slab_size],
+                batch_size=batch_size,
+                show_progress_bar=True,
+                convert_to_numpy=True,
+                normalize_embeddings=self.normalize_embeddings,
+            ).astype("float32")
 
-        dim = embeddings.shape[1]
+            if index is None:
+                dim = embeddings.shape[1]
+                # Cosine similarity: use inner product on normalized vectors.
+                if self.normalize_embeddings:
+                    index = self._faiss.IndexFlatIP(dim)
+                else:
+                    index = self._faiss.IndexFlatL2(dim)
 
-        # Cosine similarity: use inner product on normalized vectors.
-        if self.normalize_embeddings:
-            index = self._faiss.IndexFlatIP(dim)
-        else:
-            index = self._faiss.IndexFlatL2(dim)
+            index.add(embeddings)
 
-        index.add(embeddings)
         self._index = index
 
     def search(self, query: str, *, top_k: int = 5) -> List[IRHit]:

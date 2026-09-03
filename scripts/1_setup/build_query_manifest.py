@@ -13,6 +13,15 @@ Usage:
       --num-queries 500 --num-trials 3 --seed 42
   -> data/manifests/squad_v2_500x3_seed42.json  (+ prints the stats block)
 
+Engineered-overlap store (D5 F1/F3, e.g. the HotpotQA store; charter: overlap
+"ENGINEERED and reported (never assumed)"):
+  python3 scripts/1_setup/build_query_manifest.py --dataset hotpotqa \
+      --num-queries 500 --num-trials 3 --seed 42 --overlap-target 0.33
+  -> data/manifests/hotpotqa_500x3_seed42_ov0.33.json
+Every manifest (natural mode included) carries the MEASURED realized overlap in
+its "overlap" field; --overlap-target additionally gates fail-closed (a target
+the corpus cannot realize refuses with realized-vs-target, no silent best-effort).
+
 Needs the `datasets` package (loads the real split); pure CPU, no GPU/serving.
 """
 from __future__ import annotations
@@ -38,8 +47,19 @@ def main() -> int:
                    help="In-corpus pool size to pack (default max(3N, N*T)).")
     p.add_argument("--max-load", type=int, default=None,
                    help="Cap on examples loaded from the split (default: all).")
+    p.add_argument("--overlap-target", type=float, default=None,
+                   help="Engineer the store: target mean pairwise shared-paragraph "
+                        "fraction per query group (0..1). Default: natural mode "
+                        "(overlap still measured and written to the manifest).")
+    p.add_argument("--overlap-tolerance", type=float, default=0.05,
+                   help="Engineered mode: max |realized - target| before the build "
+                        "REFUSES (fail-closed; default 0.05).")
+    p.add_argument("--overlap-group-size", type=int, default=4,
+                   help="Engineered mode: questions per planned query group "
+                        "(>= 2; default 4).")
     p.add_argument("--out", default=None,
-                   help="Default: data/manifests/<dataset>_<N>x<T>_seed<seed>.json")
+                   help="Default: data/manifests/<dataset>_<N>x<T>_seed<seed>"
+                        "[_ov<target>].json")
     args = p.parse_args()
 
     from src.data.loader import get_loader, gold_only
@@ -66,11 +86,17 @@ def main() -> int:
         # unique-per-question distractor text pollutes the shared corpus budget and
         # each block degenerates to ~1 example (see src/data/manifest.py docstring).
         context_selector=gold_only,
+        overlap_target=args.overlap_target,
+        overlap_tolerance=args.overlap_tolerance,
+        overlap_group_size=args.overlap_group_size,
     )
 
+    # An engineered store is a DIFFERENT artifact than the natural manifest for
+    # the same (dataset, N, T, seed): tag the default filename so they never collide.
+    ov_tag = f"_ov{args.overlap_target:g}" if args.overlap_target is not None else ""
     out = Path(args.out) if args.out else (
         REPO_ROOT / "data" / "manifests"
-        / f"{args.dataset}_{args.num_queries}x{args.num_trials}_seed{args.seed}.json"
+        / f"{args.dataset}_{args.num_queries}x{args.num_trials}_seed{args.seed}{ov_tag}.json"
     )
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(manifest, indent=1), encoding="utf-8")
@@ -82,6 +108,13 @@ def main() -> int:
     print(f"  blocks={s['n_blocks']} pool={s['pool_size']} loaded={s['source_examples_loaded']} "
           f"excluded={s['examples_excluded']} ({s['exclusion_rate']:.1%}) "
           f"trials_disjoint={s['trials_disjoint']}")
+    ov = manifest["overlap"]
+    m = ov["measured"]
+    frac = m["mean_pairwise_shared_fraction"]
+    print(f"  overlap mode={ov['mode']} target={ov['target_shared_fraction']} "
+          f"measured_mean_shared_fraction="
+          f"{'None' if frac is None else f'{frac:.3f}'} "
+          f"pairs={m['n_pairs']} multi_question_groups={m['n_multi_question_groups']}")
     print("  export CAGE_QUERY_MANIFEST=" + str(out))
     return 0
 

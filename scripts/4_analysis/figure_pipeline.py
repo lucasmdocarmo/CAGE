@@ -81,7 +81,7 @@ import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -101,6 +101,7 @@ from matplotlib.lines import Line2D
 
 import _plot_style as ps
 from src.analysis.cellspec import CellSpec, CellSpecError
+from src.analysis.conditioned_curves import EVIDENCE_POSITION_BINS
 from src.analysis.goodput import IN_REGIME, PAST_CLIFF, UNPRESSURED
 
 KEY_COL = "row_key"
@@ -1542,6 +1543,222 @@ def plot_consort_flow(
                                             color="black"))
     ax.set_title(title, fontsize=11)
     fig.tight_layout()
+    outpath = Path(outpath)
+    ps.save_fig(fig, outpath)
+    return outpath
+
+
+# ---------------------------------------------------------------------------
+# W4.11 — §8.12 Layer-5 conditioned-curve renderers
+# ---------------------------------------------------------------------------
+# Both consume the AGGREGATED join tables produced by
+# src.analysis.conditioned_curves (quality_by_rho_own /
+# quality_by_evidence_position) via the driver's conditioned-curves pass —
+# nothing is recomputed here, matching the from-stats renderer discipline.
+# The joins are DESCRIPTIVE (§8.12 output surface): the figures carry the
+# driver's mode stamp in their titles, never a significance claim.
+
+
+@dataclass(frozen=True)
+class RhoOwnCurveConfig:
+    """quality|ρ_own curve config (§8.12): ONE metric per figure."""
+
+    metric: str
+    dataset_col: str = "dataset"
+    title: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.metric:
+            raise FigureConfigError("RhoOwnCurveConfig.metric must be a metric name")
+
+
+@dataclass(frozen=True)
+class EvidencePositionConfig:
+    """quality|evidence-position×pressure heatmap config (§8.12): ONE metric."""
+
+    metric: str
+    dataset_col: str = "dataset"
+    title: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.metric:
+            raise FigureConfigError(
+                "EvidencePositionConfig.metric must be a metric name"
+            )
+
+
+_RHO_CURVE_COLUMNS = (
+    "dataset", "metric", "curve_key", "rho_bin", "n_windows", "mean_value",
+    "rho_min", "rho_max",
+)
+_EVIDENCE_CURVE_COLUMNS = (
+    "dataset", "metric", "pressure_bin", "evidence_bin", "n_trials",
+    "mean_value",
+)
+
+
+def _one_metric(df: pd.DataFrame, config_metric: str, where: str) -> None:
+    metrics = sorted(set(df["metric"].astype(str)))
+    if metrics != [config_metric]:
+        raise FigureDataError(
+            f"{where}: the frame carries metric(s) {metrics}, the config "
+            f"names {config_metric!r} — one metric per figure, filter first"
+        )
+
+
+def plot_quality_vs_rho_own(
+    df: pd.DataFrame, outpath: Path, *, config: RhoOwnCurveConfig
+) -> Path:
+    """quality | ρ_own (§8.12): per-dataset panels of binned quality vs
+    OWN-accounting occupancy, ONE line per mechanism×engine cell identity.
+
+    Input = the ``quality_by_rho_own`` aggregate for ONE metric (one row per
+    dataset × curve_key × ρ bin; ``curve_key`` is the coordinate-free cell
+    identity — §8.12 registers the curve per mechanism × engine, so cells
+    are never pooled into one line). X = the pinned ρ_own bins in occupancy
+    order (interval categories of a continuous axis, so a connecting line is
+    legitimate); each point annotated with its window count. Colors map
+    through ``ps.categorical_colors`` and FAIL LOUD past its 8-cell budget
+    (facet or regroup — never silently truncate). Y range is data-driven —
+    quality instruments are 0-1 but the join is metric-agnostic.
+    """
+    _require_columns(df, list(_RHO_CURVE_COLUMNS), "plot_quality_vs_rho_own")
+    _one_metric(df, config.metric, "plot_quality_vs_rho_own")
+    ps.apply_style()
+
+    datasets = sorted(df[config.dataset_col].astype(str).unique())
+    curve_keys = sorted(df["curve_key"].astype(str).unique())
+    colors = ps.categorical_colors(curve_keys, "plot_quality_vs_rho_own: cell")
+    bin_order = (
+        df[["rho_bin", "rho_min"]]
+        .groupby("rho_bin", observed=True)["rho_min"]
+        .min()
+        .sort_values(kind="stable")
+        .index.tolist()
+    )
+    n_panel = len(datasets)
+    fig_w = min(ps.FULL_WIDTH_IN, 1.4 + 2.2 * n_panel)
+    fig, axes = plt.subplots(
+        1, n_panel, figsize=(fig_w, 2.6), sharey=True, squeeze=False
+    )
+    for ax, ds in zip(axes[0], datasets):
+        panel = df[df[config.dataset_col].astype(str) == ds]
+        for key in curve_keys:
+            by_bin = panel[panel["curve_key"].astype(str) == key].set_index(
+                "rho_bin"
+            )
+            xs, ys, ns = [], [], []
+            for i, b in enumerate(bin_order):
+                if b not in by_bin.index:
+                    continue
+                row = by_bin.loc[b]
+                xs.append(i)
+                ys.append(float(row["mean_value"]))
+                ns.append(int(row["n_windows"]))
+            if not xs:
+                continue  # this cell has no windows on this dataset
+            ax.plot(
+                xs, ys, marker="o", ms=4.5, lw=1.1, color=colors[key],
+                zorder=3, label=key,
+            )
+            for x, y, n in zip(xs, ys, ns):
+                ax.annotate(
+                    f"n={n}", xy=(x, y), xytext=(0, 5),
+                    textcoords="offset points", ha="center", fontsize=6.5,
+                    color="0.3",
+                )
+        ax.set_xticks(range(len(bin_order)))
+        ax.set_xticklabels(bin_order, rotation=45, ha="right", fontsize=7)
+        ax.set_title(str(ds))
+        ax.set_xlabel("ρ_own bin (own accounting, §8.8)")
+    axes[0][0].set_ylabel(f"mean {config.metric}\n(per-window means)")
+    # One figure-level legend (curves are color-consistent across panels);
+    # a key can be absent from the first panel, so collect over all of them.
+    seen: dict[str, Any] = {}
+    for ax in axes[0]:
+        for handle, label in zip(*ax.get_legend_handles_labels()):
+            seen.setdefault(label, handle)
+    fig.legend(
+        [seen[k] for k in curve_keys if k in seen],
+        [k for k in curve_keys if k in seen],
+        loc="upper left", bbox_to_anchor=(0.0, -0.02), fontsize=6,
+        ncol=1, frameon=False, title="cell (mechanism × engine)",
+        title_fontsize=6.5,
+    )
+    if config.title:
+        fig.suptitle(config.title, y=1.06)
+    fig.tight_layout()
+    outpath = Path(outpath)
+    ps.save_fig(fig, outpath)
+    return outpath
+
+
+def plot_quality_vs_evidence_position(
+    df: pd.DataFrame, outpath: Path, *, config: EvidencePositionConfig
+) -> Path:
+    """quality | evidence-position × pressure (§8.12): per-dataset heatmaps.
+
+    Input = the ``quality_by_evidence_position`` aggregate for ONE metric.
+    Rows = pressure bins (the registered grid labels, sorted), columns = the
+    pinned evidence-position vocabulary (first→late, plus "absent" — the
+    §8.10 ceiling state). Cells annotate mean value and trial count; combos
+    with no trials stay BLANK (absence rendered as absence, never as 0).
+    """
+    _require_columns(
+        df, list(_EVIDENCE_CURVE_COLUMNS), "plot_quality_vs_evidence_position"
+    )
+    _one_metric(df, config.metric, "plot_quality_vs_evidence_position")
+    unknown = set(df["evidence_bin"].astype(str)) - set(EVIDENCE_POSITION_BINS)
+    if unknown:
+        raise FigureDataError(
+            f"plot_quality_vs_evidence_position: unknown evidence bins "
+            f"{sorted(unknown)} (pinned: {list(EVIDENCE_POSITION_BINS)})"
+        )
+    ps.apply_style()
+
+    datasets = sorted(df[config.dataset_col].astype(str).unique())
+    n_panel = len(datasets)
+    fig_w = min(ps.FULL_WIDTH_IN, 1.6 + 2.4 * n_panel)
+    fig, axes = plt.subplots(1, n_panel, figsize=(fig_w, 2.9), squeeze=False)
+    cols = list(EVIDENCE_POSITION_BINS)
+    mappable = None
+    for ax, ds in zip(axes[0], datasets):
+        panel = df[df[config.dataset_col].astype(str) == ds]
+        pressure_bins = sorted(panel["pressure_bin"].astype(str).unique())
+        grid = np.full((len(pressure_bins), len(cols)), np.nan)
+        counts = np.zeros_like(grid, dtype=int)
+        for row in panel.itertuples(index=False):
+            r = pressure_bins.index(str(row.pressure_bin))
+            c = cols.index(str(row.evidence_bin))
+            grid[r, c] = float(row.mean_value)
+            counts[r, c] = int(row.n_trials)
+        mappable = ax.imshow(
+            grid, aspect="auto", cmap="viridis", interpolation="nearest"
+        )
+        for r in range(grid.shape[0]):
+            for c in range(grid.shape[1]):
+                if np.isnan(grid[r, c]):
+                    continue
+                ax.annotate(
+                    f"{grid[r, c]:.2f}\nn={counts[r, c]}", xy=(c, r),
+                    ha="center", va="center", fontsize=6,
+                    color="white" if grid[r, c] < np.nanmax(grid) * 0.6
+                    else "black",
+                )
+        ax.set_xticks(range(len(cols)))
+        ax.set_xticklabels(cols, rotation=45, ha="right", fontsize=7)
+        ax.set_yticks(range(len(pressure_bins)))
+        ax.set_yticklabels(pressure_bins, fontsize=7)
+        ax.set_title(str(ds))
+        ax.set_xlabel("gold evidence position (served)")
+    axes[0][0].set_ylabel("pressure bin (registered grid)")
+    if mappable is not None:
+        fig.colorbar(
+            mappable, ax=list(axes[0]), shrink=0.85,
+            label=f"mean {config.metric}",
+        )
+    if config.title:
+        fig.suptitle(config.title, y=1.04)
     outpath = Path(outpath)
     ps.save_fig(fig, outpath)
     return outpath

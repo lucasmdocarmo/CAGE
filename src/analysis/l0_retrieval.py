@@ -312,6 +312,30 @@ def complete_evidence_at_k(qrels: Qrels, served: Run, k: int) -> float:
     return n_complete / len(qrels)
 
 
+def pool_recall(
+    qrels: Qrels,
+    pool: Run,
+    *,
+    k_pool: int = DEFAULT_K_POOL,
+) -> float:
+    """First-stage pool recall@k_pool — the §7.2 gate metric, standalone.
+
+    The §7.2(a) offline retrieval gate table scores exactly ONE stage of one
+    run per retriever variant (first-stage pool recall@100; nDCG@10 / MRR@10
+    are reranked-stage context and NEVER gate inputs). This helper exposes the
+    ``score_stages`` pool leg — same validation, same registered instrument
+    (ranx), same metric string — without requiring the caller to fabricate
+    reranked/served stages a first-stage-only comparison does not have.
+    Consumed by scripts/4_analysis/build_retrieval_gate_table.py.
+    """
+    _validate_qrels(qrels)
+    _check_k("k_pool", k_pool)
+    _validate_run("pool", pool, qrels)
+    ranx = _import_ranx()
+    metric = f"recall@{k_pool}"
+    return _ranx_evaluate(ranx, qrels, pool, [metric])[metric]
+
+
 def score_stages(
     qrels: Qrels,
     runs: StageRuns,

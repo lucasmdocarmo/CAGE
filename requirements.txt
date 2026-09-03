@@ -40,7 +40,7 @@ transformers>=4.36.0,<5
 # Tier 2: capped below the 5.x major (PyPI latest 5.0.1, 2026-08-04); the 5.x
 # line moves in lockstep with huggingface-hub>=1.20, which breaks the legacy
 # dataset ids this repo loads (see huggingface-hub pin below).
-datasets>=2.16.0,<5
+datasets>=4,<5  # 4.x REQUIRED (verified live 2026-09-02): regenerated Hub metadata uses the 4.x-only 'List' feature type (3.x fails to parse), and the modern hub layer refuses un-namespaced repo ids — ids migrated to namespaced homes (hotpotqa/hotpot_qa, rajpurkar/squad_v2). 4.x may re-cache datasets fetched under the old 3.x layout
 
 # Evaluation Metrics
 # Tier 2: GPU-host-resolved (drags the transformers/torch stack); PyPI latest
@@ -163,5 +163,5 @@ pytest-asyncio>=0.21.0
 # RAW prefix_cache_queries/hits_total (None-on-absence; contrast #19's raw
 # material) + multi-label-set occupancy refuses-over-averaging
 # (kv_usage=None + kv_usage_multi_engine flag).
-cage-stats @ git+https://github.com/lucasmdocarmo/cage-stats.git@4ec296ddc2ebceb2a4f8dbc61625747ff7f68638
+cage-stats @ git+https://github.com/lucasmdocarmo/cage-stats.git@fcc74f261e9a6be034d63ba4373907ec4f72b1db
 # Local dev alternative (no install): set CAGE_STATS_HOME=/Users/lucasmariano/cage-stats

@@ -89,8 +89,11 @@ _ANCHOR_DEMAND = 10_000_000_000  # arbitrary but realistic-scale demand bytes
 def _floor_table_doc(
     *,
     model: str = "qwen3-14b",
-    grid: str = "full",
-    r_values=(1.5, 1.0, 0.75, 0.5, 0.25),
+    grid: str = "anchor-fine",
+    # Session 'a' pre-resolves EVERY registered r — the §6.1 factorial's 5
+    # levels PLUS the §6.4 fine additions {1.25, 0.375} (W4.3), so the
+    # fixture default is the 7-level anchor-fine union.
+    r_values=(1.5, 1.25, 1.0, 0.75, 0.5, 0.375, 0.25),
     lambda_compute: Optional[float] = None,
 ) -> Dict[str, Any]:
     rows = []
@@ -245,26 +248,39 @@ def _complete_cell(root: Path, step: Dict[str, Any]) -> None:
 
 
 class TestPlanCountsSessionA:
-    """§6.1/§6.8/§7.6.1 densities, derived independently and pinned exactly."""
+    """§6.1/§6.4/§6.8/§7.6.1/D5#5 densities, derived independently and
+    pinned exactly.
+
+    F2 grid points per engine (W4.3): the §6.1 factorial 5r × 6λ = 30, plus
+    the §6.4 fine overlay 7r × 2λ = 14, minus the overlap (the 5 factorial
+    r's × the 2 fine rates {0.85, 1.05}, both already factorial members)
+    = 10 ⇒ 30 + 14 − 10 = 34 coordinates.
+    """
 
     def test_total_counts(self, plan_a):
         # F1: 12 baselines × 2 engines × 4 datasets              =  96
         # F1 HF oracle: B3×4 + {B1,B2,B6}×2                      =  10
-        # F2: 5 FRESH × 2 engines × 5 budgets × 6 rates          = 300
+        # F2 qasper: 5 FRESH × 2 engines × 34 coordinates        = 340
+        #   (old pin 300 = 5 × 2 × 30, pre-§6.4-overlay)
+        # F2 ruler (D5#5, W4.4): 1 (B1) × 2 engines × 34 × 4 tasks = 272
         # F3: 7 REUSE × 2 engines × 3 budgets × 3 rates          = 126
-        assert plan_a["counts"]["cells"] == 532
-        # 3 windows per grid point (D6 §6.3) ⇒ 532 × 3 = 1596
-        assert plan_a["counts"]["windows"] == 1596
+        # ⇒ 96 + 10 + 340 + 272 + 126 = 844  (old pin 532)
+        assert plan_a["counts"]["cells"] == 844
+        # 3 windows per grid point (D6 §6.3) ⇒ 844 × 3 = 2532 (old 1596)
+        assert plan_a["counts"]["windows"] == 2532
         # Relaunch boundaries = distinct EXECUTABLE serving configs
         # (engine, prefix, budget, kv_dtype, connector); hf is in-process (0):
         #   vllm:   F1 {plain, fp8·B10, lmcache·B8}                   =  3
         #           F3 3 budgets × {plain, fp8, lmcache}              =  9
-        #           F2 5 budgets, all plain (FRESH set has no lever)  =  5
+        #           F2 7 budgets, all plain (FRESH set has no lever)  =  7
+        #             (5 factorial + the 2 §6.4 fine-only levels; the
+        #              ruler steps REUSE the qasper boundaries — dataset
+        #              is not a serving-config dimension)
         #   sglang: F1 {plain, fp8}   (B8 BLOCKED: no connector knob) =  2
         #           F3 3 budgets × {plain, fp8}                       =  6
-        #           F2 5 budgets, plain                               =  5
-        # ⇒ 17 + 13 = 30
-        assert plan_a["counts"]["relaunches"] == 30
+        #           F2 7 budgets, plain                               =  7
+        # ⇒ 19 + 15 = 34  (old pin 30 = 17 + 13, pre-fine-grid)
+        assert plan_a["counts"]["relaunches"] == 34
         # Blocked: retr-store (B8) on sglang — the frozen launcher has no
         # KV-store connector knob: F1 4 datasets + F3 3×3 = 13. Serving them
         # connector-free would duplicate plain rag under a B8 label.
@@ -292,9 +308,15 @@ class TestPlanCountsSessionA:
             eng = s["cellspec"]["engine"]
             key = "F1-hf" if (s["family"] == "F1" and eng == "hf") else s["family"]
             by[key] = by.get(key, 0) + 1
-        assert by == {"F1": 96, "F1-hf": 10, "F2": 300, "F3": 126}
+        # F2 = 340 qasper (5 FRESH × 2 eng × 34 coords) + 272 ruler
+        # (1 × 2 eng × 34 coords × 4 tasks) = 612; F1/F3 unchanged.
+        assert by == {"F1": 96, "F1-hf": 10, "F2": 612, "F3": 126}
         windows = {k: 3 * v for k, v in by.items()}
-        assert windows == {"F1": 288, "F1-hf": 30, "F2": 900, "F3": 378}
+        # Old window pins: F2 900 (= 300 cells × 3, pre-§6.4/pre-RULER),
+        # F3 378 (= 126 × 3, UNCHANGED — the fine grid and the RULER pairing
+        # are both F2-only registrations). New F2 = 612 × 3
+        # = (340 qasper + 272 ruler) × 3 = 1020 + 816 = 1836.
+        assert windows == {"F1": 288, "F1-hf": 30, "F2": 1836, "F3": 378}
 
     def test_hf_oracle_exact_reduced_set(self, plan_a):
         hf = [s for s in _cells(plan_a) if s["cellspec"]["engine"] == "hf"]
@@ -316,9 +338,23 @@ class TestPlanCountsSessionA:
 
     def test_f2_grid_values(self, plan_a):
         f2 = [s for s in _cells(plan_a) if s["family"] == "F2"]
-        assert {s["cellspec"]["budget_r"] for s in f2} == {1.5, 1.0, 0.75, 0.5, 0.25}
+        # W4.3: the §6.4 fine overlay adds budget levels {1.25, 0.375}.
+        assert {s["cellspec"]["budget_r"] for s in f2} == {
+            1.5, 1.25, 1.0, 0.75, 0.5, 0.375, 0.25,
+        }
         assert {s["cellspec"]["rate_frac"] for s in f2} == {0.5, 0.7, 0.85, 0.95, 1.05, 1.2}
-        assert {s["baseline"] for s in f2} == {"B1", "B5", "B6", "B9", "B11"}
+        # The fine-ONLY levels run at EXACTLY the two §6.4 chassis rates —
+        # never the other four factorial fractions.
+        for s in f2:
+            if s["cellspec"]["budget_r"] in (1.25, 0.375):
+                assert s["cellspec"]["rate_frac"] in (0.85, 1.05)
+        # qasper carries the FRESH set; ruler carries the registered B1-only
+        # pairing (D5#5 conservative pin — see SESSION_GRIDS['a']).
+        assert {s["baseline"] for s in f2 if s["dataset"] == "qasper"} == {
+            "B1", "B5", "B6", "B9", "B11",
+        }
+        assert {s["baseline"] for s in f2 if s["dataset"] == "ruler"} == {"B1"}
+        assert {s["dataset"] for s in f2} == {"qasper", "ruler"}
         # F2 is THE prefix-OFF family; everything else serves ON.
         assert all(s["serving"]["prefix_mode"] == "OFF" for s in f2)
 
@@ -354,7 +390,9 @@ class TestOrdering:
         for s in _cells(plan_a):
             if s["serving"] is not None and not s["blocked_on"]:
                 configs.add(self._config_of(s["serving"]))
-        assert len(_relaunches(plan_a)) == len(configs) == 30
+        # 34 = the 30 pre-fine configs + the 2 §6.4 fine-only F2 budget
+        # levels × 2 engines (see TestPlanCountsSessionA.test_total_counts).
+        assert len(_relaunches(plan_a)) == len(configs) == 34
 
     def test_every_cell_runs_under_its_preceding_relaunch(self, plan_a):
         current = None
@@ -685,7 +723,7 @@ class TestPlanSchema:
         after = {p for p in tmp_path.rglob("*")}
         assert after - before == {out}, "plan must write NOTHING except --out"
         plan = rc.load_plan(out)
-        assert plan["counts"]["cells"] == 532
+        assert plan["counts"]["cells"] == 844  # see TestPlanCountsSessionA
         # every row key re-mints from its embedded cellspec (never hand-built)
         for s in _cells(plan)[::50]:
             assert CellSpec.from_flat_dict(s["cellspec"]).to_row_key() == s["row_key"]
@@ -719,10 +757,13 @@ class TestPlanRefusals:
             rc.build_plan("zz", rc.load_floor_table(floor_table), window_duration_s=60.0)
 
     def test_known_but_unregistered_session_refuses(self, floor_table):
-        # 'b' is §1 vocabulary but its grid registration is Wave-3 work: the
-        # driver must refuse loudly, never fabricate a grid.
+        # 'cd-act1' is §1 vocabulary but its grid registration is Group-C/D
+        # work ('b' registered with W4.6): the driver must refuse loudly,
+        # never fabricate a grid.
         with pytest.raises(rc.PlanError, match="NOT yet registered"):
-            rc.build_plan("b", rc.load_floor_table(floor_table), window_duration_s=60.0)
+            rc.build_plan(
+                "cd-act1", rc.load_floor_table(floor_table), window_duration_s=60.0
+            )
 
     def test_empty_enumeration_refuses(self):
         grid = _tiny_grid(f1_baselines=(), f1_datasets=())
@@ -993,6 +1034,81 @@ class TestRun:
         )
         assert stub.calls()[-1]["argv"] == [str(root)], "sealer must have run"
 
+    def test_ruler_task_steps_resume_independently(
+        self, tmp_path, floor_table, stub
+    ):
+        # W4.4 driver-resume correctness: per-task RULER steps share one
+        # (row_key, dataset='ruler') window space; each claims its own
+        # ordinal range (base = task_index × replications). Completing task
+        # 1's range (ruler-01..03) must NOT mark task 2 (ruler-04..06) done —
+        # the old flat count would have silently skipped a registered cell.
+        grid = _tiny_grid(
+            f1_baselines=(),
+            f1_datasets=("squad_v2",),
+            f2_baselines=("B1",),
+            f2_budgets=(1.0,),
+            f2_rates=(0.85,),
+            f2_ruler_baselines=("B1",),
+            f2_ruler_tasks=("niah_multikey", "qa"),
+        )
+        plan = _stub_plan(grid, floor_table, stub.cmd)
+        cells = _cells(plan)
+        # 1 qasper step + 2 per-task ruler steps, one shared row key
+        assert [(s["dataset"], s["ruler_task"]) for s in cells] == [
+            ("qasper", None),
+            ("ruler", "niah_multikey"),
+            ("ruler", "qa"),
+        ]
+        assert len({s["row_key"] for s in cells}) == 1
+        assert [s["window_ordinal_base"] for s in cells] == [0, 0, 3]
+        root = _run_root(tmp_path)
+        task1 = cells[1]
+        # materialize ONLY task 1's claimed range: ruler-01..03
+        cell_dir = root / "cells" / task1["row_key"]
+        for n in (1, 2, 3):
+            wdir = cell_dir / f"window_ruler-{n:02d}"
+            wdir.mkdir(parents=True)
+            (wdir / "metrics.json").write_text("{}", encoding="utf-8")
+        assert rc.run_plan(plan, root) == 0
+        cell_calls = [c for c in stub.calls() if c["argv"][0] != "restart"]
+        # qasper + task 2 ran; task 1 was skipped-complete on ITS range only
+        assert len(cell_calls) == 2
+        tasks_run = [
+            c["argv"][c["argv"].index("--ruler-task") + 1]
+            for c in cell_calls
+            if "--ruler-task" in c["argv"]
+        ]
+        assert tasks_run == ["qa"]
+        # task 2's runner invocation carried its ordinal base env
+        (qa_call,) = [c for c in cell_calls if "--ruler-task" in c["argv"]]
+        assert qa_call["env"]["CAGE_WINDOW_ORDINAL_BASE"] == "3"
+
+    def test_ruler_task_failure_sentinels_are_range_scoped(
+        self, tmp_path, floor_table, stub, monkeypatch
+    ):
+        # A task-2 failure writes a sentinel that names ITS ordinal range;
+        # task 1's later success must not clear it (distinct spellings).
+        grid = _tiny_grid(
+            f1_baselines=(),
+            f1_datasets=("squad_v2",),
+            f2_baselines=("B1",),
+            f2_budgets=(1.0,),
+            f2_rates=(0.85,),
+            f2_ruler_baselines=("B1",),
+            f2_ruler_tasks=("niah_multikey", "qa"),
+        )
+        plan = _stub_plan(grid, floor_table, stub.cmd)
+        monkeypatch.setenv("STUB_FAIL_MARKER", "--ruler-task qa")
+        root = _run_root(tmp_path)
+        assert rc.run_plan(plan, root) == 1
+        row_key = _cells(plan)[0]["row_key"]
+        cell_dir = root / "cells" / row_key
+        # base 0 steps keep the pre-W4.4 sentinel spelling; the qa step
+        # (base 3 => range starts at ordinal 04) gets its own suffix.
+        assert not (cell_dir / ".STATUS-qasper").exists()
+        assert not (cell_dir / ".STATUS-ruler").exists()
+        assert (cell_dir / ".STATUS-ruler-from-04").is_file()
+
     def test_skip_blocked_runs_executable_subset_loudly(
         self, tmp_path, floor_table, stub
     ):
@@ -1024,3 +1140,440 @@ class TestRun:
             == 0
         )
         assert stub.calls()[-1]["argv"] == [str(root)]
+
+
+# ---------------------------------------------------------------------------
+# W4.3 — §6.4 anchor fine r-grid (registration, dedup, membership markers)
+# ---------------------------------------------------------------------------
+
+
+class TestAnchorFineGrid:
+    def test_registered_constants_are_the_charter_values(self):
+        # §6.4 verbatim: r ∈ {1.5, 1.25, 1.0, 0.75, 0.5, 0.375, 0.25} at the
+        # two chassis-validated rates 0.85·λ* and 1.05·λ*.
+        assert rc.ANCHOR_FINE_BUDGET_LEVELS == (1.5, 1.25, 1.0, 0.75, 0.5, 0.375, 0.25)
+        assert rc.ANCHOR_FINE_RATE_FRACTIONS == (0.85, 1.05)
+        # both fine rates are registered dispatcher fractions (§6.1 grid) —
+        # the fine grid can never offer a rate the D6 generator lacks
+        assert set(rc.ANCHOR_FINE_RATE_FRACTIONS) <= set(rc.FULL_RATE_FRACTIONS)
+
+    def test_membership_markers_partition_the_f2_grid(self, plan_a):
+        # Coordinate classes (per engine, per baseline):
+        #   factorial-only: 5r × the 4 non-fine rates {0.5, 0.7, 0.95, 1.2} = 20
+        #   both grids:     5r × the 2 fine rates {0.85, 1.05}              = 10
+        #   fine-only:      {1.25, 0.375} × {0.85, 1.05}                    =  4
+        # 20 + 10 + 4 = 34 coordinates (the count pin's derivation).
+        qasper = [
+            s for s in _cells(plan_a)
+            if s["family"] == "F2" and s["dataset"] == "qasper"
+        ]
+        by_marker = {}
+        for s in qasper:
+            by_marker.setdefault(tuple(s["grids"]), 0)
+            by_marker[tuple(s["grids"])] += 1
+        # 5 FRESH × 2 engines = 10 (baseline, engine) pairs per coordinate
+        assert by_marker == {
+            (rc.GRID_D6_FACTORIAL,): 20 * 10,
+            (rc.GRID_D6_FACTORIAL, rc.GRID_ANCHOR_FINE): 10 * 10,
+            (rc.GRID_ANCHOR_FINE,): 4 * 10,
+        }
+        for s in qasper:
+            r, frac = s["cellspec"]["budget_r"], s["cellspec"]["rate_frac"]
+            markers = tuple(s["grids"])
+            if r in (1.25, 0.375):
+                assert markers == (rc.GRID_ANCHOR_FINE,)
+            elif frac in (0.85, 1.05):
+                assert markers == (rc.GRID_D6_FACTORIAL, rc.GRID_ANCHOR_FINE)
+            else:
+                assert markers == (rc.GRID_D6_FACTORIAL,)
+
+    def test_no_duplicate_cells_from_the_overlay(self, plan_a):
+        # Dedup pin: a coordinate on both grids is ONE cell — the plan must
+        # never enumerate the same (row_key, dataset, ruler_task) twice.
+        seen = set()
+        for s in _cells(plan_a):
+            key = (s["row_key"], s["dataset"], s["ruler_task"])
+            assert key not in seen, f"duplicate enumeration: {key}"
+            seen.add(key)
+
+    def test_non_f2_cells_carry_no_grid_marker(self, plan_a):
+        # Absence stays absence: F1/F3 (and hf) cells sit on no registered
+        # budget×rate grid, so their marker is null, never [].
+        for s in _cells(plan_a):
+            if s["family"] == "F2":
+                assert s["grids"]
+            else:
+                assert s["grids"] is None
+
+    def test_fine_grid_in_plan_header(self, plan_a):
+        assert plan_a["fine_grid"] == {
+            "budget_levels": [1.5, 1.25, 1.0, 0.75, 0.5, 0.375, 0.25],
+            "rate_fractions": [0.85, 1.05],
+            "membership_labels": [rc.GRID_D6_FACTORIAL, rc.GRID_ANCHOR_FINE],
+        }
+
+    def test_fine_axes_must_register_together(self):
+        with pytest.raises(rc.PlanError, match="f2_fine_budgets and f2_fine_rates"):
+            _tiny_grid(f2_fine_budgets=(1.25,))
+
+
+# ---------------------------------------------------------------------------
+# W4.4 grid half — D5#5 RULER-paired F2 cells (session a)
+# ---------------------------------------------------------------------------
+
+
+class TestRulerPairing:
+    def test_task_literals_are_exactly_the_registered_charter_subset(self):
+        # The RULER lane's registered literals (src/data/ruler._TASKS), the
+        # D5#5 subset: NIAH-MK/MQ, VT, QA — niah_single is a loader default,
+        # NOT a charter subset member, and must not be enumerated.
+        assert rc.RULER_F2_TASKS == (
+            "niah_multikey",
+            "niah_multiquery",
+            "variable_tracking",
+            "qa",
+        )
+
+    def test_every_ruler_cell_has_its_matched_qasper_twin(self, plan_a):
+        # D5#5: "every RULER cell PAIRED with a matched real-text Qasper
+        # cell" — same row key (same baseline/engine/budget/rate coordinate).
+        qasper_keys = {
+            s["row_key"]
+            for s in _cells(plan_a)
+            if s["family"] == "F2" and s["dataset"] == "qasper"
+        }
+        ruler = [s for s in _cells(plan_a) if s["dataset"] == "ruler"]
+        # 1 baseline (B1) × 2 engines × 34 coordinates × 4 tasks = 272
+        assert len(ruler) == 272
+        for s in ruler:
+            assert s["row_key"] in qasper_keys, (
+                f"ruler cell {s['row_key']} has no matched qasper twin"
+            )
+
+    def test_ruler_argv_pins_task_and_shape32k(self, plan_a):
+        # SHAPE-32K (§5.1 item 1): 32,512-in + 256-out — EXPLICIT on every
+        # step (the loader's 4096 default is a pilot convenience).
+        ruler = [s for s in _cells(plan_a) if s["dataset"] == "ruler"]
+        for s in ruler:
+            assert _argv_value(s, "--ruler-context-tokens") == "32512"
+            assert _argv_value(s, "--max-tokens") == "256"
+            assert _argv_value(s, "--ruler-task") == s["ruler_task"]
+            assert s["ruler_task"] in rc.RULER_F2_TASKS
+        # and non-ruler steps never carry the instrument flags
+        for s in _cells(plan_a):
+            if s["dataset"] != "ruler":
+                assert "--ruler-task" not in s["argv"]
+                assert s["ruler_task"] is None
+
+    def test_per_task_ordinal_ranges_are_disjoint(self, plan_a):
+        # base = task_index × replications: 4 tasks × 3 reps ⇒ {0, 3, 6, 9};
+        # each step claims (base, base+3] so the on-disk ranges are disjoint.
+        ruler = [s for s in _cells(plan_a) if s["dataset"] == "ruler"]
+        by_key = {}
+        for s in ruler:
+            by_key.setdefault(s["row_key"], []).append(s)
+        for key, steps in by_key.items():
+            bases = sorted(s["window_ordinal_base"] for s in steps)
+            assert bases == [0, 3, 6, 9], f"{key}: bases {bases}"
+            for s in steps:
+                if s["window_ordinal_base"]:
+                    assert s["env"]["CAGE_WINDOW_ORDINAL_BASE"] == str(
+                        s["window_ordinal_base"]
+                    )
+                else:
+                    # base 0 stays ABSENT from the env (default, not "0")
+                    assert "CAGE_WINDOW_ORDINAL_BASE" not in s["env"]
+
+    def test_unpaired_ruler_baseline_refuses(self):
+        with pytest.raises(rc.PlanError, match="no twin"):
+            _tiny_grid(
+                f2_baselines=("B1",),
+                f2_budgets=(1.0,),
+                f2_rates=(0.85,),
+                f2_ruler_baselines=("B5",),  # not in f2_baselines
+                f2_ruler_tasks=("qa",),
+            )
+
+    def test_unregistered_task_literal_refuses(self):
+        with pytest.raises(rc.PlanError, match="ruler._TASKS"):
+            _tiny_grid(
+                f2_baselines=("B1",),
+                f2_budgets=(1.0,),
+                f2_rates=(0.85,),
+                f2_ruler_baselines=("B1",),
+                f2_ruler_tasks=("needle_haystack",),  # drifted spelling
+            )
+
+
+# ---------------------------------------------------------------------------
+# W4.2 — gpu_count producer (plan side; writer side in test_campaign_layout)
+# ---------------------------------------------------------------------------
+
+
+class TestGpuCountProducer:
+    def test_every_executable_session_a_cell_carries_gpu_count_1(self, plan_a):
+        # Session a is the single-GPU anchor (§7.6 A): serving_tp=1 ⇒ every
+        # topology-'single' cell (hf oracle included — same box) counts 1.
+        for s in _cells(plan_a):
+            assert s["gpu_count"] == 1
+            assert s["env"]["CAGE_GPU_COUNT"] == "1"
+
+    def test_blocked_tp_cell_without_registration_has_null_gpu_count(
+        self, floor_table, stub
+    ):
+        # A tp cell with no registered dist_tp_size is BLOCKED and its count
+        # is an explicit null — the debt stays visible, never guessed.
+        grid = _tiny_grid(dist_cells=(("B3", "vllm", "tp"),))
+        plan = _stub_plan(grid, floor_table, stub.cmd)
+        (dist,) = [s for s in _cells(plan) if s["family"] == "DIST"]
+        assert dist["blocked_on"] == rc.TP_DIST_BLOCKED_ON
+        assert dist["gpu_count"] is None
+        assert "CAGE_GPU_COUNT" not in dist["env"]
+
+    def test_pd_cell_gpu_count_is_role_sum(self, floor_table, stub):
+        # pd = prefill + decode role GPU counts summed; the default (1, 1)
+        # single-node dev shape counts 2.
+        grid = _tiny_grid(dist_cells=(("B3", "vllm", "pd"),))
+        floor = rc.load_floor_table(floor_table)
+        orig = rc.SESSION_GRIDS
+        rc.SESSION_GRIDS = {grid.session: grid}
+        try:
+            plan = rc.build_plan(
+                grid.session,
+                floor,
+                window_duration_s=60.0,
+                runner_cmd=stub.cmd,
+                launcher_cmds={
+                    "vllm": stub.cmd,
+                    "sglang": stub.cmd,
+                    rc.PD_LAUNCHER_KEY: stub.cmd,
+                },
+            )
+        finally:
+            rc.SESSION_GRIDS = orig
+        (dist,) = [s for s in _cells(plan) if s["family"] == "DIST"]
+        assert dist["blocked_on"] is None
+        assert dist["gpu_count"] == 1 + 1
+        assert dist["env"]["CAGE_GPU_COUNT"] == "2"
+
+
+# ---------------------------------------------------------------------------
+# W4.6 — SESSION_GRIDS['b'] (Run C-prime; §7.6.1 Group B + the DIST overlay)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def floor_table_b(tmp_path: Path) -> Path:
+    # Group B floor table: llama-3.3-70b on the §6.8 reduced grid — covers
+    # the session's every registered r ({1.0, 0.5, 0.25}; dist_budget_r=1.0).
+    path = tmp_path / "floor_table_b.json"
+    path.write_text(
+        json.dumps(
+            _floor_table_doc(
+                model="llama-3.3-70b", grid="reduced", r_values=(1.0, 0.5, 0.25)
+            )
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.fixture()
+def plan_b(floor_table_b: Path) -> Dict[str, Any]:
+    return rc.build_plan("b", rc.load_floor_table(floor_table_b), window_duration_s=300.0)
+
+
+class TestSessionB:
+    def test_total_counts(self, plan_b):
+        # F1: 12 baselines × 2 engines × 4 QA datasets           =  96
+        # F1 HF oracle: B3×4 + {B1,B2,B6}×2 (anchor slice reuse) =  10
+        # F2: 5 FRESH × 2 engines × 3 budgets × 3 rates (§6.8)   =  90
+        # F3: 7 REUSE × 2 engines × 3 budgets × 3 rates          = 126
+        # DIST: {B1, B3} × vllm × {tp, pd}                       =   4
+        # ⇒ 96 + 10 + 90 + 126 + 4 = 326; windows 326 × 3 = 978
+        assert plan_b["counts"]["cells"] == 326
+        assert plan_b["counts"]["windows"] == 978
+        # Blocked: sglang retr-store (B8) only — F1 4 + F3 3×3 = 13; the
+        # DIST legs are all EXECUTABLE (tp registered, pd launcher exists).
+        assert plan_b["counts"]["blocked"] == 13
+        # Relaunches = distinct executable configs:
+        #   vllm:   F1 {plain, fp8, lmcache} 3 + F3 3×{plain,fp8,lmcache} 9
+        #           + F2 3 plain + DIST {tp leg, pd leg} 2        = 17
+        #   sglang: F1 {plain, fp8} 2 + F3 3×{plain,fp8} 6 + F2 3 = 11
+        # ⇒ 28
+        assert plan_b["counts"]["relaunches"] == 28
+
+    def test_no_fine_grid_and_no_ruler_on_group_b(self, plan_b):
+        # §6.8: the fine r-grid runs on Group A ONLY; the D5#5 RULER pairing
+        # is likewise an anchor-only registration.
+        assert plan_b["fine_grid"] is None
+        assert plan_b["ruler_f2"] is None
+        assert all(s["dataset"] != "ruler" for s in _cells(plan_b))
+        f2 = [s for s in _cells(plan_b) if s["family"] == "F2"]
+        assert {s["cellspec"]["budget_r"] for s in f2} == {1.0, 0.5, 0.25}
+        assert {s["cellspec"]["rate_frac"] for s in f2} == {0.85, 0.95, 1.05}
+
+    def test_dist_cells_are_the_transfer_pair_on_vllm_only(self, plan_b):
+        # Plan-B scope: {B1, B3} × {tp, pd} on vLLM ONLY (#18 pairs
+        # topologies WITHIN one engine; SGLang PD is T3.4-gated — its cells
+        # are NOT registered, not even as blocked).
+        dist = [s for s in _cells(plan_b) if s["family"] == "DIST"]
+        got = {
+            (s["baseline"], s["cellspec"]["engine"], s["cellspec"]["topology"])
+            for s in dist
+        }
+        assert got == {
+            ("B1", "vllm", "tp"),
+            ("B1", "vllm", "pd"),
+            ("B3", "vllm", "tp"),
+            ("B3", "vllm", "pd"),
+        }
+        for s in dist:
+            assert s["blocked_on"] is None
+            if s["cellspec"]["topology"] == "pd":
+                assert s["gate"] == rc.PD_GATE
+                assert s["gpu_count"] == 4 + 4  # role GPU counts summed
+            else:
+                assert s["gate"] is None
+                assert s["gpu_count"] == 8  # the registered dist_tp_size
+
+    def test_serving_tp_rides_every_single_topology_relaunch(self, plan_b):
+        # §7.6 Group B e5: TP=4. Every single-topology relaunch (budget-free
+        # F1 ones INCLUDED — a 70B F1 server launched without the degree
+        # would silently serve TP=1) carries the engine's T3.1 env.
+        singles = [s for s in _relaunches(plan_b) if s["topology"] == "single"]
+        assert singles
+        for s in singles:
+            assert s["tp"] == 4
+            if s["engine"] == "vllm":
+                assert s["env"]["CAGE_VLLM_TENSOR_PARALLEL"] == "4"
+            else:
+                assert s["env"]["CAGE_SGLANG_TP"] == "4"
+
+    def test_single_topology_cells_count_the_tp_ranks(self, plan_b):
+        # W4.2 on Group B: a topology-'single' cell served TP-sharded counts
+        # its ranks (gpu_count = serving_tp = 4), hf oracle included
+        # (batch-1 device_map rides the same 4-GPU box, §7.7(e)).
+        for s in _cells(plan_b):
+            if s["cellspec"]["topology"] == "single":
+                assert s["gpu_count"] == 4
+
+    def test_tp_leg_launches_tp8_at_the_dist_budget(self, plan_b, floor_table_b):
+        # The tp leg rides the SINGLE-instance launcher at dist_tp_size=8,
+        # serving floor(dist_budget_r × D) = 10^10 bytes total — per-rank
+        # slice (GQA shards) = 10^10 // 8 = 1_250_000_000.
+        (tp_leg,) = [s for s in _relaunches(plan_b) if s["topology"] == "tp"]
+        assert tp_leg["tp"] == 8
+        assert tp_leg["env"]["CAGE_VLLM_TENSOR_PARALLEL"] == "8"
+        assert tp_leg["env"]["CAGE_KV_BUDGET_BYTES"] == str(
+            (1 * _ANCHOR_DEMAND) // 8
+        )
+        assert tp_leg["budget_bytes"] == 1 * _ANCHOR_DEMAND
+        assert tp_leg["budget_r"] is None  # DIST overlay: not a pressure coord
+
+    def test_pd_leg_splits_the_same_total_and_carries_role_tp(self, plan_b):
+        # Iso-aggregate-bytes (§6.6a): the pd leg splits the SAME
+        # floor(1.0 × D) total the tp leg serves — 0.5 split of 10^10 =
+        # 5e9 + 5e9 role POOLS — and both role instances launch at TP=4
+        # (one env, frozen launcher contract). The launcher passes each
+        # budget env VERBATIM as --kv-cache-memory-bytes on that TP=4
+        # instance, and the flag's registered convention is PER-RANK (the
+        # SAME one the tp leg's env uses), so each role env carries
+        # pool // 4 — handing the role TOTAL to 4 ranks would realize 4×
+        # the §6.5 pools (2026-09-02 verifier major).
+        (pd_leg,) = [s for s in _relaunches(plan_b) if s["topology"] == "pd"]
+        assert pd_leg["tp"] == 4
+        assert pd_leg["env"]["CAGE_VLLM_TENSOR_PARALLEL"] == "4"
+        prefill_rank = int(pd_leg["env"]["CAGE_KV_BUDGET_BYTES_PREFILL"])
+        decode_rank = int(pd_leg["env"]["CAGE_KV_BUDGET_BYTES_DECODE"])
+        assert prefill_rank == 5_000_000_000 // 4 == 1_250_000_000
+        assert decode_rank == 1_250_000_000
+        # The plan record keeps the registered §6.5 exact-sum role pools AND
+        # the per-rank env basis gate (j) closes against.
+        assert pd_leg["pd"]["prefill_bytes"] == 5_000_000_000
+        assert pd_leg["pd"]["decode_bytes"] == 5_000_000_000
+        assert (
+            pd_leg["pd"]["prefill_bytes"] + pd_leg["pd"]["decode_bytes"]
+            == 1 * _ANCHOR_DEMAND
+        )
+        assert pd_leg["pd"]["prefill_bytes_per_rank"] == prefill_rank
+        assert pd_leg["pd"]["decode_bytes_per_rank"] == decode_rank
+        # Cross-leg §6.6a closure under the ONE registered convention:
+        # pd realized = (pool // 4) × 4 ranks × 2 roles = 10^10 = tp
+        # realized = (total // 8) × 8 — the #18 pair stays iso-aggregate.
+        realized_pd = (prefill_rank + decode_rank) * 4
+        assert pd_leg["pd"]["expected_bytes_total"] == realized_pd
+        (tp_leg,) = [s for s in _relaunches(plan_b) if s["topology"] == "tp"]
+        realized_tp = int(tp_leg["env"]["CAGE_KV_BUDGET_BYTES"]) * 8
+        assert realized_pd == realized_tp == 1 * _ANCHOR_DEMAND
+
+    def test_f2_budget_env_divides_per_rank_at_tp4(self, plan_b):
+        # Independent arithmetic for the TP-sharded budget env: GQA shards ⇒
+        # per-rank = floor(r × D) // 4. llama-3.3-70b bf16 KV/token =
+        # 2 (K,V) × 80 layers × 8 KV heads × 128 head_dim × 2 B = 327_680;
+        # SGLang tokens = per-rank // 327_680.
+        per_token = 2 * 80 * 8 * 128 * 2
+        assert per_token == 327_680
+        for s in _relaunches(plan_b):
+            if s["topology"] != "single" or s["budget_r"] is None:
+                continue
+            per_rank = int(s["budget_r"] * _ANCHOR_DEMAND) // 4
+            if s["engine"] == "vllm" and s["kv_dtype"] is None and s["connector"] is None:
+                assert s["env"]["CAGE_KV_BUDGET_BYTES"] == str(per_rank)
+            if s["engine"] == "sglang" and s["kv_dtype"] is None:
+                assert s["env"]["CAGE_SGLANG_MAX_TOTAL_TOKENS"] == str(
+                    per_rank // per_token
+                )
+
+    def test_dist_registration_shape_refusals(self):
+        # unequal pd role counts: unrealizable with the frozen pd launcher
+        with pytest.raises(rc.PlanError, match="must be equal"):
+            _tiny_grid(dist_pd_role_gpus=(4, 2))
+        # a TP=1 'tp' leg is a topology/count contradiction
+        with pytest.raises(rc.PlanError, match="dist_tp_size"):
+            _tiny_grid(dist_tp_size=1)
+
+    def test_plan_b_roundtrips_through_load_plan(self, tmp_path, plan_b):
+        out = tmp_path / "plan_b.json"
+        out.write_text(json.dumps(plan_b), encoding="utf-8")
+        assert rc.load_plan(out)["counts"]["cells"] == 326
+
+
+# ---------------------------------------------------------------------------
+# Plan schema v3 (the v2-precedent bump)
+# ---------------------------------------------------------------------------
+
+
+class TestPlanSchemaV3:
+    def test_schema_literal(self):
+        assert rc.PLAN_SCHEMA == "cage-campaign-plan-v3"
+
+    def test_v2_plan_refuses(self, tmp_path):
+        # A v2 plan predates gpu_count / grids / ruler_task /
+        # window_ordinal_base / relaunch tp — 'run' must refuse it and the
+        # operator re-plans (the v2 precedent, verbatim).
+        old = tmp_path / "old.json"
+        old.write_text(
+            json.dumps({"schema": "cage-campaign-plan-v2", "steps": []}),
+            encoding="utf-8",
+        )
+        with pytest.raises(rc.RunError, match="schema"):
+            rc.load_plan(old)
+
+    def test_cell_step_missing_v3_key_refuses(self, tmp_path, plan_a):
+        plan = json.loads(json.dumps(plan_a))
+        cell = next(s for s in plan["steps"] if s["kind"] == "cell")
+        del cell["gpu_count"]
+        path = tmp_path / "missing_key.json"
+        path.write_text(json.dumps(plan), encoding="utf-8")
+        with pytest.raises(rc.RunError, match="gpu_count"):
+            rc.load_plan(path)
+
+    def test_relaunch_step_missing_tp_refuses(self, tmp_path, plan_a):
+        plan = json.loads(json.dumps(plan_a))
+        step = next(s for s in plan["steps"] if s["kind"] == "relaunch")
+        del step["tp"]
+        path = tmp_path / "missing_tp.json"
+        path.write_text(json.dumps(plan), encoding="utf-8")
+        with pytest.raises(rc.RunError, match="tp"):
+            rc.load_plan(path)

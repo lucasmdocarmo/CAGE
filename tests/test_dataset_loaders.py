@@ -140,7 +140,7 @@ def test_hotpotqa_context_assembly(monkeypatch):
     examples = HotpotQALoader(split="validation", seed=42).load()
 
     # Correct HF path/config/split.
-    assert calls == [(("hotpot_qa", "distractor"), {"split": "validation"})]
+    assert calls == [(("hotpotqa/hotpot_qa", "distractor"), {"split": "validation"})]
 
     assert len(examples) == 1
     ex = examples[0]

@@ -127,7 +127,7 @@ class HotpotQALoader(DatasetLoader):
         """Load HotpotQA (distractor) dataset."""
         from datasets import load_dataset  # lazy: see module-level note
 
-        dataset = load_dataset("hotpot_qa", "distractor", split=self.split)
+        dataset = load_dataset("hotpotqa/hotpot_qa", "distractor", split=self.split)
 
         if max_examples:
             # Seeded shuffle BEFORE select so different seeds (per trial) draw
@@ -372,7 +372,7 @@ class SquadV2Loader(DatasetLoader):
         """Load SQuAD v2 dataset."""
         from datasets import load_dataset  # lazy: see module-level note
 
-        dataset = load_dataset("squad_v2", split=self.split)
+        dataset = load_dataset("rajpurkar/squad_v2", split=self.split)
         
         if max_examples:
             # Seeded shuffle BEFORE select so different seeds (per trial) draw

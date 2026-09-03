@@ -108,9 +108,9 @@ def test_existing_single_spec_entries_unchanged(monkeypatch):
     _install_fake_datasets(monkeypatch, lambda *a, **k: None)
     specs = _load_module().dataset_specs()
 
-    assert specs["hotpotqa"] == [("hotpot_qa", "distractor")]
+    assert specs["hotpotqa"] == [("hotpotqa/hotpot_qa", "distractor")]
     assert specs["qasper"] == [("allenai/qasper", None)]
-    assert specs["squad_v2"] == [("squad_v2", None)]
+    assert specs["squad_v2"] == [("rajpurkar/squad_v2", None)]
     assert specs["trivia_qa"] == [("trivia_qa", "rc")]
     assert specs["musique"] == [("dgslibisey/MuSiQue", None)]
 

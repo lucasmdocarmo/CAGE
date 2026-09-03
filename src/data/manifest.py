@@ -22,6 +22,15 @@ Construction (corpus-first):
 The manifest stores block TEXTS verbatim so every engine serves byte-identical
 corpus prompts with no tokenizer dependency.
 
+Overlap (D5 F1/F3, charter: "overlap ENGINEERED and reported (never assumed)"):
+every manifest carries a MEASURED ``overlap`` field (src/data/overlap.py) --
+realized mean pairwise shared-paragraph fraction and shared-prefix-token
+estimate per corpus block -- in natural mode too, so natural overlap is
+reported, never assumed. Passing ``overlap_target`` switches step 1-2 to the
+seeded engineered-overlap planner (one planned query group per block) and
+gates fail-closed: a target the corpus cannot realize raises ``OverlapError``
+naming realized vs target, never silent best-effort.
+
 Pure stdlib + src.data.corpus: importable (and unit-testable) without the
 ``datasets`` package, torch, or a GPU.
 """
@@ -32,8 +41,16 @@ import random
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from src.data.corpus import build_corpus_block
+from src.data.overlap import (  # re-exported: consumers import from either module
+    OverlapError,
+    enforce_overlap_target,
+    gold_set,
+    group_overlap_stats,
+    overlap_report,
+    plan_overlap_groups,
+)
 
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2  # v2 (2026-09-02): + top-level "overlap" (measured, both modes)
 
 
 class ManifestError(ValueError):
@@ -54,6 +71,9 @@ def build_manifest(
     dataset: str = "",
     split: str = "",
     context_selector: Optional[Callable[[Any], List[str]]] = None,
+    overlap_target: Optional[float] = None,
+    overlap_tolerance: float = 0.05,
+    overlap_group_size: int = 4,
 ) -> Dict[str, Any]:
     """Build the manifest dict from loader examples (.id/.question/.context/.answer).
 
@@ -68,6 +88,14 @@ def build_manifest(
     question corpus reuse the manifest exists to measure. Applied FIRST, before
     grouping/packing, so every downstream step (grouping, packing, exclusion) is
     consistently gold-based.
+
+    ``overlap_target`` (D5 F1/F3 engineered-overlap store), if given, replaces the
+    natural shuffle-and-pack with the seeded planner (src/data/overlap.py): query
+    groups are composed to a target mean pairwise shared-paragraph fraction, one
+    planned group per corpus block, then the PACKED blocks are measured and gated
+    fail-closed against ``overlap_tolerance`` (``OverlapError`` on an unreachable
+    target). ``overlap_group_size`` caps questions per engineered group. In both
+    modes the realized overlap is measured and written to ``manifest["overlap"]``.
     """
     if num_queries < 1 or num_trials < 1:
         raise ManifestError("num_queries and num_trials must be >= 1")
@@ -78,43 +106,103 @@ def build_manifest(
             dataclasses.replace(ex, context=context_selector(ex)) for ex in examples
         ]
 
-    # Same-paragraph questions adjacent; paragraph groups in seeded-random order.
-    groups: Dict[tuple, List[Any]] = {}
-    order: List[tuple] = []
-    for ex in examples:
-        key = _ctx_key(ex)
-        if key not in groups:
-            groups[key] = []
-            order.append(key)
-        groups[key].append(ex)
-    rng = random.Random(seed)
-    rng.shuffle(order)
-    ordered: List[Any] = [ex for key in order for ex in groups[key]]
-
     blocks: List[Dict[str, Any]] = []
+    block_paragraphs: List[List[str]] = []  # per block, for overlap measurement
     question_to_block: Dict[str, int] = {}
     excluded: List[str] = []
-    remaining = ordered
-    while remaining and len(question_to_block) < target:
-        block = build_corpus_block(remaining, token_budget=block_budget)
-        if not block.example_ids:
-            # The first example's paragraph alone exceeds the budget: exclude that
-            # whole paragraph group (counted) and continue with the rest.
-            bad = _ctx_key(remaining[0])
-            excluded.extend(ex.id for ex in remaining if _ctx_key(ex) == bad)
-            remaining = [ex for ex in remaining if _ctx_key(ex) != bad]
-            continue
-        block_id = len(blocks)
-        blocks.append({
-            "block_id": block_id,
-            "text": block.text,
-            "token_count": block.token_count,
-            "n_paragraphs": len(block.paragraphs),
-        })
-        for ex_id in block.example_ids:
-            question_to_block[ex_id] = block_id
-        packed = set(block.example_ids)
-        remaining = [ex for ex in remaining if ex.id not in packed]
+
+    if overlap_target is not None:
+        # Engineered-overlap store: seeded planner composes the query groups
+        # (validates the knobs fail-closed), then each planned group packs into
+        # its OWN block -- the group IS the store unit contrast #17 pressures.
+        planned, excluded = plan_overlap_groups(
+            examples,
+            target=overlap_target,
+            group_size=overlap_group_size,
+            block_budget=block_budget,
+            seed=seed,
+            pool_target=target,
+            tolerance=overlap_tolerance,
+        )
+        for group in planned:
+            block = build_corpus_block(group, token_budget=block_budget)
+            # The planner budget-checked every addition with this same builder;
+            # a partial pack here is a structural impossibility, not bad input.
+            assert len(block.example_ids) == len(group), (
+                "engineered-overlap group failed to pack whole despite the "
+                "planner's per-candidate budget check (planner/packer drift?)"
+            )
+            block_id = len(blocks)
+            blocks.append({
+                "block_id": block_id,
+                "text": block.text,
+                "token_count": block.token_count,
+                "n_paragraphs": len(block.paragraphs),
+            })
+            block_paragraphs.append(list(block.paragraphs))
+            for ex_id in block.example_ids:
+                question_to_block[ex_id] = block_id
+    else:
+        # Natural mode: same-paragraph questions adjacent; paragraph groups in
+        # seeded-random order.
+        groups: Dict[tuple, List[Any]] = {}
+        order: List[tuple] = []
+        for ex in examples:
+            key = _ctx_key(ex)
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(ex)
+        rng = random.Random(seed)
+        rng.shuffle(order)
+        ordered: List[Any] = [ex for key in order for ex in groups[key]]
+
+        remaining = ordered
+        while remaining and len(question_to_block) < target:
+            block = build_corpus_block(remaining, token_budget=block_budget)
+            if not block.example_ids:
+                # The first example's paragraph alone exceeds the budget: exclude
+                # that whole paragraph group (counted) and continue with the rest.
+                bad = _ctx_key(remaining[0])
+                excluded.extend(ex.id for ex in remaining if _ctx_key(ex) == bad)
+                remaining = [ex for ex in remaining if _ctx_key(ex) != bad]
+                continue
+            block_id = len(blocks)
+            blocks.append({
+                "block_id": block_id,
+                "text": block.text,
+                "token_count": block.token_count,
+                "n_paragraphs": len(block.paragraphs),
+            })
+            block_paragraphs.append(list(block.paragraphs))
+            for ex_id in block.example_ids:
+                question_to_block[ex_id] = block_id
+            packed = set(block.example_ids)
+            remaining = [ex for ex in remaining if ex.id not in packed]
+
+    # MEASURED overlap of the packed store, both modes (charter D5: overlap
+    # "ENGINEERED and reported (never assumed)" -- natural overlap is a report,
+    # engineered overlap is a report + a fail-closed contract).
+    gold_by_id = {ex.id: gold_set(ex) for ex in examples}
+    members_by_block: List[List[str]] = [[] for _ in blocks]
+    for ex_id, b in question_to_block.items():  # insertion order = block pack order
+        members_by_block[b].append(ex_id)
+    per_group_stats = [
+        group_overlap_stats(
+            b, block_paragraphs[b], [gold_by_id[i] for i in members_by_block[b]]
+        )
+        for b in range(len(blocks))
+    ]
+    mode = "engineered" if overlap_target is not None else "natural"
+    overlap = overlap_report(
+        per_group_stats,
+        mode=mode,
+        target_shared_fraction=overlap_target,
+        tolerance=overlap_tolerance if overlap_target is not None else None,
+        group_size=overlap_group_size if overlap_target is not None else None,
+    )
+    if overlap_target is not None:
+        enforce_overlap_target(overlap, dataset=dataset)
 
     pool_ids = list(question_to_block)  # insertion order = deterministic
     if len(pool_ids) < num_queries:
@@ -149,6 +237,7 @@ def build_manifest(
         "blocks": blocks,
         "question_to_block": question_to_block,
         "trials": trials,
+        "overlap": overlap,
         "stats": {
             "source_examples_loaded": n_loaded,
             "pool_size": len(pool_ids),

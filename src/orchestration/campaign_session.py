@@ -19,7 +19,11 @@ This module is the seam that wires the runner INTO the campaign layout:
   Every derivation is fail-closed: an unmapped name refuses BEFORE any
   dataset/engine work.
 - **Window emission**: one runner trial = one §1 measurement window
-  ``window_<dataset>-<NN>`` (NN = trial number, %02d). The trial's collected
+  ``window_<dataset>-<NN>`` (NN = trial number, %02d; plus the optional
+  ``CAGE_WINDOW_ORDINAL_BASE`` shift — W4.4 per-task RULER steps share one
+  (row_key, dataset) window space, each claiming its own disjoint ordinal
+  range). ``CAGE_GPU_COUNT`` (W4.2) threads the serving stack's GPU count
+  into cell.json via ``CellWriter`` for the §6.6b per-GPU basis. The trial's collected
   results rows become ``requests.jsonl`` (every row carrying the #127 join
   triple ``example_id``/``repeat_index``/``record_index`` plus the shared
   ``ok`` validity predicate), the staged ``qa_evidence.jsonl`` is re-emitted
@@ -192,6 +196,29 @@ def _env_float(env: Mapping[str, str], key: str, problems: list[str]) -> Optiona
     except ValueError:
         problems.append(f"{key}={raw!r} is not a float")
         return None
+
+
+def _env_int(
+    env: Mapping[str, str],
+    key: str,
+    problems: list[str],
+    *,
+    minimum: int,
+    why: str,
+) -> Optional[int]:
+    """Optional fail-closed integer env (unset -> None; malformed -> problem)."""
+    raw = (env.get(key) or "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        problems.append(f"{key}={raw!r} is not an integer — it carries {why}")
+        return None
+    if value < minimum:
+        problems.append(f"{key}={value} must be >= {minimum} — it carries {why}")
+        return None
+    return value
 
 
 def derive_cell_spec(
@@ -451,6 +478,8 @@ class CampaignCellSession:
         num_trials: int,
         run_seed: int,
         kv_cache_dtype: Optional[str] = None,
+        gpu_count: Optional[int] = None,
+        window_ordinal_base: int = 0,
         env: Mapping[str, str] | None = None,
     ) -> None:
         self.env = os.environ if env is None else env
@@ -461,11 +490,40 @@ class CampaignCellSession:
         self.num_trials = int(num_trials)
         self.run_seed = int(run_seed)
         self.kv_cache_dtype = kv_cache_dtype
+        # W4.2: the GPU count this cell's serving stack launched with
+        # (CAGE_GPU_COUNT, threaded from the run_campaign plan step) —
+        # persisted into cell.json by CellWriter, which owns the
+        # topology/count refusal rules; None = seam not in use (pilot/shell
+        # producers), the analysis consumer's labeled skip stays the outcome.
+        self.gpu_count = gpu_count
+        # W4.4: per-task RULER steps share one (row_key, dataset) window
+        # space; this base shifts every emitted/checked ordinal so each
+        # task's runner invocation owns (base, base+num_trials] exclusively.
+        self.window_ordinal_base = int(window_ordinal_base)
         self._run: Any = None  # lazy CampaignRun
         self._manifest_created = False
 
         cl = _campaign_layout()
         problems: list[str] = []
+        if gpu_count is not None and (
+            isinstance(gpu_count, bool)
+            or not isinstance(gpu_count, int)
+            or gpu_count < 1
+        ):
+            problems.append(
+                f"gpu_count={gpu_count!r} must be an integer >= 1 "
+                "(CAGE_GPU_COUNT: the serving stack's GPU count, W4.2)"
+            )
+        if (
+            isinstance(window_ordinal_base, bool)
+            or not isinstance(window_ordinal_base, int)
+            or window_ordinal_base < 0
+        ):
+            problems.append(
+                f"window_ordinal_base={window_ordinal_base!r} must be an "
+                "integer >= 0 (CAGE_WINDOW_ORDINAL_BASE: the step's claimed "
+                "window-ordinal range starts after it)"
+            )
         if dataset not in cl.DATASET_IDS:
             problems.append(
                 f"dataset {dataset!r} is not a RESULTS_LAYOUT §1 dataset id "
@@ -524,6 +582,17 @@ class CampaignCellSession:
             model=args.model,
             env=env,
         )
+        problems: list[str] = []
+        gpu_count = _env_int(
+            env, "CAGE_GPU_COUNT", problems, minimum=1,
+            why="the serving stack's GPU count (W4.2, run_campaign threads it)",
+        )
+        base = _env_int(
+            env, "CAGE_WINDOW_ORDINAL_BASE", problems, minimum=0,
+            why="the per-task window-ordinal range start (W4.4 RULER steps)",
+        )
+        if problems:
+            raise CampaignSessionError(problems)
         return cls(
             run_root=Path(root),
             dataset=args.dataset,
@@ -531,6 +600,8 @@ class CampaignCellSession:
             num_trials=getattr(args, "num_trials", 1),
             run_seed=args.seed,
             kv_cache_dtype=getattr(args, "kv_cache_dtype", None),
+            gpu_count=gpu_count,
+            window_ordinal_base=base or 0,
             env=env,
         )
 
@@ -541,7 +612,10 @@ class CampaignCellSession:
         return self.run_root / "cells" / self.row_key
 
     def window_key(self, ordinal: int) -> str:
-        return f"{self.dataset}-{int(ordinal):02d}"
+        # ``ordinal`` is the runner's TRIAL number (1..num_trials); the W4.4
+        # base shifts it into this step's claimed on-disk ordinal range, so
+        # every path below (resume checks, resets, emission) is range-scoped.
+        return f"{self.dataset}-{self.window_ordinal_base + int(ordinal):02d}"
 
     def window_dir(self, ordinal: int) -> Path:
         return self.cell_dir / f"window_{self.window_key(ordinal)}"
@@ -826,7 +900,7 @@ class CampaignCellSession:
         """Emit ONE §1 measurement window through campaign_layout's writers."""
         cl = _campaign_layout()
         run = self._ensure_run(backend_metadata)
-        cell = run.cell(self.spec)
+        cell = run.cell(self.spec, gpu_count=self.gpu_count)
 
         requests_rows_n = [
             self._normalize_request_row(row, i) for i, row in enumerate(results_rows)
@@ -852,17 +926,20 @@ class CampaignCellSession:
             None if self.dataset in cl.QA_EVIDENCE_EXEMPT_DATASETS else evidence_rows
         )
 
+        # The trial number shifts into this step's claimed ordinal range
+        # (W4.4); base 0 keeps every pre-W4.4 emission byte-identical.
+        shifted = self.window_ordinal_base + int(ordinal)
         handle = cell.add_window(
             self.dataset,
             seed=int(trial_seed),
-            rep=int(ordinal),
+            rep=shifted,
             t_start=float(t_start),
             t_end=float(t_end),
             requests=requests_rows_n,
             cage_stats=cage_stats_rows,
             engine_metrics=engine_metrics,
             qa_evidence=qa_evidence,
-            ordinal=int(ordinal),
+            ordinal=shifted,
         )
         metrics_path = _atomic_write_json(
             handle.window_dir / WINDOW_METRICS_NAME, _normalize_json(experiment_summary)

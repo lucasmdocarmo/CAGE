@@ -603,3 +603,215 @@ def test_save_series_roundtrips_into_regime_inputs(tmp_path: Path) -> None:
     inputs = compute_window_regime_inputs(frame, 0.0, 10.0)
     assert inputs.rho_kv_time_avg == pytest.approx(0.7)
     assert inputs.scarcity_events == 4
+
+
+# ---------------------------------------------------------------------------
+# W4.2 — gpu_count producer (CellWriter persists it; NAMED write-time
+# refusals; end-to-end: a produced cell.json feeds contrast #18 past the
+# "no gpu_count" labeled skip)
+# ---------------------------------------------------------------------------
+
+
+def _dist_spec(topology: str) -> CellSpec:
+    # The #18 transfer pair rides B3 (corpus-reuse) on the DIST overlay.
+    return CellSpec.from_baseline(
+        "B3", model=MODEL, family="DIST", topology=topology  # type: ignore[arg-type]
+    )
+
+
+def test_cell_json_persists_gpu_count(tmp_path: Path) -> None:
+    run_root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    run = cl.CampaignRun.create(run_root, **_manifest_kwargs())
+    cell = run.cell(_dist_spec("tp"), gpu_count=8)
+    _add_window(cell, "squad_v2")
+    meta = json.loads((cell.cell_dir / "cell.json").read_text(encoding="utf-8"))
+    # top-level int under the EXACT key the analysis consumer reads
+    # (run_campaign_analysis._GPU_COUNT_CELL_KEY == "gpu_count")
+    assert meta["gpu_count"] == 8
+    # a single-topology cell WITHOUT a count keeps the key ABSENT (absence
+    # stays absence — the consumer's labeled skip is the honest outcome)
+    single = run.cell(_specs()[0])
+    _add_window(single, "squad_v2")
+    meta2 = json.loads((single.cell_dir / "cell.json").read_text(encoding="utf-8"))
+    assert "gpu_count" not in meta2
+
+
+def test_gpu_count_write_time_refusals_are_named(tmp_path: Path) -> None:
+    run_root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    run = cl.CampaignRun.create(run_root, **_manifest_kwargs())
+    # tp/pd cell with NO count: underivable — refuse, never a 1-GPU guess
+    with pytest.raises(cl.CampaignLayoutError, match="NO\\s+gpu_count"):
+        run.cell(_dist_spec("tp"))
+    # topology/count mismatch: a distributed overlay cell on < 2 GPUs
+    with pytest.raises(cl.CampaignLayoutError, match="topology/count contradiction"):
+        run.cell(_dist_spec("pd"), gpu_count=1)
+    # malformed counts refuse (bool is not an int count; 0 is not a stack)
+    with pytest.raises(cl.CampaignLayoutError, match="integer >= 1"):
+        run.cell(_specs()[0], gpu_count=0)
+    with pytest.raises(cl.CampaignLayoutError, match="integer >= 1"):
+        run.cell(_specs()[1], gpu_count=True)
+
+
+def test_gpu_count_resume_contradiction_refuses_and_adoption_works(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    run = cl.CampaignRun.create(run_root, **_manifest_kwargs())
+    spec = _dist_spec("tp")
+    cell = run.cell(spec, gpu_count=8)
+    _add_window(cell, "squad_v2")
+    # a fresh writer with a CONTRADICTING claim refuses (two claims about
+    # one cell's hardware cannot both be true)
+    with pytest.raises(cl.CampaignLayoutError, match="contradicts"):
+        cl.CellWriter(run_root, spec, gpu_count=4)
+    # a memoized writer re-requested with a different count refuses too
+    with pytest.raises(cl.CampaignLayoutError, match="contradicts"):
+        run.cell(spec, gpu_count=4)
+    # resume with NO fresh claim adopts the recorded fact and keeps it
+    resumed = cl.CellWriter(run_root, spec)
+    assert resumed.gpu_count == 8
+    _add_window(resumed, "squad_v2", rep=2)
+    meta = json.loads((resumed.cell_dir / "cell.json").read_text(encoding="utf-8"))
+    assert meta["gpu_count"] == 8
+
+
+def test_produced_cell_json_feeds_contrast_18_past_the_skip(tmp_path: Path) -> None:
+    """W4.2 end-to-end: producer → cell.json → the #18 consumer's read path.
+
+    Before this producer existed, run_campaign_analysis._dist_window_metrics
+    found no ``gpu_count`` in any cell.json and every DIST window was the
+    labeled '§6.6b basis undefined' skip. This test walks the actual chain
+    on fixture windows: CellWriter persists the count, the consumer's exact
+    read (top-level int key) recovers it, evaluate_window stamps the per-GPU
+    basis, and execute_contrast_18 pairs tp-vs-pd instead of skipping.
+    """
+    from src.analysis.dist_contrasts import execute_contrast_18
+    from src.analysis.goodput import SLOBaseline, evaluate_window
+
+    run_root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    run = cl.CampaignRun.create(run_root, **_manifest_kwargs())
+    handles: dict[str, Any] = {}
+    for topology in ("tp", "pd"):
+        cell = run.cell(_dist_spec(topology), gpu_count=8)
+        handles[topology] = _add_window(
+            cell,
+            "squad_v2",
+            requests=[
+                {"example_id": "e0", "ok": True, "ttft_ms": 100.0, "tpot_ms": 10.0},
+                {"example_id": "e1", "ok": True, "ttft_ms": 120.0, "tpot_ms": 12.0},
+            ],
+        )
+
+    baseline = SLOBaseline(ttft_s=0.1, tpot_s=0.01)
+    windows = []
+    for topology, handle in handles.items():
+        # the consumer's EXACT read: cell.json top-level "gpu_count" as int
+        meta = json.loads(
+            (run_root / "cells" / handle.row_key / "cell.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        gpu_count = meta.get("gpu_count")
+        assert isinstance(gpu_count, int) and not isinstance(gpu_count, bool)
+        records = pd.DataFrame(
+            [
+                {"ok": True, "veridical": True, "ttft_s": 0.1, "tpot_s": 0.01},
+                {"ok": True, "veridical": True, "ttft_s": 0.12, "tpot_s": 0.012},
+            ]
+        )
+        metrics = evaluate_window(
+            records, baseline, duration_s=10.0, gpu_count=gpu_count
+        )
+        windows.append(
+            {
+                "arm": "corpus-reuse",
+                "retriever": "none",
+                "policy": "none",
+                "engine": "vllm",
+                "model": MODEL,
+                "dataset": "squad_v2",
+                "budget_r": None,
+                "rate_frac": None,
+                "replicate": 1,
+                "topology": topology,
+                "window": handle.window_key,
+                "gpu_count": gpu_count,
+                "metrics": metrics,
+            }
+        )
+
+    section = execute_contrast_18(windows)
+    # past the skip: the pair EXECUTES on basis (b), and no skip names the
+    # missing gpu_count any more
+    assert section["status"] == "EXECUTED"
+    assert len(section["pairs"]) == 1
+    assert section["pairs"][0]["gpu_count_tp"] == 8
+    assert section["pairs"][0]["gpu_count_pd"] == 8
+    assert all("gpu_count" not in s["reason"] for s in section["skips"])
+
+
+# ---------------------------------------------------------------------------
+# W4.2/W4.4 — the campaign_session seam: CAGE_GPU_COUNT / the per-task
+# window-ordinal base (run_campaign threads both; the session parses and
+# applies them)
+# ---------------------------------------------------------------------------
+
+
+def _session_args(root: Path, dataset: str = "ruler") -> Any:
+    import types
+
+    return types.SimpleNamespace(
+        campaign_root=str(root),
+        top_k_sweep=False,
+        baseline="no_cache",
+        baseline_label="B1_gold-fresh",
+        backend="vllm",
+        model="Qwen/Qwen3-14B",
+        dataset=dataset,
+        num_trials=3,
+        seed=1,
+        kv_cache_dtype=None,
+    )
+
+
+def test_session_parses_gpu_count_and_ordinal_base_from_env(tmp_path: Path) -> None:
+    from src.orchestration.campaign_session import CampaignCellSession
+
+    root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    session = CampaignCellSession.from_cli(
+        _session_args(root),
+        env={"CAGE_GPU_COUNT": "8", "CAGE_WINDOW_ORDINAL_BASE": "6"},
+    )
+    assert session is not None
+    assert session.gpu_count == 8
+    assert session.window_ordinal_base == 6
+    # trial ordinals shift into the step's claimed range: trial 1 -> ruler-07
+    assert session.window_key(1) == "ruler-07"
+    assert session.window_dir(3).name == "window_ruler-09"
+    # unset envs keep the pre-W4.2/W4.4 behavior byte-identical
+    legacy = CampaignCellSession.from_cli(_session_args(root), env={})
+    assert legacy is not None
+    assert legacy.gpu_count is None
+    assert legacy.window_ordinal_base == 0
+    assert legacy.window_key(1) == "ruler-01"
+
+
+def test_session_refuses_malformed_seam_env(tmp_path: Path) -> None:
+    from src.orchestration.campaign_session import (
+        CampaignCellSession,
+        CampaignSessionError,
+    )
+
+    root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    with pytest.raises(CampaignSessionError, match="CAGE_GPU_COUNT"):
+        CampaignCellSession.from_cli(
+            _session_args(root), env={"CAGE_GPU_COUNT": "eight"}
+        )
+    with pytest.raises(CampaignSessionError, match="CAGE_GPU_COUNT"):
+        CampaignCellSession.from_cli(
+            _session_args(root), env={"CAGE_GPU_COUNT": "0"}
+        )
+    with pytest.raises(CampaignSessionError, match="CAGE_WINDOW_ORDINAL_BASE"):
+        CampaignCellSession.from_cli(
+            _session_args(root), env={"CAGE_WINDOW_ORDINAL_BASE": "-3"}
+        )

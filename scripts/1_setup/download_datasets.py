@@ -83,9 +83,9 @@ def dataset_specs() -> DatasetSpecs:
     return {
         # Distractor config matches HotpotQALoader: 10 paragraphs/item (2 gold +
         # 8 distractors) so retrieval arms have a real selection job.
-        "hotpotqa": [("hotpot_qa", "distractor")],
+        "hotpotqa": [("hotpotqa/hotpot_qa", "distractor")],
         "qasper": [("allenai/qasper", None)],
-        "squad_v2": [("squad_v2", None)],
+        "squad_v2": [("rajpurkar/squad_v2", None)],
         "trivia_qa": [("trivia_qa", "rc")],
         "natural_questions": [("nq_open", None)],
         "musique": [("dgslibisey/MuSiQue", None)],

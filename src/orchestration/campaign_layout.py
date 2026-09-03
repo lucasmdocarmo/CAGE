@@ -404,16 +404,63 @@ class CellWriter:
     in-memory registry and whatever already exists on disk (ordinals are
     compared as ints, so the ``window_x-1`` / ``window_x-01`` alias pair of
     Topic-8 H12 is refused, not silently coexisting).
+
+    ``gpu_count`` (W4.2, feeds the §6.6b per-GPU basis / contrast #18) is
+    the integer GPU count the cell's serving stack launched with — threaded
+    from the campaign driver's plan step (run_campaign derives it from the
+    registered topology shapes; CAGE_GPU_COUNT env → campaign_session →
+    here), persisted top-level in cell.json under the exact key the analysis
+    consumer reads (run_campaign_analysis._GPU_COUNT_CELL_KEY). Fail-closed
+    at write time: a topology/count mismatch (a tp/pd cell claiming < 2
+    GPUs), a malformed count, a resume contradicting the recorded count, or
+    a tp/pd cell with NO count at all refuses with a NAMED error — never a
+    silent 1-GPU guess. A single-topology cell without a count stays absent
+    (pilot/shell producers predate the seam; the consumer's labeled skip is
+    the correct downstream outcome for such trees).
     """
 
-    def __init__(self, run_root: Path, spec: CellSpec) -> None:
+    def __init__(
+        self, run_root: Path, spec: CellSpec, *, gpu_count: int | None = None
+    ) -> None:
         self.run_root = Path(run_root)
         self.spec = spec
         self.row_key = spec.to_row_key()
         self.cell_dir = self.run_root / "cells" / self.row_key
+        self.gpu_count = self._check_gpu_count(gpu_count)
         self._windows: dict[str, dict[str, Any]] = {}
         self._registered: set[tuple[str, int]] = set()
         self._load_existing()
+        # The None-on-tp/pd refusal comes AFTER _load_existing so a resume
+        # without a fresh claim can adopt the count the cell already records
+        # (the record IS the fact); a distributed cell with no count from
+        # EITHER source stays underivable and refuses.
+        if self.gpu_count is None and spec.topology in ("tp", "pd"):
+            raise CampaignLayoutError(
+                f"cells/{self.row_key}: topology {spec.topology!r} cell has NO "
+                "gpu_count — the §6.6b per-GPU basis (contrast #18) is "
+                "undefined without it; run this cell through run_campaign "
+                "(which threads CAGE_GPU_COUNT from the registered topology "
+                "shapes) or set CAGE_GPU_COUNT explicitly"
+            )
+
+    def _check_gpu_count(self, gpu_count: int | None) -> int | None:
+        """W4.2 write-time gate: NAMED refusals, never a guess."""
+        topology = self.spec.topology
+        if gpu_count is None:
+            return None
+        if isinstance(gpu_count, bool) or not isinstance(gpu_count, int) or gpu_count < 1:
+            raise CampaignLayoutError(
+                f"cells/{self.row_key}: gpu_count={gpu_count!r} must be an "
+                "integer >= 1 (the GPU count the serving stack launched with)"
+            )
+        if topology in ("tp", "pd") and gpu_count < 2:
+            raise CampaignLayoutError(
+                f"cells/{self.row_key}: topology {topology!r} with "
+                f"gpu_count={gpu_count} is a topology/count contradiction "
+                "(the distributed overlay serves >= 2 GPUs by definition) — "
+                "refusing to record it"
+            )
+        return gpu_count
 
     def _load_existing(self) -> None:
         """Resume support: rebuild the registry from disk, refusing aliases."""
@@ -447,6 +494,32 @@ class CellWriter:
                 meta = None
             if isinstance(meta, dict) and isinstance(meta.get("windows"), dict):
                 self._windows = dict(meta["windows"])
+            if isinstance(meta, dict):
+                recorded = meta.get("gpu_count")
+                if recorded is not None:
+                    if (
+                        isinstance(recorded, bool)
+                        or not isinstance(recorded, int)
+                        or recorded < 1
+                    ):
+                        problems.append(
+                            f"{meta_path}: recorded gpu_count={recorded!r} is "
+                            "not an integer >= 1 — the cell cannot be extended "
+                            "over a corrupt serving-stack record"
+                        )
+                    elif self.gpu_count is None:
+                        # Resume without a fresh claim: the record IS the
+                        # fact — adopt it (absence of a new claim is not a
+                        # contradiction) and keep persisting it.
+                        self.gpu_count = recorded
+                    elif recorded != self.gpu_count:
+                        problems.append(
+                            f"{meta_path}: recorded gpu_count={recorded} "
+                            f"contradicts this run's gpu_count={self.gpu_count} "
+                            "— the cell's serving-stack facts disagree; a "
+                            "re-run on different hardware is a NEW cell tree, "
+                            "not an extension"
+                        )
         if problems:
             raise CampaignLayoutError(problems)
 
@@ -554,16 +627,19 @@ class CellWriter:
     def _write_cell_meta(self) -> Path:
         """cell.json: the reader's ``_read_cell_meta`` round-trips ``cellspec``
         through CellSpec.from_flat_dict(...).to_row_key() == dirname."""
-        return _atomic_write_json(
-            self.cell_dir / _CELL_META_NAME,
-            {
-                "cellspec": self.spec.to_flat_dict(),
-                "baseline": _BASELINE_OF_CELL.get(
-                    (self.spec.arm, self.spec.retriever), ""
-                ),
-                "windows": self._windows,
-            },
-        )
+        document: dict[str, Any] = {
+            "cellspec": self.spec.to_flat_dict(),
+            "baseline": _BASELINE_OF_CELL.get(
+                (self.spec.arm, self.spec.retriever), ""
+            ),
+            "windows": self._windows,
+        }
+        # W4.2: persisted only when known — an absent count stays ABSENT
+        # (the analysis consumer's labeled skip names it), never null and
+        # never a fabricated 1.
+        if self.gpu_count is not None:
+            document["gpu_count"] = self.gpu_count
+        return _atomic_write_json(self.cell_dir / _CELL_META_NAME, document)
 
 
 class CampaignRun:
@@ -605,8 +681,13 @@ class CampaignRun:
                 "sealed, then immutable; a re-run is a new run_id)"
             )
 
-    def cell(self, spec: CellSpec) -> CellWriter:
-        """The (memoized) writer for one cell tuple; §3: one run = one model."""
+    def cell(self, spec: CellSpec, *, gpu_count: int | None = None) -> CellWriter:
+        """The (memoized) writer for one cell tuple; §3: one run = one model.
+
+        ``gpu_count`` threads the W4.2 serving-stack fact to the CellWriter;
+        a memoized writer re-requested with a DIFFERENT count refuses (two
+        claims about one cell's hardware cannot both be true).
+        """
         self._ensure_unsealed()
         if spec.model != self.manifest["model"]:
             raise CampaignLayoutError(
@@ -616,7 +697,13 @@ class CampaignRun:
             )
         key = spec.to_row_key()
         if key not in self._cells:
-            self._cells[key] = CellWriter(self.run_root, spec)
+            self._cells[key] = CellWriter(self.run_root, spec, gpu_count=gpu_count)
+        elif gpu_count is not None and self._cells[key].gpu_count != gpu_count:
+            raise CampaignLayoutError(
+                f"cells/{key}: gpu_count={gpu_count} contradicts the writer's "
+                f"established gpu_count={self._cells[key].gpu_count} — the "
+                "cell's serving-stack facts disagree; refusing to guess"
+            )
         return self._cells[key]
 
     def seal(self) -> Path:

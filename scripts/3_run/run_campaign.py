@@ -33,19 +33,42 @@ Frozen Wave-1 contracts CONSUMED here (never modified):
 - ``campaign_layout.SESSIONS``/``DATASET_IDS`` are the session/dataset
   vocabularies; ``seal_campaign_run.py`` is the one sealer.
 
-Grid registration (§7.6.1 — Group A / session 'a' is the only grid this
-driver registers so far; sessions b/cd-act1/cd-act2 refuse loudly until their
-registrations land with the Wave-3 topology work):
+Grid registration (§7.6.1 — sessions 'a' (Group A) and 'b' (Group B,
+Run C-prime scope) are registered; sessions cd-act1/cd-act2 refuse loudly
+until their registrations land):
 
 - F1  locality (prefix ON, sub-pressure): B1-B12 × {vllm, sglang} × the four
   QA datasets — no budget/rate grid (one config per cell).
 - F1 HF oracle: EXACTLY the reduced 10-cell set {B3 × all 4 datasets;
   B1, B2, B6 × squad_v2 + qasper} on the in-process hf engine.
-- F2  pressure (prefix OFF): FRESH set × {vllm, sglang} × the FULL §6.1
-  factorial r ∈ {1.5, 1.0, 0.75, 0.5, 0.25} × 6 rate fractions of λ*.
+- F2  pressure (prefix OFF): FRESH set × {vllm, sglang} × the session's
+  registered factorial — session a: the FULL §6.1 5×6 factorial PLUS the
+  §6.4 anchor fine r-grid (ANCHOR_FINE_BUDGET_LEVELS at the two chassis
+  rates 0.85/1.05·λ*, deduplicated against the factorial — a coordinate on
+  both grids is ONE cell carrying both memberships in its ``grids`` marker);
+  session b: the §6.8 reduced 3×3 grid.
+- F2 RULER pairing (session a; D5 item 5): the length INSTRUMENT rides the
+  SAME F2 grid points as gold-fresh — B1 × both pressure engines × every
+  registered F2 coordinate × the 4-task charter subset (RULER_F2_TASKS,
+  literals pinned to src/data/ruler._TASKS), dataset ``ruler`` at SHAPE-32K
+  (32,512-in / 256-out, §5.1 item 1). Every RULER cell is PAIRED with the
+  matched real-text Qasper cell at the identical coordinate BY CONSTRUCTION
+  (the registration refuses a ruler baseline absent from f2_baselines).
+  Per-task steps share the cell row key (task is not a CellSpec axis); each
+  task claims its own window-ordinal RANGE via ``window_ordinal_base``
+  (task_index × replications), threaded to the runner as
+  CAGE_WINDOW_ORDINAL_BASE so per-task resume can never collide.
 - F3  interaction (prefix ON × pressure): REUSE set × {vllm, sglang} × the
   §6.8 reduced 3×3 grid r ∈ {1.0, 0.5, 0.25} × {0.85, 0.95, 1.05}·λ*.
 - Replications: 3 measurement windows per grid point (D6 §6.3).
+- gpu_count (W4.2, feeds §6.6b / contrast #18): every cell step carries the
+  integer GPU count its serving stack launches with — topology 'single' →
+  the session's registered ``serving_tp`` (1 on the anchor; TP-sharded
+  single-instance serving counts its ranks, §7.6 Group B e5), 'tp' → the
+  registered ``dist_tp_size``, 'pd' → the two registered role GPU counts
+  summed. Threaded to the runner as CAGE_GPU_COUNT and persisted into
+  cell.json by the campaign writer; underivable counts appear ONLY on
+  blocked cells (an executable cell without one refuses at plan time).
 - BLOCKED cells are ENUMERATED (never silently dropped) but carry a non-null
   ``blocked_on``: DIST tp-overlay cells until their registration lands, PD
   cells on any engine without a PD launcher (today: everything but vllm),
@@ -86,8 +109,10 @@ number of distinct EXECUTABLE serving configs (blocked cells launch nothing).
 Failure doctrine: a failed cell writes a ``.STATUS-<dataset>`` sentinel
 (dot-named so the §5 seal scope — which refuses any non-journaled file under
 cells/ — skips it; dataset-suffixed because F1 row keys are shared by four
-datasets and a forensic record must name WHICH one failed) and execution
-CONTINUES; a later successful (or already-complete) pass of the same
+datasets and a forensic record must name WHICH one failed; per-task RULER
+steps additionally suffix ``-from-<NN>`` — their claimed ordinal range —
+because the tasks share one dataset and a task-2 success must never clear a
+task-1 failure record) and execution CONTINUES; a later successful (or already-complete) pass of the same
 cell×dataset REMOVES the sentinel — a stale "failed" record on healthy data
 is a false forensic trail. The final summary matrix prints per-cell outcomes
 and the exit code is nonzero if anything failed. A failed RELAUNCH fails
@@ -127,6 +152,7 @@ from src.orchestration.campaign_layout import (  # noqa: E402
     WINDOW_DIR_RE,
 )
 from src.orchestration.cache_budget import (  # noqa: E402
+    MODEL_KV,
     CacheBudgetError,
     plan_budget,
 )
@@ -134,6 +160,7 @@ from src.orchestration.load_generator import (  # noqa: E402
     D6_RATE_FRACTIONS,
     D6_REDUCED_RATE_FRACTIONS,
 )
+from src.data import ruler as _ruler  # noqa: E402  (task-literal pin only)
 
 __all__ = [
     "PLAN_SCHEMA",
@@ -152,7 +179,14 @@ __all__ = [
 # v2 (2026-09-01): pd steps added required keys gate/topology/pd — a v1 plan
 # predates them, so 'run' must refuse it via the schema check and the operator
 # re-plans (never silently execute a plan missing pd semantics).
-PLAN_SCHEMA = "cage-campaign-plan-v2"
+# v3 (2026-09-02, Wave-4 W4.2/W4.3/W4.6 delta, per the v2 precedent): cell
+# steps gained REQUIRED keys ``gpu_count`` (§6.6b producer), ``grids`` (the
+# §6.4 fine-grid membership marker), ``ruler_task`` and
+# ``window_ordinal_base`` (the D5#5 per-task RULER pairing); relaunch steps
+# gained REQUIRED key ``tp`` (the tensor-parallel degree the launcher is
+# given — session-b/Group-B serving shapes). A v2 plan predates ALL of these,
+# so 'run' must refuse it and the operator re-plans.
+PLAN_SCHEMA = "cage-campaign-plan-v3"
 FLOOR_TABLE_SCHEMA = "floor-table-v1"
 
 #: §6.1 pre-registered budget ratios r = B/D (Group-A anchor factorial; r=1.5
@@ -161,11 +195,63 @@ FULL_BUDGET_LEVELS: Tuple[float, ...] = (1.5, 1.0, 0.75, 0.5, 0.25)
 #: §6.8 pruning rule: the reduced grid for every non-anchor pressure family.
 REDUCED_BUDGET_LEVELS: Tuple[float, ...] = (1.0, 0.5, 0.25)
 
+#: §6.4 Graft C — the anchor fine 7-level r-grid, Qwen3-14B/Group A ONLY
+#: (§6.8: "plus the §6.4 fine 7-level r-grid run on Group A (anchor) ONLY";
+#: §7.6.1 F2 row A: "FRESH set × full 5×6 + §6.4 r-grid"). Scope derivation:
+#: §6.4 produces the quality-vs-stored-bytes curves per arm family AND the
+#: iso-KV-bytes CROSS-ENGINE comparison, so the fine grid rides the F2 FRESH
+#: set on BOTH registered pressure engines. 5 of the 7 levels coincide with
+#: FULL_BUDGET_LEVELS; the fine grid's NEW coordinates are exactly
+#: {1.25, 0.375} × the two rates below (deduplicated at enumeration — the
+#: shared coordinates are ONE cell each, carrying both grid memberships).
+ANCHOR_FINE_BUDGET_LEVELS: Tuple[float, ...] = (1.5, 1.25, 1.0, 0.75, 0.5, 0.375, 0.25)
+#: §6.4: the fine grid runs "at two chassis-validated rates (0.85·λ* and
+#: 1.05·λ*)" — both are members of the registered dispatcher factorial, so
+#: the fine grid can never offer a rate the D6 generator does not register.
+ANCHOR_FINE_RATE_FRACTIONS: Tuple[float, ...] = (0.85, 1.05)
+assert set(ANCHOR_FINE_RATE_FRACTIONS) <= set(D6_RATE_FRACTIONS), (
+    "§6.4 fine rates drifted outside load_generator.D6_RATE_FRACTIONS"
+)
+
+#: Grid-membership labels stamped on every F2 cell step (``grids``): which
+#: registered grid(s) the coordinate belongs to — reviewable in the plan and
+#: the analysis filter for the §6.4 curves (a coordinate on both grids is ONE
+#: cell serving both memberships; enumerating it twice would double-run it).
+GRID_D6_FACTORIAL = "d6-factorial"
+GRID_ANCHOR_FINE = "anchor-fine-6.4"
+
 #: Rate fractions come from the DISPATCHER's registered constants
 #: (src/orchestration/load_generator.py) — the plan and the load generator can
 #: never disagree about the grid (same rule build_floor_table.py follows).
 FULL_RATE_FRACTIONS: Tuple[float, ...] = tuple(D6_RATE_FRACTIONS)
 REDUCED_RATE_FRACTIONS: Tuple[float, ...] = tuple(D6_REDUCED_RATE_FRACTIONS)
+
+#: D5 item 5 RULER pairing — the 4-task charter subset (NIAH-MK/MQ, VT, QA;
+#: "subset tasks ...; per-task reporting (never the mean)"). ``niah_single``
+#: stays a loader/CLI default for pilots but is NOT a charter subset member,
+#: so the grid does not register it. Literals are pinned STRUCTURALLY against
+#: the loader's own registered task tuple below — a drifted spelling refuses
+#: at import, never at 3 a.m. on the pod.
+RULER_F2_TASKS: Tuple[str, ...] = (
+    "niah_multikey",
+    "niah_multiquery",
+    "variable_tracking",
+    "qa",
+)
+assert set(RULER_F2_TASKS) <= set(_ruler._TASKS), (
+    f"RULER_F2_TASKS drifted from src/data/ruler._TASKS: "
+    f"{sorted(set(RULER_F2_TASKS) - set(_ruler._TASKS))}"
+)
+#: SHAPE-32K (charter §5.1 item 1, PINNED 2026-08-02): input 32,512 + output
+#: 256 = 32,768 total. Restated from the loader's own pin so a drift refuses.
+RULER_CONTEXT_TOKENS: int = 32_512
+RULER_OUTPUT_TOKENS: int = 256
+assert RULER_CONTEXT_TOKENS == _ruler.MAX_CONTEXT_TOKENS, (
+    "SHAPE-32K input drifted from src/data/ruler.MAX_CONTEXT_TOKENS"
+)
+assert RULER_OUTPUT_TOKENS == _ruler.OUTPUT_TOKENS_HINT, (
+    "SHAPE-32K output drifted from src/data/ruler.OUTPUT_TOKENS_HINT"
+)
 
 #: §7.6.1 F1 row: the four quality-instrumented QA datasets (D5 items 1-4).
 QA_DATASETS: Tuple[str, ...] = ("squad_v2", "hotpotqa", "musique", "qasper")
@@ -175,9 +261,23 @@ QA_DATASETS: Tuple[str, ...] = ("squad_v2", "hotpotqa", "musique", "qasper")
 REPLICATIONS = 3
 
 #: The task text the operator sees on an enumerated-but-unrunnable DIST
-#: tp-overlay cell (the T3.1 TP env exists, but the tp-overlay grid/driver
-#: registration has not landed — enumerated blocked, never guessed at).
-TP_DIST_BLOCKED_ON = "tp-topology overlay registration (Wave-3)"
+#: tp-overlay cell: the T3.1 TP env exists, but THIS session registered no
+#: ``dist_tp_size``, so the TP degree the leg would launch with is
+#: underivable — enumerated blocked, never guessed at.
+TP_DIST_BLOCKED_ON = (
+    "tp-topology overlay: no registered dist_tp_size on this SessionGrid — "
+    "register the TP degree before planning the tp leg"
+)
+
+#: engine -> the launcher env carrying the T3.1 tensor-parallel degree
+#: (scripts/lib/_serving_config.sh, one source of truth; value 1 means the
+#: flag is OMITTED, so the env is only ever emitted for degrees >= 2). An
+#: engine absent here cannot serve a TP-sharded config with the frozen
+#: launcher fleet — its tp cells are enumerated BLOCKED.
+TP_LAUNCH_ENV: Dict[str, str] = {
+    "vllm": "CAGE_VLLM_TENSOR_PARALLEL",
+    "sglang": "CAGE_SGLANG_TP",
+}
 
 #: The gate label every EXECUTABLE pd cell carries (blocked_on stays null —
 #: the launcher exists — but 'run' still refuses without the operator's
@@ -402,6 +502,30 @@ class SessionGrid:
     retr_trunc_kept_docs: int = 1
     dist_pd_split: float = 0.5
     dist_budget_r: float = 1.0
+    # §6.4 anchor fine r-grid overlay on F2 (Group A ONLY per §6.8): extra
+    # (budget × rate) coordinates enumerated ON TOP of the factorial,
+    # deduplicated by coordinate. Both empty on every non-anchor session.
+    f2_fine_budgets: Tuple[float, ...] = ()
+    f2_fine_rates: Tuple[float, ...] = ()
+    # D5 item 5 RULER pairing (W4.4 grid half): the instrument's F2 baselines
+    # (MUST be a subset of f2_baselines so the matched real-text Qasper twin
+    # exists BY CONSTRUCTION — the HELMET validity boundary) and the
+    # registered task subset (RULER_F2_TASKS literals, per-task steps).
+    f2_ruler_baselines: Tuple[str, ...] = ()
+    f2_ruler_tasks: Tuple[str, ...] = ()
+    # W4.2 serving GPU counts (feed cell.json gpu_count, §6.6b basis):
+    # - serving_tp: the tensor-parallel degree every SINGLE-topology relaunch
+    #   of this session launches with (1 = the plain single-GPU launch,
+    #   byte-identical to pre-W4.2 plans; Group B serves TP=4 per §7.6 e5 —
+    #   a TP-sharded single-instance config counts its ranks as gpu_count).
+    # - dist_tp_size: the DIST tp-overlay leg's TP degree (None = the tp leg
+    #   is unregistered — its cells stay enumerated-but-BLOCKED).
+    # - dist_pd_role_gpus: (prefill, decode) GPU counts of the pd leg's role
+    #   instances; gpu_count = their sum. The frozen pd launcher applies ONE
+    #   CAGE_VLLM_TENSOR_PARALLEL to BOTH roles, so unequal counts refuse.
+    serving_tp: int = 1
+    dist_tp_size: Optional[int] = None
+    dist_pd_role_gpus: Tuple[int, int] = (1, 1)
 
     def __post_init__(self) -> None:
         problems: List[str] = []
@@ -443,6 +567,80 @@ class SessionGrid:
         ):
             problems.append(
                 f"dist_budget_r={self.dist_budget_r!r} must be finite and > 0"
+            )
+        # §6.4 fine overlay: both axes registered together or not at all — a
+        # budget list with no rates (or vice versa) enumerates nothing and
+        # silently drops the registered graft.
+        if bool(self.f2_fine_budgets) != bool(self.f2_fine_rates):
+            problems.append(
+                "f2_fine_budgets and f2_fine_rates must be registered together "
+                "(§6.4: the fine grid is budgets × rates; one side alone is an "
+                "empty registration)"
+            )
+        # D5#5 RULER pairing: tasks and baselines travel together, tasks must
+        # be loader-registered literals, and every ruler baseline needs its
+        # matched Qasper twin in f2_baselines (the HELMET validity boundary).
+        if bool(self.f2_ruler_baselines) != bool(self.f2_ruler_tasks):
+            problems.append(
+                "f2_ruler_baselines and f2_ruler_tasks must be registered "
+                "together (D5#5: the RULER instrument is baselines × tasks)"
+            )
+        unknown_tasks = sorted(set(self.f2_ruler_tasks) - set(_ruler._TASKS))
+        if unknown_tasks:
+            problems.append(
+                f"f2_ruler_tasks has task(s) {unknown_tasks} not registered in "
+                f"src/data/ruler._TASKS ({list(_ruler._TASKS)}) — the loader "
+                "would refuse them; fix the registration, not the loader"
+            )
+        if len(set(self.f2_ruler_tasks)) != len(self.f2_ruler_tasks):
+            problems.append(
+                f"f2_ruler_tasks {list(self.f2_ruler_tasks)} has duplicates — "
+                "each task claims one window-ordinal range; a duplicate would "
+                "double-claim it"
+            )
+        unpaired = sorted(set(self.f2_ruler_baselines) - set(self.f2_baselines))
+        if unpaired:
+            problems.append(
+                f"f2_ruler_baselines {unpaired} absent from f2_baselines — "
+                "D5#5 mandates every RULER cell be PAIRED with a matched "
+                "real-text Qasper cell at the same coordinate; an unpaired "
+                "ruler baseline has no twin"
+            )
+        # W4.2 GPU-count registration knobs (fail-closed shapes; the actual
+        # topology/count derivation refuses per cell at plan/write time).
+        if not isinstance(self.serving_tp, int) or isinstance(self.serving_tp, bool) or self.serving_tp < 1:
+            problems.append(
+                f"serving_tp={self.serving_tp!r} must be an integer >= 1 "
+                "(the TP degree single-topology relaunches launch with)"
+            )
+        if self.dist_tp_size is not None and (
+            not isinstance(self.dist_tp_size, int)
+            or isinstance(self.dist_tp_size, bool)
+            or self.dist_tp_size < 2
+        ):
+            problems.append(
+                f"dist_tp_size={self.dist_tp_size!r} must be None (tp leg "
+                "unregistered) or an integer >= 2 — a TP=1 'tp' leg is a "
+                "topology/count contradiction"
+            )
+        if (
+            not isinstance(self.dist_pd_role_gpus, tuple)
+            or len(self.dist_pd_role_gpus) != 2
+            or any(
+                not isinstance(v, int) or isinstance(v, bool) or v < 1
+                for v in self.dist_pd_role_gpus
+            )
+        ):
+            problems.append(
+                f"dist_pd_role_gpus={self.dist_pd_role_gpus!r} must be a "
+                "(prefill, decode) pair of integers >= 1"
+            )
+        elif self.dist_pd_role_gpus[0] != self.dist_pd_role_gpus[1]:
+            problems.append(
+                f"dist_pd_role_gpus={self.dist_pd_role_gpus!r} must be equal — "
+                "manage_vllm_pd.sh applies ONE CAGE_VLLM_TENSOR_PARALLEL to "
+                "BOTH role instances (frozen launcher contract); unequal role "
+                "counts are unrealizable"
             )
         for name in ("f1_datasets",):
             unknown = sorted(set(getattr(self, name)) - DATASET_IDS)
@@ -492,6 +690,19 @@ SESSION_GRIDS: Dict[str, SessionGrid] = {
         f2_budgets=FULL_BUDGET_LEVELS,
         f2_rates=FULL_RATE_FRACTIONS,
         f2_dataset="qasper",
+        # §6.4 anchor fine r-grid (Group A ONLY, §6.8) — see the constants'
+        # scope-derivation note; new coordinates = {1.25, 0.375} × {0.85, 1.05}.
+        f2_fine_budgets=ANCHOR_FINE_BUDGET_LEVELS,
+        f2_fine_rates=ANCHOR_FINE_RATE_FRACTIONS,
+        # D5#5 RULER pairing: B1 (gold-fresh) ONLY — the instrument's payload
+        # IS the served context, which is exactly the gold-context arm's
+        # shape; the retrieval arms (B5/B6/B9/B11) retrieve from a dataset
+        # corpus RULER does not define, so registering them would fabricate a
+        # retrieval workload the instrument never specified (conservative
+        # pin, recorded as an ADR input). Every ruler cell's Qasper twin is
+        # the B1 qasper cell at the identical (engine, r, rate) coordinate.
+        f2_ruler_baselines=("B1",),
+        f2_ruler_tasks=RULER_F2_TASKS,
         f3_baselines=_ordered(REUSE_SET),
         f3_engines=("vllm", "sglang"),
         f3_budgets=REDUCED_BUDGET_LEVELS,
@@ -501,6 +712,81 @@ SESSION_GRIDS: Dict[str, SessionGrid] = {
         corpus_prefix_budget_tokens=2800,
         corpus_trunc_budget_tokens=1400,
         retr_trunc_kept_docs=1,
+    ),
+    # Session 'b' = charter §7.6 Group B (Llama-3.3-70B) + the Run-C-prime
+    # DIST overlay (standing Plan-B scope, W4.6). Conservative pins where the
+    # charter is ambiguous — each RECORDED here as an ADR input:
+    # - DIST overlay: §7.6.1's Distributed row for B is "—", but the standing
+    #   Plan-B / Run-C-prime scope carries the transfer pair {B1, B3} (the
+    #   §7.6.1 Group-C pair) on THIS session's hardware. Registered on vLLM
+    #   ONLY: contrast #18 is topology-paired WITHIN one engine, and SGLang
+    #   PD is T3.4-gated — sglang pd cells are NOT registered (registering
+    #   them blocked would imply a pending leg the scope does not carry).
+    # - tp leg TP=8 / pd leg 4+4 roles (task-pinned Plan-B scope): both legs
+    #   serve 8 GPUs — the iso-GPU version of the #18 pair; both serve
+    #   floor(dist_budget_r × D) total bytes (§6.6a iso-aggregate-bytes).
+    #   BOTH legs' budget envs are denominated PER-RANK under the planner's
+    #   registered --kv-cache-memory-bytes convention (tp leg: total // 8;
+    #   pd leg: each §6.5 role pool // 4 — see _pd_budget_env). Per-rank vs
+    #   whole-pool live semantics is the plan's verify_live entry: gate (j)
+    #   validates realized bytes at S0 BEFORE campaign data, and would fail
+    #   BOTH legs together (never silently skew one side of the pair).
+    # - serving_tp=4 for every non-DIST cell per §7.6 Group B / §7.7(e)
+    #   (70B BF16 needs TP=4 for a comfortable budget sweep; TP=2 is the
+    #   pinched sensitivity point, NOT registered here).
+    # - F1 = B1-B12 × {vllm, sglang} × the four QA datasets ("quality
+    #   slice"). The §7.6 "+ SCBench slice" is NOT yet registered: its
+    #   2-subset selection (scbench_kv / scbench_qa_eng via
+    #   CAGE_SCBENCH_SUBSET) needs the same per-subset window-range seam the
+    #   RULER tasks got, and registering it as ONE undifferentiated dataset
+    #   would leave the subset an unregistered degree of freedom — named
+    #   deferral, additive later.
+    # - HF oracle: the same reduced 10-cell slice as session a (batch-1
+    #   device_map rides the same 4-GPU box, §7.7(e); the charter pins no
+    #   Group-B-specific oracle density — conservative reuse of the anchor
+    #   slice).
+    # - LMDeploy/TurboMind F1 carriage (§7.6 B "all 4") lands with its
+    #   launcher wiring, exactly as on session a.
+    # - F2/F3 densities per §7.6.1 row B: FRESH × 3×3 and REUSE × 3×3
+    #   (§6.8 pruning rule); no fine grid, no RULER pairing (anchor-only
+    #   grafts).
+    "b": SessionGrid(
+        session="b",
+        group="B",
+        model="llama-3.3-70b",
+        f1_baselines=_ordered(frozenset(BASELINES)),
+        f1_engines=("vllm", "sglang"),
+        f1_datasets=QA_DATASETS,
+        hf_oracle_cells=(
+            ("B1", ("squad_v2", "qasper")),
+            ("B2", ("squad_v2", "qasper")),
+            ("B3", QA_DATASETS),
+            ("B6", ("squad_v2", "qasper")),
+        ),
+        f2_baselines=_ordered(FRESH_SET),
+        f2_engines=("vllm", "sglang"),
+        f2_budgets=REDUCED_BUDGET_LEVELS,
+        f2_rates=REDUCED_RATE_FRACTIONS,
+        f2_dataset="qasper",
+        f3_baselines=_ordered(REUSE_SET),
+        f3_engines=("vllm", "sglang"),
+        f3_budgets=REDUCED_BUDGET_LEVELS,
+        f3_rates=REDUCED_RATE_FRACTIONS,
+        f3_dataset="qasper",
+        dist_cells=(
+            ("B1", "vllm", "tp"),
+            ("B1", "vllm", "pd"),
+            ("B3", "vllm", "tp"),
+            ("B3", "vllm", "pd"),
+        ),
+        corpus_prefix_budget_tokens=2800,
+        corpus_trunc_budget_tokens=1400,
+        retr_trunc_kept_docs=1,
+        dist_pd_split=0.5,
+        dist_budget_r=1.0,
+        serving_tp=4,
+        dist_tp_size=8,
+        dist_pd_role_gpus=(4, 4),
     ),
 }
 
@@ -517,7 +803,7 @@ def get_session_grid(session: str) -> SessionGrid:
         raise PlanError(
             f"session {session!r} is in the §1 vocabulary but its grid is NOT "
             f"yet registered in this driver (registered: {sorted(SESSION_GRIDS)}); "
-            "sessions b/cd-* land with the Wave-3 topology registrations — "
+            "the cd-* sessions land with the Group-C/D topology registrations — "
             "refusing to fabricate a grid"
         )
     return grid
@@ -616,12 +902,39 @@ def load_floor_table(path: Path) -> FloorTable:
 
 @dataclass(frozen=True)
 class PlannedCell:
-    """One enumerated cell: the tuple, its numbered baseline, its workload."""
+    """One enumerated cell: the tuple, its numbered baseline, its workload.
+
+    ``grids`` is the F2 grid-membership marker (None outside F2);
+    ``ruler_task``/``window_ordinal_base`` carry the D5#5 per-task RULER
+    pairing — per-task steps share a row key (task is not a CellSpec axis),
+    so each claims its own window-ordinal range ``(base, base+windows]``.
+    """
 
     spec: CellSpec
     baseline_id: str
     dataset: str
     blocked_on: Optional[str] = None
+    grids: Optional[Tuple[str, ...]] = None
+    ruler_task: Optional[str] = None
+    window_ordinal_base: int = 0
+
+
+def _cell_gpu_count(grid: SessionGrid, spec: CellSpec) -> Optional[int]:
+    """W4.2 derivation — the integer GPU count the cell's serving stack
+    launches with (None ONLY for a blocked tp cell whose degree is
+    unregistered; an executable cell without one refuses at step build).
+
+    - single: the session's registered serving_tp (1 on the anchor; a
+      TP-sharded single-instance config counts its ranks — §7.6 B e5). The
+      in-process hf oracle rides the same box (batch-1 device_map, §7.7(e)).
+    - tp: the registered dist_tp_size (None => the leg is unregistered).
+    - pd: the two registered role GPU counts summed (§6.5 roles).
+    """
+    if spec.topology == "tp":
+        return grid.dist_tp_size
+    if spec.topology == "pd":
+        return grid.dist_pd_role_gpus[0] + grid.dist_pd_role_gpus[1]
+    return grid.serving_tp
 
 
 def _launch_blocked_on(spec: CellSpec) -> Optional[str]:
@@ -698,23 +1011,75 @@ def enumerate_cells(grid: SessionGrid) -> List[PlannedCell]:
                 )
             )
 
-    # F2 — pressure, prefix OFF, budget × rate factorial (§6.1).
+    # F2 — pressure, prefix OFF. Grid points = the §6.1/§6.8 factorial PLUS
+    # the §6.4 anchor fine overlay, DEDUPLICATED by coordinate: a coordinate
+    # on both grids is ONE cell carrying both memberships (enumerating it
+    # twice would double-run the same tuple). Insertion order: factorial
+    # first, then the fine-only additions (the sort below reorders anyway).
+    f2_points: Dict[Tuple[float, float], Tuple[str, ...]] = {}
+    for r in grid.f2_budgets:
+        for frac in grid.f2_rates:
+            f2_points[(r, frac)] = (GRID_D6_FACTORIAL,)
+    for r in grid.f2_fine_budgets:
+        for frac in grid.f2_fine_rates:
+            memberships = f2_points.get((r, frac), ())
+            f2_points[(r, frac)] = memberships + (GRID_ANCHOR_FINE,)
+
+    def _f2_planned(
+        bid: str,
+        engine: str,
+        r: float,
+        frac: float,
+        memberships: Tuple[str, ...],
+        dataset: str,
+        *,
+        ruler_task: Optional[str] = None,
+        window_ordinal_base: int = 0,
+    ) -> PlannedCell:
+        spec = CellSpec.from_baseline(
+            bid,
+            engine=engine,  # type: ignore[arg-type]
+            model=grid.model,  # type: ignore[arg-type]
+            family="F2",
+            budget_r=r,
+            rate_frac=frac,
+        )
+        return PlannedCell(
+            spec=spec,
+            baseline_id=bid,
+            dataset=dataset,
+            blocked_on=_launch_blocked_on(spec),
+            grids=memberships,
+            ruler_task=ruler_task,
+            window_ordinal_base=window_ordinal_base,
+        )
+
     for bid in grid.f2_baselines:
         for engine in grid.f2_engines:
-            for r in grid.f2_budgets:
-                for frac in grid.f2_rates:
+            for (r, frac), memberships in f2_points.items():
+                cells.append(
+                    _f2_planned(bid, engine, r, frac, memberships, grid.f2_dataset)
+                )
+
+    # F2 RULER pairing (D5#5): the instrument rides the SAME F2 grid points,
+    # dataset 'ruler' at SHAPE-32K, one step per registered task. Per-task
+    # steps share the row key (task is not a CellSpec axis), so each claims
+    # its own window-ordinal range via window_ordinal_base — the ordinal
+    # ranges are disjoint by construction (task_index × replications).
+    for bid in grid.f2_ruler_baselines:
+        for engine in grid.f2_engines:
+            for (r, frac), memberships in f2_points.items():
+                for task_index, task in enumerate(grid.f2_ruler_tasks):
                     cells.append(
-                        _planned(
-                            CellSpec.from_baseline(
-                                bid,
-                                engine=engine,  # type: ignore[arg-type]
-                                model=grid.model,  # type: ignore[arg-type]
-                                family="F2",
-                                budget_r=r,
-                                rate_frac=frac,
-                            ),
+                        _f2_planned(
                             bid,
-                            grid.f2_dataset,
+                            engine,
+                            r,
+                            frac,
+                            memberships,
+                            "ruler",
+                            ruler_task=task,
+                            window_ordinal_base=task_index * grid.replications,
                         )
                     )
 
@@ -740,9 +1105,11 @@ def enumerate_cells(grid: SessionGrid) -> List[PlannedCell]:
 
     # DIST — topology overlay. pd cells on vllm are EXECUTABLE since T3.2
     # (manage_vllm_pd.sh + pd_proxy.py); they carry the --allow-pd gate label
-    # instead of blocked_on. Everything else stays enumerated-but-blocked:
-    # pd on an engine with no PD launcher, and the tp overlay until its
-    # registration lands ('run' refuses blocked cells loudly).
+    # instead of blocked_on. tp cells are EXECUTABLE (W4.6) when the session
+    # registered a dist_tp_size AND the engine has a T3.1 TP launch env.
+    # Everything else stays enumerated-but-blocked: pd on an engine with no
+    # PD launcher, and the tp overlay on an unregistered degree or a
+    # TP-env-less engine ('run' refuses blocked cells loudly).
     for bid, engine, topology in grid.dist_cells:
         spec = CellSpec.from_baseline(
             bid,
@@ -759,8 +1126,15 @@ def enumerate_cells(grid: SessionGrid) -> List[PlannedCell]:
                 )
             else:
                 blocked = _launch_blocked_on(spec)  # arm levers still gate
-        else:
+        elif grid.dist_tp_size is None:
             blocked = TP_DIST_BLOCKED_ON
+        elif engine not in TP_LAUNCH_ENV:
+            blocked = (
+                f"{engine} launcher has no T3.1 tensor-parallel env "
+                f"(registered: {sorted(TP_LAUNCH_ENV)})"
+            )
+        else:
+            blocked = _launch_blocked_on(spec)  # arm levers still gate
         cells.append(
             PlannedCell(
                 spec=spec,
@@ -822,6 +1196,11 @@ def _sort_key(cell: PlannedCell) -> Tuple[Any, ...]:
         spec.family,
         _baseline_num(cell.baseline_id),
         cell.dataset,
+        # Per-task RULER steps share every component above (one row key, one
+        # dataset) — the ordinal base keeps the order total and puts the
+        # tasks' window ranges in ascending order (deterministic plans).
+        cell.window_ordinal_base,
+        _lever_key(cell.ruler_task),
     )
 
 
@@ -867,6 +1246,7 @@ def _budget_env(
     r: float,
     floor: FloorTable,
     served_kv_dtype: Optional[str] = None,
+    tp: int = 1,
 ) -> Tuple[Dict[str, str], int]:
     """Launcher budget env for one serving config, via cache_budget.plan_budget.
 
@@ -877,7 +1257,10 @@ def _budget_env(
     anchor that makes B10's double-saving measurable), but token-denominated
     dials (SGLang --max-total-tokens) must convert bytes at the SERVED KV
     dtype — an fp8 server planned with bf16 arithmetic would realize only
-    HALF the byte budget (§6.5 violation). Returns (env, budget_bytes_total).
+    HALF the byte budget (§6.5 violation). ``tp`` > 1 plans the TP-sharded
+    launch (plan_budget topology='tp': GQA shards → the primary knob carries
+    the PER-RANK slice; MLA replicates, #20) — the TOTAL byte budget is
+    still floor(r × D). Returns (env, budget_bytes_total).
     """
     row = floor.row(r)
     if served_kv_dtype is None and floor.kv_dtype != "bf16":
@@ -899,8 +1282,8 @@ def _budget_env(
             r=r,
             demand=int(row["demand_bytes"]),
             kv_dtype=served_kv_dtype or floor.kv_dtype,
-            tp=1,
-            topology="single",
+            tp=tp,
+            topology="single" if tp == 1 else "tp",
         )
     except CacheBudgetError as exc:
         raise PlanError(f"budget planning refused for engine={engine} r={r:g}: {exc}") from exc
@@ -924,11 +1307,18 @@ def _budget_env(
 
 
 def _pd_budget_env(
-    grid: SessionGrid, engine: str, model: str, floor: FloorTable
+    grid: SessionGrid, engine: str, model: str, floor: FloorTable, role_tp: int
 ) -> Tuple[Dict[str, str], Dict[str, Any]]:
     """PD launcher env: the §6.5 split of floor(dist_budget_r × D) into the
     two REQUIRED per-role byte budgets, plus the role-tagged telemetry
-    endpoints. Returns (env, pd-record-for-the-plan)."""
+    endpoints. ``role_tp`` is the TP degree BOTH role instances launch with
+    (the frozen one-env launcher contract): the launcher passes each budget
+    env VERBATIM as ``--kv-cache-memory-bytes`` on that instance, and the
+    flag's registered convention is PER-RANK (the same convention the paired
+    tp leg's _budget_env emits; live per-rank-vs-whole-pool semantics stays
+    the plan's verify_live entry, closed by gate (j) at S0) — so a TP-sharded
+    role's env carries the per-rank SLICE of its §6.5 pool, never the pool
+    total. Returns (env, pd-record-for-the-plan)."""
     if floor.kv_dtype != "bf16":
         # Same guard as _budget_env: DIST pd cells launch PLAIN (no fp8
         # lever), so a non-bf16 floor table would mis-denominate the pools.
@@ -956,10 +1346,25 @@ def _pd_budget_env(
         ) from exc
     assert plan.pools_bytes is not None  # topology='pd' always emits pools
     prefill_bytes, decode_bytes = plan.pools_bytes
+    # W4.6 repair (2026-09-02 verifier major): handing a role's POOL TOTAL to
+    # a role instance launched at TP=role_tp would — under the flag's
+    # registered per-rank convention — realize ~role_tp× the §6.5 pools and
+    # break the #18 pair's §6.6a iso-aggregate-bytes against the tp leg. The
+    # env therefore carries the SAME per-rank shard rule the planner applies
+    # under topology='tp', sourced from its own model table (GQA shards:
+    # pool // tp, realized sum checked by gate (j); MLA replicates: per-rank
+    # == pool, the replication cost IS registered contrast #20) — never
+    # re-derived here from model arithmetic.
+    sharded = role_tp >= 2 and not MODEL_KV[model].mla_tp_replicated
+    if sharded:
+        prefill_env = prefill_bytes // role_tp
+        decode_env = decode_bytes // role_tp
+    else:
+        prefill_env, decode_env = prefill_bytes, decode_bytes
     env = {
         # The launcher REFUSES to start without both (manage_vllm_pd.sh).
-        "CAGE_KV_BUDGET_BYTES_PREFILL": str(prefill_bytes),
-        "CAGE_KV_BUDGET_BYTES_DECODE": str(decode_bytes),
+        "CAGE_KV_BUDGET_BYTES_PREFILL": str(prefill_env),
+        "CAGE_KV_BUDGET_BYTES_DECODE": str(decode_env),
         # T4.1 role-tagged telemetry — one sampler per instance.
         "CAGE_TELEMETRY_ENDPOINTS": PD_TELEMETRY_ENDPOINTS,
     }
@@ -970,6 +1375,18 @@ def _pd_budget_env(
         "prefill_bytes": prefill_bytes,
         "decode_bytes": decode_bytes,
     }
+    if role_tp >= 2:
+        # The per-rank env basis + what gate (j) must observe as the realized
+        # pool sum. Recorded ONLY when a TP degree shaped the env — (1, 1)
+        # role plans stay byte-identical to pre-W4.6 ones (the same rule the
+        # TP env itself follows in _relaunch_step).
+        record["prefill_bytes_per_rank"] = prefill_env
+        record["decode_bytes_per_rank"] = decode_env
+        record["expected_bytes_total"] = (
+            (prefill_env + decode_env) * role_tp
+            if sharded
+            else prefill_env + decode_env  # MLA: one latent copy is counted
+        )
     return env, record
 
 
@@ -993,7 +1410,16 @@ def _relaunch_step(
         argv = list(launcher) + ["start", HF_ID_OF_SLUG[model]]
         if prefix_off:
             argv.append("--no-prefix-cache")
-        env, pd_record = _pd_budget_env(grid, engine, model, floor)
+        # Per-role TP (W4.6): the frozen pd launcher applies ONE
+        # CAGE_VLLM_TENSOR_PARALLEL to BOTH role instances (validated equal
+        # at registration); degree 1 omits the env — the launcher omits the
+        # flag, keeping (1,1) plans byte-identical to pre-W4.6 ones. The
+        # degree also shapes the budget env (per-rank slices — see
+        # _pd_budget_env), so it is derived BEFORE the env is built.
+        role_tp = grid.dist_pd_role_gpus[0]
+        env, pd_record = _pd_budget_env(grid, engine, model, floor, role_tp)
+        if role_tp >= 2:
+            env["CAGE_VLLM_TENSOR_PARALLEL"] = str(role_tp)
         return {
             "kind": "relaunch",
             "engine": engine,
@@ -1007,6 +1433,7 @@ def _relaunch_step(
             "kv_dtype": kv_dtype,
             "connector": connector,
             "topology": topology,
+            "tp": role_tp,  # per ROLE instance (both roles, launcher contract)
             "pd": pd_record,
             "argv": argv,
             "env": env,
@@ -1022,10 +1449,47 @@ def _relaunch_step(
         argv.append("--no-prefix-cache")
     env: Dict[str, str] = {}
     budget_bytes: Optional[int] = None
-    if budget_r is not None:
+    if topology == "tp":
+        # W4.6: the DIST tp leg rides the SINGLE-INSTANCE launcher at the
+        # registered dist_tp_size, serving floor(dist_budget_r × D) total
+        # bytes — the SAME total the pd leg splits into roles, so the #18
+        # pair is iso-aggregate-bytes (§6.6a) AND iso-GPU by registration.
+        # Enumeration blocked these cells unless dist_tp_size was registered
+        # and the engine has a TP env, so both lookups are driver invariants.
+        tp_size = grid.dist_tp_size
+        if tp_size is None:
+            raise PlanError(
+                "relaunch for the tp overlay with no registered dist_tp_size "
+                "— enumeration should have BLOCKED these cells (driver "
+                "invariant violated)"
+            )
         env, budget_bytes = _budget_env(
-            engine, model, budget_r, floor, served_kv_dtype=kv_dtype
+            engine, model, grid.dist_budget_r, floor,
+            served_kv_dtype=kv_dtype, tp=tp_size,
         )
+        launched_tp = tp_size
+    else:
+        if budget_r is not None:
+            env, budget_bytes = _budget_env(
+                engine, model, budget_r, floor,
+                served_kv_dtype=kv_dtype, tp=grid.serving_tp,
+            )
+        launched_tp = grid.serving_tp
+    # T3.1 TP env (single-instance launchers): emitted for degrees >= 2 only
+    # — degree 1 means the launcher omits the flag, so single-GPU relaunch
+    # env stays byte-identical to pre-W4.6 plans. Budget-free relaunches
+    # (F1 on a TP-sharded session) still need the degree: a 70B F1 server
+    # launched without it would silently serve TP=1.
+    if launched_tp >= 2:
+        tp_env = TP_LAUNCH_ENV.get(engine)
+        if tp_env is None:
+            raise PlanError(
+                f"relaunch for engine={engine} demands tensor-parallel degree "
+                f"{launched_tp} but the launcher has no T3.1 TP env "
+                f"(registered: {sorted(TP_LAUNCH_ENV)}) — register the env "
+                "before planning this session"
+            )
+        env[tp_env] = str(launched_tp)
     # Launch levers ride the SERVER environment (run_compression.sh /
     # run_kv_store.sh conventions) — an unmapped engine here is a driver bug:
     # enumeration already blocked such cells, so no relaunch may reach this.
@@ -1057,7 +1521,8 @@ def _relaunch_step(
         "kv_dtype": kv_dtype,
         "connector": connector,
         "topology": topology,
-        "pd": None,  # single-topology relaunch: no §6.5 role split
+        "tp": launched_tp,  # the T3.1 degree this serving stack launches with
+        "pd": None,  # single/tp relaunch: no §6.5 role split
         "argv": argv,
         "env": env,
     }
@@ -1151,6 +1616,29 @@ def _cell_step(
         str(seed),
     ]
     argv += _behavior_argv(spec, grid)
+    if cell.ruler_task is not None:
+        # D5#5 RULER instrument step: the task literal + SHAPE-32K, EXPLICIT
+        # on every step (the loader's 4096-token default and niah_single
+        # fallback are pilot conveniences, never a registered grid cell).
+        argv += [
+            "--ruler-task",
+            cell.ruler_task,
+            "--ruler-context-tokens",
+            str(RULER_CONTEXT_TOKENS),
+            "--max-tokens",
+            str(RULER_OUTPUT_TOKENS),
+        ]
+    # W4.2: the GPU count this cell's serving stack launches with — an
+    # EXECUTABLE cell without one would strand §6.6b downstream, so it
+    # refuses here; a blocked cell carries the underivable count as an
+    # explicit null (the debt stays visible in the plan, never guessed).
+    gpu_count = _cell_gpu_count(grid, spec)
+    if gpu_count is None and cell.blocked_on is None:
+        raise PlanError(
+            f"cell {spec.to_row_key()} is executable but its gpu_count is "
+            "underivable (topology/count registration gap) — driver invariant "
+            "violated"
+        )
     offered_rate: Optional[float] = None
     lambda_star: Optional[float] = None
     rate_basis: Optional[str] = None
@@ -1175,6 +1663,16 @@ def _cell_step(
             "--duration-s",
             f"{window_duration_s:g}",
         ]
+    env = _cell_identity_env(spec)
+    if gpu_count is not None:
+        # NOT identity (derive_cell_spec ignores it): the serving-stack fact
+        # the campaign writer persists into cell.json (W4.2 → §6.6b / #18).
+        env["CAGE_GPU_COUNT"] = str(gpu_count)
+    if cell.window_ordinal_base:
+        # Per-task RULER steps share a row key; each task's runner invocation
+        # emits windows (base, base+replications] so per-task resume can
+        # never collide (campaign_session reads this env).
+        env["CAGE_WINDOW_ORDINAL_BASE"] = str(cell.window_ordinal_base)
     return {
         "kind": "cell",
         "family": spec.family,
@@ -1183,6 +1681,12 @@ def _cell_step(
         "row_key": spec.to_row_key(),
         "cellspec": spec.to_flat_dict(),
         "windows": grid.replications,
+        "gpu_count": gpu_count,
+        # F2 grid-membership marker (§6.4): null outside F2 — absence stays
+        # absence; F1/F3/DIST cells sit on no registered budget×rate grid.
+        "grids": None if cell.grids is None else list(cell.grids),
+        "ruler_task": cell.ruler_task,
+        "window_ordinal_base": cell.window_ordinal_base,
         "serving": (
             None
             if spec.engine == "hf"
@@ -1205,7 +1709,7 @@ def _cell_step(
         "lambda_star_pred_rps": lambda_star,
         "rate_basis": rate_basis,
         "argv": argv,
-        "env": _cell_identity_env(spec),
+        "env": env,
         "blocked_on": cell.blocked_on,
         # T3.2: executable pd cells are gated behind the operator's explicit
         # --allow-pd consent (blocked_on stays null — the launcher exists,
@@ -1312,6 +1816,34 @@ def build_plan(
             "retr_trunc_kept_docs": grid.retr_trunc_kept_docs,
             "lmcache_kv_transfer_config": LMCACHE_KV_TRANSFER_CONFIG,
         },
+        # W4.2/W4.6: the registered serving shapes — reviewable in the header
+        # like the behavior knobs (design registrations, not measurements).
+        "serving_shapes": {
+            "serving_tp": grid.serving_tp,
+            "dist_tp_size": grid.dist_tp_size,
+            "dist_pd_role_gpus": list(grid.dist_pd_role_gpus),
+        },
+        # §6.4 anchor fine grid registration (null on non-anchor sessions).
+        "fine_grid": (
+            None
+            if not grid.f2_fine_budgets
+            else {
+                "budget_levels": list(grid.f2_fine_budgets),
+                "rate_fractions": list(grid.f2_fine_rates),
+                "membership_labels": [GRID_D6_FACTORIAL, GRID_ANCHOR_FINE],
+            }
+        ),
+        # D5#5 RULER pairing registration (null when the session carries none).
+        "ruler_f2": (
+            None
+            if not grid.f2_ruler_baselines
+            else {
+                "baselines": list(grid.f2_ruler_baselines),
+                "tasks": list(grid.f2_ruler_tasks),
+                "context_tokens": RULER_CONTEXT_TOKENS,
+                "output_tokens": RULER_OUTPUT_TOKENS,
+            }
+        ),
         "counts": {
             "cells": len(cell_steps),
             "windows": sum(s["windows"] for s in cell_steps),
@@ -1321,7 +1853,7 @@ def build_plan(
         },
         "blocked_row_keys": blocked,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "charter_refs": ["6.1", "6.8", "7.6", "7.6.1", "P6"],
+        "charter_refs": ["6.1", "6.4", "6.8", "7.6", "7.6.1", "D5#5", "P6"],
         "steps": steps,
     }
 
@@ -1341,6 +1873,12 @@ _CELL_STEP_KEYS = (
     "env",
     "blocked_on",
     "gate",
+    # v3 additions (see the PLAN_SCHEMA comment): the §6.6b producer, the
+    # §6.4 membership marker, and the D5#5 per-task RULER pairing keys.
+    "gpu_count",
+    "grids",
+    "ruler_task",
+    "window_ordinal_base",
 )
 _RELAUNCH_STEP_KEYS = (
     "engine",
@@ -1350,6 +1888,7 @@ _RELAUNCH_STEP_KEYS = (
     "kv_dtype",
     "connector",
     "topology",
+    "tp",  # v3: the T3.1 degree the launcher is given (W4.6 serving shapes)
     "pd",
     "argv",
     "env",
@@ -1419,10 +1958,24 @@ def load_plan(path: Path) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def count_complete_windows(campaign_root: Path, row_key: str, dataset: str) -> int:
+def count_complete_windows(
+    campaign_root: Path,
+    row_key: str,
+    dataset: str,
+    *,
+    ordinal_base: int = 0,
+    expected: Optional[int] = None,
+) -> int:
     """Complete windows already on disk for one cell: window dir (reader
     grammar) + its metrics.json completeness sentinel (the same sentinel the
-    runner's own resume and the shell gates key on)."""
+    runner's own resume and the shell gates key on).
+
+    With ``expected`` given, only ordinals in the step's claimed range
+    ``(ordinal_base, ordinal_base + expected]`` count — the D5#5 per-task
+    RULER steps share one (row_key, dataset) window space, so a flat count
+    would let one task's complete windows mark ANOTHER task done (a silently
+    skipped registered cell). ``expected=None`` keeps the legacy flat count.
+    """
     cell_dir = Path(campaign_root) / "cells" / row_key
     if not cell_dir.is_dir():
         return 0
@@ -1435,23 +1988,39 @@ def count_complete_windows(campaign_root: Path, row_key: str, dataset: str) -> i
             and match.group(1) == dataset
             and (entry / "metrics.json").is_file()
         ):
+            if expected is not None:
+                ordinal = int(match.group(2))
+                if not (ordinal_base < ordinal <= ordinal_base + expected):
+                    continue
             n += 1
     return n
 
 
-def _sentinel_path(campaign_root: Path, row_key: str, dataset: str) -> Path:
+def _sentinel_path(
+    campaign_root: Path, row_key: str, dataset: str, ordinal_base: int = 0
+) -> Path:
     # Dot-named DELIBERATELY: the §5 seal scope (campaign_layout.seal_run and
     # seal_campaign_run's journal cross-check) skips dot entries — a visible
     # sentinel under cells/ must never poison a later --seal-partial seal.
     # Dataset-suffixed DELIBERATELY: F1 row keys are shared by all four QA
     # datasets, so a bare per-cell sentinel could not say WHICH pass failed.
-    return Path(campaign_root) / "cells" / row_key / f".STATUS-{dataset}"
+    # Ordinal-base-suffixed (per-task RULER steps only) for the same reason:
+    # the tasks share one dataset, and a task-2 success must never clear a
+    # task-1 failure record (base 0 keeps the pre-W4.4 spelling verbatim).
+    name = f".STATUS-{dataset}"
+    if ordinal_base:
+        name += f"-from-{ordinal_base + 1:02d}"
+    return Path(campaign_root) / "cells" / row_key / name
 
 
 def _write_failed_sentinel(
-    campaign_root: Path, row_key: str, dataset: str, reason: str
+    campaign_root: Path,
+    row_key: str,
+    dataset: str,
+    reason: str,
+    ordinal_base: int = 0,
 ) -> None:
-    path = _sentinel_path(campaign_root, row_key, dataset)
+    path = _sentinel_path(campaign_root, row_key, dataset, ordinal_base)
     path.parent.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     path.write_text(
@@ -1460,11 +2029,15 @@ def _write_failed_sentinel(
     )
 
 
-def _clear_failed_sentinel(campaign_root: Path, row_key: str, dataset: str) -> None:
+def _clear_failed_sentinel(
+    campaign_root: Path, row_key: str, dataset: str, ordinal_base: int = 0
+) -> None:
     # A stale STATUS=failed over data that later completed (resume rerun,
     # --force-rerun) is a FALSE forensic record — remove it on success and on
     # a verified-complete skip.
-    _sentinel_path(campaign_root, row_key, dataset).unlink(missing_ok=True)
+    _sentinel_path(campaign_root, row_key, dataset, ordinal_base).unlink(
+        missing_ok=True
+    )
 
 
 def _exec(argv: Sequence[str], extra_env: Mapping[str, str]) -> int:
@@ -1576,27 +2149,41 @@ def run_plan(
                 )
             continue
         row_key, dataset = step["row_key"], step["dataset"]
+        # Per-task RULER steps claim disjoint window-ordinal ranges within a
+        # shared (row_key, dataset) space — resume counting and the failure
+        # sentinel are both scoped to THIS step's range (base 0 = legacy).
+        base = int(step.get("window_ordinal_base") or 0)
         if step.get("blocked_on"):
             # Reaches here only under the operator's explicit --skip-blocked:
             # reported per-cell, executes nothing, gates a plain --seal below.
             outcomes.append(_Outcome(row_key, dataset, "skipped-blocked"))
             continue
         if step.get("serving") is not None and not server_ok:
-            _write_failed_sentinel(campaign_root, row_key, dataset, "relaunch-failed")
+            _write_failed_sentinel(
+                campaign_root, row_key, dataset, "relaunch-failed", base
+            )
             outcomes.append(_Outcome(row_key, dataset, "skipped-launch-failed"))
             continue
-        done = count_complete_windows(campaign_root, row_key, dataset)
+        done = count_complete_windows(
+            campaign_root,
+            row_key,
+            dataset,
+            ordinal_base=base,
+            expected=int(step["windows"]),
+        )
         if not force_rerun and done >= int(step["windows"]):
-            _clear_failed_sentinel(campaign_root, row_key, dataset)
+            _clear_failed_sentinel(campaign_root, row_key, dataset, base)
             outcomes.append(_Outcome(row_key, dataset, "skipped-complete"))
             continue
         argv = list(step["argv"]) + ["--campaign-root", str(campaign_root)]
         rc = _exec(argv, step["env"])
         if rc == 0:
-            _clear_failed_sentinel(campaign_root, row_key, dataset)
+            _clear_failed_sentinel(campaign_root, row_key, dataset, base)
             outcomes.append(_Outcome(row_key, dataset, "ok"))
         else:
-            _write_failed_sentinel(campaign_root, row_key, dataset, f"runner-exit-{rc}")
+            _write_failed_sentinel(
+                campaign_root, row_key, dataset, f"runner-exit-{rc}", base
+            )
             outcomes.append(_Outcome(row_key, dataset, "failed"))
 
     # ---- summary matrix (per-cell outcomes; the operator's at-a-glance) ----

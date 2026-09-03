@@ -265,7 +265,8 @@ def test_cli_writes_artifact_and_echoes_inputs(tmp_path, capsys):
         "out": str(out),
     }
     assert table["provenance"]["kv_formula"] == "2*40*8*128*2"
-    assert table["provenance"]["charter_refs"] == ["P6", "6.1", "6.8"]
+    # "6.4" added with the anchor-fine grid registration (W4.3).
+    assert table["provenance"]["charter_refs"] == ["P6", "6.1", "6.4", "6.8"]
     assert len(table["rows"]) == 5
     assert table["rows"][3]["kv_token_capacity"] == 147_456
 
@@ -309,3 +310,55 @@ def test_schema_round_trips_through_json():
     # turn into lists, no ints that turn into floats, nothing unserializable.
     table = ft.build_floor_table(**_ANCHOR)
     assert json.loads(json.dumps(table)) == table
+
+
+# --------------------------------------------------------------------------- #
+# W4.3 — the §6.4 anchor-fine grid (7 levels; per-row rate fractions)
+# --------------------------------------------------------------------------- #
+
+
+def test_anchor_fine_grid_levels_and_per_row_fractions():
+    # §6.4 verbatim: r ∈ {1.5, 1.25, 1.0, 0.75, 0.5, 0.375, 0.25} at the two
+    # chassis rates {0.85, 1.05}·λ*; the 5 factorial levels keep the full
+    # 6-rate factorial (they ARE factorial rows), the 2 fine-only levels
+    # carry EXACTLY the two §6.4 rates — predicting the other 4 would
+    # over-claim.
+    assert ft.ANCHOR_FINE_BUDGET_LEVELS == (1.5, 1.25, 1.0, 0.75, 0.5, 0.375, 0.25)
+    assert ft.ANCHOR_FINE_RATE_FRACTIONS == (0.85, 1.05)
+    table = ft.build_floor_table(**{**_ANCHOR, "grid": "anchor-fine"})
+    assert [row["r"] for row in table["rows"]] == [1.5, 1.25, 1.0, 0.75, 0.5, 0.375, 0.25]
+    for row in table["rows"]:
+        if row["r"] in (1.25, 0.375):
+            assert row["rate_fractions"] == [0.85, 1.05]
+        else:
+            assert row["rate_fractions"] == list(D6_RATE_FRACTIONS)
+        assert row["offered_rates_rps_pred"] == [
+            f * row["lambda_star_pred_rps"] for f in row["rate_fractions"]
+        ]
+    assert table["provenance"]["rate_fractions_source"] == (
+        "load_generator.D6_RATE_FRACTIONS + ANCHOR_FINE_RATE_FRACTIONS "
+        "(§6.4 fine-only rows)"
+    )
+
+
+def test_anchor_fine_only_rows_exact_arithmetic():
+    # Same hand-derivation recipe as the full-grid pin (D = 48_318_382_080 B,
+    # per_seq = 5_368_709_120 B, W = 8.0 s), on the two fine-only levels:
+    #   r=1.25:  budget = floor(1.25 × D) = 60_397_977_600
+    #            tokens = budget // 163_840 = 368_640
+    #            ceiling = budget // per_seq = 11;  λ_KV = 11/8 = 1.375
+    #   r=0.375: budget = floor(0.375 × D) = 18_119_393_280
+    #            tokens = 110_592;  ceiling = 3;  λ_KV = 3/8 = 0.375
+    table = ft.build_floor_table(**{**_ANCHOR, "grid": "anchor-fine"})
+    rows = _rows_by_r(table)
+    assert rows[1.25]["budget_bytes"] == 60_397_977_600
+    assert rows[1.25]["kv_token_capacity"] == 368_640
+    assert rows[1.25]["concurrency_ceiling"] == 11
+    assert rows[1.25]["lambda_kv_rps"] == 1.375
+    assert rows[0.375]["budget_bytes"] == 18_119_393_280
+    assert rows[0.375]["kv_token_capacity"] == 110_592
+    assert rows[0.375]["concurrency_ceiling"] == 3
+    assert rows[0.375]["lambda_kv_rps"] == 0.375
+    # the shared factorial rows stay byte-identical to the full-grid pins
+    assert rows[1.0]["budget_bytes"] == 48_318_382_080
+    assert rows[1.0]["concurrency_ceiling"] == 9
