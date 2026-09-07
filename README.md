@@ -6,6 +6,42 @@ actually buy — serving performance (TTFT, latency, throughput, KV telemetry) *
 with answer quality (grounding, faithfulness, abstention) — across engines, models,
 and memory-pressure regimes.
 
+## Why this exists
+
+LLM serving benchmarks and quality benchmarks live in different worlds. Serving
+frameworks (vLLM, SGLang, LMDeploy) and the stacks built on them compete on tokens
+per second, TTFT, and inter-token latency; RAG and hallucination evaluators score
+faithfulness on outputs collected in isolation, with no serving system under stress.
+Neither measures the situation that actually breaks production deployments: the KV
+cache running out of GPU memory while requests keep arriving. When that happens,
+engines evict, preempt, recompute, and retract — and every one of those policies can
+silently change *what the model answers*, not just how fast.
+
+CAGE's objective is to measure that blind spot with one number and one attribution
+story:
+
+- **Serving yield (Y)** — requests that are *both* on time (SLO-bound) and truthful
+  (a registered, abstention-aware correctness predicate), per second. Reported beside
+  plain goodput G, the **truth tax** (G − Y: throughput paid for wrong answers), and
+  an independence null, so a coupling between speed and truth is a measured effect,
+  not an anecdote.
+- **Mechanism attribution** — pressure is applied as an exact byte budget (verified
+  against the engine's own startup logs), occupancy is recomputed from CAGE's own
+  request accounting rather than trusted from engine gauges, and a layered quality
+  ladder (retrieval adequacy → correctness → grounding → degradation taxonomy) traces
+  each failure to the stage that caused it. The engine under test is never the referee
+  of its own experiment.
+
+The comparison spans four engines (vLLM, SGLang, LMDeploy, and an HF Transformers
+correctness oracle that is never pressured), twelve context-management baselines
+(fresh vs cache-reuse vs retrieval vs compression), eight datasets chosen to isolate
+one property each, and both single-node and distributed topologies — including
+tensor parallelism versus prefill/decode disaggregation at matched aggregate memory
+and GPU count, so the cost of distributing the cache is itself a measured contrast.
+The entire analysis is pre-registered (frozen contrasts, gatekeeping, power
+simulation, blinded scoring) so the boring result publishes as credibly as the
+exciting one.
+
 > **Start here**
 > - [`docs/RUNBOOK.md`](docs/RUNBOOK.md) — execution authority: setup → preflight →
 >   run → sync → verified pull + teardown (RunPod-first; env contract table inside)
@@ -28,10 +64,13 @@ and memory-pressure regimes.
 - **RunPod is the primary cloud** (owner directive 2026-08-18); GCP support is a
   retained port (`terraform/gcp/`, `scripts/gcp/setup_gpu_cloud.sh`,
   `scripts/gcp/teardown_vm.sh`).
-- The campaign results producer (`src/orchestration/campaign_layout.py`: manifest,
-  cell/window tree, run-end ledger seal) is built and tested; the CellSpec-native
-  campaign driver that wires it into the run loop is in progress. The runnable
-  `scripts/3_run/` harness is pilot-era and fenced as such in its headers.
+- The **campaign engineering is complete**: the CellSpec-native driver
+  (`scripts/3_run/run_campaign.py`, plan→run split with pinned window counts), the
+  sealed results producer (`src/orchestration/campaign_layout.py`), the distributed
+  serving stack (TP pass-through, prefill/decode pair with NIXL transfer config), and
+  the registered analysis chain are built and covered by a 3,000+ test offline suite.
+  Legacy pilot runners under `scripts/3_run/` remain fenced as pilot-era in their
+  headers.
 
 ## What a campaign run looks like
 
@@ -40,8 +79,11 @@ and memory-pressure regimes.
 bash scripts/runpod/setup_runpod.sh                          # container-shaped bootstrap
 source cage-env/bin/activate
 export CAGE_BACKUP_TARGET=s3://<network-volume>[/prefix]      # J4: no backup target -> run refuses
-bash scripts/checks/preflight_check.sh <MODEL> <API_BASE>     # gates (a)-(p); non-zero = do NOT launch
-nohup bash scripts/3_run/run_full_sweep.sh <MODEL> <N> <T> > sweep.log 2>&1 &
+bash scripts/checks/preflight_check.sh <MODEL> <API_BASE>     # gates (a)-(s); non-zero = do NOT launch
+
+# campaign path: mint a reviewable plan first, then execute it
+python3 scripts/3_run/run_campaign.py plan --session a --floor-table <floor.json> > plan.json
+python3 scripts/3_run/run_campaign.py run  --plan plan.json                       # per-window resume; seals at end
 
 # from the workstation, when the run is drained
 scripts/runpod/teardown_pod.sh <pod_id> <backup_target> <local_run_dir>
