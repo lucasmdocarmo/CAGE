@@ -44,7 +44,10 @@ class CompletionRequest(BaseModel):
     model: str
     prompt: str
     max_tokens: int = 100
-    temperature: float = 0.7
+    # 0.0 = greedy, the campaign's determinism contract. model_dump() at forward
+    # time materializes this default into temperature-less requests, so a
+    # non-zero value here would inject sampling in flight.
+    temperature: float = 0.0
     top_p: float = 0.95
     stop: Optional[List[str]] = None
 

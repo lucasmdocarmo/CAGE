@@ -1,8 +1,20 @@
 """
-Baseline configurations for CAGE benchmarking.
+Baseline configurations for CAGE benchmarking — PILOT-ERA taxonomy.
 
-Nine measured families (the ``BaselineType`` enum below is the source of truth; keep this
-list in sync with it):
+AUTHORITY NOTE (2026-09-07): this enum is NOT the campaign's baseline registry.
+The registered campaign identity lives in ``src/analysis/cellspec.py`` — the
+§7.1 arm vocabulary plus the numbered B1–B12 layer (FRESH/REUSE reuse bits,
+per-family arm legality) — and reaches the runner through run_campaign.py's
+``CAGE_CELL_*`` env seam, never through ``BaselineType``. This module stays
+load-bearing for exactly two things: (1) pilot-mode mechanism configuration
+consumed by run_experiment.py, and (2) the legacy names that
+``cellspec.from_legacy`` translates so pilot result trees stay readable.
+Campaign-only arms (retr-store, retr-trunc, corpus-trunc, corpus-prefix
+variants) are deliberately absent from this enum — they exist in cellspec,
+and adding them here would create a second, competing registry.
+
+Nine PILOT measured families (the ``BaselineType`` enum below is the source of
+truth for THIS legacy list; keep the list in sync with it):
 1.  no_cache        - full context reprocessing (worst-case control)
 2.  prefix_cache    - vLLM native prefix caching (server launched with --enable-prefix-caching)
 3.  redis           - Redis-backed RETRIEVAL-ARTIFACT cache (query->doc-ids), NOT a KV cache

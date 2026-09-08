@@ -13,13 +13,13 @@ def test_inference_request_creation():
     request = InferenceRequest(
         prompt="Test prompt",
         max_tokens=50,
-        temperature=0.7,
+        temperature=0.0,
         request_id="test_123",
     )
-    
+
     assert request.prompt == "Test prompt"
     assert request.max_tokens == 50
-    assert request.temperature == 0.7
+    assert request.temperature == 0.0
     assert request.request_id == "test_123"
 
 

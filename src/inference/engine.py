@@ -16,7 +16,7 @@ class InferenceRequest:
     
     prompt: str
     max_tokens: int = 100
-    temperature: float = 0.7
+    temperature: float = 0.0  # greedy decoding is the campaign's determinism contract
     top_p: float = 0.95
     stop: Optional[List[str]] = None
     truncate_prompt_tokens: Optional[int] = None

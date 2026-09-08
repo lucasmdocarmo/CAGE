@@ -921,8 +921,9 @@ def test_hf_oracle_mismatched_prefix_fails_closed(monkeypatch):
 
 def test_hf_oracle_rejects_sampling_temperature(monkeypatch):
     adapter, _model, _tok = _oracle(monkeypatch)
-    # InferenceRequest defaults to temperature=0.7 -- the oracle must refuse.
-    req = InferenceRequest(prompt="hello there", request_id="q1")
+    # Sampling must be requested explicitly (the default is 0.0 greedy) -- the
+    # oracle must refuse any temperature != 0.
+    req = InferenceRequest(prompt="hello there", temperature=0.7, request_id="q1")
     with pytest.raises(ValueError, match="T=0 greedy"):
         adapter.generate(req)
 

@@ -53,7 +53,7 @@ exciting one.
 >   VERIFY-LIVE matrix
 >
 > The design authority (groups, arms, matrices, statistics) is the publication
-> charter, `MyDocs/PUBLICATION.md` — an untracked working document until the
+> charter, `MyDocs/Publication/PUBLICATION.md` — an untracked working document until the
 > registration freeze embeds it.
 
 ## Status (honest)
