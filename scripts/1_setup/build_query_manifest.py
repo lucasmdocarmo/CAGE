@@ -22,6 +22,12 @@ Every manifest (natural mode included) carries the MEASURED realized overlap in
 its "overlap" field; --overlap-target additionally gates fail-closed (a target
 the corpus cannot realize refuses with realized-vs-target, no silent best-effort).
 
+B12 corpus-truncation ladder (charter §7.7(d), ADR-0106): every manifest also
+carries "trunc_rungs" for --trunc-budgets (default "1400,700"; "" = none): the
+same packed blocks truncated in packing order at each descending rung, every
+pool query labeled in-corpus / out-of-corpus by construction. A rung >= the
+block budget refuses (that point of the ladder is B3's own cell).
+
 Needs the `datasets` package (loads the real split); pure CPU, no GPU/serving.
 """
 from __future__ import annotations
@@ -30,9 +36,27 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import List, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
+
+
+def parse_trunc_budgets(raw: str) -> Tuple[int, ...]:
+    """'1400,700' -> (1400, 700); '' -> (). Malformed entries refuse loudly."""
+    text = (raw or "").strip()
+    if not text:
+        return ()
+    out: List[int] = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(int(part))
+        except ValueError:
+            raise SystemExit(f"--trunc-budgets: {part!r} is not an integer") from None
+    return tuple(out)
 
 
 def main() -> int:
@@ -57,10 +81,16 @@ def main() -> int:
     p.add_argument("--overlap-group-size", type=int, default=4,
                    help="Engineered mode: questions per planned query group "
                         "(>= 2; default 4).")
+    p.add_argument("--trunc-budgets", default="1400,700",
+                   help="B12 ladder (ADR-0106): comma list of DESCENDING corpus "
+                        "rung budgets, each < --block-budget (default '1400,700'; "
+                        "'' disables). The manifest then serves every corpus-trunc "
+                        "rung; a rung >= the block budget REFUSES.")
     p.add_argument("--out", default=None,
                    help="Default: data/manifests/<dataset>_<N>x<T>_seed<seed>"
                         "[_ov<target>].json")
     args = p.parse_args()
+    trunc_budgets = parse_trunc_budgets(args.trunc_budgets)
 
     from src.data.loader import get_loader, gold_only
     from src.data.manifest import build_manifest
@@ -89,6 +119,7 @@ def main() -> int:
         overlap_target=args.overlap_target,
         overlap_tolerance=args.overlap_tolerance,
         overlap_group_size=args.overlap_group_size,
+        trunc_budgets=trunc_budgets,
     )
 
     # An engineered store is a DIFFERENT artifact than the natural manifest for
@@ -115,6 +146,9 @@ def main() -> int:
           f"measured_mean_shared_fraction="
           f"{'None' if frac is None else f'{frac:.3f}'} "
           f"pairs={m['n_pairs']} multi_question_groups={m['n_multi_question_groups']}")
+    for b_str, rung in manifest["trunc_rungs"].items():
+        print(f"  trunc rung {b_str}: in_corpus={rung['n_in_corpus']} "
+              f"out_of_corpus={rung['n_out_of_corpus']}")
     print("  export CAGE_QUERY_MANIFEST=" + str(out))
     return 0
 

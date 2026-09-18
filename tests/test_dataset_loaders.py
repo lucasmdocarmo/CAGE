@@ -452,3 +452,68 @@ def test_squad_v2_is_impossible_derived_from_empty_answers(monkeypatch):
     assert unanswerable.answer == ""
     assert unanswerable.metadata["is_impossible"] is True
     assert unanswerable.metadata["all_answers"] == []
+
+
+# ---------------------------------------------------------------------------
+# Backlog A8 (Tier A): typed accessor for the loader's answerability flag, and
+# SQuAD v2 rows threaded flag-first through the quality scorer.
+# ---------------------------------------------------------------------------
+
+
+def test_a8_is_impossible_flag_accessor():
+    """Absent key (answerable-only datasets) -> None; bool -> itself; a non-bool
+    value is a schema violation and is refused with a typed error, never coerced."""
+    from src.data.loader import (
+        IS_IMPOSSIBLE_KEY, AnswerabilityFlagError, is_impossible_flag,
+    )
+
+    assert IS_IMPOSSIBLE_KEY == "is_impossible"
+    assert is_impossible_flag(None) is None
+    assert is_impossible_flag({}) is None
+    assert is_impossible_flag({"dataset": "hotpotqa"}) is None
+    assert is_impossible_flag({"is_impossible": True}) is True
+    assert is_impossible_flag({"is_impossible": False}) is False
+    for bad in (1, 0, "True", None):
+        with pytest.raises(AnswerabilityFlagError):
+            is_impossible_flag({"is_impossible": bad})
+    assert issubclass(AnswerabilityFlagError, TypeError)
+
+
+def test_a8_squad_v2_rows_score_flag_verified(monkeypatch):
+    """Loader flag threaded into the scorer: both SQuAD v2 rows verify against
+    their references (provenance flag-verified); a tampered row is refused."""
+    from src.data.loader import is_impossible_flag
+    from src.evaluation.quality import (
+        ANSWERABILITY_FLAG_VERIFIED, AnswerabilityMismatchError, QualityEvaluator,
+    )
+
+    install_fake_datasets(monkeypatch, make_squad_v2_rows())
+    answerable, unanswerable = SquadV2Loader(split="validation").load()
+    ev = QualityEvaluator(
+        use_nli=False, use_embeddings=False, use_bertscore=False,
+        use_rouge=False, use_lettucedetect=False,
+    )
+    m_ans = ev.evaluate(
+        question=answerable.question, context=answerable.context,
+        generated_text="Paris", reference_answer=answerable.answer,
+        all_answers=answerable.metadata["all_answers"],
+        is_impossible=is_impossible_flag(answerable.metadata),
+    )
+    assert m_ans.is_answerable == 1.0 and m_ans.exact_match == 1.0
+    assert m_ans.answerability_provenance == ANSWERABILITY_FLAG_VERIFIED
+    m_un = ev.evaluate(
+        question=unanswerable.question, context=unanswerable.context,
+        generated_text="Don't know.", reference_answer=unanswerable.answer,
+        all_answers=unanswerable.metadata["all_answers"],
+        is_impossible=is_impossible_flag(unanswerable.metadata),
+    )
+    assert m_un.is_answerable == 0.0 and m_un.no_answer_correct == 1.0
+    assert m_un.answerability_provenance == ANSWERABILITY_FLAG_VERIFIED
+    # A loader regression that emits a gold answer on a flagged-unanswerable row
+    # (or vice versa) is refused instead of silently flipping answerability.
+    with pytest.raises(AnswerabilityMismatchError):
+        ev.evaluate(
+            question=unanswerable.question, context=unanswerable.context,
+            generated_text="Paris", reference_answer="Paris", all_answers=["Paris"],
+            is_impossible=is_impossible_flag(unanswerable.metadata),
+        )

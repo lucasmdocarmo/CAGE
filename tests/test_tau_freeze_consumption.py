@@ -91,6 +91,10 @@ def _sealed_qasper_run(
             json.dumps({
                 "example_id": f"e{i}", "repeat_index": 0, "record_index": None,
                 "ok": True, "error": None, "empty_generation": False,
+                # ADR-0114: the loader-resolved labels select the Qasper
+                # clause; these rows take clause 3 (grounding at tau), the
+                # one the freeze-consumed tau feeds.
+                "answer_type": "abstractive", "is_impossible": False,
             }) + "\n"
             for i in range(len(grounding_scores))
         ),

@@ -192,6 +192,53 @@ def test_from_cli_refuses_top_k_sweep(tmp_path: Path) -> None:
         cs.CampaignCellSession.from_cli(_Args(), env={})
 
 
+def test_from_cli_refuses_stale_index_escape_hatch(tmp_path: Path) -> None:
+    # Backlog A6 / F6 (review 2026-09-17 defect 2): the campaign path must never
+    # run under CAGE_ALLOW_STALE_INDEX (presence, any value).
+    from src.orchestration.ir import STALE_INDEX_OPT_IN_ENV
+
+    assert cs.STALE_INDEX_OPT_IN_ENV == STALE_INDEX_OPT_IN_ENV
+
+    class _Args:
+        campaign_root = str(_run_root(tmp_path))
+        baseline = "no_cache"
+        baseline_label = None
+        backend = "vllm"
+        model = "qwen3-14b"
+        dataset = "squad_v2"
+        num_trials = 1
+        seed = 7
+        kv_cache_dtype = None
+        top_k_sweep = False
+
+    for value in ("1", "0", ""):
+        with pytest.raises(cs.CampaignSessionError, match="CAGE_ALLOW_STALE_INDEX"):
+            cs.CampaignCellSession.from_cli(
+                _Args(), env={"CAGE_GPU_COUNT": "1", cs.STALE_INDEX_OPT_IN_ENV: value},
+            )
+
+
+def test_emit_window_refuses_a_stale_index_summary(tmp_path: Path) -> None:
+    # The runner persists ir_index.stale_index_opt_in into metrics.json
+    # ["experiment"]; a True there means retrieval ran out-of-distribution and
+    # the window is refused BEFORE any artifact is written.
+    session = _session(tmp_path)
+    for summary in (
+        {"experiment": {"stale_index_opt_in": True}},
+        {"experiment": {"stale_index_opt_in": "1"}},  # non-bool: never coerced
+    ):
+        with pytest.raises(cs.CampaignSessionError, match="stale_index_opt_in"):
+            session.emit_window(
+                ordinal=1, trial_seed=7, results_rows=[], staging_dir=tmp_path,
+                experiment_summary=summary, backend_metadata={},
+                telemetry_snapshot=None, t_start=0.0, t_end=1.0,
+            )
+    assert not (session.run_root / "manifest.json").exists()
+    assert cs.refuse_stale_index_summary({"experiment": {"stale_index_opt_in": False}}) is None
+    with pytest.raises(cs.CampaignSessionError, match="stale_index_opt_in"):
+        cs.refuse_stale_index_summary({"experiment": {}})  # absent: not a valid window
+
+
 # ---------------------------------------------------------------------------
 # Write-time hash journal + seal cross-check (S0-15)
 # ---------------------------------------------------------------------------
@@ -372,3 +419,48 @@ def test_cell_dir_cli_requires_campaign_root(
     rc = cs.main(["cell-dir", "--baseline", "no_cache", "--model", "qwen3-14b"])
     assert rc == 2
     assert "CAGE_CAMPAIGN_ROOT" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# ADR-0106: the B12 rung rides the CAGE_CELL_CORPUS_BUDGET env seam
+# ---------------------------------------------------------------------------
+
+
+def _derive(env: dict[str, str]) -> CellSpec:
+    return cs.derive_cell_spec(
+        baseline="prefix_cache", baseline_label=None, backend="vllm",
+        model="qwen3-14b", env=env,
+    )
+
+
+def test_derive_corpus_budget_round_trips_to_the_rung_row_key() -> None:
+    spec = _derive({
+        "CAGE_CELL_ARM": "corpus-trunc",
+        "CAGE_CELL_RETRIEVER": "none",
+        "CAGE_CELL_FAMILY": "F3",
+        "CAGE_CELL_BUDGET_R": "0.5",
+        "CAGE_CELL_RATE_FRAC": "0.8",
+        "CAGE_CELL_CORPUS_BUDGET": "700",
+    })
+    assert spec.corpus_budget_tokens == 700
+    assert spec.to_row_key() == (
+        "corpus-trunc|none|none|single|vllm|qwen3-14b|F3|r0.5|lam0.8|cb700"
+    )
+    # Absent stays absent (never a default rung).
+    plain = _derive({"CAGE_CELL_ARM": "corpus-trunc", "CAGE_CELL_RETRIEVER": "none"})
+    assert plain.corpus_budget_tokens is None
+
+
+def test_derive_corpus_budget_refusals_are_fail_closed() -> None:
+    base = {"CAGE_CELL_ARM": "corpus-trunc", "CAGE_CELL_RETRIEVER": "none"}
+    with pytest.raises(cs.CampaignSessionError, match="CAGE_CELL_CORPUS_BUDGET"):
+        _derive({**base, "CAGE_CELL_CORPUS_BUDGET": "seven-hundred"})
+    with pytest.raises(cs.CampaignSessionError, match="CAGE_CELL_CORPUS_BUDGET"):
+        _derive({**base, "CAGE_CELL_CORPUS_BUDGET": "0"})
+    # A rung on a non-trunc arm surfaces CellSpec's own gate.
+    with pytest.raises(cs.CampaignSessionError, match="charter-illegal"):
+        _derive({
+            "CAGE_CELL_ARM": "corpus-reuse",
+            "CAGE_CELL_RETRIEVER": "none",
+            "CAGE_CELL_CORPUS_BUDGET": "1400",
+        })

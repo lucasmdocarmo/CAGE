@@ -140,6 +140,15 @@ _CHARTER_MODELS: frozenset[str] = frozenset(_get_args(Model))
 _CELLSPEC_SCHEMA_VERSION = 1
 
 
+#: The pilot-archive escape hatch of ``src.orchestration.ir`` (backlog F6),
+#: mirrored here by literal so this import-light module never loads the IR
+#: stack; ``tests/test_campaign_session.py`` pins the two equal. The campaign
+#: path refuses on PRESENCE (review 2026-09-17, backlog A6): a stale
+#: (pre-prefix) dense index serves retrieval out-of-distribution, and a window
+#: measured that way would be mislabeled data.
+STALE_INDEX_OPT_IN_ENV: str = "CAGE_ALLOW_STALE_INDEX"
+
+
 class CampaignSessionError(RuntimeError):
     """Campaign-mode contract violation; carries EVERY problem found."""
 
@@ -238,7 +247,9 @@ def derive_cell_spec(
        — the pilot-vocabulary path the existing shell runners speak.
     ``CAGE_CELL_POLICY`` / ``CAGE_CELL_FAMILY`` / ``CAGE_CELL_TOPOLOGY`` /
     ``CAGE_CELL_BUDGET_R`` / ``CAGE_CELL_RATE_FRAC`` override individual axes
-    either way. ``CellSpec.__post_init__`` stays the one validity gate.
+    either way; ``CAGE_CELL_CORPUS_BUDGET`` carries the ADR-0106 B12 rung
+    (absent = no rung coordinate, never a default). ``CellSpec.__post_init__``
+    stays the one validity gate.
     """
     env = os.environ if env is None else env
     problems: list[str] = []
@@ -284,6 +295,10 @@ def derive_cell_spec(
     topology = (env.get("CAGE_CELL_TOPOLOGY") or "").strip() or topology_default
     budget_r = _env_float(env, "CAGE_CELL_BUDGET_R", problems)
     rate_frac = _env_float(env, "CAGE_CELL_RATE_FRAC", problems)
+    corpus_budget_tokens = _env_int(
+        env, "CAGE_CELL_CORPUS_BUDGET", problems, minimum=1,
+        why="the B12 corpus-trunc rung budget in tokens (ADR-0106)",
+    )
 
     try:
         model_slug = resolve_model_slug(model, env)
@@ -305,6 +320,7 @@ def derive_cell_spec(
             family=family,  # type: ignore[arg-type]
             budget_r=budget_r,
             rate_frac=rate_frac,
+            corpus_budget_tokens=corpus_budget_tokens,
         )
     except (CellSpecError, ValueError) as exc:
         raise CampaignSessionError(
@@ -424,6 +440,27 @@ def seal_campaign_run(run_root: Path) -> Path:
 # ---------------------------------------------------------------------------
 # JSON normalization (numpy -> native; fail loud on anything else)
 # ---------------------------------------------------------------------------
+
+
+def refuse_stale_index_summary(experiment_summary: Mapping[str, Any]) -> None:
+    """Refuse a window whose runner summary says a stale index was served.
+
+    ``run_experiment.py`` persists ``ir_index.stale_index_opt_in`` under
+    ``metrics.json["experiment"]["stale_index_opt_in"]`` (False when no dense
+    index was used). Only a literal ``False`` passes: ``True`` is
+    out-of-distribution retrieval, a non-bool is never coerced, and an ABSENT
+    key is a pre-A6 runner whose provenance cannot be trusted (backlog A6/F6).
+    """
+    experiment = experiment_summary.get("experiment")
+    value = experiment.get("stale_index_opt_in") if isinstance(experiment, Mapping) else None
+    if value is False:
+        return
+    raise CampaignSessionError(
+        f"experiment.stale_index_opt_in is {value!r}; a campaign window must "
+        "record False (a stale pre-prefix dense index served under "
+        f"{STALE_INDEX_OPT_IN_ENV} is refused, backlog A6/F6; an absent key is "
+        "a runner without the provenance field)"
+    )
 
 
 def _normalize_json(value: Any) -> Any:
@@ -570,6 +607,12 @@ class CampaignCellSession:
         root = getattr(args, "campaign_root", None) or (env.get("CAGE_CAMPAIGN_ROOT") or "").strip()
         if not root:
             return None
+        if STALE_INDEX_OPT_IN_ENV in env:
+            raise CampaignSessionError(
+                f"{STALE_INDEX_OPT_IN_ENV} is set ({env[STALE_INDEX_OPT_IN_ENV]!r}); "
+                "campaign mode never serves a stale (pre-prefix) dense index "
+                "(backlog A6/F6), unset it or rebuild with --rebuild-ir-index"
+            )
         if getattr(args, "top_k_sweep", False):
             raise CampaignSessionError(
                 "--top-k-sweep varies top_k INSIDE one cell identity; a campaign "
@@ -898,6 +941,7 @@ class CampaignCellSession:
         t_end: float,
     ) -> Any:
         """Emit ONE §1 measurement window through campaign_layout's writers."""
+        refuse_stale_index_summary(experiment_summary)
         cl = _campaign_layout()
         run = self._ensure_run(backend_metadata)
         cell = run.cell(self.spec, gpu_count=self.gpu_count)

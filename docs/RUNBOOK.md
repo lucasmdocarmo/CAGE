@@ -192,6 +192,67 @@ nohup bash scripts/3_run/cloud_run.sh <MODEL> <N> <T> > run.log 2>&1 &
   regime, not a mock): the box's job is serving measurements + raw outputs + evidence;
   model-based quality is scored after the serving trees.
 
+### 4.0 Query manifests: build, register, and the blocked B12 rung cells
+
+Every QA dataset of a session measures ONE pre-drawn query manifest (the uniform
+yardstick, `scripts/1_setup/build_query_manifest.py`): build it at the grid's
+`corpus_prefix_budget_tokens` (2,800) with `--trunc-budgets 1400,700` so the file
+carries the B12 corpus-truncation ladder (ADR-0106), with `--num-trials` equal to the
+grid's `replications` and `--num-queries` at least the largest per-row-class n the
+session grid registers for that dataset (A9: the n per row class lives in
+`SessionGrid`, `n_primary`/`n_secondary`/`n_identity`/`window_requests`, lowered only
+via `achievable_n`; the runner measures the first n ids of each trial, so a shorter
+trial refuses at plan time, before any GPU spends). A dataset whose split cannot
+supply the class n (Qasper dev is about 1,005 questions; MuSiQue likely too) MUST have
+its lowered n registered in the session grid's `achievable_n` first: `plan
+--query-manifest qasper=...` REFUSES until `achievable_n["qasper"]` is registered
+(sessions a and b register `achievable_n={}` today, so that refusal is the expected
+state, not a bug). Register each manifest with
+`plan --query-manifest DATASET=PATH` (repeatable, one per dataset); the plan validates
+that the file exists, parses, is for that dataset, carries `block_budget` equal to the
+grid budget and every registered rung, and records `path`, `sha256`, `block_budget`
+and `trunc_rungs` under the header's `query_manifests`. A B12 rung cell whose dataset
+has no registered manifest is still enumerated, but BLOCKED (`blocked_on:
+query-manifest:<dataset>`), and `run` refuses the whole plan unless the operator
+passes `--skip-blocked` (which runs the executable subset loudly and gates a plain
+`--seal`).
+
+```bash
+# one manifest per QA dataset, at the grid's block budget, with the B12 ladder
+python3 scripts/1_setup/build_query_manifest.py --dataset squad_v2 \
+    --num-queries 2000 --num-trials 3 --seed 42 \
+    --block-budget 2800 --trunc-budgets 1400,700
+# register each one on the plan (repeatable); unregistered datasets keep their B12 rung cells BLOCKED
+python3 scripts/3_run/run_campaign.py plan --session a \
+    --query-manifest squad_v2=data/manifests/squad_v2_2000x3_seed42.json \
+    --query-manifest hotpotqa=data/manifests/hotpotqa_2000x3_seed42_ov0.33.json \
+    --out plan.json
+```
+
+### 4.1 G1 confirmatory look from the registered SHA (added 2026-09-16, ADR-0112)
+
+The G1 whole-repo binding (HEAD equals the registered SHA, clean tree; ADR-0089) is
+satisfied procedurally: the confirmatory analysis runs from a detached git worktree
+checked out at the registered SHA, with the pulled results tree supplied read-only.
+Docs-only commits may continue on `main`; any post-freeze CODE change goes through the
+§9.11 amendment log and a re-registration (new SHA + OSF timestamp) before the
+confirmatory look. `--registered-sha` must match the executing checkout, so run the
+script from inside the worktree, never from `main`. The script writes its output to
+`<run>/analysis/<timestamp>/`, so only the data subtrees are made read-only.
+
+```bash
+# ADR-0112: confirmatory look from the registered SHA (one look, G1)
+CAGE_MAIN=/path/to/CAGE   # the worktree has no .venv; the interpreter comes from the main checkout, the code and HEAD from the worktree
+RUN=/path/to/results/<campaign>/<session>/<run_id>
+git worktree add /path/to/cage-registered <registered-sha>
+cd /path/to/cage-registered
+mkdir -p "$RUN"/analysis
+find "$RUN" -mindepth 1 -maxdepth 1 ! -name analysis -exec chmod -R a-w {} +   # sealed data read-only; analysis/ stays writable for stats.json
+"$CAGE_MAIN"/.venv/bin/python scripts/4_analysis/run_campaign_analysis.py \
+  "$RUN" \
+  --confirmatory --i-understand-one-look --registered-sha <registered-sha>
+```
+
 ## 5. Sync during the run, then the FAIL-CLOSED end sequence
 
 **During the run** (provider-neutral; every off-box byte goes through
@@ -255,6 +316,7 @@ manually, and only then uses `--force` — a user decision, reported as such.
 | `CAGE_QUALITY_STRICT` | `src/evaluation/quality.py`, gate (e) | Unset/`1` = strict fail-closed quality layer (default). An explicit falsy (`0`/`false`/`no`) downgrades instrument failures to `score=None` for the whole run — preflight FAILS on it; forbidden for confirmatory runs. |
 | `CAGE_CLAIM_CHECKER` | `src/evaluation/quality.py` | Claim-check instrument selection. Default `nli` (owner decision #120/F8, 2026-08-19; in-process-safe). `alignscore` is Instrument B and is requested explicitly by `scripts/4_analysis/score_instrument_b.py` — never as the run default. Preflight prints the state either way. |
 | `CAGE_SKIP_QUALITY=1` | run scripts | Decoupled-scoring regime (default in `run_full_sweep.sh`): inline model-based quality is skipped and scored after the serving trees. A *declared* regime, not a mock. |
+| `CAGE_QUERY_MANIFEST` | `run_experiment.py` (loader), `campaign_session.py` | Path to the dataset's pre-drawn query manifest (`build_query_manifest.py`); the runner's `--query-manifest` sets it (the campaign driver passes that flag on every cell of a registered dataset, §4.0). The loader refuses a manifest built for another dataset, and the corpus-budget guard (A4, ADR-0106) refuses a served budget that is neither its `block_budget` nor one of its `trunc_rungs`. `campaign_session.py` resolves `dataset_manifests_sha256` from it when `CAGE_DATASET_MANIFESTS_SHA256` is unset. |
 | `HF_HUB_DOWNLOAD_TIMEOUT` | `setup_runpod.sh`, HF downloads | Stalled-read timeout in seconds (default 30). Exported BEFORE dataset staging AND model prefetch (J7 — a stalled socket must raise, then resume, not hang for an hour). |
 | `CAGE_BACKUP_INTERVAL` | `gcs_backup_daemon.sh` | Seconds between mirror passes (default 300). |
 | `CAGE_POD_SSH` / `CAGE_ASSUME_YES` | `teardown_pod.sh` | `user@host` of the pod for the final on-pod sync (unset = that step skipped loudly); `CAGE_ASSUME_YES=1` answers the confirm ceremony for non-interactive teardowns. |

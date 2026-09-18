@@ -250,6 +250,72 @@ def test_engine_launchers_source_uniform_serving_config() -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# 2b. shared-GPU memory-utilization rule (backlog Tier A item A1; S0-9/S0-20)
+# ---------------------------------------------------------------------------
+
+MULTI_INSTANCE_LAUNCHERS: Dict[str, str] = {
+    # launcher -> the per-instance GPU-pin seam it must consult
+    "scripts/2_serving/manage_vllm_cluster.py": "--replica-gpus",
+    "scripts/2_serving/manage_vllm_pd.sh": "CAGE_PD_PREFILL_GPUS",
+}
+
+
+def test_multi_instance_launchers_carry_no_unconditional_0_90_default() -> None:
+    """A1 (S0-9, S0-20): vLLM's startup check requests --gpu-memory-utilization
+    of the device unconditionally, so a launcher that hands EVERY co-resident
+    instance `${VLLM_GPU_MEMORY_UTILIZATION:-0.90}` cannot start a second
+    instance on a shared GPU. The per-instance value must come from a
+    shared-vs-distinct decision, never from an inline 0.90 fallback."""
+    inline_default = re.compile(r"VLLM_GPU_MEMORY_UTILIZATION[\"']?\s*[,:]?-?\s*[\"']?0\.90")
+    offenders = []
+    for rel in MULTI_INSTANCE_LAUNCHERS:
+        text = _strip_heredoc_bodies((REPO_ROOT / rel).read_text(encoding="utf-8"))
+        for i, line in enumerate(text.splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue
+            if inline_default.search(line):
+                offenders.append(f"{rel}:{i}: {line.strip()}")
+    assert not offenders, (
+        "inline per-instance 0.90 fallback survives in a multi-instance launcher "
+        f"(A1 shared-GPU rule): {offenders}"
+    )
+
+
+def test_pd_launcher_defines_the_shared_gpu_rule_before_teardown() -> None:
+    """The bash rule mirrors the cluster launcher: a SHARED_GPU_MEM_UTIL=0.45
+    constant citing A1 + both S0 rows, a resolver function, and the resolver
+    called from the pre-teardown validation (start is self-cleaning: a
+    refusal that fired after stop_stack would kill a healthy stack)."""
+    text = (REPO_ROOT / "scripts/2_serving/manage_vllm_pd.sh").read_text(encoding="utf-8")
+    m = re.search(r"^SHARED_GPU_MEM_UTIL=0\.45\s*$", text, re.M)
+    assert m, "manage_vllm_pd.sh must define SHARED_GPU_MEM_UTIL=0.45"
+    # the constant's comment block (the lines right above it) cites the rows
+    above = "\n".join(text[: m.start()].splitlines()[-12:])
+    assert "A1" in above and "S0-9" in above and "S0-20" in above
+    assert re.search(r"^SHARED_GPU_MEM_UTIL_CEILING=0\.50\s*$", text, re.M)
+    assert re.search(r"^cage_resolve_pd_gpu_share\(\)\s*\{", text, re.M)
+    validate = text.index("cage_validate_pd_env() {")
+    validate_end = text.index("\n}\n", validate)
+    assert "cage_resolve_pd_gpu_share" in text[validate:validate_end], (
+        "the gpu-share resolver must run inside cage_validate_pd_env (before any teardown)"
+    )
+    assert "vLLM startup check" in text
+    # the decision is printed for the S0 evidence
+    assert "[cage] gpu-share decision:" in text
+    # sourceable for the bash-level unit test: dispatch guarded by BASH_SOURCE
+    assert 'if [ "${BASH_SOURCE[0]}" != "$0" ]' in text
+    for rel, seam in MULTI_INSTANCE_LAUNCHERS.items():
+        assert seam in (REPO_ROOT / rel).read_text(encoding="utf-8"), f"{rel} lacks {seam}"
+    # the A1 region (constant block through the end of the resolver) carries
+    # no em/en dashes (doctrine for code written under this item)
+    start = text.index("SHARED_GPU_MEM_UTIL=0.45")
+    resolver = text.index("cage_resolve_pd_gpu_share() {")
+    end = text.index("\n}\n", resolver)
+    region = text[start:end]
+    assert "\u2014" not in region and "\u2013" not in region, "no em/en dashes in the A1 region"
+
+
 def _git_ls_files() -> set:
     """Tracked paths (index-inclusive), or skip when git/its metadata is absent
     — a tarball deploy on the VM has no .git and BUILD_INFO is the provenance."""
@@ -461,4 +527,81 @@ def test_exact_pins_match_environment_when_installed() -> None:
     assert not mismatches, (
         "exact pins diverge from the installed environment (re-test then bump "
         "deliberately): " + "; ".join(mismatches)
+    )
+
+
+# ---------------------------------------------------------------------------
+# 5. SGLang launcher exposes /metrics (S0-23 smoke evidence; ADR-0102)
+# ---------------------------------------------------------------------------
+
+SGLANG_LAUNCHER = SCRIPTS_DIR / "2_serving" / "manage_sglang_server.sh"
+_ENABLE_METRICS_LINE = re.compile(r"^\s*sglang_args\+=\( --enable-metrics \)\s*$", re.M)
+_BASH_BLOCK_OPEN = re.compile(r"^\s*(if|for|while|until|case)\b")
+_BASH_BLOCK_CLOSE = re.compile(r"^\s*(fi|done|esac)\b")
+
+
+def _function_body(text: str, name: str) -> str:
+    start = text.index(f"{name}() {{")
+    end = text.index("\n}\n", start)
+    return text[start:end]
+
+
+def test_sglang_launcher_enables_metrics_unconditionally() -> None:
+    """S0-23 (ADR-0102): the campaign cold-start probe reads the running
+    requests gauge from GET /metrics before every reset and persists the
+    verdict as metrics.json['cold_start'].verified. SGLang serves /metrics
+    ONLY under --enable-metrics, so a launch without it turns every SGLang
+    window into verified: False (a WARNING, never a mislabeled row, but a
+    FAIL of S0-23). The flag must ride EVERY launch: at function depth of
+    start_server, outside any if/case block, never behind an env knob."""
+    text = _strip_heredoc_bodies(SGLANG_LAUNCHER.read_text(encoding="utf-8"))
+    body = _function_body(text, "start_server")
+    depth = 0
+    hits: List[int] = []
+    for i, line in enumerate(body.splitlines(), 1):
+        if line.lstrip().startswith("#"):
+            continue
+        if _ENABLE_METRICS_LINE.match(line):
+            hits.append(i)
+            assert depth == 0, (
+                f"--enable-metrics at start_server line {i} sits inside a "
+                f"conditional block (depth {depth}); it must be unconditional"
+            )
+        if _BASH_BLOCK_OPEN.match(line):
+            depth += 1
+        elif _BASH_BLOCK_CLOSE.match(line):
+            depth -= 1
+    assert len(hits) == 1, (
+        "start_server must add `sglang_args+=( --enable-metrics )` exactly "
+        f"once, found {len(hits)}"
+    )
+
+
+def test_sglang_launcher_reuse_requires_metrics_on_live_cmdline() -> None:
+    """Fail closed on reuse: an SGLang server started BEFORE this flag landed
+    (or by hand without it) has no /metrics endpoint; reusing it silently
+    would make every window of the run unverifiable. The dials_match block
+    must treat the flag's absence on the live cmdline as a mismatch."""
+    text = SGLANG_LAUNCHER.read_text(encoding="utf-8")
+    reuse = text[text.index("dials_match=true"):text.index("local timestamp log_file")]
+    assert re.search(
+        r'\[\[ " \$live_cmd " == \*" --enable-metrics "\* \]\] \|\| dials_match=false',
+        reuse,
+    ), "reuse path must require --enable-metrics on the live cmdline (space-anchored)"
+
+
+def test_sglang_metrics_flag_region_cites_adr_and_carries_no_dashes() -> None:
+    """The flag's comment block must cite ADR-0102 and S0-23 so the reason
+    survives a refactor, and the region written under this item carries no
+    em or en dashes (doctrine)."""
+    text = SGLANG_LAUNCHER.read_text(encoding="utf-8")
+    m = _ENABLE_METRICS_LINE.search(text)
+    assert m, "sglang_args+=( --enable-metrics ) missing"
+    above = "\n".join(text[: m.start()].splitlines()[-12:])
+    assert "ADR-0102" in above and "S0-23" in above, (
+        "the --enable-metrics comment block must cite ADR-0102 and S0-23"
+    )
+    region = above + "\n" + m.group(0)
+    assert "\u2014" not in region and "\u2013" not in region, (
+        "no em/en dashes in the --enable-metrics region"
     )

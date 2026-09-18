@@ -49,11 +49,56 @@ class DatasetUnavailableError(RuntimeError):
         )
 
 
+IS_IMPOSSIBLE_KEY: str = "is_impossible"
+"""Metadata key carrying a loader's answerability flag (backlog A8, Tier A).
+
+Loaders whose dataset has an unanswerable half (SQuAD v2, Qasper) write
+``metadata[IS_IMPOSSIBLE_KEY] = True`` on unanswerable rows alongside an empty
+``answer`` and an empty ``all_answers``; answerable rows carry ``False``.
+Answerable-only loaders (HotpotQA, MuSiQue, NQ, ...) never emit the key. The
+flag is AUTHORITATIVE where present: callers thread it into
+``src.evaluation.quality.QualityEvaluator`` via ``is_impossible_flag``, and the
+scorer refuses any row whose flag disagrees with its reference, so a loader
+change can never silently flip a row's answerability.
+"""
+
+
+class AnswerabilityFlagError(TypeError):
+    """``metadata["is_impossible"]`` is present but is not a bool (backlog A8).
+
+    A truthy/falsy stand-in (``1``, ``"True"``, ``None``) would be a silently
+    coerced label; the accessor refuses it instead so the mislabeled row can
+    never reach the scorer under a guessed answerability.
+    """
+
+    def __init__(self, value: Any) -> None:
+        self.value = value
+        super().__init__(
+            f"metadata[{IS_IMPOSSIBLE_KEY!r}] must be a bool when present, got "
+            f"{type(value).__name__} {value!r}; fix the loader, no coercion is applied"
+        )
+
+
+def is_impossible_flag(metadata: Optional[Dict[str, Any]]) -> Optional[bool]:
+    """Typed accessor for the loader's answerability flag (backlog A8, Tier A).
+
+    Returns ``None`` when the key is absent (answerable-only datasets, or
+    evidence rows written before the flag was threaded), the bool itself when
+    present, and raises ``AnswerabilityFlagError`` for any non-bool value.
+    """
+    if not metadata or IS_IMPOSSIBLE_KEY not in metadata:
+        return None
+    value = metadata[IS_IMPOSSIBLE_KEY]
+    if not isinstance(value, bool):
+        raise AnswerabilityFlagError(value)
+    return value
+
+
 @dataclass
 class CAGExample:
     """Single example for CAG evaluation."""
-    
-    id: str        
+
+    id: str
     question: str
     context: List[str]  # Supporting documents/passages
     answer: str

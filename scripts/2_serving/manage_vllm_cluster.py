@@ -23,13 +23,15 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import math
 import os
 import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import requests
 
@@ -39,7 +41,174 @@ LOG_DIR = PROJECT_DIR / "logs" / "cluster"
 STATE_FILE = LOG_DIR / "cluster_state.json"
 
 
-def build_serve_args(model: str, port: int) -> List[str]:
+# =============================================================================
+# Shared-GPU memory-utilization rule  (backlog Tier A item A1; S0-9 / S0-20)
+# =============================================================================
+
+SHARED_GPU_MEM_UTIL: float = 0.45
+"""Per-instance --gpu-memory-utilization DEFAULT when two or more vLLM
+instances share ONE GPU (backlog Tier A item A1; S0 checklist rows S0-9 and
+S0-20).
+
+vLLM 0.19.1's startup check requests the fraction of the device
+unconditionally, so a second instance launched at the 0.90 uniform operating
+point on a shared GPU is refused at startup and the S0-9 cluster proof (start,
+status, routed traffic, stop) cannot begin. Two instances at 0.45 each fit
+under the device with headroom for the CUDA contexts. This value is the
+DEFAULT only: VLLM_GPU_MEMORY_UTILIZATION still overrides it, subject to
+SHARED_GPU_MEM_UTIL_CEILING.
+"""
+
+SHARED_GPU_MEM_UTIL_CEILING: float = 0.50
+"""Largest explicit VLLM_GPU_MEMORY_UTILIZATION accepted per instance on a
+shared GPU (backlog A1). Above it the second instance cannot pass vLLM's
+startup check, so the launcher REFUSES rather than launching a cluster whose
+second replica dies after the first one has already claimed the device.
+"""
+
+DISTINCT_GPU_MEM_UTIL: float = 0.90
+"""Per-instance default when every instance is pinned to its own GPU set (or
+there is a single instance): the Option-A uniform operating point, mirroring
+scripts/lib/_serving_config.sh (VLLM_GPU_MEMORY_UTILIZATION default).
+"""
+
+
+class GpuShareError(ValueError):
+    """Typed refusal for the shared-GPU rule: malformed or overlapping replica
+    GPU pins, or a per-instance memory fraction the shared device cannot
+    honor. Raised BEFORE any process is stopped or started."""
+
+
+@dataclass(frozen=True)
+class GpuShareDecision:
+    """The resolved shared-vs-distinct regime for one cluster launch.
+
+    mode:        "shared" (some instance has no distinct pin) or "distinct".
+    mem_util:    the --gpu-memory-utilization string handed to EVERY instance.
+    source:      "default" (SHARED_GPU_MEM_UTIL / DISTINCT_GPU_MEM_UTIL) or
+                 "explicit" (VLLM_GPU_MEMORY_UTILIZATION honored).
+    replica_gpus: per-replica CUDA_VISIBLE_DEVICES value, None = unpinned.
+    """
+
+    mode: str
+    mem_util: str
+    source: str
+    replica_gpus: Tuple[Optional[str], ...]
+
+    def banner(self) -> str:
+        pins = ",".join("unpinned" if g is None else g.replace(",", "+") for g in self.replica_gpus)
+        rule = "SHARED_GPU_MEM_UTIL" if self.mode == "shared" else "DISTINCT_GPU_MEM_UTIL"
+        return (
+            f"[cage] gpu-share decision: {self.mode} (replica pins: {pins}) -> "
+            f"--gpu-memory-utilization {self.mem_util} per instance "
+            f"[{self.source}; rule {rule}, backlog A1 / S0-9 / S0-20]"
+        )
+
+    def as_state(self) -> Dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "mem_util": self.mem_util,
+            "source": self.source,
+            "replica_gpus": list(self.replica_gpus),
+        }
+
+
+def parse_replica_gpus(spec: Optional[str], replica_count: int) -> Tuple[Optional[str], ...]:
+    """Parse --replica-gpus into one CUDA_VISIBLE_DEVICES value per replica.
+
+    Grammar: comma-separated entries, one per replica; an entry that spans
+    several GPUs (tensor parallel) joins them with '+' ("0+1,2+3"). Entries
+    must be numeric and pairwise disjoint. None or blank means no pins at all
+    (every replica unpinned, ambient visibility). Anything else is a
+    GpuShareError: a partially or ambiguously pinned cluster must never be
+    labeled "distinct".
+    """
+    if spec is None or not spec.strip():
+        return tuple(None for _ in range(replica_count))
+    entries = spec.split(",")
+    if len(entries) != replica_count:
+        raise GpuShareError(
+            f"--replica-gpus {spec!r} names {len(entries)} replica pin(s) but "
+            f"--replicas is {replica_count}; give exactly one entry per replica "
+            f"(join a replica's several GPUs with '+', e.g. 0+1,2+3)"
+        )
+    seen: set = set()
+    pins: List[str] = []
+    for entry in entries:
+        devices = entry.split("+")
+        if any(not d.isdigit() for d in devices):
+            raise GpuShareError(
+                f"--replica-gpus {spec!r}: entry {entry!r} is not a '+'-joined "
+                f"list of GPU indices"
+            )
+        for d in devices:
+            if len(d) > 1 and d.startswith("0"):
+                raise GpuShareError(
+                    f"--replica-gpus {spec!r}: GPU index {d!r} has a leading zero; "
+                    f"write the plain index so disjointness is unambiguous"
+                )
+            if d in seen:
+                raise GpuShareError(
+                    f"--replica-gpus {spec!r}: GPU {d} appears in more than one "
+                    f"replica pin; pins must be pairwise disjoint or the "
+                    f"replicas share a device"
+                )
+            seen.add(d)
+        pins.append(",".join(devices))
+    return tuple(pins)
+
+
+def _parse_mem_util(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise GpuShareError(
+            f"VLLM_GPU_MEMORY_UTILIZATION={raw!r} is not a decimal fraction"
+        ) from exc
+    if not math.isfinite(value) or not 0.0 < value <= 1.0:
+        raise GpuShareError(
+            f"VLLM_GPU_MEMORY_UTILIZATION={raw!r} must be a fraction in (0, 1]"
+        )
+    return value
+
+
+def resolve_gpu_share(
+    *,
+    replica_count: int,
+    replica_gpus: Tuple[Optional[str], ...],
+    env: Mapping[str, str],
+) -> GpuShareDecision:
+    """Apply the shared-GPU rule (backlog A1; S0-9 / S0-20).
+
+    shared   = replica_count > 1 and at least one replica has no pin.
+    distinct = one replica, or every replica pinned (parse_replica_gpus has
+               already proven the pins pairwise disjoint).
+    Default: SHARED_GPU_MEM_UTIL when shared, DISTINCT_GPU_MEM_UTIL otherwise.
+    Override: VLLM_GPU_MEMORY_UTILIZATION (non-empty) is honored, except that
+    a shared value above SHARED_GPU_MEM_UTIL_CEILING is refused with the fix.
+    """
+    shared = replica_count > 1 and any(g is None for g in replica_gpus)
+    mode = "shared" if shared else "distinct"
+    # Empty is unset (the bash launcher cannot tell the two apart either).
+    raw = (env.get("VLLM_GPU_MEMORY_UTILIZATION") or "").strip()
+    if not raw:
+        default = SHARED_GPU_MEM_UTIL if shared else DISTINCT_GPU_MEM_UTIL
+        return GpuShareDecision(mode, f"{default:.2f}", "default", tuple(replica_gpus))
+    value = _parse_mem_util(raw)
+    if shared and value > SHARED_GPU_MEM_UTIL_CEILING:
+        raise GpuShareError(
+            f"REFUSING cluster launch: {replica_count} replicas share one GPU and "
+            f"VLLM_GPU_MEMORY_UTILIZATION={raw} asks each instance for "
+            f"--gpu-memory-utilization {raw} of the device; the vLLM startup check "
+            f"requests that fraction unconditionally, so the second replica cannot "
+            f"start. Fix: lower VLLM_GPU_MEMORY_UTILIZATION to at most "
+            f"{SHARED_GPU_MEM_UTIL_CEILING:.2f} (default {SHARED_GPU_MEM_UTIL:.2f}), "
+            f"or pin the replicas to distinct GPUs with --replica-gpus (e.g. 0,1,2)."
+        )
+    return GpuShareDecision(mode, raw, "explicit", tuple(replica_gpus))
+
+
+def build_serve_args(model: str, port: int, *, gpu_memory_utilization: str) -> List[str]:
     """vLLM serve argv honoring the Option-A serving contract (lib/_serving_config.sh).
 
     The cluster path previously hardcoded --max-model-len 2048 with no gpu-mem-util and
@@ -47,6 +216,10 @@ def build_serve_args(model: str, port: int) -> List[str]:
     a serving-uniformity confound for any distributed-vs-single comparison (2026-07-15
     audit). Values come from the VLLM_* env exported by scripts/lib/_serving_config.sh;
     the fallbacks here mirror that file so an unsourced shell still gets Option A.
+
+    gpu_memory_utilization is REQUIRED and comes from resolve_gpu_share (backlog
+    A1): there is no inline per-instance default, because the value depends on
+    whether the replicas share a GPU.
     """
     args = [
         "vllm", "serve", model,
@@ -55,7 +228,7 @@ def build_serve_args(model: str, port: int) -> List[str]:
         "--enable-prompt-tokens-details",
         "--trust-remote-code",
         "--max-model-len", os.environ.get("VLLM_MAX_MODEL_LEN", "4096"),
-        "--gpu-memory-utilization", os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.90"),
+        "--gpu-memory-utilization", gpu_memory_utilization,
     ]
     if os.environ.get("VLLM_ENFORCE_EAGER", "0") == "1":
         args.append("--enforce-eager")
@@ -273,13 +446,17 @@ def state_matches_requested_config(
     base_port: int,
     router_port: int,
     router_strategy: str,
+    replica_gpus: Optional[str],
 ) -> bool:
+    # The pin spec is a dial: a running cluster under other pins (or none) is
+    # never reused for a launch that asked for these (backlog A1).
     return (
         state.get("model") == model
         and int(state.get("replica_count") or 0) == replica_count
         and int(state.get("base_port") or 0) == base_port
         and int(state.get("router_port") or 0) == router_port
         and state.get("router_strategy") == router_strategy
+        and (state.get("replica_gpus") or None) == (replica_gpus or None)
     )
 
 
@@ -291,11 +468,18 @@ def print_cluster_status(state: Dict[str, Any]) -> int:
     print(f"  base_port: {state.get('base_port')}")
     print(f"  router_port: {state.get('router_port')}")
     print(f"  strategy: {state.get('router_strategy')}")
+    gpu_share = state.get("gpu_share") or {}
+    print(
+        f"  gpu_share: {gpu_share.get('mode')} "
+        f"(--gpu-memory-utilization {gpu_share.get('mem_util')} per instance, "
+        f"{gpu_share.get('source')}; pins: {state.get('replica_gpus') or 'none'})"
+    )
     for replica in state.get("replicas") or []:
         pid = replica.get("pid")
         print(
             f"  - {replica.get('replica_id')}: {replica.get('api_base')} "
-            f"(pid={pid}, running={is_pid_running(pid)})"
+            f"(pid={pid}, running={is_pid_running(pid)}, "
+            f"CUDA_VISIBLE_DEVICES={replica.get('cuda_visible_devices') or 'unpinned'})"
         )
     router = state.get("router") or {}
     router_pid = router.get("pid")
@@ -316,8 +500,19 @@ def start_cluster(
     router_strategy: str,
     replica_timeout: int,
     router_timeout: int,
+    replica_gpus: Optional[str],
 ) -> int:
+    # Backlog A1 (S0-9 / S0-20): the shared-vs-distinct decision is resolved
+    # FIRST so a refusal fires before any process is stopped or started.
+    pins = parse_replica_gpus(replica_gpus, replica_count)
+    decision = resolve_gpu_share(
+        replica_count=replica_count, replica_gpus=pins, env=os.environ
+    )
+    print(decision.banner())
+
     replicas = build_replica_configs(replica_count, base_port)
+    for replica, pin in zip(replicas, pins):
+        replica["cuda_visible_devices"] = pin
     router_url = f"http://localhost:{router_port}"
 
     existing_state = load_state()
@@ -328,6 +523,7 @@ def start_cluster(
         base_port=base_port,
         router_port=router_port,
         router_strategy=router_strategy,
+        replica_gpus=replica_gpus,
     ):
         healthy, detail = validate_cluster_state(existing_state, model=model)
         if healthy:
@@ -345,6 +541,8 @@ def start_cluster(
         "base_port": base_port,
         "router_port": router_port,
         "router_strategy": router_strategy,
+        "replica_gpus": replica_gpus or None,
+        "gpu_share": decision.as_state(),
         "replicas": replicas,
         "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -360,9 +558,17 @@ def start_cluster(
     try:
         for replica in replicas:
             log_path = LOG_DIR / f"vllm_{model_slug}_{replica['replica_id']}_{replica['port']}.log"
+            replica_env = os.environ.copy()
+            pin = replica.get("cuda_visible_devices")
+            if pin is not None:
+                # The pin rides CUDA_VISIBLE_DEVICES in the child env only.
+                replica_env["CUDA_VISIBLE_DEVICES"] = pin
             pid = launch_process(
-                build_serve_args(model, replica["port"]),
+                build_serve_args(
+                    model, replica["port"], gpu_memory_utilization=decision.mem_util
+                ),
                 log_path,
+                env=replica_env,
             )
             replica["pid"] = pid
             replica["log_file"] = str(log_path)
@@ -454,6 +660,18 @@ def build_parser() -> argparse.ArgumentParser:
             default=60,
             help="Maximum time to wait for the router to become ready.",
         )
+        sub.add_argument(
+            "--replica-gpus",
+            default=None,
+            help=(
+                "Per-replica CUDA_VISIBLE_DEVICES pins, one comma-separated entry "
+                "per replica, '+' joining a replica's several GPUs (e.g. 0,1,2 or "
+                "0+1,2+3). Unset = every replica shares the visible GPU, so the "
+                "per-instance --gpu-memory-utilization default drops to "
+                f"{SHARED_GPU_MEM_UTIL:.2f} and an explicit value above "
+                f"{SHARED_GPU_MEM_UTIL_CEILING:.2f} is refused (backlog A1)."
+            ),
+        )
 
     subparsers.add_parser("stop")
     subparsers.add_parser("status")
@@ -474,6 +692,7 @@ def main() -> int:
                 router_strategy=args.router_strategy,
                 replica_timeout=args.replica_timeout,
                 router_timeout=args.router_timeout,
+                replica_gpus=args.replica_gpus,
             )
         if args.command == "restart":
             stop_cluster(silent=True)
@@ -485,6 +704,7 @@ def main() -> int:
                 router_strategy=args.router_strategy,
                 replica_timeout=args.replica_timeout,
                 router_timeout=args.router_timeout,
+                replica_gpus=args.replica_gpus,
             )
         if args.command == "stop":
             return stop_cluster()

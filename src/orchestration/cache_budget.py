@@ -81,6 +81,10 @@ MODEL_KV: dict[str, ModelKV] = {
         24_576, "2*12*4*128*2 (12/48 full-attn layers)",
         fixed_state_bytes_per_seq=38 * 1024 * 1024,
     ),
+    # S0 shakedown model only (1x L40S pod; off the D4 roster, never a campaign
+    # cell). FP8 weights, BF16 KV under kv_cache_dtype=auto:
+    # 2 x 36 x 8 x 128 x 2 = 144 KiB/tok. VERIFY-LIVE at S0-19 (gate (j)).
+    "qwen3-8b-fp8": ModelKV(147_456, "2*36*8*128*2"),
 }
 
 _ENGINES = ("vllm", "sglang", "lmdeploy", "hf")

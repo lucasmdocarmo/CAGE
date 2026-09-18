@@ -16,6 +16,21 @@ Charter bindings enforced here:
   policy=none (no axis double-counting, declared 2026-08-02).
 - §7.6.1 family × arm legality; hf = sub-pressure F1 oracle only; LMDeploy
   restricted to 14B/70B (P7).
+
+Serving-config note (ADR-0103, owner decision 2026-09-16): corpus-fresh (B4)
+is served with the engine prefix cache OFF by a per-arm relaunch in every
+family, on every engine (scripts/3_run/run_campaign.PREFIX_OFF_ARMS via
+``_prefix_off``). That is a SERVING fact, not an identity axis: B4's carriage
+here is unchanged (REUSE bit, family F3 beside B3, ``_ARMS_BY_FAMILY``), and
+no CellSpec axis or row key encodes the prefix mode.
+
+Corpus-truncation ladder (ADR-0106, owner decision 2026-09-16, charter
+§7.7(d)): B12 (corpus-trunc) is enumerated as ONE CELL PER RUNG of a
+descending corpus-budget ladder whose top point is B3's own full-budget
+cell. The rung is the optional identity coordinate ``corpus_budget_tokens``:
+legal only on arm corpus-trunc, it enters ``to_row_key()`` (``cb<tokens>``)
+and ``to_flat_dict()`` only when set, so two rungs never share a row key
+and every other cell's key is byte-identical to pre-ADR-0106 keys.
 """
 
 from __future__ import annotations
@@ -110,6 +125,7 @@ class CellSpec:
     family: Family
     budget_r: float | None = None
     rate_frac: float | None = None
+    corpus_budget_tokens: int | None = None
 
     def __post_init__(self) -> None:
         for name, allowed in _ALLOWED.items():
@@ -174,10 +190,31 @@ class CellSpec:
                     f"{name} set but family=F1 is sub-pressure by definition (§7.6.1)"
                 )
             object.__setattr__(self, name, float(value))
+        rung = self.corpus_budget_tokens
+        if rung is not None:
+            if isinstance(rung, bool) or not isinstance(rung, int):
+                raise InvalidCellSpecError(
+                    f"corpus_budget_tokens={rung!r} must be an int or None (ADR-0106: "
+                    "the rung is a token budget)"
+                )
+            if rung < 1:
+                raise InvalidCellSpecError(
+                    f"corpus_budget_tokens={rung} must be >= 1 (ADR-0106)"
+                )
+            if self.arm != "corpus-trunc":
+                raise InvalidCellSpecError(
+                    f"corpus_budget_tokens set but arm={self.arm!r}; the rung "
+                    "coordinate is legal on arm corpus-trunc only (ADR-0106: the "
+                    "full budget is B3's own cell, never a coordinate)"
+                )
 
-    def to_flat_dict(self) -> dict[str, str | float | None]:
-        """Flat mapping suitable as CSV columns (optional coords stay None)."""
-        return {
+    def to_flat_dict(self) -> dict[str, str | float | int | None]:
+        """Flat mapping suitable as CSV columns (optional coords stay None).
+
+        ``corpus_budget_tokens`` (ADR-0106) is present ONLY when set, so every
+        non-B12 row keeps its pre-ADR column set byte-identical.
+        """
+        flat: dict[str, str | float | int | None] = {
             "arm": self.arm,
             "retriever": self.retriever,
             "policy": self.policy,
@@ -188,6 +225,9 @@ class CellSpec:
             "budget_r": self.budget_r,
             "rate_frac": self.rate_frac,
         }
+        if self.corpus_budget_tokens is not None:
+            flat["corpus_budget_tokens"] = self.corpus_budget_tokens
+        return flat
 
     @classmethod
     def from_flat_dict(cls, row: Mapping[str, Any]) -> CellSpec:
@@ -208,10 +248,33 @@ class CellSpec:
                 coords[name] = None
             else:
                 coords[name] = float(value)
-        return cls(**axes, **coords)  # type: ignore[arg-type]
+        rung_raw = row.get("corpus_budget_tokens")
+        rung: int | None
+        if rung_raw is None or rung_raw == "":
+            rung = None
+        elif isinstance(rung_raw, float) and math.isnan(rung_raw):
+            rung = None
+        elif isinstance(rung_raw, bool):
+            raise CellSpecError(f"corpus_budget_tokens={rung_raw!r} is not an integer")
+        else:
+            # A CSV/pandas round-trip yields an integral float; a fractional
+            # value is a corrupt column, never silently truncated.
+            try:
+                as_float = float(rung_raw)
+            except (TypeError, ValueError) as exc:
+                raise CellSpecError(
+                    f"corpus_budget_tokens={rung_raw!r} is not an integer"
+                ) from exc
+            if not as_float.is_integer():
+                raise CellSpecError(
+                    f"corpus_budget_tokens={rung_raw!r} is not an integral token budget"
+                )
+            rung = int(as_float)
+        return cls(**axes, **coords, corpus_budget_tokens=rung)  # type: ignore[arg-type]
 
     def to_row_key(self) -> str:
-        """Canonical results-row key: the 7 axes plus any pressure coords."""
+        """Canonical results-row key: the 7 axes plus any pressure coords, plus
+        the ADR-0106 corpus rung (``cb<tokens>``) on a B12 rung cell."""
         parts = [
             self.arm,
             self.retriever,
@@ -225,6 +288,8 @@ class CellSpec:
             parts.append(f"r{self.budget_r:g}")
         if self.rate_frac is not None:
             parts.append(f"lam{self.rate_frac:g}")
+        if self.corpus_budget_tokens is not None:
+            parts.append(f"cb{self.corpus_budget_tokens}")
         return "|".join(parts)
 
     @classmethod
@@ -239,8 +304,12 @@ class CellSpec:
         policy: Policy = "none",
         budget_r: float | None = None,
         rate_frac: float | None = None,
+        corpus_budget_tokens: int | None = None,
     ) -> CellSpec:
-        """Instantiate a B1-B12 presentation-layer baseline as a concrete cell."""
+        """Instantiate a B1-B12 presentation-layer baseline as a concrete cell.
+
+        ``corpus_budget_tokens`` is the ADR-0106 rung for B12 (one cell per rung).
+        """
         try:
             base = BASELINES[baseline_id]  # type: ignore[index]
         except KeyError:
@@ -257,6 +326,7 @@ class CellSpec:
             family=family,
             budget_r=budget_r,
             rate_frac=rate_frac,
+            corpus_budget_tokens=corpus_budget_tokens,
         )
 
 

@@ -45,6 +45,9 @@ import organize_results as org  # noqa: E402
 import run_campaign_analysis as rca  # noqa: E402
 from src.analysis.cellspec import CellSpec  # noqa: E402
 from src.analysis.predicate import (  # noqa: E402
+    QASPER_CLAUSE_COLUMNS,
+    QASPER_GROUNDING_RULE_LEGACY,
+    QASPER_RULE,
     PredicateConfig,
     PredicateError,
     compute_window_predicate,
@@ -94,7 +97,7 @@ def _no_machine_freeze_artifact(
 # ---------------------------------------------------------------------------
 
 
-def _evidence_row(i: int, *, ok: bool = True) -> dict[str, Any]:
+def _evidence_row(i: int, *, ok: bool = True, **extra: Any) -> dict[str, Any]:
     return {
         "example_id": f"e{i:03d}",
         "baseline": "blind-token",
@@ -105,7 +108,19 @@ def _evidence_row(i: int, *, ok: bool = True) -> dict[str, Any]:
         "ok": ok,
         "error": None if ok else "HTTP 500",
         "empty_generation": False,
+        **extra,
     }
+
+
+def _qasper_evidence_row(
+    i: int, answer_type: str | None, *, ok: bool = True, **extra: Any
+) -> dict[str, Any]:
+    """A Qasper evidence row carrying the loader's resolved labels (ADR-0114)."""
+    fields: dict[str, Any] = dict(extra)
+    if answer_type is not None:
+        fields["answer_type"] = answer_type
+        fields.setdefault("is_impossible", answer_type == "unanswerable")
+    return _evidence_row(i, ok=ok, **fields)
 
 
 def _score_row(i: int, *, exact_match: float | None = 1.0, **extra: Any) -> dict[str, Any]:
@@ -167,9 +182,15 @@ def test_span_qa_refuses_non_binary_exact_match() -> None:
         compute_window_predicate(joined, DATASET, _config(), window="w")
 
 
-def test_qasper_branch_thresholds_at_explicit_tau() -> None:
+def test_qasper_grounding_clause_thresholds_at_explicit_tau() -> None:
+    # ADR-0114 clause 3: abstractive / extractive rows take Instrument A at
+    # the calibrated tau, exactly as the legacy single-clause rule did.
     joined = join_window_rows(
-        [_evidence_row(0), _evidence_row(1), _evidence_row(2)],
+        [
+            _qasper_evidence_row(0, "abstractive"),
+            _qasper_evidence_row(1, "extractive"),
+            _qasper_evidence_row(2, "abstractive"),
+        ],
         [
             _score_row(0, grounding_score=0.9),
             _score_row(1, grounding_score=0.5),
@@ -181,11 +202,374 @@ def test_qasper_branch_thresholds_at_explicit_tau() -> None:
         joined, "qasper", _config(qasper_tau=0.8), window="w"
     )
     by_id = {r["example_id"]: r for r in rows}
-    assert by_id["e000"]["predicate"] is True   # 0.9 >= τ
-    assert by_id["e001"]["predicate"] is False  # 0.5 < τ
+    assert by_id["e000"]["predicate"] is True   # 0.9 >= tau
+    assert by_id["e001"]["predicate"] is False  # 0.5 < tau
     assert by_id["e002"]["predicate"] is None   # unscored -> None, counted
-    assert summary["predicate_rule"] == "qasper_grounding_at_tau"
+    assert by_id["e002"]["predicate_null_reason"] == "missing_verdict"
+    for r in rows:
+        assert r["verdict_column"] == "grounding_score"
+        assert r["predicate_rule"] == "qasper_three_clause_v1"
+    assert by_id["e000"]["answer_type"] == "abstractive"
+    assert by_id["e001"]["answer_type"] == "extractive"
+    assert summary["predicate_rule"] == "qasper_three_clause_v1"
     assert summary["verdict_column"] == "grounding_score"
+    assert summary["clause_columns"] == dict(QASPER_CLAUSE_COLUMNS)
+
+
+def test_qasper_free_form_abstention_on_answerable_is_false() -> None:
+    # ADR-0114 clause 3, owner decision 2026-09-17: a no-answer prediction on
+    # an ANSWERABLE abstractive / extractive item is a wrong answer, so the
+    # predicate is False (as span-QA EM and the yes/no clause already score
+    # it). The scorer nulls grounding_score on an abstention, so before this
+    # rule the row was predicate None and the Y assembly refused the window.
+    joined = join_window_rows(
+        [_qasper_evidence_row(0, "abstractive"), _qasper_evidence_row(1, "extractive")],
+        [
+            _score_row(0, grounding_score=None, predicted_no_answer=1.0),
+            _score_row(1, grounding_score=0.9, predicted_no_answer=0.0),
+        ],
+        window="w",
+    )
+    rows, summary = compute_window_predicate(
+        joined, "qasper", _config(qasper_tau=0.8), window="w"
+    )
+    by_id = {r["example_id"]: r for r in rows}
+    assert by_id["e000"]["predicate"] is False
+    assert by_id["e000"]["predicate_null_reason"] is None
+    # The deciding column is named on the row (audit trail).
+    assert by_id["e000"]["verdict_column"] == "predicted_no_answer"
+    assert by_id["e000"]["verdict"] == 1.0
+    # A non-abstaining row still takes Instrument A at tau.
+    assert by_id["e001"]["predicate"] is True
+    assert by_id["e001"]["verdict_column"] == "grounding_score"
+    assert summary["n_abstained_on_answerable"] == 1
+    assert summary["n_missing_verdict"] == 0
+    assert summary["n_false"] == 1 and summary["n_true"] == 1
+
+
+def test_qasper_free_form_abstention_beats_a_present_span_score() -> None:
+    # The abstention is checked FIRST: grounding is N/A on an abstention (the
+    # scorer nulls it), so a span score from a foreign sidecar never decides.
+    joined = join_window_rows(
+        [_qasper_evidence_row(0, "extractive")],
+        [_score_row(0, grounding_score=1.0, predicted_no_answer=1.0)],
+        window="w",
+    )
+    rows, summary = compute_window_predicate(
+        joined, "qasper", _config(qasper_tau=0.8), window="w"
+    )
+    assert rows[0]["predicate"] is False
+    assert rows[0]["verdict_column"] == "predicted_no_answer"
+    assert summary["n_abstained_on_answerable"] == 1
+
+
+@pytest.mark.parametrize("detector", [0.0, None])
+def test_qasper_free_form_missing_score_without_abstention_stays_null(
+    detector: float | None,
+) -> None:
+    # No abstention and no span score = the instrument did not score the row:
+    # still None, counted, never turned into False.
+    joined = join_window_rows(
+        [_qasper_evidence_row(0, "abstractive"), _qasper_evidence_row(1, "abstractive")],
+        [
+            _score_row(0, grounding_score=None, predicted_no_answer=detector),
+            _score_row(1, grounding_score=0.9, predicted_no_answer=detector),
+        ],
+        window="w",
+    )
+    rows, summary = compute_window_predicate(
+        joined, "qasper", _config(qasper_tau=0.8), window="w"
+    )
+    by_id = {r["example_id"]: r for r in rows}
+    assert by_id["e000"]["predicate"] is None
+    assert by_id["e000"]["predicate_null_reason"] == "missing_verdict"
+    assert by_id["e000"]["verdict_column"] == "grounding_score"
+    assert by_id["e001"]["predicate"] is True
+    assert summary["n_abstained_on_answerable"] == 0
+    assert summary["n_missing_verdict"] == 1
+
+
+def test_qasper_free_form_refuses_non_binary_detector_output() -> None:
+    joined = join_window_rows(
+        [_qasper_evidence_row(0, "abstractive")],
+        [_score_row(0, grounding_score=0.9, predicted_no_answer=0.5)],
+        window="w",
+    )
+    with pytest.raises(PredicateError, match="predicted_no_answer"):
+        compute_window_predicate(joined, "qasper", _config(qasper_tau=0.8), window="w")
+
+
+def test_abstention_counter_is_zero_outside_qasper_free_form_rows() -> None:
+    # Span-QA and the other two Qasper clauses already score an abstention
+    # through their own columns; the counter stays 0 there.
+    joined = join_window_rows(
+        [_evidence_row(0)],
+        [_score_row(0, exact_match=0.0, predicted_no_answer=1.0)],
+        window="w",
+    )
+    _, summary = compute_window_predicate(joined, DATASET, _config(), window="w")
+    assert summary["n_abstained_on_answerable"] == 0
+    joined = join_window_rows(
+        [_qasper_evidence_row(0, "unanswerable"), _qasper_evidence_row(1, "yes_no")],
+        [
+            _score_row(0, predicted_no_answer=1.0),
+            _score_row(1, exact_match=0.0, predicted_no_answer=1.0),
+        ],
+        window="w",
+    )
+    rows, summary = compute_window_predicate(
+        joined, "qasper", _config(qasper_tau=0.8), window="w"
+    )
+    assert [r["predicate"] for r in rows] == [True, False]
+    assert summary["n_abstained_on_answerable"] == 0
+
+
+def test_qasper_rule_literals_new_and_legacy() -> None:
+    # The registered literal changed under ADR-0114; the legacy literal stays
+    # a named constant so pre-existing artifacts (the 2026-08-19 calibration
+    # manifest names it) remain attributable, and the two never collide.
+    assert QASPER_RULE == "qasper_three_clause_v1"
+    assert QASPER_GROUNDING_RULE_LEGACY == "qasper_grounding_at_tau"
+    assert QASPER_RULE != QASPER_GROUNDING_RULE_LEGACY
+    assert QASPER_CLAUSE_COLUMNS == {
+        "unanswerable": "predicted_no_answer",
+        "yes_no": "exact_match",
+        "abstractive": "grounding_score",
+        "extractive": "grounding_score",
+    }
+
+
+def test_qasper_unanswerable_clause_is_correct_abstention() -> None:
+    # ADR-0114 clause 1: an unanswerable item is veridical iff the quality
+    # layer's no-answer detector (is_no_answer_prediction, persisted by the
+    # scoring pass as predicted_no_answer) fired. grounding_score is IGNORED
+    # on these rows: a span detector cannot score a correct abstention.
+    joined = join_window_rows(
+        [
+            _qasper_evidence_row(0, "unanswerable"),
+            _qasper_evidence_row(1, "unanswerable"),
+            _qasper_evidence_row(2, "unanswerable"),
+        ],
+        [
+            _score_row(0, grounding_score=0.0, predicted_no_answer=1.0),
+            _score_row(1, grounding_score=1.0, predicted_no_answer=0.0),
+            _score_row(2, grounding_score=1.0, predicted_no_answer=None),
+        ],
+        window="w",
+    )
+    rows, summary = compute_window_predicate(
+        joined, "qasper", _config(qasper_tau=0.8), window="w"
+    )
+    by_id = {r["example_id"]: r for r in rows}
+    assert by_id["e000"]["predicate"] is True   # abstained on unanswerable
+    assert by_id["e001"]["predicate"] is False  # answered an unanswerable
+    assert by_id["e002"]["predicate"] is None   # detector output missing
+    assert by_id["e002"]["predicate_null_reason"] == "missing_verdict"
+    for r in rows:
+        assert r["verdict_column"] == "predicted_no_answer"
+        assert r["answer_type"] == "unanswerable"
+    assert summary["n_true"] == 1 and summary["n_false"] == 1
+    assert summary["n_missing_verdict"] == 1
+
+
+def test_qasper_unanswerable_clause_refuses_non_binary_detector_output() -> None:
+    joined = join_window_rows(
+        [_qasper_evidence_row(0, "unanswerable")],
+        [_score_row(0, predicted_no_answer=0.5)],
+        window="w",
+    )
+    with pytest.raises(PredicateError, match="predicted_no_answer"):
+        compute_window_predicate(joined, "qasper", _config(qasper_tau=0.8), window="w")
+
+
+def test_qasper_yes_no_clause_is_exact_match() -> None:
+    # ADR-0114 clause 2: yes/no items take the normalized exact match against
+    # the reference "Yes"/"No" (the quality layer's exact_match column, max
+    # over golds); grounding_score is IGNORED.
+    joined = join_window_rows(
+        [
+            _qasper_evidence_row(0, "yes_no"),
+            _qasper_evidence_row(1, "yes_no"),
+            _qasper_evidence_row(2, "yes_no"),
+        ],
+        [
+            _score_row(0, exact_match=1.0, grounding_score=0.0),
+            _score_row(1, exact_match=0.0, grounding_score=1.0),
+            _score_row(2, exact_match=None, grounding_score=1.0),
+        ],
+        window="w",
+    )
+    rows, summary = compute_window_predicate(
+        joined, "qasper", _config(qasper_tau=0.8), window="w"
+    )
+    by_id = {r["example_id"]: r for r in rows}
+    assert by_id["e000"]["predicate"] is True
+    assert by_id["e001"]["predicate"] is False
+    assert by_id["e002"]["predicate"] is None
+    for r in rows:
+        assert r["verdict_column"] == "exact_match"
+    assert summary["n_true"] == 1 and summary["n_false"] == 1
+
+
+def test_qasper_yes_no_clause_refuses_non_binary_exact_match() -> None:
+    joined = join_window_rows(
+        [_qasper_evidence_row(0, "yes_no")],
+        [_score_row(0, exact_match=0.5)],
+        window="w",
+    )
+    with pytest.raises(PredicateError, match="exact_match"):
+        compute_window_predicate(joined, "qasper", _config(qasper_tau=0.8), window="w")
+
+
+@pytest.mark.parametrize("answer_type", [None, "", "boolean", "free_form", 7])
+def test_qasper_missing_or_unknown_answer_type_refuses(answer_type: Any) -> None:
+    # ADR-0114: a Qasper row without a legal answer_type REFUSES, even though
+    # a grounding_score is present. It never defaults to the grounding clause.
+    extra: dict[str, Any] = {}
+    if answer_type is not None:
+        extra["answer_type"] = answer_type
+    joined = join_window_rows(
+        [_evidence_row(0, **extra), _qasper_evidence_row(1, "abstractive")],
+        [_score_row(0, grounding_score=0.99), _score_row(1, grounding_score=0.99)],
+        window="w",
+    )
+    with pytest.raises(PredicateError, match="answer_type") as exc:
+        compute_window_predicate(joined, "qasper", _config(qasper_tau=0.8), window="w")
+    assert "ADR-0114" in str(exc.value)
+    assert "e000" in str(exc.value)
+
+
+def test_qasper_answer_type_refusal_applies_to_not_ok_rows_too() -> None:
+    # The label is a property of the ITEM, not of serving: a serving failure
+    # does not excuse a mislabeled row.
+    joined = join_window_rows(
+        [_evidence_row(0, ok=False)],
+        [_score_row(0, grounding_score=None)],
+        window="w",
+    )
+    with pytest.raises(PredicateError, match="answer_type"):
+        compute_window_predicate(joined, "qasper", _config(qasper_tau=0.8), window="w")
+
+
+@pytest.mark.parametrize(
+    ("answer_type", "is_impossible"),
+    [("unanswerable", False), ("abstractive", True), ("yes_no", "True"), ("extractive", 0)],
+)
+def test_qasper_is_impossible_disagreeing_with_answer_type_refuses(
+    answer_type: str, is_impossible: Any
+) -> None:
+    # The loader writes both labels from ONE resolution; a disagreement or a
+    # non-bool stand-in (backlog A8) is a mislabeled row, refused typed.
+    joined = join_window_rows(
+        [_qasper_evidence_row(0, answer_type, is_impossible=is_impossible)],
+        [_score_row(0, predicted_no_answer=1.0, grounding_score=0.9)],
+        window="w",
+    )
+    with pytest.raises(PredicateError, match="is_impossible"):
+        compute_window_predicate(joined, "qasper", _config(qasper_tau=0.8), window="w")
+
+
+def test_qasper_absent_is_impossible_is_tolerated_with_a_legal_answer_type() -> None:
+    # Only answer_type is REQUIRED (it keys the clause); the flag is checked
+    # for agreement when present and absent stays absent.
+    joined = join_window_rows(
+        [_evidence_row(0, answer_type="yes_no")],
+        [_score_row(0, exact_match=1.0)],
+        window="w",
+    )
+    rows, _ = compute_window_predicate(joined, "qasper", _config(qasper_tau=0.8), window="w")
+    assert rows[0]["predicate"] is True
+    assert rows[0]["is_impossible"] is None
+
+
+def test_qasper_clause_column_absent_from_every_row_refuses() -> None:
+    # The unanswerable clause needs the detector column; a scoring pass that
+    # never produced it cannot feed the predicate (same class as the existing
+    # missing-column refusal, now per clause).
+    joined = join_window_rows(
+        [_qasper_evidence_row(0, "unanswerable"), _qasper_evidence_row(1, "abstractive")],
+        [
+            {"example_id": "e000", "repeat_index": "0", "record_index": None,
+             "grounding_score": 0.1},
+            {"example_id": "e001", "repeat_index": "0", "record_index": None,
+             "grounding_score": 0.9},
+        ],
+        window="w",
+    )
+    with pytest.raises(PredicateError, match="predicted_no_answer") as exc:
+        compute_window_predicate(joined, "qasper", _config(qasper_tau=0.8), window="w")
+    assert "unanswerable" in str(exc.value)
+
+
+def test_qasper_summary_reports_share_and_count_per_answer_type() -> None:
+    # ADR-0114: the share of each answer type is a REPORTED quantity per
+    # window (the mix decides how much of the Qasper predicate rides on the
+    # span detector versus the abstention and yes/no clauses).
+    joined = join_window_rows(
+        [
+            _qasper_evidence_row(0, "abstractive"),
+            _qasper_evidence_row(1, "extractive"),
+            _qasper_evidence_row(2, "unanswerable"),
+            _qasper_evidence_row(3, "yes_no"),
+            _qasper_evidence_row(4, "abstractive", ok=False),
+        ],
+        [
+            _score_row(0, grounding_score=0.9),
+            _score_row(1, grounding_score=0.1),
+            _score_row(2, predicted_no_answer=1.0),
+            _score_row(3, exact_match=0.0),
+            _score_row(4, grounding_score=0.9),
+        ],
+        window="w",
+    )
+    rows, summary = compute_window_predicate(
+        joined, "qasper", _config(qasper_tau=0.8), window="w"
+    )
+    assert len(rows) == 5
+    shares = summary["by_answer_type"]
+    assert set(shares) == {"abstractive", "extractive", "unanswerable", "yes_no"}
+    assert shares["abstractive"] == {
+        "n": 2, "share": 0.4, "n_true": 1, "n_false": 0, "n_null": 1,
+    }
+    assert shares["extractive"] == {
+        "n": 1, "share": 0.2, "n_true": 0, "n_false": 1, "n_null": 0,
+    }
+    assert shares["unanswerable"] == {
+        "n": 1, "share": 0.2, "n_true": 1, "n_false": 0, "n_null": 0,
+    }
+    assert shares["yes_no"] == {
+        "n": 1, "share": 0.2, "n_true": 0, "n_false": 1, "n_null": 0,
+    }
+    assert summary["n_without_answer_type"] == 0
+    assert sum(v["n"] for v in shares.values()) == summary["n_rows"]
+
+
+def test_span_qa_summary_counts_rows_without_answer_type() -> None:
+    # Span-QA evidence carries no answer_type (the SQuAD v2 loader emits
+    # is_impossible only): counted as unlabeled, never refused, never a share.
+    joined = join_window_rows(
+        [_evidence_row(0), _evidence_row(1)],
+        [_score_row(0), _score_row(1, exact_match=0.0)],
+        window="w",
+    )
+    rows, summary = compute_window_predicate(joined, DATASET, _config(), window="w")
+    assert all(r["answer_type"] is None for r in rows)
+    assert summary["by_answer_type"] == {}
+    assert summary["n_without_answer_type"] == 2
+    assert summary["clause_columns"] is None
+
+
+def test_join_carries_answer_type_and_is_impossible_from_evidence() -> None:
+    joined = join_window_rows(
+        [_qasper_evidence_row(0, "yes_no"), _evidence_row(1)],
+        [_score_row(0), _score_row(1)],
+        window="w",
+    )
+    by_id = {r["example_id"]: r for r in joined}
+    assert by_id["e000"]["answer_type"] == "yes_no"
+    assert by_id["e000"]["is_impossible"] is False
+    assert by_id["e001"]["answer_type"] is None
+    assert by_id["e001"]["is_impossible"] is None
 
 
 def test_qasper_without_tau_refuses_naming_120() -> None:

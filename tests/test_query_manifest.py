@@ -173,3 +173,120 @@ def test_context_selector_defaults_to_unfiltered_context() -> None:
     m_identity = build_manifest(pool, num_queries=10, num_trials=1, seed=42,
                                 block_budget=BUDGET, context_selector=lambda ex: ex.context)
     assert m_default == m_identity
+
+
+# ---------------------------------------------------------------------------
+# ADR-0106 / charter §7.7(d): B12 corpus-truncation rungs (descending budgets,
+# same seed, same packing order, no repacking; every query labeled)
+# ---------------------------------------------------------------------------
+
+from src.data.manifest import trunc_rung_for  # noqa: E402
+
+# words*4//3: header 7 words; each Document = 62 words. 3 docs -> 257 tokens
+# (<= BUDGET 300); at rung 200 only 2 docs fit (174); at rung 100 only 1 (92).
+RUNGS = (200, 100)
+
+
+def test_trunc_rungs_default_is_empty_and_leaves_the_artifact_unchanged() -> None:
+    pool = make_pool()
+    plain = build_manifest(pool, num_queries=10, num_trials=2, seed=42, block_budget=BUDGET)
+    assert plain["trunc_rungs"] == {}
+    laddered = build_manifest(pool, num_queries=10, num_trials=2, seed=42,
+                              block_budget=BUDGET, trunc_budgets=RUNGS)
+    # The full-budget store, mapping and draws are byte-identical: the ladder
+    # is derived FROM the packed blocks, never a repack.
+    for key in ("blocks", "question_to_block", "trials", "overlap", "stats"):
+        assert laddered[key] == plain[key], key
+
+
+def test_trunc_rungs_keep_packing_order_and_label_every_query() -> None:
+    pool = make_pool()
+    by_id = {ex.id: ex for ex in pool}
+    m = build_manifest(pool, num_queries=10, num_trials=2, seed=42,
+                       block_budget=BUDGET, trunc_budgets=RUNGS)
+    assert list(m["trunc_rungs"]) == ["200", "100"]  # descending, as registered
+    for b_str, rung in m["trunc_rungs"].items():
+        budget = int(b_str)
+        assert rung["budget"] == budget
+        assert len(rung["blocks"]) == len(m["blocks"])
+        for full_block, rung_block in zip(m["blocks"], rung["blocks"]):
+            assert rung_block["block_id"] == full_block["block_id"]
+            assert rung_block["token_count"] <= budget
+            assert 0 < rung_block["n_paragraphs"] < full_block["n_paragraphs"]
+            # Packing order preserved: the rung text is a literal prefix of the
+            # full block text (a prefix of the Documents, same numbering).
+            assert full_block["text"].startswith(rung_block["text"])
+        in_ids = set(rung["in_corpus_ids"])
+        assert rung["n_in_corpus"] == len(in_ids) == len(rung["in_corpus_ids"])
+        assert rung["n_in_corpus"] + rung["n_out_of_corpus"] == len(m["question_to_block"])
+        assert rung["n_out_of_corpus"] > 0  # the ladder actually truncates
+        # Label correctness by construction: in-corpus iff the gold paragraph
+        # survived in the query's own rung block.
+        for ex_id, block_id in m["question_to_block"].items():
+            text = rung["blocks"][block_id]["text"]
+            survived = all(p in text for p in by_id[ex_id].context)
+            assert (ex_id in in_ids) == survived, (b_str, ex_id)
+        # Every pool id is labeled exactly once (in or out), never dropped.
+        assert in_ids <= set(m["question_to_block"])
+    # Monotone ladder: the lower rung keeps a subset of the higher rung.
+    assert set(m["trunc_rungs"]["100"]["in_corpus_ids"]) < set(
+        m["trunc_rungs"]["200"]["in_corpus_ids"]
+    )
+
+
+def test_trunc_rungs_are_deterministic() -> None:
+    pool = make_pool()
+    m1 = build_manifest(pool, num_queries=10, num_trials=2, seed=42,
+                        block_budget=BUDGET, trunc_budgets=RUNGS)
+    m2 = build_manifest(pool, num_queries=10, num_trials=2, seed=42,
+                        block_budget=BUDGET, trunc_budgets=RUNGS)
+    assert m1["trunc_rungs"] == m2["trunc_rungs"]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        (BUDGET,),          # a rung equal to the block budget is B3's own cell
+        (BUDGET + 1,),      # above the block budget: not a truncation
+        (0,),               # non-positive
+        (200, 200),         # duplicate rung
+        (100, 200),         # not descending
+        (200.0,),           # not an int
+    ],
+)
+def test_trunc_rungs_refuse_bad_ladders(bad: tuple) -> None:
+    pool = make_pool()
+    with pytest.raises(ManifestError):
+        build_manifest(pool, num_queries=10, num_trials=2, seed=42,
+                       block_budget=BUDGET, trunc_budgets=bad)
+
+
+def test_trunc_rung_lookup_fails_closed() -> None:
+    pool = make_pool()
+    m = build_manifest(pool, num_queries=10, num_trials=2, seed=42,
+                       block_budget=BUDGET, trunc_budgets=RUNGS)
+    assert trunc_rung_for(m, 200) is m["trunc_rungs"]["200"]
+    with pytest.raises(ManifestError, match="150"):
+        trunc_rung_for(m, 150)
+    plain = build_manifest(pool, num_queries=10, num_trials=2, seed=42, block_budget=BUDGET)
+    with pytest.raises(ManifestError, match="no truncation rungs"):
+        trunc_rung_for(plain, 200)
+
+
+def test_trial_ids_are_prefix_stable_for_nested_cells() -> None:
+    """A9 per-row N: a cell measuring n < N reads the FIRST n ids of each
+    trial in manifest order, so smaller cells are tested prefix subsets of
+    the manifest's draw (and stay pairwise disjoint across trials when the
+    pool allows). The manifest's trial lists are therefore the ordered
+    source of truth: select_examples must preserve that order verbatim."""
+    pool = make_pool(n_paragraphs=12)  # pool 60 >= 10*3
+    m = build_manifest(pool, num_queries=10, num_trials=3, seed=42, block_budget=BUDGET,
+                       pool_target=60)
+    for t in ("1", "2", "3"):
+        ordered = [ex.id for ex in select_examples(m, int(t), pool)]
+        assert ordered == m["trials"][t]
+        for n in (1, 4, 10):
+            assert ordered[:n] == m["trials"][t][:n]
+    prefixes = [set(m["trials"][t][:4]) for t in ("1", "2", "3")]
+    assert not (prefixes[0] & prefixes[1]) and not (prefixes[0] & prefixes[2])
+    assert not (prefixes[1] & prefixes[2])

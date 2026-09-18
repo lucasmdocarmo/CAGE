@@ -159,18 +159,32 @@ def parse_row_key(key: str) -> dict[str, str | float | None]:
         )
     budget_r: float | None = None
     rate_frac: float | None = None
+    corpus_budget_tokens: int | None = None
     for coord in parts[7:]:
-        if coord.startswith("lam"):
-            rate_frac = float(coord[3:])
-        elif coord.startswith("r"):
-            budget_r = float(coord[1:])
-        else:
+        try:
+            if coord.startswith("lam"):
+                rate_frac = float(coord[3:])
+            elif coord.startswith("cb"):
+                # ADR-0106: the B12 corpus rung (an integer token budget).
+                corpus_budget_tokens = int(coord[2:])
+            elif coord.startswith("r"):
+                budget_r = float(coord[1:])
+            else:
+                raise FigureDataError(
+                    f"row key {key!r}: unrecognized coord segment {coord!r} "
+                    "(expected 'r<float>', 'lam<float>' or 'cb<int>')"
+                )
+        except ValueError as exc:
             raise FigureDataError(
-                f"row key {key!r}: unrecognized coord segment {coord!r} "
-                "(expected 'r<float>' or 'lam<float>')"
-            )
+                f"row key {key!r}: malformed coord segment {coord!r}: {exc}"
+            ) from exc
     try:
-        spec = CellSpec(*parts[:7], budget_r=budget_r, rate_frac=rate_frac)  # type: ignore[arg-type]
+        spec = CellSpec(
+            *parts[:7],  # type: ignore[arg-type]
+            budget_r=budget_r,
+            rate_frac=rate_frac,
+            corpus_budget_tokens=corpus_budget_tokens,
+        )
     except (CellSpecError, ValueError) as exc:
         raise FigureDataError(f"row key {key!r} is not a valid CellSpec: {exc}") from exc
     if spec.to_row_key() != key:

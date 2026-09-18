@@ -89,6 +89,86 @@ class InstrumentUnavailableError(RuntimeError):
         )
 
 
+# ---- Backlog A8 (Tier A): answerability provenance ---------------------------- #
+# The loader's ``metadata["is_impossible"]`` flag (SQuAD v2, Qasper) is
+# AUTHORITATIVE where example metadata is available. ``evaluate_f1_score`` takes
+# the flag as an optional input; when both the flag and the reference are
+# present they must AGREE (flag == empty gold) or the row is refused with
+# ``AnswerabilityMismatchError``, so a loader change can never silently flip
+# answerability. Rows scored without the flag keep the historical empty-reference
+# derivation and are labeled so downstream analysis can tell the two apart.
+ANSWERABILITY_FLAG_VERIFIED: str = "flag-verified"
+"""Row answerability came from the loader flag AND was verified against the gold."""
+
+ANSWERABILITY_REFERENCE_DERIVED: str = "reference-derived"
+"""Row answerability was derived solely from an empty gold (no flag available)."""
+
+
+class AnswerabilityMismatchError(ValueError):
+    """The loader's ``is_impossible`` flag disagrees with the gold answer (A8).
+
+    ``is_impossible=True`` with a non-empty gold, or ``False`` with an empty
+    gold, means either the loader or the evidence row is mislabeled. Neither
+    side is trusted silently: the row is refused so the mislabel surfaces at the
+    scorer instead of moving F1/EM and the abstention metrics under a wrong
+    answerability.
+    """
+
+    def __init__(
+        self,
+        is_impossible: bool,
+        reference_no_answer: bool,
+        reference_answer: str,
+        all_answers: Optional[List[str]],
+    ) -> None:
+        self.is_impossible = is_impossible
+        self.reference_no_answer = reference_no_answer
+        self.reference_answer = reference_answer
+        self.all_answers = all_answers
+        gold_source = "all_answers" if all_answers is not None else "reference_answer"
+        super().__init__(
+            f"answerability mismatch: metadata is_impossible={is_impossible!r} but the "
+            f"gold ({gold_source}) is {'empty' if reference_no_answer else 'non-empty'} "
+            f"(reference_answer={reference_answer!r}, all_answers={all_answers!r}); "
+            f"the loader flag and the gold must agree, no side is trusted silently"
+        )
+
+
+def resolve_answerability(
+    reference_answer: str,
+    all_answers: Optional[List[str]],
+    is_impossible: Optional[bool],
+) -> Tuple[bool, str]:
+    """Return ``(gold_no_answer, answerability_provenance)`` for one row (A8).
+
+    The gold source is ``all_answers`` when given (official max-over-golds
+    semantics: an empty list is unanswerable) and ``reference_answer`` otherwise.
+    A non-bool flag is refused with ``TypeError`` (a truthy stand-in would be a
+    silently coerced label); a flag that disagrees with the gold raises
+    ``AnswerabilityMismatchError``.
+
+    Public because the runner applies the SAME rule at the loader boundary
+    (``scripts/3_run/run_experiment.py`` ``verify_answerability_labels``) so a
+    mislabeled row refuses before any engine work rather than at the scorer.
+    """
+    if all_answers is not None:
+        reference_no_answer = not any((a or "").strip() for a in all_answers)
+    else:
+        reference_no_answer = not (reference_answer or "").strip()
+    if is_impossible is None:
+        return reference_no_answer, ANSWERABILITY_REFERENCE_DERIVED
+    if not isinstance(is_impossible, bool):
+        raise TypeError(
+            f"is_impossible must be a bool or None, got {type(is_impossible).__name__} "
+            f"{is_impossible!r}; no coercion is applied (backlog A8)"
+        )
+    if is_impossible != reference_no_answer:
+        raise AnswerabilityMismatchError(
+            is_impossible, reference_no_answer, reference_answer, all_answers
+        )
+    return reference_no_answer, ANSWERABILITY_FLAG_VERIFIED
+
+
 def _package_version(package: str) -> str:
     """Installed distribution version for provenance strings (D8 §8.1).
 
@@ -493,6 +573,11 @@ class QualityMetrics:
     exact_match_answerable: Optional[float] = None  # EM over answerable items only
     no_answer_correct: Optional[float] = None  # 1.0/0.0 on no-answer items; abstention accuracy
     abstention_precision: Optional[float] = None  # 1.0/0.0 on abstained rows only; mean = precision
+    # Backlog A8: where this row's answerability came from. ANSWERABILITY_FLAG_VERIFIED
+    # when the loader's is_impossible flag was supplied AND verified against the gold;
+    # ANSWERABILITY_REFERENCE_DERIVED when only the gold was available (empty gold ==
+    # unanswerable); None only when F1/EM were not scored at all.
+    answerability_provenance: Optional[str] = None
     cache_relevance: Optional[float] = None  # 0-1, proportion of useful cache blocks
     # Hallucination (LettuceDetect, PRIMARY grounding signal)
     grounding_score: Optional[float] = None  # 0-1, 1 - hallucinated_span_ratio (None if detector unavailable)
@@ -583,6 +668,9 @@ class QualityMetrics:
             "exact_match_answerable": self.exact_match_answerable,
             "no_answer_correct": self.no_answer_correct,
             "abstention_precision": self.abstention_precision,
+            # Backlog A8: emitted unconditionally (stable column) so analysis can
+            # split flag-verified rows from reference-derived ones.
+            "answerability_provenance": self.answerability_provenance,
             "grounding_score": self.grounding_score,
             "hallucinated_span_ratio": self.hallucinated_span_ratio,
             "supported_claim_ratio": self.supported_claim_ratio,
@@ -1952,7 +2040,8 @@ class QualityEvaluator:
     def evaluate_f1_score(
         self, generated_text: str, reference_answer: str,
         all_answers: Optional[List[str]] = None,
-    ) -> Dict[str, float]:
+        is_impossible: Optional[bool] = None,
+    ) -> Dict[str, Any]:
         """
         Compute token-level F1 / EM with SQuAD v2 no-answer credit.
 
@@ -1971,6 +2060,13 @@ class QualityEvaluator:
                 CAGExample.metadata["all_answers"]. Empty list = unanswerable item
                 (official semantics); None falls back to the single reference_answer
                 (older evidence files / datasets without the field).
+            is_impossible: Optional loader answerability flag (backlog A8, Tier A),
+                sourced from CAGExample.metadata["is_impossible"] via
+                ``src.data.loader.is_impossible_flag``. AUTHORITATIVE when given: it
+                must AGREE with the gold (True == empty gold) or the row is refused
+                with AnswerabilityMismatchError; a non-bool raises TypeError. None
+                (answerable-only datasets, older evidence rows) keeps the
+                empty-gold derivation and labels the row reference-derived.
 
         Returns:
             Dict with:
@@ -1980,14 +2076,25 @@ class QualityEvaluator:
               f1_answerable, exact_match_answerable    -- None on no-answer items (answerable-only)
               no_answer_correct                        -- None on answerable items; 1.0/0.0 on
                                                           no-answer items (abstention accuracy)
+              answerability_provenance                 -- ANSWERABILITY_FLAG_VERIFIED or
+                                                          ANSWERABILITY_REFERENCE_DERIVED
         """
+        # Backlog A8: resolve (and verify) answerability ONCE, up front, so the flag
+        # can refuse a mislabeled row before any score is produced; the recursive
+        # per-gold calls below run flag-less and inherit this provenance.
+        gold_no_answer, answerability_provenance = resolve_answerability(
+            reference_answer, all_answers, is_impossible
+        )
+
         # Max over ALL gold answers (audit 2026-07-16 M5). Explicit class calls keep the
         # method free of instance state (tests invoke it unbound with self=None).
         if all_answers is not None:
             golds = [a for a in all_answers if (a or "").strip()]
             if not golds:
                 # Official SQuAD v2 semantics: no gold answers == unanswerable item.
-                return QualityEvaluator.evaluate_f1_score(self, generated_text, "")
+                merged = QualityEvaluator.evaluate_f1_score(self, generated_text, "")
+                merged["answerability_provenance"] = answerability_provenance
+                return merged
             per_gold = [
                 QualityEvaluator.evaluate_f1_score(self, generated_text, g) for g in golds
             ]
@@ -2001,6 +2108,7 @@ class QualityEvaluator:
                 merged["f1_answerable"] = merged["f1"]
             if merged.get("exact_match_answerable") is not None:
                 merged["exact_match_answerable"] = merged["exact_match"]
+            merged["answerability_provenance"] = answerability_provenance
             return merged
 
         import re
@@ -2024,9 +2132,9 @@ class QualityEvaluator:
         # ------------------------------------------------------------------ #
         # SQuAD v2 scoring with no-answer credit  (fix #4, options A + B)
         # ------------------------------------------------------------------ #
-        # gold_no_answer: this is an UNANSWERABLE item (empty reference). ~52% of SQuAD v2.
+        # gold_no_answer: this is an UNANSWERABLE item (empty reference, ~52% of SQuAD v2),
+        # resolved and flag-verified above by resolve_answerability (backlog A8).
         # pred_no_answer: the model produced an abstention (empty or an explicit phrase).
-        gold_no_answer = not (reference_answer or "").strip()
         pred_no_answer = is_no_answer_prediction(generated_text)
 
         # (A) Official SQuAD v2 semantics on the UNANSWERABLE half. Before this fix the
@@ -2048,6 +2156,7 @@ class QualityEvaluator:
                 # only on rows where the model abstained; 1.0 = the abstention was right
                 # (item truly unanswerable). Recall over unanswerable rows is mean(no_answer_correct).
                 "abstention_precision": 1.0 if pred_no_answer else None,
+                "answerability_provenance": answerability_provenance,
             }
 
         # ANSWERABLE item but the model abstained -> wrong (standard SQuAD v2: predicting
@@ -2060,6 +2169,7 @@ class QualityEvaluator:
                 "f1_answerable": 0.0, "exact_match_answerable": 0.0,
                 "no_answer_correct": None,
                 "abstention_precision": 0.0,  # abstained on an answerable item: wrong abstention
+                "answerability_provenance": answerability_provenance,
             }
 
         # ANSWERABLE item, model attempted an answer: standard token-level F1 / EM.
@@ -2074,6 +2184,7 @@ class QualityEvaluator:
                 "f1_answerable": 0.0, "exact_match_answerable": exact_match,
                 "no_answer_correct": None,
                 "abstention_precision": None,
+                "answerability_provenance": answerability_provenance,
             }
 
         # Count common tokens
@@ -2103,8 +2214,9 @@ class QualityEvaluator:
             "exact_match_answerable": exact_match,
             "no_answer_correct": None,
             "abstention_precision": None,
+            "answerability_provenance": answerability_provenance,
         }
-    
+
     def evaluate(
         self,
         question: str,
@@ -2112,6 +2224,7 @@ class QualityEvaluator:
         generated_text: str,
         reference_answer: str,
         all_answers: Optional[List[str]] = None,
+        is_impossible: Optional[bool] = None,
     ) -> QualityMetrics:
         """
         Perform full quality evaluation.
@@ -2123,6 +2236,8 @@ class QualityEvaluator:
             reference_answer: Ground truth answer
             all_answers: Optional list of ALL gold answers for max-over-golds F1/EM
                 (audit 2026-07-16 M5); see evaluate_f1_score.
+            is_impossible: Optional loader answerability flag (backlog A8); see
+                evaluate_f1_score. Refuses the row when it disagrees with the gold.
 
         Returns:
             QualityMetrics with all scores
@@ -2138,7 +2253,9 @@ class QualityEvaluator:
         # produced a score (config-disabled instruments are not consulted).
         self._row_status_tokens = []
         sanitized_text = sanitize_answer(generated_text)
-        f1_metrics = self.evaluate_f1_score(sanitized_text, reference_answer, all_answers)
+        f1_metrics = self.evaluate_f1_score(
+            sanitized_text, reference_answer, all_answers, is_impossible=is_impossible
+        )
         relevance = self.evaluate_relevance(question, context)
 
         # Abstention-aware grounding/faithfulness (2026-07-15 audit): an abstention like
@@ -2193,6 +2310,7 @@ class QualityEvaluator:
             exact_match_answerable=f1_metrics.get("exact_match_answerable"),
             no_answer_correct=f1_metrics.get("no_answer_correct"),
             abstention_precision=f1_metrics.get("abstention_precision"),
+            answerability_provenance=f1_metrics.get("answerability_provenance"),
             grounding_score=halluc["grounding_score"],
             hallucination_detected=halluc["hallucination_detected"],
             hallucinated_span_ratio=halluc["hallucinated_span_ratio"],
@@ -2230,6 +2348,7 @@ class QualityEvaluator:
         all_answers: Optional[Sequence[Optional[List[str]]]] = None,
         batched: bool = True,
         nli_batch_size: int = 32,
+        is_impossible: Optional[Sequence[Optional[bool]]] = None,
     ) -> List[QualityMetrics]:
         """Batch evaluation with REAL cross-row batching (D8 §8.1).
 
@@ -2249,6 +2368,10 @@ class QualityEvaluator:
                 (also the comparison baseline for the equivalence test).
             nli_batch_size: forwarded to the HF pipeline's ``batch_size`` for
                 the single batched NLI call.
+            is_impossible: optional per-row loader answerability flags (backlog
+                A8); index-aligned with the rows and refused (ValueError) when
+                shorter, so no row can silently fall back to reference-derived.
+                None entries are reference-derived rows; see evaluate_f1_score.
         """
 
         def _aa(i: int) -> Optional[List[str]]:
@@ -2257,9 +2380,20 @@ class QualityEvaluator:
             return all_answers[i]
 
         rows = list(zip(questions, contexts, generated_texts, reference_answers))
+        # Backlog A8: a flag sequence shorter than the rows would silently leave the
+        # tail reference-derived under a caller that believed it threaded the flag.
+        if is_impossible is not None and len(is_impossible) < len(rows):
+            raise ValueError(
+                f"is_impossible has {len(is_impossible)} entries for {len(rows)} rows; "
+                f"pass one entry per row (None for rows without a loader flag)"
+            )
+
+        def _flag(i: int) -> Optional[bool]:
+            return None if is_impossible is None else is_impossible[i]
+
         if not batched:
             return [
-                self.evaluate(q, ctx, gen, ref, all_answers=_aa(i))
+                self.evaluate(q, ctx, gen, ref, all_answers=_aa(i), is_impossible=_flag(i))
                 for i, (q, ctx, gen, ref) in enumerate(rows)
             ]
 
@@ -2271,7 +2405,10 @@ class QualityEvaluator:
         row_tokens: List[List[str]] = [[] for _ in range(n)]
         sanitized = [sanitize_answer(gen) for (_, _, gen, _) in rows]
         f1s = [
-            self.evaluate_f1_score(sanitized[i], rows[i][3], _aa(i)) for i in range(n)
+            self.evaluate_f1_score(
+                sanitized[i], rows[i][3], _aa(i), is_impossible=_flag(i)
+            )
+            for i in range(n)
         ]
         abstained = [is_no_answer_prediction(s) for s in sanitized]
 
@@ -2334,6 +2471,7 @@ class QualityEvaluator:
                     exact_match_answerable=f1_metrics.get("exact_match_answerable"),
                     no_answer_correct=f1_metrics.get("no_answer_correct"),
                     abstention_precision=f1_metrics.get("abstention_precision"),
+                    answerability_provenance=f1_metrics.get("answerability_provenance"),
                     grounding_score=halluc["grounding_score"],
                     hallucination_detected=halluc["hallucination_detected"],
                     hallucinated_span_ratio=halluc["hallucinated_span_ratio"],
@@ -2762,6 +2900,7 @@ class QualityEvaluator:
         cache_blocks: Optional[List[str]] = None,
         relevance_threshold: float = 0.3,
         all_answers: Optional[List[str]] = None,
+        is_impossible: Optional[bool] = None,
     ) -> QualityMetrics:
         """
         Full quality evaluation including cache relevance.
@@ -2781,12 +2920,15 @@ class QualityEvaluator:
                           If None, uses context as cache blocks.
             relevance_threshold: Threshold for considering a block "relevant"
             all_answers: Optional list of ALL gold answers (see evaluate_f1_score)
+            is_impossible: Optional loader answerability flag (backlog A8; see
+                evaluate_f1_score)
 
         Returns:
             QualityMetrics with all scores including cache_relevance
         """
         metrics = self.evaluate(
-            question, context, generated_text, reference_answer, all_answers=all_answers
+            question, context, generated_text, reference_answer,
+            all_answers=all_answers, is_impossible=is_impossible,
         )
 
         # Cache relevance (use context as cache blocks if not provided)

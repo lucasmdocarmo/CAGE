@@ -51,6 +51,16 @@ def test_kv_per_token_constants_are_the_charter_arithmetic() -> None:
     assert MODEL_KV["qwen3-14b"].mla_tp_replicated is False
 
 
+def test_s0_shakedown_model_kv_arithmetic_is_registered() -> None:
+    # S0 serves a small model on the 1x L40S pod (S0_CHECKLIST model guidance),
+    # off the D4 roster. FP8 weights, BF16 KV (kv_cache_dtype=auto):
+    # 2 (K,V) x 36 layers x 8 KV heads x 128 head_dim x 2 B = 144 KiB/tok.
+    s0 = MODEL_KV["qwen3-8b-fp8"]
+    assert s0.kv_bytes_per_token == 2 * 36 * 8 * 128 * 2 == 147_456
+    assert s0.fixed_state_bytes_per_seq == 0
+    assert s0.mla_tp_replicated is False
+
+
 def test_demand_reproduces_the_charter_45gb_anchor_number() -> None:
     # 9 x 32768 x 160 KiB = 48,318,382,080 B ≈ 45 GiB — the D4.1 re-rung basis.
     assert _D_14B == 9 * 32768 * 163_840 == 48_318_382_080

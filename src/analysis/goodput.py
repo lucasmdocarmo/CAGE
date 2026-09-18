@@ -11,6 +11,13 @@ Charter bindings (PUBLICATION.md):
   independence null G·E[v] and the covariance gap Cov(timely, veridical)
   printed beside every Y (clause b), and the truth tax G − Y (§9.2 estimand
   variable). Y is reported raw AND Rogan-Gladen-corrected.
+- ADR-0115 (backlog A3, proposed): the corrected Y is RECOMPOSED, never
+  corrected as a conjunction. The instrument misclassifies only the
+  predicate half of Y; "timely" is a clock measurement. Y_corrected =
+  P(timely) x RG(P(predicate | timely)); ``corrected_yield`` is the
+  registered estimator, ``corrected_rate`` stays the scalar primitive, and
+  ``reweight_gold_sample`` turns the verdict-stratified gold sample (§8.6(c),
+  ADR-0109) into population sensitivity/specificity.
 - §9.2: onset misses at grid resolution get the pre-registered label
   INCONCLUSIVE_AT_RESOLUTION (multiplicative ×/÷1.15 band) — labeled, never
   guessed. Knee point estimate = interpolated Chiu-Jain argmax over the three
@@ -36,7 +43,7 @@ from __future__ import annotations
 
 import math
 import operator
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import Literal
 
@@ -49,7 +56,12 @@ __all__ = [
     "BASIS_PER_GPU",
     "BasisLabel",
     "BasisRecord",
+    "CORRECTED_YIELD_ASSUMPTION",
+    "CORRECTED_YIELD_ESTIMATOR",
+    "CorrectedYield",
+    "GoldStratum",
     "GoodputError",
+    "InstrumentAccuracy",
     "IN_REGIME",
     "OnsetEstimate",
     "OnsetKind",
@@ -66,10 +78,14 @@ __all__ = [
     "assert_single_basis",
     "classify_regime",
     "corrected_rate",
+    "corrected_yield",
+    "corrected_yield_from_flags",
+    "corrected_yield_from_window",
     "evaluate_window",
     "find_cliff",
     "find_knee",
     "label_regime",
+    "reweight_gold_sample",
 ]
 
 # §6.1 primary relative SLO pair (the ONLY pair inside Y; Sarathi secondaries
@@ -808,26 +824,430 @@ def label_regime(
     return pd.Series(labels, index=cells.index, name="regime")
 
 
-def corrected_rate(apparent: float, sensitivity: float, specificity: float) -> float:
-    """Rogan-Gladen-corrected true rate from an apparent (instrument-measured)
-    rate: (apparent + sp − 1) / (se + sp − 1), truncated to [0, 1] (the
-    standard truncated estimator). se/sp come from the §8.6 gold set; Y is
-    reported raw AND corrected (S1). Raises when any input leaves [0, 1] or
-    the instrument is uninformative (Youden's J = se + sp − 1 ≤ 0)."""
-    for name, value in (
-        ("apparent", apparent),
-        ("sensitivity", sensitivity),
-        ("specificity", specificity),
-    ):
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise GoodputError(f"{name}={value!r} must be a number")
-        if not math.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0:
-            raise GoodputError(f"{name}={value!r} must be within [0, 1]")
-    youden = float(sensitivity) + float(specificity) - 1.0
+def _check_unit_interval(name: str, value: object) -> float:
+    """Typed [0, 1] guard shared by the correction estimators (bool refused:
+    True would silently pass as a rate of 1)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise GoodputError(f"{name}={value!r} must be a number")
+    value = float(value)
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise GoodputError(f"{name}={value!r} must be within [0, 1]")
+    return value
+
+
+def _youden_j(sensitivity: float, specificity: float) -> float:
+    """Youden's J = se + sp - 1; refuses an uninformative instrument (J <= 0),
+    for which the Rogan-Gladen denominator is zero or the correction flips
+    sign."""
+    youden = sensitivity + specificity - 1.0
     if youden <= 0.0:
         raise GoodputError(
             f"uninformative instrument: sensitivity + specificity = "
-            f"{float(sensitivity) + float(specificity):g} <= 1 (Youden's J <= 0)"
+            f"{sensitivity + specificity:g} <= 1 (Youden's J <= 0)"
         )
-    raw = (float(apparent) + float(specificity) - 1.0) / youden
+    return youden
+
+
+def corrected_rate(apparent: float, sensitivity: float, specificity: float) -> float:
+    """Rogan-Gladen-corrected true rate from an apparent (instrument-measured)
+    rate: (apparent + sp − 1) / (se + sp − 1), truncated to [0, 1] (the
+    standard truncated estimator). se/sp come from the §8.6 gold set. Raises
+    when any input leaves [0, 1] or the instrument is uninformative (Youden's
+    J = se + sp − 1 ≤ 0).
+
+    This is the SCALAR PRIMITIVE. It corrects whatever rate it is handed, so
+    it must only ever be handed a rate the instrument actually measured: the
+    predicate rate among SLO-met requests. Handing it Y (the conjunction
+    timely AND predicate) corrects the clock half too and is the backlog A3
+    defect; the registered Y estimator is ``corrected_yield`` (ADR-0115)."""
+    apparent = _check_unit_interval("apparent", apparent)
+    sensitivity = _check_unit_interval("sensitivity", sensitivity)
+    specificity = _check_unit_interval("specificity", specificity)
+    youden = _youden_j(sensitivity, specificity)
+    raw = (apparent + specificity - 1.0) / youden
     return min(1.0, max(0.0, raw))
+
+
+# --------------------------------------------------------------------------- #
+# ADR-0115 (backlog A3): corrected serving yield by recomposition
+# --------------------------------------------------------------------------- #
+
+#: Estimator identity stamped on every ``CorrectedYield`` and
+#: ``InstrumentAccuracy`` record (ADR-0115, proposed 2026-09-17, backlog
+#: Tier A item A3). A record without this stamp was not produced by the
+#: registered estimator and must not be reported as the corrected Y.
+CORRECTED_YIELD_ESTIMATOR: str = (
+    "ADR-0115 recomposed Rogan-Gladen: Y_corrected = P(timely) x "
+    "RG(P(predicate | timely); se, sp)"
+)
+
+#: The identifying assumption of ADR-0115, carried verbatim on every record so
+#: the caveat travels with the number: NO DIFFERENTIAL MISCLASSIFICATION. The
+#: instrument's sensitivity and specificity are taken as the same in every
+#: arm (so an arm contrast on corrected Y is not an artifact of arm-specific
+#: instrument error) and independent of timeliness (so the gold-set se/sp,
+#: estimated without conditioning on the clock, apply to the SLO-met subset).
+#: Both halves are checkable on the gold set (arm is a stratum per ADR-0109;
+#: timeliness is recorded per gold item) and the check is the pre-registered
+#: diagnostic, never a silent default.
+CORRECTED_YIELD_ASSUMPTION: str = (
+    "no differential misclassification: instrument sensitivity and "
+    "specificity are the same in every arm and independent of timeliness "
+    "(ADR-0115)"
+)
+
+
+@dataclass(frozen=True)
+class CorrectedYield:
+    """The ADR-0115 corrected serving yield with every input beside it.
+
+    ``slo_rate`` = P(timely), a clock measurement, never corrected.
+    ``apparent_predicate_rate_given_slo`` = instrument-positive fraction
+    AMONG SLO-met requests. ``corrected_predicate_rate_given_slo`` = its
+    Rogan-Gladen correction, truncated to [0, 1] (``truncated`` says whether
+    the truncation bit; the untruncated value is kept for the audit).
+    ``yield_raw`` = slo_rate x apparent; ``yield_corrected`` = slo_rate x
+    corrected. ``n_issued``/``n_slo_met`` are the counts when the record was
+    built from flags or a window, else 0 (a scalar-rate call has no counts;
+    0 is the honest "unknown count", not a fabricated sample size).
+    ``assumption`` and ``estimator`` are the module constants, stamped so the
+    caveat and the estimator identity ride with the number.
+    """
+
+    slo_rate: float
+    apparent_predicate_rate_given_slo: float
+    sensitivity: float
+    specificity: float
+    youden_j: float
+    corrected_predicate_rate_given_slo_untruncated: float
+    corrected_predicate_rate_given_slo: float
+    truncated: bool
+    yield_raw: float
+    yield_corrected: float
+    n_issued: int
+    n_slo_met: int
+    assumption: str
+    estimator: str
+
+    def to_flat_dict(self) -> dict[str, int | float | bool | str]:
+        """One key per field, for JSON serialization beside a WindowMetrics."""
+        return asdict(self)
+
+
+def corrected_yield(
+    *,
+    slo_rate: float,
+    apparent_predicate_rate_given_slo: float,
+    sensitivity: float,
+    specificity: float,
+    n_issued: int = 0,
+    n_slo_met: int = 0,
+) -> CorrectedYield:
+    """Registered corrected-Y estimator (ADR-0115, backlog A3).
+
+    Y = timely AND predicate. The quality instrument (§8.5 predicate at the
+    registered tau) misclassifies ONLY the predicate; "timely" is measured by
+    the clock. So the correction is applied to the predicate rate CONDITIONAL
+    on SLO-met, and Y is recomposed::
+
+        p_hat   = apparent_predicate_rate_given_slo
+        p_corr  = clip((p_hat + sp - 1) / (se + sp - 1), 0, 1)
+        Y_corr  = slo_rate x p_corr
+
+    Correcting the conjunction directly, RG(slo_rate x p_hat), treats the
+    clock's misses as instrument errors and is wrong whenever slo_rate < 1
+    (the A3 defect). Identity: with se = sp = 1, Y_corr = slo_rate x p_hat =
+    raw Y.
+
+    Assumption (``CORRECTED_YIELD_ASSUMPTION``): no differential
+    misclassification, i.e. se/sp are the same across arms and independent
+    of timeliness, so gold-set se/sp estimated on the whole sample apply to
+    the SLO-met subset of every arm. The record carries the assumption text.
+
+    se/sp come from the §8.6(c) gold set via ``reweight_gold_sample``
+    (verdict-stratified sample reweighted to population verdict shares).
+    Refuses inputs outside [0, 1], an uninformative instrument (Youden's
+    J <= 0), and negative or non-integer counts.
+    """
+    slo = _check_unit_interval("slo_rate", slo_rate)
+    apparent = _check_unit_interval(
+        "apparent_predicate_rate_given_slo", apparent_predicate_rate_given_slo
+    )
+    se = _check_unit_interval("sensitivity", sensitivity)
+    sp = _check_unit_interval("specificity", specificity)
+    youden = _youden_j(se, sp)
+    for name, value in (("n_issued", n_issued), ("n_slo_met", n_slo_met)):
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+            raise GoodputError(f"{name}={value!r} must be a non-negative integer")
+        if int(value) < 0:
+            raise GoodputError(f"{name}={value!r} must be a non-negative integer")
+    if int(n_slo_met) > int(n_issued):
+        raise GoodputError(
+            f"n_slo_met={int(n_slo_met)} exceeds n_issued={int(n_issued)}"
+        )
+    untruncated = (apparent + sp - 1.0) / youden
+    corrected = min(1.0, max(0.0, untruncated))
+    return CorrectedYield(
+        slo_rate=slo,
+        apparent_predicate_rate_given_slo=apparent,
+        sensitivity=se,
+        specificity=sp,
+        youden_j=youden,
+        corrected_predicate_rate_given_slo_untruncated=untruncated,
+        corrected_predicate_rate_given_slo=corrected,
+        truncated=corrected != untruncated,
+        yield_raw=slo * apparent,
+        yield_corrected=slo * corrected,
+        n_issued=int(n_issued),
+        n_slo_met=int(n_slo_met),
+        assumption=CORRECTED_YIELD_ASSUMPTION,
+        estimator=CORRECTED_YIELD_ESTIMATOR,
+    )
+
+
+def _flag_array(values: Sequence[bool] | np.ndarray | pd.Series, name: str) -> np.ndarray:
+    """Per-request boolean flags: bool arrays pass, 0/1 numerics are accepted,
+    NaN and any other value are refused (a NaN flag is an unscored request,
+    never a False)."""
+    series = values if isinstance(values, pd.Series) else pd.Series(list(np.asarray(values).ravel()))
+    arr = series.to_numpy()
+    if arr.dtype == np.bool_:
+        return arr
+    num = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
+    if np.isnan(num).any():
+        raise GoodputError(f"column {name!r} contains NaN or non-boolean values")
+    if not np.isin(num, (0.0, 1.0)).all():
+        raise GoodputError(f"column {name!r} must be boolean / 0-1 valued")
+    return num.astype(bool)
+
+
+def corrected_yield_from_flags(
+    *,
+    timely: Sequence[bool] | np.ndarray | pd.Series,
+    veridical: Sequence[bool] | np.ndarray | pd.Series,
+    sensitivity: float,
+    specificity: float,
+) -> CorrectedYield:
+    """``corrected_yield`` from per-request flags: ``timely`` (SLO-met by the
+    clock) and ``veridical`` (the instrument's verdict on the §8.5 predicate).
+    slo_rate = mean(timely); the apparent conditional rate =
+    mean(veridical[timely]). Verdicts on untimely requests never enter the
+    correction. Refuses empty or length-mismatched inputs and a window with
+    no SLO-met request (the conditional rate is 0/0; such a window's Y is 0
+    raw and needs no correction, so the caller reports it raw)."""
+    t = _flag_array(timely, "timely")
+    v = _flag_array(veridical, "veridical")
+    if t.size == 0:
+        raise GoodputError("empty window: no issued requests")
+    if t.shape != v.shape:
+        raise GoodputError(
+            f"timely/veridical length mismatch: {t.shape[0]} vs {v.shape[0]}"
+        )
+    n_issued = int(t.size)
+    n_slo_met = int(t.sum())
+    if n_slo_met == 0:
+        raise GoodputError(
+            "no SLO-met requests in the window: the predicate rate given SLO "
+            "is undefined (0/0); Y is 0 raw and is reported raw (ADR-0115)"
+        )
+    apparent = float(v[t].sum()) / n_slo_met
+    return corrected_yield(
+        slo_rate=n_slo_met / n_issued,
+        apparent_predicate_rate_given_slo=apparent,
+        sensitivity=sensitivity,
+        specificity=specificity,
+        n_issued=n_issued,
+        n_slo_met=n_slo_met,
+    )
+
+
+def corrected_yield_from_window(
+    metrics: WindowMetrics, *, sensitivity: float, specificity: float
+) -> CorrectedYield:
+    """``corrected_yield`` from an ``evaluate_window`` record: slo_rate =
+    n_timely / n_issued (= goodput_frac), apparent conditional rate =
+    n_yield / n_timely. The route every Y reporter takes (S1: Y raw AND
+    corrected). Refuses anything that is not a WindowMetrics and a window
+    with n_timely = 0 (see ``corrected_yield_from_flags``)."""
+    if not isinstance(metrics, WindowMetrics):
+        raise GoodputError(
+            f"corrected_yield_from_window needs a WindowMetrics, got "
+            f"{type(metrics).__name__}"
+        )
+    if metrics.n_timely == 0:
+        raise GoodputError(
+            "no SLO-met requests in the window: the predicate rate given SLO "
+            "is undefined (0/0); Y is 0 raw and is reported raw (ADR-0115)"
+        )
+    return corrected_yield(
+        slo_rate=metrics.n_timely / metrics.n_issued,
+        apparent_predicate_rate_given_slo=metrics.n_yield / metrics.n_timely,
+        sensitivity=sensitivity,
+        specificity=specificity,
+        n_issued=metrics.n_issued,
+        n_slo_met=metrics.n_timely,
+    )
+
+
+def _check_count(name: str, value: object, *, minimum: int) -> int:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+        raise GoodputError(f"{name}={value!r} must be an integer >= {minimum}")
+    if int(value) < minimum:
+        raise GoodputError(f"{name}={value!r} must be an integer >= {minimum}")
+    return int(value)
+
+
+@dataclass(frozen=True)
+class GoldStratum:
+    """One stratum of the verdict-stratified gold sample (§8.6(c), ADR-0109).
+
+    ``verdict``: the instrument's verdict defining the stratum (True =
+    predicate positive at the registered tau). ``dataset``: the optional
+    second stratification key (None for a verdict-only design; a sample must
+    be all-None or all-named). ``n_sampled``: gold-annotated items drawn from
+    this stratum; ``n_gold_true``: how many the annotators judged predicate
+    true. ``population_count``: how many instrument-scored requests in the
+    population fall in this stratum (the reweighting target)."""
+
+    verdict: bool
+    dataset: str | None
+    n_sampled: int
+    n_gold_true: int
+    population_count: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.verdict, bool):
+            raise GoodputError(f"verdict={self.verdict!r} must be a bool")
+        if self.dataset is not None and not isinstance(self.dataset, str):
+            raise GoodputError(f"dataset={self.dataset!r} must be a str or None")
+        n_sampled = _check_count("n_sampled", self.n_sampled, minimum=1)
+        n_true = _check_count("n_gold_true", self.n_gold_true, minimum=0)
+        _check_count("population_count", self.population_count, minimum=1)
+        if n_true > n_sampled:
+            raise GoodputError(
+                f"n_gold_true={n_true} exceeds n_sampled={n_sampled}"
+            )
+
+    @property
+    def key(self) -> tuple[bool, str | None]:
+        return (self.verdict, self.dataset)
+
+    @property
+    def gold_true_fraction(self) -> float:
+        return self.n_gold_true / self.n_sampled
+
+
+@dataclass(frozen=True)
+class InstrumentAccuracy:
+    """Population sensitivity/specificity reweighted from a verdict-stratified
+    gold sample (``reweight_gold_sample``), with the weights beside them.
+    ``weights`` maps (verdict, dataset) to its population share; ``dataset``
+    is the filter used (None = pooled over all strata)."""
+
+    sensitivity: float
+    specificity: float
+    youden_j: float
+    prevalence: float
+    n_sampled: int
+    n_population: int
+    n_strata: int
+    weights: dict[tuple[bool, str | None], float]
+    dataset: str | None
+    estimator: str
+
+
+def reweight_gold_sample(
+    strata: Sequence[GoldStratum], *, dataset: str | None = None
+) -> InstrumentAccuracy:
+    """Sensitivity/specificity for ``corrected_yield`` from a gold sample
+    stratified by instrument verdict (optionally x dataset), reweighted to
+    the POPULATION verdict shares (ADR-0115; the two-phase verification-bias
+    correction of Begg and Greenes, 1983).
+
+    A verdict-stratified sample oversamples one verdict, so pooling its rows
+    as if they were the population biases se/sp. With strata h, population
+    share w_h = population_count_h / sum population_count, and gold-true
+    fraction p_h = n_gold_true_h / n_sampled_h (unbiased within a stratum
+    because sampling was on the verdict, not on the truth)::
+
+        pi  = sum_h w_h p_h                          (prevalence)
+        se  = sum_{h: verdict+} w_h p_h / pi
+        sp  = sum_{h: verdict-} w_h (1 - p_h) / (1 - pi)
+
+    ``dataset`` restricts the computation to that dataset's strata (per
+    dataset se/sp, the §8.5 predicate being per dataset); None pools every
+    stratum given. Refuses: no strata (or none matching the filter), a
+    duplicate (verdict, dataset) key, mixed None/named datasets, a missing
+    verdict stratum (both verdicts must be sampled for every dataset
+    present), degenerate prevalence (pi = 0 leaves se undefined; pi = 1
+    leaves sp undefined), and an uninformative reweighted instrument
+    (se + sp <= 1).
+    """
+    if dataset is not None and not isinstance(dataset, str):
+        raise GoodputError(f"dataset={dataset!r} must be a str or None")
+    items = list(strata)
+    for idx, item in enumerate(items):
+        if not isinstance(item, GoldStratum):
+            raise GoodputError(
+                f"strata[{idx}] is {type(item).__name__}, expected GoldStratum"
+            )
+    if not items:
+        raise GoodputError("no strata supplied")
+    named = {item.dataset is not None for item in items}
+    if len(named) > 1:
+        raise GoodputError(
+            "strata mix dataset=None with named datasets; a gold sample is "
+            "stratified by verdict only or by verdict x dataset, not both"
+        )
+    if dataset is not None:
+        items = [item for item in items if item.dataset == dataset]
+        if not items:
+            raise GoodputError(f"no strata for dataset={dataset!r}")
+    keys = [item.key for item in items]
+    if len(set(keys)) != len(keys):
+        dupes = sorted({k for k in keys if keys.count(k) > 1}, key=repr)
+        raise GoodputError(f"duplicate strata {dupes}")
+    for ds in sorted({item.dataset for item in items}, key=repr):
+        present = {item.verdict for item in items if item.dataset == ds}
+        for verdict in (True, False):
+            if verdict not in present:
+                raise GoodputError(
+                    f"missing stratum verdict={verdict} for dataset={ds!r}: "
+                    "both verdicts must be gold-sampled"
+                )
+    n_population = sum(item.population_count for item in items)
+    weights = {item.key: item.population_count / n_population for item in items}
+    prevalence = sum(weights[item.key] * item.gold_true_fraction for item in items)
+    true_positive_mass = sum(
+        weights[item.key] * item.gold_true_fraction for item in items if item.verdict
+    )
+    true_negative_mass = sum(
+        weights[item.key] * (1.0 - item.gold_true_fraction)
+        for item in items
+        if not item.verdict
+    )
+    if prevalence <= 0.0:
+        raise GoodputError(
+            "degenerate gold sample: no gold-true item in any stratum, "
+            "sensitivity is undefined"
+        )
+    if prevalence >= 1.0:
+        raise GoodputError(
+            "degenerate gold sample: no gold-false item in any stratum, "
+            "specificity is undefined"
+        )
+    sensitivity = true_positive_mass / prevalence
+    specificity = true_negative_mass / (1.0 - prevalence)
+    youden = _youden_j(sensitivity, specificity)
+    return InstrumentAccuracy(
+        sensitivity=sensitivity,
+        specificity=specificity,
+        youden_j=youden,
+        prevalence=prevalence,
+        n_sampled=sum(item.n_sampled for item in items),
+        n_population=n_population,
+        n_strata=len(items),
+        weights=weights,
+        dataset=dataset,
+        estimator=CORRECTED_YIELD_ESTIMATOR,
+    )

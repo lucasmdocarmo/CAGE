@@ -191,6 +191,15 @@ class TestMechanismEngineKey:
     def test_coordinate_free_key_is_identity(self) -> None:
         assert cc.mechanism_engine_key(_CURVE_A) == _CURVE_A
 
+    def test_keeps_the_b12_rung_coordinate(self) -> None:
+        # ADR-0106: the served corpus rung (cb<tokens>) is a MECHANISM
+        # coordinate (which store was served), not a pressure coordinate:
+        # stripping it would pool the two B12 rungs into one curve (Simpson).
+        base = "corpus-trunc|none|none|single|vllm|qwen3-14b|F3"
+        assert cc.mechanism_engine_key(base + "|r0.5|lam0.8|cb700") == base + "|cb700"
+        assert cc.mechanism_engine_key(base + "|r0.25|lam1.05|cb1400") == base + "|cb1400"
+        assert cc.mechanism_engine_key(base + "|cb700") == base + "|cb700"
+
     @pytest.mark.parametrize("bad", ["c1", "a|b|c", "a||c|d|e|f|g", ""])
     def test_non_canonical_key_refuses(self, bad: str) -> None:
         with pytest.raises(cc.ConditionedCurveError, match="7 canonical axes"):

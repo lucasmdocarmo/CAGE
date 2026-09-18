@@ -31,6 +31,16 @@ seeded engineered-overlap planner (one planned query group per block) and
 gates fail-closed: a target the corpus cannot realize raises ``OverlapError``
 naming realized vs target, never silent best-effort.
 
+Corpus-truncation rungs (B12, charter §7.7(d), ADR-0106, owner decision
+2026-09-16): ``trunc_budgets`` derives, from the SAME packed blocks (same seed,
+same packing order, no repacking), one descending rung per budget b <
+block_budget: each block keeps its paragraphs in packing order until b would
+be exceeded, and every pool query is labeled in-corpus (its gold paragraph
+survived in its own block) or out-of-corpus BY CONSTRUCTION. Out-of-corpus
+queries are SERVED against the rung block (expected abstention), never
+dropped. The full block_budget point of the ladder is B3's own cell; it is
+never a rung. Written as ``manifest["trunc_rungs"]`` keyed by the rung budget.
+
 Pure stdlib + src.data.corpus: importable (and unit-testable) without the
 ``datasets`` package, torch, or a GPU.
 """
@@ -38,9 +48,9 @@ from __future__ import annotations
 
 import dataclasses
 import random
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
-from src.data.corpus import build_corpus_block
+from src.data.corpus import DEFAULT_HEADER, _assemble, build_corpus_block, default_token_counter
 from src.data.overlap import (  # re-exported: consumers import from either module
     OverlapError,
     enforce_overlap_target,
@@ -50,7 +60,9 @@ from src.data.overlap import (  # re-exported: consumers import from either modu
     plan_overlap_groups,
 )
 
-MANIFEST_VERSION = 2  # v2 (2026-09-02): + top-level "overlap" (measured, both modes)
+# v2 (2026-09-02): + top-level "overlap" (measured, both modes)
+# v3 (2026-09-16, ADR-0106): + top-level "trunc_rungs" (B12 ladder; {} when none)
+MANIFEST_VERSION = 3
 
 
 class ManifestError(ValueError):
@@ -74,6 +86,7 @@ def build_manifest(
     overlap_target: Optional[float] = None,
     overlap_tolerance: float = 0.05,
     overlap_group_size: int = 4,
+    trunc_budgets: Tuple[int, ...] = (),
 ) -> Dict[str, Any]:
     """Build the manifest dict from loader examples (.id/.question/.context/.answer).
 
@@ -96,9 +109,15 @@ def build_manifest(
     fail-closed against ``overlap_tolerance`` (``OverlapError`` on an unreachable
     target). ``overlap_group_size`` caps questions per engineered group. In both
     modes the realized overlap is measured and written to ``manifest["overlap"]``.
+
+    ``trunc_budgets`` (B12 ladder, ADR-0106): strictly descending integer rung
+    budgets, each < ``block_budget``; validated fail-closed BEFORE packing. The
+    rungs are derived from the packed blocks by ``derive_trunc_rungs`` and
+    written to ``manifest["trunc_rungs"]`` ({} when no ladder is requested).
     """
     if num_queries < 1 or num_trials < 1:
         raise ManifestError("num_queries and num_trials must be >= 1")
+    validate_trunc_budgets(trunc_budgets, block_budget)
     target = pool_target or max(3 * num_queries, num_queries * num_trials)
 
     if context_selector is not None:
@@ -225,6 +244,10 @@ def build_manifest(
             chosen = set(picked)
             available = [i for i in available if i not in chosen]
 
+    trunc_rungs = derive_trunc_rungs(
+        blocks, block_paragraphs, question_to_block, gold_by_id, trunc_budgets
+    )
+
     n_loaded = len(examples)
     return {
         "manifest_version": MANIFEST_VERSION,
@@ -238,6 +261,7 @@ def build_manifest(
         "question_to_block": question_to_block,
         "trials": trials,
         "overlap": overlap,
+        "trunc_rungs": trunc_rungs,
         "stats": {
             "source_examples_loaded": n_loaded,
             "pool_size": len(pool_ids),
@@ -247,6 +271,101 @@ def build_manifest(
             "trials_disjoint": disjoint,
         },
     }
+
+
+def validate_trunc_budgets(trunc_budgets: Sequence[int], block_budget: int) -> None:
+    """Fail-closed ladder check: ints >= 1, strictly descending, every rung < block_budget.
+
+    A rung equal to ``block_budget`` is refused explicitly: that point of the
+    ladder is B3's own cell (charter §7.7(d)), never a duplicate B12 rung.
+    """
+    seen: List[int] = []
+    for b in trunc_budgets:
+        if isinstance(b, bool) or not isinstance(b, int):
+            raise ManifestError(f"trunc_budgets entry {b!r} is not an int")
+        if b < 1:
+            raise ManifestError(f"trunc_budgets entry {b} must be >= 1")
+        if b >= block_budget:
+            raise ManifestError(
+                f"trunc rung {b} must be < block_budget {block_budget}: the full "
+                "budget is B3's own cell, and a rung above it is not a truncation"
+            )
+        if seen and b >= seen[-1]:
+            raise ManifestError(
+                f"trunc_budgets must be strictly descending (got {tuple(trunc_budgets)})"
+            )
+        seen.append(b)
+
+
+def derive_trunc_rungs(
+    blocks: Sequence[Dict[str, Any]],
+    block_paragraphs: Sequence[Sequence[str]],
+    question_to_block: Dict[str, int],
+    gold_by_id: Dict[str, Any],
+    trunc_budgets: Sequence[int],
+    *,
+    header: str = DEFAULT_HEADER,
+    count_tokens: Optional[Callable[[str], int]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """The B12 ladder from packed blocks (ADR-0106): no repacking, labels by construction.
+
+    For each rung budget, each block keeps the longest PREFIX of its paragraphs
+    (packing order) whose assembled text stays within the budget; the rung text
+    is therefore a literal prefix of the full block text (same Document
+    numbering). A query is in-corpus at a rung iff EVERY paragraph of its gold
+    set survived in its own block's rung text. Keys are the rung budgets as
+    strings (JSON-stable), in the registered descending order.
+    """
+    counter = count_tokens if count_tokens is not None else default_token_counter
+    rungs: Dict[str, Dict[str, Any]] = {}
+    for budget in trunc_budgets:
+        rung_blocks: List[Dict[str, Any]] = []
+        kept_sets: List[Set[str]] = []
+        for block, paragraphs in zip(blocks, block_paragraphs):
+            kept: List[str] = []
+            for paragraph in paragraphs:
+                candidate = kept + [paragraph]
+                if counter(_assemble(header, candidate)) > budget:
+                    break  # prefix semantics: stop at the first overflow
+                kept = candidate
+            text = _assemble(header, kept)
+            rung_blocks.append({
+                "block_id": block["block_id"],
+                "text": text,
+                "token_count": counter(text),
+                "n_paragraphs": len(kept),
+                "n_paragraphs_full": len(paragraphs),
+            })
+            kept_sets.append(set(kept))
+        in_corpus_ids = [
+            ex_id for ex_id, b in question_to_block.items()  # pack order
+            if gold_by_id[ex_id] and gold_by_id[ex_id] <= kept_sets[b]
+        ]
+        rungs[str(budget)] = {
+            "budget": budget,
+            "blocks": rung_blocks,
+            "in_corpus_ids": in_corpus_ids,
+            "n_in_corpus": len(in_corpus_ids),
+            "n_out_of_corpus": len(question_to_block) - len(in_corpus_ids),
+        }
+    return rungs
+
+
+def trunc_rung_for(manifest: Dict[str, Any], budget: int) -> Dict[str, Any]:
+    """The B12 rung record for ``budget`` (fail closed on a missing rung/ladder)."""
+    rungs = manifest.get("trunc_rungs")
+    if not rungs:
+        raise ManifestError(
+            f"manifest carries no truncation rungs (rung {budget} requested); "
+            "rebuild it with build_query_manifest.py --trunc-budgets"
+        )
+    rung = rungs.get(str(budget))
+    if rung is None:
+        raise ManifestError(
+            f"manifest has no truncation rung {budget} (registered rungs: "
+            f"{sorted((int(k) for k in rungs), reverse=True)})"
+        )
+    return rung
 
 
 def select_examples(manifest: Dict[str, Any], trial: int, examples: Sequence[Any]) -> List[Any]:

@@ -324,3 +324,88 @@ def test_examples_are_cag_examples_with_dataset_tag(monkeypatch):
     assert ex.metadata["dataset"] == "qasper"
     assert ex.metadata["paper_id"] == "p1"
     assert ex.id == "p1_q0"
+
+
+# ---------------------------------------------------------------------------
+# Backlog A8 (Tier A): Qasper unanswerable rows threaded flag-first through the
+# quality scorer (the flag is authoritative and must agree with the reference).
+# ---------------------------------------------------------------------------
+
+
+def _model_free_evaluator():
+    from src.evaluation.quality import QualityEvaluator
+
+    return QualityEvaluator(
+        use_nli=False, use_embeddings=False, use_bertscore=False,
+        use_rouge=False, use_lettucedetect=False,
+    )
+
+
+def test_a8_qasper_unanswerable_row_scores_flag_verified(monkeypatch):
+    """Every annotator unanswerable -> is_impossible=True, empty answer, empty
+    all_answers: the scorer verifies the flag against the reference, credits
+    the abstention, and labels the row flag-verified."""
+    from src.data.loader import is_impossible_flag
+    from src.evaluation.quality import ANSWERABILITY_FLAG_VERIFIED
+
+    rows = [make_paper("p1", ["Q?"], [[annot(unanswerable=True),
+                                       annot(unanswerable=True)]])]
+    install_fake_datasets(monkeypatch, rows)
+    ex = QasperLoader().load()[0]
+    assert is_impossible_flag(ex.metadata) is True
+
+    m = _model_free_evaluator().evaluate(
+        question=ex.question, context=ex.context, generated_text="Don't know.",
+        reference_answer=ex.answer, all_answers=ex.metadata["all_answers"],
+        is_impossible=is_impossible_flag(ex.metadata),
+    )
+    assert m.is_answerable == 0.0
+    assert m.no_answer_correct == 1.0 and m.exact_match == 1.0
+    assert m.answerability_provenance == ANSWERABILITY_FLAG_VERIFIED
+    assert m.to_dict()["answerability_provenance"] == ANSWERABILITY_FLAG_VERIFIED
+
+
+def test_a8_qasper_split_annotators_row_is_answerable_flag_verified(monkeypatch):
+    """Annotators disagree (one unanswerable, one yes/no) -> ANSWERABLE row
+    with is_impossible=False; the scorer verifies and scores the yes/no gold."""
+    from src.data.loader import is_impossible_flag
+    from src.evaluation.quality import ANSWERABILITY_FLAG_VERIFIED
+
+    rows = [make_paper("p1", ["Q?"], [[annot(unanswerable=True),
+                                       annot(yes_no=False)]])]
+    install_fake_datasets(monkeypatch, rows)
+    ex = QasperLoader().load()[0]
+    assert is_impossible_flag(ex.metadata) is False
+
+    m = _model_free_evaluator().evaluate(
+        question=ex.question, context=ex.context, generated_text="No",
+        reference_answer=ex.answer, all_answers=ex.metadata["all_answers"],
+        is_impossible=is_impossible_flag(ex.metadata),
+    )
+    assert m.is_answerable == 1.0 and m.exact_match == 1.0
+    assert m.answerability_provenance == ANSWERABILITY_FLAG_VERIFIED
+
+
+def test_a8_qasper_flag_reference_mismatch_is_refused(monkeypatch):
+    """If the loader ever emitted is_impossible=True alongside a non-empty gold
+    (or the reverse), the scorer refuses the row instead of silently trusting
+    either side."""
+    from src.data.loader import is_impossible_flag
+    from src.evaluation.quality import AnswerabilityMismatchError
+
+    rows = [make_paper("p1", ["Q?"], [[annot(unanswerable=True)]])]
+    install_fake_datasets(monkeypatch, rows)
+    ex = QasperLoader().load()[0]
+    tampered = CAGExample(
+        id=ex.id, question=ex.question, context=ex.context, answer="a gold span",
+        metadata={**ex.metadata, "all_answers": ["a gold span"]},
+    )
+    import pytest
+
+    with pytest.raises(AnswerabilityMismatchError):
+        _model_free_evaluator().evaluate(
+            question=tampered.question, context=tampered.context,
+            generated_text="a gold span", reference_answer=tampered.answer,
+            all_answers=tampered.metadata["all_answers"],
+            is_impossible=is_impossible_flag(tampered.metadata),
+        )

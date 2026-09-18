@@ -302,6 +302,17 @@ def test_score_cells_refuses_non_retrieval_cells(ranx_stub: types.ModuleType) ->
         l0.score_cells(QRELS_SINGLE_GOLD, {GOLD_KEY: STAGE_RUNS}, k_served=5)
 
 
+def test_score_cells_refuses_b12_rung_cell_as_a_category_error(
+    ranx_stub: types.ModuleType,
+) -> None:
+    # ADR-0106: a B12 rung key parses (cb<tokens> is a known coordinate) and
+    # is then refused for the honest reason, a corpus arm consumes no ranked
+    # list, never as an "unrecognized coord segment".
+    rung_key = "corpus-trunc|none|none|single|vllm|qwen3-14b|F1|cb700"
+    with pytest.raises(l0.RetrievalScoringError, match="retriever='none'"):
+        l0.score_cells(QRELS_SINGLE_GOLD, {rung_key: STAGE_RUNS}, k_served=5)
+
+
 def test_score_cells_lists_every_illegal_key(ranx_stub: types.ModuleType) -> None:
     bad_short = "not-a-cell-key"
     bad_axis = "retr-fresh|rerank|none|single|vllm|qwen3-14b|NOPE"

@@ -2,10 +2,12 @@
 
 WHAT is pinned and WHY:
 
-- **Session-'a' enumeration integers** (532 cells / 1596 windows / 30
-  relaunches / 13 blocked; per-family 96+10 / 300 / 126 cells): the grid is
+- **Session-'a' enumeration integers** (870 cells / 2610 windows / 36
+  relaunches / 13 blocked; per-family 104+10 / 340+272 / 144 cells): the grid is
   the charter's registered design (§6.1 full 5×6 factorial, §6.8 reduced 3×3,
-  §7.6.1 family × group matrix, 3 replications per grid point per D6 §6.3).
+  §7.6.1 family × group matrix, 3 replications per grid point per D6 §6.3,
+  and the ADR-0106 B12 ladder: one corpus-trunc cell PER RUNG (1400, 700)
+  wherever B12 is carried).
   A silent count drift here is a silently changed experiment — the single
   worst failure mode of a sweep driver.
 - **Cell BEHAVIOR realization** (the verified T1.2 blocker): the --baseline
@@ -34,6 +36,12 @@ WHAT is pinned and WHY:
   CAGE_SGLANG_MAX_TOTAL_TOKENS = floor(r×D) // 163840 (SGLang; qwen3-14b
   bf16 KV = 2·40·8·128·2 B/token) — both pinned by independent arithmetic,
   never by re-calling the planner.
+- **Uniform max_model_len (backlog A10)**: every relaunch of both engines
+  carries VLLM_MAX_MODEL_LEN=32768 (RULER SHAPE-32K = 32,512 + 256, plus
+  long Qasper papers; the pilot shell default 4096 must never reach a
+  campaign relaunch), the relaunch record and the plan header carry the
+  value, load_plan refuses a relaunch without it, and a grid registering
+  RULER tasks refuses a value below SHAPE-32K.
 - **Refusal paths** (fail-closed doctrine): unknown session; known-but-
   unregistered session; empty enumeration; missing/invalid/mismatched floor
   table; blocked cells at 'run' WITHOUT the explicit --skip-blocked consent;
@@ -130,6 +138,52 @@ def floor_table(tmp_path: Path) -> Path:
     return path
 
 
+#: The dense-retriever freeze slot as the registration artifact carries it
+#: (INSTRUMENT_REVISIONS.dense_retriever, ADR-0099). Mirrored into a tmp
+#: artifact so every plan built here is hermetic (no dependency on the
+#: untracked MyDocs copy) while pinning the SAME values the driver reads.
+_FREEZE_EMBEDDING_MODEL = "intfloat/e5-large-v2"
+_FREEZE_EMBEDDING_REVISION = "f169b11e22de13617baa190a028a32f3493550b6"
+
+
+def _freeze_doc(revisions: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if revisions is None:
+        revisions = {
+            "dense_retriever": {
+                "model": _FREEZE_EMBEDDING_MODEL,
+                "revision": _FREEZE_EMBEDDING_REVISION,
+                "resolved": "test mirror of the registration artifact",
+            },
+            # The QUALITY module's similarity embedder: a DIFFERENT
+            # instrument's pin; the driver must never consume it.
+            "embedding": {
+                "model": "sentence-transformers/all-MiniLM-L6-v2",
+                "revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+            },
+        }
+    return {"INSTRUMENT_REVISIONS": revisions}
+
+
+def _write_freeze(path: Path, doc: Dict[str, Any]) -> Path:
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    return path
+
+
+# The autouse freeze fixture lives in tests/conftest.py (suite-wide hermeticity,
+# review 2026-09-17 A5): every module that builds a plan gets the tmp mirror,
+# not only this one. The literals below must equal conftest's so the header
+# assertions here double as the drift check between the two copies.
+
+
+def test_conftest_freeze_mirror_pins_the_same_literals() -> None:
+    import conftest as suite_conftest
+
+    assert suite_conftest.FREEZE_FILE_ENV_VAR == rc.FREEZE_FILE_ENV_VAR
+    assert suite_conftest.FREEZE_EMBEDDING_MODEL == _FREEZE_EMBEDDING_MODEL
+    assert suite_conftest.FREEZE_EMBEDDING_REVISION == _FREEZE_EMBEDDING_REVISION
+    assert suite_conftest.hermetic_freeze_doc() == _freeze_doc()
+
+
 @pytest.fixture()
 def plan_a(floor_table: Path) -> Dict[str, Any]:
     floor = rc.load_floor_table(floor_table)
@@ -175,7 +229,7 @@ import json, os, sys
 with open(os.environ["STUB_CALLS"], "a", encoding="utf-8") as fh:
     fh.write(json.dumps({
         "argv": sys.argv[1:],
-        "env": {k: v for k, v in os.environ.items() if k.startswith("CAGE_")},
+        "env": {k: v for k, v in os.environ.items() if k.startswith(("CAGE_", "VLLM_"))},
     }) + "\\n")
 marker = os.environ.get("STUB_FAIL_MARKER", "")
 if marker and marker in " ".join(sys.argv[1:]):
@@ -259,15 +313,20 @@ class TestPlanCountsSessionA:
 
     def test_total_counts(self, plan_a):
         # F1: 12 baselines × 2 engines × 4 datasets              =  96
+        #   + ADR-0106 B12 ladder: B12 is 2 rungs (1400, 700), so
+        #     its 2 engines × 4 datasets = 8 cells become 16      =  +8
         # F1 HF oracle: B3×4 + {B1,B2,B6}×2                      =  10
         # F2 qasper: 5 FRESH × 2 engines × 34 coordinates        = 340
         #   (old pin 300 = 5 × 2 × 30, pre-§6.4-overlay)
         # F2 ruler (D5#5, W4.4): 1 (B1) × 2 engines × 34 × 4 tasks = 272
         # F3: 7 REUSE × 2 engines × 3 budgets × 3 rates          = 126
-        # ⇒ 96 + 10 + 340 + 272 + 126 = 844  (old pin 532)
-        assert plan_a["counts"]["cells"] == 844
-        # 3 windows per grid point (D6 §6.3) ⇒ 844 × 3 = 2532 (old 1596)
-        assert plan_a["counts"]["windows"] == 2532
+        #   + B12 ladder: 2 engines × 3 × 3 = 18 cells become 36 = +18
+        # ⇒ 104 + 10 + 340 + 272 + 144 = 870
+        #   (old pin 844, pre-ADR-0106; older 532)
+        assert plan_a["counts"]["cells"] == 870
+        # 3 windows per grid point (D6 §6.3) ⇒ 870 × 3 = 2610
+        #   (old 2532 = 844 × 3; older 1596)
+        assert plan_a["counts"]["windows"] == 2610
         # Relaunch boundaries = distinct EXECUTABLE serving configs
         # (engine, prefix, budget, kv_dtype, connector); hf is in-process (0):
         #   vllm:   F1 {plain, fp8·B10, lmcache·B8}                   =  3
@@ -279,21 +338,43 @@ class TestPlanCountsSessionA:
         #   sglang: F1 {plain, fp8}   (B8 BLOCKED: no connector knob) =  2
         #           F3 3 budgets × {plain, fp8}                       =  6
         #           F2 7 budgets, plain                               =  7
-        # ⇒ 19 + 15 = 34  (old pin 30 = 17 + 13, pre-fine-grid)
-        assert plan_a["counts"]["relaunches"] == 34
+        #   ADR-0103 (corpus-fresh B4 served prefix OFF by relaunch):
+        #           F1 B4 = the budget-free prefix-OFF plain config, new
+        #           on EACH engine                                    = +1 ×2
+        #           F3 B4 = prefix-OFF plain at r ∈ {1.0, 0.5, 0.25}, which
+        #           is IDENTICAL to the F2 plain-OFF configs at those r
+        #           (F3 budgets ⊂ F2 budgets; family is not a serving
+        #           dimension), so they share F2's boundaries       = +0
+        # ⇒ (19 + 1) + (15 + 1) = 36  (old pin 34 = 19 + 15, pre-ADR-0103;
+        #    older 30 = 17 + 13, pre-fine-grid)
+        assert plan_a["counts"]["relaunches"] == 36
         # Blocked: retr-store (B8) on sglang — the frozen launcher has no
         # KV-store connector knob: F1 4 datasets + F3 3×3 = 13. Serving them
         # connector-free would duplicate plain rag under a B8 label.
-        assert plan_a["counts"]["blocked"] == 13
+        #   + ADR-0106 B12 rung cells with NO query manifest registered for
+        #     their dataset (this fixture passes none): a rung serves only
+        #     from a manifest carrying the ladder, so all 52 B12 cells
+        #     (F1 2 eng × 4 ds × 2 rungs = 16; F3 2 eng × 9 × 2 = 36) are
+        #     blocked_on the missing manifest, never silently run through
+        #     the non-manifest fallback that DROPS out-of-corpus queries.
+        # ⇒ 13 + 52 = 65  (old pin 13, pre-manifest-registration)
+        assert plan_a["counts"]["blocked"] == 65
 
-    def test_blocked_cells_are_exactly_sglang_retr_store(self, plan_a):
+    def test_blocked_cells_are_sglang_retr_store_plus_unmanifested_b12(self, plan_a):
         blocked = [s for s in _cells(plan_a) if s["blocked_on"]]
-        assert len(blocked) == 13
-        for s in blocked:
-            assert s["baseline"] == "B8"
+        assert len(blocked) == 65
+        b8 = [s for s in blocked if s["baseline"] == "B8"]
+        b12 = [s for s in blocked if s["baseline"] == "B12"]
+        assert len(b8) == 13 and len(b12) == 52
+        assert len(b8) + len(b12) == len(blocked)
+        for s in b8:
             assert s["cellspec"]["arm"] == "retr-store"
             assert s["cellspec"]["engine"] == "sglang"
             assert s["blocked_on"] == rc.SGLANG_STORE_BLOCKED_ON
+        for s in b12:
+            assert s["cellspec"]["arm"] == "corpus-trunc"
+            assert s["blocked_on"] == rc.trunc_manifest_blocked_on(s["dataset"])
+            assert f"query-manifest:{s['dataset']}" in s["blocked_on"]
         assert sorted(plan_a["blocked_row_keys"]) == sorted(
             s["row_key"] for s in blocked
         )
@@ -309,14 +390,17 @@ class TestPlanCountsSessionA:
             key = "F1-hf" if (s["family"] == "F1" and eng == "hf") else s["family"]
             by[key] = by.get(key, 0) + 1
         # F2 = 340 qasper (5 FRESH × 2 eng × 34 coords) + 272 ruler
-        # (1 × 2 eng × 34 coords × 4 tasks) = 612; F1/F3 unchanged.
-        assert by == {"F1": 96, "F1-hf": 10, "F2": 612, "F3": 126}
+        # (1 × 2 eng × 34 coords × 4 tasks) = 612.
+        # ADR-0106 B12 ladder (2 rungs): F1 96 + 8 = 104 (B12's 2 eng × 4
+        # datasets doubled), F3 126 + 18 = 144 (B12's 2 eng × 3 × 3 doubled);
+        # the hf oracle slice and F2 carry no B12 (old pins F1 96, F3 126).
+        assert by == {"F1": 104, "F1-hf": 10, "F2": 612, "F3": 144}
         windows = {k: 3 * v for k, v in by.items()}
         # Old window pins: F2 900 (= 300 cells × 3, pre-§6.4/pre-RULER),
-        # F3 378 (= 126 × 3, UNCHANGED — the fine grid and the RULER pairing
-        # are both F2-only registrations). New F2 = 612 × 3
-        # = (340 qasper + 272 ruler) × 3 = 1020 + 816 = 1836.
-        assert windows == {"F1": 288, "F1-hf": 30, "F2": 1836, "F3": 378}
+        # F3 378 (= 126 × 3), F1 288 (= 96 × 3). New F2 = 612 × 3
+        # = (340 qasper + 272 ruler) × 3 = 1020 + 816 = 1836; F1 = 104 × 3
+        # = 312; F3 = 144 × 3 = 432 (ADR-0106 ladder).
+        assert windows == {"F1": 312, "F1-hf": 30, "F2": 1836, "F3": 432}
 
     def test_hf_oracle_exact_reduced_set(self, plan_a):
         hf = [s for s in _cells(plan_a) if s["cellspec"]["engine"] == "hf"]
@@ -363,7 +447,12 @@ class TestPlanCountsSessionA:
         assert {s["cellspec"]["budget_r"] for s in f3} == {1.0, 0.5, 0.25}
         assert {s["cellspec"]["rate_frac"] for s in f3} == {0.85, 0.95, 1.05}
         assert {s["baseline"] for s in f3} == {"B2", "B3", "B4", "B7", "B8", "B10", "B12"}
-        assert all(s["serving"]["prefix_mode"] == "ON" for s in f3)
+        # F3 serves prefix ON, except corpus-fresh (B4), which ADR-0103
+        # serves prefix OFF by relaunch in EVERY family (its REUSE-bit family
+        # carriage beside B3 is unchanged).
+        for s in f3:
+            want = "OFF" if s["baseline"] == "B4" else "ON"
+            assert s["serving"]["prefix_mode"] == want, s["row_key"]
 
 
 # ---------------------------------------------------------------------------
@@ -390,9 +479,12 @@ class TestOrdering:
         for s in _cells(plan_a):
             if s["serving"] is not None and not s["blocked_on"]:
                 configs.add(self._config_of(s["serving"]))
-        # 34 = the 30 pre-fine configs + the 2 §6.4 fine-only F2 budget
-        # levels × 2 engines (see TestPlanCountsSessionA.test_total_counts).
-        assert len(_relaunches(plan_a)) == len(configs) == 34
+        # 36 = the 30 pre-fine configs + the 2 §6.4 fine-only F2 budget
+        # levels × 2 engines + the ADR-0103 budget-free prefix-OFF plain
+        # config for F1 B4 × 2 engines (F3 B4 rides the F2 plain-OFF
+        # boundaries at the same r; see
+        # TestPlanCountsSessionA.test_total_counts).
+        assert len(_relaunches(plan_a)) == len(configs) == 36
 
     def test_every_cell_runs_under_its_preceding_relaunch(self, plan_a):
         current = None
@@ -413,6 +505,32 @@ class TestOrdering:
             assert current == self._config_of(
                 s["serving"]
             ), f"cell {s['row_key']} would run under serving config {current}"
+
+    def test_corpus_fresh_prefix_off_rides_f2_boundaries(self, plan_a):
+        # ADR-0103 minimality: every B4 F3 cell's serving config is one of
+        # the F2 plain prefix-OFF configs at the same r (F3 budgets are a
+        # subset of F2 budgets), so B4 F3 adds NO relaunch; only the
+        # budget-free F1 B4 config is new (one per engine).
+        f2_configs = {
+            self._config_of(s["serving"])
+            for s in _cells(plan_a)
+            if s["family"] == "F2"
+        }
+        f1_b4_configs = set()
+        for s in _cells(plan_a):
+            if s["baseline"] != "B4":
+                continue
+            cfg = self._config_of(s["serving"])
+            if s["family"] == "F3":
+                assert cfg in f2_configs, s["row_key"]
+            else:
+                assert s["family"] == "F1"
+                assert cfg not in f2_configs, s["row_key"]
+                f1_b4_configs.add(cfg)
+        assert f1_b4_configs == {
+            ("vllm", "OFF", None, None, None),
+            ("sglang", "OFF", None, None, None),
+        }
 
     def test_rate_changes_never_relaunch(self, floor_table):
         # Synthetic small grid: 1 F1 cell + F2 = 1 baseline × 2 budgets × 2
@@ -441,9 +559,12 @@ class TestOrdering:
     def test_budget_env_on_relaunch_steps(self, plan_a):
         # The launcher env carries plan_budget's PRIMARY knob per engine —
         # frozen contract (CAGE_KV_BUDGET_BYTES / CAGE_SGLANG_MAX_TOTAL_TOKENS)
-        # — plus the launch levers (KV dtype / connector) and nothing else.
+        # plus the launch levers (KV dtype / connector), plus the uniform
+        # per-session max_model_len (backlog A10; both engines read
+        # VLLM_MAX_MODEL_LEN), and nothing else.
         for s in _relaunches(plan_a):
             env = dict(s["env"])
+            assert env.pop("VLLM_MAX_MODEL_LEN") == "32768"
             # launch levers ride the documented launcher env vars
             if s["kv_dtype"] == "fp8":
                 if s["engine"] == "vllm":
@@ -566,27 +687,110 @@ def _by_baseline(plan, family, engine, dataset=None):
     return out
 
 
+class TestCorpusFreshPrefixOff:
+    """ADR-0103 (owner decision 2026-09-16): corpus-fresh (B4) is served with
+    the engine prefix cache OFF through a per-arm RELAUNCH, uniformly on every
+    engine, in every family. Its family carriage (REUSE bit, rides F3 beside
+    B3) is unchanged. Before ADR-0103 the runner's ``no_cache`` token only
+    labeled telemetry, so B4 and B3 were served by the SAME prefix-ON server:
+    the mislabeled-duplicate failure class."""
+
+    @staticmethod
+    def _b3_b4(plan, family, engine):
+        cells = _by_baseline(plan, family, engine)
+        return cells["B3"], cells["B4"]
+
+    @pytest.mark.parametrize("engine", ["vllm", "sglang"])
+    @pytest.mark.parametrize("family", ["F1", "F3"])
+    def test_b4_serves_prefix_off_and_b3_on(self, plan_a, family, engine):
+        b3, b4 = self._b3_b4(plan_a, family, engine)
+        assert b3 and b4
+        assert all(s["serving"]["prefix_mode"] == "ON" for s in b3)
+        assert all(s["serving"]["prefix_mode"] == "OFF" for s in b4)
+        # Serving config differs ONLY by the prefix mode: same engine,
+        # budget, and (absent) launch levers.
+        for s in b4:
+            assert s["serving"]["kv_dtype"] is None
+            assert s["serving"]["connector"] is None
+            assert s["serving"]["topology"] == "single"
+        assert {s["serving"]["budget_r"] for s in b3} == {
+            s["serving"]["budget_r"] for s in b4
+        }
+
+    def test_b4_family_carriage_unchanged(self, plan_a):
+        # The REUSE bit still carries B4 in F3 beside B3, never in F2.
+        f3 = {s["baseline"] for s in _cells(plan_a) if s["family"] == "F3"}
+        f2 = {s["baseline"] for s in _cells(plan_a) if s["family"] == "F2"}
+        assert {"B3", "B4"} <= f3
+        assert "B4" not in f2
+        for s in _cells(plan_a):
+            if s["baseline"] == "B4":
+                assert s["cellspec"]["arm"] == "corpus-fresh"
+                assert s["family"] in ("F1", "F3")
+
+    def test_b4_relaunch_argv_carries_no_prefix_cache(self, plan_a):
+        # Every B4 cell runs under a relaunch whose argv disables the
+        # engine prefix cache (launchers map --no-prefix-cache to
+        # --no-enable-prefix-caching / --disable-radix-cache).
+        current = None
+        for s in plan_a["steps"]:
+            if s["kind"] == "relaunch":
+                current = s
+                continue
+            if s["baseline"] != "B4":
+                continue
+            assert current is not None
+            assert current["prefix_mode"] == "OFF"
+            assert "--no-prefix-cache" in current["argv"]
+            assert current["engine"] == s["cellspec"]["engine"]
+
+    def test_hf_cells_unaffected(self, plan_a):
+        # The in-process oracle has no server: serving stays None and the
+        # B4 rule never enumerates an hf cell (the reduced slice has none).
+        hf = [s for s in _cells(plan_a) if s["cellspec"]["engine"] == "hf"]
+        assert hf and all(s["serving"] is None for s in hf)
+        assert all(s["baseline"] != "B4" for s in hf)
+
+    def test_rule_is_the_named_constant(self):
+        # Doctrine: the knob is a named module constant citing its ADR, and
+        # _prefix_off is the ONE rule the sort key, the serving-config
+        # identity, the relaunch step and the cell step all consult.
+        assert rc.PREFIX_OFF_ARMS == frozenset({"corpus-fresh"})
+        assert "ADR-0103" in rc._prefix_off.__doc__
+
+    def test_rule_surfaces_in_the_plan_header(self, plan_a, plan_b):
+        # Like the ADR-0102 constants: the operator reviews the registered
+        # prefix-OFF arms in the header, not only inside the cell list.
+        for plan in (plan_a, plan_b):
+            knobs = plan["behavior_knobs"]
+            assert knobs["prefix_off_arms"] == ["corpus-fresh"]
+            assert knobs["prefix_off_adr"] == "ADR-0103"
+
+
 class TestBehaviorRealization:
     def test_corpus_arms_carry_the_corpus_block(self, plan_a):
         # B3/B4/B10 serve the SHARED corpus-as-prefix block
         # (run_prefix_envelope.sh cag_true_*: --corpus-prefix-budget); B12
-        # serves the TRUNCATED block — the budget delta IS the whole
-        # B12-vs-B3 one-slot contrast ("store less than you know").
+        # serves the TRUNCATED block at ITS rung (ADR-0106 ladder); the
+        # budget delta IS the B12-vs-B3 contrast ("store less than you know").
         knobs = plan_a["behavior_knobs"]
-        full, trunc = (
-            knobs["corpus_prefix_budget_tokens"],
-            knobs["corpus_trunc_budget_tokens"],
-        )
-        assert 0 < trunc < full
+        full = knobs["corpus_prefix_budget_tokens"]
+        rungs = tuple(knobs["corpus_trunc_budgets"])
+        assert all(0 < r < full for r in rungs)
         for s in _cells(plan_a):
             arm = s["cellspec"]["arm"]
             if arm in ("corpus-reuse", "corpus-fresh", "corpus-comp"):
                 assert _argv_value(s, "--corpus-prefix-budget") == str(full)
+                assert "--corpus-rung" not in s["argv"]
             elif arm == "corpus-trunc":
-                assert _argv_value(s, "--corpus-prefix-budget") == str(trunc)
+                rung = s["cellspec"]["corpus_budget_tokens"]
+                assert rung in rungs
+                assert _argv_value(s, "--corpus-prefix-budget") == str(rung)
+                assert _argv_value(s, "--corpus-rung") == str(rung)
             else:
                 # gold/retrieval arms never serve a corpus block
                 assert "--corpus-prefix-budget" not in s["argv"]
+                assert "--corpus-rung" not in s["argv"]
 
     def test_reranker_ablated_exactly_once(self, plan_a):
         # §7.1 ranking rule: B5 = dense WITHOUT the reranker, B6 = the pinned
@@ -602,9 +806,32 @@ class TestBehaviorRealization:
             if s["baseline"] == "B5":
                 assert retriever == "dense"
                 assert _argv_value(s, "--reranker-model") == "none"
+                # ADR-0104: B5 serves the dense top-k UNRANKED, no pool.
+                assert "--rerank-pool" not in s["argv"]
             else:
                 assert retriever == "rerank"
                 assert _argv_value(s, "--reranker-model") == rc.RERANKER_MODEL
+                # ADR-0104: the ranked pipeline reranks a POOL of RERANK_POOL
+                # candidates and serves --top-k (the runner default, 3).
+                assert _argv_value(s, "--rerank-pool") == str(rc.RERANK_POOL)
+
+    def test_rerank_pool_is_the_named_constant(self, plan_a, plan_b):
+        # ADR-0104 (owner decision 2026-09-16): pool 10, reranked whole, top 3
+        # served. The knob is a named module constant citing its ADR, pinned
+        # in the argv (never a runner default) and reviewable in the header.
+        assert rc.RERANK_POOL == 10
+        assert rc.RETRIEVER_ARGV["rerank"] == (
+            "--retriever", "dense",
+            "--reranker-model", rc.RERANKER_MODEL,
+            "--rerank-pool", "10",
+        )
+        assert rc.RETRIEVER_ARGV["dense"] == (
+            "--retriever", "dense", "--reranker-model", "none",
+        )
+        for plan in (plan_a, plan_b):
+            knobs = plan["behavior_knobs"]
+            assert knobs["rerank_pool"] == 10
+            assert knobs["rerank_pool_adr"] == "ADR-0104"
 
     def test_retr_comp_compresses_retrieved_context(self, plan_a):
         # run_compression.sh: without --context-source retrieved the arm
@@ -698,6 +925,144 @@ class TestBehaviorRealization:
 
 
 # ---------------------------------------------------------------------------
+# ADR-0106 / backlog A4: the B12 corpus-truncation ladder (one cell per rung)
+# ---------------------------------------------------------------------------
+
+
+class TestCorpusTruncLadder:
+    """ADR-0106 (owner decision 2026-09-16, charter §7.7(d)): B12 is a
+    descending corpus-budget ladder whose 2,800 point is B3's own cell; the
+    registered rungs (1400, 700) each enumerate ONE corpus-trunc cell
+    wherever B12 is carried (F1 and F3), the rung rides the identity seam as
+    CAGE_CELL_CORPUS_BUDGET and the argv as the explicit --corpus-rung."""
+
+    LADDER = (1400, 700)
+
+    @staticmethod
+    def _b12(plan):
+        return [s for s in _cells(plan) if s["cellspec"]["arm"] == "corpus-trunc"]
+
+    def test_registered_ladder_and_header(self, plan_a, plan_b):
+        for session in ("a", "b"):
+            assert rc.SESSION_GRIDS[session].corpus_trunc_budgets == self.LADDER
+        for plan in (plan_a, plan_b):
+            knobs = plan["behavior_knobs"]
+            assert "corpus_trunc_budget_tokens" not in knobs  # the single-rung knob is gone
+            assert knobs["corpus_trunc_budgets"] == list(self.LADDER)
+            # The full ladder as the operator reads it: B3's budget first.
+            assert knobs["corpus_trunc_ladder"] == [
+                knobs["corpus_prefix_budget_tokens"], *self.LADDER
+            ]
+            assert knobs["corpus_trunc_adr"] == "ADR-0106"
+
+    @pytest.mark.parametrize("family", ["F1", "F3"])
+    @pytest.mark.parametrize("engine", ["vllm", "sglang"])
+    def test_one_cell_per_rung_in_every_slice(self, plan_a, family, engine):
+        # Group the B12 cells of one (family, engine) by workload slice: each
+        # slice carries exactly the registered rungs, each once.
+        slices = {}
+        for s in self._b12(plan_a):
+            if s["family"] != family or s["cellspec"]["engine"] != engine:
+                continue
+            key = (s["dataset"], s["cellspec"]["budget_r"], s["cellspec"]["rate_frac"])
+            slices.setdefault(key, []).append(s["cellspec"]["corpus_budget_tokens"])
+        expected_slices = 4 if family == "F1" else 9  # 4 datasets; 3 r × 3 λ
+        assert len(slices) == expected_slices
+        for key, rungs in slices.items():
+            assert tuple(rungs) == self.LADDER, key  # descending, no duplicates
+
+    def test_total_b12_cells_session_a_and_b(self, plan_a, plan_b):
+        # a: F1 2 eng × 4 ds × 2 rungs = 16; F3 2 eng × 9 × 2 = 36 ⇒ 52.
+        # b: identical F1/F3 carriage (no B12 in the hf slice, F2 or DIST).
+        assert len(self._b12(plan_a)) == 52
+        assert len(self._b12(plan_b)) == 52
+        for plan in (plan_a, plan_b):
+            for s in self._b12(plan):
+                assert s["cellspec"]["engine"] != "hf"
+                assert s["family"] in ("F1", "F3")
+
+    def test_rung_rides_identity_env_argv_and_row_key(self, plan_a):
+        for s in _cells(plan_a):
+            rung = s["cellspec"].get("corpus_budget_tokens")
+            if s["cellspec"]["arm"] == "corpus-trunc":
+                assert rung in self.LADDER
+                assert s["env"]["CAGE_CELL_CORPUS_BUDGET"] == str(rung)
+                assert s["row_key"].endswith(f"|cb{rung}")
+                assert _argv_value(s, "--corpus-rung") == str(rung)
+                assert _argv_value(s, "--corpus-prefix-budget") == str(rung)
+            else:
+                assert rung is None
+                assert "CAGE_CELL_CORPUS_BUDGET" not in s["env"]
+                assert "|cb" not in s["row_key"]
+                assert "--corpus-rung" not in s["argv"]
+
+    def test_rung_cells_round_trip_through_derive_cell_spec(self, plan_a):
+        # The generic seam test samples every 17th cell; the rung coordinate
+        # must round-trip on EVERY B12 cell or two rungs collapse into one row.
+        keys = set()
+        for s in self._b12(plan_a):
+            argv = s["argv"]
+
+            def val(flag: str, argv=argv) -> str:
+                return argv[argv.index(flag) + 1]
+
+            derived = derive_cell_spec(
+                baseline=val("--baseline"),
+                baseline_label=val("--baseline-label"),
+                backend=val("--backend"),
+                model=val("--model"),
+                env=s["env"],
+            )
+            assert derived.to_row_key() == s["row_key"]
+            keys.add((s["row_key"], s["dataset"]))
+        # Every rung cell is its own (row, dataset) pair: 52 cells. Distinct
+        # row keys = 40: F1 keys are shared by the 4 datasets (2 engines × 2
+        # rungs = 4) and F3 keys are per coordinate (2 × 9 × 2 = 36).
+        assert len(keys) == 52
+        assert len({k for k, _ in keys}) == 40
+
+    def test_rungs_share_one_serving_config(self, plan_a):
+        # The rung is a RUNNER-side corpus fact (the served block), never a
+        # server dial: both rungs of a slice run under the same relaunch
+        # boundary (relaunch count pinned at 36 in test_total_counts).
+        by_slice = {}
+        for s in self._b12(plan_a):
+            key = (s["family"], s["cellspec"]["engine"], s["dataset"],
+                   s["cellspec"]["budget_r"], s["cellspec"]["rate_frac"])
+            by_slice.setdefault(key, []).append(s["serving"])
+        for key, servings in by_slice.items():
+            assert len(servings) == 2 and servings[0] == servings[1], key
+
+    def test_ladder_order_is_descending_in_the_plan(self, plan_a):
+        # Within a slice the 1400 rung precedes the 700 rung (descending
+        # budgets, as the charter reads the ladder), deterministically.
+        seen = {}
+        for s in self._b12(plan_a):
+            key = (s["family"], s["cellspec"]["engine"], s["dataset"],
+                   s["cellspec"]["budget_r"], s["cellspec"]["rate_frac"])
+            seen.setdefault(key, []).append(s["index"])
+        for key, indices in seen.items():
+            assert indices == sorted(indices), key
+
+    @pytest.mark.parametrize(
+        "ladder",
+        [(), (2800,), (2900,), (700, 1400), (1400, 1400), (1400, 0), (1400.0, 700)],
+    )
+    def test_grid_refuses_bad_ladders(self, ladder):
+        with pytest.raises(rc.PlanError):
+            _tiny_grid(f1_baselines=("B12",), corpus_trunc_budgets=ladder)
+
+    def test_tiny_grid_enumerates_one_cell_per_rung(self, floor_table, stub):
+        grid = _tiny_grid(f1_baselines=("B3", "B12"), corpus_trunc_budgets=(1000, 500))
+        plan = _stub_plan(grid, floor_table, stub.cmd)
+        cells = _cells(plan)
+        assert [s["baseline"] for s in cells] == ["B3", "B12", "B12"]
+        assert [s["cellspec"].get("corpus_budget_tokens") for s in cells] == [None, 1000, 500]
+        assert plan["counts"]["cells"] == 3
+        assert plan["behavior_knobs"]["corpus_trunc_ladder"] == [2800, 1000, 500]
+
+
+# ---------------------------------------------------------------------------
 # Plan schema roundtrip + CLI purity
 # ---------------------------------------------------------------------------
 
@@ -723,7 +1088,7 @@ class TestPlanSchema:
         after = {p for p in tmp_path.rglob("*")}
         assert after - before == {out}, "plan must write NOTHING except --out"
         plan = rc.load_plan(out)
-        assert plan["counts"]["cells"] == 844  # see TestPlanCountsSessionA
+        assert plan["counts"]["cells"] == 870  # see TestPlanCountsSessionA (ADR-0106; old 844)
         # every row key re-mints from its embedded cellspec (never hand-built)
         for s in _cells(plan)[::50]:
             assert CellSpec.from_flat_dict(s["cellspec"]).to_row_key() == s["row_key"]
@@ -870,6 +1235,23 @@ class TestDistBlocked:
 
 
 class TestRun:
+    @pytest.mark.parametrize("value", ["1", "0", ""])
+    def test_run_refuses_when_the_stale_index_escape_hatch_is_set(
+        self, tmp_path, floor_table, stub, monkeypatch, value
+    ):
+        # Backlog A6 / F6 (review 2026-09-17 defect 2): _exec inherits the
+        # operator's shell, so CAGE_ALLOW_STALE_INDEX would reach every
+        # retrieval cell and serve a pre-prefix index under a WARNING. The
+        # driver refuses on PRESENCE (any value), before the first step.
+        from src.orchestration.ir import STALE_INDEX_OPT_IN_ENV
+
+        assert rc.STALE_INDEX_OPT_IN_ENV == STALE_INDEX_OPT_IN_ENV == "CAGE_ALLOW_STALE_INDEX"
+        monkeypatch.setenv(rc.STALE_INDEX_OPT_IN_ENV, value)
+        plan = _stub_plan(_tiny_grid(), floor_table, stub.cmd)
+        with pytest.raises(rc.RunError, match="CAGE_ALLOW_STALE_INDEX"):
+            rc.run_plan(plan, _run_root(tmp_path))
+        assert stub.calls() == [], "nothing may execute under the escape hatch"
+
     def test_end_to_end_two_cell_plan(self, tmp_path, floor_table, stub):
         plan = _stub_plan(_tiny_grid(), floor_table, stub.cmd)
         root = _run_root(tmp_path)
@@ -1386,22 +1768,34 @@ def plan_b(floor_table_b: Path) -> Dict[str, Any]:
 class TestSessionB:
     def test_total_counts(self, plan_b):
         # F1: 12 baselines × 2 engines × 4 QA datasets           =  96
+        #   + ADR-0106 B12 ladder (2 rungs): 2 eng × 4 ds doubled = +8
         # F1 HF oracle: B3×4 + {B1,B2,B6}×2 (anchor slice reuse) =  10
         # F2: 5 FRESH × 2 engines × 3 budgets × 3 rates (§6.8)   =  90
         # F3: 7 REUSE × 2 engines × 3 budgets × 3 rates          = 126
+        #   + B12 ladder: 2 eng × 3 × 3 = 18 doubled             = +18
         # DIST: {B1, B3} × vllm × {tp, pd}                       =   4
-        # ⇒ 96 + 10 + 90 + 126 + 4 = 326; windows 326 × 3 = 978
-        assert plan_b["counts"]["cells"] == 326
-        assert plan_b["counts"]["windows"] == 978
-        # Blocked: sglang retr-store (B8) only — F1 4 + F3 3×3 = 13; the
-        # DIST legs are all EXECUTABLE (tp registered, pd launcher exists).
-        assert plan_b["counts"]["blocked"] == 13
+        # ⇒ 104 + 10 + 90 + 144 + 4 = 352; windows 352 × 3 = 1056
+        #   (old pins 326 / 978, pre-ADR-0106)
+        assert plan_b["counts"]["cells"] == 352
+        assert plan_b["counts"]["windows"] == 1056
+        # Blocked: sglang retr-store (B8), F1 4 + F3 3×3 = 13; the DIST
+        # legs are all EXECUTABLE (tp registered, pd launcher exists).
+        #   + ADR-0106 B12 rung cells with no query manifest registered
+        #     (identical F1/F3 carriage to session a): 16 + 36 = 52
+        # ⇒ 13 + 52 = 65  (old pin 13, pre-manifest-registration)
+        assert plan_b["counts"]["blocked"] == 65
         # Relaunches = distinct executable configs:
         #   vllm:   F1 {plain, fp8, lmcache} 3 + F3 3×{plain,fp8,lmcache} 9
         #           + F2 3 plain + DIST {tp leg, pd leg} 2        = 17
         #   sglang: F1 {plain, fp8} 2 + F3 3×{plain,fp8} 6 + F2 3 = 11
-        # ⇒ 28
-        assert plan_b["counts"]["relaunches"] == 28
+        #   ADR-0103 (corpus-fresh B4 served prefix OFF by relaunch):
+        #           F1 B4 = budget-free prefix-OFF plain, new per engine
+        #                                                         = +1 ×2
+        #           F3 B4 = prefix-OFF plain at r ∈ {1.0, 0.5, 0.25} =
+        #           the F2 plain-OFF configs (same budgets)       = +0
+        #           DIST carries {B1, B3} only (no B4 leg)         = +0
+        # ⇒ (17 + 1) + (11 + 1) = 30  (old pin 28, pre-ADR-0103)
+        assert plan_b["counts"]["relaunches"] == 30
 
     def test_no_fine_grid_and_no_ruler_on_group_b(self, plan_b):
         # §6.8: the fine r-grid runs on Group A ONLY; the D5#5 RULER pairing
@@ -1536,7 +1930,7 @@ class TestSessionB:
     def test_plan_b_roundtrips_through_load_plan(self, tmp_path, plan_b):
         out = tmp_path / "plan_b.json"
         out.write_text(json.dumps(plan_b), encoding="utf-8")
-        assert rc.load_plan(out)["counts"]["cells"] == 326
+        assert rc.load_plan(out)["counts"]["cells"] == 352  # TestSessionB pin (ADR-0106; old 326)
 
 
 # ---------------------------------------------------------------------------
@@ -1544,17 +1938,24 @@ class TestSessionB:
 # ---------------------------------------------------------------------------
 
 
-class TestPlanSchemaV3:
+class TestPlanSchemaV5:
     def test_schema_literal(self):
-        assert rc.PLAN_SCHEMA == "cage-campaign-plan-v3"
+        assert rc.PLAN_SCHEMA == "cage-campaign-plan-v5"
 
-    def test_v2_plan_refuses(self, tmp_path):
+    @pytest.mark.parametrize(
+        "old_schema",
+        ["cage-campaign-plan-v2", "cage-campaign-plan-v3", "cage-campaign-plan-v4"],
+    )
+    def test_older_plan_refuses(self, tmp_path, old_schema):
         # A v2 plan predates gpu_count / grids / ruler_task /
-        # window_ordinal_base / relaunch tp — 'run' must refuse it and the
-        # operator re-plans (the v2 precedent, verbatim).
+        # window_ordinal_base / relaunch tp; a v3 plan predates the
+        # ADR-0102/0103/0104/0106 argv and the query-manifest registration;
+        # a v4 plan predates the A9 per-row N cell keys (row_class,
+        # num_queries) and the --num-queries argv. 'run' must refuse all
+        # three and the operator re-plans (the v2 precedent).
         old = tmp_path / "old.json"
         old.write_text(
-            json.dumps({"schema": "cage-campaign-plan-v2", "steps": []}),
+            json.dumps({"schema": old_schema, "steps": []}),
             encoding="utf-8",
         )
         with pytest.raises(rc.RunError, match="schema"):
@@ -1577,3 +1978,1201 @@ class TestPlanSchemaV3:
         path.write_text(json.dumps(plan), encoding="utf-8")
         with pytest.raises(rc.RunError, match="tp"):
             rc.load_plan(path)
+
+    @pytest.mark.parametrize("key", ["row_class", "num_queries"])
+    def test_cell_step_missing_v5_key_refuses(self, tmp_path, plan_a, key):
+        # A9: the per-row N keys are REQUIRED cell-step keys (v5).
+        plan = json.loads(json.dumps(plan_a))
+        cell = next(s for s in plan["steps"] if s["kind"] == "cell")
+        del cell[key]
+        path = tmp_path / f"missing_{key}.json"
+        path.write_text(json.dumps(plan), encoding="utf-8")
+        with pytest.raises(rc.RunError, match=key):
+            rc.load_plan(path)
+
+
+# ---------------------------------------------------------------------------
+# ADR-0102 (owner decision 2026-09-16): cold start per window with a
+# registered warm-up from a DISJOINT pool (W_warm = 20)
+# ---------------------------------------------------------------------------
+
+
+class TestColdStartPerWindow:
+    def test_registered_constants(self):
+        # The knobs are module constants (reviewable, ADR-cited), never a
+        # silent default inside a step builder.
+        assert rc.RESET_CACHE_PER_WINDOW is True
+        assert rc.WARMUP_POOL_QUERIES == 20
+        assert set(rc.SERVER_ENGINES) == {"vllm", "sglang", "lmdeploy"}
+        assert "hf" not in rc.SERVER_ENGINES
+
+    def test_every_server_engine_cell_carries_cold_start_argv(self, plan_a, plan_b):
+        # A window that starts warm when the plan says cold is a mislabeled
+        # row: EVERY server-engine cell resets the engine cache per trial
+        # and warms up from the disjoint pool; the in-process hf oracle
+        # gets neither (no server cache to flush).
+        for plan in (plan_a, plan_b):
+            for s in _cells(plan):
+                engine = s["cellspec"]["engine"]
+                if engine in rc.SERVER_ENGINES:
+                    assert "--reset-cache-between-trials" in s["argv"], s["row_key"]
+                    assert _argv_value(s, "--warmup-pool-queries") == str(
+                        rc.WARMUP_POOL_QUERIES
+                    )
+                else:
+                    assert engine == "hf"
+                    assert "--reset-cache-between-trials" not in s["argv"]
+                    assert "--warmup-pool-queries" not in s["argv"]
+                # The legacy flag replays the MEASURED set (cache-warms the
+                # measured queries) and must never ride a campaign cell.
+                assert "--warmup-queries" not in s["argv"], s["row_key"]
+
+    def test_hf_cells_exist_and_are_excluded(self, plan_a):
+        hf = [s for s in _cells(plan_a) if s["cellspec"]["engine"] == "hf"]
+        assert len(hf) == 10  # the reduced oracle set is the exclusion witness
+        for s in hf:
+            assert "--reset-cache-between-trials" not in s["argv"]
+            assert "--warmup-pool-queries" not in s["argv"]
+
+    def test_plan_header_records_both_constants(self, plan_a, plan_b):
+        for plan in (plan_a, plan_b):
+            knobs = plan["behavior_knobs"]
+            assert knobs["reset_cache_per_window"] is True
+            assert knobs["warmup_pool_queries"] == rc.WARMUP_POOL_QUERIES
+            assert knobs["cold_start_adr"] == "ADR-0102"
+
+    def test_counts_unchanged_by_cold_start(self, plan_a, plan_b):
+        # The window protocol adds argv, never cells or windows (the pins at
+        # TestPlanCountsSessionA / TestSessionB stay: 870/2610 and 352/1056,
+        # the ADR-0106 ladder pins; pre-ADR-0106 844/2532 and 326/978).
+        assert (plan_a["counts"]["cells"], plan_a["counts"]["windows"]) == (870, 2610)
+        assert (plan_b["counts"]["cells"], plan_b["counts"]["windows"]) == (352, 1056)
+
+    def test_load_plan_refuses_server_cell_without_cold_start(self, tmp_path, plan_a):
+        # A stale plan (pre-ADR-0102) whose server-engine cell lacks the
+        # cold-start argv would run warm windows under a cold label: 'run'
+        # refuses it at load time and the operator re-plans.
+        plan = json.loads(json.dumps(plan_a))
+        cell = next(
+            s for s in plan["steps"]
+            if s["kind"] == "cell" and s["cellspec"]["engine"] == "vllm"
+        )
+        cell["argv"] = [
+            a for a in cell["argv"] if a != "--reset-cache-between-trials"
+        ]
+        path = tmp_path / "stale_cold_start.json"
+        path.write_text(json.dumps(plan), encoding="utf-8")
+        with pytest.raises(rc.RunError, match="reset-cache-between-trials"):
+            rc.load_plan(path)
+
+        plan = json.loads(json.dumps(plan_a))
+        cell = next(
+            s for s in plan["steps"]
+            if s["kind"] == "cell" and s["cellspec"]["engine"] == "sglang"
+        )
+        i = cell["argv"].index("--warmup-pool-queries")
+        del cell["argv"][i:i + 2]
+        path.write_text(json.dumps(plan), encoding="utf-8")
+        with pytest.raises(rc.RunError, match="warmup-pool-queries"):
+            rc.load_plan(path)
+
+    def test_load_plan_accepts_a_fresh_plan(self, tmp_path, plan_a):
+        path = tmp_path / "fresh.json"
+        path.write_text(json.dumps(plan_a), encoding="utf-8")
+        assert rc.load_plan(path)["counts"]["cells"] == 870  # ADR-0106 pin (old 844)
+
+
+# ---------------------------------------------------------------------------
+# Adversarial review 2026-09-16, defect 5: query-manifest registration. A
+# B12 rung serves ONLY from a manifest carrying the ladder (the runner's A4
+# guard), so the plan must carry the manifest per dataset or the rung cells
+# are blocked_on the missing registration (visible debt, never a silent
+# fallback that DROPS out-of-corpus queries).
+# ---------------------------------------------------------------------------
+
+
+def _manifest_trials(dataset: str, *, trials: int, ids_per_trial: int) -> Dict[str, List[str]]:
+    """Disjoint per-trial id lists in manifest (draw) order."""
+    return {
+        str(t): [
+            f"{dataset}-q{(t - 1) * ids_per_trial + i:05d}" for i in range(ids_per_trial)
+        ]
+        for t in range(1, trials + 1)
+    }
+
+
+def _write_manifest(
+    tmp_path: Path,
+    dataset: str,
+    *,
+    block_budget: int = 2800,
+    rungs: tuple = (1400, 700),
+    name: Optional[str] = None,
+    # A9 per-row N: the planner refuses a manifest whose trials carry fewer
+    # ids than the dataset's most demanding cell (primary n = 2000, 3 reps),
+    # so the default fixture carries exactly that; tests lower it to probe
+    # the shortfall refusal.
+    trials: int = 3,
+    ids_per_trial: int = 2000,
+    trial_ids: Optional[Dict[str, List[str]]] = None,
+) -> Path:
+    """A minimal manifest carrying exactly what the planner validates."""
+    doc = {
+        "manifest_version": 3,
+        "dataset": dataset,
+        "block_budget": block_budget,
+        "trials": (
+            _manifest_trials(dataset, trials=trials, ids_per_trial=ids_per_trial)
+            if trial_ids is None
+            else trial_ids
+        ),
+        "blocks": [],
+        "question_to_block": {},
+        "trunc_rungs": {
+            str(r): {"budget": r, "blocks": [], "in_corpus_ids": []} for r in rungs
+        },
+    }
+    path = tmp_path / (name or f"manifest_{dataset}.json")
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    return path
+
+
+@pytest.fixture()
+def manifests_a(tmp_path: Path) -> Dict[str, Path]:
+    return {ds: _write_manifest(tmp_path, ds) for ds in rc.QA_DATASETS}
+
+
+@pytest.fixture()
+def plan_a_manifests(floor_table: Path, manifests_a: Dict[str, Path]) -> Dict[str, Any]:
+    floor = rc.load_floor_table(floor_table)
+    return rc.build_plan("a", floor, window_duration_s=300.0, query_manifests=manifests_a)
+
+
+class TestQueryManifestRegistration:
+    @staticmethod
+    def _b12(plan):
+        return [s for s in _cells(plan) if s["cellspec"]["arm"] == "corpus-trunc"]
+
+    def test_without_manifests_every_b12_cell_is_blocked(self, plan_a):
+        b12 = self._b12(plan_a)
+        assert len(b12) == 52
+        for s in b12:
+            assert s["blocked_on"] == rc.trunc_manifest_blocked_on(s["dataset"])
+        for s in _cells(plan_a):
+            assert "--query-manifest" not in s["argv"], s["row_key"]
+        assert plan_a["query_manifests"] == {}
+
+    def test_with_manifests_b12_is_executable_and_every_qa_cell_carries_the_flag(
+        self, plan_a_manifests, manifests_a
+    ):
+        plan = plan_a_manifests
+        for s in self._b12(plan):
+            assert s["blocked_on"] is None
+        # Back to the B8-only blocked set (13, see TestPlanCountsSessionA).
+        assert plan["counts"]["blocked"] == 13
+        for s in _cells(plan):
+            if s["dataset"] in manifests_a:
+                assert _argv_value(s, "--query-manifest") == str(
+                    manifests_a[s["dataset"]].resolve()
+                ), s["row_key"]
+            else:
+                assert s["dataset"] == "ruler"
+                assert "--query-manifest" not in s["argv"]
+        header = plan["query_manifests"]
+        assert set(header) == set(rc.QA_DATASETS)
+        for ds, rec in header.items():
+            assert rec["path"] == str(manifests_a[ds].resolve())
+            assert len(rec["sha256"]) == 64
+            assert rec["block_budget"] == 2800
+            assert rec["trunc_rungs"] == [1400, 700]
+
+    def test_counts_unchanged_by_manifest_registration(self, plan_a, plan_a_manifests):
+        # Registration changes executability, never the enumeration: the
+        # TestPlanCountsSessionA pins (870 / 2610 / 36) hold on both plans.
+        for key in ("cells", "windows", "relaunches"):
+            assert plan_a_manifests["counts"][key] == plan_a["counts"][key] == {
+                "cells": 870, "windows": 2610, "relaunches": 36
+            }[key]
+
+    def test_partial_registration_blocks_only_the_unmanifested_datasets(
+        self, floor_table, tmp_path
+    ):
+        floor = rc.load_floor_table(floor_table)
+        only = {"squad_v2": _write_manifest(tmp_path, "squad_v2")}
+        plan = rc.build_plan("a", floor, window_duration_s=300.0, query_manifests=only)
+        for s in self._b12(plan):
+            if s["dataset"] == "squad_v2":
+                assert s["blocked_on"] is None
+                assert _argv_value(s, "--query-manifest") == str(only["squad_v2"].resolve())
+            else:
+                assert s["blocked_on"] == rc.trunc_manifest_blocked_on(s["dataset"])
+        unblocked = [s for s in self._b12(plan) if s["dataset"] == "squad_v2"]
+        assert len(unblocked) == 4  # F1 only: 2 engines x 2 rungs (F3 runs on qasper)
+        assert plan["counts"]["blocked"] == 65 - 4
+
+    @pytest.mark.parametrize(
+        "spoil, match",
+        [
+            ("missing", "not found"),
+            ("dataset", "for dataset"),
+            ("budget", "block_budget"),
+            ("rung", "rung"),
+            ("unknown", "not a dataset"),
+        ],
+    )
+    def test_manifest_registration_refusals(self, floor_table, tmp_path, spoil, match):
+        floor = rc.load_floor_table(floor_table)
+        manifests: Dict[str, Path] = {}
+        if spoil == "missing":
+            manifests["squad_v2"] = tmp_path / "absent.json"
+        elif spoil == "dataset":
+            manifests["squad_v2"] = _write_manifest(tmp_path, "hotpotqa", name="wrong.json")
+        elif spoil == "budget":
+            manifests["squad_v2"] = _write_manifest(tmp_path, "squad_v2", block_budget=2000)
+        elif spoil == "rung":
+            manifests["squad_v2"] = _write_manifest(tmp_path, "squad_v2", rungs=(1400,))
+        elif spoil == "unknown":
+            manifests["nq_open"] = _write_manifest(tmp_path, "nq_open")
+        with pytest.raises(rc.PlanError, match=match):
+            rc.build_plan("a", floor, window_duration_s=300.0, query_manifests=manifests)
+
+    def test_real_build_manifest_artifact_registers(self, floor_table, stub, tmp_path):
+        # The registration contract holds for the REAL artifact
+        # build_query_manifest.py writes (src.data.manifest.build_manifest).
+        from src.data.loader import CAGExample
+        from src.data.manifest import build_manifest
+
+        pool = [
+            CAGExample(
+                id=f"squad_v2-q{i:03d}",
+                question=f"Question {i}?",
+                context=[f"Paragraph {i} " + "word " * 30],
+                answer=f"a{i}",
+                metadata={},
+            )
+            for i in range(40)
+        ]
+        manifest = build_manifest(
+            pool, num_queries=8, num_trials=3, seed=7, block_budget=2800,
+            dataset="squad_v2", trunc_budgets=(1000, 500),
+        )
+        path = tmp_path / "squad_v2.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        floor = rc.load_floor_table(floor_table)
+
+        def _plan(grid):
+            orig = rc.SESSION_GRIDS
+            rc.SESSION_GRIDS = {grid.session: grid}
+            try:
+                return rc.build_plan(
+                    grid.session, floor, window_duration_s=60.0, runner_cmd=stub.cmd,
+                    launcher_cmds={"vllm": stub.cmd, "sglang": stub.cmd},
+                    query_manifests={"squad_v2": path},
+                )
+            finally:
+                rc.SESSION_GRIDS = orig
+
+        # A9: an 8-id-per-trial artifact cannot serve the registered primary
+        # n (B3 on vllm = 2000) -> the plan refuses naming the shortfall ...
+        grid = _tiny_grid(f1_baselines=("B3", "B12"), corpus_trunc_budgets=(1000, 500))
+        with pytest.raises(rc.PlanError, match=r"squad_v2.*trial 1.*2000.*shortfall 1992"):
+            _plan(grid)
+        # ... unless the grid registers the dataset's achievable n (A5).
+        grid = _tiny_grid(
+            f1_baselines=("B3", "B12"), corpus_trunc_budgets=(1000, 500),
+            achievable_n={"squad_v2": 8},
+        )
+        plan = _plan(grid)
+        cells = _cells(plan)
+        assert [s["baseline"] for s in cells] == ["B3", "B12", "B12"]
+        assert all(s["blocked_on"] is None for s in cells)
+        assert all(_argv_value(s, "--query-manifest") == str(path.resolve()) for s in cells)
+        assert all(_argv_value(s, "--num-queries") == "8" for s in cells)
+        assert [s["row_class"] for s in cells] == ["primary", "secondary", "secondary"]
+        assert plan["counts"]["blocked"] == 0
+
+    def test_cli_registers_manifests_and_refuses_malformed(self, tmp_path, floor_table):
+        out = tmp_path / "plan.json"
+        squad = _write_manifest(tmp_path, "squad_v2")
+        base = ["plan", "--session", "a", "--floor-table", str(floor_table),
+                "--window-duration-s", "300", "--out", str(out)]
+        assert rc.main(base + ["--query-manifest", f"squad_v2={squad}"]) == 0
+        plan = rc.load_plan(out)
+        assert set(plan["query_manifests"]) == {"squad_v2"}
+        # Malformed (no '=') and duplicate registrations refuse (exit 2).
+        assert rc.main(base + ["--query-manifest", str(squad)]) == 2
+        assert rc.main(
+            base + ["--query-manifest", f"squad_v2={squad}", "--query-manifest", f"squad_v2={squad}"]
+        ) == 2
+
+
+# ---------------------------------------------------------------------------
+# Adversarial review 2026-09-16, defect 4: load_plan refuses EVERY stale
+# plan shape today's ADRs fail-close against, not only ADR-0102's.
+# ---------------------------------------------------------------------------
+
+
+def _dump(tmp_path: Path, plan: Dict[str, Any], name: str) -> Path:
+    path = tmp_path / name
+    path.write_text(json.dumps(plan), encoding="utf-8")
+    return path
+
+
+def _preceding_relaunch(plan: Dict[str, Any], cell: Dict[str, Any]) -> Dict[str, Any]:
+    idx = plan["steps"].index(cell)
+    return next(s for s in reversed(plan["steps"][:idx]) if s["kind"] == "relaunch")
+
+
+class TestStalePlanRefusals:
+    def test_fresh_plan_with_manifests_loads(self, tmp_path, plan_a_manifests):
+        path = _dump(tmp_path, plan_a_manifests, "fresh.json")
+        assert rc.load_plan(path)["counts"]["cells"] == 870  # ADR-0106 pin
+
+    def test_warmup_pool_value_drift_refuses(self, tmp_path, plan_a):
+        plan = json.loads(json.dumps(plan_a))
+        cell = next(s for s in _cells(plan) if s["cellspec"]["engine"] == "vllm")
+        cell["argv"][cell["argv"].index("--warmup-pool-queries") + 1] = "5"
+        with pytest.raises(rc.RunError, match="warmup-pool-queries"):
+            rc.load_plan(_dump(tmp_path, plan, "warm5.json"))
+
+    def test_prefix_off_arm_served_prefix_on_refuses(self, tmp_path, plan_a):
+        # ADR-0103: a corpus-fresh (B4) cell must be served prefix OFF, in
+        # its own serving record AND by the relaunch it runs under.
+        plan = json.loads(json.dumps(plan_a))
+        cell = next(
+            s for s in _cells(plan)
+            if s["cellspec"]["arm"] == "corpus-fresh" and s["cellspec"]["engine"] == "vllm"
+        )
+        cell["serving"]["prefix_mode"] = "ON"
+        with pytest.raises(rc.RunError, match="prefix"):
+            rc.load_plan(_dump(tmp_path, plan, "b4_on.json"))
+
+        plan = json.loads(json.dumps(plan_a))
+        cell = next(
+            s for s in _cells(plan)
+            if s["cellspec"]["arm"] == "corpus-fresh" and s["cellspec"]["engine"] == "vllm"
+        )
+        relaunch = _preceding_relaunch(plan, cell)
+        assert "--no-prefix-cache" in relaunch["argv"]
+        relaunch["argv"] = [a for a in relaunch["argv"] if a != "--no-prefix-cache"]
+        with pytest.raises(rc.RunError, match="no-prefix-cache"):
+            rc.load_plan(_dump(tmp_path, plan, "b4_relaunch_on.json"))
+
+    def test_rerank_pool_drift_refuses_both_ways(self, tmp_path, plan_a):
+        # ADR-0104: a ranked cell without the pool would run the legacy
+        # rerank-exactly-top-k pipeline under the pooled row key; a dense
+        # (B5) cell with a pool is the runner-refused leak.
+        plan = json.loads(json.dumps(plan_a))
+        cell = next(s for s in _cells(plan) if s["cellspec"]["retriever"] == "rerank")
+        i = cell["argv"].index("--rerank-pool")
+        del cell["argv"][i:i + 2]
+        with pytest.raises(rc.RunError, match="rerank-pool"):
+            rc.load_plan(_dump(tmp_path, plan, "no_pool.json"))
+
+        plan = json.loads(json.dumps(plan_a))
+        cell = next(s for s in _cells(plan) if s["cellspec"]["retriever"] == "rerank")
+        i = cell["argv"].index("--rerank-pool")
+        cell["argv"][i + 1] = "3"
+        with pytest.raises(rc.RunError, match="rerank-pool"):
+            rc.load_plan(_dump(tmp_path, plan, "pool3.json"))
+
+        plan = json.loads(json.dumps(plan_a))
+        cell = next(s for s in _cells(plan) if s["cellspec"]["retriever"] == "dense")
+        cell["argv"] += ["--rerank-pool", str(rc.RERANK_POOL)]
+        with pytest.raises(rc.RunError, match="rerank-pool"):
+            rc.load_plan(_dump(tmp_path, plan, "dense_pool.json"))
+
+    def test_corpus_trunc_cell_without_rung_or_manifest_refuses(
+        self, tmp_path, plan_a_manifests
+    ):
+        # ADR-0106: an EXECUTABLE rung cell carries --corpus-rung equal to
+        # its identity rung and the --query-manifest that serves it.
+        def _b12(plan):
+            return next(
+                s for s in _cells(plan)
+                if s["cellspec"]["arm"] == "corpus-trunc" and s["blocked_on"] is None
+            )
+
+        plan = json.loads(json.dumps(plan_a_manifests))
+        cell = _b12(plan)
+        i = cell["argv"].index("--corpus-rung")
+        del cell["argv"][i:i + 2]
+        with pytest.raises(rc.RunError, match="corpus-rung"):
+            rc.load_plan(_dump(tmp_path, plan, "no_rung.json"))
+
+        plan = json.loads(json.dumps(plan_a_manifests))
+        cell = _b12(plan)
+        cell["argv"][cell["argv"].index("--corpus-rung") + 1] = "9999"
+        with pytest.raises(rc.RunError, match="corpus-rung"):
+            rc.load_plan(_dump(tmp_path, plan, "wrong_rung.json"))
+
+        plan = json.loads(json.dumps(plan_a_manifests))
+        cell = _b12(plan)
+        i = cell["argv"].index("--query-manifest")
+        del cell["argv"][i:i + 2]
+        with pytest.raises(rc.RunError, match="query-manifest"):
+            rc.load_plan(_dump(tmp_path, plan, "no_manifest.json"))
+
+
+# ---------------------------------------------------------------------------
+# Backlog A9 (--num-queries half): registered per-row N
+# (MyDocs/registration/power_decision_2026-08-07/DECISION.md, amendment A1
+# table; A5 achievable-n branch). Every cell carries --num-queries <n> for
+# its row class; the plan refuses a manifest that cannot supply n.
+# ---------------------------------------------------------------------------
+
+from dataclasses import replace as _dc_replace  # noqa: E402
+
+
+def _expected_class(step: Dict[str, Any], grid: Any) -> str:
+    """The A1 table restated INDEPENDENTLY of the driver's classifier."""
+    cs = step["cellspec"]
+    if cs["engine"] == "hf":
+        return "identity"  # HF-oracle / T=0 identity cells
+    if step["family"] in ("F2", "F3") or step["dataset"] == "ruler":
+        return "window"  # loaded/window cells: W requests per window
+    if step["family"] == "DIST":
+        return "identity"  # TTFT-only topology contrast (#18)
+    assert step["family"] == "F1"
+    if step["baseline"] in grid.primary_baselines and cs["engine"] == grid.primary_engine:
+        return "primary"  # the #4 contrast cells on the pinned engine
+    return "secondary"
+
+
+def _n_of_class(cls: str) -> int:
+    return {"primary": 2000, "secondary": 800, "identity": 300, "window": 200}[cls]
+
+
+class TestPerRowN:
+    def test_registered_constants_and_grid_fields(self):
+        # The A1 table lives on the SessionGrid (reviewable in the header),
+        # seeded from named module constants citing the decision record.
+        assert rc.N_PRIMARY == 2000
+        assert rc.N_SECONDARY == 800
+        assert rc.N_IDENTITY == 300
+        assert rc.WINDOW_REQUESTS == 200
+        assert rc.PRIMARY_ENGINE == "vllm"
+        assert rc.PRIMARY_BASELINES == ("B3", "B6")
+        assert set(rc.ROW_CLASSES) == {"primary", "secondary", "identity", "window"}
+        for grid in rc.SESSION_GRIDS.values():
+            assert grid.n_primary == 2000
+            assert grid.n_secondary == 800
+            assert grid.n_identity == 300
+            assert grid.window_requests == 200
+            assert grid.primary_engine == "vllm"
+            assert grid.primary_baselines == ("B3", "B6")
+            # Qasper's achievable n is an OWNER registration (A5): not
+            # fabricated here, so the anchor grids register none.
+            assert dict(grid.achievable_n) == {}
+
+    def test_classifier_table_every_family_engine_baseline(self, plan_a, plan_b):
+        # Every (family x engine x baseline) cell of both sessions lands in
+        # the class the A1 table assigns, and the per-class cell counts are
+        # pinned by independent arithmetic:
+        #   a: primary = B3,B6 x vllm x 4 datasets = 8; secondary = the other
+        #      F1 server cells 104 - 8 = 96; identity = 10 hf; window =
+        #      F2 612 + F3 144 = 756  (sum 870 = the cells pin)
+        #   b: primary 8; secondary 96; identity = 10 hf + 4 DIST = 14;
+        #      window = F2 90 + F3 144 = 234  (sum 352)
+        for plan, grid, want in (
+            (plan_a, rc.SESSION_GRIDS["a"],
+             {"primary": 8, "secondary": 96, "identity": 10, "window": 756}),
+            (plan_b, rc.SESSION_GRIDS["b"],
+             {"primary": 8, "secondary": 96, "identity": 14, "window": 234}),
+        ):
+            got: Dict[str, int] = {}
+            for s in _cells(plan):
+                cls = _expected_class(s, grid)
+                assert s["row_class"] == cls, s["row_key"]
+                got[cls] = got.get(cls, 0) + 1
+            assert got == want
+            assert sum(want.values()) == plan["counts"]["cells"]
+            assert plan["per_row_n"]["cells_by_class"] == want
+        # Direct table checks on the pure classifier.
+        grid = rc.SESSION_GRIDS["a"]
+        f1 = {(s["baseline"], s["cellspec"]["engine"]): s for s in _cells(plan_a) if s["family"] == "F1"}
+        assert f1[("B3", "vllm")]["row_class"] == "primary"
+        assert f1[("B6", "vllm")]["row_class"] == "primary"
+        assert f1[("B3", "sglang")]["row_class"] == "secondary"
+        assert f1[("B6", "sglang")]["row_class"] == "secondary"
+        assert f1[("B1", "vllm")]["row_class"] == "secondary"
+        assert f1[("B12", "vllm")]["row_class"] == "secondary"
+        assert f1[("B3", "hf")]["row_class"] == "identity"
+        for s in _cells(plan_a):
+            if s["dataset"] == "ruler":
+                assert s["row_class"] == "window"
+        assert {s["row_class"] for s in _cells(plan_b) if s["family"] == "DIST"} == {"identity"}
+        cell = next(c for c in rc.enumerate_cells(grid) if c.baseline_id == "B3" and c.spec.engine == "vllm" and c.spec.family == "F1")
+        assert rc.row_class(grid, cell) == "primary"
+
+    def test_every_cell_carries_num_queries_for_its_class(self, plan_a, plan_b):
+        for plan in (plan_a, plan_b):
+            for s in _cells(plan):
+                n = _n_of_class(s["row_class"])
+                assert s["num_queries"] == n, s["row_key"]
+                assert _argv_value(s, "--num-queries") == str(n), s["row_key"]
+                # The window pool: the open-loop generator draws from the
+                # measured set, so W IS the registered --num-queries.
+                if s["family"] in ("F2", "F3"):
+                    assert s["num_queries"] == rc.WINDOW_REQUESTS
+
+    def test_plan_header_records_the_constants(self, plan_a, plan_b):
+        for plan in (plan_a, plan_b):
+            head = plan["per_row_n"]
+            assert head["n_primary"] == 2000
+            assert head["n_secondary"] == 800
+            assert head["n_identity"] == 300
+            assert head["window_requests"] == 200
+            assert head["primary_engine"] == "vllm"
+            assert head["primary_baselines"] == ["B3", "B6"]
+            assert head["achievable_n"] == {}
+            assert head["achievable_n_caveat"] is None
+            assert "power_decision_2026-08-07" in head["decision"]
+
+    def test_counts_unchanged_by_per_row_n(self, plan_a, plan_b):
+        # --num-queries is argv on existing cells: the enumeration pins
+        # (TestPlanCountsSessionA / TestSessionB) are byte-identical.
+        assert (
+            plan_a["counts"]["cells"], plan_a["counts"]["windows"],
+            plan_a["counts"]["relaunches"], plan_a["counts"]["blocked"],
+        ) == (870, 2610, 36, 65)
+        assert (
+            plan_b["counts"]["cells"], plan_b["counts"]["windows"],
+            plan_b["counts"]["relaunches"], plan_b["counts"]["blocked"],
+        ) == (352, 1056, 30, 65)
+
+    @pytest.mark.parametrize(
+        "overrides, match",
+        [
+            ({"n_primary": 0}, "n_primary"),
+            ({"n_secondary": -1}, "n_secondary"),
+            ({"n_identity": True}, "n_identity"),
+            ({"window_requests": 0}, "window_requests"),
+            ({"n_primary": 2.0}, "n_primary"),
+            ({"primary_engine": "hf"}, "primary_engine"),
+            ({"primary_engine": "nope"}, "primary_engine"),
+            ({"primary_engine": "sglang"}, "primary_engine"),  # not an f1 engine of the tiny grid
+            ({"primary_baselines": ()}, "primary_baselines"),
+            ({"primary_baselines": ("B99",)}, "primary_baselines"),
+            ({"achievable_n": {"qasper": 3000}}, "achievable_n"),  # above n_primary: not a lowering
+            ({"achievable_n": {"nq_open": 100}}, "achievable_n"),  # not a dataset of the grid
+            ({"achievable_n": {"qasper": 0}}, "achievable_n"),
+            ({"achievable_n": {"qasper": 1.5}}, "achievable_n"),
+        ],
+    )
+    def test_grid_registration_refusals(self, overrides, match):
+        with pytest.raises(rc.PlanError, match=match):
+            _tiny_grid(**overrides)
+
+    def test_manifest_shortfall_refuses_naming_dataset_trial_n_and_shortfall(
+        self, floor_table, tmp_path
+    ):
+        floor = rc.load_floor_table(floor_table)
+        # squad_v2 carries primary cells (B3/B6 on vllm): trial 2 with 1999
+        # ids is one short of the registered n = 2000.
+        short = _write_manifest(
+            tmp_path, "squad_v2",
+            trial_ids={
+                "1": [f"squad_v2-q{i:05d}" for i in range(2000)],
+                "2": [f"squad_v2-q{i:05d}" for i in range(2000, 3999)],
+                "3": [f"squad_v2-q{i:05d}" for i in range(4000, 6000)],
+            },
+        )
+        with pytest.raises(rc.PlanError, match=r"squad_v2.*trial 2.*1999.*n=2000.*shortfall 1"):
+            rc.build_plan("a", floor, window_duration_s=300.0, query_manifests={"squad_v2": short})
+        # A manifest with fewer trials than the registered windows refuses too
+        # (the runner would read trial 3 and find nothing).
+        two = _write_manifest(tmp_path, "squad_v2", trials=2, name="two.json")
+        with pytest.raises(rc.PlanError, match=r"squad_v2.*trial 3"):
+            rc.build_plan("a", floor, window_duration_s=300.0, query_manifests={"squad_v2": two})
+        # Malformed trials refuse rather than being read as empty.
+        bad = _write_manifest(tmp_path, "squad_v2", trial_ids={"1": "not-a-list"}, name="bad.json")
+        with pytest.raises(rc.PlanError, match=r"squad_v2.*trial"):
+            rc.build_plan("a", floor, window_duration_s=300.0, query_manifests={"squad_v2": bad})
+        # ruler (the F2 instrument) carries only window cells: a 200-id
+        # manifest is enough for it and the header records the trial sizes.
+        plan = rc.build_plan(
+            "a", floor, window_duration_s=300.0,
+            query_manifests={"squad_v2": _write_manifest(tmp_path, "squad_v2", name="ok.json")},
+        )
+        assert plan["query_manifests"]["squad_v2"]["trial_sizes"] == {"1": 2000, "2": 2000, "3": 2000}
+
+    def test_achievable_n_lowers_the_class_n_with_a_header_caveat(self, floor_table, tmp_path):
+        floor = rc.load_floor_table(floor_table)
+        grid = _dc_replace(rc.SESSION_GRIDS["a"], achievable_n={"qasper": 900})
+        orig = rc.SESSION_GRIDS
+        rc.SESSION_GRIDS = {"a": grid}
+        try:
+            plan = rc.build_plan("a", floor, window_duration_s=300.0)
+            for s in _cells(plan):
+                base = _n_of_class(s["row_class"])
+                want = min(base, 900) if s["dataset"] == "qasper" else base
+                assert s["num_queries"] == want, s["row_key"]
+                assert _argv_value(s, "--num-queries") == str(want)
+            lowered = [s for s in _cells(plan) if s["dataset"] == "qasper" and s["row_class"] == "primary"]
+            assert len(lowered) == 2 and all(s["num_queries"] == 900 for s in lowered)
+            # secondary (800) < 900: the override only LOWERS, never raises.
+            assert all(
+                s["num_queries"] == 800
+                for s in _cells(plan) if s["dataset"] == "qasper" and s["row_class"] == "secondary"
+            )
+            head = plan["per_row_n"]
+            assert head["achievable_n"] == {"qasper": 900}
+            assert "qasper" in head["achievable_n_caveat"] and "A5" in head["achievable_n_caveat"]
+            # A 900-id qasper manifest now registers (it would refuse at 2000).
+            m900 = _write_manifest(tmp_path, "qasper", ids_per_trial=900)
+            plan = rc.build_plan("a", floor, window_duration_s=300.0, query_manifests={"qasper": m900})
+            assert plan["query_manifests"]["qasper"]["trial_sizes"]["1"] == 900
+        finally:
+            rc.SESSION_GRIDS = orig
+        with pytest.raises(rc.PlanError, match=r"qasper.*trial 1.*900.*n=2000"):
+            rc.build_plan("a", floor, window_duration_s=300.0, query_manifests={"qasper": m900})
+        # Counts are untouched by the override.
+        assert plan["counts"]["cells"] == 870
+
+    def test_load_plan_refuses_cells_without_or_with_drifted_num_queries(self, tmp_path, plan_a):
+        def _strip(engine: str, name: str) -> Path:
+            plan = json.loads(json.dumps(plan_a))
+            cell = next(s for s in _cells(plan) if s["cellspec"]["engine"] == engine)
+            i = cell["argv"].index("--num-queries")
+            del cell["argv"][i:i + 2]
+            return _dump(tmp_path, plan, name)
+
+        # A server-engine cell AND an hf cell without --num-queries refuse.
+        with pytest.raises(rc.RunError, match="num-queries"):
+            rc.load_plan(_strip("vllm", "no_n_vllm.json"))
+        with pytest.raises(rc.RunError, match="num-queries"):
+            rc.load_plan(_strip("hf", "no_n_hf.json"))
+        # argv value drifted from the step's own record.
+        plan = json.loads(json.dumps(plan_a))
+        cell = next(s for s in _cells(plan) if s["row_class"] == "primary")
+        cell["argv"][cell["argv"].index("--num-queries") + 1] = "800"
+        with pytest.raises(rc.RunError, match="num-queries"):
+            rc.load_plan(_dump(tmp_path, plan, "drift.json"))
+        # step record drifted from the registered class n (a primary cell
+        # relabeled to 800 with a consistent argv is still a mislabeled row).
+        plan = json.loads(json.dumps(plan_a))
+        cell = next(s for s in _cells(plan) if s["row_class"] == "primary")
+        cell["num_queries"] = 800
+        cell["argv"][cell["argv"].index("--num-queries") + 1] = "800"
+        with pytest.raises(rc.RunError, match="num_queries"):
+            rc.load_plan(_dump(tmp_path, plan, "relabel.json"))
+        # row_class drifted.
+        plan = json.loads(json.dumps(plan_a))
+        cell = next(s for s in _cells(plan) if s["row_class"] == "primary")
+        cell["row_class"] = "secondary"
+        with pytest.raises(rc.RunError, match="row_class"):
+            rc.load_plan(_dump(tmp_path, plan, "reclass.json"))
+        # header without the registration refuses.
+        plan = json.loads(json.dumps(plan_a))
+        del plan["per_row_n"]
+        with pytest.raises(rc.RunError, match="per_row_n"):
+            rc.load_plan(_dump(tmp_path, plan, "no_header.json"))
+        # and the untouched plan loads.
+        assert rc.load_plan(_dump(tmp_path, plan_a, "fresh_n.json"))["counts"]["cells"] == 870
+
+    def test_run_passes_num_queries_to_the_runner(self, tmp_path, floor_table, stub):
+        plan = _stub_plan(_tiny_grid(f1_baselines=("B1", "B3")), floor_table, stub.cmd)
+        root = _run_root(tmp_path)
+        assert rc.run_plan(plan, root) == 0
+        cell_calls = [c for c in stub.calls() if "--baseline" in c["argv"]]
+        by_label = {c["argv"][c["argv"].index("--baseline-label") + 1]: c["argv"] for c in cell_calls}
+        assert by_label["B1_gold-fresh"][by_label["B1_gold-fresh"].index("--num-queries") + 1] == "800"
+        assert by_label["B3_corpus-reuse"][by_label["B3_corpus-reuse"].index("--num-queries") + 1] == "2000"
+
+
+# ---------------------------------------------------------------------------
+# Backlog A5 (retrieval pins) + F5a (per-cell Redis namespaces)
+# ---------------------------------------------------------------------------
+
+
+def _retrieval_cells(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [s for s in _cells(plan) if s["cellspec"]["retriever"] != "none"]
+
+
+def _b7_cells(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [s for s in _cells(plan) if s["cellspec"]["arm"] == "retr-reuse"]
+
+
+class TestRetrievalPinsA5:
+    """Backlog A5: the runner's retrieval knobs (--top-k, --embedding-model,
+    --ir-index-dir, CAGE_DISTRACTOR_DOCS) are REGISTERED driver values pinned
+    on every retrieval cell, never runner defaults; the embedding model is
+    read from the ADR-0099 freeze slot (INSTRUMENT_REVISIONS.dense_retriever),
+    never a second hard-coded copy."""
+
+    def test_named_constants(self):
+        assert rc.RETRIEVAL_TOP_K == 3
+        assert rc.DISTRACTOR_DOCS == 1000
+        assert rc.DEFAULT_IR_INDEX_ROOT == "./experiments/ir_index"
+        assert rc.SessionGrid.__dataclass_fields__["ir_index_root"].default == rc.DEFAULT_IR_INDEX_ROOT
+        assert rc.FREEZE_DENSE_RETRIEVER_SLOT == "dense_retriever"
+        assert rc.FREEZE_FILE_ENV_VAR == "CAGE_FREEZE_RESOLUTIONS"
+        assert rc.DEFAULT_FREEZE_FILE == (
+            rc.REPO_ROOT / "MyDocs" / "registration" / "freeze_resolutions.json"
+        )
+
+    def test_pins_resolve_from_the_freeze_slot(self, freeze_file):
+        pins = rc.resolve_retrieval_pins(freeze_file)
+        assert pins.embedding_model == _FREEZE_EMBEDDING_MODEL
+        assert pins.embedding_revision == _FREEZE_EMBEDDING_REVISION
+        assert pins.freeze_file == str(freeze_file.resolve())
+        # The env seam is the default source (no explicit path).
+        assert rc.resolve_retrieval_pins() == pins
+
+    def test_the_freeze_pin_is_read_not_hard_coded(self, tmp_path, floor_table, stub):
+        # A different registered model flows through to every retrieval
+        # cell: the driver carries no second copy of the id that could drift
+        # from the freeze artifact.
+        doc = _freeze_doc()
+        doc["INSTRUMENT_REVISIONS"]["dense_retriever"]["model"] = "org/other-encoder"
+        doc["INSTRUMENT_REVISIONS"]["dense_retriever"]["revision"] = "d" * 40
+        path = _write_freeze(tmp_path / "other.json", doc)
+        pins = rc.resolve_retrieval_pins(path)
+        assert pins.embedding_model == "org/other-encoder"
+        assert pins.embedding_revision == "d" * 40
+        grid = _tiny_grid(f1_baselines=("B5", "B6"))
+        floor = rc.load_floor_table(floor_table)
+        orig = rc.SESSION_GRIDS
+        rc.SESSION_GRIDS = {grid.session: grid}
+        try:
+            plan = rc.build_plan(
+                grid.session, floor, window_duration_s=60.0, runner_cmd=stub.cmd,
+                launcher_cmds={"vllm": stub.cmd}, freeze_file=path,
+            )
+        finally:
+            rc.SESSION_GRIDS = orig
+        assert plan["behavior_knobs"]["embedding_model"] == "org/other-encoder"
+        for s in _cells(plan):
+            assert _argv_value(s, "--embedding-model") == "org/other-encoder"
+
+    @pytest.mark.parametrize(
+        "spoil, match",
+        [
+            (lambda d: None, "missing"),  # file absent
+            (lambda d: "not json", "not valid JSON"),
+            (lambda d: {"no": "revisions"}, "INSTRUMENT_REVISIONS"),
+            (lambda d: _freeze_doc({}), "dense_retriever"),
+            # Only the QUALITY embedder is registered: never consumed as a
+            # fallback for the retriever.
+            (lambda d: _freeze_doc({"embedding": d["INSTRUMENT_REVISIONS"]["embedding"]}), "dense_retriever"),
+            (lambda d: _freeze_doc({"dense_retriever": {"model": "", "revision": "x"}}), "model"),
+            (lambda d: _freeze_doc({"dense_retriever": {"model": "m"}}), "revision"),
+            (lambda d: _freeze_doc({"dense_retriever": "intfloat/e5-large-v2"}), "dense_retriever"),
+        ],
+    )
+    def test_freeze_refusals_are_typed(self, tmp_path, spoil, match):
+        path = tmp_path / "spoiled.json"
+        doc = spoil(_freeze_doc())
+        if doc is None:
+            pass  # absent file
+        elif isinstance(doc, str):
+            path.write_text(doc, encoding="utf-8")
+        else:
+            _write_freeze(path, doc)
+        with pytest.raises(rc.PlanError, match=match):
+            rc.resolve_retrieval_pins(path)
+
+    def test_build_plan_refuses_without_the_freeze_artifact(self, tmp_path, floor_table, monkeypatch):
+        monkeypatch.setenv(rc.FREEZE_FILE_ENV_VAR, str(tmp_path / "absent.json"))
+        floor = rc.load_floor_table(floor_table)
+        with pytest.raises(rc.PlanError, match="freeze"):
+            rc.build_plan("a", floor, window_duration_s=300.0)
+        # An explicit path wins over the env seam.
+        good = _write_freeze(tmp_path / "explicit.json", _freeze_doc())
+        assert rc.build_plan("a", floor, window_duration_s=300.0, freeze_file=good)["counts"]["cells"] == 870
+
+    def test_every_retrieval_cell_pins_top_k_model_and_index_root(self, plan_a, plan_b):
+        for plan in (plan_a, plan_b):
+            root = plan["behavior_knobs"]["ir_index_root"]
+            retrieval = _retrieval_cells(plan)
+            assert retrieval
+            for s in retrieval:
+                assert _argv_value(s, "--top-k") == str(rc.RETRIEVAL_TOP_K)
+                assert _argv_value(s, "--embedding-model") == _FREEZE_EMBEDDING_MODEL
+                # Review 2026-09-17 defect 5: the revision is ENFORCED (runner
+                # passes it to SentenceTransformer), not merely recorded.
+                assert _argv_value(s, "--embedding-revision") == _FREEZE_EMBEDDING_REVISION
+                assert _argv_value(s, "--ir-index-dir") == root
+                assert s["env"]["CAGE_DISTRACTOR_DOCS"] == str(rc.DISTRACTOR_DOCS)
+            for s in _cells(plan):
+                if s["cellspec"]["retriever"] == "none":
+                    for flag in ("--top-k", "--embedding-model", "--embedding-revision", "--ir-index-dir"):
+                        assert flag not in s["argv"], (s["baseline"], flag)
+                    assert "CAGE_DISTRACTOR_DOCS" not in s["env"]
+
+    def test_ir_index_root_is_a_registered_grid_path(self, floor_table, stub):
+        grid = _tiny_grid(f1_baselines=("B5", "B6"), ir_index_root="/data/ir_index")
+        plan = _stub_plan(grid, floor_table, stub.cmd)
+        assert plan["behavior_knobs"]["ir_index_root"] == "/data/ir_index"
+        for s in _cells(plan):
+            assert _argv_value(s, "--ir-index-dir") == "/data/ir_index"
+        for bad in ("", "   ", None, 3):
+            with pytest.raises(rc.PlanError, match="ir_index_root"):
+                _tiny_grid(ir_index_root=bad)
+
+    def test_distractor_docs_is_not_identity(self, plan_a):
+        # CAGE_DISTRACTOR_DOCS rides the cell env as BEHAVIOR: derive_cell_spec
+        # ignores it (identity rides the CAGE_CELL_* seam and nothing else).
+        cell = _retrieval_cells(plan_a)[0]
+        argv = cell["argv"]
+
+        def val(flag: str) -> str:
+            return argv[argv.index(flag) + 1]
+
+        def derive(env: Dict[str, str]) -> str:
+            return derive_cell_spec(
+                baseline=val("--baseline"),
+                baseline_label=val("--baseline-label"),
+                backend=val("--backend"),
+                model=val("--model"),
+                env=env,
+            ).to_row_key()
+
+        with_env = dict(cell["env"])
+        assert "CAGE_DISTRACTOR_DOCS" in with_env
+        without = {k: v for k, v in with_env.items() if k != "CAGE_DISTRACTOR_DOCS"}
+        altered = {**with_env, "CAGE_DISTRACTOR_DOCS": "7"}
+        assert derive(with_env) == derive(without) == derive(altered) == cell["row_key"]
+
+    def test_header_records_the_pins(self, plan_a, plan_b, freeze_file):
+        for plan in (plan_a, plan_b):
+            knobs = plan["behavior_knobs"]
+            assert knobs["retrieval_top_k"] == 3
+            assert knobs["distractor_docs"] == 1000
+            assert knobs["embedding_model"] == _FREEZE_EMBEDDING_MODEL
+            assert knobs["embedding_model_revision"] == _FREEZE_EMBEDDING_REVISION
+            assert knobs["embedding_model_freeze_slot"] == "INSTRUMENT_REVISIONS.dense_retriever"
+            assert knobs["embedding_model_freeze_file"] == str(freeze_file.resolve())
+            assert knobs["embedding_model_adr"] == "ADR-0099"
+            assert knobs["ir_index_root"] == rc.DEFAULT_IR_INDEX_ROOT
+            assert knobs["retrieval_pins_backlog"] == "A5"
+
+    def test_counts_unchanged_by_the_pins(self, plan_a, plan_b):
+        # Argv/env pins never mint cells: the enumeration pins hold.
+        c = plan_a["counts"]
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (870, 2610, 36, 65)
+        c = plan_b["counts"]
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (352, 1056, 30, 65)
+
+    def test_load_plan_refuses_stale_retrieval_pins(self, tmp_path, plan_a):
+        def _cell(plan: Dict[str, Any]) -> Dict[str, Any]:
+            return _retrieval_cells(plan)[0]
+
+        # --top-k missing.
+        plan = json.loads(json.dumps(plan_a))
+        cell = _cell(plan)
+        i = cell["argv"].index("--top-k")
+        del cell["argv"][i:i + 2]
+        with pytest.raises(rc.RunError, match="top-k"):
+            rc.load_plan(_dump(tmp_path, plan, "no_top_k.json"))
+        # --top-k drifted.
+        plan = json.loads(json.dumps(plan_a))
+        cell = _cell(plan)
+        cell["argv"][cell["argv"].index("--top-k") + 1] = "5"
+        with pytest.raises(rc.RunError, match="top-k"):
+            rc.load_plan(_dump(tmp_path, plan, "top_k_5.json"))
+        # --embedding-model drifted from the header's freeze pin.
+        plan = json.loads(json.dumps(plan_a))
+        cell = _cell(plan)
+        cell["argv"][cell["argv"].index("--embedding-model") + 1] = "org/other"
+        with pytest.raises(rc.RunError, match="embedding-model"):
+            rc.load_plan(_dump(tmp_path, plan, "model_drift.json"))
+        # --embedding-revision drifted from / missing against the header's pin.
+        plan = json.loads(json.dumps(plan_a))
+        cell = _cell(plan)
+        cell["argv"][cell["argv"].index("--embedding-revision") + 1] = "deadbeef"
+        with pytest.raises(rc.RunError, match="embedding-revision"):
+            rc.load_plan(_dump(tmp_path, plan, "revision_drift.json"))
+        plan = json.loads(json.dumps(plan_a))
+        cell = _cell(plan)
+        i = cell["argv"].index("--embedding-revision")
+        del cell["argv"][i:i + 2]
+        with pytest.raises(rc.RunError, match="embedding-revision"):
+            rc.load_plan(_dump(tmp_path, plan, "revision_missing.json"))
+        # Header without the revision pin: a pre-enforcement plan.
+        plan = json.loads(json.dumps(plan_a))
+        del plan["behavior_knobs"]["embedding_model_revision"]
+        with pytest.raises(rc.RunError, match="embedding_model_revision"):
+            rc.load_plan(_dump(tmp_path, plan, "no_header_revision.json"))
+        # A retriever-none cell carrying the flag.
+        plan = json.loads(json.dumps(plan_a))
+        none_cell = next(s for s in _cells(plan) if s["cellspec"]["retriever"] == "none")
+        none_cell["argv"] += ["--embedding-revision", _FREEZE_EMBEDDING_REVISION]
+        with pytest.raises(rc.RunError, match="embedding-revision"):
+            rc.load_plan(_dump(tmp_path, plan, "none_with_revision.json"))
+        # --ir-index-dir drifted from the registered root.
+        plan = json.loads(json.dumps(plan_a))
+        cell = _cell(plan)
+        cell["argv"][cell["argv"].index("--ir-index-dir") + 1] = "/elsewhere"
+        with pytest.raises(rc.RunError, match="ir-index-dir"):
+            rc.load_plan(_dump(tmp_path, plan, "root_drift.json"))
+        # CAGE_DISTRACTOR_DOCS missing / drifted.
+        plan = json.loads(json.dumps(plan_a))
+        del _cell(plan)["env"]["CAGE_DISTRACTOR_DOCS"]
+        with pytest.raises(rc.RunError, match="CAGE_DISTRACTOR_DOCS"):
+            rc.load_plan(_dump(tmp_path, plan, "no_distractors.json"))
+        plan = json.loads(json.dumps(plan_a))
+        _cell(plan)["env"]["CAGE_DISTRACTOR_DOCS"] = "0"
+        with pytest.raises(rc.RunError, match="CAGE_DISTRACTOR_DOCS"):
+            rc.load_plan(_dump(tmp_path, plan, "zero_distractors.json"))
+        # A non-retrieval cell carrying a retrieval pin is a mislabeled row.
+        plan = json.loads(json.dumps(plan_a))
+        gold = next(s for s in _cells(plan) if s["cellspec"]["retriever"] == "none")
+        gold["argv"] += ["--top-k", "3"]
+        with pytest.raises(rc.RunError, match="top-k"):
+            rc.load_plan(_dump(tmp_path, plan, "gold_top_k.json"))
+        # Header without the pins refuses (a pre-A5 plan).
+        plan = json.loads(json.dumps(plan_a))
+        del plan["behavior_knobs"]["embedding_model"]
+        with pytest.raises(rc.RunError, match="embedding_model"):
+            rc.load_plan(_dump(tmp_path, plan, "no_header_pin.json"))
+        plan = json.loads(json.dumps(plan_a))
+        del plan["behavior_knobs"]["ir_index_root"]
+        with pytest.raises(rc.RunError, match="ir_index_root"):
+            rc.load_plan(_dump(tmp_path, plan, "no_header_root.json"))
+        # And the untouched plan loads.
+        assert rc.load_plan(_dump(tmp_path, plan_a, "fresh_a5.json"))["counts"]["cells"] == 870
+
+    def test_cli_plan_carries_freeze_file(self, tmp_path, floor_table):
+        good = _write_freeze(tmp_path / "cli_freeze.json", _freeze_doc())
+        out = tmp_path / "plan.json"
+        code = rc.main([
+            "plan", "--session", "a", "--floor-table", str(floor_table),
+            "--window-duration-s", "300", "--freeze-file", str(good), "--out", str(out),
+        ])
+        assert code == 0
+        plan = rc.load_plan(out)
+        assert plan["behavior_knobs"]["embedding_model_freeze_file"] == str(good.resolve())
+
+
+class TestRedisNamespacesF5a:
+    """Backlog F5a: every B7 (retr-reuse) cell owns a Redis namespace minted
+    from its row key (cage:<sha1(row_key)[:12]>) and flushes it at start, so
+    no two cells ever share artifact-cache entries and each starts empty."""
+
+    def test_prefix_rule(self):
+        row = "retr-reuse|rerank|reuse|single|vllm|qwen3-14b|F1"
+        import hashlib as _h
+        expected = "cage:" + _h.sha1(row.encode("utf-8")).hexdigest()[:12]
+        assert rc.redis_key_prefix_for_row(row) == expected
+        assert rc.REDIS_CACHE_ARMS == frozenset({"retr-reuse"})
+        assert rc.REDIS_KEY_PREFIX_ROOT == "cage"
+        assert rc.REDIS_NAMESPACE_SHA_CHARS == 12
+        with pytest.raises(rc.PlanError, match="row key"):
+            rc.redis_key_prefix_for_row("")
+
+    def test_every_b7_cell_owns_a_namespace_and_flushes_it(self, plan_a, plan_b):
+        for plan in (plan_a, plan_b):
+            b7 = _b7_cells(plan)
+            assert b7
+            for s in b7:
+                assert s["baseline"] == "B7"
+                assert _argv_value(s, "--redis-key-prefix") == rc.redis_key_prefix_for_row(s["row_key"])
+                assert "--flush-redis-namespace" in s["argv"]
+            for s in _cells(plan):
+                if s["cellspec"]["arm"] != "retr-reuse":
+                    assert "--redis-key-prefix" not in s["argv"], s["baseline"]
+                    assert "--flush-redis-namespace" not in s["argv"], s["baseline"]
+
+    def test_no_two_cells_share_a_namespace(self, plan_a):
+        b7 = _b7_cells(plan_a)
+        by_row: Dict[str, str] = {}
+        for s in b7:
+            prefix = _argv_value(s, "--redis-key-prefix")
+            by_row.setdefault(s["row_key"], prefix)
+            assert by_row[s["row_key"]] == prefix
+        prefixes = list(by_row.values())
+        assert len(set(prefixes)) == len(prefixes) == len(by_row) >= 2
+        # Two concrete cells, stated explicitly: different row keys, different
+        # namespaces (the pre-F5a plan gave BOTH the runner's default 'cage').
+        first, second = b7[0], next(s for s in b7 if s["row_key"] != b7[0]["row_key"])
+        assert _argv_value(first, "--redis-key-prefix") != _argv_value(second, "--redis-key-prefix")
+        assert _argv_value(first, "--redis-key-prefix") != "cage"
+
+    def test_header_records_the_rule(self, plan_a):
+        knobs = plan_a["behavior_knobs"]
+        assert knobs["redis_cache_arms"] == ["retr-reuse"]
+        assert knobs["redis_namespace_rule"] == "cage:<sha1(row_key)[:12]>"
+        assert knobs["redis_namespace_backlog"] == "F5a"
+
+    def test_load_plan_refuses_stale_namespaces(self, tmp_path, plan_a):
+        # Prefix drifted (two cells would share entries).
+        plan = json.loads(json.dumps(plan_a))
+        cell = _b7_cells(plan)[0]
+        cell["argv"][cell["argv"].index("--redis-key-prefix") + 1] = "cage"
+        with pytest.raises(rc.RunError, match="redis-key-prefix"):
+            rc.load_plan(_dump(tmp_path, plan, "shared_prefix.json"))
+        # Prefix missing.
+        plan = json.loads(json.dumps(plan_a))
+        cell = _b7_cells(plan)[0]
+        i = cell["argv"].index("--redis-key-prefix")
+        del cell["argv"][i:i + 2]
+        with pytest.raises(rc.RunError, match="redis-key-prefix"):
+            rc.load_plan(_dump(tmp_path, plan, "no_prefix.json"))
+        # Flush missing (the cell would start warm).
+        plan = json.loads(json.dumps(plan_a))
+        cell = _b7_cells(plan)[0]
+        cell["argv"].remove("--flush-redis-namespace")
+        with pytest.raises(rc.RunError, match="flush-redis-namespace"):
+            rc.load_plan(_dump(tmp_path, plan, "no_flush.json"))
+        # A non-B7 cell carrying a namespace is a mislabeled row.
+        plan = json.loads(json.dumps(plan_a))
+        b6 = next(s for s in _cells(plan) if s["baseline"] == "B6")
+        b6["argv"] += ["--redis-key-prefix", "cage:deadbeef0000"]
+        with pytest.raises(rc.RunError, match="redis-key-prefix"):
+            rc.load_plan(_dump(tmp_path, plan, "b6_prefix.json"))
+
+    def test_run_passes_the_namespace_to_the_runner(self, tmp_path, floor_table, stub):
+        plan = _stub_plan(_tiny_grid(f1_baselines=("B6", "B7")), floor_table, stub.cmd)
+        root = _run_root(tmp_path)
+        assert rc.run_plan(plan, root) == 0
+        cell_calls = [c for c in stub.calls() if "--baseline" in c["argv"]]
+        by_label = {c["argv"][c["argv"].index("--baseline-label") + 1]: c for c in cell_calls}
+        b7 = by_label["B7_retr-reuse"]
+        row = next(s["row_key"] for s in _cells(plan) if s["baseline"] == "B7")
+        assert b7["argv"][b7["argv"].index("--redis-key-prefix") + 1] == rc.redis_key_prefix_for_row(row)
+        assert "--flush-redis-namespace" in b7["argv"]
+        assert b7["env"]["CAGE_DISTRACTOR_DOCS"] == "1000"
+        b6 = by_label["B6_retr-fresh"]
+        assert "--redis-key-prefix" not in b6["argv"]
+        assert b6["argv"][b6["argv"].index("--top-k") + 1] == "3"
+
+
+# ---------------------------------------------------------------------------
+# Backlog A10: uniform max_model_len per session (RULER SHAPE-32K + Qasper)
+# ---------------------------------------------------------------------------
+
+
+_SHAPE_32K_TOTAL = 32_512 + 256  # RULER input + output, restated independently
+
+
+class TestMaxModelLenA10:
+    """Backlog A10 (Tier A): RULER requests are 32,512 input + 256 output
+    tokens and Qasper papers exceed 4,096 tokens, while the uniform-regime
+    rule (_serving_config.sh) demands ONE max_model_len per session. The
+    value is a registered SessionGrid knob (32768), rides EVERY relaunch of
+    BOTH engines as VLLM_MAX_MODEL_LEN (vLLM --max-model-len; SGLang maps it
+    to --context-length), is recorded on the relaunch step and in the plan
+    header, and a stale plan lacking it is refused. The pilot shell default
+    (4096) is untouched and must never reach a campaign relaunch."""
+
+    def test_registered_constant_and_grid_field(self):
+        assert rc.DEFAULT_MAX_MODEL_LEN == 32_768 == _SHAPE_32K_TOTAL
+        assert rc.MAX_MODEL_LEN_ENV == "VLLM_MAX_MODEL_LEN"
+        assert rc.RULER_CONTEXT_TOKENS + rc.RULER_OUTPUT_TOKENS == _SHAPE_32K_TOTAL
+        for grid in rc.SESSION_GRIDS.values():
+            assert grid.max_model_len == 32_768
+            assert isinstance(grid.max_model_len, int)
+
+    def test_env_on_every_relaunch_for_both_engines(self, plan_a, plan_b):
+        for plan in (plan_a, plan_b):
+            relaunches = _relaunches(plan)
+            assert relaunches
+            assert {s["engine"] for s in relaunches} == {"vllm", "sglang"}
+            for s in relaunches:
+                assert s["max_model_len"] == 32_768, s
+                assert s["env"]["VLLM_MAX_MODEL_LEN"] == "32768", s
+                # the pilot default can never ride a campaign relaunch
+                assert s["env"]["VLLM_MAX_MODEL_LEN"] != "4096"
+        # Session b: the single, tp AND pd relaunch shapes all carry it
+        # (the pd launcher reads the same env for both role instances).
+        assert {s["topology"] for s in _relaunches(plan_b)} == {"single", "tp", "pd"}
+
+    def test_header_records_it(self, plan_a, plan_b):
+        for plan in (plan_a, plan_b):
+            shapes = plan["serving_shapes"]
+            assert shapes["max_model_len"] == 32_768
+            assert shapes["max_model_len_env"] == "VLLM_MAX_MODEL_LEN"
+            assert shapes["max_model_len_backlog"] == "A10"
+
+    def test_cell_steps_never_carry_it(self, plan_a):
+        # The value is a SERVER dial (relaunch boundary), never cell argv or
+        # cell env: identity rides the CAGE_CELL_* seam and nothing else.
+        for s in _cells(plan_a):
+            assert "VLLM_MAX_MODEL_LEN" not in s["env"]
+            assert "--max-model-len" not in s["argv"]
+
+    def test_ruler_grid_refuses_a_value_below_shape_32k(self):
+        ruler_kwargs: Dict[str, Any] = dict(
+            f2_baselines=("B1",),
+            f2_budgets=(1.0,),
+            f2_rates=(0.85,),
+            f2_ruler_baselines=("B1",),
+            f2_ruler_tasks=("qa",),
+        )
+        with pytest.raises(rc.PlanError, match="max_model_len=4096"):
+            _tiny_grid(max_model_len=4096, **ruler_kwargs)
+        with pytest.raises(rc.PlanError, match="32768"):
+            _tiny_grid(max_model_len=_SHAPE_32K_TOTAL - 1, **ruler_kwargs)
+        # exactly SHAPE-32K is the floor, not below it
+        assert _tiny_grid(max_model_len=_SHAPE_32K_TOTAL, **ruler_kwargs).max_model_len == 32_768
+        # a grid WITHOUT RULER tasks may register the pilot regime (no
+        # RULER request would exceed it; Qasper coverage is the operator's
+        # registered choice, reviewable in the header)
+        assert _tiny_grid(max_model_len=4096).max_model_len == 4096
+
+    @pytest.mark.parametrize("bad", [0, -1, True, 4096.0, "32768", None])
+    def test_grid_refuses_non_integer_or_non_positive(self, bad):
+        with pytest.raises(rc.PlanError, match="max_model_len"):
+            _tiny_grid(max_model_len=bad)
+
+    def test_registered_value_rides_the_relaunch(self, floor_table, stub):
+        plan = _stub_plan(_tiny_grid(max_model_len=8192), floor_table, stub.cmd)
+        (relaunch,) = _relaunches(plan)
+        assert relaunch["max_model_len"] == 8192
+        assert relaunch["env"]["VLLM_MAX_MODEL_LEN"] == "8192"
+        assert plan["serving_shapes"]["max_model_len"] == 8192
+
+    def test_load_plan_refuses_a_relaunch_without_it(self, tmp_path, plan_a):
+        # record missing (a pre-A10 plan)
+        plan = json.loads(json.dumps(plan_a))
+        del _relaunches(plan)[0]["max_model_len"]
+        with pytest.raises(rc.RunError, match="max_model_len"):
+            rc.load_plan(_dump(tmp_path, plan, "no_record.json"))
+        # env missing: the launcher would fall back to the pilot 4096
+        plan = json.loads(json.dumps(plan_a))
+        del _relaunches(plan)[0]["env"]["VLLM_MAX_MODEL_LEN"]
+        with pytest.raises(rc.RunError, match="VLLM_MAX_MODEL_LEN"):
+            rc.load_plan(_dump(tmp_path, plan, "no_env.json"))
+        # env drifted from the record (the record would lie about the server)
+        plan = json.loads(json.dumps(plan_a))
+        _relaunches(plan)[-1]["env"]["VLLM_MAX_MODEL_LEN"] = "4096"
+        with pytest.raises(rc.RunError, match="VLLM_MAX_MODEL_LEN"):
+            rc.load_plan(_dump(tmp_path, plan, "env_drift.json"))
+        # record disagrees with the header: a non-uniform session
+        plan = json.loads(json.dumps(plan_a))
+        step = _relaunches(plan)[5]
+        step["max_model_len"] = 16_384
+        step["env"]["VLLM_MAX_MODEL_LEN"] = "16384"
+        with pytest.raises(rc.RunError, match="uniform"):
+            rc.load_plan(_dump(tmp_path, plan, "non_uniform.json"))
+        # record is not a positive integer
+        plan = json.loads(json.dumps(plan_a))
+        _relaunches(plan)[0]["max_model_len"] = "32768"
+        with pytest.raises(rc.RunError, match="max_model_len"):
+            rc.load_plan(_dump(tmp_path, plan, "str_record.json"))
+        # header missing the value (a pre-A10 header)
+        plan = json.loads(json.dumps(plan_a))
+        del plan["serving_shapes"]["max_model_len"]
+        with pytest.raises(rc.RunError, match="max_model_len"):
+            rc.load_plan(_dump(tmp_path, plan, "no_header.json"))
+        # a fresh plan still loads (the refusals above are the only change)
+        assert rc.load_plan(_dump(tmp_path, plan_a, "fresh_a10.json"))["counts"]["cells"] == 870
+
+    def test_run_passes_it_to_the_launcher(self, tmp_path, floor_table, stub):
+        plan = _stub_plan(_tiny_grid(), floor_table, stub.cmd)
+        root = _run_root(tmp_path)
+        assert rc.run_plan(plan, root) == 0
+        calls = stub.calls()
+        launcher_call = calls[0]
+        assert launcher_call["argv"][0] == "restart"
+        assert launcher_call["env"]["VLLM_MAX_MODEL_LEN"] == "32768"
+
+    def test_counts_unchanged_by_max_model_len(self, plan_a, plan_b):
+        # A server dial on an existing boundary adds no cell, window,
+        # relaunch or block (pins: TestPlanCountsSessionA / TestSessionB).
+        c = plan_a["counts"]
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (870, 2610, 36, 65)
+        c = plan_b["counts"]
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (352, 1056, 30, 65)

@@ -760,6 +760,10 @@ def _score_evidence_file(
             "generated": generated,
             "reference": reference,
             "all_answers": all_answers,
+            # Backlog A8: the loader's answerability flag persisted on the row
+            # (ADR-0114), passed VERBATIM (absent/null -> None = reference-derived;
+            # a non-bool is refused by the scorer, never coerced here).
+            "is_impossible": rec.get("is_impossible"),
         })
     if not records:
         return [], 0
@@ -790,6 +794,7 @@ def _score_evidence_file(
         [r["generated"] for r in records],
         [r["reference"] for r in records],
         all_answers=[r["all_answers"] for r in records],
+        is_impossible=[r["is_impossible"] for r in records],
         batched=batch_size is not None,
         nli_batch_size=batch_size if batch_size is not None else 32,
     )

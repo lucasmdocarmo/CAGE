@@ -181,7 +181,8 @@ start_server() {
 
         # Reuse ONLY when no launch lever is requested AND the live cmdline
         # matches what this environment would launch: exact budget dial +
-        # uniform context length (adversarial review 2026-08-12). The live
+        # uniform context length (adversarial review 2026-08-12) + /metrics
+        # exposure (S0-23, checked below). The live
         # --kv-cache-dtype cannot be read back over the API, so if it is set
         # we force a restart rather than risk mislabeling the arm's data.
         live_cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
@@ -208,6 +209,11 @@ start_server() {
         else
             [[ "$live_cmd" != *"--tp-size"* ]] || dials_match=false
         fi
+        # /metrics exposure (S0-23, ADR-0102) is a reuse requirement too: a
+        # server started without --enable-metrics (pre-A14, or by hand) has
+        # no running-requests gauge, so every window served from it would
+        # record cold_start.verified == False. Restart rather than reuse.
+        [[ " $live_cmd " == *" --enable-metrics "* ]] || dials_match=false
 
         if [ "$loaded_model" = "$model" ] && [ "$has_prefix_cache" = "$want_prefix_cache" ] \
            && [ "$dials_match" = "true" ] \
@@ -236,6 +242,16 @@ start_server() {
     sglang_args+=( --mem-fraction-static "$mem_fraction" )
     # Uniform context length (vLLM --max-model-len analogue).
     sglang_args+=( --context-length "${VLLM_MAX_MODEL_LEN}" )
+    # Prometheus exposure (S0-23 smoke item A14; ADR-0102 cold start per
+    # window). The campaign driver's strict reset reads the running-requests
+    # gauge sglang:num_running_reqs from GET /metrics before every
+    # /flush_cache and persists the verdict as metrics.json['cold_start']
+    # .verified (scripts/3_run/run_experiment.py COLD_START_RUNNING_GAUGE).
+    # SGLang serves /metrics ONLY under --enable-metrics; without it every
+    # SGLang window records verified: False with a WARNING, which fails
+    # S0-23. Unconditional on purpose: never an env knob, never optional.
+    # [VERIFY-LIVE at S0]: flag spelling per SGLang's documented server CLI.
+    sglang_args+=( --enable-metrics )
 
     # Token-capped KV budget (T2.1; CacheBudgetPlanner SGLang knob, derived
     # FROM the byte budget). Passed in addition to the fraction dial — the

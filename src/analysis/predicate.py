@@ -22,17 +22,42 @@ freeze):
   (run_power_sim G15: surrogate = ``exact_match``), so the registered power
   analysis and the executed predicate agree. Continuous F1 stays the
   ADR-0087 exploratory companion, never the predicate.
-- **Qasper — groundedness-based**: Instrument A (LettuceDetect,
-  ``grounding_score``) at the calibrated τ. The τ decision is EXECUTED
-  (task #120, calibration run 2026-08-19): τ* = 0.995516 (registered
-  decimal 0.9955156950672646), selected by rule
-  ``max_balanced_accuracy_pooled_v1`` and FROZEN in the registration
-  artifact ``MyDocs/registration/freeze_resolutions.json`` (key
-  ``QASPER_TAU``). τ stays an EXPLICIT config field with NO default here:
-  the value is CONSUMED from the freeze artifact
-  (``build_predicate_table.py`` — ``--freeze-file`` /
-  ``$CAGE_FREEZE_RESOLUTIONS``), never hard-coded, and qasper rows without
-  a configured τ still REFUSE rather than borrow a threshold.
+- **Qasper, groundedness-based, THREE clauses keyed on the loader's
+  ``answer_type`` (ADR-0114, proposed 2026-09-17; backlog Tier A item A2;
+  rule literal ``qasper_three_clause_v1``)**. The Qasper loader keeps the
+  yes/no and unanswerable questions (charter D5 item 4: their scoring is
+  special-cased) and resolves every question to one of ``unanswerable`` |
+  ``yes_no`` | ``abstractive`` | ``extractive`` (src/data/loader.py
+  QasperLoader); the label rides the evidence row (run_experiment persists
+  ``answer_type`` + ``is_impossible`` per row) and selects the clause:
+  (1) ``unanswerable`` -> veridical iff the prediction is a correct
+  abstention, i.e. the quality layer's no-answer detector
+  (``src.evaluation.quality.is_no_answer_prediction`` on the sanitized
+  answer) fired; consumed as the sidecar column ``predicted_no_answer``
+  the scoring pass persists, so the predicate reuses the exact detector and
+  never re-implements it; (2) ``yes_no`` -> the normalized exact match
+  against the reference ``"Yes"``/``"No"`` (the sidecar ``exact_match``
+  column, max over golds, abstention scores 0); (3) ``abstractive`` and
+  ``extractive`` -> Instrument A (LettuceDetect, ``grounding_score``) at the
+  calibrated τ, unchanged from the legacy single-clause rule, EXCEPT that a
+  no-answer prediction on these ANSWERABLE items is a wrong answer:
+  ``predicted_no_answer == 1`` is checked first and yields predicate False
+  (owner decision 2026-09-17; the scorer nulls ``grounding_score`` on an
+  abstention, and span-QA EM and clause 2 already score it 0). A Qasper row
+  with a missing or unknown ``answer_type`` REFUSES (typed) and never
+  defaults to the grounding clause; the share and count per answer type
+  are REPORTED per window. The τ decision is EXECUTED (task #120,
+  calibration run 2026-08-19): τ* = 0.995516 (registered decimal
+  0.9955156950672646), selected by rule ``max_balanced_accuracy_pooled_v1``
+  and FROZEN in the registration artifact
+  ``MyDocs/registration/freeze_resolutions.json`` (key ``QASPER_TAU``). τ
+  stays an EXPLICIT config field with NO default here: the value is
+  CONSUMED from the freeze artifact (``build_predicate_table.py``,
+  ``--freeze-file`` / ``$CAGE_FREEZE_RESOLUTIONS``), never hard-coded, and
+  qasper rows without a configured τ still REFUSE rather than borrow a
+  threshold. Artifacts produced before ADR-0114 (the 2026-08-19 calibration
+  manifest names the rule) carry the legacy literal, kept here as
+  ``QASPER_GROUNDING_RULE_LEGACY`` for provenance only.
 - **Contradiction and neutral reported separately** (§8.5 claim-pipeline
   protocol: misread evidence vs invented claim are different bugs): the
   3-class NLI columns (``faithfulness_contradiction`` /
@@ -69,14 +94,18 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 __all__ = [
+    "EVIDENCE_CARRIED_FIELDS",
     "GROUNDEDNESS_DATASETS",
     "JOIN_KEY_FIELDS",
     "PREDICATE_DATASETS",
     "PredicateConfig",
     "PredicateError",
+    "QASPER_ANSWER_TYPES",
+    "QASPER_CLAUSE_COLUMNS",
+    "QASPER_GROUNDING_RULE_LEGACY",
+    "QASPER_RULE",
     "SPAN_QA_DATASETS",
     "SPAN_QA_RULE",
-    "QASPER_RULE",
     "compute_window_predicate",
     "join_window_rows",
     "required_verdict_column",
@@ -92,7 +121,40 @@ PREDICATE_DATASETS: frozenset[str] = SPAN_QA_DATASETS | GROUNDEDNESS_DATASETS
 
 #: Registered rule labels stamped on every produced row (audit trail).
 SPAN_QA_RULE = "span_qa_em_abstention_aware"
-QASPER_RULE = "qasper_grounding_at_tau"
+#: ADR-0114 (proposed 2026-09-17; backlog Tier A item A2): the Qasper branch
+#: is three clauses keyed on the loader's per-question ``answer_type`` (see
+#: the module docstring and QASPER_CLAUSE_COLUMNS).
+QASPER_RULE = "qasper_three_clause_v1"
+#: The pre-ADR-0114 single-clause literal (grounding_score >= tau on every
+#: Qasper row). Kept ONLY so artifacts produced under it stay attributable:
+#: the 2026-08-19 Instrument-A calibration manifest
+#: (MyDocs/registration/instrument_a_tau_calibration/) names it verbatim.
+#: Never stamped on new rows.
+QASPER_GROUNDING_RULE_LEGACY = "qasper_grounding_at_tau"
+
+#: The Qasper loader's answer_type vocabulary (src/data/loader.py
+#: QasperLoader._resolve_annotator; ADR-0114). A row outside it refuses.
+QASPER_ANSWER_TYPES: frozenset[str] = frozenset(
+    {"unanswerable", "yes_no", "abstractive", "extractive"}
+)
+#: ADR-0114 clause table: the scoring-sidecar (qa_scores.jsonl) verdict
+#: column each answer type consumes. ``predicted_no_answer`` is the quality
+#: layer's no-answer detector output (is_no_answer_prediction on the
+#: sanitized answer, persisted by rescore_quality via QualityMetrics);
+#: ``exact_match`` is the abstention-aware normalized EM (max over golds);
+#: ``grounding_score`` is Instrument A. Insertion order is the report order.
+QASPER_CLAUSE_COLUMNS: Mapping[str, str] = {
+    "unanswerable": "predicted_no_answer",
+    "yes_no": "exact_match",
+    "abstractive": "grounding_score",
+    "extractive": "grounding_score",
+}
+#: The no-answer detector column. Clause 1 consumes it as the verdict; clause
+#: 3 reads it FIRST, because an abstention on an answerable item is False.
+_ABSTENTION_COLUMN = QASPER_CLAUSE_COLUMNS["unanswerable"]
+#: Loader-resolved item labels carried from the evidence row into the joined
+#: row (absent -> None: span-QA loaders emit no answer_type). ADR-0114.
+EVIDENCE_CARRIED_FIELDS: tuple[str, ...] = ("answer_type", "is_impossible")
 
 #: The #127 identity triple (run_experiment.evidence_integrity_fields +
 #: rescore_quality._evidence_row_key): example_id, repeat_index (string,
@@ -162,7 +224,12 @@ class PredicateConfig:
 
 
 def required_verdict_column(dataset: str) -> str:
-    """The sidecar verdict column the §8.5 branch for ``dataset`` consumes."""
+    """The PRIMARY sidecar verdict column of the §8.5 branch for ``dataset``.
+
+    Span-QA: ``exact_match``. Qasper: ``grounding_score`` (the clause-3
+    column; the unanswerable and yes/no clauses consume the columns named in
+    QASPER_CLAUSE_COLUMNS, resolved per row by compute_window_predicate).
+    """
     if dataset in SPAN_QA_DATASETS:
         return "exact_match"
     if dataset in GROUNDEDNESS_DATASETS:
@@ -224,7 +291,9 @@ def join_window_rows(
     failures instead of scoring them, H2).
 
     Output rows carry the join key, the evidence integrity fields
-    (``ok``/``error``/``empty_generation``) and every score-row field, in
+    (``ok``/``error``/``empty_generation``), the loader-resolved item labels
+    (EVIDENCE_CARRIED_FIELDS: ``answer_type``/``is_impossible``, None when
+    the evidence row lacks them; ADR-0114) and every score-row field, in
     evidence-row order (deterministic).
     """
     ev_keyed = _keyed(evidence_rows, source="qa_evidence.jsonl", window=window)
@@ -264,6 +333,8 @@ def join_window_rows(
         row["ok"] = bool(ev["ok"])
         row["error"] = ev.get("error")
         row["empty_generation"] = ev.get("empty_generation")
+        for field in EVIDENCE_CARRIED_FIELDS:
+            row[field] = ev.get(field)
         joined.append(row)
     return joined
 
@@ -282,6 +353,57 @@ def _verdict_value(row: Mapping[str, Any], column: str, window: str) -> float | 
     return float(value)
 
 
+def _validate_qasper_labels(
+    joined_rows: Sequence[Mapping[str, Any]], *, window: str
+) -> None:
+    """ADR-0114 label contract for every Qasper row (ok or not).
+
+    Refuses (PredicateError, offenders listed) a row whose ``answer_type`` is
+    missing or outside QASPER_ANSWER_TYPES, and a row whose ``is_impossible``
+    is present but is not a bool (backlog A8: no coerced stand-ins) or
+    disagrees with ``answer_type == "unanswerable"`` (the loader writes both
+    from one resolution). Absent ``is_impossible`` is tolerated: the type
+    alone keys the clause.
+    """
+    bad_type: list[tuple[Any, Any]] = []
+    bad_flag: list[tuple[Any, Any, Any]] = []
+    for row in joined_rows:
+        answer_type = row.get("answer_type")
+        if not isinstance(answer_type, str) or answer_type not in QASPER_ANSWER_TYPES:
+            bad_type.append((row["example_id"], answer_type))
+            continue
+        flag = row.get("is_impossible")
+        if flag is None:
+            continue
+        if isinstance(flag, bool) and flag == (answer_type == "unanswerable"):
+            continue
+        bad_flag.append((row["example_id"], answer_type, flag))
+    if bad_type:
+        shown = ", ".join(f"{k!r}: {v!r}" for k, v in bad_type[:_MAX_LISTED_KEYS])
+        more = "" if len(bad_type) <= _MAX_LISTED_KEYS else f" (+{len(bad_type) - _MAX_LISTED_KEYS} more)"
+        raise PredicateError(
+            f"{window}: {len(bad_type)} Qasper row(s) with a missing or unknown "
+            f"answer_type ({shown}{more}); legal values are "
+            f"{sorted(QASPER_ANSWER_TYPES)} (src/data/loader.py QasperLoader). "
+            "ADR-0114: the three-clause rule never defaults a row to the "
+            "grounding clause; evidence written before answer_type was "
+            "persisted cannot feed the predicate, re-run the serving cell"
+        )
+    if bad_flag:
+        shown = ", ".join(
+            f"{k!r}: answer_type={t!r}, is_impossible={f!r}"
+            for k, t, f in bad_flag[:_MAX_LISTED_KEYS]
+        )
+        more = "" if len(bad_flag) <= _MAX_LISTED_KEYS else f" (+{len(bad_flag) - _MAX_LISTED_KEYS} more)"
+        raise PredicateError(
+            f"{window}: {len(bad_flag)} Qasper row(s) whose is_impossible flag "
+            f"is not a bool or disagrees with answer_type ({shown}{more}); the "
+            "loader writes both labels from one resolution (backlog A8, "
+            "ADR-0114), a mismatch is a mislabeled row and is refused, never "
+            "coerced"
+        )
+
+
 def compute_window_predicate(
     joined_rows: Sequence[Mapping[str, Any]],
     dataset: str,
@@ -293,8 +415,15 @@ def compute_window_predicate(
 
     Returns ``(predicate_rows, summary)``. Refusals (PredicateError): dataset
     outside the predicate universe; qasper rows without a configured τ
-    (#120); a required verdict column absent from EVERY joined row; a null
-    fraction above ``config.max_null_fraction``; EM values outside {0, 1}.
+    (#120); a qasper row with a missing/unknown ``answer_type`` or an
+    inconsistent ``is_impossible`` (ADR-0114); a required clause column
+    absent from EVERY joined row; a null fraction above
+    ``config.max_null_fraction``; binary-column values outside {0, 1}.
+
+    Qasper clause 3 (abstractive / extractive): a row whose
+    ``predicted_no_answer`` is 1 gets predicate False before the span score
+    is read; the row names that column in ``verdict_column`` and the summary
+    counts it in ``n_abstained_on_answerable``.
     """
     column = required_verdict_column(dataset)
     span_qa = dataset in SPAN_QA_DATASETS
@@ -308,20 +437,37 @@ def compute_window_predicate(
             "build_predicate_table --freeze-file / $CAGE_FREEZE_RESOLUTIONS "
             "instead of defaulting in code"
         )
-    if not any(column in row for row in joined_rows):
-        raise PredicateError(
-            f"{window}: required verdict column {column!r} is absent from "
-            f"every scoring-sidecar row for dataset {dataset!r} — the §8.5 "
-            f"{'correctness' if span_qa else 'groundedness'} branch cannot "
-            "be computed; re-run the scoring pass with the instrument that "
-            "produces it"
-        )
+    # ADR-0114: the Qasper clause per row is selected by the loader's
+    # answer_type; the labels are validated for EVERY row (ok or not) before
+    # any verdict is read, so a mislabeled row refuses instead of defaulting.
+    row_columns: list[str] = []
+    if span_qa:
+        row_columns = [column] * len(joined_rows)
+    else:
+        _validate_qasper_labels(joined_rows, window=window)
+        row_columns = [QASPER_CLAUSE_COLUMNS[str(r["answer_type"])] for r in joined_rows]
+    for needed in dict.fromkeys(row_columns):
+        if not any(needed in row for row in joined_rows):
+            if span_qa:
+                clause = "the §8.5 correctness branch"
+            else:
+                types = sorted(
+                    t for t, c in QASPER_CLAUSE_COLUMNS.items() if c == needed
+                )
+                clause = f"the §8.5 Qasper clause(s) for answer_type {types}"
+            raise PredicateError(
+                f"{window}: required verdict column {needed!r} is absent from "
+                f"every scoring-sidecar row for dataset {dataset!r}; "
+                f"{clause} cannot be computed; re-run the scoring pass with "
+                "the instrument that produces it"
+            )
     rule = SPAN_QA_RULE if span_qa else QASPER_RULE
 
     rows_out: list[dict[str, Any]] = []
     n_not_ok = 0
     n_missing_verdict = 0
-    for row in joined_rows:
+    n_abstained_on_answerable = 0
+    for row, row_column in zip(joined_rows, row_columns):
         out: dict[str, Any] = {
             "example_id": row["example_id"],
             "repeat_index": row["repeat_index"],
@@ -329,7 +475,11 @@ def compute_window_predicate(
             "ok": bool(row["ok"]),
             "dataset": dataset,
             "predicate_rule": rule,
-            "verdict_column": column,
+            "verdict_column": row_column,
+            # ADR-0114: the loader-resolved item labels ride every row
+            # (None on span-QA rows, whose loaders emit no answer_type).
+            "answer_type": row.get("answer_type"),
+            "is_impossible": row.get("is_impossible"),
         }
         # §8.5 protocol: contradiction/neutral reported SEPARATELY — carried
         # through (nulled with the rest on not-ok rows), never in the predicate.
@@ -344,7 +494,28 @@ def compute_window_predicate(
             out["predicate_null_reason"] = "not_ok"
             rows_out.append(out)
             continue
-        verdict = _verdict_value(row, column, window)
+        if row_column == "grounding_score":
+            # Clause 3 rows are ANSWERABLE, so a no-answer prediction is a
+            # wrong answer. Checked before the span score: the scorer treats
+            # grounding as N/A on an abstention and nulls it
+            # (src/evaluation/quality.py evaluate(), abstention-aware block),
+            # so the span score of an abstention never decides the verdict.
+            abstained = _verdict_value(row, _ABSTENTION_COLUMN, window)
+            if abstained is not None and abstained not in (0.0, 1.0):
+                raise PredicateError(
+                    f"{window}: {_ABSTENTION_COLUMN} value {abstained!r} "
+                    f"outside {{0, 1}}; the {_ABSTENTION_COLUMN} column is "
+                    "binary by contract (is_no_answer_prediction)"
+                )
+            if abstained == 1.0:
+                n_abstained_on_answerable += 1
+                out["verdict_column"] = _ABSTENTION_COLUMN
+                out["verdict"] = abstained
+                out["predicate"] = False
+                out["predicate_null_reason"] = None
+                rows_out.append(out)
+                continue
+        verdict = _verdict_value(row, row_column, window)
         out["verdict"] = verdict
         if verdict is None:
             n_missing_verdict += 1
@@ -352,26 +523,33 @@ def compute_window_predicate(
             out["predicate_null_reason"] = "missing_verdict"
             rows_out.append(out)
             continue
-        if span_qa:
-            if verdict not in (0.0, 1.0):
-                raise PredicateError(
-                    f"{window}: exact_match value {verdict!r} outside "
-                    "{0, 1} — the abstention-aware EM column is binary by "
-                    "contract (quality.py fix #4)"
-                )
-            out["predicate"] = verdict == 1.0
-        else:
+        if row_column == "grounding_score":
+            # Span detector at the calibrated τ (Qasper clause 3).
             assert config.qasper_tau is not None
             out["predicate"] = verdict >= float(config.qasper_tau)
+        else:
+            # Binary columns: span-QA abstention-aware EM (quality.py fix #4),
+            # Qasper yes/no EM (clause 2) and the no-answer detector output
+            # (clause 1) are 0/1 by contract.
+            if verdict not in (0.0, 1.0):
+                raise PredicateError(
+                    f"{window}: {row_column} value {verdict!r} outside "
+                    f"{{0, 1}}; the {row_column} column is binary by "
+                    "contract (quality.py fix #4 / is_no_answer_prediction)"
+                )
+            out["predicate"] = verdict == 1.0
         out["predicate_null_reason"] = None
         rows_out.append(out)
 
     summary = summarize_predicate_rows(rows_out)
     summary["n_not_ok_nulled"] = n_not_ok
     summary["n_missing_verdict"] = n_missing_verdict
+    summary["n_abstained_on_answerable"] = n_abstained_on_answerable
     summary["dataset"] = dataset
     summary["predicate_rule"] = rule
     summary["verdict_column"] = column
+    # ADR-0114: the per-clause column table (None on the single-column branch).
+    summary["clause_columns"] = None if span_qa else dict(QASPER_CLAUSE_COLUMNS)
     if summary["n_rows"] and summary["null_fraction"] > float(config.max_null_fraction):
         raise PredicateError(
             f"{window}: predicate null fraction "
@@ -401,6 +579,30 @@ def summarize_predicate_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any
             "n": len(values),
             "mean": (sum(values) / len(values)) if values else None,
         }
+    # ADR-0114: share and count per loader answer_type (a REPORTED quantity:
+    # the mix says how much of the Qasper predicate rides on the span
+    # detector versus the abstention and yes/no clauses). Rows without a
+    # string answer_type (span-QA loaders emit none) are counted, not shared.
+    by_type: dict[str, dict[str, Any]] = {}
+    n_without_type = 0
+    for r in rows:
+        answer_type = r.get("answer_type")
+        if not isinstance(answer_type, str):
+            n_without_type += 1
+            continue
+        bucket = by_type.setdefault(
+            answer_type, {"n": 0, "share": 0.0, "n_true": 0, "n_false": 0, "n_null": 0}
+        )
+        bucket["n"] += 1
+        predicate = r.get("predicate")
+        if predicate is True:
+            bucket["n_true"] += 1
+        elif predicate is False:
+            bucket["n_false"] += 1
+        else:
+            bucket["n_null"] += 1
+    for bucket in by_type.values():
+        bucket["share"] = bucket["n"] / n_rows if n_rows else 0.0
     return {
         "n_rows": n_rows,
         "n_true": n_true,
@@ -409,4 +611,6 @@ def summarize_predicate_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any
         "null_fraction": (n_null / n_rows) if n_rows else 0.0,
         # §8.5: contradiction/neutral are SEPARATE reported measurements.
         "reported_separately": separate,
+        "by_answer_type": {k: by_type[k] for k in sorted(by_type)},
+        "n_without_answer_type": n_without_type,
     }

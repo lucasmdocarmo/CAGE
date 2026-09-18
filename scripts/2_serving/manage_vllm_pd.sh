@@ -35,6 +35,22 @@
 #                                 defaults 8100 / 8200 / 8000 (mirrored by
 #                                 run_campaign.py's telemetry-endpoint
 #                                 emission — override BOTH sides together).
+#   CAGE_PD_PREFILL_GPUS / CAGE_PD_DECODE_GPUS
+#                                 OPTIONAL per-role CUDA_VISIBLE_DEVICES pins
+#                                 (comma-separated GPU indices, e.g. "0" and
+#                                 "1", or "0,1" and "2,3" under TP). Set BOTH
+#                                 to pairwise-disjoint sets or NEITHER; one
+#                                 pinned role or an overlap is a refusal.
+#                                 Unset = both roles share ONE GPU, which
+#                                 drives the per-instance memory dial:
+#   VLLM_GPU_MEMORY_UTILIZATION   per-instance --gpu-memory-utilization
+#                                 OVERRIDE. Default 0.45 on a shared GPU
+#                                 (SHARED_GPU_MEM_UTIL, backlog A1 / S0-9 /
+#                                 S0-20; vLLM's startup check refuses the
+#                                 second instance at 0.90) and 0.90 with
+#                                 distinct pins; an explicit value above 0.50
+#                                 on a shared GPU is REFUSED. The decision is
+#                                 printed at start and captured per role.
 # REFUSED when set at start (ambiguity is a refusal, not a precedence rule):
 #   CAGE_KV_BUDGET_BYTES / CAGE_VLLM_GPU_BLOCKS_OVERRIDE  (single-instance
 #     budget knobs: which pool would they cap? — unset them for pd runs)
@@ -62,6 +78,11 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_DIR"
 # shellcheck source=scripts/lib/_common.sh
 source "$PROJECT_DIR/scripts/lib/_common.sh"
+# Capture the CALLER's memory-utilization request BEFORE the serving config
+# is sourced: that lib exports VLLM_GPU_MEMORY_UTILIZATION=0.90 whenever it is
+# unset, and the shared-GPU rule below must not mistake the lib's default for
+# an explicit 0.90 (which it would have to refuse on a shared GPU).
+PD_MEM_UTIL_REQUESTED="${VLLM_GPU_MEMORY_UTILIZATION:-}"
 # Uniform serving regime + the shared positive-int validator (Option A source
 # of truth) — sourced HERE like every engine launcher (D1 doctrine).
 # shellcheck source=scripts/lib/_serving_config.sh
@@ -87,6 +108,123 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
+
+# --- shared-GPU memory-utilization rule (backlog Tier A item A1) -------------
+# vLLM 0.19.1's startup check requests --gpu-memory-utilization of the device
+# unconditionally, so two role instances on ONE GPU at the 0.90 uniform
+# operating point cannot both start: the second one is refused and the S0
+# proofs S0-9 (cluster lifecycle) and S0-20 (pd preflight smoke) cannot begin.
+# Rule (mirrors manage_vllm_cluster.py, backlog A1, S0 rows S0-9 and S0-20):
+#   shared   = no distinct per-role CUDA_VISIBLE_DEVICES pins -> per-instance
+#              default SHARED_GPU_MEM_UTIL; an explicit value above
+#              SHARED_GPU_MEM_UTIL_CEILING is REFUSED (the fix is named).
+#   distinct = both roles pinned to disjoint GPU sets -> DISTINCT_GPU_MEM_UTIL
+#              (the Option-A operating point) stands; the override is honored.
+# VLLM_GPU_MEMORY_UTILIZATION remains the override on both paths.
+SHARED_GPU_MEM_UTIL=0.45
+SHARED_GPU_MEM_UTIL_CEILING=0.50
+DISTINCT_GPU_MEM_UTIL=0.90
+
+cage_pd_gpu_list_ok() {
+    # $1 = env name, $2 = value: a comma-separated list of GPU indices with no
+    # empty entries and no leading zeros ("00" and "0" would name one device
+    # under two spellings and defeat the disjointness check).
+    local name="$1" value="$2" item
+    case "$value" in
+        ''|*[!0-9,]*|,*|*,|*,,*)
+            printf '[cage] REFUSING pd launch: %s=%s is not a comma-separated list of GPU indices (set CAGE_PD_PREFILL_GPUS and CAGE_PD_DECODE_GPUS to disjoint sets, or neither)\n' \
+                "$name" "${2:-<empty>}" >&2
+            return 1
+            ;;
+    esac
+    local IFS=','
+    for item in $value; do
+        case "$item" in
+            0?*)
+                printf '[cage] REFUSING pd launch: %s=%s has a leading-zero GPU index (%s); write the plain index (CAGE_PD_PREFILL_GPUS / CAGE_PD_DECODE_GPUS)\n' \
+                    "$name" "$value" "$item" >&2
+                return 1
+                ;;
+        esac
+    done
+    return 0
+}
+
+cage_pd_gpu_lists_overlap() {
+    # $1, $2 = comma-separated GPU index lists. 0 iff they share an index.
+    local a b
+    local IFS=','
+    for a in $1; do
+        for b in $2; do
+            [ "$a" = "$b" ] && return 0
+        done
+    done
+    return 1
+}
+
+cage_resolve_pd_gpu_share() {
+    # Resolves the rule into globals consumed by compose/capture/launch:
+    #   PD_GPU_SHARE        shared | distinct
+    #   PD_MEM_UTIL         the per-instance --gpu-memory-utilization value
+    #   PD_MEM_UTIL_SOURCE  default | explicit
+    #   PD_PREFILL_CUDA / PD_DECODE_CUDA  per-role CUDA_VISIBLE_DEVICES ('' =
+    #                       unpinned; the pin rides the child env only)
+    # Returns 1 (after a REFUSING line) on any ambiguity: one pinned role,
+    # overlapping or malformed pins, or a shared explicit value the vLLM
+    # startup check cannot honor.
+    PD_PREFILL_CUDA="${CAGE_PD_PREFILL_GPUS:-}"
+    PD_DECODE_CUDA="${CAGE_PD_DECODE_GPUS:-}"
+    if [ -n "$PD_PREFILL_CUDA" ] || [ -n "$PD_DECODE_CUDA" ]; then
+        if [ -z "$PD_PREFILL_CUDA" ] || [ -z "$PD_DECODE_CUDA" ]; then
+            printf '[cage] REFUSING pd launch: only one role is pinned (CAGE_PD_PREFILL_GPUS=%s CAGE_PD_DECODE_GPUS=%s); pin BOTH roles to disjoint GPU sets or NEITHER (shared GPU)\n' \
+                "${PD_PREFILL_CUDA:-<unset>}" "${PD_DECODE_CUDA:-<unset>}" >&2
+            return 1
+        fi
+        cage_pd_gpu_list_ok CAGE_PD_PREFILL_GPUS "$PD_PREFILL_CUDA" || return 1
+        cage_pd_gpu_list_ok CAGE_PD_DECODE_GPUS "$PD_DECODE_CUDA" || return 1
+        if cage_pd_gpu_lists_overlap "$PD_PREFILL_CUDA" "$PD_DECODE_CUDA"; then
+            printf '[cage] REFUSING pd launch: CAGE_PD_PREFILL_GPUS=%s and CAGE_PD_DECODE_GPUS=%s share a GPU index; distinct pins must be pairwise disjoint (or unset both for the shared-GPU regime)\n' \
+                "$PD_PREFILL_CUDA" "$PD_DECODE_CUDA" >&2
+            return 1
+        fi
+        PD_GPU_SHARE=distinct
+    else
+        PD_GPU_SHARE=shared
+    fi
+
+    local requested="${PD_MEM_UTIL_REQUESTED:-}"
+    if [ -z "$requested" ]; then
+        PD_MEM_UTIL_SOURCE=default
+        if [ "$PD_GPU_SHARE" = shared ]; then
+            PD_MEM_UTIL="$SHARED_GPU_MEM_UTIL"
+        else
+            PD_MEM_UTIL="$DISTINCT_GPU_MEM_UTIL"
+        fi
+        return 0
+    fi
+    case "$requested" in
+        *[!0-9.]*|.|*.*.*)
+            printf '[cage] REFUSING pd launch: VLLM_GPU_MEMORY_UTILIZATION=%s is not a decimal fraction\n' \
+                "$requested" >&2
+            return 1
+            ;;
+    esac
+    # LC_ALL=C: a comma-radix locale would misread the fraction.
+    if ! LC_ALL=C awk -v v="$requested" 'BEGIN { exit !(v > 0 && v <= 1) }'; then
+        printf '[cage] REFUSING pd launch: VLLM_GPU_MEMORY_UTILIZATION=%s must be a fraction in (0, 1]\n' \
+            "$requested" >&2
+        return 1
+    fi
+    if [ "$PD_GPU_SHARE" = shared ] \
+        && LC_ALL=C awk -v v="$requested" -v c="$SHARED_GPU_MEM_UTIL_CEILING" 'BEGIN { exit !(v > c) }'; then
+        printf '[cage] REFUSING pd launch: prefill and decode share one GPU and VLLM_GPU_MEMORY_UTILIZATION=%s asks each instance for --gpu-memory-utilization %s of the device; the vLLM startup check requests that fraction unconditionally, so the second instance cannot start. Fix: lower VLLM_GPU_MEMORY_UTILIZATION to at most %s (default %s), or pin the roles to distinct GPUs with CAGE_PD_PREFILL_GPUS / CAGE_PD_DECODE_GPUS (e.g. 0 and 1)\n' \
+            "$requested" "$requested" "$SHARED_GPU_MEM_UTIL_CEILING" "$SHARED_GPU_MEM_UTIL" >&2
+        return 1
+    fi
+    PD_MEM_UTIL="$requested"
+    PD_MEM_UTIL_SOURCE=explicit
+    return 0
+}
 
 # --- validation (start only; stop/status never gated) ------------------------
 
@@ -120,6 +258,9 @@ cage_validate_pd_env() {
             "$PREFILL_PORT" "$DECODE_PORT" "$PROXY_PORT" >&2
         return 1
     fi
+    # Backlog A1 (S0-9 / S0-20): shared-vs-distinct GPU decision, resolved
+    # here so a refusal fires BEFORE the self-cleaning teardown.
+    cage_resolve_pd_gpu_share || return 1
     return 0
 }
 
@@ -194,7 +335,9 @@ compose_role_args() {
     # Per-role connector config — the disaggregation wiring itself.
     ROLE_ARGS+=( --kv-transfer-config "$kv_cfg" )
     ROLE_ARGS+=( --max-model-len "${VLLM_MAX_MODEL_LEN:-4096}" )
-    ROLE_ARGS+=( --gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION:-0.90}" )
+    # Per-instance dial from the shared-GPU rule (backlog A1), never an
+    # inline fallback: the value depends on whether the roles share a GPU.
+    ROLE_ARGS+=( --gpu-memory-utilization "$PD_MEM_UTIL" )
     # §6.5 per-role pool budget: the BINDING byte cap for this role's pool.
     # Per-role semantics under a connector are unproven offline
     # [VERIFY-LIVE at Run-C-prime preflight]; gate (j) closes on the logs.
@@ -216,6 +359,8 @@ capture_role_config() {
     # CAGE_RUN_ROOT is unset; never fatal to startup.
     local role="$1" model="$2" port="$3" kv_cfg="$4" budget="$5" args_line="$6" prefix="$7"
     [ -n "${CAGE_RUN_ROOT:-}" ] || return 0
+    local cuda_pin=""
+    if [ "$role" = prefill ]; then cuda_pin="$PD_PREFILL_CUDA"; else cuda_pin="$PD_DECODE_CUDA"; fi
     local cfg_dir="$CAGE_RUN_ROOT/observability/serving_configs"
     local model_slug cfg_file
     model_slug=$(printf '%s' "$model" | tr '[:upper:]' '[:lower:]' | sed -E 's|.*/||; s|[^a-z0-9]+|-|g; s|^-+||; s|-+$||')
@@ -229,7 +374,10 @@ capture_role_config() {
     SC_TENSOR_PARALLEL="${CAGE_VLLM_TENSOR_PARALLEL:-}" \
     SC_PREFIX="$prefix" \
     SC_MAX_LEN="${VLLM_MAX_MODEL_LEN:-4096}" \
-    SC_MEM_UTIL="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}" \
+    SC_MEM_UTIL="$PD_MEM_UTIL" \
+    SC_GPU_SHARE="$PD_GPU_SHARE" \
+    SC_MEM_UTIL_SOURCE="$PD_MEM_UTIL_SOURCE" \
+    SC_CUDA="$cuda_pin" \
     SC_EAGER="${VLLM_ENFORCE_EAGER:-0}" \
     SC_ARGS="$args_line" \
     SC_FILE="$cfg_file" \
@@ -265,7 +413,12 @@ cfg = {
     ),
     "enable_prefix_caching": os.environ.get("SC_PREFIX") == "true",
     "max_model_len": int(os.environ.get("SC_MAX_LEN", "4096")),
-    "gpu_memory_utilization": float(os.environ.get("SC_MEM_UTIL", "0.90")),
+    # Backlog A1 (S0-9 / S0-20): the realized per-instance dial, the
+    # shared-vs-distinct decision behind it, and this role's GPU pin.
+    "gpu_memory_utilization": float(os.environ["SC_MEM_UTIL"]),
+    "gpu_share": os.environ["SC_GPU_SHARE"],
+    "gpu_memory_utilization_source": os.environ["SC_MEM_UTIL_SOURCE"],
+    "cuda_visible_devices": os.environ.get("SC_CUDA") or None,
     "enforce_eager": os.environ.get("SC_EAGER") == "1",
     "args": os.environ["SC_ARGS"],
 }
@@ -274,6 +427,20 @@ with open(os.environ["SC_FILE"], "w", encoding="utf-8") as fh:
     fh.write("\n")
 PYEOF
     echo "  Serving config captured: $cfg_file"
+}
+
+launch_role_instance() {
+    # $1 = CUDA_VISIBLE_DEVICES pin ('' = unpinned, ambient visibility), $2 =
+    # log file, $3 = pidfile, rest = vllm serve argv. The pin rides the child
+    # env ONLY (backlog A1): nothing is exported into this shell.
+    local cuda_pin="$1" log_file="$2" pid_file="$3"
+    shift 3
+    if [ -n "$cuda_pin" ]; then
+        CUDA_VISIBLE_DEVICES="$cuda_pin" nohup vllm serve "$@" > "$log_file" 2>&1 &
+    else
+        nohup vllm serve "$@" > "$log_file" 2>&1 &
+    fi
+    printf '%s\n' "$!" > "$pid_file"
 }
 
 start_stack() {
@@ -293,6 +460,9 @@ start_stack() {
     echo "[cage]   whole NIXL data path are UNPROVEN offline; until the pd preflight"
     echo "[cage]   smoke passes, the campaign PD provenance gate refusing source-less"
     echo "[cage]   kv_transfer_params is the CORRECT outcome, not a bug."
+    local share_rule="DISTINCT_GPU_MEM_UTIL"
+    [ "$PD_GPU_SHARE" = shared ] && share_rule="SHARED_GPU_MEM_UTIL"
+    echo "[cage] gpu-share decision: $PD_GPU_SHARE (prefill=${PD_PREFILL_CUDA:-unpinned} decode=${PD_DECODE_CUDA:-unpinned}) -> --gpu-memory-utilization $PD_MEM_UTIL per instance [$PD_MEM_UTIL_SOURCE; rule $share_rule, backlog A1 / S0-9 / S0-20]"
 
     # start is self-cleaning: a stale pd stack (or a lone single-instance
     # server on these ports) must never be reused under new dials — the
@@ -321,8 +491,7 @@ start_stack() {
     capture_role_config prefill "$model" "$PREFILL_PORT" "$PREFILL_KV_TRANSFER_CONFIG" \
         "$CAGE_KV_BUDGET_BYTES_PREFILL" "vllm serve $model ${prefill_args[*]}" "$want_prefix_cache"
     echo "Starting prefill instance (logging to $prefill_log)..."
-    nohup vllm serve "$model" "${prefill_args[@]}" > "$prefill_log" 2>&1 &
-    printf '%s\n' "$!" > "$PREFILL_PID_FILE"
+    launch_role_instance "$PD_PREFILL_CUDA" "$prefill_log" "$PREFILL_PID_FILE" "$model" "${prefill_args[@]}"
     echo "Prefill PID: $(cat "$PREFILL_PID_FILE") (pidfile: $PREFILL_PID_FILE)"
 
     compose_role_args decode "$DECODE_PORT" "$DECODE_KV_TRANSFER_CONFIG" \
@@ -332,8 +501,7 @@ start_stack() {
     capture_role_config decode "$model" "$DECODE_PORT" "$DECODE_KV_TRANSFER_CONFIG" \
         "$CAGE_KV_BUDGET_BYTES_DECODE" "vllm serve $model ${decode_args[*]}" "$want_prefix_cache"
     echo "Starting decode instance (logging to $decode_log)..."
-    nohup vllm serve "$model" "${decode_args[@]}" > "$decode_log" 2>&1 &
-    printf '%s\n' "$!" > "$DECODE_PID_FILE"
+    launch_role_instance "$PD_DECODE_CUDA" "$decode_log" "$DECODE_PID_FILE" "$model" "${decode_args[@]}"
     echo "Decode PID: $(cat "$DECODE_PID_FILE") (pidfile: $DECODE_PID_FILE)"
 
     # Readiness: BOTH instances, then the proxy (whose /health requires both
@@ -428,6 +596,12 @@ status_stack() {
     echo "PD data path: PENDING [VERIFY-LIVE at Run-C-prime preflight] — NIXL transfer + kv_transfer_params provenance unproven offline"
     return "$ok"
 }
+
+# Sourced (bash-level unit tests of the functions above): define only, never
+# dispatch. Executed: fall through to the verb dispatch.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+    return 0
+fi
 
 case "${1:-}" in
     start)

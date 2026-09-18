@@ -61,6 +61,49 @@ until their registrations land):
 - F3  interaction (prefix ON × pressure): REUSE set × {vllm, sglang} × the
   §6.8 reduced 3×3 grid r ∈ {1.0, 0.5, 0.25} × {0.85, 0.95, 1.05}·λ*.
 - Replications: 3 measurement windows per grid point (D6 §6.3).
+- corpus-fresh prefix OFF (ADR-0103, owner decision 2026-09-16): B4 is
+  served with the engine prefix cache OFF through a PER-ARM RELAUNCH,
+  uniformly on every engine, in EVERY family (F1 and F3; PREFIX_OFF_ARMS,
+  consulted only via ``_prefix_off``). Its family carriage is unchanged
+  (REUSE bit, rides F3 beside B3). The runner's ``no_cache`` token only
+  labels telemetry, so before ADR-0103 B4 and B3 were served by one
+  prefix-ON server: the mislabeled-duplicate failure class. Cost: one extra
+  budget-free prefix-OFF relaunch per engine for F1; the F3 B4 cells share
+  the F2 plain prefix-OFF boundaries at the same r (F3 budgets are a subset
+  of F2 budgets and family is not a serving dimension).
+- rerank pool (ADR-0104, owner decision 2026-09-16): B6 and every arm
+  inheriting the ranked pipeline retrieve a dense candidate POOL of
+  RERANK_POOL (10), rerank it whole with the pinned cross-encoder and serve
+  the top 3; B5 serves the dense top 3 unranked. The pool is pinned in the
+  cell argv (--rerank-pool, RETRIEVER_ARGV['rerank']); the runner refuses a
+  pool without a reranker, so B5 can never carry one silently.
+- retrieval pins (backlog A5): every retrieval cell pins --top-k
+  (RETRIEVAL_TOP_K), --embedding-model and --embedding-revision (both read
+  from the ADR-0099 freeze slot INSTRUMENT_REVISIONS.dense_retriever of the
+  registration artifact, never a second hard-coded copy; the runner loads
+  the encoder AT that revision and rebuilds an index built at another) and
+  --ir-index-dir (SessionGrid.ir_index_root),
+  and its env pins CAGE_DISTRACTOR_DOCS (DISTRACTOR_DOCS; behavior, not
+  identity: derive_cell_spec ignores it). The runner's argparse defaults
+  never reach a campaign cell, and load_plan refuses a plan whose retrieval
+  cells lack the pins or whose header lacks the freeze pin.
+- per-cell Redis namespaces (backlog F5a): every B7 (retr-reuse) cell
+  carries --redis-key-prefix cage:<sha1(row_key)[:12]>
+  (redis_key_prefix_for_row) and --flush-redis-namespace, so no two cells
+  ever share retrieval-artifact cache entries and each cell starts empty.
+  The runner-side key additionally folds the index's corpus hash (F5b).
+- max_model_len (backlog A10, Tier A): ONE request-length cap per session
+  (SessionGrid.max_model_len, default DEFAULT_MAX_MODEL_LEN = 32768: RULER
+  SHAPE-32K is 32,512 in + 256 out and long Qasper papers exceed the pilot
+  4096), carried on EVERY relaunch of BOTH engines as the env
+  MAX_MODEL_LEN_ENV (VLLM_MAX_MODEL_LEN: vLLM --max-model-len, SGLang
+  --context-length, the pd launcher applies it to both roles), recorded on
+  the relaunch step and in the header ``serving_shapes``. The KV pool is
+  byte-budgeted separately (gate (j)); this caps request length only. The
+  shell default (_serving_config.sh, 4096) stays for the pilot scripts and
+  never reaches a campaign relaunch: load_plan refuses a relaunch without
+  the record or the env, and a grid registering RULER tasks refuses a value
+  below SHAPE-32K.
 - gpu_count (W4.2, feeds §6.6b / contrast #18): every cell step carries the
   integer GPU count its serving stack launches with — topology 'single' →
   the session's registered ``serving_tp`` (1 on the anchor; TP-sharded
@@ -95,10 +138,40 @@ corpus arms get ``--corpus-prefix-budget`` (run_prefix_envelope.sh), retr-comp
 gets ``--context-source retrieved`` (run_compression.sh's Phase-2-confound
 fix), the reranker is pinned EXPLICITLY on every retrieval arm so B5-vs-B6
 stays the one pre-registered reranker ablation, trunc arms carry their
-registered truncation knob, corpus-comp launches the server with the fp8 KV
+registered truncation knob (B12: ONE cell per rung of the ADR-0106 descending
+corpus ladder, ``--corpus-prefix-budget <rung> --corpus-rung <rung>`` plus the
+CAGE_CELL_CORPUS_BUDGET identity coordinate; the runner refuses a manifest
+lacking the rung and serves out-of-corpus queries labeled, never dropped),
+corpus-comp launches the server with the fp8 KV
 dtype env, and retr-store launches vLLM with the LMCache connector env
 (run_kv_store.sh). Identity STILL rides only the CAGE_CELL_* seam — behavior
 flags never mint identity.
+
+Cold start per window (ADR-0102, owner decision 2026-09-16): every
+server-engine cell (SERVER_ENGINES; the in-process hf oracle is exempt)
+carries ``--reset-cache-between-trials`` (RESET_CACHE_PER_WINDOW) and
+``--warmup-pool-queries 20`` (WARMUP_POOL_QUERIES): the runner flushes the
+engine cache before EVERY window, refuses the window if the flush fails, and
+warms up on W_warm = 20 requests drawn deterministically from a pool DISJOINT
+from every trial's measured set (results discarded; summary + ids sha256 in
+the window metadata). Both constants surface in the plan header, and
+``load_plan`` refuses a stale plan whose server-engine cell lacks them.
+
+Per-row N (backlog A9, DECISION.md amendment A1 / A5 of
+MyDocs/registration/power_decision_2026-08-07): every cell carries
+``--num-queries <n>`` for its ROW CLASS: primary predicate cells (the #4
+contrast cells, baselines PRIMARY_BASELINES on the pinned PRIMARY_ENGINE in
+F1) n = 2,000 paired queries per dataset; every other per-query F1 cell
+(secondary) n = 800; HF-oracle / T=0 identity and the TTFT-only DIST
+topology cells n = 300; loaded/window cells (F2, F3, RULER) W = 200 requests
+per window (the open-loop generator draws from the measured set, so W IS the
+registered pool size). The five constants live on the SessionGrid (header
+``per_row_n``); ``achievable_n`` LOWERS a dataset's class n with a header
+caveat (A5: Qasper registers its own achievable n). With a registered query
+manifest the runner measures the FIRST n ids of each trial (nested prefix
+subsets), so the plan REFUSES a manifest whose trials carry fewer than n ids
+for that dataset's cells. The 2,000 to 1,600 to 1,200 step-down is an
+ANALYSIS-time realized-n policy, never a plan knob.
 
 Ordering minimizes engine relaunches: cells sort on (engine, prefix_mode,
 model, budget_r, kv_dtype, connector, rate); every serving-config change is
@@ -130,10 +203,10 @@ import os
 import shlex
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -161,6 +234,8 @@ from src.orchestration.load_generator import (  # noqa: E402
     D6_REDUCED_RATE_FRACTIONS,
 )
 from src.data import ruler as _ruler  # noqa: E402  (task-literal pin only)
+from src.data.manifest import ManifestError, trunc_rung_for  # noqa: E402
+from src.orchestration.ir import STALE_INDEX_OPT_IN_ENV  # noqa: E402
 
 __all__ = [
     "PLAN_SCHEMA",
@@ -170,10 +245,14 @@ __all__ = [
     "SESSION_GRIDS",
     "PlannedCell",
     "build_plan",
+    "cell_num_queries",
+    "class_n",
+    "classify_row",
     "enumerate_cells",
     "load_floor_table",
     "load_plan",
     "main",
+    "row_class",
 ]
 
 # v2 (2026-09-01): pd steps added required keys gate/topology/pd — a v1 plan
@@ -186,7 +265,39 @@ __all__ = [
 # gained REQUIRED key ``tp`` (the tensor-parallel degree the launcher is
 # given — session-b/Group-B serving shapes). A v2 plan predates ALL of these,
 # so 'run' must refuse it and the operator re-plans.
-PLAN_SCHEMA = "cage-campaign-plan-v3"
+# v4 (2026-09-16, adversarial-review repair, per the v2/v3 precedent): cell
+# argv gained the ADR-0102 cold-start flags, the ADR-0104 --rerank-pool on
+# ranked cells, the ADR-0106 --corpus-rung on B12 cells and the per-dataset
+# --query-manifest registration (plan header ``query_manifests``); the
+# ADR-0103 prefix-OFF relaunch became part of the serving identity. A v3
+# plan predates ALL of these: its B4 cells would run under prefix-ON
+# relaunches and its ranked cells the legacy rerank-exactly-top-k pipeline
+# under the SAME row keys (mislabeled duplicates), so 'run' refuses it via
+# the schema check AND load_plan's per-clause _stale_plan_problems.
+# v5 (2026-09-17, backlog A9 --num-queries half, per the v2/v3/v4 precedent):
+# cell steps gained REQUIRED keys ``row_class`` and ``num_queries`` (the
+# DECISION.md A1 per-row N) and every cell argv gained --num-queries; the
+# header gained ``per_row_n``. A v4 plan predates them: its cells would run
+# the runner's default query count under row keys that now register a per
+# class n (mislabeled n), so 'run' refuses it and the operator re-plans.
+# A5/F5a (2026-09-17, backlog A5 retrieval pins + F5a per-cell Redis
+# namespaces): retrieval cell argv gained --top-k / --embedding-model /
+# --embedding-revision / --ir-index-dir (+ --redis-key-prefix /
+# --flush-redis-namespace on B7), the cell env CAGE_DISTRACTOR_DOCS, and the
+# header's behavior_knobs the freeze pin (embedding_model,
+# embedding_model_revision, ir_index_root). No schema bump: a v5 plan built
+# before A5 (or before the revision became enforced, review 2026-09-17) is
+# refused by load_plan's header check and the per-clause
+# _stale_plan_problems (its retrieval cells lack the pins), so it can never
+# run runner defaults under registered row keys.
+# A10 (2026-09-17, backlog Tier A uniform max_model_len): relaunch steps
+# gained the REQUIRED key ``max_model_len`` and the env VLLM_MAX_MODEL_LEN;
+# the header ``serving_shapes`` gained ``max_model_len``. No schema bump: a
+# v5 plan built before A10 is refused by the relaunch key check and by
+# load_plan's header + per-relaunch checks (its launchers would fall back to
+# the pilot shell default 4096 and refuse every RULER request), so it can
+# never run a non-uniform or under-sized regime under registered row keys.
+PLAN_SCHEMA = "cage-campaign-plan-v5"
 FLOOR_TABLE_SCHEMA = "floor-table-v1"
 
 #: §6.1 pre-registered budget ratios r = B/D (Group-A anchor factorial; r=1.5
@@ -253,12 +364,99 @@ assert RULER_OUTPUT_TOKENS == _ruler.OUTPUT_TOKENS_HINT, (
     "SHAPE-32K output drifted from src/data/ruler.OUTPUT_TOKENS_HINT"
 )
 
+#: Backlog A10 (Tier A): the ONE launcher env that carries the per-session
+#: request-length cap. Every launcher of the frozen fleet reads it from the
+#: environment: scripts/lib/_serving_config.sh exports it (pilot default
+#: 4096, untouched), manage_vllm_server.sh and manage_vllm_pd.sh pass it as
+#: --max-model-len (the pd launcher to BOTH role instances),
+#: manage_sglang_server.sh maps it to --context-length, and
+#: manage_vllm_cluster.py reads it per instance. The relaunch env sets it
+#: EXPLICITLY on every relaunch so the shell default never reaches a
+#: campaign server.
+MAX_MODEL_LEN_ENV: str = "VLLM_MAX_MODEL_LEN"
+#: Backlog A10: the registered default of SessionGrid.max_model_len. RULER
+#: SHAPE-32K requests are RULER_CONTEXT_TOKENS + RULER_OUTPUT_TOKENS =
+#: 32,768 tokens and long Qasper papers exceed the pilot 4096; the
+#: uniform-regime rule (_serving_config.sh) demands ONE value per session so
+#: no cell is served under a different length regime. The KV pool is
+#: byte-budgeted separately (CAGE_KV_BUDGET_BYTES / max-total-tokens, gate
+#: (j)), so this caps request length only. Pinned structurally to SHAPE-32K
+#: below: a drift of either side refuses at import.
+DEFAULT_MAX_MODEL_LEN: int = 32_768
+assert DEFAULT_MAX_MODEL_LEN >= RULER_CONTEXT_TOKENS + RULER_OUTPUT_TOKENS, (
+    "DEFAULT_MAX_MODEL_LEN is below RULER SHAPE-32K (backlog A10)"
+)
+
 #: §7.6.1 F1 row: the four quality-instrumented QA datasets (D5 items 1-4).
 QA_DATASETS: Tuple[str, ...] = ("squad_v2", "hotpotqa", "musique", "qasper")
 
 #: D6 §6.3: >= 3 replications per grid point; one replication = one §1
 #: measurement window (= one runner trial).
 REPLICATIONS = 3
+
+#: ADR-0102 (owner decision 2026-09-16): COLD START PER WINDOW. A campaign
+#: trial IS a window, so every server-engine cell passes
+#: ``--reset-cache-between-trials`` and the runner flushes the engine cache
+#: before EVERY window (trial 1 included: the server may still hold the
+#: previous cell's cache) and REFUSES the window when the flush fails (a
+#: window that starts warm when the plan says cold is a mislabeled row).
+#: Registered here, never a silent default inside a step builder.
+RESET_CACHE_PER_WINDOW: bool = True
+#: ADR-0102: the registered warm-up W_warm = 20 requests, served after every
+#: per-window cache reset and drawn deterministically (seed + trial ordinal)
+#: from a pool DISJOINT from every trial's measured set
+#: (``run_experiment.py --warmup-pool-queries``). Results are discarded; only
+#: a summary line + the ids' sha256 land in the window metadata. The legacy
+#: ``--warmup-queries`` flag replays the MEASURED set (cache-warms it) and
+#: must never ride a campaign cell.
+WARMUP_POOL_QUERIES: int = 20
+#: ADR-0102: the engines with a server-side cache to flush; the in-process
+#: hf oracle gets neither cold-start flag. lmdeploy is listed for the day its
+#: cells register (BACKEND_OF_ENGINE has no lmdeploy token today).
+SERVER_ENGINES: Tuple[str, ...] = ("vllm", "sglang", "lmdeploy")
+
+#: Backlog A9 / DECISION.md amendment A1 (MyDocs/registration/
+#: power_decision_2026-08-07/DECISION.md): the registered per-row N. These
+#: seed the SessionGrid fields of the same name (the grid is what the plan
+#: header records; a session may only LOWER a dataset's n via achievable_n,
+#: A5). Never a silent default inside a step builder.
+#: - N_PRIMARY: MDE-0.05 primary predicate cells (the #4 B6/B3 contrast on
+#:   the pinned primary engine, family F1): 2,000 paired queries per dataset.
+#: - N_SECONDARY: secondary-only per-query F1 cells (MDE 0.10 at alpha/12): 800.
+#: - N_IDENTITY: TTFT-only, HF-oracle and T=0 identity cells: 300.
+#: - WINDOW_REQUESTS: loaded/window cells (F2, F3, RULER): W = 200 requests
+#:   per window; the open-loop generator draws from the measured set
+#:   (run_experiment execute_open_loop_measured: schedule index maps modulo
+#:   the prepared measured set), so --num-queries IS the window pool size.
+N_PRIMARY: int = 2000
+N_SECONDARY: int = 800
+N_IDENTITY: int = 300
+WINDOW_REQUESTS: int = 200
+#: A1: the primary predicate cells are pinned to ONE engine per group (the
+#: charter primary engine, vLLM) and to the #4 contrast pair B3 (corpus-reuse)
+#: vs B6 (retr-reuse ranked).
+PRIMARY_ENGINE: str = "vllm"
+PRIMARY_BASELINES: Tuple[str, ...] = ("B3", "B6")
+#: The row-class vocabulary (``row_class`` on every cell step).
+ROW_CLASSES: Tuple[str, ...] = ("primary", "secondary", "identity", "window")
+#: The decision record every per_row_n header cites.
+PER_ROW_N_DECISION: str = (
+    "MyDocs/registration/power_decision_2026-08-07/DECISION.md amendment A1 "
+    "(per-row N table) and A5 (achievable-n branch); the 2000/1600/1200 "
+    "step-down is an analysis-time realized-n policy, not a plan knob"
+)
+
+#: ADR-0103 (owner decision 2026-09-16): the arms served with the engine
+#: prefix cache OFF in EVERY family, through a per-arm RELAUNCH, uniformly on
+#: every engine. corpus-fresh (B4) recomputes the corpus block on every
+#: request: its runner token ``no_cache`` only LABELS telemetry
+#: (src/orchestration/baselines.py), so absent this rule B4 and B3 would be
+#: served by the same prefix-ON server and differ by label alone (the
+#: mislabeled-duplicate failure class). Family carriage is unchanged: B4's
+#: REUSE bit still rides F3 beside B3 (cellspec._ARMS_BY_FAMILY). The rule
+#: is consulted ONLY through _prefix_off (sort key, serving-config identity,
+#: relaunch argv, cell serving record), never re-derived by a step builder.
+PREFIX_OFF_ARMS: FrozenSet[str] = frozenset({"corpus-fresh"})
 
 #: The task text the operator sees on an enumerated-but-unrunnable DIST
 #: tp-overlay cell: the T3.1 TP env exists, but THIS session registered no
@@ -344,21 +542,118 @@ ARM_RUNNER_BASELINE: Dict[str, str] = {
 #: rewrite the pre-registered ablation.
 RERANKER_MODEL = "BAAI/bge-reranker-large"
 
+#: ADR-0104 (owner decision 2026-09-16): the dense candidate-POOL size the
+#: ranked pipeline reranks before serving. B6 and every arm inheriting the
+#: ranked pipeline (B7-B9, B11) retrieve the dense top RERANK_POOL, rerank
+#: the whole pool with RERANKER_MODEL and serve the runner's --top-k (3,
+#: unchanged); B5 serves the dense top 3 UNRANKED and carries no pool. The
+#: pool rides the cell argv as --rerank-pool (never a runner default: the
+#: runner's unset default is the LEGACY rerank-exactly-top-k behavior, so a
+#: silently dropped flag would collapse B6's pool to the old pipeline
+#: without any label changing). The runner refuses a pool without a
+#: reranker, so the flag can never leak onto B5 unnoticed.
+RERANK_POOL = 10
+
 #: CellSpec retriever axis -> the runner's retrieval argv. The runner splits
-#: the axis into --retriever (pipeline) + --reranker-model (ranking stage);
-#: 'rerank' = dense retrieval + the pinned cross-encoder, 'dense' = the same
-#: retrieval with ranking DISABLED ('none' is the runner's documented off
-#: switch, normalize_reranker_model). bm25/rrf have no registered argv here
-#: yet — enumerating them refuses (fail closed) rather than guessing.
+#: the axis into --retriever (pipeline) + --reranker-model (ranking stage)
+#: + --rerank-pool (ADR-0104 candidate pool, ranked pipeline only);
+#: 'rerank' = dense retrieval + the pinned cross-encoder over a RERANK_POOL
+#: pool, 'dense' = the same retrieval with ranking DISABLED ('none' is the
+#: runner's documented off switch, normalize_reranker_model) and no pool.
+#: bm25/rrf have no registered argv here yet: enumerating them refuses
+#: (fail closed) rather than guessing.
 RETRIEVER_ARGV: Dict[str, Tuple[str, ...]] = {
     "dense": ("--retriever", "dense", "--reranker-model", "none"),
-    "rerank": ("--retriever", "dense", "--reranker-model", RERANKER_MODEL),
+    "rerank": (
+        "--retriever", "dense",
+        "--reranker-model", RERANKER_MODEL,
+        "--rerank-pool", str(RERANK_POOL),
+    ),
 }
+
+#: Backlog A5 (retrieval pins): the number of retrieved documents every
+#: retrieval cell SERVES (the runner's --top-k). The ranked pipeline reranks
+#: a RERANK_POOL of candidates and serves this many (ADR-0104); B5 serves the
+#: dense top RETRIEVAL_TOP_K unranked. Pinned in every retrieval cell's argv:
+#: the runner's argparse default (3 today) must never be what a campaign
+#: cell silently inherits, or a runner-default drift would rewrite the
+#: served context width under unchanged row keys.
+RETRIEVAL_TOP_K: int = 3
+
+#: Backlog A5: the Decision 3B distractor pool size (the first N content
+#: deduped, gold-excluded paragraphs of the split widen the retrieval corpus
+#: so retrieval is a real search problem). The runner reads it from the env
+#: (CAGE_DISTRACTOR_DOCS, default 1000); the driver pins it in every
+#: retrieval cell's env. BEHAVIOR, not identity: derive_cell_spec ignores
+#: it (identity rides the CAGE_CELL_* seam and nothing else).
+DISTRACTOR_DOCS: int = 1000
+
+#: Backlog A5: the runner's IR index root (its --ir-index-dir default). A
+#: session registers the root it serves from (SessionGrid.ir_index_root,
+#: reviewable in the plan header) and every retrieval cell pins it
+#: explicitly; per-dataset/per-model index dirs hang below it (the runner's
+#: default_index_dir), and the index content hash guards staleness.
+DEFAULT_IR_INDEX_ROOT: str = "./experiments/ir_index"
+
+#: ADR-0099 / backlog A5: the dense retriever's registered pin lives in the
+#: freeze artifact's INSTRUMENT_REVISIONS.dense_retriever slot
+#: (MyDocs/registration/freeze_resolutions.json; the same resolution chain
+#: build_retrieval_gate_table.py consumes). The driver READS the model id
+#: from that slot at plan time (resolve_retrieval_pins) and records model +
+#: revision in the plan header; it never carries a second copy of the id.
+#: The artifact's 'embedding' entry registers the QUALITY module's
+#: similarity embedder, a different instrument: never consumed here.
+FREEZE_FILE_ENV_VAR: str = "CAGE_FREEZE_RESOLUTIONS"
+DEFAULT_FREEZE_FILE: Path = (
+    REPO_ROOT / "MyDocs" / "registration" / "freeze_resolutions.json"
+)
+FREEZE_DENSE_RETRIEVER_SLOT: str = "dense_retriever"
+DENSE_RETRIEVER_ADR: str = "ADR-0099"
+
+#: Backlog F5a (per-cell Redis namespaces): the arms whose runner pipeline
+#: consults the Redis retrieval-artifact cache (B7 retr-reuse = the runner's
+#: 'hybrid' pipeline). Each such cell gets --redis-key-prefix minted from
+#: its row key (redis_key_prefix_for_row) plus --flush-redis-namespace, so
+#: no two cells ever share cache entries and every cell starts empty. The
+#: prefix root and the short-sha width are named here, never inline.
+REDIS_CACHE_ARMS: FrozenSet[str] = frozenset({"retr-reuse"})
+REDIS_KEY_PREFIX_ROOT: str = "cage"
+REDIS_NAMESPACE_SHA_CHARS: int = 12
+REDIS_NAMESPACE_RULE: str = "cage:<sha1(row_key)[:12]>"
 
 #: Arms serving the shared corpus-as-prefix block (true CAG, Chan et al.
 #: 2412.15605): all get --corpus-prefix-budget. corpus-trunc is handled apart
-#: (its budget is the TRUNCATED one — that difference IS the B12-vs-B3 slot).
+#: (its budget is a TRUNCATED rung: that difference IS the B12-vs-B3 slot).
 CORPUS_BLOCK_ARMS = frozenset({"corpus-reuse", "corpus-fresh", "corpus-comp"})
+
+#: ADR-0106 (owner decision 2026-09-16, charter §7.7(d)): B12 (corpus-trunc)
+#: is a DESCENDING corpus-budget ladder whose top point is B3's own
+#: full-budget cell (never duplicated). The registered rungs live on
+#: SessionGrid.corpus_trunc_budgets; each enumerates ONE cell wherever B12
+#: is carried, the rung rides the identity seam (CAGE_CELL_CORPUS_BUDGET,
+#: CellSpec.corpus_budget_tokens) and the argv as the EXPLICIT --corpus-rung
+#: (the runner's A4 guard refuses a manifest whose ladder lacks the rung).
+#: The arm the ladder applies to, and the ADR the plan header cites.
+CORPUS_TRUNC_ARM = "corpus-trunc"
+CORPUS_TRUNC_ADR = "ADR-0106"
+
+#: ADR-0106 (repair 2026-09-16): a B12 rung serves ONLY from a query
+#: manifest carrying the ladder (the runner's A4 guard refuses any other
+#: source, and the non-manifest fallback DROPS out-of-corpus queries), so
+#: every rung cell whose dataset has no manifest registered at plan time is
+#: blocked_on this text: visible debt in the plan and a 'run' refusal
+#: without --skip-blocked, never a silently unrunnable step. Manifests are
+#: registered per dataset with ``plan --query-manifest <dataset>=<path>``
+#: and validated at plan time (dataset, block budget, every rung).
+TRUNC_MANIFEST_BLOCKED_ON_FMT = (
+    "query-manifest:{dataset} ({adr}: a B12 rung serves only from a query "
+    "manifest carrying the ladder; plan with --query-manifest {dataset}=<path>)"
+)
+
+
+def trunc_manifest_blocked_on(dataset: str) -> str:
+    """The blocked_on text for a B12 rung cell with no manifest for ``dataset``."""
+    return TRUNC_MANIFEST_BLOCKED_ON_FMT.format(dataset=dataset, adr=CORPUS_TRUNC_ADR)
 
 #: arm -> serving-side levers that must be applied AT SERVER LAUNCH (they are
 #: part of the relaunch-boundary identity, not the cell argv):
@@ -439,6 +734,102 @@ def _baseline_num(baseline_id: str) -> int:
     return int(baseline_id[1:])
 
 
+@dataclass(frozen=True)
+class RetrievalPins:
+    """The freeze-artifact half of the A5 retrieval pins (ADR-0099).
+
+    ``embedding_model`` is what every retrieval cell pins as
+    --embedding-model; ``embedding_revision`` is the frozen HF commit the
+    slot records (provenance, recorded in the plan header); ``freeze_file``
+    is the resolved artifact path the values were read from.
+    """
+
+    embedding_model: str
+    embedding_revision: str
+    freeze_file: str
+
+
+def resolve_retrieval_pins(freeze_file: Optional[Path] = None) -> RetrievalPins:
+    """Read the dense retriever pin from the freeze artifact (fail closed).
+
+    Source order: the explicit ``freeze_file``, else ``$CAGE_FREEZE_RESOLUTIONS``
+    (FREEZE_FILE_ENV_VAR), else DEFAULT_FREEZE_FILE. Consumes ONLY
+    ``INSTRUMENT_REVISIONS.dense_retriever`` (FREEZE_DENSE_RETRIEVER_SLOT):
+    the artifact's ``embedding`` entry is the quality module's similarity
+    embedder and is never a fallback. Every gap refuses with PlanError
+    naming the fix; there is no default model id in this driver.
+    """
+    if freeze_file is None:
+        override = (os.environ.get(FREEZE_FILE_ENV_VAR) or "").strip()
+        freeze_file = Path(override) if override else DEFAULT_FREEZE_FILE
+    freeze_file = Path(freeze_file)
+    slot = f"INSTRUMENT_REVISIONS.{FREEZE_DENSE_RETRIEVER_SLOT}"
+    fix = (
+        f"point --freeze-file / ${FREEZE_FILE_ENV_VAR} at the frozen registration "
+        f"artifact (default {DEFAULT_FREEZE_FILE}); a campaign plan never pins "
+        f"an unregistered retriever ({DENSE_RETRIEVER_ADR}, backlog A5)"
+    )
+    if not freeze_file.is_file():
+        raise PlanError(
+            f"{freeze_file}: freeze artifact missing: the retrieval cells' "
+            f"--embedding-model pin ({slot}) cannot be read; {fix}"
+        )
+    try:
+        data = json.loads(freeze_file.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise PlanError(f"{freeze_file}: freeze artifact cannot be read: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise PlanError(f"{freeze_file}: freeze artifact is not valid JSON: {exc}") from exc
+    revisions = data.get("INSTRUMENT_REVISIONS") if isinstance(data, dict) else None
+    if not isinstance(revisions, Mapping):
+        raise PlanError(
+            f"{freeze_file}: no INSTRUMENT_REVISIONS mapping: the artifact carries "
+            f"no instrument pins to consume; {fix}"
+        )
+    entry = revisions.get(FREEZE_DENSE_RETRIEVER_SLOT)
+    if not isinstance(entry, Mapping):
+        raise PlanError(
+            f"{freeze_file}: INSTRUMENT_REVISIONS has no "
+            f"{FREEZE_DENSE_RETRIEVER_SLOT!r} mapping: the dense retriever pin is "
+            f"absent. Fix: record {{model, revision, resolved}} under {slot}. Do "
+            f"NOT repurpose INSTRUMENT_REVISIONS.embedding (the quality module's "
+            f"similarity embedder, a different instrument); {fix}"
+        )
+    model = entry.get("model")
+    revision = entry.get("revision")
+    if not isinstance(model, str) or not model.strip():
+        raise PlanError(
+            f"{freeze_file}: {slot}.model is {model!r}: a pin without a model "
+            f"pins nothing; {fix}"
+        )
+    if not isinstance(revision, str) or not revision.strip():
+        raise PlanError(
+            f"{freeze_file}: {slot}.revision is {revision!r}: the dense retriever "
+            f"revision pin is absent; resolve and record the HF commit hash; {fix}"
+        )
+    return RetrievalPins(
+        embedding_model=model.strip(),
+        embedding_revision=revision.strip(),
+        freeze_file=str(freeze_file.resolve()),
+    )
+
+
+def redis_key_prefix_for_row(row_key: str) -> str:
+    """The F5a Redis namespace of one cell: ``cage:<sha1(row_key)[:12]>``.
+
+    Minted from the CellSpec row key (unique per cell by construction), so
+    two cells can never share retrieval-artifact entries; the runner's
+    RedisClient composes ``<prefix>:<namespace>:<key>`` below it. An empty
+    row key refuses (a namespace must name a cell).
+    """
+    if not isinstance(row_key, str) or not row_key.strip():
+        raise PlanError(
+            f"redis namespace needs a row key, got {row_key!r} (backlog F5a)"
+        )
+    digest = hashlib.sha1(row_key.encode("utf-8")).hexdigest()
+    return f"{REDIS_KEY_PREFIX_ROOT}:{digest[:REDIS_NAMESPACE_SHA_CHARS]}"
+
+
 def _ordered(baseline_ids: frozenset) -> Tuple[str, ...]:
     """Deterministic B-number order for a baseline-id set (B2 < B10)."""
     return tuple(sorted(baseline_ids, key=_baseline_num))
@@ -448,6 +839,18 @@ def _ordered(baseline_ids: frozenset) -> Tuple[str, ...]:
 # Session grid registration (§7.6 / §7.6.1 — THE registered enumeration
 # source; no hand lists anywhere downstream)
 # ---------------------------------------------------------------------------
+
+
+def _grid_datasets(grid: "SessionGrid") -> FrozenSet[str]:
+    """Every dataset a cell of this grid can carry (QA rows, hf slice, F2/F3,
+    and the D5#5 RULER instrument when the session registers it)."""
+    names = set(grid.f1_datasets)
+    for _bid, datasets in grid.hf_oracle_cells:
+        names.update(datasets)
+    names.update({grid.f2_dataset, grid.f3_dataset})
+    if grid.f2_ruler_baselines:
+        names.add("ruler")
+    return frozenset(names)
 
 
 @dataclass(frozen=True)
@@ -484,9 +887,12 @@ class SessionGrid:
     #   the corpus arms (B3/B4/B10); the pilot convention is 2800
     #   (run_prefix_envelope.sh CORPUS_BUDGET, fits the uniform 4096 max-len
     #   regime with query+generation headroom).
-    # - corpus_trunc_budget_tokens: B12's TRUNCATED corpus budget ("store
-    #   less than you know") — the one-slot B12-vs-B3 contrast; ~2x matches
-    #   the compression arms' ratio (run_compression.sh's 2x2 convention).
+    # - corpus_trunc_budgets: B12's TRUNCATED corpus budgets ("store less
+    #   than you know"), the ADR-0106 descending ladder below B3's full
+    #   budget: (1400, 700) = 2x and 4x truncation (2x matches the
+    #   compression arms' ratio, run_compression.sh's 2x2 convention). One
+    #   corpus-trunc cell is enumerated PER RUNG; the 2800 point of the
+    #   ladder is B3's own cell and is never a rung.
     # - retr_trunc_kept_docs: B11's rank-truncation ("read less of what you
     #   found") — serve only the top-N of the ranked list via
     #   --max-context-docs; kept/dropped labels come from the runner.
@@ -498,10 +904,15 @@ class SessionGrid:
     #   comfortable r=1.0 rung, not under pressure); the pd byte budgets are
     #   the split of floor(dist_budget_r × D) from the floor table.
     corpus_prefix_budget_tokens: int = 2800
-    corpus_trunc_budget_tokens: int = 1400
+    corpus_trunc_budgets: Tuple[int, ...] = (1400, 700)
     retr_trunc_kept_docs: int = 1
     dist_pd_split: float = 0.5
     dist_budget_r: float = 1.0
+    # Backlog A5: the IR index root every retrieval cell of this session
+    # serves from (--ir-index-dir, EXPLICIT on every retrieval cell; the
+    # runner's own default is DEFAULT_IR_INDEX_ROOT and never reaches a
+    # cell silently). A registered PATH, reviewable in the plan header.
+    ir_index_root: str = DEFAULT_IR_INDEX_ROOT
     # §6.4 anchor fine r-grid overlay on F2 (Group A ONLY per §6.8): extra
     # (budget × rate) coordinates enumerated ON TOP of the factorial,
     # deduplicated by coordinate. Both empty on every non-anchor session.
@@ -526,28 +937,132 @@ class SessionGrid:
     serving_tp: int = 1
     dist_tp_size: Optional[int] = None
     dist_pd_role_gpus: Tuple[int, int] = (1, 1)
+    # Backlog A10: the ONE request-length cap every relaunch of this session
+    # launches with (env MAX_MODEL_LEN_ENV, both engines): RULER SHAPE-32K
+    # (32,512 in + 256 out) plus long Qasper papers; uniform per session
+    # (_serving_config.sh uniform-regime rule). The KV pool is
+    # byte-budgeted separately by gate (j), so this caps request length
+    # only. A grid registering RULER tasks refuses a value below SHAPE-32K.
+    max_model_len: int = DEFAULT_MAX_MODEL_LEN
+    # Backlog A9 / DECISION.md A1 per-row N (see the module constants of the
+    # same names for the table): the class n every cell's --num-queries is
+    # drawn from, the primary-predicate pin (engine + baseline pair), and
+    # the A5 per-dataset achievable n, which may only LOWER a class n for
+    # that dataset (header caveat; e.g. qasper whose dev split cannot supply
+    # 2,000 paper-first draws). Registered per session so the header reviews
+    # THE values, never a runner default.
+    n_primary: int = N_PRIMARY
+    n_secondary: int = N_SECONDARY
+    n_identity: int = N_IDENTITY
+    window_requests: int = WINDOW_REQUESTS
+    primary_engine: str = PRIMARY_ENGINE
+    primary_baselines: Tuple[str, ...] = PRIMARY_BASELINES
+    achievable_n: Mapping[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         problems: List[str] = []
+        # A9 per-row N registration (fail closed on shapes; the classifier
+        # and the manifest-coverage check refuse per cell at plan time).
+        for name in ("n_primary", "n_secondary", "n_identity", "window_requests"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                problems.append(
+                    f"{name}={value!r} must be an integer >= 1 (DECISION.md A1 "
+                    "per-row N)"
+                )
+        if self.primary_engine not in BACKEND_OF_ENGINE or self.primary_engine == "hf":
+            problems.append(
+                f"primary_engine={self.primary_engine!r} must be a server engine "
+                f"of the runner vocabulary ({sorted(e for e in BACKEND_OF_ENGINE if e != 'hf')}); "
+                "the primary predicate cells are per-query F1 cells on the "
+                "pinned engine, never the in-process oracle (A1)"
+            )
+        elif self.primary_engine not in self.f1_engines:
+            problems.append(
+                f"primary_engine={self.primary_engine!r} is not one of this "
+                f"session's f1_engines {list(self.f1_engines)}: the primary "
+                "class would enumerate ZERO cells (A1 pins the #4 contrast to "
+                "an engine the session actually serves)"
+            )
+        if not isinstance(self.primary_baselines, tuple) or not self.primary_baselines:
+            problems.append(
+                f"primary_baselines={self.primary_baselines!r} must be a non-empty "
+                "tuple of baseline ids (A1: the #4 contrast pair)"
+            )
+        else:
+            unknown_primary = sorted(set(self.primary_baselines) - set(BASELINES))
+            if unknown_primary:
+                problems.append(
+                    f"primary_baselines has unregistered baseline id(s) "
+                    f"{unknown_primary} (registered: {sorted(BASELINES)})"
+                )
+        if not isinstance(self.achievable_n, Mapping):
+            problems.append(
+                f"achievable_n={self.achievable_n!r} must be a mapping dataset -> n"
+            )
+        else:
+            grid_datasets = _grid_datasets(self)
+            for dataset, value in self.achievable_n.items():
+                if dataset not in grid_datasets:
+                    problems.append(
+                        f"achievable_n[{dataset!r}] names a dataset no cell of "
+                        f"this session carries (registered: {sorted(grid_datasets)})"
+                    )
+                if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                    problems.append(
+                        f"achievable_n[{dataset!r}]={value!r} must be an integer >= 1"
+                    )
+                elif isinstance(self.n_primary, int) and value > self.n_primary:
+                    problems.append(
+                        f"achievable_n[{dataset!r}]={value} exceeds n_primary="
+                        f"{self.n_primary}: the A5 branch only LOWERS a class n "
+                        "for a dataset whose split cannot supply it"
+                    )
         for name in (
             "corpus_prefix_budget_tokens",
-            "corpus_trunc_budget_tokens",
             "retr_trunc_kept_docs",
         ):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 problems.append(f"{name}={value!r} must be an integer >= 1")
-        if (
-            isinstance(self.corpus_trunc_budget_tokens, int)
-            and isinstance(self.corpus_prefix_budget_tokens, int)
-            and self.corpus_trunc_budget_tokens >= self.corpus_prefix_budget_tokens
-        ):
+        if not isinstance(self.ir_index_root, str) or not self.ir_index_root.strip():
             problems.append(
-                f"corpus_trunc_budget_tokens={self.corpus_trunc_budget_tokens} "
-                f"must be < corpus_prefix_budget_tokens="
-                f"{self.corpus_prefix_budget_tokens} — B12 truncates the B3 "
-                "corpus, or it is not a truncation arm"
+                f"ir_index_root={self.ir_index_root!r} must be a non-empty path "
+                "(backlog A5: every retrieval cell pins --ir-index-dir to it)"
             )
+        # ADR-0106 ladder: non-empty, integer rungs, strictly descending, every
+        # rung < the full budget (the full budget is B3's own cell; a rung at or
+        # above it is not a truncation and would duplicate B3 under a B12 label).
+        ladder = self.corpus_trunc_budgets
+        if not isinstance(ladder, tuple) or not ladder:
+            problems.append(
+                f"corpus_trunc_budgets={ladder!r} must be a non-empty tuple of "
+                "descending rung budgets (ADR-0106)"
+            )
+        else:
+            previous: Optional[int] = None
+            for rung in ladder:
+                if not isinstance(rung, int) or isinstance(rung, bool) or rung < 1:
+                    problems.append(
+                        f"corpus_trunc_budgets entry {rung!r} must be an integer >= 1"
+                    )
+                    continue
+                if (
+                    isinstance(self.corpus_prefix_budget_tokens, int)
+                    and rung >= self.corpus_prefix_budget_tokens
+                ):
+                    problems.append(
+                        f"corpus_trunc_budgets rung {rung} must be < "
+                        f"corpus_prefix_budget_tokens={self.corpus_prefix_budget_tokens} "
+                        "(the full budget is B3's own cell, ADR-0106, and a "
+                        "rung above it is not a truncation)"
+                    )
+                if previous is not None and rung >= previous:
+                    problems.append(
+                        f"corpus_trunc_budgets={ladder} must be strictly descending "
+                        "(ADR-0106: a descending ladder, no duplicate rungs)"
+                    )
+                previous = rung
         # T3.2 pd registration knobs: same fail-closed rules the budget
         # planner enforces (a grid carrying an illegal split would refuse at
         # relaunch-build time anyway; refusing HERE names the registration).
@@ -622,6 +1137,29 @@ class SessionGrid:
                 f"dist_tp_size={self.dist_tp_size!r} must be None (tp leg "
                 "unregistered) or an integer >= 2 — a TP=1 'tp' leg is a "
                 "topology/count contradiction"
+            )
+        # Backlog A10: a positive integer; with RULER tasks registered, at
+        # least SHAPE-32K (a shorter cap would refuse every RULER request at
+        # the server, or silently truncate it: mislabeled instrument data).
+        if (
+            not isinstance(self.max_model_len, int)
+            or isinstance(self.max_model_len, bool)
+            or self.max_model_len < 1
+        ):
+            problems.append(
+                f"max_model_len={self.max_model_len!r} must be an integer >= 1 "
+                "(backlog A10: the uniform per-session request-length cap "
+                f"every relaunch carries as {MAX_MODEL_LEN_ENV})"
+            )
+        elif self.f2_ruler_tasks and self.max_model_len < (
+            RULER_CONTEXT_TOKENS + RULER_OUTPUT_TOKENS
+        ):
+            problems.append(
+                f"max_model_len={self.max_model_len} is below RULER SHAPE-32K "
+                f"({RULER_CONTEXT_TOKENS} + {RULER_OUTPUT_TOKENS} = "
+                f"{RULER_CONTEXT_TOKENS + RULER_OUTPUT_TOKENS}) but this grid "
+                f"registers RULER tasks {list(self.f2_ruler_tasks)} (backlog "
+                "A10: every RULER request would exceed the server cap)"
             )
         if (
             not isinstance(self.dist_pd_role_gpus, tuple)
@@ -710,7 +1248,7 @@ SESSION_GRIDS: Dict[str, SessionGrid] = {
         f3_dataset="qasper",
         dist_cells=(),
         corpus_prefix_budget_tokens=2800,
-        corpus_trunc_budget_tokens=1400,
+        corpus_trunc_budgets=(1400, 700),
         retr_trunc_kept_docs=1,
     ),
     # Session 'b' = charter §7.6 Group B (Llama-3.3-70B) + the Run-C-prime
@@ -780,7 +1318,7 @@ SESSION_GRIDS: Dict[str, SessionGrid] = {
             ("B3", "vllm", "pd"),
         ),
         corpus_prefix_budget_tokens=2800,
-        corpus_trunc_budget_tokens=1400,
+        corpus_trunc_budgets=(1400, 700),
         retr_trunc_kept_docs=1,
         dist_pd_split=0.5,
         dist_budget_r=1.0,
@@ -983,33 +1521,32 @@ def enumerate_cells(grid: SessionGrid) -> List[PlannedCell]:
             blocked_on=_launch_blocked_on(spec),
         )
 
+    def _rung_specs(bid: str, **axes: Any) -> List[CellSpec]:
+        # ADR-0106: the corpus-trunc baseline enumerates ONE cell per
+        # registered rung (descending ladder order); every other baseline
+        # is exactly one cell, carrying no rung coordinate.
+        if BASELINES[bid].arm == CORPUS_TRUNC_ARM:  # type: ignore[index]
+            return [
+                CellSpec.from_baseline(
+                    bid, model=grid.model, corpus_budget_tokens=rung, **axes  # type: ignore[arg-type]
+                )
+                for rung in grid.corpus_trunc_budgets
+            ]
+        return [CellSpec.from_baseline(bid, model=grid.model, **axes)]  # type: ignore[arg-type]
+
     # F1 — locality, prefix ON, sub-pressure (no budget/rate coordinates).
     for bid in grid.f1_baselines:
         for engine in grid.f1_engines:
             for dataset in grid.f1_datasets:
-                cells.append(
-                    _planned(
-                        CellSpec.from_baseline(
-                            bid, engine=engine, model=grid.model, family="F1"  # type: ignore[arg-type]
-                        ),
-                        bid,
-                        dataset,
-                    )
-                )
+                for spec in _rung_specs(bid, engine=engine, family="F1"):
+                    cells.append(_planned(spec, bid, dataset))
 
     # F1 HF-oracle reduced slice (§7.3: hf carries family F1 only —
     # CellSpec itself refuses anything else, making the guard structural).
     for bid, datasets in grid.hf_oracle_cells:
         for dataset in datasets:
-            cells.append(
-                _planned(
-                    CellSpec.from_baseline(
-                        bid, engine="hf", model=grid.model, family="F1"  # type: ignore[arg-type]
-                    ),
-                    bid,
-                    dataset,
-                )
-            )
+            for spec in _rung_specs(bid, engine="hf", family="F1"):
+                cells.append(_planned(spec, bid, dataset))
 
     # F2 — pressure, prefix OFF. Grid points = the §6.1/§6.8 factorial PLUS
     # the §6.4 anchor fine overlay, DEDUPLICATED by coordinate: a coordinate
@@ -1088,20 +1625,10 @@ def enumerate_cells(grid: SessionGrid) -> List[PlannedCell]:
         for engine in grid.f3_engines:
             for r in grid.f3_budgets:
                 for frac in grid.f3_rates:
-                    cells.append(
-                        _planned(
-                            CellSpec.from_baseline(
-                                bid,
-                                engine=engine,  # type: ignore[arg-type]
-                                model=grid.model,  # type: ignore[arg-type]
-                                family="F3",
-                                budget_r=r,
-                                rate_frac=frac,
-                            ),
-                            bid,
-                            grid.f3_dataset,
-                        )
-                    )
+                    for spec in _rung_specs(
+                        bid, engine=engine, family="F3", budget_r=r, rate_frac=frac
+                    ):
+                        cells.append(_planned(spec, bid, grid.f3_dataset))
 
     # DIST — topology overlay. pd cells on vllm are EXECUTABLE since T3.2
     # (manage_vllm_pd.sh + pd_proxy.py); they carry the --allow-pd gate label
@@ -1153,8 +1680,20 @@ def enumerate_cells(grid: SessionGrid) -> List[PlannedCell]:
 
 
 def _prefix_off(spec: CellSpec) -> bool:
-    """Pinned rule: F2 is the prefix-OFF family; every other family serves ON."""
-    return spec.family == "F2"
+    """The ONE prefix-cache rule: a cell serves with the engine prefix cache
+    OFF when its family is F2 (the prefix-OFF pressure family) OR its arm is
+    in PREFIX_OFF_ARMS (ADR-0103: corpus-fresh, B4, in every family); every
+    other cell serves ON.
+
+    ADR-0103 closes a mislabeled-duplicate exposure (the failure class the
+    module docstring names): the B4 runner token ``no_cache`` only labels
+    telemetry, so without this clause B4 and B3 shared one prefix-ON server
+    and were byte-identical serving twins under different names. Making the
+    prefix mode part of the arm's serving config gives B4 its own relaunch
+    group (the grouping key already carries prefix_off) while its family
+    carriage is untouched.
+    """
+    return spec.family == "F2" or spec.arm in PREFIX_OFF_ARMS
 
 
 def _coord_key(value: Optional[float]) -> Tuple[int, float]:
@@ -1196,6 +1735,10 @@ def _sort_key(cell: PlannedCell) -> Tuple[Any, ...]:
         spec.family,
         _baseline_num(cell.baseline_id),
         cell.dataset,
+        # ADR-0106: a B12 slice's rung cells run in DESCENDING budget order
+        # (the ladder as the charter reads it); non-rung cells carry 0 so
+        # their order is byte-identical to pre-ADR-0106 plans.
+        0 if spec.corpus_budget_tokens is None else -spec.corpus_budget_tokens,
         # Per-task RULER steps share every component above (one row key, one
         # dataset) — the ordinal base keeps the order total and puts the
         # tasks' window ranges in ascending order (deterministic plans).
@@ -1232,6 +1775,120 @@ def _serving_config(cell: PlannedCell) -> Optional[_ServingConfig]:
         ARM_KV_DTYPE.get(spec.arm),
         ARM_CONNECTOR.get(spec.arm),
         spec.topology,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-row N (backlog A9, DECISION.md A1/A5): row class -> --num-queries
+# ---------------------------------------------------------------------------
+
+
+def classify_row(
+    spec: CellSpec,
+    baseline_id: str,
+    dataset: str,
+    *,
+    primary_engine: str,
+    primary_baselines: Sequence[str],
+) -> str:
+    """The DECISION.md A1 row class of one cell, as a pure function of the
+    cell tuple and the primary-predicate pin (so load_plan can re-derive it
+    from the plan header without a SessionGrid):
+
+    - engine hf -> "identity" (the HF-oracle / T=0 identity cells);
+    - family F2/F3, or the RULER instrument dataset -> "window" (loaded
+      cells: W requests per window);
+    - family DIST -> "identity" (the TTFT-only topology contrast #18: a
+      closed-loop latency pair, never a per-query predicate cell);
+    - family F1 with baseline in ``primary_baselines`` on ``primary_engine``
+      -> "primary" (the #4 contrast cells); every other F1 cell ->
+      "secondary".
+
+    Any other family refuses (PlanError): a new family must register its
+    class here, never inherit one silently.
+    """
+    if spec.engine == "hf":
+        return "identity"
+    if spec.family in _PRESSURE_FAMILIES or dataset == "ruler":
+        return "window"
+    if spec.family == "DIST":
+        return "identity"
+    if spec.family == "F1":
+        if baseline_id in primary_baselines and spec.engine == primary_engine:
+            return "primary"
+        return "secondary"
+    raise PlanError(
+        f"cell {spec.to_row_key()} has family {spec.family!r} with no registered "
+        f"A1 row class (registered families: F1, F2, F3, DIST) - refusing to "
+        "guess its --num-queries"
+    )
+
+
+def row_class(grid: SessionGrid, cell: PlannedCell) -> str:
+    """``classify_row`` under the session's registered primary pin."""
+    return classify_row(
+        cell.spec,
+        cell.baseline_id,
+        cell.dataset,
+        primary_engine=grid.primary_engine,
+        primary_baselines=grid.primary_baselines,
+    )
+
+
+def class_n(
+    cls: str,
+    dataset: str,
+    *,
+    n_primary: int,
+    n_secondary: int,
+    n_identity: int,
+    window_requests: int,
+    achievable_n: Mapping[str, int],
+) -> int:
+    """The registered n for a row class, LOWERED to the dataset's achievable
+    n when one is registered (A5); never raised by it."""
+    table = {
+        "primary": n_primary,
+        "secondary": n_secondary,
+        "identity": n_identity,
+        "window": window_requests,
+    }
+    if cls not in table:
+        raise PlanError(f"unknown row class {cls!r} (registered: {list(ROW_CLASSES)})")
+    n = table[cls]
+    ceiling = achievable_n.get(dataset)
+    if ceiling is not None and ceiling < n:
+        return int(ceiling)
+    return n
+
+
+def cell_num_queries(grid: SessionGrid, cell: PlannedCell) -> Tuple[str, int]:
+    """(row_class, --num-queries) for one cell under the session's registration."""
+    cls = row_class(grid, cell)
+    return cls, class_n(
+        cls,
+        cell.dataset,
+        n_primary=grid.n_primary,
+        n_secondary=grid.n_secondary,
+        n_identity=grid.n_identity,
+        window_requests=grid.window_requests,
+        achievable_n=grid.achievable_n,
+    )
+
+
+def _achievable_n_caveat(grid: SessionGrid) -> Optional[str]:
+    """The header caveat naming every dataset whose class n is lowered (A5)."""
+    if not grid.achievable_n:
+        return None
+    lowered = ", ".join(
+        f"{ds}={n}" for ds, n in sorted(grid.achievable_n.items())
+    )
+    return (
+        f"achievable_n lowers the registered class n for {lowered} (DECISION.md "
+        "A5: the dataset's evaluation split cannot supply the registered n, so "
+        "it registers its own achievable n; achieved power is restated at the "
+        "realized n with the section 9.6 labeled caveat - a pre-declared "
+        "branch, not a protocol deviation)"
     )
 
 
@@ -1420,11 +2077,15 @@ def _relaunch_step(
         env, pd_record = _pd_budget_env(grid, engine, model, floor, role_tp)
         if role_tp >= 2:
             env["CAGE_VLLM_TENSOR_PARALLEL"] = str(role_tp)
+        # Backlog A10: the uniform request-length cap, applied by the pd
+        # launcher to BOTH role instances (one env, frozen contract).
+        env[MAX_MODEL_LEN_ENV] = str(grid.max_model_len)
         return {
             "kind": "relaunch",
             "engine": engine,
             "model": model,
             "prefix_mode": "OFF" if prefix_off else "ON",
+            "max_model_len": grid.max_model_len,
             # budget_r stays the CELL coordinate (None — DIST is the
             # topology overlay, not a pressure family); the pd byte budgets
             # ride the dedicated record + env.
@@ -1511,11 +2172,17 @@ def _relaunch_step(
                 "have BLOCKED these cells (driver invariant violated)"
             )
         env[mapping[0]] = mapping[1]
+    # Backlog A10: the uniform request-length cap rides EVERY relaunch of
+    # BOTH engines (vLLM --max-model-len, SGLang --context-length), budget-
+    # free F1 relaunches included: a server launched without it would fall
+    # back to the pilot shell default 4096 and refuse every RULER request.
+    env[MAX_MODEL_LEN_ENV] = str(grid.max_model_len)
     return {
         "kind": "relaunch",
         "engine": engine,
         "model": model,
         "prefix_mode": "OFF" if prefix_off else "ON",
+        "max_model_len": grid.max_model_len,
         "budget_r": budget_r,
         "budget_bytes": budget_bytes,
         "kv_dtype": kv_dtype,
@@ -1543,10 +2210,13 @@ def _cell_identity_env(spec: CellSpec) -> Dict[str, str]:
         env["CAGE_CELL_BUDGET_R"] = f"{spec.budget_r:g}"
     if spec.rate_frac is not None:
         env["CAGE_CELL_RATE_FRAC"] = f"{spec.rate_frac:g}"
+    if spec.corpus_budget_tokens is not None:
+        # ADR-0106: the B12 rung is an identity coordinate (one row per rung).
+        env["CAGE_CELL_CORPUS_BUDGET"] = str(spec.corpus_budget_tokens)
     return env
 
 
-def _behavior_argv(spec: CellSpec, grid: SessionGrid) -> List[str]:
+def _behavior_argv(spec: CellSpec, grid: SessionGrid, pins: RetrievalPins) -> List[str]:
     """The arm's behavior-bearing runner flags BEYOND the --baseline token.
 
     Mirrors the shell drivers' conventions exactly (the --baseline token
@@ -1555,7 +2225,9 @@ def _behavior_argv(spec: CellSpec, grid: SessionGrid) -> List[str]:
     T1.2 blocker):
 
     - corpus arms: --corpus-prefix-budget (run_prefix_envelope.sh cag_true_*;
-      corpus-trunc gets the TRUNCATED budget — that difference IS B12-vs-B3).
+      corpus-trunc gets its TRUNCATED rung budget PLUS the explicit
+      --corpus-rung (ADR-0106): the runner's A4 guard requires a manifest
+      carrying that rung and serves every query, labeling in/out-of-corpus).
     - retrieval arms: the pipeline + reranker EXPLICIT (never the runner's
       default), so B5 (dense, reranker OFF) vs B6 (ranked) stays the one
       pre-registered reranker ablation.
@@ -1565,12 +2237,26 @@ def _behavior_argv(spec: CellSpec, grid: SessionGrid) -> List[str]:
       you found").
     - corpus-comp: --kv-cache-dtype fp8 is RECORD-ONLY provenance (the
       runner's own help text); the launch lever rides the relaunch env.
+    - retrieval arms (backlog A5): --top-k RETRIEVAL_TOP_K, --embedding-model
+      and --embedding-revision (the freeze-slot pins; the runner loads the
+      encoder at that revision) and --ir-index-dir (the registered root), so
+      no runner argparse default ever reaches a campaign cell.
+    - retr-reuse (backlog F5a): --redis-key-prefix minted from the row key
+      plus --flush-redis-namespace (a private, initially empty namespace).
     """
     extra: List[str] = []
     if spec.arm in CORPUS_BLOCK_ARMS:
         extra += ["--corpus-prefix-budget", str(grid.corpus_prefix_budget_tokens)]
-    elif spec.arm == "corpus-trunc":
-        extra += ["--corpus-prefix-budget", str(grid.corpus_trunc_budget_tokens)]
+    elif spec.arm == CORPUS_TRUNC_ARM:
+        rung = spec.corpus_budget_tokens
+        if rung is None or rung not in grid.corpus_trunc_budgets:
+            raise PlanError(
+                f"corpus-trunc cell {spec.to_row_key()} carries rung {rung!r}, "
+                f"not one of the registered ladder {grid.corpus_trunc_budgets} "
+                "(ADR-0106); enumeration should have minted one cell per "
+                "rung (driver invariant violated)"
+            )
+        extra += ["--corpus-prefix-budget", str(rung), "--corpus-rung", str(rung)]
     if spec.retriever != "none":
         retrieval = RETRIEVER_ARGV.get(spec.retriever)
         if retrieval is None:
@@ -1580,6 +2266,17 @@ def _behavior_argv(spec: CellSpec, grid: SessionGrid) -> List[str]:
                 "retrieval pipeline (fail closed)"
             )
         extra += list(retrieval)
+        extra += [
+            "--top-k", str(RETRIEVAL_TOP_K),
+            "--embedding-model", pins.embedding_model,
+            "--embedding-revision", pins.embedding_revision,
+            "--ir-index-dir", grid.ir_index_root,
+        ]
+        if spec.arm in REDIS_CACHE_ARMS:
+            extra += [
+                "--redis-key-prefix", redis_key_prefix_for_row(spec.to_row_key()),
+                "--flush-redis-namespace",
+            ]
     if spec.arm == "retr-comp":
         extra += ["--context-source", "retrieved"]
     if spec.arm == "retr-trunc":
@@ -1590,6 +2287,268 @@ def _behavior_argv(spec: CellSpec, grid: SessionGrid) -> List[str]:
     return extra
 
 
+def _cold_start_argv(spec: CellSpec) -> List[str]:
+    """ADR-0102 cold-start-per-window runner flags for one cell.
+
+    Server engines (SERVER_ENGINES) get ``--reset-cache-between-trials`` when
+    RESET_CACHE_PER_WINDOW and ``--warmup-pool-queries WARMUP_POOL_QUERIES``
+    when the registered W_warm is positive; the in-process hf oracle has no
+    server cache to flush and gets neither. A window protocol, not arm
+    behavior: identity still rides only the CAGE_CELL_* seam.
+    """
+    if spec.engine not in SERVER_ENGINES:
+        return []
+    extra: List[str] = []
+    if RESET_CACHE_PER_WINDOW:
+        extra.append("--reset-cache-between-trials")
+    if WARMUP_POOL_QUERIES > 0:
+        extra += ["--warmup-pool-queries", str(WARMUP_POOL_QUERIES)]
+    return extra
+
+
+def _argv_flag_value(argv: Sequence[str], flag: str) -> Optional[str]:
+    """The value following ``flag`` in argv (None when absent or trailing)."""
+    if flag not in argv:
+        return None
+    i = list(argv).index(flag)
+    return argv[i + 1] if i + 1 < len(argv) else None
+
+
+def _stale_plan_problems(
+    step: Mapping[str, Any],
+    spec: CellSpec,
+    preceding_relaunch: Optional[Mapping[str, Any]],
+    label: str,
+    per_row_n: Optional[Mapping[str, Any]] = None,
+    retrieval: Optional[Mapping[str, Any]] = None,
+) -> List[str]:
+    """load_plan's fail-closed per-cell check against EVERY stale plan shape
+    today's ADRs fail-close against (v4; one clause per ADR). A stale plan
+    that passes the schema literal but carries pre-ADR argv would run
+    mislabeled duplicates, so 'run' refuses it and the operator re-plans:
+
+    - ADR-0102: a server-engine cell carries --reset-cache-between-trials
+      and --warmup-pool-queries == WARMUP_POOL_QUERIES (the VALUE, not just
+      the flag).
+    - ADR-0103: the cell's serving record and the relaunch it runs under
+      agree with ``_prefix_off`` (the one prefix rule): prefix_mode and
+      the launcher's --no-prefix-cache.
+    - ADR-0104: a 'rerank' cell carries --rerank-pool RERANK_POOL; every
+      other retriever carries no pool.
+    - ADR-0106: a corpus-trunc cell carries --corpus-rung and
+      --corpus-prefix-budget equal to its identity rung, and an EXECUTABLE
+      one carries the --query-manifest that serves the rung.
+    - A9 (per-row N): EVERY cell (server engine or hf) carries --num-queries
+      equal to its ``num_queries`` record, and, given the plan header's
+      ``per_row_n``, that record and ``row_class`` re-derive from the
+      registered table (a primary cell relabeled to 800 is a mislabeled n).
+    - A5 (retrieval pins), given the plan header's ``retrieval`` knobs
+      (embedding_model, embedding_model_revision, ir_index_root): every
+      retrieval cell carries --top-k RETRIEVAL_TOP_K, --embedding-model and
+      --embedding-revision == the header's freeze pins, --ir-index-dir ==
+      the registered root and the env CAGE_DISTRACTOR_DOCS ==
+      DISTRACTOR_DOCS; a non-retrieval cell carries none of them.
+    - F5a: a retr-reuse cell carries --redis-key-prefix ==
+      redis_key_prefix_for_row(row_key) and --flush-redis-namespace; every
+      other cell carries neither (a shared namespace is shared cache hits).
+    """
+    row = step.get("row_key")
+    argv: Sequence[str] = step.get("argv") or []
+    problems: List[str] = []
+    stale = ": stale plan, re-plan"
+
+    got_n = _argv_flag_value(argv, "--num-queries")
+    if got_n is None:
+        problems.append(
+            f"{label}: cell {row!r} lacks --num-queries (A9 per-row N: the "
+            "runner's default query count must never reach a campaign cell)"
+            + stale
+        )
+    elif got_n != str(step.get("num_queries")):
+        problems.append(
+            f"{label}: cell {row!r} carries --num-queries {got_n!r} but its "
+            f"num_queries record is {step.get('num_queries')!r} (A9)" + stale
+        )
+    if per_row_n is not None:
+        try:
+            expected_cls = classify_row(
+                spec,
+                str(step.get("baseline")),
+                str(step.get("dataset")),
+                primary_engine=str(per_row_n["primary_engine"]),
+                primary_baselines=tuple(per_row_n["primary_baselines"]),
+            )
+            expected_n = class_n(
+                expected_cls,
+                str(step.get("dataset")),
+                n_primary=int(per_row_n["n_primary"]),
+                n_secondary=int(per_row_n["n_secondary"]),
+                n_identity=int(per_row_n["n_identity"]),
+                window_requests=int(per_row_n["window_requests"]),
+                achievable_n=dict(per_row_n.get("achievable_n") or {}),
+            )
+        except (KeyError, TypeError, ValueError, PlanError) as exc:
+            problems.append(
+                f"{label}: cell {row!r} row class cannot be re-derived from the "
+                f"plan header per_row_n: {exc}" + stale
+            )
+        else:
+            if step.get("row_class") != expected_cls:
+                problems.append(
+                    f"{label}: cell {row!r} row_class is {step.get('row_class')!r} "
+                    f"but the A1 table says {expected_cls!r}" + stale
+                )
+            if step.get("num_queries") != expected_n:
+                problems.append(
+                    f"{label}: cell {row!r} num_queries is {step.get('num_queries')!r} "
+                    f"but the registered {expected_cls} n is {expected_n} (A9)"
+                    + stale
+                )
+
+    if spec.engine in SERVER_ENGINES:
+        if RESET_CACHE_PER_WINDOW and "--reset-cache-between-trials" not in argv:
+            problems.append(
+                f"{label}: server-engine cell {row!r} lacks "
+                "--reset-cache-between-trials (ADR-0102 cold start per window)"
+                + stale
+            )
+        if WARMUP_POOL_QUERIES > 0:
+            got = _argv_flag_value(argv, "--warmup-pool-queries")
+            if got != str(WARMUP_POOL_QUERIES):
+                problems.append(
+                    f"{label}: server-engine cell {row!r} carries "
+                    f"--warmup-pool-queries {got!r}, registered W_warm is "
+                    f"{WARMUP_POOL_QUERIES} (ADR-0102 disjoint-pool warm-up)"
+                    + stale
+                )
+
+    expected_mode = "OFF" if _prefix_off(spec) else "ON"
+    serving = step.get("serving")
+    if isinstance(serving, dict):
+        if serving.get("prefix_mode") != expected_mode:
+            problems.append(
+                f"{label}: cell {row!r} serving.prefix_mode is "
+                f"{serving.get('prefix_mode')!r} but the one prefix rule "
+                f"(_prefix_off, ADR-0103) says {expected_mode}" + stale
+            )
+        if step.get("blocked_on") is None:
+            if preceding_relaunch is None:
+                problems.append(
+                    f"{label}: executable server cell {row!r} has no relaunch "
+                    "step before it (ADR-0103: the serving config is a relaunch "
+                    "boundary)" + stale
+                )
+            else:
+                r_argv: Sequence[str] = preceding_relaunch.get("argv") or []
+                if preceding_relaunch.get("prefix_mode") != expected_mode:
+                    problems.append(
+                        f"{label}: cell {row!r} runs under a relaunch with "
+                        f"prefix_mode {preceding_relaunch.get('prefix_mode')!r}, "
+                        f"the one prefix rule says {expected_mode} (ADR-0103)"
+                        + stale
+                    )
+                if ("--no-prefix-cache" in r_argv) != (expected_mode == "OFF"):
+                    problems.append(
+                        f"{label}: cell {row!r} needs prefix {expected_mode} but "
+                        "its relaunch argv "
+                        + ("carries" if "--no-prefix-cache" in r_argv else "lacks")
+                        + " --no-prefix-cache (ADR-0103)" + stale
+                    )
+
+    if spec.retriever == "rerank":
+        pool = _argv_flag_value(argv, "--rerank-pool")
+        if pool != str(RERANK_POOL):
+            problems.append(
+                f"{label}: ranked cell {row!r} carries --rerank-pool {pool!r}, "
+                f"registered pool is {RERANK_POOL} (ADR-0104: without it the "
+                "legacy rerank-exactly-top-k pipeline runs under the pooled "
+                "row key)" + stale
+            )
+    elif "--rerank-pool" in argv:
+        problems.append(
+            f"{label}: cell {row!r} (retriever {spec.retriever!r}) carries "
+            "--rerank-pool (ADR-0104: the pool rides ranked cells only)" + stale
+        )
+
+    if retrieval is not None:
+        env: Mapping[str, Any] = step.get("env") or {}
+        if spec.retriever != "none":
+            expected_flags = {
+                "--top-k": str(RETRIEVAL_TOP_K),
+                "--embedding-model": str(retrieval.get("embedding_model")),
+                "--embedding-revision": str(retrieval.get("embedding_model_revision")),
+                "--ir-index-dir": str(retrieval.get("ir_index_root")),
+            }
+            for flag, want in expected_flags.items():
+                got = _argv_flag_value(argv, flag)
+                if got != want:
+                    problems.append(
+                        f"{label}: retrieval cell {row!r} carries {flag} {got!r}, "
+                        f"the registered pin is {want!r} (backlog A5: runner "
+                        "defaults never reach a campaign cell)" + stale
+                    )
+            got_env = env.get("CAGE_DISTRACTOR_DOCS")
+            if got_env != str(DISTRACTOR_DOCS):
+                problems.append(
+                    f"{label}: retrieval cell {row!r} env CAGE_DISTRACTOR_DOCS is "
+                    f"{got_env!r}, the registered pin is {DISTRACTOR_DOCS} "
+                    "(backlog A5)" + stale
+                )
+        else:
+            for flag in ("--top-k", "--embedding-model", "--embedding-revision", "--ir-index-dir"):
+                if flag in argv:
+                    problems.append(
+                        f"{label}: cell {row!r} (retriever 'none') carries {flag} "
+                        "(backlog A5: retrieval pins ride retrieval cells only)"
+                        + stale
+                    )
+            if "CAGE_DISTRACTOR_DOCS" in env:
+                problems.append(
+                    f"{label}: cell {row!r} (retriever 'none') carries "
+                    "CAGE_DISTRACTOR_DOCS (backlog A5)" + stale
+                )
+        if spec.arm in REDIS_CACHE_ARMS:
+            want_prefix = redis_key_prefix_for_row(str(row))
+            got_prefix = _argv_flag_value(argv, "--redis-key-prefix")
+            if got_prefix != want_prefix:
+                problems.append(
+                    f"{label}: retr-reuse cell {row!r} carries --redis-key-prefix "
+                    f"{got_prefix!r}, its own namespace is {want_prefix!r} "
+                    "(backlog F5a: no two cells share cache entries)" + stale
+                )
+            if "--flush-redis-namespace" not in argv:
+                problems.append(
+                    f"{label}: retr-reuse cell {row!r} lacks "
+                    "--flush-redis-namespace (backlog F5a: every cell starts "
+                    "with an empty namespace)" + stale
+                )
+        else:
+            for flag in ("--redis-key-prefix", "--flush-redis-namespace"):
+                if flag in argv:
+                    problems.append(
+                        f"{label}: cell {row!r} (arm {spec.arm!r}) carries {flag} "
+                        "(backlog F5a: Redis namespaces ride retr-reuse cells only)"
+                        + stale
+                    )
+
+    if spec.arm == CORPUS_TRUNC_ARM:
+        rung = str(spec.corpus_budget_tokens)
+        for flag in ("--corpus-rung", "--corpus-prefix-budget"):
+            got = _argv_flag_value(argv, flag)
+            if got != rung:
+                problems.append(
+                    f"{label}: corpus-trunc cell {row!r} carries {flag} {got!r}, "
+                    f"its identity rung is {rung} ({CORPUS_TRUNC_ADR})" + stale
+                )
+        if step.get("blocked_on") is None and "--query-manifest" not in argv:
+            problems.append(
+                f"{label}: executable corpus-trunc cell {row!r} lacks "
+                f"--query-manifest ({CORPUS_TRUNC_ADR}: a rung serves only from "
+                "a manifest carrying the ladder)" + stale
+            )
+    return problems
+
+
 def _cell_step(
     cell: PlannedCell,
     grid: SessionGrid,
@@ -1597,6 +2556,8 @@ def _cell_step(
     runner_cmd: Sequence[str],
     seed: int,
     window_duration_s: float,
+    pins: RetrievalPins,
+    query_manifest: Optional[str] = None,
 ) -> Dict[str, Any]:
     spec = cell.spec
     argv = list(runner_cmd) + [
@@ -1615,7 +2576,19 @@ def _cell_step(
         "--seed",
         str(seed),
     ]
-    argv += _behavior_argv(spec, grid)
+    # A9 per-row N: EVERY cell carries its registered --num-queries (the
+    # runner's default query count must never reach a campaign cell); with a
+    # manifest the runner measures the FIRST n ids of each trial.
+    cls, num_queries = cell_num_queries(grid, cell)
+    argv += ["--num-queries", str(num_queries)]
+    argv += _behavior_argv(spec, grid, pins)
+    argv += _cold_start_argv(spec)
+    if query_manifest is not None:
+        # The uniform yardstick (build_query_manifest.py): every cell of a
+        # dataset with a registered manifest measures the manifest's
+        # pre-drawn ids (the runner's --query-manifest sets
+        # CAGE_QUERY_MANIFEST); a B12 rung is served from its ladder.
+        argv += ["--query-manifest", query_manifest]
     if cell.ruler_task is not None:
         # D5#5 RULER instrument step: the task literal + SHAPE-32K, EXPLICIT
         # on every step (the loader's 4096-token default and niah_single
@@ -1664,6 +2637,11 @@ def _cell_step(
             f"{window_duration_s:g}",
         ]
     env = _cell_identity_env(spec)
+    if spec.retriever != "none":
+        # Backlog A5: the Decision 3B distractor pool size, BEHAVIOR (not
+        # identity: derive_cell_spec ignores it) pinned so the runner's env
+        # default never reaches a campaign cell.
+        env["CAGE_DISTRACTOR_DOCS"] = str(DISTRACTOR_DOCS)
     if gpu_count is not None:
         # NOT identity (derive_cell_spec ignores it): the serving-stack fact
         # the campaign writer persists into cell.json (W4.2 → §6.6b / #18).
@@ -1681,6 +2659,10 @@ def _cell_step(
         "row_key": spec.to_row_key(),
         "cellspec": spec.to_flat_dict(),
         "windows": grid.replications,
+        # A9: the DECISION.md A1 row class and the n this cell measures per
+        # window (--num-queries above); both re-derived by load_plan.
+        "row_class": cls,
+        "num_queries": num_queries,
         "gpu_count": gpu_count,
         # F2 grid-membership marker (§6.4): null outside F2 — absence stays
         # absence; F1/F3/DIST cells sit on no registered budget×rate grid.
@@ -1718,6 +2700,132 @@ def _cell_step(
     }
 
 
+def _register_query_manifests(
+    grid: SessionGrid, query_manifests: Optional[Mapping[str, Path]]
+) -> Dict[str, Dict[str, Any]]:
+    """Validate the operator's per-dataset manifest registration (ADR-0106
+    repair): each file must exist and parse, be for its dataset, carry the
+    grid's corpus_prefix_budget_tokens as block_budget (B3/B4/B10 serve the
+    full block through the same manifest) and every registered rung. Returns
+    the plan-header records (absolute path, sha256, validated fields)."""
+    out: Dict[str, Dict[str, Any]] = {}
+    if not query_manifests:
+        return out
+    known = _grid_datasets(grid)
+    for dataset, raw_path in query_manifests.items():
+        if dataset not in known:
+            raise PlanError(
+                f"--query-manifest {dataset}=...: {dataset!r} is not a dataset "
+                f"of session {grid.session!r} (registered: {sorted(known)})"
+            )
+        path = Path(raw_path)
+        if not path.is_file():
+            raise PlanError(f"--query-manifest {dataset}: manifest not found: {path}")
+        raw = path.read_bytes()
+        try:
+            manifest = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise PlanError(
+                f"--query-manifest {dataset}: {path} is not valid JSON: {exc}"
+            ) from exc
+        if not isinstance(manifest, dict):
+            raise PlanError(f"--query-manifest {dataset}: {path} is not a JSON object")
+        if manifest.get("dataset") != dataset:
+            raise PlanError(
+                f"--query-manifest {dataset}: {path} is for dataset "
+                f"{manifest.get('dataset')!r}; refusing a mismatched yardstick"
+            )
+        block_budget = manifest.get("block_budget")
+        if block_budget != grid.corpus_prefix_budget_tokens:
+            raise PlanError(
+                f"--query-manifest {dataset}: {path} has block_budget "
+                f"{block_budget!r} but the grid registers corpus_prefix_budget_tokens="
+                f"{grid.corpus_prefix_budget_tokens} (the runner's A4 guard would "
+                "refuse every corpus cell); rebuild the manifest at the grid's budget"
+            )
+        for rung in grid.corpus_trunc_budgets:
+            try:
+                trunc_rung_for(manifest, rung)
+            except ManifestError as exc:
+                raise PlanError(
+                    f"--query-manifest {dataset}: {path} lacks the registered "
+                    f"B12 rung {rung} ({CORPUS_TRUNC_ADR}): {exc}; rebuild with "
+                    f"build_query_manifest.py --trunc-budgets "
+                    f"{','.join(str(r) for r in grid.corpus_trunc_budgets)}"
+                ) from exc
+        # A9: the per-trial id counts (the runner selects the first n ids of
+        # each trial, so coverage is checked per trial, never on the pool).
+        trials = manifest.get("trials")
+        if not isinstance(trials, dict) or not trials:
+            raise PlanError(
+                f"--query-manifest {dataset}: {path} has no trials{{}} object "
+                "(every window reads its trial's pre-drawn ids by number)"
+            )
+        trial_sizes: Dict[str, int] = {}
+        for trial_key, ids in trials.items():
+            if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+                raise PlanError(
+                    f"--query-manifest {dataset}: {path} trial {trial_key!r} is not "
+                    "a list of id strings; refusing to read it as empty"
+                )
+            trial_sizes[str(trial_key)] = len(ids)
+        out[dataset] = {
+            "path": str(path.resolve()),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "block_budget": int(block_budget),
+            "trunc_rungs": list(grid.corpus_trunc_budgets),
+            "trial_sizes": trial_sizes,
+        }
+    return out
+
+
+def _check_manifest_coverage(
+    grid: SessionGrid,
+    manifests: Mapping[str, Mapping[str, Any]],
+    cells: Sequence[PlannedCell],
+) -> None:
+    """A9 fail-closed coverage: every registered manifest must carry, for
+    each of the grid's ``replications`` trials, at least as many ids as the
+    most demanding cell of its dataset registers as --num-queries (the
+    runner measures the first n ids of trial t and refuses a shorter trial,
+    so a shortfall is caught HERE, before any GPU spends). ``achievable_n``
+    is the ONLY way to lower the requirement (A5)."""
+    demand: Dict[str, Tuple[int, str, str]] = {}  # dataset -> (n, class, row_key)
+    for cell in cells:
+        cls, n = cell_num_queries(grid, cell)
+        current = demand.get(cell.dataset)
+        if current is None or n > current[0]:
+            demand[cell.dataset] = (n, cls, cell.spec.to_row_key())
+    for dataset, rec in manifests.items():
+        need = demand.get(dataset)
+        if need is None:
+            continue  # a manifest for a dataset without cells is not a shortfall
+        n, cls, row_key = need
+        sizes: Mapping[str, int] = rec["trial_sizes"]
+        for trial in range(1, grid.replications + 1):
+            have = sizes.get(str(trial))
+            if have is None:
+                raise PlanError(
+                    f"--query-manifest {dataset}: {rec['path']} has no trial {trial} "
+                    f"but the grid registers {grid.replications} windows per cell "
+                    f"(one manifest trial each); the {cls} cells of {dataset} "
+                    f"(e.g. {row_key}) register n={n}. Rebuild with "
+                    f"build_query_manifest.py --num-queries {n} --num-trials "
+                    f"{grid.replications}"
+                )
+            if have < n:
+                raise PlanError(
+                    f"--query-manifest {dataset}: {rec['path']} trial {trial} carries "
+                    f"{have} ids but the {cls} cells of {dataset} (e.g. {row_key}) "
+                    f"register n={n}: shortfall {n - have} (A9 per-row N; the runner "
+                    "measures the first n ids of each trial and would refuse). "
+                    f"Rebuild with build_query_manifest.py --num-queries {n} "
+                    f"--num-trials {grid.replications}, or register "
+                    f"SessionGrid.achievable_n[{dataset!r}] (DECISION.md A5) if the "
+                    "split cannot supply it"
+                )
+
+
 def build_plan(
     session: str,
     floor: FloorTable,
@@ -1726,14 +2834,29 @@ def build_plan(
     seed: int = 42,
     runner_cmd: Sequence[str] = DEFAULT_RUNNER_CMD,
     launcher_cmds: Optional[Mapping[str, Sequence[str]]] = None,
+    query_manifests: Optional[Mapping[str, Path]] = None,
+    freeze_file: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """PURE plan builder: registered grid -> ordered step list + counts.
 
     Raises :class:`PlanError` on every dishonest input (unknown/unregistered
     session, floor table not matching the session model or missing r rows,
-    non-positive window duration). Never touches the filesystem.
+    non-positive window duration, a query manifest that does not exist, is
+    for another dataset, or lacks the registered corpus budget / a rung).
+    Reads only the registered manifest files (their sha256 is recorded).
+
+    ``query_manifests`` maps dataset -> manifest path (``plan
+    --query-manifest <dataset>=<path>``): every cell of that dataset carries
+    ``--query-manifest``; a B12 rung cell of a dataset WITHOUT one is
+    blocked_on the missing registration (see TRUNC_MANIFEST_BLOCKED_ON_FMT).
+
+    ``freeze_file`` is the registration artifact the A5 retrieval pins are
+    read from (``plan --freeze-file``; None = $CAGE_FREEZE_RESOLUTIONS, else
+    DEFAULT_FREEZE_FILE). Reads only that artifact and the manifests.
     """
     grid = get_session_grid(session)
+    pins = resolve_retrieval_pins(freeze_file)
+    manifests = _register_query_manifests(grid, query_manifests)
     if floor.model != grid.model:
         raise PlanError(
             f"floor table {floor.path} is for model {floor.model!r} but session "
@@ -1748,11 +2871,24 @@ def build_plan(
     launcher_cmds = dict(launcher_cmds or DEFAULT_LAUNCHER_CMDS)
 
     cells = sorted(enumerate_cells(grid), key=_sort_key)
+    # ADR-0106 repair: a rung cell with no manifest for its dataset is
+    # blocked (never a silent fallback); an already-blocked cell keeps its
+    # first (launch-side) reason.
+    cells = [
+        replace(c, blocked_on=trunc_manifest_blocked_on(c.dataset))
+        if c.spec.arm == CORPUS_TRUNC_ARM
+        and c.dataset not in manifests
+        and c.blocked_on is None
+        else c
+        for c in cells
+    ]
 
     # Pre-resolve every budget row so a floor-table gap refuses BEFORE any
     # step is emitted (all problems at plan time, none at 3 a.m. on the pod).
     for r in sorted({c.spec.budget_r for c in cells if c.spec.budget_r is not None}):
         floor.row(r)
+    # A9: every registered manifest must supply each cell's n per trial.
+    _check_manifest_coverage(grid, manifests, cells)
 
     steps: List[Dict[str, Any]] = []
     current: Optional[_ServingConfig] = None
@@ -1766,6 +2902,7 @@ def build_plan(
             steps.append(_relaunch_step(config, grid, floor, launcher_cmds))
             current = config
             relaunches += 1
+        manifest_rec = manifests.get(cell.dataset)
         steps.append(
             _cell_step(
                 cell,
@@ -1774,18 +2911,37 @@ def build_plan(
                 runner_cmd,
                 seed,
                 window_duration_s,
+                pins,
+                query_manifest=None if manifest_rec is None else manifest_rec["path"],
             )
         )
     for i, step in enumerate(steps):
         step["index"] = i
 
     cell_steps = [s for s in steps if s["kind"] == "cell"]
+    # F5a invariant: distinct row keys mint distinct namespaces (a short-sha
+    # collision would silently share cache entries between two cells).
+    namespace_owner: Dict[str, str] = {}
+    for s in cell_steps:
+        prefix = _argv_flag_value(s["argv"], "--redis-key-prefix")
+        if prefix is None:
+            continue
+        owner = namespace_owner.setdefault(prefix, s["row_key"])
+        if owner != s["row_key"]:
+            raise PlanError(
+                f"Redis namespace {prefix!r} is minted by two cells ({owner!r} and "
+                f"{s['row_key']!r}): short-sha collision, widen "
+                "REDIS_NAMESPACE_SHA_CHARS (backlog F5a)"
+            )
     by_family: Dict[str, Dict[str, int]] = {}
     for s in cell_steps:
         fam = by_family.setdefault(s["family"], {"cells": 0, "windows": 0})
         fam["cells"] += 1
         fam["windows"] += s["windows"]
     blocked = [s["row_key"] for s in cell_steps if s["blocked_on"]]
+    cells_by_class: Dict[str, int] = {}
+    for s in cell_steps:
+        cells_by_class[s["row_class"]] = cells_by_class.get(s["row_class"], 0) + 1
 
     return {
         "schema": PLAN_SCHEMA,
@@ -1811,10 +2967,48 @@ def build_plan(
         # the cell list (they also appear inline in every affected argv).
         "behavior_knobs": {
             "reranker_model": RERANKER_MODEL,
+            # ADR-0104: the ranked pipeline reranks a pool of RERANK_POOL
+            # dense candidates and serves the runner's --top-k (3).
+            "rerank_pool": RERANK_POOL,
+            "rerank_pool_adr": "ADR-0104",
             "corpus_prefix_budget_tokens": grid.corpus_prefix_budget_tokens,
-            "corpus_trunc_budget_tokens": grid.corpus_trunc_budget_tokens,
+            # ADR-0106: the B12 ladder, the registered rungs, and the full
+            # ladder as read (B3's own budget first, then each B12 rung).
+            "corpus_trunc_budgets": list(grid.corpus_trunc_budgets),
+            "corpus_trunc_ladder": [
+                grid.corpus_prefix_budget_tokens, *grid.corpus_trunc_budgets
+            ],
+            "corpus_trunc_adr": CORPUS_TRUNC_ADR,
             "retr_trunc_kept_docs": grid.retr_trunc_kept_docs,
+            # Backlog A5: the retrieval pins every retrieval cell carries
+            # (argv --top-k / --embedding-model / --ir-index-dir and the env
+            # CAGE_DISTRACTOR_DOCS); the embedding model is READ from the
+            # ADR-0099 freeze slot, recorded here with its revision + source.
+            "retrieval_top_k": RETRIEVAL_TOP_K,
+            "distractor_docs": DISTRACTOR_DOCS,
+            "embedding_model": pins.embedding_model,
+            "embedding_model_revision": pins.embedding_revision,
+            "embedding_model_freeze_slot": (
+                f"INSTRUMENT_REVISIONS.{FREEZE_DENSE_RETRIEVER_SLOT}"
+            ),
+            "embedding_model_freeze_file": pins.freeze_file,
+            "embedding_model_adr": DENSE_RETRIEVER_ADR,
+            "ir_index_root": grid.ir_index_root,
+            "retrieval_pins_backlog": "A5",
+            # Backlog F5a: per-cell Redis namespaces on the cache-consulting
+            # arms (minted from the row key, flushed at cell start).
+            "redis_cache_arms": sorted(REDIS_CACHE_ARMS),
+            "redis_namespace_rule": REDIS_NAMESPACE_RULE,
+            "redis_namespace_backlog": "F5a",
             "lmcache_kv_transfer_config": LMCACHE_KV_TRANSFER_CONFIG,
+            # ADR-0102 cold start per window (server-engine cells only).
+            "reset_cache_per_window": RESET_CACHE_PER_WINDOW,
+            "warmup_pool_queries": WARMUP_POOL_QUERIES,
+            "cold_start_adr": "ADR-0102",
+            # ADR-0103: the arms served prefix OFF by relaunch in every
+            # family (corpus-fresh); F2 stays the prefix-OFF family.
+            "prefix_off_arms": sorted(PREFIX_OFF_ARMS),
+            "prefix_off_adr": "ADR-0103",
         },
         # W4.2/W4.6: the registered serving shapes — reviewable in the header
         # like the behavior knobs (design registrations, not measurements).
@@ -1822,6 +3016,12 @@ def build_plan(
             "serving_tp": grid.serving_tp,
             "dist_tp_size": grid.dist_tp_size,
             "dist_pd_role_gpus": list(grid.dist_pd_role_gpus),
+            # Backlog A10: the ONE request-length cap every relaunch of this
+            # session carries (env MAX_MODEL_LEN_ENV, both engines);
+            # re-checked per relaunch by load_plan.
+            "max_model_len": grid.max_model_len,
+            "max_model_len_env": MAX_MODEL_LEN_ENV,
+            "max_model_len_backlog": "A10",
         },
         # §6.4 anchor fine grid registration (null on non-anchor sessions).
         "fine_grid": (
@@ -1844,6 +3044,25 @@ def build_plan(
                 "output_tokens": RULER_OUTPUT_TOKENS,
             }
         ),
+        # A9 / DECISION.md A1: the registered per-row N this plan's
+        # --num-queries values are drawn from, the primary-predicate pin and
+        # the A5 achievable-n override (with its caveat) - reviewable here
+        # like the behavior knobs, and re-derived per cell by load_plan.
+        "per_row_n": {
+            "n_primary": grid.n_primary,
+            "n_secondary": grid.n_secondary,
+            "n_identity": grid.n_identity,
+            "window_requests": grid.window_requests,
+            "primary_engine": grid.primary_engine,
+            "primary_baselines": list(grid.primary_baselines),
+            "achievable_n": dict(grid.achievable_n),
+            "achievable_n_caveat": _achievable_n_caveat(grid),
+            "cells_by_class": cells_by_class,
+            "decision": PER_ROW_N_DECISION,
+        },
+        # ADR-0106 repair: the per-dataset query manifests this plan serves
+        # (path + sha256 + what was validated); {} when none is registered.
+        "query_manifests": manifests,
         "counts": {
             "cells": len(cell_steps),
             "windows": sum(s["windows"] for s in cell_steps),
@@ -1879,6 +3098,9 @@ _CELL_STEP_KEYS = (
     "grids",
     "ruler_task",
     "window_ordinal_base",
+    # v5 additions (A9 per-row N): the A1 row class and the n measured.
+    "row_class",
+    "num_queries",
 )
 _RELAUNCH_STEP_KEYS = (
     "engine",
@@ -1892,7 +3114,47 @@ _RELAUNCH_STEP_KEYS = (
     "pd",
     "argv",
     "env",
+    # A10: the uniform request-length cap this relaunch launches with
+    # (also carried in env as MAX_MODEL_LEN_ENV; both re-checked below).
+    "max_model_len",
 )
+
+
+def _stale_relaunch_problems(
+    step: Mapping[str, Any], label: str, header_max_model_len: int
+) -> List[str]:
+    """load_plan's fail-closed per-relaunch check (backlog A10): the
+    ``max_model_len`` record is a positive integer equal to the header's
+    (ONE value per session, the uniform-regime rule) and the env carries
+    MAX_MODEL_LEN_ENV with exactly that value (a relaunch without the env
+    would launch at the pilot shell default 4096; a drifted env would make
+    the record lie about the server every cell under it ran against)."""
+    problems: List[str] = []
+    stale = ": stale plan, re-plan"
+    value = step.get("max_model_len")
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        problems.append(
+            f"{label}: relaunch max_model_len is {value!r}, must be an integer "
+            ">= 1 (backlog A10)" + stale
+        )
+        return problems
+    if value != header_max_model_len:
+        problems.append(
+            f"{label}: relaunch max_model_len {value} differs from the header's "
+            f"{header_max_model_len}: a session serves ONE uniform "
+            "max_model_len (backlog A10, _serving_config.sh uniform-regime "
+            "rule)" + stale
+        )
+    env: Mapping[str, Any] = step.get("env") or {}
+    got = env.get(MAX_MODEL_LEN_ENV)
+    if got != str(value):
+        problems.append(
+            f"{label}: relaunch env {MAX_MODEL_LEN_ENV} is {got!r} but its "
+            f"max_model_len record is {value} (backlog A10: the launcher reads "
+            "the env; without it the pilot shell default 4096 would serve the "
+            "cells under this relaunch)" + stale
+        )
+    return problems
 
 
 def load_plan(path: Path) -> Dict[str, Any]:
@@ -1919,10 +3181,55 @@ def load_plan(path: Path) -> Dict[str, Any]:
     steps = plan.get("steps")
     if not isinstance(steps, list):
         raise RunError(f"plan {path} has no steps[] list")
+    per_row_n = plan.get("per_row_n")
+    if not isinstance(per_row_n, dict):
+        raise RunError(
+            f"plan {path} has no per_row_n header (A9: the registered per-row N "
+            "every cell's --num-queries is re-derived from) - stale plan, re-plan"
+        )
+    knobs = plan.get("behavior_knobs")
+    if not isinstance(knobs, dict):
+        raise RunError(
+            f"plan {path} has no behavior_knobs header (the registered behavior "
+            "knobs every cell argv is checked against) - stale plan, re-plan"
+        )
+    for key in ("embedding_model", "embedding_model_revision", "ir_index_root"):
+        value = knobs.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise RunError(
+                f"plan {path} behavior_knobs lacks {key} (backlog A5: the "
+                "retrieval pins every retrieval cell's argv is re-checked "
+                "against; a pre-A5 plan would run runner defaults under "
+                "registered row keys) - stale plan, re-plan"
+            )
+    retrieval_knobs = {
+        "embedding_model": knobs["embedding_model"],
+        "embedding_model_revision": knobs["embedding_model_revision"],
+        "ir_index_root": knobs["ir_index_root"],
+    }
+    shapes = plan.get("serving_shapes")
+    header_max_model_len = (
+        shapes.get("max_model_len") if isinstance(shapes, dict) else None
+    )
+    if (
+        not isinstance(header_max_model_len, int)
+        or isinstance(header_max_model_len, bool)
+        or header_max_model_len < 1
+    ):
+        raise RunError(
+            f"plan {path} serving_shapes lacks an integer max_model_len >= 1 "
+            "(backlog A10: the uniform request-length cap every relaunch is "
+            "re-checked against; a pre-A10 plan would launch at the pilot "
+            "shell default 4096 and refuse every RULER request) - stale plan, "
+            "re-plan"
+        )
+    preceding_relaunch: Optional[Dict[str, Any]] = None
     for i, step in enumerate(steps):
         if not isinstance(step, dict) or step.get("kind") not in ("cell", "relaunch"):
             problems.append(f"steps[{i}]: kind must be 'cell' or 'relaunch'")
             continue
+        if step["kind"] == "relaunch":
+            preceding_relaunch = step
         keys = _CELL_STEP_KEYS if step["kind"] == "cell" else _RELAUNCH_STEP_KEYS
         missing = [k for k in keys if k not in step]
         if missing:
@@ -1934,9 +3241,14 @@ def load_plan(path: Path) -> Dict[str, Any]:
             problems.append(f"steps[{i}]: argv must be a list of strings")
         if not isinstance(step["env"], dict):
             problems.append(f"steps[{i}]: env must be an object")
+        if step["kind"] == "relaunch":
+            problems.extend(
+                _stale_relaunch_problems(step, f"steps[{i}]", header_max_model_len)
+            )
         if step["kind"] == "cell":
             try:
-                minted = CellSpec.from_flat_dict(step["cellspec"]).to_row_key()
+                spec = CellSpec.from_flat_dict(step["cellspec"])
+                minted = spec.to_row_key()
             except Exception as exc:  # cellspec is the one legality gate
                 problems.append(f"steps[{i}]: cellspec is charter-illegal: {exc}")
                 continue
@@ -1945,6 +3257,16 @@ def load_plan(path: Path) -> Dict[str, Any]:
                     f"steps[{i}]: row_key {step['row_key']!r} != cellspec-minted "
                     f"{minted!r} — keys are minted by CellSpec, never hand-built"
                 )
+            problems.extend(
+                _stale_plan_problems(
+                    step,
+                    spec,
+                    preceding_relaunch,
+                    f"steps[{i}]",
+                    per_row_n=per_row_n,
+                    retrieval=retrieval_knobs,
+                )
+            )
     if problems:
         raise RunError(
             f"plan {path} failed validation ({len(problems)} problem(s)):\n"
@@ -2080,6 +3402,17 @@ def run_plan(
     the data, which is worse than not running.
     """
     campaign_root = Path(campaign_root)
+    # Backlog A6 / F6 (review 2026-09-17): _exec inherits the operator's shell
+    # environment, so the pilot-archive escape hatch would reach every
+    # retrieval cell and serve a pre-prefix index under a WARNING. Refused on
+    # PRESENCE (any value) before the first step; campaign indices are
+    # rebuilt with --rebuild-ir-index, never served stale.
+    if STALE_INDEX_OPT_IN_ENV in os.environ:
+        raise RunError(
+            f"{STALE_INDEX_OPT_IN_ENV} is set in the environment "
+            f"({os.environ[STALE_INDEX_OPT_IN_ENV]!r}); the campaign path never "
+            "serves a stale (pre-prefix) dense index, unset it before 'run'"
+        )
     steps: List[Dict[str, Any]] = list(plan["steps"])
     cell_steps = [s for s in steps if s["kind"] == "cell"]
 
@@ -2221,6 +3554,23 @@ def run_plan(
 # ---------------------------------------------------------------------------
 
 
+def parse_query_manifest_args(items: Sequence[str]) -> Dict[str, Path]:
+    """``DATASET=PATH`` registrations -> {dataset: path}; malformed or
+    duplicate entries refuse (PlanError)."""
+    out: Dict[str, Path] = {}
+    for item in items:
+        dataset, sep, raw_path = item.partition("=")
+        if not sep or not dataset.strip() or not raw_path.strip():
+            raise PlanError(
+                f"--query-manifest {item!r}: expected DATASET=PATH"
+            )
+        dataset = dataset.strip()
+        if dataset in out:
+            raise PlanError(f"--query-manifest {dataset}: registered twice")
+        out[dataset] = Path(raw_path.strip())
+    return out
+
+
 def _cmd_plan(args: argparse.Namespace) -> int:
     floor = load_floor_table(Path(args.floor_table))
     launcher_cmds: Optional[Dict[str, Tuple[str, ...]]] = None
@@ -2234,6 +3584,8 @@ def _cmd_plan(args: argparse.Namespace) -> int:
         seed=args.seed,
         runner_cmd=tuple(shlex.split(args.runner_cmd)),
         launcher_cmds=launcher_cmds,
+        query_manifests=parse_query_manifest_args(args.query_manifest),
+        freeze_file=Path(args.freeze_file) if args.freeze_file else None,
     )
     text = json.dumps(plan, indent=2, sort_keys=False) + "\n"
     if args.out:
@@ -2303,6 +3655,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=None,
         help="argv prefix override for ALL relaunch steps (test seam; default "
         "= the real per-engine 2_serving launchers)",
+    )
+    p_plan.add_argument(
+        "--query-manifest",
+        action="append",
+        default=[],
+        metavar="DATASET=PATH",
+        help="register the uniform query manifest (build_query_manifest.py) "
+        "for one dataset; repeatable. Every cell of that dataset carries "
+        "--query-manifest; a B12 rung cell of a dataset WITHOUT one is "
+        "blocked_on the missing registration (ADR-0106)",
+    )
+    p_plan.add_argument(
+        "--freeze-file",
+        default=None,
+        help="the frozen registration artifact the A5 retrieval pins are read "
+        f"from (INSTRUMENT_REVISIONS.{FREEZE_DENSE_RETRIEVER_SLOT}, "
+        f"{DENSE_RETRIEVER_ADR}); default ${FREEZE_FILE_ENV_VAR} else "
+        f"{DEFAULT_FREEZE_FILE}; a missing artifact refuses",
     )
     p_plan.add_argument("--out", default=None, help="write the plan JSON here (else stdout)")
     p_plan.set_defaults(func=_cmd_plan)

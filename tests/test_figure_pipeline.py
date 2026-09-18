@@ -149,6 +149,18 @@ def test_parse_row_key_rejects_unknown_coord_segment() -> None:
         fp.parse_row_key(K_B1 + "|q0.5")
 
 
+def test_parse_row_key_accepts_the_b12_rung_segment() -> None:
+    # ADR-0106: a B12 rung cell carries the corpus-budget coordinate cb<tokens>
+    # after the pressure coords; it round-trips into corpus_budget_tokens.
+    key = "corpus-trunc|none|none|single|vllm|qwen3-14b|F3|r0.5|lam0.95|cb700"
+    fields = fp.parse_row_key(key)
+    assert fields["corpus_budget_tokens"] == 700
+    assert fields["budget_r"] == 0.5 and fields["rate_frac"] == 0.95
+    assert "corpus_budget_tokens" not in fp.parse_row_key(K_B1)  # absence stays absence
+    with pytest.raises(fp.FigureDataError, match="coord segment"):
+        fp.parse_row_key(key.replace("cb700", "cb7.5"))
+
+
 def test_condense_row_key_labels_drops_shared_segments() -> None:
     labels = fp.condense_row_key_labels([K_B1, K_B3, K_B6])
     assert labels[K_B1] == "gold-fresh · none"

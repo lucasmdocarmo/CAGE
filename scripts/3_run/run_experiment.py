@@ -22,14 +22,20 @@ import subprocess
 import shlex
 import shutil
 from pathlib import Path
+from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, FrozenSet, Optional, Sequence, Set, Tuple
 from collections import defaultdict
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from src.data.loader import get_loader, CAGExample
+from src.data.loader import (
+    AnswerabilityFlagError,
+    CAGExample,
+    get_loader,
+    is_impossible_flag,
+)
 from src.inference.engine import InferenceEngine, InferenceRequest
 from src.inference.vllm_adapter import VLLMAdapter, VLLMOfflineAdapter
 from src.inference.ollama_adapter import OllamaAdapter
@@ -46,7 +52,11 @@ from src.orchestration.load_generator import (
     generate_arrival_schedule,
     trim_to_measurement_window,
 )
-from src.evaluation.quality import QualityEvaluator
+from src.evaluation.quality import (
+    AnswerabilityMismatchError,
+    QualityEvaluator,
+    resolve_answerability,
+)
 from src.evaluation.performance import PerformanceEvaluator, CacheMetricsTracker
 from src.evaluation.code_evaluator import CodeQualityEvaluator
 from src.orchestration.baselines import get_baseline_config, check_baseline_requirements
@@ -66,7 +76,13 @@ from src.orchestration.ir import (
     stage_tagged_search,
     CrossEncoderReranker,
 )
-from src.orchestration.redis_cache import RedisConfig, RedisClient, RetrievalCache
+from src.orchestration.redis_cache import (
+    RedisConfig,
+    RedisClient,
+    RetrievalCache,
+    RetrievalCacheKeyError,
+    corpus_sha1_of_index,
+)
 from src.evaluation.staleness import staleness_metrics, select_stale, make_stale_context
 from src.utils.prompting import (
     format_qa_prompt,
@@ -916,6 +932,152 @@ def stage_tagged_retrieve(
     )
 
 
+class RerankPoolError(ValueError):
+    """``--rerank-pool`` (ADR-0104) cannot be realized as specified.
+
+    A candidate pool without a reranker is meaningless (nothing ranks the
+    pool, so serving its head would silently change B5, the UNRANKED control
+    of the one pre-registered reranker ablation), and a pool smaller than the
+    served top_k cannot serve top_k docs. Both refuse loudly, before any
+    dataset or engine work.
+    """
+
+
+@dataclass(frozen=True)
+class DenseRetrieval:
+    """One dense-path retrieval pass: the SERVED hits plus their provenance.
+
+    ``hits`` is the served list in rank order (what context assembly
+    consumes). ``pool_size`` is the ADR-0104 candidate-pool size that was
+    reranked before truncation, None on the legacy path (rerank exactly the
+    top_k hits) and on the unranked B5 path.
+    """
+
+    hits: List[IRHit]
+    cached: bool
+    reranked: bool
+    pool_size: Optional[int]
+
+
+def resolve_rerank_pool(
+    rerank_pool: Optional[int],
+    *,
+    top_k: int,
+    reranker_active: bool,
+) -> Optional[int]:
+    """Validate ``--rerank-pool`` (ADR-0104, owner decision 2026-09-16).
+
+    None = legacy behavior (the reranker, when active, reranks exactly the
+    top_k hits). A set pool is only meaningful with an active reranker and
+    must be at least the served top_k; anything else refuses (fail closed).
+    """
+    if rerank_pool is None:
+        return None
+    pool = int(rerank_pool)
+    if not reranker_active:
+        raise RerankPoolError(
+            f"--rerank-pool {pool} requires an active reranker (ADR-0104: the "
+            f"pool is reranked WHOLE, then truncated to top_k). Without a "
+            f"reranker a pool is meaningless and would silently change the "
+            f"unranked B5 control: set --reranker-model or drop --rerank-pool."
+        )
+    if pool < 1:
+        raise RerankPoolError(f"--rerank-pool must be >= 1, got {pool}")
+    if pool < top_k:
+        raise RerankPoolError(
+            f"--rerank-pool {pool} is smaller than the served top_k {top_k}: "
+            f"the served context is a subset of the candidate pool by "
+            f"construction (ADR-0104 pins pool 10, served 3)."
+        )
+    return pool
+
+
+def dense_retrieve(
+    question: str,
+    *,
+    ir_index: Any,
+    top_k: int,
+    reranker: Any,
+    rerank_pool: Optional[int],
+    retrieval_cache: Any,
+    dataset: str,
+    embedding_model: str,
+    ttl_seconds: Optional[int] = None,
+    corpus_sha1: Optional[str] = None,
+) -> DenseRetrieval:
+    """The dense (FAISS) retrieval path: search, optional cache, rerank, serve.
+
+    Ordering (ADR-0104): with ``rerank_pool`` set the index is searched for
+    the POOL (``top_k = rerank_pool``), the pool is what the optional Redis
+    retrieval cache stores and returns (keyed with the pool size, since a
+    pool-10 hit list is not a top-3 hit list), the reranker reranks the WHOLE
+    pool AFTER the cache, and the served list is the reranked head of length
+    ``top_k``. With ``rerank_pool`` None the legacy pipeline is byte-for-byte
+    unchanged: search ``top_k``, cache ``top_k``, rerank exactly those hits
+    (when a reranker is active), serve them all. ``rerank_pool`` set without
+    a reranker refuses (RerankPoolError) before touching the index.
+
+    Backlog F5b: with a ``retrieval_cache`` present, ``corpus_sha1`` (the
+    index's corpus fingerprint, ``corpus_sha1_of_index``) is REQUIRED and
+    rides every cache key, so a rebuilt index never serves stale hits; a
+    cache without it refuses (RetrievalCacheKeyError) before the search.
+    Without a cache the hash is unused.
+    """
+    pool = resolve_rerank_pool(
+        rerank_pool, top_k=top_k, reranker_active=reranker is not None
+    )
+    search_k = pool if pool is not None else top_k
+    if retrieval_cache is not None and corpus_sha1 is None:
+        raise RetrievalCacheKeyError(
+            "retrieval cache active but no corpus hash was supplied: the cache "
+            "key must fold the index's corpus fingerprint (backlog F5b, "
+            "corpus_sha1_of_index) or a rebuilt index could serve stale hits"
+        )
+
+    cached = False
+    hits_payload = None
+    if retrieval_cache is not None:
+        hits_payload = retrieval_cache.get(
+            dataset=dataset,
+            embedding_model=embedding_model,
+            top_k=top_k,
+            query=question,
+            corpus_sha1=corpus_sha1,
+            pool=pool,
+        )
+
+    if hits_payload:
+        cached = True
+        hits: List[IRHit] = [
+            IRHit(doc_id=h["doc_id"], score=float(h.get("score", 0.0)))
+            for h in hits_payload
+            if "doc_id" in h
+        ]
+    else:
+        hits = list(ir_index.search(question, top_k=search_k))
+        if retrieval_cache is not None:
+            retrieval_cache.set(
+                dataset=dataset,
+                embedding_model=embedding_model,
+                top_k=top_k,
+                query=question,
+                hits=[{"doc_id": h.doc_id, "score": h.score} for h in hits],
+                corpus_sha1=corpus_sha1,
+                ttl_seconds=ttl_seconds,
+                pool=pool,
+            )
+
+    reranked = False
+    if reranker is not None and hits:
+        hits = list(reranker.rerank(question, hits, ir_index))
+        reranked = True
+
+    if pool is not None:
+        hits = hits[:top_k]
+
+    return DenseRetrieval(hits=hits, cached=cached, reranked=reranked, pool_size=pool)
+
+
 def derive_corpus_prompt_prefix(build_prompt: Any) -> str:
     """Shared cacheable prefix of a corpus-block prompt (template-agnostic).
 
@@ -938,6 +1100,186 @@ def derive_corpus_prompt_prefix(build_prompt: Any) -> str:
             "(expected the '\\n\\nQuestion:' marker after the context blocks)"
         )
     return common[:cut]
+
+
+@dataclass(frozen=True)
+class CorpusServingPlan:
+    """What the corpus-prefix path serves (ADR-0106 / backlog A4 guard result).
+
+    ``blocks`` is the manifest block list to serve (the full blocks for
+    B3/B4/B10 at the manifest's block_budget, the rung blocks for a B12 rung);
+    None means the non-manifest pilot fallback packs its own block.
+    ``in_corpus_ids`` is the rung's in-corpus label set; None means every
+    measured query is in-corpus by construction (the full-budget manifest
+    store), never "unknown".
+    """
+
+    budget: int
+    rung: Optional[int]
+    blocks: Optional[List[Dict[str, Any]]]
+    in_corpus_ids: Optional[FrozenSet[str]]
+
+
+CORPUS_TRUNC_ARM = "corpus-trunc"
+
+
+class QueryCountError(ValueError):
+    """Backlog A9 per-row N: ``--num-queries`` cannot be realized from the
+    query manifest as specified (a trial with fewer ids than n, or a
+    non-positive n). Typed so the runner refuses before any engine work,
+    never serving a shorter measured set under the registered n."""
+
+
+def select_manifest_prefix(
+    manifest: Dict[str, Any],
+    *,
+    trial: int,
+    examples: Sequence[CAGExample],
+    num_queries: int,
+) -> List[CAGExample]:
+    """The FIRST ``num_queries`` ids of manifest trial ``trial``, in manifest
+    order (backlog A9, DECISION.md A1 per-row N).
+
+    Nested prefix subsets by construction: an 800-query cell measures a
+    tested prefix of the 2,000-query manifest trial, so every cell of a
+    dataset pairs per query with every other on the shared head of the
+    draw. Refuses (``QueryCountError``) when the trial carries fewer than
+    ``num_queries`` ids or when ``num_queries`` < 1; a missing id in the
+    trial refuses through ``select_examples`` (dataset/split mismatch).
+    """
+    from src.data.manifest import ManifestError, select_examples
+
+    if num_queries < 1:
+        raise QueryCountError(
+            f"--num-queries must be >= 1 with a query manifest (got {num_queries})"
+        )
+    ids = (manifest.get("trials") or {}).get(str(trial))
+    if not isinstance(ids, list) or not ids:
+        raise QueryCountError(
+            f"query manifest has no trial {trial} (trials present: "
+            f"{sorted(str(k) for k in (manifest.get('trials') or {}))}); "
+            "--num-trials must not exceed the manifest's trial count"
+        )
+    if len(ids) < num_queries:
+        raise QueryCountError(
+            f"query manifest trial {trial} carries {len(ids)} ids but "
+            f"--num-queries {num_queries} was registered for this cell (A9 "
+            "per-row N): the runner measures the first n ids of the trial and "
+            "refuses a shorter one; rebuild the manifest with "
+            f"build_query_manifest.py --num-queries >= {num_queries} or lower "
+            "the registered n (SessionGrid.achievable_n, DECISION.md A5)"
+        )
+    try:
+        selected = select_examples(manifest, trial, examples)
+    except ManifestError as exc:
+        raise QueryCountError(
+            f"query manifest trial {trial}: {exc}"
+        ) from exc
+    return list(selected[:num_queries])
+
+
+def resolve_corpus_serving(
+    *,
+    corpus_budget: int,
+    corpus_rung: Optional[int],
+    cell_arm: Optional[str],
+    cell_corpus_budget: Optional[int],
+    manifest: Optional[Dict[str, Any]],
+) -> Optional[CorpusServingPlan]:
+    """The fail-closed corpus-budget guard (backlog A4, ADR-0106 charter §7.7(d)).
+
+    ``cell_arm`` / ``cell_corpus_budget`` are the identity seam
+    (CAGE_CELL_ARM / CAGE_CELL_CORPUS_BUDGET); when an identity is present its
+    rung coordinate must equal the served rung, both ways (a rung cell served
+    at another budget, or a served rung on a rung-less identity, is mislabeled
+    data). Rules, every violation a ValueError BEFORE any dataset/engine work:
+    - ``--corpus-rung R`` (a B12 rung cell) requires ``--corpus-prefix-budget``
+      == R, a query manifest, and that manifest carrying rung R in its
+      ``trunc_rungs`` ladder; it is illegal on any arm but corpus-trunc. The
+      non-manifest fallback (pack one block, DROP out-of-corpus queries) is a
+      pilot convenience, never a registered path for the ladder arm.
+    - A corpus-trunc cell (CAGE_CELL_ARM) without ``--corpus-rung`` refuses:
+      the rung is explicit, never inferred from the budget.
+    - In manifest mode without a rung (B3/B4/B10), ``--corpus-prefix-budget``
+      must equal the manifest's ``block_budget``: "manifest block budget or
+      rung must equal the arm's budget".
+    Returns None when the run is not a corpus-prefix run at all.
+    """
+    if corpus_rung is not None and (isinstance(corpus_rung, bool) or corpus_rung < 1):
+        raise ValueError(f"--corpus-rung {corpus_rung!r} must be a token budget >= 1")
+    if corpus_rung is not None and cell_arm is not None and cell_arm != CORPUS_TRUNC_ARM:
+        raise ValueError(
+            f"--corpus-rung {corpus_rung} is legal on arm corpus-trunc only "
+            f"(ADR-0106); this cell's arm is {cell_arm!r}"
+        )
+    if cell_arm is not None and cell_corpus_budget != corpus_rung:
+        raise ValueError(
+            f"identity rung CAGE_CELL_CORPUS_BUDGET={cell_corpus_budget!r} does not "
+            f"equal the served --corpus-rung {corpus_rung!r} (ADR-0106: the rung is "
+            "an identity coordinate; the driver sets both from one registered "
+            "ladder, a disagreement is a mislabeled cell)"
+        )
+    if corpus_rung is None and corpus_budget <= 0:
+        if cell_arm == CORPUS_TRUNC_ARM:
+            raise ValueError(
+                "cell arm corpus-trunc (B12, ADR-0106) requires the explicit "
+                "--corpus-rung <tokens> (and --corpus-prefix-budget equal to it) "
+                "-- refusing to serve a truncation cell without its rung"
+            )
+        return None
+    if corpus_rung is not None:
+        if corpus_budget != corpus_rung:
+            raise ValueError(
+                f"--corpus-rung {corpus_rung} must equal --corpus-prefix-budget "
+                f"{corpus_budget} (A4: the served budget IS the rung)"
+            )
+        if manifest is None:
+            raise ValueError(
+                f"--corpus-rung {corpus_rung} requires a query manifest carrying "
+                "that rung (CAGE_QUERY_MANIFEST / --query-manifest, built with "
+                "build_query_manifest.py --trunc-budgets); the non-manifest "
+                "fallback DROPS out-of-corpus queries and is not a registered "
+                "path for the B12 ladder (ADR-0106)"
+            )
+        from src.data.manifest import ManifestError, trunc_rung_for
+        try:
+            rung = trunc_rung_for(manifest, corpus_rung)
+        except ManifestError as exc:
+            raise ValueError(
+                f"A4 guard: manifest block budget or rung must equal the arm's "
+                f"budget ({corpus_rung}): {exc}"
+            ) from exc
+        return CorpusServingPlan(
+            budget=corpus_budget,
+            rung=corpus_rung,
+            blocks=list(rung["blocks"]),
+            in_corpus_ids=frozenset(rung["in_corpus_ids"]),
+        )
+    # corpus_budget > 0, no rung: the full-budget corpus arms (B3/B4/B10).
+    if cell_arm == CORPUS_TRUNC_ARM:
+        raise ValueError(
+            "cell arm corpus-trunc (B12, ADR-0106) requires the explicit "
+            f"--corpus-rung {corpus_budget} beside --corpus-prefix-budget "
+            f"{corpus_budget} -- the rung is never inferred from the budget"
+        )
+    if manifest is None:
+        return CorpusServingPlan(
+            budget=corpus_budget, rung=None, blocks=None, in_corpus_ids=None
+        )
+    block_budget = manifest.get("block_budget")
+    if block_budget != corpus_budget:
+        raise ValueError(
+            f"A4 guard: manifest block budget or rung must equal the arm's "
+            f"budget: --corpus-prefix-budget {corpus_budget} vs manifest "
+            f"block_budget {block_budget!r} -- a mismatched budget would "
+            "serve the manifest's blocks under the wrong label"
+        )
+    return CorpusServingPlan(
+        budget=corpus_budget,
+        rung=None,
+        blocks=list(manifest["blocks"]),
+        in_corpus_ids=None,
+    )
 
 
 class OracleCorpusPreloader:
@@ -1410,6 +1752,10 @@ def run_experiment(
     embedding_model: str,
     ir_index_dir: str,
     rebuild_ir_index: bool,
+    # Backlog A5 (review 2026-09-17): the frozen HF commit of the dense
+    # encoder (--embedding-revision, pinned by the campaign driver from the
+    # freeze slot); None = unpinned pilot use. Enforced by ensure_ir_index.
+    embedding_revision: Optional[str] = None,
     # Retriever variant (charter sec. 7.2): "dense" (default) = the pre-existing
     # FAISS+cross-encoder path unchanged; "bm25"/"hybrid-rrf" = the stage-tagged
     # BM25 / RRF-fused paths (src/orchestration/ir.py).
@@ -1441,6 +1787,11 @@ def run_experiment(
     # Reranker
     reranker_model: Optional[str],
     reranker_device: str,
+    # ADR-0104 rerank pool: retrieve a dense candidate POOL of this many
+    # hits, rerank it whole with the cross-encoder, serve top_k. None (the
+    # default) = legacy behavior, rerank exactly the top_k hits. A pool
+    # without a reranker refuses (RerankPoolError).
+    rerank_pool: Optional[int] = None,
     # Prompt/context truncation
     truncate_prompt_tokens: Optional[int],
     max_context_chars: Optional[int],
@@ -1469,6 +1820,18 @@ def run_experiment(
     # hashes). None (the default) leaves the pilot path byte-identical.
     campaign_session: Optional[CampaignCellSession] = None,
     campaign_window_ordinal: Optional[int] = None,
+    # ADR-0102 cold start per window: after the per-trial cache reset, serve
+    # ``warmup_pool_queries`` requests drawn deterministically (seed + trial
+    # ordinal) from examples DISJOINT from every trial's measured set; their
+    # results are discarded (never a results row, never a requests.jsonl or
+    # qa_evidence row), only a summary + the ids' sha256 land in the trial
+    # metadata. 0 (the default) leaves every existing caller byte-identical.
+    warmup_pool_queries: int = 0,
+    warmup_pool_trial: int = 1,
+    # ADR-0102 cold-start provenance: the record _reset_prefix_cache returned
+    # for this window (campaign mode), persisted as metrics.json['cold_start'].
+    # None (the default) leaves every existing caller byte-identical.
+    cold_start: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Run a single baseline experiment.
@@ -1497,6 +1860,14 @@ def run_experiment(
             f"baselines (redis/hybrid): their cache keys pin the dense "
             f"embedding-model pipeline. Use the dense retriever for these arms."
         )
+    # ADR-0104 rerank pool, EARLY (same fail-closed slot): a pool without a
+    # reranker model is refused before any dataset or engine work. The
+    # definitive check (against whether this ARM builds a reranker at all)
+    # runs right after the baseline config is resolved, still before any
+    # dataset load or index build; a belt-and-braces assertion re-checks it
+    # against the reranker instance once built.
+    if rerank_pool is not None and not reranker_model:
+        resolve_rerank_pool(rerank_pool, top_k=top_k, reranker_active=False)
 
     # T4.1 multi-instance telemetry endpoints (CAGE_TELEMETRY_ENDPOINTS):
     # parsed + validated EARLY, same fail-closed slot as the retriever check
@@ -1522,6 +1893,25 @@ def run_experiment(
             f"single/batched only (got '{workload_mode}'): the corpus-prefix "
             f"preload requires every prompt to literally extend the cached "
             f"block prefix (Chan et al. 2024 recipe)"
+        )
+
+    # ADR-0102 warm-up pool validation, EARLY and fail-closed: a negative
+    # count is a typo, and combining the disjoint-pool warm-up with the
+    # legacy --warmup-queries replay of the MEASURED set would cache-warm the
+    # measured queries under a "cold start" label (a mislabeled window).
+    if warmup_pool_queries < 0:
+        raise WarmupPoolError(
+            f"warmup_pool_queries must be >= 0 (got {warmup_pool_queries})"
+        )
+    if warmup_pool_queries > 0 and warmup_queries > 0:
+        raise WarmupPoolError(
+            "--warmup-pool-queries (ADR-0102 disjoint-pool cold-start warm-up) "
+            "cannot be combined with --warmup-queries (replays the MEASURED set "
+            "and cache-warms the measured queries): drop --warmup-queries"
+        )
+    if warmup_pool_trial < 1:
+        raise WarmupPoolError(
+            f"warmup_pool_trial must be >= 1 (got {warmup_pool_trial})"
         )
 
     # Open-loop configuration validation, EARLY (before any dataset/engine work)
@@ -1621,6 +2011,16 @@ def run_experiment(
         num_speculative_tokens=num_speculative_tokens,
         speculative_method=speculative_method,
     )
+    # ADR-0104 rerank pool, DEFINITIVE check (still before any dataset load,
+    # IR-index build or engine work): the pool applies only where this arm
+    # builds a reranker, i.e. a ranked retrieval arm (use_faiss) with a
+    # reranker model; a pool on a corpus arm that merely CARRIES a reranker
+    # model refuses here, not after the index build.
+    _rerank_pool = resolve_rerank_pool(
+        rerank_pool,
+        top_k=int(baseline_config.top_k_retrieval),
+        reranker_active=bool(baseline_config.use_faiss and reranker_model),
+    )
     # CLI compression overrides (only when explicitly provided, to keep per-baseline defaults).
     if compress_method is not None:
         baseline_config.compress_method = None if compress_method == "none" else compress_method
@@ -1711,39 +2111,101 @@ def run_experiment(
     _manifest_path = os.getenv("CAGE_QUERY_MANIFEST", "").strip()
     _manifest = None
     if _manifest_path:
-        from src.data.manifest import select_examples as _manifest_select
         _manifest = json.loads(Path(_manifest_path).read_text(encoding="utf-8"))
         if _manifest.get("dataset") and _manifest["dataset"] != dataset:
             raise ValueError(
                 f"manifest is for dataset '{_manifest['dataset']}' but this run uses "
                 f"'{dataset}' -- refusing to serve a mismatched yardstick"
             )
+    # Corpus-budget guard (backlog A4, ADR-0106) BEFORE the split load and
+    # before any engine work: the served budget must be the manifest's block
+    # budget (B3/B4/B10) or one of its truncation rungs (B12, explicit
+    # --corpus-rung), or the run refuses here.
+    _corpus_budget = int(os.getenv("CAGE_CORPUS_PREFIX_BUDGET", "0") or "0")
+    _corpus_rung_raw = os.getenv("CAGE_CORPUS_RUNG", "").strip()
+    _cell_rung_raw = os.getenv("CAGE_CELL_CORPUS_BUDGET", "").strip()
+    _corpus_plan = resolve_corpus_serving(
+        corpus_budget=_corpus_budget,
+        corpus_rung=int(_corpus_rung_raw) if _corpus_rung_raw else None,
+        cell_arm=(os.getenv("CAGE_CELL_ARM") or "").strip() or None,
+        cell_corpus_budget=int(_cell_rung_raw) if _cell_rung_raw else None,
+        manifest=_manifest,
+    )
+    _manifest_provenance: Optional[Dict[str, Any]] = None
+    if _manifest is not None:
         _trial_no = int(os.getenv("CAGE_MANIFEST_TRIAL", "1") or "1")
         pool = loader.load(max_examples=None)  # full split; selection is by id
-        base_examples = _manifest_select(_manifest, _trial_no, pool)
+        # A9 per-row N: the measured set is the FIRST num_queries ids of the
+        # trial in manifest order (nested prefix subsets across cells of one
+        # dataset); a trial shorter than num_queries refuses (QueryCountError).
+        base_examples = select_manifest_prefix(
+            _manifest, trial=_trial_no, examples=pool, num_queries=num_queries
+        )
+        _trial_len = len(_manifest["trials"][str(_trial_no)])
+        _manifest_provenance = {
+            "path": _manifest_path,
+            "trial": _trial_no,
+            "trial_ids": _trial_len,
+            "prefix": len(base_examples),
+        }
+        _mstats = _manifest.get("stats") or {}
         print(f"MANIFEST workload: trial {_trial_no}, {len(base_examples)} queries "
-              f"from {_manifest_path} (pool={_manifest['stats']['pool_size']}, "
-              f"blocks={_manifest['stats']['n_blocks']})")
+              f"(the first {len(base_examples)} of {_trial_len} trial ids, A9 "
+              f"prefix subset) from {_manifest_path} "
+              f"(pool={_mstats.get('pool_size')}, blocks={_mstats.get('n_blocks')})")
+        # ADR-0102: the warm-up pool is everything the manifest never
+        # measures in ANY trial (trial 2's measured ids are off-limits for
+        # trial 1's warm-up too); the seeded draw below picks from it.
+        _every_trial_ids: set = {
+            str(i) for ids in (_manifest.get("trials") or {}).values() for i in ids
+        }
+        _warmup_candidates: List[CAGExample] = [
+            ex for ex in pool if ex.id not in _every_trial_ids
+        ]
     else:
-        pool = loader.load(max_examples=num_queries)
-        base_examples = pool
+        # ADR-0102 (repair 2026-09-16): the measured set is the UNCHANGED
+        # pre-ADR load, max_examples=num_queries (on QASPER that bounds
+        # PAPERS, each contributing ALL its questions, so slicing a larger
+        # load to num_queries rows would silently change the measured set).
+        # The warm-up candidates come from a SEPARATE, larger load beyond
+        # it: the loaders are prefix-stable (shuffle(seed).select(range(k))),
+        # so the measured examples are the head of the slate and everything
+        # past them is the candidate pool, over-provisioned by
+        # WARMUP_POOL_CANDIDATE_MULTIPLIER for the context-disjointness filter.
+        base_examples = loader.load(max_examples=num_queries)
+        _warmup_candidates = []
+        if warmup_pool_queries > 0:
+            _measured_head: Set[str] = {ex.id for ex in base_examples}
+            _slate = loader.load(
+                max_examples=num_queries
+                + warmup_pool_queries * WARMUP_POOL_CANDIDATE_MULTIPLIER
+            )
+            _warmup_candidates = [ex for ex in _slate if ex.id not in _measured_head]
+    # ADR-0102 repair: fingerprint the measured set's SERVED context from the
+    # RAW loader examples (before any corpus transform) so the warm-up draw
+    # can refuse a candidate that shares a paragraph or a paper with it.
+    _measured_context_keys: Set[str] = warmup_context_keys(base_examples)
 
     # cag_true corpus-as-prefix mode (2026-07-15, tasks #71/#82): pack gold paragraphs into
     # ONE shared corpus block and serve it as every query's context, so all prompts share a
     # long identical prefix -- the true-CAG layout (Chan et al., arXiv 2412.15605) that
     # vLLM's prefix cache can actually reuse. (Single-workload SQuAD shares only the
     # ~32-token system prefix across queries -> the honest -3.3% TTFT; this mode is the
-    # arm that measures the CAG mechanism itself.) Examples whose gold paragraph did not
-    # fit the budget are DROPPED (announced): cag_true cells answer in-corpus questions.
-    _corpus_budget = int(os.getenv("CAGE_CORPUS_PREFIX_BUDGET", "0") or "0")
-    if _corpus_budget > 0 and _manifest is not None:
-        # Manifest mode: every query is in-corpus BY CONSTRUCTION (corpus-first
-        # sampling), each using its manifest-assigned block. Queries run in block order
-        # so each block's KV stays resident while its questions run (true CAG per
-        # block within the L4's capacity); the ordering is identical in the paired
-        # cache-off cell, so the pair stays clean.
-        _blocks = _manifest["blocks"]
+    # arm that measures the CAG mechanism itself.) In the NON-manifest fallback,
+    # examples whose gold paragraph did not fit the budget are DROPPED (announced).
+    # Manifest mode never drops: at the full budget every query is in-corpus by
+    # construction; at a B12 rung (ADR-0106, charter §7.7(d)) every query is
+    # SERVED against the rung block and labeled in_corpus / out-of-corpus.
+    if _corpus_plan is not None and _corpus_plan.blocks is not None:
+        # Manifest mode: each query uses its manifest-assigned block (the full
+        # block for B3/B4/B10, the rung block of the SAME block id for B12).
+        # Queries run in block order so each block's KV stays resident while
+        # its questions run (true CAG per block within the GPU's capacity);
+        # the ordering is identical in the paired cache-off cell, so the pair
+        # stays clean.
+        _blocks = _corpus_plan.blocks
         _q2b = _manifest["question_to_block"]
+        _in_ids = _corpus_plan.in_corpus_ids
         base_examples = [
             CAGExample(
                 id=ex.id, question=ex.question,
@@ -1752,12 +2214,21 @@ def run_experiment(
                           "corpus_prefix": True,
                           "corpus_block": _q2b[ex.id],
                           "corpus_tokens": _blocks[_q2b[ex.id]]["token_count"],
+                          # ADR-0106 labels: the rung (None at the full budget)
+                          # and the by-construction in-corpus label (True for
+                          # every query of the full-budget store).
+                          "corpus_rung": _corpus_plan.rung,
+                          "in_corpus": True if _in_ids is None else (ex.id in _in_ids),
                           "gold_context": (ex.context or [None])[0]},
             )
             for ex in sorted(base_examples, key=lambda e: _q2b[e.id])
         ]
+        _n_out = sum(1 for ex in base_examples if not ex.metadata["in_corpus"])
         print(f"CORPUS-PREFIX mode (manifest): {len(base_examples)} queries over "
-              f"{len(_blocks)} blocks, block-ordered")
+              f"{len(_blocks)} blocks, block-ordered"
+              + (f"; rung={_corpus_plan.rung} tokens, out-of-corpus served="
+                 f"{_n_out} (expected abstention, never dropped)"
+                 if _corpus_plan.rung is not None else ""))
     elif _corpus_budget > 0:
         from src.data.corpus import build_corpus_block
         from src.data.loader import gold_only
@@ -1801,7 +2272,33 @@ def run_experiment(
         )
         print("DOC-GROUPED ordering: examples sorted by context hash (shared-prefix groups)")
 
+    # Backlog A8: the loader's is_impossible flag is verified against the gold
+    # HERE, before the engine is touched; a mislabeled row refuses the cell.
+    _n_flag_verified = verify_answerability_labels(base_examples)
+    if _n_flag_verified:
+        print(f"ANSWERABILITY: {_n_flag_verified}/{len(base_examples)} examples carry a "
+              f"loader is_impossible flag, all verified against their gold (A8)")
+
     warmup_pool = list(base_examples) if warmup_queries > 0 else []
+    # ADR-0102: the disjoint cold-start warm-up draw (typed refusal when the
+    # dataset cannot supply N examples outside the measured set). Drawn from
+    # the RAW loader examples (own gold context) so a corpus-prefix cell's
+    # shared block is never touched by the warm-up.
+    _measured_ids_for_pool: Set[str] = {ex.id for ex in base_examples}
+    _warmup_split = partition_warmup_candidates(
+        _warmup_candidates,
+        measured_ids=_measured_ids_for_pool,
+        measured_context_keys=_measured_context_keys,
+    )
+    warmup_pool_examples: List[CAGExample] = draw_warmup_pool(
+        _warmup_candidates,
+        measured_ids=_measured_ids_for_pool,
+        measured_context_keys=_measured_context_keys,
+        n=warmup_pool_queries,
+        seed=seed,
+        trial=warmup_pool_trial,
+    )
+    warmup_pool_ids: List[str] = [ex.id for ex in warmup_pool_examples]
     code_dataset = is_code_dataset(dataset, base_examples)
 
     if repeat_queries < 1:
@@ -1842,6 +2339,18 @@ def run_experiment(
             )
         )
 
+    warmup_pool_requests: List[CAGExample] = [
+        CAGExample(
+            id=f"{ex.id}__warmup_pool{idx}",
+            question=ex.question,
+            context=ex.context,
+            answer=ex.answer,
+            metadata={**(ex.metadata or {}), "warmup": True, "warmup_pool": True,
+                      "repeat_index": None},
+        )
+        for idx, ex in enumerate(warmup_pool_examples)
+    ]
+
     measured_examples: List[CAGExample] = []
     for rep in range(repeat_queries):
         for ex in base_examples:
@@ -1858,7 +2367,8 @@ def run_experiment(
 
     print(
         f"Loaded {len(base_examples)} base examples "
-        f"({len(warmup_examples)} warmup requests, {len(measured_examples)} measured requests)"
+        f"({len(warmup_examples)} warmup requests, {len(measured_examples)} measured requests"
+        f"{f', {len(warmup_pool_requests)} disjoint-pool warm-up requests' if warmup_pool_requests else ''})"
     )
 
     if workload_mode == "open_loop":
@@ -1867,9 +2377,11 @@ def run_experiment(
         # requested, primes the caches closed-loop single-shot -- identical to
         # the "single" mode warmup pass.
         warmup_work_units = [[ex] for ex in warmup_examples]
+        warmup_pool_work_units = [[ex] for ex in warmup_pool_requests]
         work_units = []
     else:
         warmup_work_units = build_work_units(warmup_examples)
+        warmup_pool_work_units = build_work_units(warmup_pool_requests)
         work_units = build_work_units(measured_examples)
 
     # IR index / retriever (for RAG/Redis/Hybrid baselines, or any baseline when
@@ -1939,6 +2451,7 @@ def run_experiment(
                 embedding_model=baseline_config.embedding_model,
                 rebuild=bool(baseline_config.ir_rebuild),
                 device="cpu",
+                embedding_revision=embedding_revision,
             )
             print(f"IR index ready at: {index_dir}")
         # Lexical (BM25) leg over the SAME chunk store (charter sec. 7.2;
@@ -1976,6 +2489,15 @@ def run_experiment(
                 f"({deleted_keys} keys deleted)"
             )
         print("Redis cache connected")
+    # Backlog F5b: the corpus fingerprint every retrieval-cache key folds,
+    # derived ONCE from the dense index that serves this run (the same hash
+    # ensure_ir_index checks). Refuses (typed) when a cache is active but the
+    # dense index exposes no corpus; None when no cache or no dense index
+    # (the dense path then refuses per query if a cache is ever consulted).
+    retrieval_corpus_sha1: Optional[str] = None
+    if retrieval_cache is not None and ir_index is not None:
+        retrieval_corpus_sha1 = corpus_sha1_of_index(ir_index)
+        print(f"Retrieval cache corpus fingerprint: {retrieval_corpus_sha1[:12]} (F5b)")
     # Optional text compressor (compressed_rag baseline / --compress-method)
     context_compressor = None
     if baseline_config.compress_method:
@@ -1988,6 +2510,19 @@ def run_experiment(
     reranker = None
     if baseline_config.use_faiss and reranker_model:
         reranker = build_reranker(reranker_model, reranker_device)
+
+    # ADR-0104 belt-and-braces: the definitive check above resolved the pool
+    # from the arm's config; the built reranker instance must agree.
+    if _rerank_pool is not None and reranker is None:
+        raise RerankPoolError(
+            f"--rerank-pool {_rerank_pool} resolved against the arm config but "
+            "no reranker was built (driver invariant violated, ADR-0104)"
+        )
+    if _rerank_pool is not None:
+        print(
+            f"RERANK POOL (ADR-0104): dense pool_k={_rerank_pool} reranked whole "
+            f"by {reranker_model}, served_k={baseline_config.top_k_retrieval}"
+        )
 
     # Stage-tagged candidate-pool size for the non-dense retrievers (charter
     # sec. 8.2: pool recall@100 default), never below the served top_k.
@@ -2125,6 +2660,7 @@ def run_experiment(
         retrieval_top1_score = None
         retrieved_doc_ids: List[str] = []
         retrieval_reranked = False
+        retrieval_pool_size = None  # ADR-0104 reranked candidate-pool size (dense path); None = no pool
         retrieval_stages = None    # stage-tagged pool/reranked/served ranks (non-dense retrievers)
         evidence_version = None    # staleness baseline: "v0" (stale) | "v1" (fresh)
         served_from_cache = None   # staleness baseline: warm-cache hit flag
@@ -2172,37 +2708,24 @@ def run_experiment(
             if ir_index is None:
                 raise RuntimeError("IR index not initialized for retrieval-backed baseline")
 
-            hits_payload = None
-            if retrieval_cache is not None:
-                hits_payload = retrieval_cache.get(
-                    dataset=dataset,
-                    embedding_model=baseline_config.embedding_model,
-                    top_k=baseline_config.top_k_retrieval,
-                    query=question,
-                )
-
-            if hits_payload:
-                retrieval_cached = True
-                hits = [
-                    IRHit(doc_id=h["doc_id"], score=float(h.get("score", 0.0)))
-                    for h in hits_payload
-                    if "doc_id" in h
-                ]
-            else:
-                hits = ir_index.search(question, top_k=baseline_config.top_k_retrieval)
-                if retrieval_cache is not None:
-                    retrieval_cache.set(
-                        dataset=dataset,
-                        embedding_model=baseline_config.embedding_model,
-                        top_k=baseline_config.top_k_retrieval,
-                        query=question,
-                        hits=[{"doc_id": h.doc_id, "score": h.score} for h in hits],
-                        ttl_seconds=redis_ttl_seconds,
-                    )
-
-            if reranker is not None and hits:
-                hits = reranker.rerank(question, hits, ir_index)
-                retrieval_reranked = True
+            # Dense path: search (pool or top_k), optional Redis retrieval
+            # cache, rerank, serve (ADR-0104 ordering lives in dense_retrieve).
+            _dense = dense_retrieve(
+                question,
+                ir_index=ir_index,
+                top_k=int(baseline_config.top_k_retrieval),
+                reranker=reranker,
+                rerank_pool=_rerank_pool,
+                retrieval_cache=retrieval_cache,
+                dataset=dataset,
+                embedding_model=baseline_config.embedding_model,
+                ttl_seconds=redis_ttl_seconds,
+                corpus_sha1=retrieval_corpus_sha1,
+            )
+            hits = _dense.hits
+            retrieval_cached = _dense.cached
+            retrieval_reranked = _dense.reranked
+            retrieval_pool_size = _dense.pool_size
 
             retrieved_doc_ids = [h.doc_id for h in hits]
             retrieval_top1_score = hits[0].score if hits else 0.0
@@ -2309,6 +2832,8 @@ def run_experiment(
             "retrieval_top1_score": retrieval_top1_score,
             "retrieved_doc_ids": retrieved_doc_ids,
             "retrieval_reranked": retrieval_reranked,
+            # ADR-0104: the reranked candidate-pool size (None = no pool).
+            "retrieval_pool_size": retrieval_pool_size,
             # Non-dense retrievers only (None on the untouched dense path):
             # the label plus the charter sec. 8.2 stage-tagged rank lists.
             "retriever": retriever if retrieval_stages is not None else None,
@@ -2398,6 +2923,10 @@ def run_experiment(
             # Audit 2026-07-16 M5: official SQuAD v2 F1/EM = max over ALL gold answers;
             # loaders that provide them store the deduplicated list in metadata.
             all_answers=(example.metadata or {}).get("all_answers"),
+            # Backlog A8: the loader flag is AUTHORITATIVE; the scorer refuses a
+            # row whose flag disagrees with its gold (verified up front by
+            # verify_answerability_labels, so this can only re-confirm).
+            is_impossible=is_impossible_flag(example.metadata),
         )
         _quality_row = quality_metrics.to_dict()
 
@@ -2437,9 +2966,10 @@ def run_experiment(
         # question_to_block keyed by the base example id (repeat/warmup suffixes
         # stripped). None outside manifest runs.
         _base_id = example.id.split("__rep")[0].split("__warmup")[0]
-        group_id = (
-            example.metadata.get("corpus_block") if isinstance(example.metadata, dict) else None
+        _example_meta: Dict[str, Any] = (
+            example.metadata if isinstance(example.metadata, dict) else {}
         )
+        group_id = _example_meta.get("corpus_block")
         if group_id is None and _manifest is not None:
             group_id = (_manifest.get("question_to_block") or {}).get(_base_id)
 
@@ -2495,6 +3025,18 @@ def run_experiment(
             # a served cache hit, its evidence version, and whether the answer was grounded.
             "served_from_cache": meta.get("served_from_cache"),
             "evidence_version": meta.get("evidence_version"),
+            # ADR-0106 corpus labels (None outside corpus-prefix mode: absence
+            # stays absence): the by-construction in-corpus label, the B12 rung
+            # budget (None at the full budget) and the served block's tokens.
+            "in_corpus": _example_meta.get("in_corpus"),
+            "corpus_rung": _example_meta.get("corpus_rung"),
+            "corpus_tokens": _example_meta.get("corpus_tokens"),
+            # ADR-0114 (backlog A2): the loader-resolved item labels, persisted
+            # VERBATIM (absent stays None; never coerced) so the three-clause
+            # Qasper predicate (src/analysis/predicate.py) keys on them and
+            # refuses a mislabeled row instead of scoring a guess.
+            "answer_type": _example_meta.get("answer_type"),
+            "is_impossible": _example_meta.get("is_impossible"),
             # None (not False) when grounding is N/A -- abstentions and unscored rows are
             # MISSING data for this flag, not "ungrounded"; False would mislabel a correct
             # "Don't know." as a grounding failure in the staleness curve.
@@ -2507,6 +3049,8 @@ def run_experiment(
             "retrieval_rank": meta.get("retrieval_rank"),  # graded rank for MRR (fix #5-C)
             "retrieval_cached": meta["retrieval_cached"],
             "retrieval_reranked": meta["retrieval_reranked"],
+            # ADR-0104: candidate-pool size reranked before serving (None = no pool).
+            "retrieval_pool_size": meta.get("retrieval_pool_size"),
             "retrieved_doc_ids": ";".join(meta["retrieved_doc_ids"]) if meta["retrieved_doc_ids"] else "",
             "compression_ratio": (meta.get("compression_stats") or {}).get("compression_ratio"),
             "compression_applied": (meta.get("compression_stats") or {}).get("compression_applied"),
@@ -2572,6 +3116,14 @@ def run_experiment(
                 "sum_token_logprob": sum_token_logprob,
                 "served_from_cache": meta.get("served_from_cache"),
                 "evidence_version": meta.get("evidence_version"),
+                # ADR-0106: the abstention scorer needs the in-corpus label.
+                "in_corpus": _example_meta.get("in_corpus"),
+                "corpus_rung": _example_meta.get("corpus_rung"),
+                # ADR-0114: the loader-resolved answer_type / is_impossible ride
+                # the evidence row (verbatim) so build_predicate_table's join can
+                # select the Qasper clause per row without re-reading the dataset.
+                "answer_type": _example_meta.get("answer_type"),
+                "is_impossible": _example_meta.get("is_impossible"),
                 "grounding_score": _quality_row.get("grounding_score"),
                 "grounded": result.get("grounded"),
                 "hallucinated_spans": getattr(quality_metrics, "hallucinated_spans", None),
@@ -2593,6 +3145,12 @@ def run_experiment(
             if meta.get("retrieval_stages") is not None:
                 _evidence["retriever"] = meta.get("retriever")
                 _evidence["retrieval_stages"] = meta.get("retrieval_stages")
+            # ADR-0104 rerank-pool provenance (pooled dense cells only, so
+            # legacy dense evidence rows keep their exact schema): the pool
+            # size reranked before truncation plus the reranked flag.
+            if meta.get("retrieval_pool_size") is not None:
+                _evidence["retrieval_pool_size"] = meta.get("retrieval_pool_size")
+                _evidence["retrieval_reranked"] = meta.get("retrieval_reranked")
         except Exception as _ev_exc:
             # Row construction failed: the loss is identical to a write failure
             # from the evidence chain's point of view -- count it the same way.
@@ -2742,6 +3300,10 @@ def run_experiment(
                                           turn_index=0, settle_ms=settle_ms)
                         elif response.error:
                             print(f"[warmup] Request {example.id} failed: {response.error}")
+                    except (AnswerabilityMismatchError, AnswerabilityFlagError):
+                        # A8: a label defect is never a per-query drop (it would
+                        # hide in n_dropped_record); it fails the cell.
+                        raise
                     except Exception as _ex:
                         if collect_results:
                             consort_counters["n_dropped_record"] += 1
@@ -2836,6 +3398,8 @@ def run_experiment(
                         batch_id=1, turn_index=0, settle_ms=0.0,
                         open_loop_record=record,
                     )
+                except (AnswerabilityMismatchError, AnswerabilityFlagError):
+                    raise  # A8: a label defect fails the cell, never a silent drop
                 except Exception as _ex:
                     consort_counters["n_dropped_record"] += 1
                     print(f"[open-loop] record failed for {example.id}: {_ex}; skipping row")
@@ -2860,6 +3424,28 @@ def run_experiment(
             f"{report.n_errors} errors, {report.n_dropped} dropped "
             f"(measured rows after warmup trim: {len(kept)})"
         )
+
+    # ADR-0102 cold-start warm-up: served right after the per-trial cache
+    # reset (main's trial loop) and BEFORE the measured stage, with
+    # collect_results=False so nothing reaches results rows, requests.jsonl
+    # or qa_evidence.jsonl. Only the summary line + the ids' sha256 persist.
+    warmup_pool_ids_sha256_value: Optional[str] = None
+    if warmup_pool_work_units:
+        warmup_pool_ids_sha256_value = warmup_pool_ids_sha256(warmup_pool_ids)
+        print(
+            f"\n[warmup-pool] trial {warmup_pool_trial}: serving "
+            f"{len(warmup_pool_requests)} disjoint-pool warm-up requests "
+            f"(ADR-0102; ids sha256 {warmup_pool_ids_sha256_value[:12]}; discarded)..."
+        )
+        execute_work_units(
+            warmup_pool_work_units, collect_results=False, stage_name="WarmupPool"
+        )
+        print(
+            f"[warmup-pool] trial {warmup_pool_trial}: served "
+            f"{len(warmup_pool_requests)} disjoint requests, results discarded "
+            f"(ids sha256 {warmup_pool_ids_sha256_value})"
+        )
+        print("-" * 70)
 
     if warmup_work_units:
         print(
@@ -3286,6 +3872,7 @@ def run_experiment(
             "cache_rate": cache_rate,
             "top_k": baseline_config.top_k_retrieval,
             "embedding_model": baseline_config.embedding_model,
+            "embedding_revision": embedding_revision,
             "reranker_model": baseline_config.reranker_model,
         }
 
@@ -3425,6 +4012,23 @@ def run_experiment(
             "num_queries": len(base_examples),
             "num_measured_requests": len(measured_examples),
             "num_warmup_requests": len(warmup_examples),
+            # Backlog A6/F6 (review 2026-09-17): whether the dense index was
+            # served stale (pre-prefix) under CAGE_ALLOW_STALE_INDEX. False
+            # when no dense index was used; campaign_session refuses True.
+            "stale_index_opt_in": (
+                bool(ir_index.stale_index_opt_in) if ir_index is not None else False
+            ),
+            # Backlog A5: the dense encoder revision as PINNED for this run
+            # (None when unpinned); the served weights were loaded at it.
+            "embedding_revision": embedding_revision,
+            # A9 per-row N provenance (manifest runs only, so non-manifest
+            # metrics.json schemas stay untouched): which trial, how many ids
+            # it carries and the measured prefix length (= num_queries).
+            **(
+                {"query_manifest": _manifest_provenance}
+                if _manifest_provenance is not None
+                else {}
+            ),
             "max_tokens": max_tokens,
             "timestamp": timestamp,
             "seed": seed,
@@ -3519,6 +4123,32 @@ def run_experiment(
             "t_start": measured_window_t_start,
             "t_end": measured_window_t_end,
         }
+    # ADR-0102 warm-up pool provenance: the count, the served count and the
+    # sha256 of the drawn ids (never the ids' results). Only present when the
+    # pool is on, so pre-ADR metrics.json schemas stay untouched.
+    if warmup_pool_queries > 0:
+        experiment_summary["warmup_pool"] = {
+            "num_queries": warmup_pool_queries,
+            "num_requests": len(warmup_pool_requests),
+            "trial_ordinal": warmup_pool_trial,
+            "ids_sha256": warmup_pool_ids_sha256_value,
+            "disjoint_from_measured": True,
+            # Repair 2026-09-16: disjointness is enforced by id AND by served
+            # context (paragraph / paper fingerprints); the exclusion counts
+            # are the measured evidence, not an assertion by construction.
+            "disjoint_ids": True,
+            "disjoint_contexts": True,
+            "candidates": len(_warmup_candidates),
+            "excluded_by_id": _warmup_split.excluded_by_id,
+            "excluded_by_context": _warmup_split.excluded_by_context,
+            "included_in_metrics": False,
+            "adr": "ADR-0102",
+        }
+    # ADR-0102 cold-start provenance (campaign mode): the per-window reset
+    # record main() obtained from _reset_prefix_cache (mechanism, endpoint,
+    # quiescence probe, verified flag). Absent when no reset ran.
+    if cold_start is not None:
+        experiment_summary["cold_start"] = dict(cold_start)
 
     write_json_atomic(metrics_file, experiment_summary)
     write_json_atomic(stable_metrics_file, experiment_summary)
@@ -3555,7 +4185,285 @@ def run_experiment(
     return experiment_summary
 
 
-def _reset_prefix_cache(api_base: str, *, backend: str = "vllm", model: str = "") -> None:
+class CacheResetError(RuntimeError):
+    """A per-window cache reset failed in campaign mode (ADR-0102).
+
+    A window that starts warm when the plan says cold is a mislabeled row, so
+    campaign mode refuses instead of warning. The pilot path keeps the
+    historical warning.
+    """
+
+
+class WarmupPoolError(ValueError):
+    """The ADR-0102 disjoint warm-up pool cannot be realized as specified."""
+
+
+def warmup_pool_ids_sha256(ids: List[str]) -> str:
+    """sha256 over the drawn warm-up ids (in served order), one id per line."""
+    return hashlib.sha256("\n".join(str(i) for i in ids).encode("utf-8")).hexdigest()
+
+
+#: ADR-0102 (repair 2026-09-16): in the non-manifest path the warm-up
+#: candidate slate is loaded BEYOND the measured set as W_warm times this
+#: multiplier, so the context-disjointness filter (a candidate sharing a
+#: measured paragraph or paper is excluded) can still yield W_warm examples
+#: on datasets where several questions share one paragraph (SQuAD v2). The
+#: measured set itself is never touched by the slate size.
+WARMUP_POOL_CANDIDATE_MULTIPLIER: int = 4
+
+
+@dataclass(frozen=True)
+class WarmupCandidateSplit:
+    """ADR-0102: the candidate slate partitioned for the warm-up draw."""
+
+    disjoint: List[CAGExample]
+    excluded_by_id: int
+    excluded_by_context: int
+
+
+def verify_answerability_labels(examples: Sequence[CAGExample]) -> int:
+    """Loader-boundary answerability check (backlog A8, Tier A; review 2026-09-17).
+
+    For every example carrying ``metadata["is_impossible"]`` the flag must be a
+    bool (``AnswerabilityFlagError`` otherwise) and must AGREE with the gold
+    (``True`` iff every gold in ``all_answers`` when present, else ``answer``,
+    is empty; ``AnswerabilityMismatchError`` otherwise). The rule is the
+    scorer's own (``src.evaluation.quality.resolve_answerability``), applied
+    BEFORE any engine work so a loader change that flips a row's answerability
+    refuses the cell up front instead of surfacing as a per-query drop or as
+    a wrongly scored row. Returns the number of flagged (verified) examples;
+    examples without the key (answerable-only loaders) are not counted.
+    """
+    verified = 0
+    for ex in examples:
+        flag = is_impossible_flag(ex.metadata)
+        if flag is None:
+            continue
+        all_answers = (ex.metadata or {}).get("all_answers")
+        if all_answers is not None and not isinstance(all_answers, list):
+            raise AnswerabilityFlagError(all_answers)
+        try:
+            resolve_answerability(ex.answer or "", all_answers, flag)
+        except AnswerabilityMismatchError as exc:
+            raise AnswerabilityMismatchError(
+                exc.is_impossible, exc.reference_no_answer,
+                f"{ex.id}: {exc.reference_answer}", exc.all_answers,
+            ) from exc
+        verified += 1
+    return verified
+
+
+def warmup_context_keys(examples: List[CAGExample]) -> Set[str]:
+    """ADR-0102: fingerprints of the SERVED context of ``examples``.
+
+    One ``stable_text_id`` per non-empty context paragraph (the same doc-id
+    hashing the IR corpus uses) plus ``paper:<paper_id>`` when the loader
+    groups questions by source document (QASPER). Computed on the RAW loader
+    examples, before any corpus-block transform, so it names the gold
+    paragraphs a warm-up request would share with a measured prompt.
+    """
+    keys: Set[str] = set()
+    for ex in examples:
+        for paragraph in (ex.context or []):
+            if paragraph:
+                keys.add(stable_text_id(paragraph))
+        paper = (ex.metadata or {}).get("paper_id")
+        if paper:
+            keys.add(f"paper:{paper}")
+    return keys
+
+
+def partition_warmup_candidates(
+    candidates: List[CAGExample],
+    *,
+    measured_ids: Set[str],
+    measured_context_keys: Set[str],
+) -> WarmupCandidateSplit:
+    """ADR-0102: keep the candidates disjoint from the measured set by id
+    AND by served context; count what each filter excluded (the counts are
+    the measured evidence persisted in metrics.json['warmup_pool'])."""
+    disjoint: List[CAGExample] = []
+    seen: Set[str] = set()
+    by_id = 0
+    by_context = 0
+    for ex in candidates:
+        if ex.id in seen:
+            continue
+        seen.add(ex.id)
+        if ex.id in measured_ids:
+            by_id += 1
+            continue
+        if warmup_context_keys([ex]) & measured_context_keys:
+            by_context += 1
+            continue
+        disjoint.append(ex)
+    return WarmupCandidateSplit(
+        disjoint=disjoint, excluded_by_id=by_id, excluded_by_context=by_context
+    )
+
+
+def draw_warmup_pool(
+    candidates: List[CAGExample],
+    *,
+    measured_ids: Set[str],
+    measured_context_keys: Set[str],
+    n: int,
+    seed: int,
+    trial: int,
+) -> List[CAGExample]:
+    """ADR-0102: draw ``n`` warm-up examples DISJOINT from the measured set.
+
+    Deterministic: the draw is a seeded sample (``random.Random`` keyed by the
+    run seed AND the trial ordinal) over the candidates in loader order, with
+    any candidate whose id is in ``measured_ids`` OR whose served context
+    (paragraph / paper fingerprint, ``warmup_context_keys``) intersects
+    ``measured_context_keys`` filtered out first: a measured query, or a
+    measured PREFIX, must never be served under the warm-up label (that
+    would cache-warm the measured set under a cold label). Refuses with a
+    typed ``WarmupPoolError`` when fewer than ``n`` disjoint examples exist:
+    a short pool would silently warm up on fewer requests than the
+    registered W_warm.
+    """
+    import random as _random
+
+    if n < 0:
+        raise WarmupPoolError(f"warm-up pool size must be >= 0 (got {n})")
+    if n == 0:
+        return []
+    split = partition_warmup_candidates(
+        candidates,
+        measured_ids=measured_ids,
+        measured_context_keys=measured_context_keys,
+    )
+    if len(split.disjoint) < n:
+        raise WarmupPoolError(
+            f"warm-up pool needs {n} examples disjoint from the measured set but "
+            f"only {len(split.disjoint)} exist (candidates={len(candidates)}, "
+            f"excluded by id={split.excluded_by_id}, excluded by shared "
+            f"context={split.excluded_by_context}, measured={len(measured_ids)}): "
+            f"load a larger split or lower --warmup-pool-queries (ADR-0102 W_warm)"
+        )
+    rng = _random.Random(f"cage-warmup-pool:{int(seed)}:{int(trial)}")
+    return rng.sample(split.disjoint, n)
+
+
+#: ADR-0102 (repair 2026-09-16): the Prometheus gauge, per server backend,
+#: that counts in-flight requests. vLLM answers HTTP 200 to
+#: /reset_prefix_cache even when its block pool DECLINES to reset (blocks
+#: still held by in-flight requests), so the strict campaign reset first
+#: waits for this gauge to read 0 and records the verification in
+#: metrics.json['cold_start']. A backend without a registered gauge (LMDeploy,
+#: the ADR's open VERIFY-LIVE item) is recorded as unverified, loudly, never
+#: assumed verified.
+COLD_START_RUNNING_GAUGE: Dict[str, str] = {
+    "vllm": "vllm:num_requests_running",
+    "sglang": "sglang:num_running_reqs",
+}
+#: ADR-0102: how long the strict reset waits for in-flight requests to drain
+#: before refusing the window, and the poll interval between probes.
+COLD_START_QUIESCE_TIMEOUT_S: float = 30.0
+COLD_START_QUIESCE_POLL_S: float = 0.5
+
+
+def parse_running_requests(metrics_text: str, gauge: str) -> Optional[int]:
+    """Sum every sample of ``gauge`` in a Prometheus text exposition (labeled
+    or bare, optional trailing timestamp ignored); None when absent."""
+    total = 0.0
+    found = False
+    for raw in metrics_text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith(gauge + "{"):
+            rest = line[line.index("}") + 1:] if "}" in line else ""
+        elif line.startswith(gauge + " "):
+            rest = line[len(gauge):]
+        else:
+            continue
+        tokens = rest.split()
+        if not tokens:
+            continue
+        try:
+            total += float(tokens[0])
+        except ValueError:
+            continue
+        found = True
+    return int(round(total)) if found else None
+
+
+def _probe_running_requests(api_base: str, backend: str) -> Tuple[Optional[int], str]:
+    """GET <api_base>/metrics and read the backend's running-requests gauge.
+
+    Returns (count, "ok") or (None, reason) when the backend has no registered
+    gauge, the endpoint is unreachable, or the gauge is absent.
+    """
+    gauge = COLD_START_RUNNING_GAUGE.get(backend)
+    if gauge is None:
+        return None, f"no running-requests gauge registered for backend {backend!r}"
+    import urllib.request
+
+    url = api_base.rstrip("/") + "/metrics"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+    except Exception as e:  # any transport/HTTP failure is one unreadable probe
+        return None, f"GET {url} failed: {e}"
+    value = parse_running_requests(text, gauge)
+    if value is None:
+        return None, f"gauge {gauge} absent from {url}"
+    return value, "ok"
+
+
+def _await_quiescence(api_base: str, backend: str) -> Dict[str, Any]:
+    """ADR-0102 strict reset: wait until the engine reports zero in-flight
+    requests (bounded by COLD_START_QUIESCE_TIMEOUT_S), refusing with
+    ``CacheResetError`` when it never drains. Returns the probe record; an
+    unreadable probe is recorded (readable=False, reason) and WARNED, so the
+    window's cold_start record says ``verified: False`` rather than lying.
+    """
+    gauge = COLD_START_RUNNING_GAUGE.get(backend)
+    first, reason = _probe_running_requests(api_base, backend)
+    probe: Dict[str, Any] = {
+        "gauge": gauge,
+        "url": api_base.rstrip("/") + "/metrics",
+        "readable": first is not None,
+        "reason": reason,
+        "running_at_first_probe": first,
+        "running_before_flush": first,
+        "waited_s": 0.0,
+    }
+    if first is None:
+        print(
+            f"[cache] WARNING: cannot verify {backend} quiescence before the "
+            f"reset ({reason}); this window's cold_start record is UNVERIFIED "
+            "(ADR-0102)"
+        )
+        return probe
+    running: Optional[int] = first
+    t0 = time.monotonic()
+    deadline = t0 + COLD_START_QUIESCE_TIMEOUT_S
+    while running is not None and running > 0 and time.monotonic() < deadline:
+        time.sleep(COLD_START_QUIESCE_POLL_S)
+        running, reason = _probe_running_requests(api_base, backend)
+        if running is None:
+            probe["readable"] = False
+            probe["reason"] = reason
+    probe["waited_s"] = round(time.monotonic() - t0, 3)
+    probe["running_before_flush"] = running
+    if running is not None and running > 0:
+        raise CacheResetError(
+            f"{backend} still reports {running} in-flight request(s) "
+            f"({gauge}) after waiting {probe['waited_s']}s; a reset issued now "
+            "may be declined by the engine (blocks still held) while answering "
+            "200, so campaign mode refuses to serve this window under a "
+            "cold-start label (ADR-0102)"
+        )
+    return probe
+
+
+def _reset_prefix_cache(
+    api_base: str, *, backend: str = "vllm", model: str = "", strict: bool = False
+) -> Dict[str, Any]:
     """Flush the serving engine's prefix/KV cache between trials (cold-start-per-trial).
 
     Migrated to the adapter flush seam (ADR-0007): when the backend's adapter
@@ -3565,8 +4473,23 @@ def _reset_prefix_cache(api_base: str, *, backend: str = "vllm", model: str = ""
     fallback for backends without an adapter flush capability (e.g. LMDeploy,
     which documents none, or unknown backends) -- behavior-preserving for
     them. Failures WARN loudly but never abort the trial loop, matching the
-    historical helper.
+    historical helper, UNLESS ``strict`` (campaign mode, ADR-0102): then a
+    failed reset raises ``CacheResetError`` because a window that starts
+    warm when the plan says cold is a mislabeled row. In strict mode the
+    flush is preceded by the quiescence probe (``_await_quiescence``): an
+    HTTP 200 alone does not prove the engine reset (vLLM answers 200 while
+    declining), so the record returned here, persisted by the campaign
+    window as metrics.json['cold_start'], carries ``verified`` = the probe
+    read zero in-flight requests right before the flush.
     """
+    record: Dict[str, Any] = {
+        "backend": backend,
+        "endpoint": None,
+        "mechanism": None,
+        "quiescence_probe": None,
+        "verified": False,
+        "adr": "ADR-0102",
+    }
     adapter_cls = {
         "vllm": VLLMAdapter,
         "sglang": SGLangAdapter,
@@ -3583,6 +4506,12 @@ def _reset_prefix_cache(api_base: str, *, backend: str = "vllm", model: str = ""
         resolved_api_base = (
             os.getenv(f"CAGE_{env_key}_API_BASE", "").strip() or api_base
         )
+    if strict:
+        record["quiescence_probe"] = _await_quiescence(resolved_api_base, backend)
+
+    def _verified() -> bool:
+        probe = record["quiescence_probe"]
+        return bool(probe and probe["readable"] and probe["running_before_flush"] == 0)
 
     if adapter_cls is not None:
         try:
@@ -3602,15 +4531,27 @@ def _reset_prefix_cache(api_base: str, *, backend: str = "vllm", model: str = ""
                     f"[cache] flushed {backend} cache via adapter.flush_cache() "
                     f"({caps['flush_endpoint']})"
                 )
-                return
+                record["endpoint"] = caps["flush_endpoint"]
+                record["mechanism"] = "adapter"
+                record["verified"] = _verified()
+                return record
             # No declared flush endpoint -> fall through to the legacy path.
         except Exception as e:
             # The adapter targets the same endpoint the legacy path would;
-            # retrying raw would fail identically, so warn and return.
+            # retrying raw would fail identically, so warn and return
+            # (or refuse, in campaign mode).
+            if strict:
+                raise CacheResetError(
+                    f"could not reset the {backend} cache before this window "
+                    f"({e}); campaign mode refuses to serve a window under a "
+                    f"cold-start label from an unflushed cache (ADR-0102). For "
+                    f"vLLM, start the server with VLLM_SERVER_DEV_MODE=1 to "
+                    f"enable /reset_prefix_cache."
+                ) from e
             print(f"[cache] WARNING: could not reset prefix cache ({e}). "
                   f"For vLLM, start the server with VLLM_SERVER_DEV_MODE=1 to "
                   f"enable /reset_prefix_cache.")
-            return
+            return record
 
     # Legacy fallback (pre-ADR-0007 behavior, kept verbatim): raw POST to the
     # vLLM dev-mode endpoint.
@@ -3620,9 +4561,19 @@ def _reset_prefix_cache(api_base: str, *, backend: str = "vllm", model: str = ""
         req = urllib.request.Request(url, method="POST")
         urllib.request.urlopen(req, timeout=10)
         print(f"[cache] reset prefix cache via {url}")
+        record["endpoint"] = "/reset_prefix_cache"
+        record["mechanism"] = "legacy"
+        record["verified"] = _verified()
     except Exception as e:
+        if strict:
+            raise CacheResetError(
+                f"could not reset the {backend} cache before this window via "
+                f"{url} ({e}); campaign mode refuses to serve a window under a "
+                f"cold-start label from an unflushed cache (ADR-0102)."
+            ) from e
         print(f"[cache] WARNING: could not reset prefix cache ({e}). "
               f"Start vLLM with VLLM_SERVER_DEV_MODE=1 to enable /reset_prefix_cache.")
+    return record
 
 
 def main():
@@ -3702,6 +4653,17 @@ def main():
         help="cag_true mode: pack gold paragraphs into one shared corpus block of at most "
              "this many tokens and serve it as every query's context (true CAG, Chan et "
              "al. 2412.15605). 0 = off. Equivalent to CAGE_CORPUS_PREFIX_BUDGET.",
+    )
+    parser.add_argument(
+        "--corpus-rung",
+        type=int,
+        default=None,
+        help="B12 corpus-trunc rung (ADR-0106, charter §7.7(d)): serve the query "
+             "manifest's truncation rung of this many tokens (must equal "
+             "--corpus-prefix-budget and exist in the manifest's trunc_rungs "
+             "ladder, else the run REFUSES: backlog A4). Every measured query is "
+             "served against the rung block and labeled in_corpus/out-of-corpus; "
+             "nothing is dropped. Equivalent to CAGE_CORPUS_RUNG.",
     )
     parser.add_argument(
         "--order-by-context",
@@ -3928,6 +4890,14 @@ def main():
         help="SentenceTransformers model used for retrieval embeddings",
     )
     parser.add_argument(
+        "--embedding-revision",
+        default=None,
+        help="Backlog A5: HF commit the --embedding-model weights are pinned to. "
+             "The campaign driver passes the freeze slot's revision on every "
+             "retrieval cell; the encoder loads at it and a persisted index built "
+             "at another revision is rebuilt. Unset = unpinned (pilot use only).",
+    )
+    parser.add_argument(
         "--reranker-model",
         default="BAAI/bge-reranker-large",
         help="Optional cross-encoder reranker model (set to 'none' to disable)",
@@ -3936,6 +4906,16 @@ def main():
         "--reranker-device",
         default="cpu",
         help="Device for reranker model (e.g., cpu or cuda)",
+    )
+    parser.add_argument(
+        "--rerank-pool",
+        type=int,
+        default=None,
+        help="ADR-0104: retrieve a dense candidate POOL of N hits, rerank it "
+             "whole with --reranker-model, then serve --top-k. Unset = legacy "
+             "behavior (rerank exactly the top-k hits). Refused without an "
+             "active reranker, or when N < --top-k. The campaign driver pins "
+             "10 on every ranked-pipeline cell (run_campaign.RERANK_POOL).",
     )
     parser.add_argument(
         "--ir-index-dir",
@@ -4029,7 +5009,20 @@ def main():
         "--warmup-queries",
         type=int,
         default=0,
-        help="Number of warmup queries before measurement (excluded from metrics)",
+        help="Number of warmup queries before measurement (excluded from metrics). "
+             "Replays the MEASURED set (cache-warms it): never for cold-start cells.",
+    )
+    parser.add_argument(
+        "--warmup-pool-queries",
+        type=int,
+        default=0,
+        help="ADR-0102 cold start per window: after every per-trial cache reset "
+             "(campaign mode resets before EVERY trial, trial 1 included) serve N "
+             "requests drawn deterministically (seed + trial ordinal) from examples "
+             "DISJOINT from every trial's measured set (manifest: ids outside every "
+             "trial; otherwise the next N loaded examples). Results are discarded; "
+             "only a summary + the ids' sha256 land in the trial metadata. Refuses "
+             "when fewer than N disjoint examples exist. 0 = off.",
     )
 
     args = parser.parse_args()
@@ -4037,6 +5030,8 @@ def main():
         os.environ["CAGE_SKIP_QUALITY"] = "1"
     if args.corpus_prefix_budget and args.corpus_prefix_budget > 0:
         os.environ["CAGE_CORPUS_PREFIX_BUDGET"] = str(args.corpus_prefix_budget)
+    if args.corpus_rung is not None:
+        os.environ["CAGE_CORPUS_RUNG"] = str(args.corpus_rung)
     if args.order_by_context:
         os.environ["CAGE_ORDER_BY_CONTEXT"] = "1"
     if args.query_manifest:
@@ -4086,6 +5081,7 @@ def main():
             backend=args.backend,
             top_k=top_k_value,
             embedding_model=embedding_model,
+            embedding_revision=args.embedding_revision,
             ir_index_dir=args.ir_index_dir,
             rebuild_ir_index=args.rebuild_ir_index,
             retriever=args.retriever,
@@ -4108,6 +5104,7 @@ def main():
             routing_switch_at=args.routing_switch_at,
             reranker_model=reranker_model,
             reranker_device=args.reranker_device,
+            rerank_pool=args.rerank_pool,
             truncate_prompt_tokens=args.truncate_prompt_tokens,
             max_context_chars=args.max_context_chars,
             max_context_docs=args.max_context_docs,
@@ -4122,6 +5119,8 @@ def main():
             compress_ratio=args.compress_ratio,
             kv_cache_dtype=args.kv_cache_dtype,
             vllm_telemetry=args.vllm_telemetry,
+            warmup_pool_queries=args.warmup_pool_queries,
+            warmup_pool_trial=1,
         )
 
     def _run_trials(top_k_value: int) -> None:
@@ -4179,8 +5178,20 @@ def main():
             # Cold-start-per-trial: flush the vLLM prefix cache between trials so each
             # trial measures from a known (empty) cache state. Requires the server to be
             # started with VLLM_SERVER_DEV_MODE=1 (enables POST /reset_prefix_cache).
-            if args.reset_cache_between_trials and trial > 1:
-                _reset_prefix_cache(args.api_base, backend=args.backend, model=args.model)
+            # ADR-0102 (campaign mode): a trial IS a window, so the reset runs before
+            # EVERY window, trial 1 included (the server may still hold the previous
+            # cell's cache), and a failed reset REFUSES (CacheResetError) instead of
+            # warning. The pilot path keeps its historical trial > 1 warning semantics.
+            cold_start_record: Optional[Dict[str, Any]] = None
+            if args.reset_cache_between_trials and (
+                trial > 1 or campaign_session is not None
+            ):
+                cold_start_record = _reset_prefix_cache(
+                    args.api_base,
+                    backend=args.backend,
+                    model=args.model,
+                    strict=campaign_session is not None,
+                )
 
             # Run with different seed for each trial
             run_experiment(
@@ -4196,6 +5207,7 @@ def main():
                 backend=args.backend,
                 top_k=top_k_value,
                 embedding_model=embedding_model,
+                embedding_revision=args.embedding_revision,
                 ir_index_dir=args.ir_index_dir,
                 rebuild_ir_index=args.rebuild_ir_index if trial == 1 else False,
                 retriever=args.retriever,
@@ -4218,6 +5230,7 @@ def main():
                 routing_switch_at=args.routing_switch_at,
                 reranker_model=reranker_model,
                 reranker_device=args.reranker_device,
+                rerank_pool=args.rerank_pool,
                 truncate_prompt_tokens=args.truncate_prompt_tokens,
                 max_context_chars=args.max_context_chars,
                 max_context_docs=args.max_context_docs,
@@ -4233,6 +5246,13 @@ def main():
                 vllm_telemetry=args.vllm_telemetry,
                 campaign_session=campaign_session,
                 campaign_window_ordinal=trial,
+                warmup_pool_queries=args.warmup_pool_queries,
+                warmup_pool_trial=trial,
+                # Campaign-only by contract (the pilot metrics.json stays
+                # byte-identical): the ADR-0102 reset record for this window.
+                cold_start=(
+                    cold_start_record if campaign_session is not None else None
+                ),
             )
 
             # Load trial results. A metrics.json that EXISTS but does not parse is

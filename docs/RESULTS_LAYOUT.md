@@ -51,17 +51,20 @@ Row keys come from `src/analysis/cellspec.py::CellSpec.to_row_key()` — never
 hand-built. Exact format (quoting the implementation):
 
 ```
-arm|retriever|policy|topology|engine|model|family[|r<budget_r>][|lam<rate_frac>]
+arm|retriever|policy|topology|engine|model|family[|r<budget_r>][|lam<rate_frac>][|cb<corpus_budget_tokens>]
 ```
 
 i.e. `"|".join([arm, retriever, policy, topology, engine, model, family])`, then, when
 the pressure coordinates are set, `f"r{budget_r:g}"` and `f"lam{rate_frac:g}"` are
-appended as extra `|`-separated parts. Examples:
+appended as extra `|`-separated parts, and, on a B12 (corpus-trunc) rung cell only,
+`f"cb{corpus_budget_tokens}"` (ADR-0106: one cell per rung of the descending corpus
+ladder; the full 2,800 budget is B3's own cell and never a rung). Examples:
 
 ```
 gold-reuse|none|none|single|vllm|qwen3-14b|F1                       # B2 on the anchor, F1
 retr-fresh|rerank|none|single|sglang|llama-3.3-70b|F2|r0.5|lam0.8   # B6 under pressure, F2
 corpus-reuse|none|evict|single|lmdeploy|llama-3.3-70b|F3|r0.5|lam0.8
+corpus-trunc|none|none|single|vllm|qwen3-14b|F3|r0.5|lam0.8|cb700   # B12 at the 700-token rung
 gold-fresh|none|none|pd|vllm|deepseek-v3|DIST                       # transfer pair, D rung
 ```
 

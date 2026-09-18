@@ -11,7 +11,12 @@ import pytest
 
 from src.analysis.goodput import (
     ATTAINMENT_MIN,
+    CORRECTED_YIELD_ASSUMPTION,
+    CORRECTED_YIELD_ESTIMATOR,
+    CorrectedYield,
+    GoldStratum,
     GoodputError,
+    InstrumentAccuracy,
     RHO_KV_MIN,
     SLOBaseline,
     TPOT_SLO_MULTIPLIER,
@@ -19,10 +24,14 @@ from src.analysis.goodput import (
     WindowMetrics,
     classify_regime,
     corrected_rate,
+    corrected_yield,
+    corrected_yield_from_flags,
+    corrected_yield_from_window,
     evaluate_window,
     find_cliff,
     find_knee,
     label_regime,
+    reweight_gold_sample,
 )
 
 # SLO thresholds under this baseline: ttft <= 1.0 s, tpot <= 0.1 s.
@@ -466,3 +475,435 @@ class TestCorrectedRate:
     ) -> None:
         with pytest.raises(GoodputError):
             corrected_rate(apparent, sensitivity, specificity)
+
+
+# --------------------------------------------------------------------------- #
+# ADR-0115 (backlog A3): corrected serving yield = SLO rate x corrected
+# predicate rate among SLO-met requests. The instrument misclassifies only the
+# predicate half of Y; "timely" is a clock measurement and is never corrected.
+# --------------------------------------------------------------------------- #
+
+# Synthetic SLO-met population with KNOWN truth: 200 timely rows, 120 truly
+# veridical (p = 0.6). Instrument Se = 0.9 (108 TP, 12 FN), Sp = 0.95 (76 TN,
+# 4 FP) applied EXACTLY, so apparent = (108 + 4) / 200 = 0.56 and the
+# Rogan-Gladen correction recovers p exactly: (0.56 + 0.95 - 1) / 0.85 = 0.6.
+_SE, _SP = 0.9, 0.95
+_TRUE_P_GIVEN_SLO = 0.6
+_APPARENT_GIVEN_SLO = 0.56
+
+
+def _synthetic_flags(n_untimely: int = 200) -> tuple[np.ndarray, np.ndarray]:
+    """(timely, instrument_veridical) flags: 200 timely rows carrying the
+    exact confusion counts above, plus ``n_untimely`` slow rows of which half
+    carry an instrument-positive verdict (never part of Y)."""
+    timely = np.array([True] * 200 + [False] * n_untimely)
+    verdict_timely = [True] * 108 + [False] * 12 + [False] * 76 + [True] * 4
+    verdict_slow = [True, False] * (n_untimely // 2) + [True] * (n_untimely % 2)
+    return timely, np.array(verdict_timely + verdict_slow)
+
+
+class TestCorrectedYield:
+    def test_perfect_instrument_recomposes_raw_yield(self) -> None:
+        rec = corrected_yield(
+            slo_rate=0.6,
+            apparent_predicate_rate_given_slo=0.75,
+            sensitivity=1.0,
+            specificity=1.0,
+        )
+        assert isinstance(rec, CorrectedYield)
+        assert rec.yield_raw == pytest.approx(0.45)
+        assert rec.yield_corrected == pytest.approx(rec.yield_raw)
+        assert rec.corrected_predicate_rate_given_slo == pytest.approx(0.75)
+        assert rec.truncated is False
+
+    def test_synthetic_known_truth_is_recovered(self) -> None:
+        rec = corrected_yield(
+            slo_rate=0.5,
+            apparent_predicate_rate_given_slo=_APPARENT_GIVEN_SLO,
+            sensitivity=_SE,
+            specificity=_SP,
+        )
+        assert rec.corrected_predicate_rate_given_slo == pytest.approx(_TRUE_P_GIVEN_SLO)
+        assert rec.yield_corrected == pytest.approx(0.5 * _TRUE_P_GIVEN_SLO)
+        assert rec.yield_raw == pytest.approx(0.5 * _APPARENT_GIVEN_SLO)
+        assert rec.youden_j == pytest.approx(0.85)
+        assert rec.truncated is False
+
+    def test_conditional_correction_differs_from_correcting_the_conjunction(
+        self,
+    ) -> None:
+        # The A3 defect: correcting Y = 0.28 as if the instrument saw the
+        # conjunction gives (0.28 - 0.05) / 0.85 = 0.2706, not the true 0.30.
+        rec = corrected_yield(
+            slo_rate=0.5,
+            apparent_predicate_rate_given_slo=_APPARENT_GIVEN_SLO,
+            sensitivity=_SE,
+            specificity=_SP,
+        )
+        conjunction = corrected_rate(0.5 * _APPARENT_GIVEN_SLO, _SE, _SP)
+        assert conjunction == pytest.approx(0.23 / 0.85)
+        assert rec.yield_corrected == pytest.approx(0.30)
+        assert rec.yield_corrected != pytest.approx(conjunction)
+
+    def test_slo_rate_is_never_corrected(self) -> None:
+        rec = corrected_yield(
+            slo_rate=0.37,
+            apparent_predicate_rate_given_slo=0.5,
+            sensitivity=0.8,
+            specificity=0.9,
+        )
+        assert rec.slo_rate == 0.37
+        assert rec.yield_corrected == pytest.approx(0.37 * rec.corrected_predicate_rate_given_slo)
+
+    def test_truncation_at_zero_is_recorded(self) -> None:
+        rec = corrected_yield(
+            slo_rate=0.9,
+            apparent_predicate_rate_given_slo=0.02,
+            sensitivity=_SE,
+            specificity=_SP,
+        )
+        assert rec.corrected_predicate_rate_given_slo == 0.0
+        assert rec.yield_corrected == 0.0
+        assert rec.truncated is True
+        assert rec.corrected_predicate_rate_given_slo_untruncated == pytest.approx(-0.03 / 0.85)
+
+    def test_truncation_at_one_is_recorded(self) -> None:
+        rec = corrected_yield(
+            slo_rate=0.9,
+            apparent_predicate_rate_given_slo=0.99,
+            sensitivity=_SE,
+            specificity=_SP,
+        )
+        assert rec.corrected_predicate_rate_given_slo == 1.0
+        assert rec.yield_corrected == pytest.approx(0.9)
+        assert rec.truncated is True
+        assert rec.corrected_predicate_rate_given_slo_untruncated > 1.0
+
+    def test_record_carries_inputs_assumption_and_estimator(self) -> None:
+        rec = corrected_yield(
+            slo_rate=0.5,
+            apparent_predicate_rate_given_slo=_APPARENT_GIVEN_SLO,
+            sensitivity=_SE,
+            specificity=_SP,
+        )
+        assert rec.apparent_predicate_rate_given_slo == _APPARENT_GIVEN_SLO
+        assert rec.sensitivity == _SE
+        assert rec.specificity == _SP
+        assert rec.assumption == CORRECTED_YIELD_ASSUMPTION
+        assert rec.estimator == CORRECTED_YIELD_ESTIMATOR
+        assert "ADR-0115" in CORRECTED_YIELD_ESTIMATOR
+        assert "arm" in CORRECTED_YIELD_ASSUMPTION
+        assert "timel" in CORRECTED_YIELD_ASSUMPTION
+        flat = rec.to_flat_dict()
+        assert flat["yield_corrected"] == rec.yield_corrected
+        assert flat["assumption"] == CORRECTED_YIELD_ASSUMPTION
+
+    def test_uninformative_instrument_raises(self) -> None:
+        with pytest.raises(GoodputError, match="uninformative"):
+            corrected_yield(
+                slo_rate=0.5,
+                apparent_predicate_rate_given_slo=0.5,
+                sensitivity=0.5,
+                specificity=0.5,
+            )
+
+    @pytest.mark.parametrize(
+        "slo_rate,apparent,sensitivity,specificity",
+        [
+            (-0.1, 0.5, 0.9, 0.9),
+            (1.1, 0.5, 0.9, 0.9),
+            (math.nan, 0.5, 0.9, 0.9),
+            (0.5, -0.1, 0.9, 0.9),
+            (0.5, 1.1, 0.9, 0.9),
+            (0.5, 0.5, 1.2, 0.9),
+            (0.5, 0.5, 0.9, math.nan),
+            (True, 0.5, 0.9, 0.9),
+            ("0.5", 0.5, 0.9, 0.9),
+        ],
+    )
+    def test_domain_guards_raise(
+        self, slo_rate: object, apparent: float, sensitivity: float, specificity: float
+    ) -> None:
+        with pytest.raises(GoodputError):
+            corrected_yield(
+                slo_rate=slo_rate,  # type: ignore[arg-type]
+                apparent_predicate_rate_given_slo=apparent,
+                sensitivity=sensitivity,
+                specificity=specificity,
+            )
+
+
+class TestCorrectedYieldFromFlags:
+    def test_flags_reproduce_the_synthetic_truth(self) -> None:
+        timely, verdict = _synthetic_flags()
+        rec = corrected_yield_from_flags(
+            timely=timely, veridical=verdict, sensitivity=_SE, specificity=_SP
+        )
+        assert rec.slo_rate == pytest.approx(0.5)
+        assert rec.n_issued == 400
+        assert rec.n_slo_met == 200
+        assert rec.apparent_predicate_rate_given_slo == pytest.approx(_APPARENT_GIVEN_SLO)
+        assert rec.corrected_predicate_rate_given_slo == pytest.approx(_TRUE_P_GIVEN_SLO)
+        assert rec.yield_corrected == pytest.approx(0.30)
+
+    def test_untimely_verdicts_never_enter_the_conditional_rate(self) -> None:
+        timely, verdict = _synthetic_flags(n_untimely=0)
+        a = corrected_yield_from_flags(
+            timely=timely, veridical=verdict, sensitivity=_SE, specificity=_SP
+        )
+        timely_b, verdict_b = _synthetic_flags(n_untimely=200)
+        b = corrected_yield_from_flags(
+            timely=timely_b, veridical=verdict_b, sensitivity=_SE, specificity=_SP
+        )
+        assert a.apparent_predicate_rate_given_slo == pytest.approx(
+            b.apparent_predicate_rate_given_slo
+        )
+        assert a.slo_rate == pytest.approx(1.0)
+        assert b.slo_rate == pytest.approx(0.5)
+
+    def test_perfect_instrument_matches_evaluate_window_yield_frac(self) -> None:
+        frame = _window()
+        m = evaluate_window(frame, BASELINE, duration_s=10.0)
+        timely = np.array([True] * 6 + [False] * 4)
+        rec = corrected_yield_from_flags(
+            timely=timely,
+            veridical=frame["veridical"].to_numpy(dtype=bool),
+            sensitivity=1.0,
+            specificity=1.0,
+        )
+        assert rec.yield_raw == pytest.approx(m.yield_frac)
+        assert rec.yield_corrected == pytest.approx(m.yield_frac)
+        assert rec.slo_rate == pytest.approx(m.goodput_frac)
+
+    def test_accepts_series_and_0_1_ints(self) -> None:
+        rec = corrected_yield_from_flags(
+            timely=pd.Series([1, 1, 0, 1]),
+            veridical=pd.Series([1, 0, 1, 1]),
+            sensitivity=1.0,
+            specificity=1.0,
+        )
+        assert rec.n_slo_met == 3
+        assert rec.apparent_predicate_rate_given_slo == pytest.approx(2 / 3)
+
+    def test_no_slo_met_requests_refused(self) -> None:
+        with pytest.raises(GoodputError, match="no SLO-met"):
+            corrected_yield_from_flags(
+                timely=np.array([False, False]),
+                veridical=np.array([False, False]),
+                sensitivity=_SE,
+                specificity=_SP,
+            )
+
+    def test_length_mismatch_refused(self) -> None:
+        with pytest.raises(GoodputError, match="length"):
+            corrected_yield_from_flags(
+                timely=np.array([True, False]),
+                veridical=np.array([True]),
+                sensitivity=_SE,
+                specificity=_SP,
+            )
+
+    def test_empty_refused(self) -> None:
+        with pytest.raises(GoodputError, match="empty"):
+            corrected_yield_from_flags(
+                timely=np.array([], dtype=bool),
+                veridical=np.array([], dtype=bool),
+                sensitivity=_SE,
+                specificity=_SP,
+            )
+
+    def test_nan_and_non_boolean_flags_refused(self) -> None:
+        with pytest.raises(GoodputError, match="veridical"):
+            corrected_yield_from_flags(
+                timely=np.array([True, True]),
+                veridical=np.array([1.0, np.nan]),
+                sensitivity=_SE,
+                specificity=_SP,
+            )
+        with pytest.raises(GoodputError, match="timely"):
+            corrected_yield_from_flags(
+                timely=np.array([2, 1]),
+                veridical=np.array([True, True]),
+                sensitivity=_SE,
+                specificity=_SP,
+            )
+
+
+class TestCorrectedYieldFromWindow:
+    def test_window_route_matches_flag_route(self) -> None:
+        frame = _window()
+        m = evaluate_window(frame, BASELINE, duration_s=10.0)
+        rec = corrected_yield_from_window(m, sensitivity=_SE, specificity=_SP)
+        timely = np.array([True] * 6 + [False] * 4)
+        via_flags = corrected_yield_from_flags(
+            timely=timely,
+            veridical=frame["veridical"].to_numpy(dtype=bool),
+            sensitivity=_SE,
+            specificity=_SP,
+        )
+        assert rec == via_flags
+        assert rec.slo_rate == pytest.approx(0.6)
+        assert rec.apparent_predicate_rate_given_slo == pytest.approx(4 / 6)
+        assert rec.yield_raw == pytest.approx(m.yield_frac)
+
+    def test_window_with_no_timely_requests_refused(self) -> None:
+        frame = _window()
+        frame.loc[:, "ttft_s"] = 5.0
+        m = evaluate_window(frame, BASELINE, duration_s=10.0)
+        assert m.n_timely == 0
+        with pytest.raises(GoodputError, match="no SLO-met"):
+            corrected_yield_from_window(m, sensitivity=_SE, specificity=_SP)
+
+    def test_non_window_object_refused(self) -> None:
+        with pytest.raises(GoodputError, match="WindowMetrics"):
+            corrected_yield_from_window(
+                {"n_timely": 3},  # type: ignore[arg-type]
+                sensitivity=_SE,
+                specificity=_SP,
+            )
+
+
+# Population with known accuracy for the weighting helper: N = 1000, 600 truly
+# veridical; Se = 0.9 (540 TP, 60 FN), Sp = 0.95 (380 TN, 20 FP). Verdict
+# shares: positive 560 (540 true), negative 440 (60 true). A verdict-stratified
+# gold sample that OVERSAMPLES the negative verdict (28 positives, 220
+# negatives) keeps each stratum's gold-true fraction exact (27/28 and 30/220).
+def _population_strata(dataset: str | None = None) -> list[GoldStratum]:
+    return [
+        GoldStratum(
+            verdict=True, dataset=dataset, n_sampled=28, n_gold_true=27, population_count=560
+        ),
+        GoldStratum(
+            verdict=False, dataset=dataset, n_sampled=220, n_gold_true=30, population_count=440
+        ),
+    ]
+
+
+class TestReweightGoldSample:
+    def test_recovers_population_sensitivity_and_specificity(self) -> None:
+        acc = reweight_gold_sample(_population_strata())
+        assert isinstance(acc, InstrumentAccuracy)
+        assert acc.sensitivity == pytest.approx(_SE)
+        assert acc.specificity == pytest.approx(_SP)
+        assert acc.prevalence == pytest.approx(0.6)
+        assert acc.n_sampled == 248
+        assert acc.n_population == 1000
+        assert acc.n_strata == 2
+        assert acc.youden_j == pytest.approx(0.85)
+        assert "ADR-0115" in acc.estimator
+
+    def test_unweighted_pooling_would_be_wrong(self) -> None:
+        # Pooling the oversampled negatives as if they were the population
+        # gives Se = 27 / (27 + 30), a verification-bias artifact.
+        acc = reweight_gold_sample(_population_strata())
+        naive = 27 / 57
+        assert acc.sensitivity != pytest.approx(naive)
+
+    def test_weights_are_population_verdict_shares(self) -> None:
+        acc = reweight_gold_sample(_population_strata())
+        assert acc.weights == {(True, None): 0.56, (False, None): pytest.approx(0.44)}
+
+    def test_dataset_strata_pool_and_filter(self) -> None:
+        strata = _population_strata("hotpotqa") + [
+            GoldStratum(
+                verdict=True, dataset="qasper", n_sampled=10, n_gold_true=8, population_count=100
+            ),
+            GoldStratum(
+                verdict=False, dataset="qasper", n_sampled=20, n_gold_true=4, population_count=100
+            ),
+        ]
+        pooled = reweight_gold_sample(strata)
+        assert pooled.n_strata == 4
+        assert pooled.n_population == 1200
+        hot = reweight_gold_sample(strata, dataset="hotpotqa")
+        assert hot.n_strata == 2
+        assert hot.sensitivity == pytest.approx(_SE)
+        assert hot.specificity == pytest.approx(_SP)
+        # qasper alone: prevalence = 0.5 * 0.8 + 0.5 * 0.2 = 0.5;
+        # Se = 0.5 * 0.8 / 0.5 = 0.8; Sp = 0.5 * 0.8 / 0.5 = 0.8.
+        qas = reweight_gold_sample(strata, dataset="qasper")
+        assert qas.sensitivity == pytest.approx(0.8)
+        assert qas.specificity == pytest.approx(0.8)
+        assert qas.dataset == "qasper"
+        assert pooled.dataset is None
+
+    def test_feeds_corrected_yield(self) -> None:
+        acc = reweight_gold_sample(_population_strata())
+        rec = corrected_yield(
+            slo_rate=0.5,
+            apparent_predicate_rate_given_slo=_APPARENT_GIVEN_SLO,
+            sensitivity=acc.sensitivity,
+            specificity=acc.specificity,
+        )
+        assert rec.yield_corrected == pytest.approx(0.30)
+
+    def test_missing_verdict_stratum_refused(self) -> None:
+        with pytest.raises(GoodputError, match="missing"):
+            reweight_gold_sample(_population_strata()[:1])
+
+    def test_dataset_filter_without_match_refused(self) -> None:
+        with pytest.raises(GoodputError, match="no strata"):
+            reweight_gold_sample(_population_strata("hotpotqa"), dataset="qasper")
+
+    def test_mixed_dataset_labeling_refused(self) -> None:
+        strata = [_population_strata()[0], _population_strata("hotpotqa")[1]]
+        with pytest.raises(GoodputError, match="dataset"):
+            reweight_gold_sample(strata)
+
+    def test_duplicate_stratum_refused(self) -> None:
+        strata = _population_strata() + _population_strata()[:1]
+        with pytest.raises(GoodputError, match="duplicate"):
+            reweight_gold_sample(strata)
+
+    def test_empty_refused(self) -> None:
+        with pytest.raises(GoodputError, match="no strata"):
+            reweight_gold_sample([])
+
+    def test_degenerate_prevalence_refused(self) -> None:
+        all_true = [
+            GoldStratum(verdict=True, dataset=None, n_sampled=10, n_gold_true=10, population_count=50),
+            GoldStratum(verdict=False, dataset=None, n_sampled=10, n_gold_true=10, population_count=50),
+        ]
+        with pytest.raises(GoodputError, match="specificity"):
+            reweight_gold_sample(all_true)
+        all_false = [
+            GoldStratum(verdict=True, dataset=None, n_sampled=10, n_gold_true=0, population_count=50),
+            GoldStratum(verdict=False, dataset=None, n_sampled=10, n_gold_true=0, population_count=50),
+        ]
+        with pytest.raises(GoodputError, match="sensitivity"):
+            reweight_gold_sample(all_false)
+
+    def test_uninformative_reweighted_instrument_refused(self) -> None:
+        # Same gold-true fraction in both verdict strata: the verdict carries
+        # no information (Se + Sp = 1).
+        strata = [
+            GoldStratum(verdict=True, dataset=None, n_sampled=10, n_gold_true=5, population_count=50),
+            GoldStratum(verdict=False, dataset=None, n_sampled=10, n_gold_true=5, population_count=50),
+        ]
+        with pytest.raises(GoodputError, match="uninformative"):
+            reweight_gold_sample(strata)
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            dict(n_sampled=0, n_gold_true=0, population_count=10),
+            dict(n_sampled=5, n_gold_true=6, population_count=10),
+            dict(n_sampled=5, n_gold_true=-1, population_count=10),
+            dict(n_sampled=5, n_gold_true=2, population_count=0),
+            dict(n_sampled=5.0, n_gold_true=2, population_count=10),
+            dict(n_sampled=5, n_gold_true=True, population_count=10),
+        ],
+    )
+    def test_stratum_count_guards(self, kwargs: dict[str, object]) -> None:
+        with pytest.raises(GoodputError):
+            GoldStratum(verdict=True, dataset=None, **kwargs)  # type: ignore[arg-type]
+
+    def test_stratum_verdict_must_be_bool(self) -> None:
+        with pytest.raises(GoodputError, match="verdict"):
+            GoldStratum(
+                verdict=1,  # type: ignore[arg-type]
+                dataset=None,
+                n_sampled=5,
+                n_gold_true=2,
+                population_count=10,
+            )

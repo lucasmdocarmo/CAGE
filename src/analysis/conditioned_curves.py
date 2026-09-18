@@ -184,12 +184,15 @@ def mechanism_engine_key(row_key: Any) -> str:
 
     The canonical D7 row key is ``arm|retriever|policy|topology|engine|model|
     family`` plus optional swept pressure coordinates (``r<...>``/``lam<...>``
-    segments). §8.12 registers quality|ρ_KV "per mechanism × engine": the
-    curve identity keeps EVERY mechanism/engine axis and strips ONLY the
+    segments) and, on a B12 rung cell, the ADR-0106 corpus-rung coordinate
+    (``cb<tokens>``). §8.12 registers quality|ρ_KV "per mechanism × engine":
+    the curve identity keeps EVERY mechanism/engine axis and strips ONLY the
     pressure coordinates — pressure is the swept variable a curve traverses,
     never part of its identity (keeping the coords would shatter the sweep
     into per-cell fragments; dropping the axes would pool distinct arms —
-    the Simpson hazard). A key without the 7 canonical axes fails closed.
+    the Simpson hazard). The corpus rung is a MECHANISM coordinate (which
+    store was served), so it is KEPT: stripping it would pool the two B12
+    rungs into one curve. A key without the 7 canonical axes fails closed.
     """
     parts = str(row_key).split("|")
     if len(parts) < 7 or any(not part for part in parts[:7]):
@@ -199,7 +202,8 @@ def mechanism_engine_key(row_key: Any) -> str:
             "§8.12 per-mechanism×engine curve identity cannot be derived "
             "from a non-canonical key (re-run organize_results.py)"
         )
-    return "|".join(parts[:7])
+    kept = parts[:7] + [seg for seg in parts[7:] if seg.startswith("cb")]
+    return "|".join(kept)
 
 
 def pressure_bin_of(budget_r: Any, rate_frac: Any) -> str:

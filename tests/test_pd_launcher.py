@@ -113,12 +113,23 @@ def stub_bin(tmp_path_factory: pytest.TempPathFactory) -> Path:
     `vllm` exists-but-exits so backgrounded launches are inert. python3 stays
     REAL (the serving-config capture needs it)."""
     d = tmp_path_factory.mktemp("stub_bin")
+    # The vllm stub journals the env it was launched with (A1 / S0-20: the
+    # per-role GPU pin must ride CUDA_VISIBLE_DEVICES in the child env and
+    # nowhere else) when CAGE_TEST_VLLM_JOURNAL names a file.
+    vllm_stub = (
+        "#!/bin/sh\n"
+        'if [ -n "${CAGE_TEST_VLLM_JOURNAL:-}" ]; then\n'
+        "  printf 'CUDA_VISIBLE_DEVICES=%s args=%s\\n' "
+        '"${CUDA_VISIBLE_DEVICES-unset}" "$*" >> "$CAGE_TEST_VLLM_JOURNAL"\n'
+        "fi\n"
+        "exit 0\n"
+    )
     for name, body in {
         "pgrep": "#!/bin/sh\nexit 1\n",
         "curl": "#!/bin/sh\nexit 1\n",
         "nvidia-smi": "#!/bin/sh\nexit 1\n",
         "pkill": "#!/bin/sh\nexit 0\n",
-        "vllm": "#!/bin/sh\nexit 0\n",
+        "vllm": vllm_stub,
     }.items():
         p = d / name
         p.write_text(body, encoding="utf-8")
@@ -213,11 +224,20 @@ def test_start_composes_both_role_instances(stub_bin: Path, tmp_path: Path) -> N
     assert "--tensor-parallel-size 4" in prefill
     assert "--tensor-parallel-size 4" in decode
 
-    # uniform regime still ships on both
+    # uniform regime still ships on both. Mem-util pin derivation (backlog
+    # A1, S0-9/S0-20): no CAGE_PD_PREFILL_GPUS / CAGE_PD_DECODE_GPUS in this
+    # env, so both roles share ONE GPU and the per-instance default is
+    # SHARED_GPU_MEM_UTIL=0.45 (was 0.90, which vLLM's startup check refuses
+    # for the second instance on a shared device). The 0.90 operating point
+    # is pinned on the distinct-pins path in
+    # test_start_distinct_role_pins_keep_0_90_and_ride_cuda_visible_devices.
     for line in (prefill, decode):
         assert "--max-model-len 4096" in line
-        assert "--gpu-memory-utilization 0.90" in line
+        assert "--gpu-memory-utilization 0.45" in line
         assert "--enable-prompt-tokens-details" in line
+    # the decision is printed so the S0 evidence shows which regime served
+    assert "[cage] gpu-share decision: shared" in out
+    assert "0.45" in out.split("[cage] gpu-share decision:")[1].splitlines()[0]
 
     # start banner surfaces the VERIFY-LIVE state (not only comments)
     assert "VERIFY-LIVE at Run-C-prime preflight" in out
@@ -258,12 +278,243 @@ def test_start_captures_serving_config_per_role(stub_bin: Path, tmp_path: Path) 
     assert decode["kv_transfer_config"]["kv_role"] == "kv_consumer"
     assert "--kv-cache-memory-bytes 3000000000" in prefill["args"]
     assert "--kv-cache-memory-bytes 7000000000" in decode["args"]
+    # A1 / S0-20 provenance: the capture records the gpu-share decision and
+    # the realized per-instance dial (shared default here, see the pin
+    # derivation in test_start_composes_both_role_instances).
+    for cap in (prefill, decode):
+        assert cap["gpu_memory_utilization"] == 0.45
+        assert cap["gpu_share"] == "shared"
+        assert cap["cuda_visible_devices"] is None
 
 
 def test_start_tp_unset_omits_flag_on_both(stub_bin: Path) -> None:
     proc = _run_pd(stub_bin, "start", "fake/test-model", **GOOD_BUDGETS)
     assert "--tensor-parallel-size" not in _args_line(proc.stdout, "prefill")
     assert "--tensor-parallel-size" not in _args_line(proc.stdout, "decode")
+
+
+# ---------------------------------------------------------------------------
+# 1b. behavioral: shared-GPU memory-utilization rule (backlog A1, S0-9/S0-20)
+# ---------------------------------------------------------------------------
+# vLLM's startup check requests --gpu-memory-utilization of the device
+# unconditionally, so two role instances on ONE GPU at 0.90 each cannot both
+# start. Rule: no distinct per-role CUDA_VISIBLE_DEVICES pins (CAGE_PD_PREFILL_GPUS
+# / CAGE_PD_DECODE_GPUS) = shared -> default SHARED_GPU_MEM_UTIL=0.45, explicit
+# VLLM_GPU_MEMORY_UTILIZATION above 0.50 REFUSED; distinct pins = 0.90 stands.
+
+DISTINCT_PINS = {"CAGE_PD_PREFILL_GPUS": "0", "CAGE_PD_DECODE_GPUS": "1"}
+
+
+def _decision_line(stdout: str) -> str:
+    lines = [ln for ln in stdout.splitlines() if ln.startswith("[cage] gpu-share decision:")]
+    assert len(lines) == 1, f"expected exactly one gpu-share decision line, got:\n{stdout}"
+    return lines[0]
+
+
+def _read_journal(path: Path, expected_lines: int) -> List[str]:
+    # the stubbed vllm is backgrounded (nohup ... &); give it a moment to land
+    import time
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if path.exists():
+            lines = path.read_text(encoding="utf-8").splitlines()
+            if len(lines) >= expected_lines:
+                return lines
+        time.sleep(0.05)
+    raise AssertionError(f"vllm stub journal never reached {expected_lines} lines: {path}")
+
+
+def test_start_distinct_role_pins_keep_0_90_and_ride_cuda_visible_devices(
+    stub_bin: Path, tmp_path: Path
+) -> None:
+    journal = tmp_path / "vllm_journal.txt"
+    proc = _run_pd(
+        stub_bin, "start", "fake/test-model",
+        CAGE_RUN_ROOT=str(tmp_path), CAGE_TEST_VLLM_JOURNAL=str(journal),
+        **GOOD_BUDGETS, **DISTINCT_PINS,
+    )
+    out = proc.stdout
+    assert "--gpu-memory-utilization 0.90" in _args_line(out, "prefill")
+    assert "--gpu-memory-utilization 0.90" in _args_line(out, "decode")
+    line = _decision_line(out)
+    assert "distinct" in line and "0.90" in line
+    assert "prefill=0" in line and "decode=1" in line
+    # the pin rides the child env (CUDA_VISIBLE_DEVICES), one value per role
+    lines = _read_journal(journal, 2)
+    prefill = [ln for ln in lines if "--port 8100" in ln]
+    decode = [ln for ln in lines if "--port 8200" in ln]
+    assert len(prefill) == 1 and len(decode) == 1, lines
+    assert prefill[0].startswith("CUDA_VISIBLE_DEVICES=0 ")
+    assert decode[0].startswith("CUDA_VISIBLE_DEVICES=1 ")
+    # and the per-role capture records it
+    cfg_dir = tmp_path / "observability" / "serving_configs"
+    pcap = json.loads(next(cfg_dir.glob("*_pd-prefill.json")).read_text(encoding="utf-8"))
+    dcap = json.loads(next(cfg_dir.glob("*_pd-decode.json")).read_text(encoding="utf-8"))
+    assert pcap["gpu_share"] == dcap["gpu_share"] == "distinct"
+    assert pcap["cuda_visible_devices"] == "0" and dcap["cuda_visible_devices"] == "1"
+    assert pcap["gpu_memory_utilization"] == dcap["gpu_memory_utilization"] == 0.90
+
+
+def test_start_shared_does_not_inject_cuda_visible_devices(
+    stub_bin: Path, tmp_path: Path
+) -> None:
+    journal = tmp_path / "vllm_journal.txt"
+    _run_pd(
+        stub_bin, "start", "fake/test-model",
+        CAGE_TEST_VLLM_JOURNAL=str(journal), **GOOD_BUDGETS,
+    )
+    for ln in _read_journal(journal, 2):
+        assert ln.startswith("CUDA_VISIBLE_DEVICES=unset "), ln
+
+
+def test_start_shared_explicit_above_ceiling_is_refused_before_anything(stub_bin: Path) -> None:
+    proc = _run_pd(
+        stub_bin, "start", "fake/test-model",
+        VLLM_GPU_MEMORY_UTILIZATION="0.90", **GOOD_BUDGETS,
+    )
+    _assert_refused_before_anything(proc)
+    err = proc.stderr
+    assert "vLLM startup check" in err
+    assert "--gpu-memory-utilization" in err and "0.90" in err and "0.50" in err
+    # both fixes named: lower the value or pin distinct GPUs per role
+    assert "VLLM_GPU_MEMORY_UTILIZATION" in err
+    assert "CAGE_PD_PREFILL_GPUS" in err and "CAGE_PD_DECODE_GPUS" in err
+
+
+def test_start_shared_explicit_at_or_below_ceiling_is_honored(stub_bin: Path) -> None:
+    proc = _run_pd(
+        stub_bin, "start", "fake/test-model",
+        VLLM_GPU_MEMORY_UTILIZATION="0.40", **GOOD_BUDGETS,
+    )
+    assert "--gpu-memory-utilization 0.40" in _args_line(proc.stdout, "prefill")
+    assert "--gpu-memory-utilization 0.40" in _args_line(proc.stdout, "decode")
+    line = _decision_line(proc.stdout)
+    assert "shared" in line and "0.40" in line and "explicit" in line
+    proc = _run_pd(
+        stub_bin, "start", "fake/test-model",
+        VLLM_GPU_MEMORY_UTILIZATION="0.50", **GOOD_BUDGETS,
+    )
+    assert "--gpu-memory-utilization 0.50" in _args_line(proc.stdout, "prefill")
+
+
+def test_start_distinct_explicit_override_is_honored(stub_bin: Path) -> None:
+    proc = _run_pd(
+        stub_bin, "start", "fake/test-model",
+        VLLM_GPU_MEMORY_UTILIZATION="0.95", **GOOD_BUDGETS, **DISTINCT_PINS,
+    )
+    assert "--gpu-memory-utilization 0.95" in _args_line(proc.stdout, "prefill")
+    assert "--gpu-memory-utilization 0.95" in _args_line(proc.stdout, "decode")
+    assert "explicit" in _decision_line(proc.stdout)
+
+
+@pytest.mark.parametrize(
+    "pins",
+    [
+        {"CAGE_PD_PREFILL_GPUS": "0"},                                 # decode unpinned
+        {"CAGE_PD_DECODE_GPUS": "1"},                                  # prefill unpinned
+        {"CAGE_PD_PREFILL_GPUS": "0", "CAGE_PD_DECODE_GPUS": "0"},     # same device
+        {"CAGE_PD_PREFILL_GPUS": "0,1", "CAGE_PD_DECODE_GPUS": "1,2"}, # overlapping TP sets
+        {"CAGE_PD_PREFILL_GPUS": "a", "CAGE_PD_DECODE_GPUS": "1"},     # non-numeric
+        {"CAGE_PD_PREFILL_GPUS": "0,", "CAGE_PD_DECODE_GPUS": "1"},    # empty device
+    ],
+    ids=["decode-unpinned", "prefill-unpinned", "same-device", "overlap", "non-numeric", "empty-device"],
+)
+def test_start_refuses_partial_overlapping_or_malformed_pins(
+    stub_bin: Path, pins: Dict[str, str]
+) -> None:
+    proc = _run_pd(stub_bin, "start", "fake/test-model", **GOOD_BUDGETS, **pins)
+    _assert_refused_before_anything(proc)
+    assert "CAGE_PD_PREFILL_GPUS" in proc.stderr and "CAGE_PD_DECODE_GPUS" in proc.stderr
+
+
+@pytest.mark.parametrize("bad", ["abc", "0", "1.5", "0,9", "-0.4", ""])
+def test_start_refuses_malformed_mem_util(stub_bin: Path, bad: str) -> None:
+    proc = _run_pd(
+        stub_bin, "start", "fake/test-model",
+        VLLM_GPU_MEMORY_UTILIZATION=bad, **GOOD_BUDGETS, **DISTINCT_PINS,
+    )
+    if bad == "":
+        # empty = unset for the sourced serving config: distinct default 0.90
+        assert "--gpu-memory-utilization 0.90" in _args_line(proc.stdout, "prefill")
+        return
+    _assert_refused_before_anything(proc)
+    assert "VLLM_GPU_MEMORY_UTILIZATION" in proc.stderr
+
+
+def test_stop_is_never_gated_by_gpu_share_rule(stub_bin: Path) -> None:
+    proc = _run_pd(
+        stub_bin, "stop",
+        VLLM_GPU_MEMORY_UTILIZATION="0.90",  # would refuse a shared start
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "Stopping" in proc.stdout
+
+
+# --- bash-level unit test of the resolver (sourced, no dispatch) ------------
+
+
+def _resolve_in_bash(stub_bin: Path, **env_extra: str):
+    """Source the launcher (the `BASH_SOURCE != $0` guard skips the dispatch),
+    call cage_resolve_pd_gpu_share, and print its outputs."""
+    env = _clean_env(**env_extra)
+    env["PATH"] = f"{stub_bin}:{env.get('PATH', '/usr/bin:/bin')}"
+    script = (
+        f'source "{PD_SH}" && cage_resolve_pd_gpu_share '
+        '&& printf "RESOLVED %s %s %s %s %s\\n" '
+        '"$PD_GPU_SHARE" "$PD_MEM_UTIL" "$PD_MEM_UTIL_SOURCE" '
+        '"${PD_PREFILL_CUDA:-unset}" "${PD_DECODE_CUDA:-unset}"'
+    )
+    return subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, env=env, timeout=60,
+    )
+
+
+def _resolved(proc) -> List[str]:
+    lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("RESOLVED ")]
+    assert len(lines) == 1, f"{proc.stdout}\n{proc.stderr}"
+    return lines[0].split()[1:]
+
+
+def test_bash_resolver_shared_default(stub_bin: Path) -> None:
+    proc = _resolve_in_bash(stub_bin)
+    assert proc.returncode == 0, proc.stderr
+    assert _resolved(proc) == ["shared", "0.45", "default", "unset", "unset"]
+
+
+def test_bash_resolver_distinct_default(stub_bin: Path) -> None:
+    proc = _resolve_in_bash(stub_bin, CAGE_PD_PREFILL_GPUS="0,1", CAGE_PD_DECODE_GPUS="2,3")
+    assert proc.returncode == 0, proc.stderr
+    assert _resolved(proc) == ["distinct", "0.90", "default", "0,1", "2,3"]
+
+
+def test_bash_resolver_shared_explicit_paths(stub_bin: Path) -> None:
+    proc = _resolve_in_bash(stub_bin, VLLM_GPU_MEMORY_UTILIZATION="0.30")
+    assert _resolved(proc) == ["shared", "0.30", "explicit", "unset", "unset"]
+    proc = _resolve_in_bash(stub_bin, VLLM_GPU_MEMORY_UTILIZATION="0.51")
+    assert proc.returncode != 0
+    assert "REFUSING" in proc.stderr and "vLLM startup check" in proc.stderr
+    assert "RESOLVED" not in proc.stdout
+
+
+def test_bash_resolver_sees_the_pre_source_value_not_the_lib_default(stub_bin: Path) -> None:
+    # _serving_config.sh exports VLLM_GPU_MEMORY_UTILIZATION=0.90 whenever it
+    # is sourced; the resolver must treat that as a DEFAULT (shared -> 0.45),
+    # not as an explicit 0.90 that would refuse every unpinned pd launch.
+    proc = _resolve_in_bash(stub_bin)
+    assert proc.returncode == 0, proc.stderr
+    assert _resolved(proc)[:3] == ["shared", "0.45", "default"]
+
+
+def test_sourcing_the_launcher_does_not_dispatch(stub_bin: Path) -> None:
+    env = _clean_env()
+    env["PATH"] = f"{stub_bin}:{env.get('PATH', '/usr/bin:/bin')}"
+    proc = subprocess.run(
+        ["bash", "-c", f'source "{PD_SH}"; echo SOURCED_OK'],
+        capture_output=True, text=True, env=env, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "SOURCED_OK" in proc.stdout
+    assert "Usage:" not in proc.stdout and "Stopping" not in proc.stdout
 
 
 # ---------------------------------------------------------------------------

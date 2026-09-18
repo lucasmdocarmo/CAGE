@@ -752,3 +752,51 @@ def test_abandon_cli_is_exclusive_with_scoring_flags(
     assert rq.main() == 2
     assert "exclusive" in capsys.readouterr().err
     assert (run / "scoring" / "s07-crash").is_dir()  # nothing happened
+
+
+# ---------------------------------------------------------------------------
+# Backlog A8 (review 2026-09-17 defect 1): the evidence row's persisted
+# is_impossible flag reaches batch_evaluate per row, verbatim.
+# ---------------------------------------------------------------------------
+
+
+def test_rescore_threads_is_impossible_into_the_scorer(tmp_path: Path) -> None:
+    from src.evaluation.quality import (
+        ANSWERABILITY_FLAG_VERIFIED, ANSWERABILITY_REFERENCE_DERIVED,
+    )
+
+    rows = [
+        {**EVIDENCE_ROWS[0], "is_impossible": False},
+        {**EVIDENCE_ROWS[1], "is_impossible": True},
+        {**EVIDENCE_ROWS[2], "example_id": "e2b", "is_impossible": None},
+        EVIDENCE_ROWS[3],
+    ]
+    ev = _write_evidence(tmp_path / "qa_evidence.jsonl", rows)
+    spy = _SpyEvaluator(_fast_evaluator())
+    out, _ = rq._score_evidence_file(ev, spy)
+    assert spy.calls[-1]["is_impossible"] == [False, True, None, None]
+    prov = {r["example_id"]: r["answerability_provenance"] for r in out}
+    assert prov == {
+        "e0": ANSWERABILITY_FLAG_VERIFIED,
+        "e1": ANSWERABILITY_FLAG_VERIFIED,
+        "e2b": ANSWERABILITY_REFERENCE_DERIVED,
+        "e3": ANSWERABILITY_REFERENCE_DERIVED,
+    }
+    assert out[1]["is_answerable"] == 0.0 and out[1]["no_answer_correct"] == 1.0
+
+
+def test_rescore_refuses_a_flag_that_disagrees_with_the_gold(tmp_path: Path) -> None:
+    from src.evaluation.quality import AnswerabilityMismatchError
+
+    # e1 has an empty reference; flagging it answerable is a mislabel.
+    ev = _write_evidence(
+        tmp_path / "qa_evidence.jsonl", [{**EVIDENCE_ROWS[1], "is_impossible": False}]
+    )
+    with pytest.raises(AnswerabilityMismatchError):
+        rq._score_evidence_file(ev, _fast_evaluator())
+    # A non-bool stand-in is passed verbatim and refused by the scorer, never coerced.
+    ev2 = _write_evidence(
+        tmp_path / "qa_evidence2.jsonl", [{**EVIDENCE_ROWS[1], "is_impossible": "true"}]
+    )
+    with pytest.raises(TypeError, match="is_impossible"):
+        rq._score_evidence_file(ev2, _fast_evaluator())

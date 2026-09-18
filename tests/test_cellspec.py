@@ -279,3 +279,62 @@ def test_to_row_key_shape() -> None:
     )
     keyed = _spec(family="F2", budget_r=0.5, rate_frac=0.95).to_row_key()
     assert keyed == "gold-fresh|none|none|single|vllm|qwen3-14b|F2|r0.5|lam0.95"
+
+
+# --- ADR-0106: the B12 corpus-budget coordinate (one row per rung) ------------
+
+
+def test_corpus_budget_coordinate_distinguishes_b12_rungs() -> None:
+    hi = _spec(arm="corpus-trunc", corpus_budget_tokens=1400)
+    lo = _spec(arm="corpus-trunc", corpus_budget_tokens=700)
+    assert hi.to_row_key() == "corpus-trunc|none|none|single|vllm|qwen3-14b|F1|cb1400"
+    assert lo.to_row_key() == "corpus-trunc|none|none|single|vllm|qwen3-14b|F1|cb700"
+    assert hi != lo and hi.to_row_key() != lo.to_row_key()
+    assert hi.to_flat_dict()["corpus_budget_tokens"] == 1400
+    assert CellSpec.from_flat_dict(hi.to_flat_dict()) == hi
+    # Under pressure the corpus coordinate follows the pressure coords.
+    f3 = _spec(
+        arm="corpus-trunc", family="F3", budget_r=0.5, rate_frac=0.95,
+        corpus_budget_tokens=700,
+    )
+    assert f3.to_row_key() == (
+        "corpus-trunc|none|none|single|vllm|qwen3-14b|F3|r0.5|lam0.95|cb700"
+    )
+    assert CellSpec.from_flat_dict(f3.to_flat_dict()) == f3
+    assert CellSpec.from_baseline("B12", corpus_budget_tokens=700) == lo
+
+
+def test_corpus_budget_absent_leaves_key_and_flat_dict_unchanged() -> None:
+    flat = _spec().to_flat_dict()
+    assert "corpus_budget_tokens" not in flat
+    assert _spec().to_row_key() == "gold-fresh|none|none|single|vllm|qwen3-14b|F1"
+    for absent in (None, "", float("nan")):
+        assert CellSpec.from_flat_dict(dict(flat, corpus_budget_tokens=absent)) == _spec()
+    # pandas reads an int column with missing values as float: integral floats coerce
+    flat_b12 = _spec(arm="corpus-trunc", corpus_budget_tokens=700).to_flat_dict()
+    assert CellSpec.from_flat_dict(dict(flat_b12, corpus_budget_tokens=700.0)) == _spec(
+        arm="corpus-trunc", corpus_budget_tokens=700
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        dict(corpus_budget_tokens=1400),                        # gold arm: no corpus
+        dict(arm="corpus-reuse", corpus_budget_tokens=1400),    # B3 is the full budget
+        dict(arm="corpus-comp", corpus_budget_tokens=1400),
+        dict(arm="corpus-trunc", corpus_budget_tokens=0),
+        dict(arm="corpus-trunc", corpus_budget_tokens=-700),
+        dict(arm="corpus-trunc", corpus_budget_tokens=700.0),   # coordinate is an int
+        dict(arm="corpus-trunc", corpus_budget_tokens=True),
+    ],
+)
+def test_corpus_budget_illegal_combos_raise(overrides: dict[str, object]) -> None:
+    with pytest.raises(InvalidCellSpecError):
+        _spec(**overrides)
+
+
+def test_from_flat_dict_refuses_non_integral_corpus_budget() -> None:
+    flat = _spec(arm="corpus-trunc", corpus_budget_tokens=700).to_flat_dict()
+    with pytest.raises(CellSpecError):
+        CellSpec.from_flat_dict(dict(flat, corpus_budget_tokens=700.5))

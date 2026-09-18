@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -47,6 +48,63 @@ def corpus_doc_ids_sha1(documents: Sequence["IRDocument"]) -> str:
     """
     joined = "\n".join(sorted(d.doc_id for d in documents))
     return hashlib.sha1(joined.encode("utf-8")).hexdigest()
+
+
+class StaleIndexError(RuntimeError):
+    """Typed refusal: a persisted dense index predates the e5/bge prefix fix (backlog F6).
+
+    Such an index embedded its passages WITHOUT the ``passage:`` prefix, so serving
+    it runs the encoder out-of-distribution and silently depresses Hit@k for every
+    RAG/redis/hybrid baseline. Before F6 this loaded with a printed WARNING; a
+    WARNING is not a refusal, and a mislabeled retrieval row is exactly the class
+    of silent default the doctrine forbids. Raised by ``FaissIRIndex.load`` (and so
+    by ``ensure_ir_index``) unless ``STALE_INDEX_OPT_IN_ENV`` is set.
+    """
+
+
+class IndexRevisionMismatchError(RuntimeError):
+    """Typed refusal: a persisted dense index was not built at the pinned revision.
+
+    Backlog A5 (review 2026-09-17): the campaign header records the freeze
+    slot's ``embedding_model_revision`` and every retrieval cell carries
+    ``--embedding-revision``; ``FaissIRIndex`` passes it to
+    ``SentenceTransformer(revision=)`` and stamps it in ``meta.json``. A load
+    that asks for a revision the archive was not built at (or an archive with
+    no stamp at all) refuses BEFORE any dependency loads, so the recorded pin
+    can never differ from the served weights; ``ensure_ir_index`` turns that
+    refusal into a rebuild at the pin.
+    """
+
+
+STALE_INDEX_OPT_IN_ENV: str = "CAGE_ALLOW_STALE_INDEX"
+"""Escape hatch for backlog F6, PILOT ARCHIVES ONLY.
+
+Set to ``1``/``true``/``yes`` (same truthy set as ``CAGE_ALLOW_NO_RERANK``) to
+downgrade the ``StaleIndexError`` refusal in ``FaissIRIndex.load`` to the legacy
+WARNING when re-reading a pilot archive whose index was built before the prefix
+fix. The opt-in is never silent: the loaded instance carries
+``stale_index_opt_in=True`` and the archive's ``meta.json`` is stamped with
+``stale_index_opt_in`` / ``stale_index_opt_in_env`` so provenance shows the
+out-of-distribution retrieval. The campaign path (run_campaign.py) must never set
+this variable; campaign indices are rebuilt with ``--rebuild-ir-index`` instead.
+"""
+
+_STALE_INDEX_OPT_IN_TRUTHY: frozenset[str] = frozenset({"1", "true", "yes"})
+
+
+def stale_index_opt_in() -> bool:
+    """True iff ``STALE_INDEX_OPT_IN_ENV`` holds a truthy value (case-insensitive)."""
+    return os.getenv(STALE_INDEX_OPT_IN_ENV, "").strip().lower() in _STALE_INDEX_OPT_IN_TRUTHY
+
+
+def embedding_model_wants_e5_prefixes(embedding_model: str) -> bool:
+    """E5 / BGE-style bi-encoders REQUIRE asymmetric ``query:``/``passage:`` prefixes.
+
+    Omitting them runs the encoder out-of-distribution and silently degrades
+    retrieval (depressed Hit@k). BGE rerankers are cross-encoders and take no prefix.
+    """
+    model_lc = embedding_model.lower()
+    return ("e5" in model_lc) or ("bge" in model_lc and "reranker" not in model_lc)
 
 
 def build_corpus_from_contexts(
@@ -87,16 +145,23 @@ class FaissIRIndex:
         embedding_model: str = "intfloat/e5-large-v2",
         normalize_embeddings: bool = True,
         device: str = "cpu",
+        embedding_revision: Optional[str] = None,
     ):
         self.embedding_model = embedding_model
         self.normalize_embeddings = normalize_embeddings
         self.device = device
+        # Backlog A5: the HF commit the encoder weights are pinned to. None =
+        # unpinned (pilot use; the HF default revision), stamped as null.
+        self.embedding_revision: Optional[str] = embedding_revision
 
-        # E5 / BGE-style models REQUIRE asymmetric "query:"/"passage:" prefixes.
-        # Omitting them runs the encoder out-of-distribution and silently degrades
-        # retrieval (depressed Hit@k). Auto-enable for the model families that need it.
-        model_lc = embedding_model.lower()
-        self.uses_e5_prefixes = ("e5" in model_lc) or ("bge" in model_lc and "reranker" not in model_lc)
+        # Auto-enable the asymmetric prefixes for the model families that need them
+        # (see embedding_model_wants_e5_prefixes). ``load`` overrides this with the
+        # flag persisted at build time so queries always match the stored passages.
+        self.uses_e5_prefixes: bool = embedding_model_wants_e5_prefixes(embedding_model)
+        # Provenance flag (backlog F6): True only when ``load`` served a pre-prefix-fix
+        # index under the CAGE_ALLOW_STALE_INDEX opt-in. Fresh and rebuilt indices
+        # never set it.
+        self.stale_index_opt_in: bool = False
 
         self._st_model = None
         self._faiss = None
@@ -113,7 +178,11 @@ class FaissIRIndex:
         if self._st_model is None:
             from sentence_transformers import SentenceTransformer
 
-            self._st_model = SentenceTransformer(self.embedding_model, device=self.device)
+            st_kwargs: Dict[str, Any] = {"device": self.device}
+            if self.embedding_revision is not None:
+                # A5: the pin is ENFORCED at weight-load time, not only recorded.
+                st_kwargs["revision"] = self.embedding_revision
+            self._st_model = SentenceTransformer(self.embedding_model, **st_kwargs)
 
         if self._faiss is None:
             import faiss
@@ -221,6 +290,9 @@ class FaissIRIndex:
             # (two trials with equal-size corpora previously reused the wrong index).
             "doc_ids_sha1": corpus_doc_ids_sha1(self._documents),
             "uses_e5_prefixes": self.uses_e5_prefixes,
+            # Backlog A5: the encoder revision this index was embedded at (null
+            # when unpinned); load/ensure_ir_index check it against the pin.
+            "embedding_revision": self.embedding_revision,
         }
         (directory / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
@@ -239,31 +311,74 @@ class FaissIRIndex:
         self._faiss.write_index(self._index, str(directory / "faiss.index"))
 
     @classmethod
-    def load(cls, directory: Path, *, device: str = "cpu") -> "FaissIRIndex":
-        """Load a persisted index from disk."""
+    def load(
+        cls,
+        directory: Path,
+        *,
+        device: str = "cpu",
+        embedding_revision: Optional[str] = None,
+    ) -> "FaissIRIndex":
+        """Load a persisted index from disk.
+
+        ``embedding_revision`` (backlog A5): when given, the archive's stamped
+        revision must equal it or the load refuses (``IndexRevisionMismatchError``)
+        before any dependency import; when None the archive is served at its
+        own stamped revision (null for pre-pin archives), never at a silently
+        different one.
+        """
         meta_path = directory / "meta.json"
         if not meta_path.exists():
             raise FileNotFoundError(f"Missing IR meta.json at {meta_path}")
 
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
 
+        stored_revision = meta.get("embedding_revision")
+        if embedding_revision is not None and stored_revision != embedding_revision:
+            raise IndexRevisionMismatchError(
+                f"IR index at {directory} was built at embedding_revision="
+                f"{stored_revision!r} (embedding_model={meta.get('embedding_model')!r}) "
+                f"but the pinned revision is {embedding_revision!r} (backlog A5: the "
+                "recorded pin must be the served weights). Rebuild it with "
+                "--rebuild-ir-index at the pin."
+            )
+
         inst = cls(
             embedding_model=meta["embedding_model"],
             normalize_embeddings=bool(meta["normalize_embeddings"]),
             device=device,
+            embedding_revision=(
+                stored_revision if isinstance(stored_revision, str) else None
+            ),
         )
         # Respect how THIS index was built. Indices built before the e5-prefix fix
-        # have no flag -> default False so queries match the (un-prefixed) passages.
-        # Rebuild with --rebuild-ir-index to get the corrected, prefixed retrieval.
+        # have no flag -> False so queries match the (un-prefixed) passages.
         inst.uses_e5_prefixes = bool(meta.get("uses_e5_prefixes", False))
-        model_lc = str(meta.get("embedding_model", "")).lower()
-        wants_prefixes = ("e5" in model_lc) or ("bge" in model_lc and "reranker" not in model_lc)
-        if wants_prefixes and not inst.uses_e5_prefixes:
+        stale_prefixes = (
+            embedding_model_wants_e5_prefixes(str(meta.get("embedding_model", "")))
+            and not inst.uses_e5_prefixes
+        )
+        if stale_prefixes:
+            # Backlog F6: refuse by default. The opt-in exists for pilot archives only
+            # and is checked BEFORE any dependency load so a refusal costs nothing.
+            if not stale_index_opt_in():
+                raise StaleIndexError(
+                    f"IR index at {directory} was built BEFORE the e5/bge "
+                    f"query:/passage: prefix fix (embedding_model="
+                    f"{meta.get('embedding_model')}, uses_e5_prefixes="
+                    f"{meta.get('uses_e5_prefixes', 'absent')}). Serving it runs "
+                    f"retrieval out-of-distribution and degrades every RAG/hybrid "
+                    f"row. Rebuild it with --rebuild-ir-index, or, for a PILOT "
+                    f"ARCHIVE only, set {STALE_INDEX_OPT_IN_ENV}=1 to load it with a "
+                    f"provenance stamp."
+                )
+            inst.stale_index_opt_in = True
             print(
                 f"WARNING: IR index at {directory} was built BEFORE the e5/bge "
                 f"query:/passage: prefix fix (model={meta.get('embedding_model')}). "
                 f"Retrieval is out-of-distribution and RAG/hybrid quality is degraded. "
-                f"Rebuild with --rebuild-ir-index."
+                f"Loading anyway because {STALE_INDEX_OPT_IN_ENV} is set (pilot archives "
+                f"only); meta.json is stamped stale_index_opt_in=true. Rebuild with "
+                f"--rebuild-ir-index for corrected retrieval."
             )
         inst._ensure_deps()
 
@@ -284,6 +399,18 @@ class FaissIRIndex:
 
         # Index
         inst._index = inst._faiss.read_index(str(directory / "faiss.index"))
+
+        if inst.stale_index_opt_in:
+            # Provenance stamp (backlog F6): the archive itself records that it was
+            # served stale under the opt-in. Written only after a successful load so
+            # a refused or failed load leaves the archive untouched; a write failure
+            # propagates (an unwritable pilot archive is a condition to surface, not
+            # to swallow).
+            stamped = dict(meta)
+            stamped["uses_e5_prefixes"] = False
+            stamped["stale_index_opt_in"] = True
+            stamped["stale_index_opt_in_env"] = STALE_INDEX_OPT_IN_ENV
+            meta_path.write_text(json.dumps(stamped, indent=2), encoding="utf-8")
         return inst
 
 
@@ -765,6 +892,7 @@ def ensure_ir_index(
     embedding_model: str,
     rebuild: bool = False,
     device: str = "cpu",
+    embedding_revision: Optional[str] = None,
 ) -> FaissIRIndex:
     """Load an existing index if present AND current, otherwise build and persist one.
 
@@ -777,6 +905,9 @@ def ensure_ir_index(
     (the 100x3 run escaped only because its per-trial corpora were 31/30/32 docs).
     Backward compat: an old meta.json without doc_ids_sha1 triggers ONE rebuild, which
     persists the hash (a rebuild also restores the correct e5 prefixes).
+    Revision guard (backlog A5, review 2026-09-17): with ``embedding_revision``
+    given, an index stamped with a different (or no) revision REBUILDS at the
+    pin, so the campaign header's recorded revision is always the served one.
     """
     meta_path = index_dir / "meta.json"
     if meta_path.exists() and not rebuild:
@@ -809,12 +940,27 @@ def ensure_ir_index(
                         f"rebuilding (stale index)."
                     )
                     stale = True
+            if (
+                not stale
+                and embedding_revision is not None
+                and _meta.get("embedding_revision") != embedding_revision
+            ):
+                print(
+                    f"[ir] index at {index_dir} was built at embedding_revision="
+                    f"{_meta.get('embedding_revision')!r}, the pin is "
+                    f"{embedding_revision!r}; rebuilding at the pin (backlog A5)."
+                )
+                stale = True
         except Exception:
             stale = False  # unreadable meta -> fall through to load (prior behavior)
         if not stale:
-            return FaissIRIndex.load(index_dir, device=device)
+            return FaissIRIndex.load(
+                index_dir, device=device, embedding_revision=embedding_revision
+            )
 
-    idx = FaissIRIndex(embedding_model=embedding_model, device=device)
+    idx = FaissIRIndex(
+        embedding_model=embedding_model, device=device, embedding_revision=embedding_revision
+    )
     idx.build(documents)
     idx.save(index_dir)
     return idx

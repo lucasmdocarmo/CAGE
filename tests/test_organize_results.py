@@ -824,3 +824,29 @@ def test_pull_run_sh_fails_closed_without_args() -> None:
     assert proc.returncode != 0
     assert "DO NOT TEARDOWN" in proc.stderr
     assert "SAFE TO TEARDOWN" not in proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# ADR-0106 (adversarial review 2026-09-16): the organizer must parse the B12
+# rung coordinate ``cb<int>`` exactly as figure_pipeline.parse_row_key does,
+# or every ladder cell directory is refused at run-tree organization.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_row_key_dir_accepts_b12_rung() -> None:
+    f3 = "corpus-trunc|none|none|single|vllm|qwen3-14b|F3|r0.5|lam0.8|cb700"
+    spec = org.parse_row_key_dir(f3)
+    assert spec.corpus_budget_tokens == 700
+    assert spec.budget_r == 0.5 and spec.rate_frac == 0.8
+    assert spec.to_row_key() == f3
+    f1 = "corpus-trunc|none|none|single|sglang|qwen3-14b|F1|cb1400"
+    assert org.parse_row_key_dir(f1).corpus_budget_tokens == 1400
+    # A fractional rung is malformed (the rung is an integer token budget).
+    with pytest.raises(org.OrganizeError, match="cb7.5"):
+        org.parse_row_key_dir("corpus-trunc|none|none|single|vllm|qwen3-14b|F1|cb7.5")
+    # A rung on any arm but corpus-trunc is charter-illegal (CellSpec refuses).
+    with pytest.raises(org.OrganizeError, match="not a valid CellSpec"):
+        org.parse_row_key_dir("corpus-reuse|none|none|single|vllm|qwen3-14b|F1|cb700")
+    # Unknown coord segments still refuse, naming every accepted form.
+    with pytest.raises(org.OrganizeError, match="cb<int>"):
+        org.parse_row_key_dir("corpus-trunc|none|none|single|vllm|qwen3-14b|F1|xx700")

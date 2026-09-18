@@ -268,3 +268,150 @@ def test_faithfulness_method_none_on_abstention() -> None:
     assert m.faithfulness is None
     assert m.faithfulness_method is None
     assert m.faithfulness_premise_count is None
+
+
+# --------------------------------------------------------------------------- #
+# Backlog A8 (Tier A): the loader's is_impossible flag is AUTHORITATIVE where
+# example metadata is available. The scorer takes an optional ``is_impossible``
+# input; when both the flag and the reference are present they MUST agree, so a
+# loader change can never silently flip a row's answerability. Reference-only
+# rows keep the empty-reference derivation and are labeled "reference-derived".
+# --------------------------------------------------------------------------- #
+from src.evaluation.quality import (  # noqa: E402
+    ANSWERABILITY_FLAG_VERIFIED,
+    ANSWERABILITY_REFERENCE_DERIVED,
+    AnswerabilityMismatchError,
+)
+
+
+def _f1_flag(
+    generated: str, reference: str, is_impossible, all_answers: list | None = None,
+) -> dict:
+    return QualityEvaluator.evaluate_f1_score(
+        None, generated, reference, all_answers, is_impossible=is_impossible,
+    )
+
+
+def test_a8_provenance_constants_are_distinct_strings() -> None:
+    assert ANSWERABILITY_FLAG_VERIFIED == "flag-verified"
+    assert ANSWERABILITY_REFERENCE_DERIVED == "reference-derived"
+
+
+def test_a8_flag_agreement_unanswerable_row() -> None:
+    r = _f1_flag("Don't know.", "", True)
+    assert r["is_answerable"] == 0.0
+    assert r["no_answer_correct"] == 1.0 and r["f1"] == 1.0
+    assert r["answerability_provenance"] == ANSWERABILITY_FLAG_VERIFIED
+
+
+def test_a8_flag_agreement_answerable_row() -> None:
+    r = _f1_flag("Paris", "Paris", False)
+    assert r["is_answerable"] == 1.0 and r["f1"] == 1.0
+    assert r["answerability_provenance"] == ANSWERABILITY_FLAG_VERIFIED
+
+
+@pytest.mark.parametrize("reference,flag", [("Paris", True), ("", False)])
+def test_a8_flag_reference_mismatch_is_refused(reference: str, flag: bool) -> None:
+    with pytest.raises(AnswerabilityMismatchError) as ei:
+        _f1_flag("Paris", reference, flag)
+    assert ei.value.is_impossible is flag
+    assert ei.value.reference_no_answer is (not reference)
+    assert "is_impossible" in str(ei.value)
+
+
+def test_a8_mismatch_against_all_answers_is_refused() -> None:
+    # all_answers is the gold source when present (official max-over-golds
+    # semantics), so it is what the flag must agree with, not the bare reference.
+    with pytest.raises(AnswerabilityMismatchError):
+        _f1_flag("Paris", "", False, all_answers=[])
+    with pytest.raises(AnswerabilityMismatchError):
+        _f1_flag("Paris", "", True, all_answers=["Paris"])
+
+
+def test_a8_flag_agreement_with_all_answers_keeps_max_over_golds() -> None:
+    r = _f1_flag("Paris", "London", False, all_answers=["London", "Paris"])
+    assert r["f1"] == 1.0 and r["exact_match"] == 1.0
+    assert r["answerability_provenance"] == ANSWERABILITY_FLAG_VERIFIED
+    r2 = _f1_flag("Don't know.", "", True, all_answers=[])
+    assert r2["is_answerable"] == 0.0 and r2["no_answer_correct"] == 1.0
+    assert r2["answerability_provenance"] == ANSWERABILITY_FLAG_VERIFIED
+
+
+@pytest.mark.parametrize(
+    "generated,reference",
+    [("Don't know.", ""), ("Paris", ""), ("Paris", "Paris"), ("I don't know.", "Paris"),
+     ("Paris France", "Paris")],
+)
+def test_a8_reference_only_path_keeps_derivation(generated: str, reference: str) -> None:
+    # No flag: the empty-reference derivation is unchanged and the row is
+    # labeled reference-derived; an agreeing flag yields identical scores.
+    r = _f1(generated, reference)
+    assert r["answerability_provenance"] == ANSWERABILITY_REFERENCE_DERIVED
+    flagged = _f1_flag(generated, reference, not reference.strip())
+    assert flagged["answerability_provenance"] == ANSWERABILITY_FLAG_VERIFIED
+    strip = lambda d: {k: v for k, v in d.items() if k != "answerability_provenance"}
+    assert strip(flagged) == strip(r)
+
+
+@pytest.mark.parametrize("bad", [1, 0, "True", "false", 1.0])
+def test_a8_non_bool_flag_is_refused(bad) -> None:
+    # A truthy/falsy non-bool would be a silently coerced label: typed refusal.
+    with pytest.raises(TypeError):
+        _f1_flag("Paris", "Paris", bad)
+
+
+def test_a8_evaluate_threads_flag_and_emits_provenance_column() -> None:
+    ev = _model_free_evaluator()
+    m = ev.evaluate(
+        question="q", context=["ctx"], generated_text="Don't know.",
+        reference_answer="", is_impossible=True,
+    )
+    assert m.answerability_provenance == ANSWERABILITY_FLAG_VERIFIED
+    assert m.to_dict()["answerability_provenance"] == ANSWERABILITY_FLAG_VERIFIED
+    m2 = ev.evaluate(
+        question="q", context=["ctx"], generated_text="Paris", reference_answer="Paris",
+    )
+    assert m2.to_dict()["answerability_provenance"] == ANSWERABILITY_REFERENCE_DERIVED
+    with pytest.raises(AnswerabilityMismatchError):
+        ev.evaluate(
+            question="q", context=["ctx"], generated_text="Paris",
+            reference_answer="Paris", is_impossible=True,
+        )
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_a8_batch_evaluate_threads_per_row_flags(batched: bool) -> None:
+    ev = _model_free_evaluator()
+    out = ev.batch_evaluate(
+        ["q"] * 3, [["ctx"]] * 3,
+        ["Don't know.", "Paris", "Paris"], ["", "Paris", "Paris"],
+        is_impossible=[True, False, None], batched=batched,
+    )
+    assert [m.answerability_provenance for m in out] == [
+        ANSWERABILITY_FLAG_VERIFIED, ANSWERABILITY_FLAG_VERIFIED,
+        ANSWERABILITY_REFERENCE_DERIVED,
+    ]
+    assert [m.is_answerable for m in out] == [0.0, 1.0, 1.0]
+    with pytest.raises(AnswerabilityMismatchError):
+        ev.batch_evaluate(
+            ["q"], [["ctx"]], ["Paris"], ["Paris"], is_impossible=[True], batched=batched,
+        )
+
+
+def test_a8_batch_evaluate_short_flag_sequence_is_refused() -> None:
+    # A flag list shorter than the rows would silently leave rows reference-derived.
+    with pytest.raises(ValueError):
+        _model_free_evaluator().batch_evaluate(
+            ["q"] * 2, [["ctx"]] * 2, ["Paris", "Paris"], ["Paris", "Paris"],
+            is_impossible=[False],
+        )
+
+
+def test_a8_evaluate_with_cache_relevance_threads_flag() -> None:
+    ev = _model_free_evaluator()
+    m = ev.evaluate_with_cache_relevance(
+        "q", ["ctx"], "Don't know.", "", is_impossible=True,
+    )
+    assert m.answerability_provenance == ANSWERABILITY_FLAG_VERIFIED
+    with pytest.raises(AnswerabilityMismatchError):
+        ev.evaluate_with_cache_relevance("q", ["ctx"], "Paris", "Paris", is_impossible=True)
