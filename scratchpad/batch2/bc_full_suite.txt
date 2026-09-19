@@ -85,4 +85,105 @@ tests/test_pilot_tree_campaign_guard.py ............                     [ 53%]
 tests/test_predicate_chain.py .......................................... [ 55%]
 ..............                                                           [ 55%]
 tests/test_preflight_gates.py .......................................... [ 56%]
-.......................................................
+........................................................................ [ 58%]
+..                                                                       [ 58%]
+tests/test_prompting_chat.py ................                            [ 59%]
+tests/test_quality_batching.py .........                                 [ 59%]
+tests/test_quality_claim_checker.py ...................                  [ 60%]
+tests/test_quality_failclosed.py ..................                      [ 60%]
+tests/test_quality_no_answer.py ........................................ [ 61%]
+..........................................                               [ 62%]
+tests/test_quality_provenance.py .............                           [ 63%]
+tests/test_quality_windowed_grounding.py ..............                  [ 63%]
+tests/test_query_manifest.py .....................                       [ 64%]
+tests/test_ragas_runner.py ...................                           [ 64%]
+tests/test_redis_cache.py ...............                                [ 65%]
+tests/test_regime_inputs.py .....................................        [ 66%]
+tests/test_registered_margins_consumption.py .....................       [ 66%]
+tests/test_rerank_pool.py ...................                            [ 67%]
+tests/test_rescore_wiring.py .............................               [ 68%]
+tests/test_results_loader.py .......................                     [ 68%]
+tests/test_retrieval_gate_table.py ...........................           [ 69%]
+tests/test_review_fixes_analysis.py ...                                  [ 69%]
+tests/test_review_fixes_core.py .............                            [ 70%]
+tests/test_review_fixes_data.py .....                                    [ 70%]
+tests/test_review_fixes_evaluation.py ........                           [ 70%]
+tests/test_router_integration.py sssss                                   [ 70%]
+tests/test_ruler_tasks.py .............................................. [ 71%]
+                                                                         [ 71%]
+tests/test_run_calibration.py ........................                   [ 72%]
+tests/test_run_campaign.py ............................................. [ 73%]
+........................................................................ [ 75%]
+........................................................................ [ 78%]
+........................................                                 [ 79%]
+tests/test_run_experiment_campaign_layout.py ........................... [ 79%]
+..................................                                       [ 80%]
+tests/test_run_power_sim.py ............................................ [ 82%]
+......                                                                   [ 82%]
+tests/test_runpod_ops.py .....................................           [ 83%]
+tests/test_score_instrument_b.py ..................                      [ 83%]
+tests/test_scoring_blinding.py ....................                      [ 84%]
+tests/test_script_headers.py ........................................... [ 85%]
+.................................                                        [ 86%]
+tests/test_scripts_doctrine.py ........................                  [ 87%]
+tests/test_serving_budget_knobs.py ............................          [ 88%]
+tests/test_staleness.py ..........                                       [ 88%]
+tests/test_stats_decided.py ..................................           [ 89%]
+tests/test_stats_engine.py ............................................. [ 90%]
+.................................................                        [ 92%]
+tests/test_stats_proof.py .............................................. [ 93%]
+.......                                                                  [ 93%]
+tests/test_tau_freeze_consumption.py ..................                  [ 94%]
+tests/test_terraform_contract.py ......                                  [ 94%]
+tests/test_token_divergence.py ..                                        [ 94%]
+tests/test_token_divergence_campaign.py ..............                   [ 94%]
+tests/test_token_divergence_stats.py .........                           [ 94%]
+tests/test_topic10_runner_hardening.py ........s.................        [ 95%]
+tests/test_topic10_transport_runpod.py ................................. [ 96%]
+..............                                                           [ 97%]
+tests/test_tp_flags.py ............................                      [ 97%]
+tests/test_truth_tax_palette.py .....                                    [ 97%]
+tests/test_verify_results_v2.py ..............                           [ 98%]
+tests/test_vllm_integration.py sssssss                                   [ 98%]
+tests/test_vllm_telemetry.py ..                                          [ 98%]
+tests/test_wave1_runexp_telemetry.py .........................           [ 99%]
+tests/test_yield_ladder.py ........................                      [100%]
+
+=============================== warnings summary ===============================
+src/orchestration/router.py:515
+  /Users/lucasmariano/CAGE/src/orchestration/router.py:515: DeprecationWarning: 
+          on_event is deprecated, use lifespan event handlers instead.
+  
+          Read more about it in the
+          [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+          
+    @app.on_event("startup")
+
+.venv/lib/python3.13/site-packages/fastapi/applications.py:4681
+  /Users/lucasmariano/CAGE/.venv/lib/python3.13/site-packages/fastapi/applications.py:4681: DeprecationWarning: 
+          on_event is deprecated, use lifespan event handlers instead.
+  
+          Read more about it in the
+          [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+          
+    return self.router.on_event(event_type)  # ty: ignore[deprecated]
+
+tests/test_quality_claim_checker.py::test_explicit_alignscore_unavailable_strict_points_to_runner
+tests/test_quality_claim_checker.py::test_explicit_alignscore_unavailable_strict_points_to_runner
+tests/test_quality_claim_checker.py::test_explicit_alignscore_unavailable_strict_points_to_runner
+tests/test_quality_claim_checker.py::test_explicit_alignscore_unavailable_strict_points_to_runner
+tests/test_quality_claim_checker.py::test_explicit_alignscore_unavailable_strict_points_to_runner
+tests/test_quality_claim_checker.py::test_explicit_alignscore_unavailable_strict_points_to_runner
+tests/test_quality_claim_checker.py::test_explicit_alignscore_unavailable_strict_points_to_runner
+  /Users/lucasmariano/CAGE/.venv/lib/python3.13/site-packages/torch/jit/_script.py:1488: DeprecationWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+tests/test_run_power_sim.py::TestSmokeMode::test_smoke_main_end_to_end_offline_and_deterministic
+tests/test_run_power_sim.py::TestSmokeMode::test_smoke_main_end_to_end_offline_and_deterministic
+tests/test_run_power_sim.py::TestSmokeMode::test_smoke_main_end_to_end_offline_and_deterministic
+tests/test_run_power_sim.py::TestSmokeMode::test_smoke_main_end_to_end_offline_and_deterministic
+  /Users/lucasmariano/CAGE/.venv/lib/python3.13/site-packages/scipy/stats/_axis_nan_policy.py:601: RuntimeWarning: Precision loss occurred in moment calculation due to catastrophic cancellation. This occurs when the data are nearly identical. Results may be unreliable.
+    res = hypotest_fun_out(*samples, **kwds)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+========== 3497 passed, 13 skipped, 13 warnings in 114.16s (0:01:54) ===========

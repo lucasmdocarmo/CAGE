@@ -46,11 +46,16 @@ results/<campaign>/<session>/<run_id>/
   possible without opening any JSON.
 - `t_start` / `t_end` in the windows[] table are the window's **dispatch span** on the
   telemetry clock (`time.time()`): first measured send to last completion (ADR-0055
-  amendment 2026-09-19). Request preparation and result recording sit outside it; the
-  regime bridge slices the telemetry series by `[t_start, t_end)` and every per-second
-  figure divides by its length. The window's `metrics.json["measured_window"]` carries the
-  same pair plus the stage bracket (`stage_t_start` / `stage_t_end`, preparation +
-  dispatch + recording) as provenance.
+  amendment 2026-09-19). For open-loop windows (the pressure families) request
+  preparation and result recording sit outside it; for closed-loop windows (F1, DIST)
+  only the first unit's preparation and the last unit's recording fall outside, the
+  units in between interleave inside the span. The regime bridge slices the telemetry
+  series by `[t_start, t_end)` and every per-second figure divides by its length; a span
+  under a few seconds trips the bridge's minimum-sample and coverage gates (sampler
+  interval 1 s), which is a recorded refusal, not a crash. The window's
+  `metrics.json["measured_window"]` carries the same pair plus `span`, `workload_mode`
+  and the stage bracket (`stage_t_start` / `stage_t_end`, preparation + dispatch +
+  recording) as provenance.
 
 ## 2. Cell directory names = `CellSpec.to_row_key()`
 

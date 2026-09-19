@@ -1936,6 +1936,17 @@ def run_experiment(
                 None,
                 "workload_mode=open_loop requires an offered arrival rate (--rate)",
             )
+        if campaign_session is not None and open_loop_warmup_s > 0:
+            # ADR-0055 amendment 2026-09-19: the campaign window's t_start is
+            # the FIRST send, so a Jain warm-up trim would drop rows that sit
+            # inside the stamped window (the driver never passes the flag).
+            raise LoadGeneratorError(
+                "open_loop_warmup_s",
+                open_loop_warmup_s,
+                "campaign mode refuses --open-loop-warmup-s > 0: the measurement "
+                "window opens at the first send (ADR-0055 amendment 2026-09-19), "
+                "so trimmed rows would sit inside the stamped window",
+            )
         if (open_loop_duration_s is None) == (open_loop_num_arrivals is None):
             raise LoadGeneratorError(
                 "open_loop_duration_s/open_loop_num_arrivals",
@@ -2631,10 +2642,14 @@ def run_experiment(
     # ADR-0055 amendment 2026-09-19 (Batch 2 W1, option C): the measurement
     # window is the DISPATCH SPAN, first measured send to last completion,
     # on the telemetry clock (time.time(), the same clock as the sampler's
-    # per-tick ts). The measured stages below stamp it around the sends
-    # only, never around preparation (retrieval, reranking, prompt building)
-    # or recording. None until a measured request is sent: a campaign window
-    # without one refuses instead of stamping a window that measured nothing.
+    # per-tick ts). Open loop: every request is prepared before the first
+    # send and every row recorded after the last completion, so both sit
+    # outside the window. Closed loop: the first unit's preparation and the
+    # last unit's recording sit outside; the interleaved preparation, settle
+    # and recording of the units in between sit inside (they are part of the
+    # closed-loop serving process). None until a measured request is sent: a
+    # campaign window without one refuses instead of stamping a window that
+    # measured nothing.
     measured_window_t_start: Optional[float] = None
     measured_window_t_end: Optional[float] = None
 
@@ -3313,8 +3328,9 @@ def run_experiment(
                 # unit's rows records the same measured value.
                 settle_ms = settle_before_request() if collect_results else 0.0
                 # Window bracket (option C): the first measured send opens the
-                # window, every measured completion moves its end; the unit's
-                # preparation above and its recording below stay outside.
+                # window, every measured completion moves its end; only the
+                # first unit's preparation and the last unit's recording fall
+                # outside (later units interleave inside the span).
                 if collect_results and measured_window_t_start is None:
                     measured_window_t_start = time.time()
                 if len(requests) == 1:
@@ -3615,11 +3631,16 @@ def run_experiment(
     if campaign_session is not None and (
         measured_window_t_start is None or measured_window_t_end is None
     ):
+        cause = (
+            "dispatched no measured request (every measured example was dropped "
+            "before its send, or the arrival schedule drew zero arrivals)"
+            if measured_window_t_start is None
+            else "sent measured requests but none completed (every send raised)"
+        )
         raise RuntimeError(
-            "campaign window dispatched no measured request (every measured "
-            "example was dropped before its send), so no measurement window "
-            "can be stamped (ADR-0055 amendment 2026-09-19: the window is the "
-            "dispatch span); refusing to emit an empty window"
+            f"campaign window {cause}, so no measurement window can be stamped "
+            "(ADR-0055 amendment 2026-09-19: the window is the dispatch span); "
+            "refusing to emit an empty window"
         )
 
     print("-" * 70)
@@ -4194,6 +4215,9 @@ def run_experiment(
             "t_start": measured_window_t_start,
             "t_end": measured_window_t_end,
             "span": "dispatch",
+            # open_loop: preparation and recording outside the span; closed
+            # loop: the units after the first interleave inside it.
+            "workload_mode": workload_mode,
             "stage_t_start": stage_t_start,
             "stage_t_end": stage_t_end,
         }
@@ -4462,7 +4486,11 @@ def parse_running_requests(metrics_text: str, gauge: str) -> Optional[int]:
         except ValueError:
             continue
         found = True
-    return int(round(total)) if found else None
+    import math
+
+    # A non-finite sample (NaN, +Inf) reads as ABSENT (the probe then records
+    # the window unverified), never as a count and never as a crash.
+    return int(round(total)) if found and math.isfinite(total) else None
 
 
 def _probe_running_requests(api_base: str, backend: str) -> Tuple[Optional[int], str]:

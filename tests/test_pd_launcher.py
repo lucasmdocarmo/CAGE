@@ -863,6 +863,14 @@ def test_proxy_relayed_paths_mirror_the_runner_and_the_adapter() -> None:
     )
     assert pd_proxy.sum_gauge(text, "vllm:num_requests_running") == 3
     assert pd_proxy.sum_gauge("other 5\n", "vllm:num_requests_running") is None
+    # A non-finite sample reads as ABSENT (503 lane), never as a count or a crash.
+    for bad in ("NaN", "+Inf", "-Inf"):
+        assert pd_proxy.sum_gauge(f"vllm:num_requests_running {bad}\n", "vllm:num_requests_running") is None
+    # The relay's per-leg timeouts stay inside the runner's budgets even at
+    # http.client's per-operation semantics (about twice the value per leg),
+    # because the two roles are visited concurrently.
+    assert 2 * pd_proxy._METRICS_TIMEOUT < 10.0
+    assert 2 * pd_proxy._RESET_TIMEOUT < 30.0
 
 
 def test_proxy_metrics_relays_only_the_running_gauge_per_role(pd_stack) -> None:
@@ -893,6 +901,12 @@ def test_proxy_metrics_fails_closed_when_a_role_is_unreadable(pd_stack) -> None:
     doc = json.loads(body)
     assert "decode" in doc["roles"] and "absent" in doc["roles"]["decode"]
     assert "prefill" not in doc["roles"]
+    # a non-finite sample on one role: absent, never a count, never a dropped
+    # connection (the runner would otherwise read a socket error)
+    decode.metrics_text = "vllm:num_requests_running NaN\n"
+    status, body = _get(port, "/metrics")
+    assert status == 503
+    assert "absent" in json.loads(body)["roles"]["decode"]
     # role down
     decode.close()
     status, body = _get(port, "/metrics")
@@ -906,10 +920,9 @@ def test_proxy_reset_fans_out_to_both_roles_and_requires_both(pd_stack) -> None:
     assert status == 200
     doc = json.loads(body)
     assert doc["roles"] == {"prefill": 200, "decode": 200}
-    assert [(r, p) for r, p in journal] == [
-        ("prefill", {"reset": "/reset_prefix_cache"}),
-        ("decode", {"reset": "/reset_prefix_cache"}),
-    ], "the reset must reach BOTH roles"
+    # Both roles, concurrently (arrival order in the journal is not defined).
+    assert sorted(r for r, _ in journal) == ["decode", "prefill"], "the reset must reach BOTH roles"
+    assert all(p == {"reset": "/reset_prefix_cache"} for _, p in journal)
     # one role declines: never a partial success under a cold-start label
     decode.reset_status = 500
     status, body = _post(port, "/reset_prefix_cache", {})

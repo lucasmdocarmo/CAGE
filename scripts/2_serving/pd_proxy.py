@@ -47,18 +47,26 @@ BOTH roles and answers 200 only when both flushed, else 502 naming the role
 that did not (never a partial success under a cold-start label). No other
 metric family is relayed: a sampler pointed at the proxy finds absence,
 never a doubled occupancy (per-role telemetry rides CAGE_TELEMETRY_ENDPOINTS
-against the instances themselves). Both role instances are launched with
-VLLM_SERVER_DEV_MODE=1 by manage_vllm_pd.sh, which is what enables the flush
-endpoint on them [VERIFY-LIVE at Run-C-prime preflight: the pinned vLLM
-exposes both paths on a NixlConnector-configured instance].
+against the instances themselves). manage_vllm_pd.sh launches both role
+instances with VLLM_SERVER_DEV_MODE defaulting to 1, which is what enables
+the flush endpoint on them; an ambient VLLM_SERVER_DEV_MODE=0 in the
+operator's shell disables it on both roles and the strict reset then refuses
+(both legs non-2xx, proxy 502, CacheResetError) [VERIFY-LIVE at Run-C-prime
+preflight: the pinned vLLM exposes both paths on a NixlConnector-configured
+instance]. The two role calls of each relay run CONCURRENTLY, so the proxy's
+worst case is one leg; http.client applies a timeout per socket operation
+(connect, then each read), so a leg is bounded by about twice its timeout,
+and the per-leg values below keep that bound inside the runner's own probe
+(10 s) and flush (30 s) budgets.
 """
 from __future__ import annotations
 
 import argparse
 import http.client
 import json
+import math
 import sys
-import threading  # noqa: F401  (documented seam: ThreadingHTTPServer below)
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlsplit
@@ -86,11 +94,13 @@ ROLE_LABEL = "pd_role"
 #: path mirrors src/inference/vllm_adapter.py _flush_endpoint).
 METRICS_PATH = "/metrics"
 RESET_PATH = "/reset_prefix_cache"
-#: Upstream timeouts for the two relayed paths, seconds. The runner's own
-#: flush timeout is 30 s and its probe timeout 10 s; the proxy visits the two
-#: roles in sequence, so each leg stays well inside those budgets.
+#: Upstream timeouts for the two relayed paths, seconds, PER socket operation
+#: (http.client semantics: connect, then each read), so one leg is bounded by
+#: about twice the value. The roles are visited concurrently (_call_roles),
+#: so the proxy's worst case is one leg: about 8 s against the runner's 10 s
+#: probe timeout, about 28 s against its 30 s flush timeout.
 _METRICS_TIMEOUT = 4.0
-_RESET_TIMEOUT = 10.0
+_RESET_TIMEOUT = 14.0
 
 
 def _split_url(url: str) -> Tuple[str, int]:
@@ -148,7 +158,32 @@ def sum_gauge(metrics_text: str, gauge: str) -> Optional[int]:
         except ValueError:
             continue
         found = True
-    return int(round(total)) if found else None
+    # A non-finite sample (NaN, +Inf) reads as ABSENT, never as a count and
+    # never as an exception escaping into the handler (the runner's parser
+    # applies the same guard).
+    return int(round(total)) if found and math.isfinite(total) else None
+
+
+def _call_roles(
+    roles: Tuple[Tuple[str, str], ...], method: str, path: str, timeout: float
+) -> Dict[str, Tuple[Optional[int], str]]:
+    """One upstream call per role, run CONCURRENTLY (one thread per role), so
+    the relay's worst case is a single leg rather than the sum of both; each
+    thread writes its own key of the result."""
+    out: Dict[str, Tuple[Optional[int], str]] = {}
+
+    def _one(role: str, url: str) -> None:
+        out[role] = _upstream_call(url, method, path, timeout)
+
+    threads = [
+        threading.Thread(target=_one, args=(role, url), daemon=True)
+        for role, url in roles
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return out
 
 
 def _upstream_call(
@@ -245,8 +280,9 @@ class PDProxyHandler(BaseHTTPRequestHandler):
         stack must never report a partial count as the whole)."""
         counts: Dict[str, int] = {}
         failures: Dict[str, str] = {}
-        for role, url in self._roles():
-            status, body = _upstream_call(url, "GET", METRICS_PATH, _METRICS_TIMEOUT)
+        replies = _call_roles(self._roles(), "GET", METRICS_PATH, _METRICS_TIMEOUT)
+        for role, _url in self._roles():
+            status, body = replies[role]
             if status != 200:
                 failures[role] = body if status is None else f"http-{status}"
                 continue
@@ -279,8 +315,9 @@ class PDProxyHandler(BaseHTTPRequestHandler):
         declined is not a cold start)."""
         statuses: Dict[str, Any] = {}
         failed: Dict[str, str] = {}
-        for role, url in self._roles():
-            status, body = _upstream_call(url, "POST", RESET_PATH, _RESET_TIMEOUT)
+        replies = _call_roles(self._roles(), "POST", RESET_PATH, _RESET_TIMEOUT)
+        for role, _url in self._roles():
+            status, body = replies[role]
             statuses[role] = status
             if status is None:
                 failed[role] = body

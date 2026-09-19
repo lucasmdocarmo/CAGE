@@ -976,6 +976,12 @@ def test_parse_running_requests_sums_labeled_gauges() -> None:
     assert runner.parse_running_requests(text, "vllm:num_requests_running") == 3
     assert runner.parse_running_requests(text, "sglang:num_running_reqs") is None
     assert runner.parse_running_requests("", "vllm:num_requests_running") is None
+    # A non-finite sample reads as ABSENT (the probe records the window
+    # unverified), never as a count and never as a crash.
+    for bad in ("NaN", "+Inf", "-Inf"):
+        assert runner.parse_running_requests(
+            f"vllm:num_requests_running {bad}\n", "vllm:num_requests_running"
+        ) is None
 
 
 class _EngineStub(http.server.BaseHTTPRequestHandler):
@@ -1802,8 +1808,10 @@ def test_measured_window_is_the_dispatch_span_and_keeps_the_stage_bracket(
     (wdir,) = _window_dirs(root, "no_cache", "squad_v2")
     meta = json.loads((wdir / "metrics.json").read_text(encoding="utf-8"))
     win = meta["measured_window"]
-    assert set(win) == {"t_start", "t_end", "span", "stage_t_start", "stage_t_end"}
-    assert win["span"] == "dispatch"
+    assert set(win) == {
+        "t_start", "t_end", "span", "workload_mode", "stage_t_start", "stage_t_end",
+    }
+    assert win["span"] == "dispatch" and win["workload_mode"] == "single"
     # The dispatch span sits inside the stage bracket, opens at least one
     # settle after the stage began and no later than the first served
     # response, and closes no earlier than the last served response.
@@ -1875,4 +1883,53 @@ def test_campaign_window_with_no_measured_send_refuses(
     assert exc.value.code == 1
     out = capsys.readouterr().out
     assert "dispatched no measured request" in out and "ADR-0055" in out
+    assert not _window_dirs(root, "no_cache", "squad_v2")
+
+
+class _RaisingEngine(StubEngine):
+    """Every send raises: requests are sent but none completes."""
+
+    def generate(self, request: Any, stream: bool = False) -> InferenceResponse:
+        raise RuntimeError("engine exploded on send")
+
+
+def test_campaign_multi_turn_window_with_no_completion_refuses_naming_the_cause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # multi_turn: the per-turn guard swallows a raising send, so t_start is
+    # stamped and t_end never is; the refusal names THAT cause.
+    root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    with pytest.raises(SystemExit) as exc:
+        _run_cell(
+            monkeypatch, root, "no_cache", "squad_v2", ttft_base=200.0, num_trials=1,
+            engine_factory=lambda model: _RaisingEngine(model, "no_cache", 200.0),
+            extra_argv=("--workload-mode", "multi_turn"),
+        )
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "sent measured requests but none completed" in out and "ADR-0055" in out
+    assert not _window_dirs(root, "no_cache", "squad_v2")
+
+
+def test_campaign_mode_refuses_the_open_loop_warmup_trim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The window opens at the FIRST send, so a Jain warm-up trim would drop
+    # rows that sit inside the stamped window: refused early, before any
+    # dataset or engine work (the driver never passes the flag).
+    _RecordingEngine.calls = []
+    root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    with pytest.raises(SystemExit) as exc:
+        _run_cell(
+            monkeypatch, root, "no_cache", "squad_v2", ttft_base=200.0, num_trials=1,
+            engine_factory=lambda model: _RecordingEngine(model, "no_cache", 200.0),
+            extra_argv=(
+                "--workload-mode", "open_loop", "--rate", "5", "--arrival-count", "4",
+                "--open-loop-warmup-s", "1",
+            ),
+        )
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "open-loop-warmup-s" in out and "ADR-0055" in out
+    assert _RecordingEngine.calls == []
     assert not _window_dirs(root, "no_cache", "squad_v2")
