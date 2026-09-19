@@ -31,7 +31,12 @@ replicated single-instance stack mislabeled as disaggregation):
    engine-real stamps, so until the live NIXL path is verified the correct
    end-to-end outcome is that gate REFUSING (a proxy-fabricated stamp would
    be fake provenance). /health is 200 only when BOTH upstreams answer and
-   reports the data path as PENDING, never PASS.
+   reports the data path as PENDING, never PASS. Cold start per window on
+   pd (ADR-0102 amendment 2026-09-19, Batch 2 W2-R1): GET /metrics relays
+   ONLY the runner's in-flight gauge, one relabeled sample per role (503
+   unless both roles are readable), and POST /reset_prefix_cache fans out
+   to both roles and is 200 only when both flushed (else 502 naming the
+   role), so the runner's strict reset works against the proxy.
 
 4. run_campaign.py pd emission + gating (stub runner, no GPU/network): a
    vllm DIST/pd cell is enumerated EXECUTABLE (blocked_on=null) with
@@ -630,11 +635,20 @@ DECODE_PAYLOAD = json.dumps(
 
 
 class _StubUpstream:
-    """A recording OpenAI-shaped upstream (prefill or decode role)."""
+    """A recording OpenAI-shaped upstream (prefill or decode role).
+
+    ``running`` is the in-flight count its /metrics reports (beside a decoy
+    occupancy family the proxy must NOT relay); ``metrics_text`` overrides
+    the whole exposition; ``reset_status`` is what POST /reset_prefix_cache
+    answers (the reset is journaled as (role, {"reset": path})).
+    """
 
     def __init__(self, role: str, journal: List[Tuple[str, Dict[str, Any]]]):
         self.role = role
         self.journal = journal
+        self.running = 0
+        self.metrics_text: Optional[str] = None
+        self.reset_status = 200
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -642,6 +656,21 @@ class _StubUpstream:
                 pass
 
             def do_GET(self) -> None:  # noqa: N802
+                if self.path == "/metrics":
+                    text = outer.metrics_text
+                    if text is None:
+                        text = (
+                            "# TYPE vllm:num_requests_running gauge\n"
+                            f'vllm:num_requests_running{{model_name="m"}} {outer.running}\n'
+                            "vllm:gpu_cache_usage_perc 0.5\n"
+                        )
+                    body = text.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; version=0.0.4")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 body = b'{"status":"ok"}'
                 self.send_response(200 if self.path == "/health" else 404)
                 self.send_header("Content-Type", "application/json")
@@ -650,6 +679,15 @@ class _StubUpstream:
                 self.wfile.write(body)
 
             def do_POST(self) -> None:  # noqa: N802
+                if self.path == "/reset_prefix_cache":
+                    outer.journal.append((outer.role, {"reset": self.path}))
+                    body = b"{}"
+                    self.send_response(outer.reset_status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 length = int(self.headers.get("Content-Length", "0"))
                 payload = json.loads(self.rfile.read(length).decode("utf-8"))
                 outer.journal.append((outer.role, payload))
@@ -796,6 +834,96 @@ def test_proxy_refuses_unparseable_body_and_unknown_paths(pd_stack) -> None:
 def test_proxy_build_server_refuses_portless_upstreams() -> None:
     with pytest.raises(ValueError, match="http://host:port"):
         pd_proxy.build_server(0, "http://localhost", "http://localhost:8200")
+
+
+# --- ADR-0102 on pd (Batch 2 W2-R1): the strict reset against the proxy ---
+
+RUN_EXPERIMENT_PY = REPO_ROOT / "scripts" / "3_run" / "run_experiment.py"
+VLLM_ADAPTER_PY = REPO_ROOT / "src" / "inference" / "vllm_adapter.py"
+
+
+def test_proxy_relayed_paths_mirror_the_runner_and_the_adapter() -> None:
+    # The gauge the runner's quiescence probe sums, and the flush path the
+    # vLLM adapter POSTs, restated from their SOURCE (no heavy imports): a
+    # drift on either side fails here.
+    runner = RUN_EXPERIMENT_PY.read_text(encoding="utf-8")
+    m = re.search(r'COLD_START_RUNNING_GAUGE[^}]*"vllm":\s*"([^"]+)"', runner, re.S)
+    assert m and m.group(1) == pd_proxy.RUNNING_GAUGE == "vllm:num_requests_running"
+    adapter = VLLM_ADAPTER_PY.read_text(encoding="utf-8")
+    m = re.search(r'_flush_endpoint:\s*Optional\[str\]\s*=\s*"([^"]+)"', adapter)
+    assert m and m.group(1) == pd_proxy.RESET_PATH == "/reset_prefix_cache"
+    assert pd_proxy.METRICS_PATH == "/metrics"
+    # The summing rule is the runner's (labeled, bare, timestamp, comments).
+    text = (
+        "# HELP x\n"
+        'vllm:num_requests_running{a="1"} 2\n'
+        "vllm:num_requests_running 1 1700000000\n"
+        "vllm:num_requests_running_total 99\n"
+        "other 5\n"
+    )
+    assert pd_proxy.sum_gauge(text, "vllm:num_requests_running") == 3
+    assert pd_proxy.sum_gauge("other 5\n", "vllm:num_requests_running") is None
+
+
+def test_proxy_metrics_relays_only_the_running_gauge_per_role(pd_stack) -> None:
+    _, prefill, decode, port = pd_stack
+    prefill.running, decode.running = 3, 1
+    status, body = _get(port, "/metrics")
+    assert status == 200
+    text = body.decode("utf-8")
+    # The runner's own parser reads the STACK total (the sum over both labels).
+    assert pd_proxy.sum_gauge(text, "vllm:num_requests_running") == 4
+    assert 'vllm:num_requests_running{pd_role="prefill"} 3' in text
+    assert 'vllm:num_requests_running{pd_role="decode"} 1' in text
+    # Nothing else is relayed: the decoy occupancy family of each role never
+    # appears (a sampler on the proxy finds absence, never a doubled value).
+    assert "gpu_cache_usage_perc" not in text
+    assert "model_name" not in text
+    prefill.running = decode.running = 0
+    _, body = _get(port, "/metrics")
+    assert pd_proxy.sum_gauge(body.decode("utf-8"), "vllm:num_requests_running") == 0
+
+
+def test_proxy_metrics_fails_closed_when_a_role_is_unreadable(pd_stack) -> None:
+    _, _, decode, port = pd_stack
+    # gauge absent on one role: a partial count must never pass as the whole
+    decode.metrics_text = "vllm:gpu_cache_usage_perc 0.5\n"
+    status, body = _get(port, "/metrics")
+    assert status == 503
+    doc = json.loads(body)
+    assert "decode" in doc["roles"] and "absent" in doc["roles"]["decode"]
+    assert "prefill" not in doc["roles"]
+    # role down
+    decode.close()
+    status, body = _get(port, "/metrics")
+    assert status == 503
+    assert "unreachable" in json.loads(body)["roles"]["decode"]
+
+
+def test_proxy_reset_fans_out_to_both_roles_and_requires_both(pd_stack) -> None:
+    journal, _, decode, port = pd_stack
+    status, body = _post(port, "/reset_prefix_cache", {})
+    assert status == 200
+    doc = json.loads(body)
+    assert doc["roles"] == {"prefill": 200, "decode": 200}
+    assert [(r, p) for r, p in journal] == [
+        ("prefill", {"reset": "/reset_prefix_cache"}),
+        ("decode", {"reset": "/reset_prefix_cache"}),
+    ], "the reset must reach BOTH roles"
+    # one role declines: never a partial success under a cold-start label
+    decode.reset_status = 500
+    status, body = _post(port, "/reset_prefix_cache", {})
+    assert status == 502
+    doc = json.loads(body)
+    assert doc["roles"]["prefill"] == 200 and doc["roles"]["decode"] == 500
+    assert "decode" in doc["failed"] and "prefill" not in doc["failed"]
+    # one role down
+    decode.close()
+    status, body = _post(port, "/reset_prefix_cache", {})
+    assert status == 502
+    assert "unreachable" in json.loads(body)["failed"]["decode"]
+    # the reset never touches the 1P1D data path: no /v1 request was journaled
+    assert all(p == {"reset": "/reset_prefix_cache"} for _, p in journal)
 
 
 # ---------------------------------------------------------------------------

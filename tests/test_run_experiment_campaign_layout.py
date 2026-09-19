@@ -1701,3 +1701,178 @@ def test_embedding_revision_pin_is_threaded_and_persisted(
     meta2 = json.loads((wdir2 / "metrics.json").read_text(encoding="utf-8"))
     assert "embedding_revision" in meta2["experiment"]
     assert meta2["experiment"]["embedding_revision"] is None
+
+
+# ---------------------------------------------------------------------------
+# Batch 2 finding W1 (ADR-0055 "serving writes, scoring reads"): the campaign
+# path refuses inline model scoring before any serving work, honors the
+# --skip-quality flag as the pin, and records the scoring regime in every
+# window's metrics.json (campaign-only: the pilot path stays byte-identical).
+# ---------------------------------------------------------------------------
+
+
+def test_campaign_window_metrics_record_decoupled_scoring(campaign_tree: Path) -> None:
+    for baseline, _ in ARMS:
+        for dataset in DATASETS:
+            for wdir in _window_dirs(campaign_tree, baseline, dataset):
+                meta = json.loads((wdir / "metrics.json").read_text(encoding="utf-8"))
+                assert meta["quality_scoring"] == {"mode": "decoupled", "adr": "ADR-0055"}
+
+
+@pytest.mark.parametrize("value", ["0", "", "yes"])
+def test_campaign_mode_refuses_inline_scoring_before_serving(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    value: str,
+) -> None:
+    _RecordingEngine.calls = []
+    root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    with pytest.raises(SystemExit) as exc:
+        _run_cell(
+            monkeypatch, root, "no_cache", "squad_v2", ttft_base=200.0, num_trials=1,
+            engine_factory=lambda model: _RecordingEngine(model, "no_cache", 200.0),
+            extra_env={"CAGE_SKIP_QUALITY": value},
+        )
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "CAGE_SKIP_QUALITY" in err and "ADR-0055" in err
+    # The remedy names the campaign v2 scoring mode, never the legacy --apply.
+    assert "--scoring-run-id" in err
+    assert _RecordingEngine.calls == [], "inline scoring must refuse BEFORE serving"
+    assert not _window_dirs(root, "no_cache", "squad_v2")
+
+
+def test_skip_quality_flag_satisfies_the_campaign_pin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The runner's own --skip-quality exports the env before the check, so a
+    # hand-built campaign invocation can carry the pin as a flag.
+    root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    _run_cell(
+        monkeypatch, root, "no_cache", "squad_v2", ttft_base=200.0, num_trials=1,
+        extra_argv=("--skip-quality",), extra_env={"CAGE_SKIP_QUALITY": "0"},
+    )
+    (wdir,) = _window_dirs(root, "no_cache", "squad_v2")
+    meta = json.loads((wdir / "metrics.json").read_text(encoding="utf-8"))
+    assert meta["quality_scoring"]["mode"] == "decoupled"
+
+
+# ---------------------------------------------------------------------------
+# Batch 2 finding W1, option C (ADR-0055 amendment 2026-09-19): the campaign
+# measurement window is the DISPATCH SPAN (first measured send to last
+# completion) on the telemetry clock; preparation and recording sit outside;
+# the stage bracket is kept beside it as provenance; a window with no measured
+# send refuses instead of stamping bounds around nothing.
+# ---------------------------------------------------------------------------
+
+import asyncio  # noqa: E402
+import time  # noqa: E402
+
+
+class _WallClockEngine(StubEngine):
+    """StubEngine that stamps time.time() at every response it serves."""
+
+    def __init__(self, model_name: str, baseline: str, ttft_base: float) -> None:
+        super().__init__(model_name, baseline, ttft_base)
+        self.served_at: list[float] = []
+
+    def _respond(self, request: Any) -> InferenceResponse:
+        self.served_at.append(time.time())
+        return super()._respond(request)
+
+
+def test_measured_window_is_the_dispatch_span_and_keeps_the_stage_bracket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engines: list[_WallClockEngine] = []
+
+    def _engine(model: str) -> _WallClockEngine:
+        eng = _WallClockEngine(model, "no_cache", 200.0)
+        engines.append(eng)
+        return eng
+
+    root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    # A 50 ms settle before every timed send: stage time the window must
+    # exclude ahead of the first send (the stage bracket still contains it).
+    _run_cell(
+        monkeypatch, root, "no_cache", "squad_v2", ttft_base=200.0, num_trials=1,
+        engine_factory=_engine, extra_env={"CAGE_REQUEST_SETTLE_MS": "50"},
+    )
+    (eng,) = engines
+    assert len(eng.served_at) == N_QUERIES
+    (wdir,) = _window_dirs(root, "no_cache", "squad_v2")
+    meta = json.loads((wdir / "metrics.json").read_text(encoding="utf-8"))
+    win = meta["measured_window"]
+    assert set(win) == {"t_start", "t_end", "span", "stage_t_start", "stage_t_end"}
+    assert win["span"] == "dispatch"
+    # The dispatch span sits inside the stage bracket, opens at least one
+    # settle after the stage began and no later than the first served
+    # response, and closes no earlier than the last served response.
+    assert win["stage_t_start"] < win["t_start"] < win["t_end"] <= win["stage_t_end"]
+    assert win["t_start"] - win["stage_t_start"] >= 0.05
+    assert win["t_start"] <= eng.served_at[0]
+    assert win["t_end"] >= eng.served_at[-1]
+    # The sealed windows[] entry carries the SAME dispatch values (exact fields
+    # unchanged: the regime bridge and the analysis read this entry).
+    cell = json.loads((wdir.parent / "cell.json").read_text(encoding="utf-8"))
+    entry = cell["windows"]["squad_v2-01"]
+    assert entry["t_start"] == win["t_start"] and entry["t_end"] == win["t_end"]
+
+
+class _AsyncStubEngine:
+    """Async-streaming stub (the test_integration_wiring pattern) that stamps
+    time.time() at every send and every completion."""
+
+    def __init__(self) -> None:
+        self.sends: list[float] = []
+        self.done: list[float] = []
+        self._stub = StubEngine("m", "no_cache", 200.0)
+
+    async def async_stream_generate(self, request: Any, *, on_first_token: Any = None) -> InferenceResponse:
+        self.sends.append(time.time())
+        if on_first_token is not None:
+            on_first_token()
+        await asyncio.sleep(0.005)
+        response = self._stub._respond(request)
+        self.done.append(time.time())
+        return response
+
+
+def test_dispatch_open_loop_first_send_hook_fires_once_at_the_first_send() -> None:
+    from src.inference.engine import InferenceRequest
+
+    engine = _AsyncStubEngine()
+    fired: list[float] = []
+    requests = [
+        InferenceRequest(prompt=f"p{i}", max_tokens=4, temperature=0.0, request_id=f"r{i}")
+        for i in range(3)
+    ]
+    kept, report = runner.dispatch_open_loop(
+        engine, requests, rate_qps=200.0, seed=7, n_arrivals=3,
+        on_first_send=lambda: fired.append(time.time()),
+    )
+    assert len(kept) == 3 and report.n_completed == 3
+    assert len(fired) == 1, "the hook fires exactly once, at the first send"
+    assert fired[0] <= engine.sends[0] <= min(engine.done)
+    # Without the hook the call is unchanged (existing callers pass nothing).
+    kept2, report2 = runner.dispatch_open_loop(engine, requests, rate_qps=200.0, seed=7, n_arrivals=3)
+    assert len(kept2) == 3 and report2.n_completed == 3
+
+
+def test_campaign_window_with_no_measured_send_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Every prepare fails (the prompt formatters raise), so nothing is sent:
+    # there is no dispatch span, and the window refuses instead of stamping
+    # bounds around nothing (no window dir, exit 1).
+    def _boom(*a: Any, **k: Any) -> Any:
+        raise RuntimeError("no prompt for this example")
+
+    monkeypatch.setattr(runner, "format_qa_messages", _boom)
+    monkeypatch.setattr(runner, "format_qa_prompt", _boom)
+    root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    with pytest.raises(SystemExit) as exc:
+        _run_cell(monkeypatch, root, "no_cache", "squad_v2", ttft_base=200.0, num_trials=1)
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "dispatched no measured request" in out and "ADR-0055" in out
+    assert not _window_dirs(root, "no_cache", "squad_v2")

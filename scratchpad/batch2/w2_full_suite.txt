@@ -1,0 +1,189 @@
+============================= test session starts ==============================
+collected 3499 items
+
+tests/test_assemble_preregistration.py ......................            [  0%]
+tests/test_baselines.py ...                                              [  0%]
+tests/test_baselines_config.py .........                                 [  0%]
+tests/test_bm25_rrf.py .......................                           [  1%]
+tests/test_build_legacy_index.py ...............                         [  2%]
+tests/test_cache_budget.py .................................             [  3%]
+tests/test_cag_reference_runner.py .................                     [  3%]
+tests/test_cage_stats_pin.py ........                                    [  3%]
+tests/test_calibrate_instrument_a_tau.py ............................... [  4%]
+................                                                         [  5%]
+tests/test_calibration.py ........................................       [  6%]
+tests/test_campaign_analysis.py ........................................ [  7%]
+........................                                                 [  8%]
+tests/test_campaign_layout.py .......................................... [  9%]
+.......                                                                  [  9%]
+tests/test_campaign_session.py ........................                  [ 10%]
+tests/test_cell_complete_exec.py ..............................          [ 10%]
+tests/test_cellspec.py ................................................. [ 12%]
+........................                                                 [ 13%]
+tests/test_compression.py ......                                         [ 13%]
+tests/test_compression_ops.py ..........                                 [ 13%]
+tests/test_conditioned_curves.py ....................................... [ 14%]
+.................                                                        [ 15%]
+tests/test_corpus_builder.py ..............                              [ 15%]
+tests/test_cov_blinding_tamper.py ..............                         [ 15%]
+tests/test_cov_calibrate_cell.py .............                           [ 16%]
+tests/test_cov_families_guards.py .........................              [ 17%]
+tests/test_cov_performance_trackers.py ..........................        [ 17%]
+tests/test_cov_provenance_defaults.py ..........................         [ 18%]
+tests/test_cov_router_logic.py .............................             [ 19%]
+tests/test_cov_sharegpt_loader.py .................                      [ 19%]
+tests/test_cov_verify_results_refusals.py .............................. [ 20%]
+.                                                                        [ 20%]
+tests/test_data.py ...                                                   [ 20%]
+tests/test_dataset_download_staging.py ..........                        [ 21%]
+tests/test_dataset_loaders.py .................                          [ 21%]
+tests/test_dataset_qasper_full.py ................                       [ 22%]
+tests/test_dataset_ruler.py ................                             [ 22%]
+tests/test_dataset_scbench.py ..........                                 [ 22%]
+tests/test_degradation.py ..........................................     [ 23%]
+tests/test_dist_contrasts.py ........................................... [ 25%]
+.................                                                        [ 25%]
+tests/test_engine_adapters.py .......................................... [ 26%]
+.                                                                        [ 26%]
+tests/test_evidence_writer.py .................                          [ 27%]
+tests/test_figure_pipeline.py .......................................... [ 28%]
+......................                                                   [ 29%]
+tests/test_floor_table.py .............................                  [ 30%]
+tests/test_gate_rc_consumption.py ........                               [ 30%]
+tests/test_gitignore_freeze_artifacts.py ............                    [ 30%]
+tests/test_goodput.py .................................................. [ 32%]
+.............................................................            [ 33%]
+tests/test_inference.py ........                                         [ 34%]
+tests/test_instrument_b_runner.py ...................................... [ 35%]
+....................                                                     [ 35%]
+tests/test_instrument_calibration.py ................................... [ 36%]
+.......................                                                  [ 37%]
+tests/test_instrument_revision_provenance.py ...............             [ 37%]
+tests/test_integration_wiring.py ....................................... [ 38%]
+.........................                                                [ 39%]
+tests/test_ir.py .........................                               [ 40%]
+tests/test_iso_basis.py .......................................          [ 41%]
+tests/test_l0_retrieval.py .....................                         [ 42%]
+tests/test_load_generator.py ........................................... [ 43%]
+....................                                                     [ 43%]
+tests/test_manage_vllm_cluster.py ...................................... [ 44%]
+                                                                         [ 44%]
+tests/test_memory_sweep_traps.py .....                                   [ 45%]
+tests/test_multi_instance_telemetry.py ................................. [ 45%]
+......................                                                   [ 46%]
+tests/test_nli_windowing.py ...............                              [ 47%]
+tests/test_observability.py ..........                                   [ 47%]
+tests/test_organize_results.py ........................................  [ 48%]
+tests/test_overlap_store.py ...........                                  [ 48%]
+tests/test_own_accounting.py ........................................... [ 50%]
+...                                                                      [ 50%]
+tests/test_pd_launcher.py .............................................. [ 51%]
+............                                                             [ 51%]
+tests/test_pd_regime.py ..............................................   [ 53%]
+tests/test_pilot_fences.py ..................                            [ 53%]
+tests/test_pilot_tree_campaign_guard.py ............                     [ 53%]
+tests/test_predicate_chain.py .......................................... [ 55%]
+..............                                                           [ 55%]
+tests/test_preflight_gates.py .......................................... [ 56%]
+........................................................................ [ 58%]
+..                                                                       [ 58%]
+tests/test_prompting_chat.py ................                            [ 59%]
+tests/test_quality_batching.py .........                                 [ 59%]
+tests/test_quality_claim_checker.py ...................                  [ 60%]
+tests/test_quality_failclosed.py ..................                      [ 60%]
+tests/test_quality_no_answer.py ........................................ [ 61%]
+..........................................                               [ 62%]
+tests/test_quality_provenance.py .............                           [ 63%]
+tests/test_quality_windowed_grounding.py ..............                  [ 63%]
+tests/test_query_manifest.py .....................                       [ 64%]
+tests/test_ragas_runner.py ...................                           [ 64%]
+tests/test_redis_cache.py ...............                                [ 65%]
+tests/test_regime_inputs.py .....................................        [ 66%]
+tests/test_registered_margins_consumption.py .....................       [ 66%]
+tests/test_rerank_pool.py ...................                            [ 67%]
+tests/test_rescore_wiring.py .............................               [ 68%]
+tests/test_results_loader.py .......................                     [ 68%]
+tests/test_retrieval_gate_table.py ...........................           [ 69%]
+tests/test_review_fixes_analysis.py ...                                  [ 69%]
+tests/test_review_fixes_core.py .............                            [ 70%]
+tests/test_review_fixes_data.py .....                                    [ 70%]
+tests/test_review_fixes_evaluation.py ........                           [ 70%]
+tests/test_router_integration.py sssss                                   [ 70%]
+tests/test_ruler_tasks.py .............................................. [ 72%]
+                                                                         [ 72%]
+tests/test_run_calibration.py ........................                   [ 72%]
+tests/test_run_campaign.py ............................................. [ 74%]
+........................................................................ [ 76%]
+........................................................................ [ 78%]
+....................................                                     [ 79%]
+tests/test_run_experiment_campaign_layout.py ........................... [ 79%]
+...............................                                          [ 80%]
+tests/test_run_power_sim.py ............................................ [ 82%]
+......                                                                   [ 82%]
+tests/test_runpod_ops.py .....................................           [ 83%]
+tests/test_score_instrument_b.py ..................                      [ 83%]
+tests/test_scoring_blinding.py ....................                      [ 84%]
+tests/test_script_headers.py ........................................... [ 85%]
+.................................                                        [ 86%]
+tests/test_scripts_doctrine.py ........................                  [ 87%]
+tests/test_serving_budget_knobs.py ............................          [ 88%]
+tests/test_staleness.py ..........                                       [ 88%]
+tests/test_stats_decided.py ..................................           [ 89%]
+tests/test_stats_engine.py ............................................. [ 90%]
+.................................................                        [ 91%]
+tests/test_stats_proof.py .............................................. [ 93%]
+.......                                                                  [ 93%]
+tests/test_tau_freeze_consumption.py ..................                  [ 94%]
+tests/test_terraform_contract.py ......                                  [ 94%]
+tests/test_token_divergence.py ..                                        [ 94%]
+tests/test_token_divergence_campaign.py ..............                   [ 94%]
+tests/test_token_divergence_stats.py .........                           [ 94%]
+tests/test_topic10_runner_hardening.py ........s.................        [ 95%]
+tests/test_topic10_transport_runpod.py ................................. [ 96%]
+..............                                                           [ 96%]
+tests/test_tp_flags.py ............................                      [ 97%]
+tests/test_truth_tax_palette.py .....                                    [ 97%]
+tests/test_verify_results_v2.py ..............                           [ 98%]
+tests/test_vllm_integration.py sssssss                                   [ 98%]
+tests/test_vllm_telemetry.py ..                                          [ 98%]
+tests/test_wave1_runexp_telemetry.py .........................           [ 99%]
+tests/test_yield_ladder.py ........................                      [100%]
+
+=============================== warnings summary ===============================
+src/orchestration/router.py:515
+  /Users/lucasmariano/CAGE/src/orchestration/router.py:515: DeprecationWarning: 
+          on_event is deprecated, use lifespan event handlers instead.
+  
+          Read more about it in the
+          [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+          
+    @app.on_event("startup")
+
+.venv/lib/python3.13/site-packages/fastapi/applications.py:4681
+  /Users/lucasmariano/CAGE/.venv/lib/python3.13/site-packages/fastapi/applications.py:4681: DeprecationWarning: 
+          on_event is deprecated, use lifespan event handlers instead.
+  
+          Read more about it in the
+          [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+          
+    return self.router.on_event(event_type)  # ty: ignore[deprecated]
+
+tests/test_quality_claim_checker.py::test_explicit_alignscore_unavailable_strict_points_to_runner
+tests/test_quality_claim_checker.py::test_explicit_alignscore_unavailable_strict_points_to_runner
+tests/test_quality_claim_checker.py::test_explicit_alignscore_unavailable_strict_points_to_runner
+tests/test_quality_claim_checker.py::test_explicit_alignscore_unavailable_strict_points_to_runner
+tests/test_quality_claim_checker.py::test_explicit_alignscore_unavailable_strict_points_to_runner
+tests/test_quality_claim_checker.py::test_explicit_alignscore_unavailable_strict_points_to_runner
+tests/test_quality_claim_checker.py::test_explicit_alignscore_unavailable_strict_points_to_runner
+  /Users/lucasmariano/CAGE/.venv/lib/python3.13/site-packages/torch/jit/_script.py:1488: DeprecationWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+tests/test_run_power_sim.py::TestSmokeMode::test_smoke_main_end_to_end_offline_and_deterministic
+tests/test_run_power_sim.py::TestSmokeMode::test_smoke_main_end_to_end_offline_and_deterministic
+tests/test_run_power_sim.py::TestSmokeMode::test_smoke_main_end_to_end_offline_and_deterministic
+tests/test_run_power_sim.py::TestSmokeMode::test_smoke_main_end_to_end_offline_and_deterministic
+  /Users/lucasmariano/CAGE/.venv/lib/python3.13/site-packages/scipy/stats/_axis_nan_policy.py:601: RuntimeWarning: Precision loss occurred in moment calculation due to catastrophic cancellation. This occurs when the data are nearly identical. Results may be unreliable.
+    res = hypotest_fun_out(*samples, **kwds)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+========== 3486 passed, 13 skipped, 13 warnings in 116.45s (0:01:56) ===========

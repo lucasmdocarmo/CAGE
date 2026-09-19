@@ -48,7 +48,8 @@ source "$SCRIPT_DIR/../lib/_serving_config.sh"
 # quality metrics (the ~90%-of-wall-clock CPU sink that idles the GPU); model quality is
 # scored AFTER all serving trees, on the freed GPU, from qa_evidence.jsonl (scoring tree
 # below). F1/EM/abstention are still computed inline (model-free). Set CAGE_SKIP_QUALITY=0
-# to restore inline scoring.
+# to restore inline scoring on the PILOT path only: campaign mode pins 1 below
+# (ADR-0055, Batch 2 W1; the runner refuses a campaign cell without it).
 export CAGE_SKIP_QUALITY="${CAGE_SKIP_QUALITY:-1}"
 
 # ONE run-id for the whole matrix. Reuses cloud_run.sh's minting convention (_common.sh
@@ -75,6 +76,10 @@ if [ -n "${CAGE_CAMPAIGN_ROOT:-}" ] || [ -n "${CAGE_CAMPAIGN:-}" ]; then
         export CAGE_RUN_ID="${CAGE_RUN_ID:-$(basename "$CAGE_CAMPAIGN_ROOT")}"
     fi
     export CAGE_RUN_ROOT="$CAGE_CAMPAIGN_ROOT"
+    # ADR-0055 (Batch 2 W1): the campaign path never scores inline, whatever
+    # the shell exported above; the runner refuses a campaign cell without
+    # this pin, so an operator's 0 would fail every cell after each engine start.
+    export CAGE_SKIP_QUALITY=1
     log "CAMPAIGN MODE (task #116): v2 run root $CAGE_CAMPAIGN_ROOT"
 else
     export CAGE_RUN_ID="${CAGE_RUN_ID:-$(mint_run_id "$_model_slug" "$NUM_QUERIES" "$NUM_TRIALS" "${DATASET:-squad_v2}")}"

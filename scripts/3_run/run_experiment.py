@@ -24,7 +24,7 @@ import shutil
 from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Dict, Any, FrozenSet, Optional, Sequence, Set, Tuple
+from typing import Callable, List, Dict, Any, FrozenSet, Optional, Sequence, Set, Tuple
 from collections import defaultdict
 
 # Add src to path
@@ -1652,8 +1652,15 @@ def dispatch_open_loop(
     warmup_s: float = 0.0,
     max_in_flight: Optional[int] = None,
     distribution: str = "poisson",
+    on_first_send: Optional[Callable[[], None]] = None,
 ) -> Tuple[List[RequestRecord], DispatchReport]:
     """Run one open-loop dispatch pass over prepared requests (charter D6 §6.1).
+
+    ``on_first_send`` (ADR-0055 amendment 2026-09-19, W1 option C) is called
+    exactly once, synchronously, right before the FIRST request is handed to
+    the engine: the caller stamps the measurement window's t_start on the
+    telemetry clock there (the dispatcher's own timestamps are monotonic).
+    None keeps every existing caller byte-identical.
 
     Builds a seeded pre-drawn arrival schedule (Poisson by default; Schroeder,
     Wierman & Harchol-Balter, NSDI 2006 open-loop arrival model as used by
@@ -1721,8 +1728,13 @@ def dispatch_open_loop(
             f"cache-locality profile and duplicates example_ids)"
         )
     dispatcher = OpenLoopDispatcher(max_in_flight=max_in_flight, cap_policy="delay")
+    first_send_pending = on_first_send is not None
 
     async def _send(i: int, on_first_token: Any) -> Any:
+        nonlocal first_send_pending
+        if first_send_pending:
+            first_send_pending = False
+            on_first_send()  # type: ignore[misc]  (guarded by the flag above)
         return await engine.async_stream_generate(
             requests[i % len(requests)], on_first_token=on_first_token
         )
@@ -2616,6 +2628,15 @@ def run_experiment(
     results: List[Dict[str, Any]] = []
     sent_requests = 0
     measured_processed = 0
+    # ADR-0055 amendment 2026-09-19 (Batch 2 W1, option C): the measurement
+    # window is the DISPATCH SPAN, first measured send to last completion,
+    # on the telemetry clock (time.time(), the same clock as the sampler's
+    # per-tick ts). The measured stages below stamp it around the sends
+    # only, never around preparation (retrieval, reranking, prompt building)
+    # or recording. None until a measured request is sent: a campaign window
+    # without one refuses instead of stamping a window that measured nothing.
+    measured_window_t_start: Optional[float] = None
+    measured_window_t_end: Optional[float] = None
 
     # CONSORT accounting (task #127, audit H3/H11; charter §9.10: exclusions must
     # be countable from artifacts, not stdout). Persisted into metrics.json.
@@ -3167,6 +3188,7 @@ def run_experiment(
         stage_name: str,
     ) -> None:
         nonlocal sent_requests, measured_processed
+        nonlocal measured_window_t_start, measured_window_t_end
         batch_id = 0
         total_stage_examples = sum(len(unit) for unit in units)
         stage_processed = 0
@@ -3214,8 +3236,13 @@ def run_experiment(
                         stream_flag = backend in _stream_backends
                         # B5: settle immediately before the TIMED request only.
                         settle_ms = settle_before_request() if collect_results else 0.0
+                        # Window bracket (option C): first measured send opens
+                        # it, every measured completion moves its end.
+                        if collect_results and measured_window_t_start is None:
+                            measured_window_t_start = time.time()
                         response = engine.generate(request, stream=stream_flag)
                         if collect_results:
+                            measured_window_t_end = time.time()
                             record_result(example, meta, response, batch_id=batch_id,
                                           turn_index=turn_idx, settle_ms=settle_ms)
                         elif response.error:
@@ -3285,11 +3312,18 @@ def run_experiment(
                 # batched unit the single settle precedes the batch send; each of the
                 # unit's rows records the same measured value.
                 settle_ms = settle_before_request() if collect_results else 0.0
+                # Window bracket (option C): the first measured send opens the
+                # window, every measured completion moves its end; the unit's
+                # preparation above and its recording below stay outside.
+                if collect_results and measured_window_t_start is None:
+                    measured_window_t_start = time.time()
                 if len(requests) == 1:
                     stream_flag = backend in _stream_backends
                     responses = [engine.generate(requests[0], stream=stream_flag)]
                 else:
                     responses = engine.batch_generate(requests)
+                if collect_results:
+                    measured_window_t_end = time.time()
 
                 for example, meta, response in zip(kept, metas, responses):
                     # Per-query guard (B4): a failed record (metric-eval / OOM) drops one
@@ -3349,6 +3383,7 @@ def run_experiment(
     def execute_open_loop_measured() -> None:
         """Dispatch the measured set open-loop and record rows with D6 columns."""
         nonlocal open_loop_report, sent_requests, measured_processed
+        nonlocal measured_window_t_start, measured_window_t_end
 
         prepared: List[Tuple[CAGExample, Dict[str, Any], InferenceRequest]] = []
         for example in measured_examples:
@@ -3374,6 +3409,11 @@ def run_experiment(
             f"warmup_s={open_loop_warmup_s}, max_in_flight={open_loop_max_in_flight}, "
             f"{len(prepared)} prepared requests (schedule index maps modulo)"
         )
+        # Window bracket (option C): t_start at the FIRST send (the dispatcher
+        # fires the hook right before it), t_end right after the dispatcher
+        # returns with every completion awaited; the preparation above and
+        # the recording loop below stay outside the window.
+        first_send_ts: List[float] = []
         kept, report = dispatch_open_loop(
             engine,
             [req for _, _, req in prepared],
@@ -3383,7 +3423,11 @@ def run_experiment(
             n_arrivals=open_loop_num_arrivals,
             warmup_s=open_loop_warmup_s,
             max_in_flight=open_loop_max_in_flight,
+            on_first_send=lambda: first_send_ts.append(time.time()),
         )
+        if first_send_ts:
+            measured_window_t_start = first_send_ts[0]
+            measured_window_t_end = time.time()
         open_loop_report = report
 
         for record in kept:
@@ -3520,11 +3564,14 @@ def run_experiment(
             except Exception as e:
                 print(f"[telemetry] sampler not started: {e}")
 
-    # Measurement-window bounds on the SAME clock as the telemetry sampler's
-    # per-tick `ts` (epoch seconds, time.time() — see VllmTelemetrySampler._run):
-    # the campaign window's [t_start, t_end) is what the §6.1 regime bridge
-    # slices the cage_stats series against.
-    measured_window_t_start = time.time()
+    # Stage bracket on the SAME clock as the telemetry sampler's per-tick `ts`
+    # (epoch seconds, time.time(), see VllmTelemetrySampler._run). Before the
+    # ADR-0055 amendment of 2026-09-19 this pair WAS the campaign window; it is
+    # now provenance beside it (metrics.json measured_window.stage_t_*), so the
+    # preparation and recording time outside the dispatch span is derivable.
+    # The window itself is stamped by the measured stages (see
+    # measured_window_t_start above).
+    stage_t_start = time.time()
     performance_evaluator.start()
     try:
         if workload_mode == "open_loop":
@@ -3551,7 +3598,7 @@ def run_experiment(
         raise
     finally:
         performance_evaluator.stop()
-    measured_window_t_end = time.time()
+    stage_t_end = time.time()
 
     if gpu_monitoring:
         gpu_tracker.stop_monitoring()
@@ -3560,6 +3607,20 @@ def run_experiment(
     if vllm_role_samplers is not None:
         for _s in vllm_role_samplers:
             _s.stop()
+
+    # ADR-0055 amendment 2026-09-19 (option C): a campaign window whose stage
+    # sent no measured request has no dispatch span. Refuse (no window is
+    # emitted) instead of stamping bounds around nothing; the pilot path
+    # never reads the stamps and is unchanged.
+    if campaign_session is not None and (
+        measured_window_t_start is None or measured_window_t_end is None
+    ):
+        raise RuntimeError(
+            "campaign window dispatched no measured request (every measured "
+            "example was dropped before its send), so no measurement window "
+            "can be stamped (ADR-0055 amendment 2026-09-19: the window is the "
+            "dispatch span); refusing to emit an empty window"
+        )
 
     print("-" * 70)
     print("Experiment complete!")
@@ -4113,15 +4174,28 @@ def run_experiment(
 
     # Atomic writes (task #127, audit H10): metrics.json is the completeness
     # sentinel the resume gates key on -- it must exist fully-formed or not at all.
-    # Measured-stage wall-clock bounds (epoch seconds, telemetry clock) — the
-    # campaign window's [t_start, t_end) for the §6.1 regime bridge (task #116).
+    # Measurement-window bounds (epoch seconds, telemetry clock): the campaign
+    # window's [t_start, t_end) for the §6.1 regime bridge (task #116).
     # CAMPAIGN-ONLY by contract: the pilot path stays byte-identical to the
     # pre-#116 output (2026-08-21 verifier finding 1 — unconditional insertion
     # falsified the byte-identity claim; no pilot consumer reads this key).
     if campaign_session is not None:
+        # ADR-0055 (Batch 2 W1): the scoring regime that produced this window,
+        # persisted in the sealed tree. main() refuses inline scoring on the
+        # campaign path, so this records "decoupled"; a window without the key
+        # predates W1. Campaign-only, same byte-identity contract as above.
+        experiment_summary["quality_scoring"] = {
+            "mode": "decoupled" if _skip_quality else "inline",
+            "adr": "ADR-0055",
+        }
+        # ADR-0055 amendment 2026-09-19 (W1 option C): t_start/t_end are the
+        # DISPATCH SPAN; the stage bracket is kept beside them as provenance.
         experiment_summary["measured_window"] = {
             "t_start": measured_window_t_start,
             "t_end": measured_window_t_end,
+            "span": "dispatch",
+            "stage_t_start": stage_t_start,
+            "stage_t_end": stage_t_end,
         }
     # ADR-0102 warm-up pool provenance: the count, the served count and the
     # sha256 of the drawn ids (never the ids' results). Only present when the
@@ -5066,6 +5140,25 @@ def main():
             f"  windows: window_{campaign_session.dataset}-01..{args.num_trials:02d} "
             f"(one per trial); --output-dir is STAGING"
         )
+        # ADR-0055 ("serving writes, scoring reads"; Batch 2 finding W1): the
+        # campaign path never scores inline. The driver pins CAGE_SKIP_QUALITY=1
+        # on every cell (run_campaign.SKIP_QUALITY_ENV) and --skip-quality
+        # exports it above; a campaign invocation without the pin refuses HERE,
+        # before any dataset or engine work. Inline model scoring inside the
+        # measured window idles the pod on CPU scoring and dilutes the window's
+        # occupancy average with engine-idle time. Pilot runs are untouched.
+        if os.getenv("CAGE_SKIP_QUALITY", "0").strip() != "1":
+            print(
+                "\nError activating campaign mode: CAGE_SKIP_QUALITY is "
+                f"{os.getenv('CAGE_SKIP_QUALITY')!r}; the campaign path scores "
+                "quality as a separate post-serving pass (ADR-0055: serving "
+                "writes, scoring reads). Export CAGE_SKIP_QUALITY=1 or pass "
+                "--skip-quality, then score after serving with "
+                "scripts/4_analysis/rescore_quality.py --full --scoring-run-id <id> "
+                "(the campaign v2 mode; --apply is the legacy layout only).",
+                file=sys.stderr,
+            )
+            sys.exit(2)
 
     def _run_with_top_k(top_k_value: int) -> None:
         run_experiment(

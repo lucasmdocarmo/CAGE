@@ -106,31 +106,39 @@ def test_guard_sits_before_any_work(runner: str) -> None:
     )
 
 
-def test_measured_window_is_campaign_gated_in_source() -> None:
-    """Pilot byte-identity pin (verifier finding 1).
+#: Campaign-only metrics.json keys: ``measured_window`` (#116) and
+#: ``quality_scoring`` (Batch 2 W1, ADR-0055). Both share the byte-identity
+#: contract, so both are pinned by the same source guard.
+CAMPAIGN_ONLY_SUMMARY_KEYS = ["measured_window", "quality_scoring"]
 
-    ``measured_window`` may enter experiment_summary ONLY inside the
+
+@pytest.mark.parametrize("key", CAMPAIGN_ONLY_SUMMARY_KEYS)
+def test_campaign_only_summary_key_is_gated_in_source(key: str) -> None:
+    """Pilot byte-identity pin (verifier finding 1; extended to quality_scoring
+    by the W1 review).
+
+    A campaign-only key may enter experiment_summary ONLY inside the
     ``campaign_session is not None`` branch — never as an inline literal of
     the summary dict (which the pilot path writes verbatim).
     """
     lines = RUN_EXPERIMENT.read_text(encoding="utf-8").splitlines()
     literal_sites = [
-        i for i, ln in enumerate(lines) if re.search(r'^\s*"measured_window"\s*:', ln)
+        i for i, ln in enumerate(lines) if re.search(rf'^\s*"{key}"\s*:', ln)
     ]
     assert not literal_sites, (
-        "measured_window must not be an inline experiment_summary literal "
+        f"{key} must not be an inline experiment_summary literal "
         f"(pilot path would carry it); found at lines {[i + 1 for i in literal_sites]}"
     )
     assign_sites = [
         i
         for i, ln in enumerate(lines)
-        if 'experiment_summary["measured_window"]' in ln
+        if f'experiment_summary["{key}"]' in ln
     ]
-    assert assign_sites, "campaign path must still record measured_window"
+    assert assign_sites, f"campaign path must still record {key}"
     for i in assign_sites:
-        window = "\n".join(lines[max(0, i - 8) : i])
+        window = "\n".join(lines[max(0, i - 12) : i])
         assert "campaign_session is not None" in window, (
-            f"measured_window assignment at line {i + 1} is not guarded by "
+            f"{key} assignment at line {i + 1} is not guarded by "
             "'campaign_session is not None' within the preceding lines"
         )
 

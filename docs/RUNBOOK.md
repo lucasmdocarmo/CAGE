@@ -188,9 +188,31 @@ nohup bash scripts/3_run/cloud_run.sh <MODEL> <N> <T> > run.log 2>&1 &
   lands, a harness run root carries **no `ledger.json`**, and the §5 pull gate will
   refuse it — that refusal is the gate working, not a bug. Plan teardown accordingly
   (§5 note).
-- Quality scoring is decoupled by default (`CAGE_SKIP_QUALITY=1` — a *declared*
-  regime, not a mock): the box's job is serving measurements + raw outputs + evidence;
-  model-based quality is scored after the serving trees.
+- Quality scoring is decoupled on every path (`CAGE_SKIP_QUALITY=1`, a *declared*
+  regime, not a mock; ADR-0055 "serving writes, scoring reads"): `run_full_sweep.sh`
+  exports it on the pilot path, every campaign branch of the sweep scripts
+  (`run_full_sweep.sh`, `run_baselines.sh`, `run_compression.sh`) pins it, the
+  campaign driver pins it on every cell step (Batch 2 W1, 2026-09-18; `load_plan`
+  refuses a plan without the pin), and `run_experiment.py` refuses a campaign cell
+  that lacks it (exit 2, before any dataset or engine work). The box's job is serving
+  measurements + raw outputs + evidence; model-based quality is scored after the
+  serving trees (`rescore_quality.py --full --scoring-run-id <id>` for a v2 tree;
+  `--apply` is the legacy layout only), and every campaign window records the regime
+  in `metrics.json["quality_scoring"]`.
+- Engine endpoints are pinned by the campaign driver (Batch 2 W2, 2026-09-18): every
+  server-engine cell step carries `--api-base http://localhost:<port>` and every
+  relaunch exports the launcher port env (`VLLM_PORT=8000`, `SGLANG_PORT=30000`; the pd
+  relaunch `CAGE_PD_PROXY_PORT=8000`), both from the driver's one port table
+  (`ENGINE_PORTS`, mirroring the launchers' defaults), so the server a relaunch starts
+  and the endpoint its cells dial agree by construction; the plan header records the
+  table under `serving_shapes`. The runner's own `--api-base` default is the vLLM port,
+  so a hand-run SGLang row must pass `--api-base http://localhost:30000` (with
+  `CAGE_SGLANG_API_BASE` unset, the adapter, the cache flush and the telemetry sampler
+  all dial that flag). `load_plan` refuses a plan whose cell or relaunch lacks the pin
+  or whose cell dials an endpoint other than the one its relaunch serves; `run` refuses
+  while `CAGE_SGLANG_API_BASE` or `CAGE_LMDEPLOY_API_BASE` is exported (the runner
+  resolves them before the pin) and while a shell `VLLM_PORT` / `SGLANG_PORT` / pd
+  port value differs from the table (the preflight dials the shell value).
 
 ### 4.0 Query manifests: build, register, and the blocked B12 rung cells
 
@@ -315,7 +337,9 @@ manually, and only then uses `--force` — a user decision, reported as such.
 | `CAGE_ISO_BYTES_LOGS` | gate (j) | Pin exact engine startup logs: `vllm=/path/a.log,sglang=/path/b.log` (e.g. one budget point of a pressure sweep). |
 | `CAGE_QUALITY_STRICT` | `src/evaluation/quality.py`, gate (e) | Unset/`1` = strict fail-closed quality layer (default). An explicit falsy (`0`/`false`/`no`) downgrades instrument failures to `score=None` for the whole run — preflight FAILS on it; forbidden for confirmatory runs. |
 | `CAGE_CLAIM_CHECKER` | `src/evaluation/quality.py` | Claim-check instrument selection. Default `nli` (owner decision #120/F8, 2026-08-19; in-process-safe). `alignscore` is Instrument B and is requested explicitly by `scripts/4_analysis/score_instrument_b.py` — never as the run default. Preflight prints the state either way. |
-| `CAGE_SKIP_QUALITY=1` | run scripts | Decoupled-scoring regime (default in `run_full_sweep.sh`): inline model-based quality is skipped and scored after the serving trees. A *declared* regime, not a mock. |
+| `CAGE_SKIP_QUALITY=1` | run scripts, `run_campaign.py` (cell-step env pin), `run_experiment.py` (campaign-mode gate) | Decoupled-scoring regime (default in `run_full_sweep.sh`; pinned on every campaign cell step by the driver, W1 / ADR-0055): inline model-based quality is skipped and scored after the serving trees. A *declared* regime, not a mock. A campaign cell without it refuses before serving; the regime is recorded per window in `metrics.json["quality_scoring"]`. |
+| `VLLM_PORT` / `SGLANG_PORT` / `CAGE_PD_PROXY_PORT` / `CAGE_PD_PREFILL_PORT` / `CAGE_PD_DECODE_PORT` | launchers (`manage_vllm_server.sh`, `manage_sglang_server.sh`, `manage_vllm_pd.sh`), `run_campaign.py` (relaunch env) | Listening ports of the launchers (defaults 8000 / 30000 / 8000 / 8100 / 8200). The campaign driver exports them on every relaunch from its port table and pins the matching `--api-base` on every server-engine cell (W2); the operator's shell value never reaches a campaign relaunch (the step env wins). The preflight's own gate URL reads the shell `SGLANG_PORT`, so `run` refuses a shell value that differs from the table (an equal value is fine). |
+| `CAGE_SGLANG_API_BASE` / `CAGE_LMDEPLOY_API_BASE` | `run_experiment.py` (adapter + cache flush) | Per-engine endpoint override, resolved BEFORE `--api-base`. Pilot convenience only: `run_campaign.py run` refuses while either is set (W2), because it would beat the plan's pin. |
 | `CAGE_QUERY_MANIFEST` | `run_experiment.py` (loader), `campaign_session.py` | Path to the dataset's pre-drawn query manifest (`build_query_manifest.py`); the runner's `--query-manifest` sets it (the campaign driver passes that flag on every cell of a registered dataset, §4.0). The loader refuses a manifest built for another dataset, and the corpus-budget guard (A4, ADR-0106) refuses a served budget that is neither its `block_budget` nor one of its `trunc_rungs`. `campaign_session.py` resolves `dataset_manifests_sha256` from it when `CAGE_DATASET_MANIFESTS_SHA256` is unset. |
 | `HF_HUB_DOWNLOAD_TIMEOUT` | `setup_runpod.sh`, HF downloads | Stalled-read timeout in seconds (default 30). Exported BEFORE dataset staging AND model prefetch (J7 — a stalled socket must raise, then resume, not hang for an hour). |
 | `CAGE_BACKUP_INTERVAL` | `gcs_backup_daemon.sh` | Seconds between mirror passes (default 300). |

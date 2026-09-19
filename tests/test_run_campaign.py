@@ -229,7 +229,7 @@ import json, os, sys
 with open(os.environ["STUB_CALLS"], "a", encoding="utf-8") as fh:
     fh.write(json.dumps({
         "argv": sys.argv[1:],
-        "env": {k: v for k, v in os.environ.items() if k.startswith(("CAGE_", "VLLM_"))},
+        "env": {k: v for k, v in os.environ.items() if k.startswith(("CAGE_", "VLLM_", "SGLANG_"))},
     }) + "\\n")
 marker = os.environ.get("STUB_FAIL_MARKER", "")
 if marker and marker in " ".join(sys.argv[1:]):
@@ -246,6 +246,10 @@ def stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     calls_path = tmp_path / "stub_calls.jsonl"
     monkeypatch.setenv("STUB_CALLS", str(calls_path))
     monkeypatch.delenv("STUB_FAIL_MARKER", raising=False)
+    # Hermetic endpoint env (Batch 2 W2): 'run' refuses a runner override or
+    # a differing launcher port, so the developer's shell must not leak in.
+    for name in (*rc.API_BASE_OVERRIDE_ENVS, *rc.SHELL_PORT_ENVS):
+        monkeypatch.delenv(name, raising=False)
 
     class Stub:
         cmd = (sys.executable, str(stub_path))
@@ -561,10 +565,15 @@ class TestOrdering:
         # frozen contract (CAGE_KV_BUDGET_BYTES / CAGE_SGLANG_MAX_TOTAL_TOKENS)
         # plus the launch levers (KV dtype / connector), plus the uniform
         # per-session max_model_len (backlog A10; both engines read
-        # VLLM_MAX_MODEL_LEN), and nothing else.
+        # VLLM_MAX_MODEL_LEN), plus the launcher port env (Batch 2 W2, from
+        # the ONE table the cells' --api-base derives from), and nothing else.
         for s in _relaunches(plan_a):
             env = dict(s["env"])
             assert env.pop("VLLM_MAX_MODEL_LEN") == "32768"
+            port_env, port = {
+                "vllm": ("VLLM_PORT", "8000"), "sglang": ("SGLANG_PORT", "30000"),
+            }[s["engine"]]
+            assert env.pop(port_env) == port
             # launch levers ride the documented launcher env vars
             if s["kv_dtype"] == "fp8":
                 if s["engine"] == "vllm":
@@ -3176,3 +3185,401 @@ class TestMaxModelLenA10:
         assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (870, 2610, 36, 65)
         c = plan_b["counts"]
         assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (352, 1056, 30, 65)
+
+
+# ---------------------------------------------------------------------------
+# Batch 2 finding W1 (ADR-0055 "serving writes, scoring reads"): every cell
+# step pins CAGE_SKIP_QUALITY=1 so no campaign window is produced by inline
+# model-based scoring inside the measured window
+# ---------------------------------------------------------------------------
+
+
+class TestDecoupledScoringW1:
+    """ADR-0055 (accepted 2026-08-04) requires quality scoring as a separate
+    post-serving pass. The runner honors it only under CAGE_SKIP_QUALITY=1
+    and defaults to inline model scoring, so the driver pins the env on
+    EVERY cell step (hf oracle and blocked cells included), records the
+    rule in the header, and load_plan refuses a stale plan without it."""
+
+    def test_registered_constants(self):
+        assert rc.SKIP_QUALITY_ENV == "CAGE_SKIP_QUALITY"
+        assert rc.SKIP_QUALITY_VALUE == "1"
+        assert rc.DECOUPLED_SCORING_ADR == "ADR-0055"
+
+    def test_every_cell_step_pins_the_env_and_no_relaunch_carries_it(self, plan_a, plan_b):
+        for plan in (plan_a, plan_b):
+            cells = _cells(plan)
+            assert cells
+            for s in cells:
+                assert s["env"]["CAGE_SKIP_QUALITY"] == "1", s["row_key"]
+            # A server dial it is not: relaunch env stays exactly as pinned
+            # by TestOrdering.test_budget_env_on_relaunch_steps.
+            for s in _relaunches(plan):
+                assert "CAGE_SKIP_QUALITY" not in s["env"]
+
+    def test_pin_is_not_identity(self, plan_a):
+        cell = _cells(plan_a)[0]
+        argv = cell["argv"]
+
+        def val(flag: str) -> str:
+            return argv[argv.index(flag) + 1]
+
+        def derive(env: Dict[str, str]) -> str:
+            return derive_cell_spec(
+                baseline=val("--baseline"),
+                baseline_label=val("--baseline-label"),
+                backend=val("--backend"),
+                model=val("--model"),
+                env=env,
+            ).to_row_key()
+
+        with_env = dict(cell["env"])
+        assert with_env["CAGE_SKIP_QUALITY"] == "1"
+        without = {k: v for k, v in with_env.items() if k != "CAGE_SKIP_QUALITY"}
+        altered = {**with_env, "CAGE_SKIP_QUALITY": "0"}
+        assert derive(with_env) == derive(without) == derive(altered) == cell["row_key"]
+
+    def test_header_records_the_rule(self, plan_a, plan_b):
+        for plan in (plan_a, plan_b):
+            knobs = plan["behavior_knobs"]
+            assert knobs["quality_scoring"] == "decoupled"
+            assert knobs["quality_scoring_env"] == "CAGE_SKIP_QUALITY"
+            assert knobs["quality_scoring_adr"] == "ADR-0055"
+
+    def test_load_plan_refuses_a_cell_without_the_pin(self, tmp_path, plan_a):
+        # Missing: a pre-W1 plan would score inline inside the window.
+        plan = json.loads(json.dumps(plan_a))
+        del _cells(plan)[0]["env"]["CAGE_SKIP_QUALITY"]
+        with pytest.raises(rc.RunError, match="CAGE_SKIP_QUALITY"):
+            rc.load_plan(_dump(tmp_path, plan, "no_skip_quality.json"))
+        # Drifted: an explicit inline switch is the same violation.
+        plan = json.loads(json.dumps(plan_a))
+        _cells(plan)[-1]["env"]["CAGE_SKIP_QUALITY"] = "0"
+        with pytest.raises(rc.RunError, match="ADR-0055"):
+            rc.load_plan(_dump(tmp_path, plan, "inline_scoring.json"))
+        # The hf oracle cell is pinned too (the evaluator is CPU-side either way).
+        plan = json.loads(json.dumps(plan_a))
+        hf = next(s for s in _cells(plan) if s["cellspec"]["engine"] == "hf")
+        del hf["env"]["CAGE_SKIP_QUALITY"]
+        with pytest.raises(rc.RunError, match="CAGE_SKIP_QUALITY"):
+            rc.load_plan(_dump(tmp_path, plan, "hf_no_pin.json"))
+        # And the untouched plan loads.
+        assert rc.load_plan(_dump(tmp_path, plan_a, "fresh_w1.json"))["counts"]["cells"] == 870
+
+    def test_run_pin_wins_over_the_operator_shell(self, tmp_path, floor_table, stub, monkeypatch):
+        # _exec copies the shell env and applies the step env on top: an
+        # exported inline switch never reaches a cell.
+        monkeypatch.setenv("CAGE_SKIP_QUALITY", "0")
+        plan = _stub_plan(_tiny_grid(), floor_table, stub.cmd)
+        root = _run_root(tmp_path)
+        assert rc.run_plan(plan, root) == 0
+        cell_calls = [c for c in stub.calls() if "--baseline" in c["argv"]]
+        assert len(cell_calls) == 2
+        for call in cell_calls:
+            assert call["env"]["CAGE_SKIP_QUALITY"] == "1"
+
+    def test_counts_unchanged_by_the_pin(self, plan_a, plan_b):
+        c = plan_a["counts"]
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (870, 2610, 36, 65)
+        c = plan_b["counts"]
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (352, 1056, 30, 65)
+
+
+# ---------------------------------------------------------------------------
+# Batch 2 finding W2 (owner picked option A): every server-engine cell pins
+# --api-base and every relaunch exports the launcher port env, both from the
+# ONE port table that mirrors the frozen launchers' defaults
+# ---------------------------------------------------------------------------
+
+
+#: (script, the exact default line the table mirrors): a launcher default
+#: drift fails here, never at 3 a.m. on the pod.
+_LAUNCHER_PORT_LINES = (
+    ("scripts/2_serving/manage_vllm_server.sh", 'PORT="${VLLM_PORT:-8000}"'),
+    ("scripts/2_serving/manage_sglang_server.sh", 'PORT="${SGLANG_PORT:-30000}"'),
+    ("scripts/2_serving/manage_vllm_pd.sh", 'PROXY_PORT="${CAGE_PD_PROXY_PORT:-8000}"'),
+    ("scripts/2_serving/manage_vllm_pd.sh", 'PREFILL_PORT="${CAGE_PD_PREFILL_PORT:-8100}"'),
+    ("scripts/2_serving/manage_vllm_pd.sh", 'DECODE_PORT="${CAGE_PD_DECODE_PORT:-8200}"'),
+)
+_ENDPOINT_OF = {"vllm": "http://localhost:8000", "sglang": "http://localhost:30000"}
+_PORT_ENV_OF = {"vllm": ("VLLM_PORT", "8000"), "sglang": ("SGLANG_PORT", "30000")}
+
+
+class TestEngineEndpointsW2:
+    """Before W2 no cell carried an endpoint: every cell rode the runner's
+    --api-base default (http://localhost:8000, the vLLM port), so every SGLang
+    cell was sent to a port no SGLang server listens on. The driver now
+    derives BOTH the launcher port env and the cell endpoint from
+    ENGINE_PORTS, load_plan refuses a stale plan per cell and per relaunch,
+    and 'run' refuses while a runner override env is exported."""
+
+    def test_port_table_mirrors_the_frozen_launchers(self):
+        assert rc.ENGINE_PORTS == {"vllm": 8000, "sglang": 30000}
+        assert rc.PORT_LAUNCH_ENV == {"vllm": "VLLM_PORT", "sglang": "SGLANG_PORT"}
+        assert rc.PD_PROXY_PORT == 8000
+        assert rc.PD_PROXY_PORT_ENV == "CAGE_PD_PROXY_PORT"
+        assert rc.API_BASE_OVERRIDE_ENVS == ("CAGE_SGLANG_API_BASE", "CAGE_LMDEPLOY_API_BASE")
+        assert rc.PD_ROLE_PORT_ENVS == {"CAGE_PD_PREFILL_PORT": 8100, "CAGE_PD_DECODE_PORT": 8200}
+        assert rc.SHELL_PORT_ENVS == {
+            "VLLM_PORT": 8000, "SGLANG_PORT": 30000, "CAGE_PD_PROXY_PORT": 8000,
+            "CAGE_PD_PREFILL_PORT": 8100, "CAGE_PD_DECODE_PORT": 8200,
+        }
+        for rel, line in _LAUNCHER_PORT_LINES:
+            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+            assert line in text, f"{rel}: launcher default drifted from {line!r}"
+        assert rc.engine_api_base("vllm") == "http://localhost:8000"
+        assert rc.engine_api_base("sglang") == "http://localhost:30000"
+        assert rc.engine_api_base("sglang", "tp") == "http://localhost:30000"
+        assert rc.engine_api_base("vllm", "pd") == "http://localhost:8000"
+        for engine in ("lmdeploy", "hf"):
+            with pytest.raises(rc.PlanError, match="no registered port"):
+                rc.engine_api_base(engine)
+        # Review F4: the pd proxy is vLLM's; no other engine may be pinned to it.
+        with pytest.raises(rc.PlanError, match="no registered pd proxy"):
+            rc.engine_api_base("sglang", "pd")
+
+    def test_every_server_cell_pins_its_engine_endpoint_and_hf_none(self, plan_a, plan_b):
+        for plan in (plan_a, plan_b):
+            seen = set()
+            for s in _cells(plan):
+                engine = s["cellspec"]["engine"]
+                if engine == "hf":
+                    assert "--api-base" not in s["argv"], s["row_key"]
+                    continue
+                want = (
+                    "http://localhost:8000"
+                    if s["cellspec"]["topology"] == "pd"
+                    else _ENDPOINT_OF[engine]
+                )
+                assert _argv_value(s, "--api-base") == want, s["row_key"]
+                seen.add((engine, s["cellspec"]["topology"]))
+            assert {("vllm", "single"), ("sglang", "single")} <= seen
+        assert {("vllm", "tp"), ("vllm", "pd")} <= {
+            (s["cellspec"]["engine"], s["cellspec"]["topology"]) for s in _cells(plan_b)
+        }
+        # The pre-W2 failure, stated: no SGLang cell dials the vLLM port.
+        assert not [
+            s for s in _cells(plan_a)
+            if s["cellspec"]["engine"] == "sglang"
+            and _argv_value(s, "--api-base") == "http://localhost:8000"
+        ]
+
+    def test_every_relaunch_exports_the_port_env_and_records_the_endpoint(self, plan_a, plan_b):
+        for plan in (plan_a, plan_b):
+            for s in _relaunches(plan):
+                if s["topology"] == "pd":
+                    assert s["env"]["CAGE_PD_PROXY_PORT"] == "8000"
+                    # Review F3: the role ports the telemetry endpoints name
+                    # are exported from the same constants.
+                    assert s["env"]["CAGE_PD_PREFILL_PORT"] == "8100"
+                    assert s["env"]["CAGE_PD_DECODE_PORT"] == "8200"
+                    assert s["env"]["CAGE_TELEMETRY_ENDPOINTS"] == (
+                        "prefill=http://localhost:8100,decode=http://localhost:8200"
+                    )
+                    assert s["api_base"] == "http://localhost:8000"
+                    assert "VLLM_PORT" not in s["env"]
+                    continue
+                port_env, port = _PORT_ENV_OF[s["engine"]]
+                assert s["env"][port_env] == port, s
+                assert s["api_base"] == f"http://localhost:{port}"
+                # one engine, one port env: never the other engine's
+                assert not ({"VLLM_PORT", "SGLANG_PORT"} - {port_env}) & set(s["env"]), s
+        assert {s["topology"] for s in _relaunches(plan_b)} == {"single", "tp", "pd"}
+
+    def test_cells_dial_the_port_their_relaunch_launched(self, plan_a, plan_b):
+        # Agreement by construction, restated by walking the plan: each
+        # executable server cell's --api-base names the port carried by the
+        # env of the relaunch it runs under.
+        for plan in (plan_a, plan_b):
+            current = None
+            checked = 0
+            for s in plan["steps"]:
+                if s["kind"] == "relaunch":
+                    current = s
+                    continue
+                if s["serving"] is None or s["blocked_on"]:
+                    continue
+                assert current is not None
+                api = _argv_value(s, "--api-base")
+                assert api == current["api_base"], s["row_key"]
+                port_env = (
+                    "CAGE_PD_PROXY_PORT"
+                    if current["topology"] == "pd"
+                    else _PORT_ENV_OF[current["engine"]][0]
+                )
+                assert api.endswith(":" + current["env"][port_env]), s["row_key"]
+                checked += 1
+            assert checked > 0
+
+    def test_header_records_the_table(self, plan_a, plan_b):
+        for plan in (plan_a, plan_b):
+            shapes = plan["serving_shapes"]
+            assert shapes["engine_ports"] == {"vllm": 8000, "sglang": 30000}
+            assert shapes["port_launch_env"] == {"vllm": "VLLM_PORT", "sglang": "SGLANG_PORT"}
+            assert shapes["pd_proxy_port"] == 8000
+            assert shapes["pd_proxy_port_env"] == "CAGE_PD_PROXY_PORT"
+            assert shapes["api_base_override_envs"] == [
+                "CAGE_SGLANG_API_BASE", "CAGE_LMDEPLOY_API_BASE",
+            ]
+            assert shapes["engine_ports_finding"] == "Batch 2 W2"
+
+    def test_counts_and_row_keys_unchanged_by_the_endpoint(self, plan_a, plan_b):
+        # Argv on existing cells: the enumeration pins hold, and the identity
+        # seam never reads argv (test_identity_env_roundtrips_through_derive_cell_spec).
+        c = plan_a["counts"]
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (870, 2610, 36, 65)
+        c = plan_b["counts"]
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (352, 1056, 30, 65)
+
+    def test_load_plan_refuses_stale_endpoints(self, tmp_path, plan_a, plan_b):
+        def _sglang(plan):
+            return next(s for s in _cells(plan) if s["cellspec"]["engine"] == "sglang")
+
+        # A server cell without the flag (a pre-W2 plan).
+        plan = json.loads(json.dumps(plan_a))
+        cell = _sglang(plan)
+        i = cell["argv"].index("--api-base")
+        del cell["argv"][i:i + 2]
+        with pytest.raises(rc.RunError, match="api-base"):
+            rc.load_plan(_dump(tmp_path, plan, "no_api_base.json"))
+        # The exact pre-W2 failure by hand: an SGLang cell pointed at the vLLM port.
+        plan = json.loads(json.dumps(plan_a))
+        cell = _sglang(plan)
+        cell["argv"][cell["argv"].index("--api-base") + 1] = "http://localhost:8000"
+        with pytest.raises(rc.RunError, match="30000"):
+            rc.load_plan(_dump(tmp_path, plan, "sglang_on_8000.json"))
+        # An hf cell carrying an endpoint.
+        plan = json.loads(json.dumps(plan_a))
+        hf = next(s for s in _cells(plan) if s["cellspec"]["engine"] == "hf")
+        hf["argv"] += ["--api-base", "http://localhost:8000"]
+        with pytest.raises(rc.RunError, match="hf cell"):
+            rc.load_plan(_dump(tmp_path, plan, "hf_api_base.json"))
+        # A relaunch without the port env (the launcher would serve on its shell default).
+        plan = json.loads(json.dumps(plan_a))
+        relaunch = next(s for s in _relaunches(plan) if s["engine"] == "sglang")
+        del relaunch["env"]["SGLANG_PORT"]
+        with pytest.raises(rc.RunError, match="SGLANG_PORT"):
+            rc.load_plan(_dump(tmp_path, plan, "no_port_env.json"))
+        # A relaunch whose port env drifted (a server on a port no cell dials).
+        plan = json.loads(json.dumps(plan_a))
+        relaunch = next(s for s in _relaunches(plan) if s["engine"] == "vllm")
+        relaunch["env"]["VLLM_PORT"] = "8001"
+        with pytest.raises(rc.RunError, match="VLLM_PORT"):
+            rc.load_plan(_dump(tmp_path, plan, "port_drift.json"))
+        # The pd relaunch without the proxy port env (session b).
+        plan = json.loads(json.dumps(plan_b))
+        pd = next(s for s in _relaunches(plan) if s["topology"] == "pd")
+        del pd["env"]["CAGE_PD_PROXY_PORT"]
+        with pytest.raises(rc.RunError, match="CAGE_PD_PROXY_PORT"):
+            rc.load_plan(_dump(tmp_path, plan, "no_proxy_port.json"))
+        # Review F3: the pd relaunch with a drifted role port env.
+        plan = json.loads(json.dumps(plan_b))
+        pd = next(s for s in _relaunches(plan) if s["topology"] == "pd")
+        pd["env"]["CAGE_PD_PREFILL_PORT"] = "8300"
+        with pytest.raises(rc.RunError, match="CAGE_PD_PREFILL_PORT"):
+            rc.load_plan(_dump(tmp_path, plan, "role_port_drift.json"))
+        # Review F1: a relaunch whose api_base record drifted or is missing.
+        plan = json.loads(json.dumps(plan_a))
+        _relaunches(plan)[0]["api_base"] = "http://localhost:8001"
+        with pytest.raises(rc.RunError, match="api_base record"):
+            rc.load_plan(_dump(tmp_path, plan, "record_drift.json"))
+        plan = json.loads(json.dumps(plan_a))
+        del _relaunches(plan)[0]["api_base"]
+        with pytest.raises(rc.RunError, match="api_base"):
+            rc.load_plan(_dump(tmp_path, plan, "no_record.json"))
+        # Review F1: an SGLang cell moved under a vLLM relaunch dials 30000
+        # while the boundary it sits under serves 8000; whatever SGLang server
+        # survived an earlier boundary would serve it (mislabeled data).
+        plan = json.loads(json.dumps(plan_a))
+        cell = next(
+            s for s in _cells(plan)
+            if s["cellspec"]["engine"] == "sglang" and s["blocked_on"] is None
+        )
+        vllm_relaunch = next(s for s in _relaunches(plan) if s["engine"] == "vllm")
+        plan["steps"].remove(cell)
+        plan["steps"].insert(plan["steps"].index(vllm_relaunch) + 1, cell)
+        with pytest.raises(rc.RunError, match="relaunch serving"):
+            rc.load_plan(_dump(tmp_path, plan, "moved_cell.json"))
+        # And the untouched plans load.
+        assert rc.load_plan(_dump(tmp_path, plan_a, "fresh_w2_a.json"))["counts"]["cells"] == 870
+        assert rc.load_plan(_dump(tmp_path, plan_b, "fresh_w2_b.json"))["counts"]["cells"] == 352
+
+    def test_blocked_cell_without_a_registered_endpoint_carries_none(
+        self, tmp_path, floor_table, stub
+    ):
+        # Review F4: an SGLang pd cell is enumerated BLOCKED (the pd launcher
+        # is vLLM-only); it has no registered endpoint, so it carries no
+        # --api-base (the gpu_count rule: visible debt, never a guess), the
+        # plan still builds and loads, and giving it one is refused.
+        grid = _tiny_grid(dist_cells=(("B3", "sglang", "pd"),))
+        plan = _stub_plan(grid, floor_table, stub.cmd)
+        (dist,) = [s for s in _cells(plan) if s["family"] == "DIST"]
+        assert dist["blocked_on"] and "PD launcher" in dist["blocked_on"]
+        assert "--api-base" not in dist["argv"]
+        assert rc.load_plan(_dump(tmp_path, plan, "blocked_pd.json"))["counts"]["blocked"] == 1
+        tampered = json.loads(json.dumps(plan))
+        (dist,) = [s for s in _cells(tampered) if s["family"] == "DIST"]
+        dist["argv"] += ["--api-base", "http://localhost:8000"]
+        with pytest.raises(rc.RunError, match="no registered endpoint"):
+            rc.load_plan(_dump(tmp_path, tampered, "blocked_pd_pinned.json"))
+
+    @pytest.mark.parametrize("name", ["CAGE_SGLANG_API_BASE", "CAGE_LMDEPLOY_API_BASE"])
+    @pytest.mark.parametrize("value", ["http://elsewhere:1", ""])
+    def test_run_refuses_while_a_runner_override_env_is_exported(
+        self, tmp_path, floor_table, stub, monkeypatch, name, value
+    ):
+        # The runner resolves the override BEFORE --api-base, and _exec
+        # inherits the shell: refused on presence, before the first step.
+        monkeypatch.setenv(name, value)
+        plan = _stub_plan(_tiny_grid(), floor_table, stub.cmd)
+        with pytest.raises(rc.RunError, match=name):
+            rc.run_plan(plan, _run_root(tmp_path))
+        assert stub.calls() == [], "nothing may execute under an endpoint override"
+
+    def test_run_passes_the_port_to_the_launcher_and_the_endpoint_to_the_runner(
+        self, tmp_path, floor_table, stub, monkeypatch
+    ):
+        for name in ("VLLM_PORT", "SGLANG_PORT"):
+            monkeypatch.delenv(name, raising=False)
+        plan = _stub_plan(_tiny_grid(f1_engines=("vllm", "sglang")), floor_table, stub.cmd)
+        root = _run_root(tmp_path)
+        assert rc.run_plan(plan, root) == 0
+        calls = stub.calls()
+        launchers = [c for c in calls if c["argv"][0] == "restart"]
+        cells = [c for c in calls if "--baseline" in c["argv"]]
+        assert len(launchers) == 2 and len(cells) == 4
+        # One relaunch per engine, each carrying ITS port env and not the other's.
+        assert {
+            (c["env"].get("VLLM_PORT"), c["env"].get("SGLANG_PORT")) for c in launchers
+        } == {(None, "30000"), ("8000", None)}
+        for c in cells:
+            backend = c["argv"][c["argv"].index("--backend") + 1]
+            assert c["argv"][c["argv"].index("--api-base") + 1] == _ENDPOINT_OF[backend]
+
+    @pytest.mark.parametrize(
+        "name, value",
+        [("VLLM_PORT", "8001"), ("SGLANG_PORT", " 30001 "), ("CAGE_PD_PREFILL_PORT", "8300")],
+    )
+    def test_run_refuses_a_shell_port_that_differs_from_the_table(
+        self, tmp_path, floor_table, stub, monkeypatch, name, value
+    ):
+        # Review F5: the preflight dials the shell value while every relaunch
+        # pins the registered port, so a differing shell value would make the
+        # preflight evidence come from a port the campaign never serves on.
+        monkeypatch.setenv(name, value)
+        plan = _stub_plan(_tiny_grid(), floor_table, stub.cmd)
+        with pytest.raises(rc.RunError, match=name):
+            rc.run_plan(plan, _run_root(tmp_path))
+        assert stub.calls() == [], "nothing may execute under a differing shell port"
+
+    def test_run_accepts_a_shell_port_equal_to_the_table(
+        self, tmp_path, floor_table, stub, monkeypatch
+    ):
+        # An equal shell value is fine, and the step env still carries the
+        # registered port to the launcher (_exec applies it on top of the shell).
+        monkeypatch.setenv("VLLM_PORT", "8000")
+        monkeypatch.setenv("SGLANG_PORT", "30000")
+        plan = _stub_plan(_tiny_grid(), floor_table, stub.cmd)
+        assert rc.run_plan(plan, _run_root(tmp_path)) == 0
+        (launcher,) = [c for c in stub.calls() if c["argv"][0] == "restart"]
+        assert launcher["env"]["VLLM_PORT"] == "8000"

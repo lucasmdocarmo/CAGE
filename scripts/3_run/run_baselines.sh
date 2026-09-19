@@ -66,6 +66,11 @@ fi
 # the second label sees the tuple's windows complete and SKIPs.
 if [ -n "${CAGE_CAMPAIGN_ROOT:-}" ]; then
     OUTPUT_DIR="$CAGE_CAMPAIGN_ROOT/.staging/baselines"
+    # ADR-0055 (Batch 2 W1): the campaign path never scores inline. The runner
+    # refuses a campaign cell without CAGE_SKIP_QUALITY=1, so pin it here the
+    # way run_campaign.py pins it on every cell step; model-based quality is
+    # scored after serving (rescore_quality.py --full --scoring-run-id <id>).
+    export CAGE_SKIP_QUALITY=1
     log "CAMPAIGN MODE: v2 cells -> $CAGE_CAMPAIGN_ROOT/cells/ (staging: $OUTPUT_DIR)"
 else
     OUTPUT_DIR="$RUN_ROOT/baselines"

@@ -33,6 +33,24 @@ Fail-closed doctrine: an unparseable client body, a failed/unparseable
 prefill response, or an unreachable upstream is a LOUD 4xx/5xx — the proxy
 never silently degrades to decode-only serving (that would measure a
 non-disaggregated path under a PD label).
+
+Cold start per window on the pd topology (ADR-0102 amendment 2026-09-19,
+Batch 2 W2-R1): a pd cell dials THIS port for everything, including the
+runner's strict per-window reset, which first reads the in-flight gauge from
+``GET /metrics`` and then issues ``POST /reset_prefix_cache``. The proxy
+relays both to the role instances: ``/metrics`` exposes ONE family only,
+``vllm:num_requests_running`` labeled ``pd_role="prefill"`` / ``"decode"``
+(each the sum of that role's own samples, the same rule the runner applies,
+so the runner's probe reads the stack's total), and answers 503 when either
+role is unreachable or lacks the gauge; ``/reset_prefix_cache`` is sent to
+BOTH roles and answers 200 only when both flushed, else 502 naming the role
+that did not (never a partial success under a cold-start label). No other
+metric family is relayed: a sampler pointed at the proxy finds absence,
+never a doubled occupancy (per-role telemetry rides CAGE_TELEMETRY_ENDPOINTS
+against the instances themselves). Both role instances are launched with
+VLLM_SERVER_DEV_MODE=1 by manage_vllm_pd.sh, which is what enables the flush
+endpoint on them [VERIFY-LIVE at Run-C-prime preflight: the pinned vLLM
+exposes both paths on a NixlConnector-configured instance].
 """
 from __future__ import annotations
 
@@ -57,6 +75,22 @@ _CHUNK = 8192
 _UPSTREAM_TIMEOUT = 600.0
 
 _HEALTH_TIMEOUT = 5.0
+
+#: The in-flight gauge the runner's strict reset probes (run_experiment.py
+#: COLD_START_RUNNING_GAUGE["vllm"]; the pd launcher is vLLM-only). Mirrored
+#: literally, pinned by tests/test_pd_launcher.py against the runner source.
+RUNNING_GAUGE = "vllm:num_requests_running"
+#: The label the proxy stamps on each role's relayed gauge sample.
+ROLE_LABEL = "pd_role"
+#: The paths the runner's strict reset dials on a cell's endpoint (the flush
+#: path mirrors src/inference/vllm_adapter.py _flush_endpoint).
+METRICS_PATH = "/metrics"
+RESET_PATH = "/reset_prefix_cache"
+#: Upstream timeouts for the two relayed paths, seconds. The runner's own
+#: flush timeout is 30 s and its probe timeout 10 s; the proxy visits the two
+#: roles in sequence, so each leg stays well inside those budgets.
+_METRICS_TIMEOUT = 4.0
+_RESET_TIMEOUT = 10.0
 
 
 def _split_url(url: str) -> Tuple[str, int]:
@@ -84,6 +118,56 @@ def _probe_health(url: str) -> str:
             conn.close()
     except OSError as exc:
         return f"unreachable ({exc.__class__.__name__})"
+
+
+def sum_gauge(metrics_text: str, gauge: str) -> Optional[int]:
+    """Sum every sample of ``gauge`` in a Prometheus text exposition (labeled
+    or bare, optional trailing timestamp ignored); None when absent.
+
+    The same rule as run_experiment.parse_running_requests (restated here:
+    the proxy is stdlib-only and launched standalone), so the value each
+    role contributes is exactly what the runner would read from that role.
+    """
+    total = 0.0
+    found = False
+    for raw in metrics_text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith(gauge + "{"):
+            rest = line[line.index("}") + 1:] if "}" in line else ""
+        elif line.startswith(gauge + " "):
+            rest = line[len(gauge):]
+        else:
+            continue
+        tokens = rest.split()
+        if not tokens:
+            continue
+        try:
+            total += float(tokens[0])
+        except ValueError:
+            continue
+        found = True
+    return int(round(total)) if found else None
+
+
+def _upstream_call(
+    url: str, method: str, path: str, timeout: float
+) -> Tuple[Optional[int], str]:
+    """(status, body text) of one upstream call; (None, reason) when the role
+    is unreachable or times out (an OSError, never an exception escaping into
+    the handler)."""
+    host, port = _split_url(url)
+    try:
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        try:
+            conn.request(method, path)
+            resp = conn.getresponse()
+            return resp.status, resp.read().decode("utf-8", "replace")
+        finally:
+            conn.close()
+    except OSError as exc:
+        return None, f"unreachable ({exc.__class__.__name__}: {exc})"
 
 
 def _prefill_body(body: Dict[str, Any]) -> Dict[str, Any]:
@@ -142,7 +226,84 @@ class PDProxyHandler(BaseHTTPRequestHandler):
 
     # -- health ------------------------------------------------------------
 
+    def _reply_text(self, status: int, text: str) -> None:
+        data = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _roles(self) -> Tuple[Tuple[str, str], Tuple[str, str]]:
+        return ("prefill", self.prefill_url), ("decode", self.decode_url)
+
+    # -- cold start per window (ADR-0102 on the pd topology) ----------------
+
+    def _relay_metrics(self) -> None:
+        """GET /metrics: the in-flight gauge of EACH role, relabeled, and
+        nothing else; 503 unless both roles are readable (a half-readable
+        stack must never report a partial count as the whole)."""
+        counts: Dict[str, int] = {}
+        failures: Dict[str, str] = {}
+        for role, url in self._roles():
+            status, body = _upstream_call(url, "GET", METRICS_PATH, _METRICS_TIMEOUT)
+            if status != 200:
+                failures[role] = body if status is None else f"http-{status}"
+                continue
+            value = sum_gauge(body, RUNNING_GAUGE)
+            if value is None:
+                failures[role] = f"gauge {RUNNING_GAUGE} absent"
+                continue
+            counts[role] = value
+        if failures:
+            self._reply_json(
+                503,
+                {
+                    "error": "pd stack in-flight count unreadable (fail closed)",
+                    "gauge": RUNNING_GAUGE,
+                    "roles": failures,
+                },
+            )
+            return
+        lines = [
+            f"# HELP {RUNNING_GAUGE} In-flight requests per pd role, relayed by pd_proxy.",
+            f"# TYPE {RUNNING_GAUGE} gauge",
+        ]
+        for role, _url in self._roles():
+            lines.append(f'{RUNNING_GAUGE}{{{ROLE_LABEL}="{role}"}} {counts[role]}')
+        self._reply_text(200, "\n".join(lines) + "\n")
+
+    def _relay_reset(self) -> None:
+        """POST /reset_prefix_cache to BOTH roles; 200 only when both answered
+        2xx, else 502 naming the role(s) that did not (a flush that one role
+        declined is not a cold start)."""
+        statuses: Dict[str, Any] = {}
+        failed: Dict[str, str] = {}
+        for role, url in self._roles():
+            status, body = _upstream_call(url, "POST", RESET_PATH, _RESET_TIMEOUT)
+            statuses[role] = status
+            if status is None:
+                failed[role] = body
+            elif not 200 <= status < 300:
+                failed[role] = f"http-{status}: {body[:200]}"
+        if failed:
+            self._reply_json(
+                502,
+                {
+                    "error": "prefix cache reset failed on a pd role (fail closed)",
+                    "roles": statuses,
+                    "failed": failed,
+                },
+            )
+            return
+        self._reply_json(200, {"reset": RESET_PATH, "roles": statuses})
+
+    # -- health ------------------------------------------------------------
+
     def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
+        if self.path == METRICS_PATH:
+            self._relay_metrics()
+            return
         if self.path != "/health":
             self._reply_json(404, {"error": f"unknown path {self.path!r}"})
             return
@@ -164,6 +325,9 @@ class PDProxyHandler(BaseHTTPRequestHandler):
     # -- the 1P1D data path -------------------------------------------------
 
     def do_POST(self) -> None:  # noqa: N802
+        if self.path == RESET_PATH:
+            self._relay_reset()
+            return
         if not self.path.startswith("/v1/"):
             self._reply_json(404, {"error": f"unknown path {self.path!r}"})
             return

@@ -44,6 +44,13 @@ results/<campaign>/<session>/<run_id>/
   scbench · sharegpt` (ShareGPT = load donor; its windows carry serving streams only).
   Putting the dataset in the window name is what makes the §8 dataset-scoped globs
   possible without opening any JSON.
+- `t_start` / `t_end` in the windows[] table are the window's **dispatch span** on the
+  telemetry clock (`time.time()`): first measured send to last completion (ADR-0055
+  amendment 2026-09-19). Request preparation and result recording sit outside it; the
+  regime bridge slices the telemetry series by `[t_start, t_end)` and every per-second
+  figure divides by its length. The window's `metrics.json["measured_window"]` carries the
+  same pair plus the stage bracket (`stage_t_start` / `stage_t_end`, preparation +
+  dispatch + recording) as provenance.
 
 ## 2. Cell directory names = `CellSpec.to_row_key()`
 

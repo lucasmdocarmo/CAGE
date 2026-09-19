@@ -605,3 +605,63 @@ def test_sglang_metrics_flag_region_cites_adr_and_carries_no_dashes() -> None:
     assert "\u2014" not in region and "\u2013" not in region, (
         "no em/en dashes in the --enable-metrics region"
     )
+
+
+# ---------------------------------------------------------------------------
+# 6. ADR-0055 decoupled scoring on every campaign branch (Batch 2 W1)
+# ---------------------------------------------------------------------------
+
+#: Shell entry points that enter run_experiment's campaign mode. The runner
+#: refuses a campaign cell without CAGE_SKIP_QUALITY=1 (W1), so each campaign
+#: branch must pin it, the way run_campaign.py pins it on every cell step.
+#: script -> the line that opens its campaign branch.
+CAMPAIGN_BRANCH_OPENERS: Dict[str, str] = {
+    "scripts/3_run/run_baselines.sh": 'if [ -n "${CAGE_CAMPAIGN_ROOT:-}" ]; then',
+    "scripts/3_run/run_compression.sh": 'if [ -n "${CAGE_CAMPAIGN_ROOT:-}" ]; then',
+    # The campaign branch of run_full_sweep.sh nests an if/else (root minted
+    # or preset), so the opener is the line AFTER that inner block: from it
+    # to the outer else is the tail of the campaign branch, where the pin sits.
+    "scripts/3_run/run_full_sweep.sh": 'export CAGE_RUN_ROOT="$CAGE_CAMPAIGN_ROOT"',
+}
+_SKIP_QUALITY_PIN = re.compile(r"^\s*export CAGE_SKIP_QUALITY=1\s*$", re.M)
+
+
+def _campaign_branch(text: str, opener: str) -> str:
+    """The text from the FIRST occurrence of ``opener`` to the next bare
+    ``else`` line (the campaign branch of the if block)."""
+    start = text.index(opener)
+    m = re.compile(r"^\s*else\s*$", re.M).search(text, start)
+    assert m, f"no else after {opener!r}"
+    return text[start:m.start()]
+
+
+@pytest.mark.parametrize("rel", sorted(CAMPAIGN_BRANCH_OPENERS))
+def test_campaign_branch_pins_decoupled_scoring(rel: str) -> None:
+    """W1 review finding H1: these scripts entered campaign mode without the
+    pin, so the runner would start the engine and then refuse every cell.
+    The pin must sit INSIDE the campaign branch (an unconditional export at
+    the top would change the pilot path too)."""
+    text = _strip_heredoc_bodies((REPO_ROOT / rel).read_text(encoding="utf-8"))
+    branch = _campaign_branch(text, CAMPAIGN_BRANCH_OPENERS[rel])
+    hits = [ln for ln in branch.splitlines() if _SKIP_QUALITY_PIN.match(ln)]
+    assert len(hits) == 1, (
+        f"{rel}: the campaign branch must export CAGE_SKIP_QUALITY=1 exactly "
+        f"once (ADR-0055, W1); found {len(hits)}"
+    )
+    assert "ADR-0055" in branch, f"{rel}: the pin's comment must cite ADR-0055"
+    assert "\u2014" not in branch and "\u2013" not in branch, (
+        f"{rel}: no em/en dashes in the campaign branch"
+    )
+
+
+def test_full_sweep_keeps_the_pilot_default_and_overrides_it_in_campaign_mode() -> None:
+    """run_full_sweep.sh keeps ``${CAGE_SKIP_QUALITY:-1}`` for the pilot path
+    (an operator's 0 restores inline scoring there) and the campaign branch
+    pins 1 AFTER it, so the pin wins in campaign mode (W1 review M1)."""
+    text = (REPO_ROOT / "scripts/3_run/run_full_sweep.sh").read_text(encoding="utf-8")
+    default = text.index('export CAGE_SKIP_QUALITY="${CAGE_SKIP_QUALITY:-1}"')
+    pin = _SKIP_QUALITY_PIN.search(text)
+    assert pin is not None and pin.start() > default, (
+        "the campaign pin must follow the pilot default so it overrides it"
+    )
+    assert pin.start() > text.index("CAMPAIGN_MODE=1")

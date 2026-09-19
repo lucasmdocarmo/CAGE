@@ -157,6 +157,17 @@ from every trial's measured set (results discarded; summary + ids sha256 in
 the window metadata). Both constants surface in the plan header, and
 ``load_plan`` refuses a stale plan whose server-engine cell lacks them.
 
+Engine endpoints (Batch 2 finding W2, 2026-09-18, option A): every
+server-engine cell carries ``--api-base http://localhost:<port>`` and every
+relaunch exports the launcher port env (VLLM_PORT / SGLANG_PORT; the pd
+relaunch CAGE_PD_PROXY_PORT), BOTH derived from the one port table
+ENGINE_PORTS that mirrors the frozen launchers' defaults, so the server a
+relaunch starts and the endpoint its cells dial agree by construction. The
+runner's --api-base default is the vLLM port and never reaches a campaign
+cell; ``load_plan`` refuses a stale plan per cell and per relaunch, and
+``run`` refuses while a CAGE_<ENGINE>_API_BASE override is exported (the
+runner resolves it before the pin). The in-process hf oracle dials nothing.
+
 Per-row N (backlog A9, DECISION.md amendment A1 / A5 of
 MyDocs/registration/power_decision_2026-08-07): every cell carries
 ``--num-queries <n>`` for its ROW CLASS: primary predicate cells (the #4
@@ -248,6 +259,7 @@ __all__ = [
     "cell_num_queries",
     "class_n",
     "classify_row",
+    "engine_api_base",
     "enumerate_cells",
     "load_floor_table",
     "load_plan",
@@ -297,6 +309,19 @@ __all__ = [
 # load_plan's header + per-relaunch checks (its launchers would fall back to
 # the pilot shell default 4096 and refuse every RULER request), so it can
 # never run a non-uniform or under-sized regime under registered row keys.
+# W1 (2026-09-18, Batch 2 finding W1 / ADR-0055 decoupled scoring): cell
+# steps gained the env CAGE_SKIP_QUALITY=1 and the header behavior_knobs the
+# quality_scoring record. No schema bump: a v5 plan built before W1 is
+# refused by _stale_plan_problems (its cells would run inline model scoring
+# inside the measured window), so the operator re-plans.
+# W2 (2026-09-18, Batch 2 finding W2, owner picked option A): every
+# server-engine cell argv gained --api-base and every relaunch env the
+# launcher port env (VLLM_PORT / SGLANG_PORT / CAGE_PD_PROXY_PORT), both
+# derived from the ONE port table ENGINE_PORTS; the relaunch record gained
+# ``api_base`` and the header serving_shapes the table. No schema bump: a v5
+# plan built before W2 is refused per cell and per relaunch (its SGLang cells
+# would ride the runner's --api-base default, the vLLM port), so the operator
+# re-plans.
 PLAN_SCHEMA = "cage-campaign-plan-v5"
 FLOOR_TABLE_SCHEMA = "floor-table-v1"
 
@@ -415,6 +440,21 @@ WARMUP_POOL_QUERIES: int = 20
 #: cells register (BACKEND_OF_ENGINE has no lmdeploy token today).
 SERVER_ENGINES: Tuple[str, ...] = ("vllm", "sglang", "lmdeploy")
 
+#: ADR-0055 ("serving writes, scoring reads", accepted 2026-08-04; Batch 2
+#: finding W1, 2026-09-18): the runner's decoupled-scoring switch. Under
+#: CAGE_SKIP_QUALITY=1 the serving loop uses the MODEL-FREE evaluator (F1,
+#: EM and the abstention detector inline; LettuceDetect, NLI, BERTScore,
+#: ROUGE and the similarity embedder run post-serving through
+#: rescore_quality.py --full --scoring-run-id <id>, the campaign v2 mode).
+#: The runner's own default is 0 (inline model scoring,
+#: the pilot path), so EVERY cell step pins the env: a campaign window
+#: produced by inline scoring spends pod time on CPU scoring, dilutes the
+#: window's occupancy average with engine-idle time and contradicts the
+#: accepted ADR. BEHAVIOR, not identity: derive_cell_spec ignores it.
+SKIP_QUALITY_ENV: str = "CAGE_SKIP_QUALITY"
+SKIP_QUALITY_VALUE: str = "1"
+DECOUPLED_SCORING_ADR: str = "ADR-0055"
+
 #: Backlog A9 / DECISION.md amendment A1 (MyDocs/registration/
 #: power_decision_2026-08-07/DECISION.md): the registered per-row N. These
 #: seed the SessionGrid fields of the same name (the grid is what the plan
@@ -496,6 +536,69 @@ PD_TELEMETRY_ENDPOINTS = (
     f"prefill=http://localhost:{PD_PREFILL_PORT},"
     f"decode=http://localhost:{PD_DECODE_PORT}"
 )
+
+#: Batch 2 finding W2 (2026-09-18; owner picked option A of A/B/C; ADR-0059
+#: amendment of the same date): the ONE port table the launcher env AND every
+#: server cell's --api-base derive from, so the server a relaunch starts and
+#: the endpoint its cells dial cannot drift apart. Values MIRROR the frozen
+#: launchers' defaults (manage_vllm_server.sh PORT="${VLLM_PORT:-8000}",
+#: manage_sglang_server.sh PORT="${SGLANG_PORT:-30000}"), pinned structurally
+#: by tests/test_run_campaign.py against the scripts. Before W2 no cell
+#: carried an endpoint: every cell rode the runner's --api-base default
+#: (http://localhost:8000, the vLLM port), so every SGLang cell was sent to a
+#: port no SGLang server listens on. An engine absent here has no registered
+#: port and its cells refuse at plan time (lmdeploy: no campaign launcher
+#: today). BEHAVIOR, not identity: derive_cell_spec never reads argv.
+ENGINE_PORTS: Dict[str, int] = {"vllm": 8000, "sglang": 30000}
+#: engine -> the launcher env carrying the port (frozen launcher contract),
+#: exported on every single-instance relaunch (the tp overlay rides the same
+#: launcher) so the launcher's shell default never reaches a campaign server
+#: (the A10 rule for max_model_len).
+PORT_LAUNCH_ENV: Dict[str, str] = {"vllm": "VLLM_PORT", "sglang": "SGLANG_PORT"}
+assert set(ENGINE_PORTS) == set(PORT_LAUNCH_ENV), (
+    "ENGINE_PORTS and PORT_LAUNCH_ENV register different engines (Batch 2 W2)"
+)
+#: manage_vllm_pd.sh: the proxy the runner dials in the pd topology
+#: (CAGE_PD_PROXY_PORT, default 8000, mirrored like PD_PREFILL_PORT /
+#: PD_DECODE_PORT); pd cells pin --api-base to it and the pd relaunch exports
+#: the env.
+PD_PROXY_PORT = 8000
+PD_PROXY_PORT_ENV = "CAGE_PD_PROXY_PORT"
+#: manage_vllm_pd.sh role instance ports: the SAME mirrored defaults the
+#: telemetry endpoints above are built from, exported on the pd relaunch so
+#: the launcher, the proxy's upstreams and the recorded telemetry endpoints
+#: agree by construction (W2 review F3: an operator shell CAGE_PD_PREFILL_PORT
+#: would move the instance while the record kept naming 8100).
+PD_ROLE_PORT_ENVS: Dict[str, int] = {
+    "CAGE_PD_PREFILL_PORT": PD_PREFILL_PORT,
+    "CAGE_PD_DECODE_PORT": PD_DECODE_PORT,
+}
+#: The loopback host every campaign endpoint is dialed on: the runner and the
+#: servers share the pod, the launchers health-check on it, and
+#: PD_TELEMETRY_ENDPOINTS already spells it out.
+API_BASE_HOST = "http://localhost"
+#: The runner's per-engine endpoint OVERRIDES: run_experiment.py resolves
+#: CAGE_<ENGINE>_API_BASE BEFORE --api-base for sglang/lmdeploy (adapter and
+#: cache flush alike). _exec inherits the operator's shell, so an exported
+#: override would beat the plan's pin on every cell of that engine: 'run'
+#: refuses on PRESENCE, the STALE_INDEX_OPT_IN_ENV rule.
+API_BASE_OVERRIDE_ENVS: Tuple[str, ...] = (
+    "CAGE_SGLANG_API_BASE",
+    "CAGE_LMDEPLOY_API_BASE",
+)
+#: The finding every endpoint refusal and header record cites.
+ENGINE_PORTS_FINDING = "Batch 2 W2"
+#: Every launcher port env the driver pins -> its registered value. 'run'
+#: refuses a shell value that DIFFERS (an equal value is fine): the preflight
+#: gate dials the shell's SGLANG_PORT for its URL (scripts/checks/
+#: preflight_check.sh), while every relaunch exports the registered port and
+#: the step env wins, so a differing shell value would make the preflight
+#: evidence come from a port the campaign never serves on (W2 review F5).
+SHELL_PORT_ENVS: Dict[str, int] = {
+    **{PORT_LAUNCH_ENV[engine]: port for engine, port in ENGINE_PORTS.items()},
+    PD_PROXY_PORT_ENV: PD_PROXY_PORT,
+    **PD_ROLE_PORT_ENVS,
+}
 
 #: charter model slug -> HF id, as the launchers and run_experiment --model
 #: expect it (the runner maps the id back to the slug via
@@ -828,6 +931,34 @@ def redis_key_prefix_for_row(row_key: str) -> str:
         )
     digest = hashlib.sha1(row_key.encode("utf-8")).hexdigest()
     return f"{REDIS_KEY_PREFIX_ROOT}:{digest[:REDIS_NAMESPACE_SHA_CHARS]}"
+
+
+def engine_api_base(engine: str, topology: str = "single") -> str:
+    """The endpoint a cell of ``engine`` dials (Batch 2 W2), from the one
+    port table: ``http://localhost:<ENGINE_PORTS[engine]>`` for the single
+    and tp topologies (both ride the single-instance launcher), the pd proxy
+    (``PD_PROXY_PORT``) for vLLM pd (manage_vllm_pd.sh is the only PD
+    launcher). The in-process hf oracle has no endpoint and refuses here, as
+    does any engine with no registered port or pd proxy (fail closed: the
+    runner's --api-base default is the vLLM port and must never be what
+    another engine's cell silently inherits).
+    """
+    if topology == "pd":
+        if engine != "vllm":
+            raise PlanError(
+                f"engine {engine!r} has no registered pd proxy (manage_vllm_pd.sh "
+                f"is vLLM-only; {ENGINE_PORTS_FINDING}): refusing to pin its pd "
+                "cells to the vLLM proxy"
+            )
+        return f"{API_BASE_HOST}:{PD_PROXY_PORT}"
+    port = ENGINE_PORTS.get(engine)
+    if port is None:
+        raise PlanError(
+            f"engine {engine!r} has no registered port (ENGINE_PORTS: "
+            f"{sorted(ENGINE_PORTS)}; {ENGINE_PORTS_FINDING}): refusing to let "
+            "its cells inherit the runner's --api-base default"
+        )
+    return f"{API_BASE_HOST}:{port}"
 
 
 def _ordered(baseline_ids: frozenset) -> Tuple[str, ...]:
@@ -2080,6 +2211,12 @@ def _relaunch_step(
         # Backlog A10: the uniform request-length cap, applied by the pd
         # launcher to BOTH role instances (one env, frozen contract).
         env[MAX_MODEL_LEN_ENV] = str(grid.max_model_len)
+        # Batch 2 W2: the proxy port the cells under this relaunch dial, and
+        # the role ports the proxy's upstreams and the telemetry endpoints
+        # above name (one table, exported, never left to the shell).
+        env[PD_PROXY_PORT_ENV] = str(PD_PROXY_PORT)
+        for role_env, role_port in PD_ROLE_PORT_ENVS.items():
+            env[role_env] = str(role_port)
         return {
             "kind": "relaunch",
             "engine": engine,
@@ -2096,6 +2233,7 @@ def _relaunch_step(
             "topology": topology,
             "tp": role_tp,  # per ROLE instance (both roles, launcher contract)
             "pd": pd_record,
+            "api_base": engine_api_base(engine, topology),  # W2: the proxy
             "argv": argv,
             "env": env,
         }
@@ -2177,6 +2315,11 @@ def _relaunch_step(
     # free F1 relaunches included: a server launched without it would fall
     # back to the pilot shell default 4096 and refuse every RULER request.
     env[MAX_MODEL_LEN_ENV] = str(grid.max_model_len)
+    # Batch 2 W2: the launcher port, from the ONE table the cells under this
+    # relaunch pin --api-base from (the launcher's shell default never
+    # reaches a campaign server; the tp overlay rides the same launcher).
+    api_base = engine_api_base(engine, topology)  # refuses an unregistered engine
+    env[PORT_LAUNCH_ENV[engine]] = str(ENGINE_PORTS[engine])
     return {
         "kind": "relaunch",
         "engine": engine,
@@ -2190,6 +2333,7 @@ def _relaunch_step(
         "topology": topology,
         "tp": launched_tp,  # the T3.1 degree this serving stack launches with
         "pd": None,  # single/tp relaunch: no §6.5 role split
+        "api_base": api_base,  # W2: what the cells under this relaunch dial
         "argv": argv,
         "env": env,
     }
@@ -2351,11 +2495,60 @@ def _stale_plan_problems(
     - F5a: a retr-reuse cell carries --redis-key-prefix ==
       redis_key_prefix_for_row(row_key) and --flush-redis-namespace; every
       other cell carries neither (a shared namespace is shared cache hits).
+    - ADR-0055 (Batch 2 W1): EVERY cell env carries SKIP_QUALITY_ENV ==
+      SKIP_QUALITY_VALUE (a pre-W1 plan, or one hand-edited to "0", would
+      score inline inside the measured window).
+    - Batch 2 W2 (engine endpoints): every non-hf cell carries --api-base ==
+      engine_api_base(engine, topology) (a pre-W2 plan, or one whose SGLang
+      cell was hand-pointed at the vLLM port, dials a server the plan never
+      registered), and an EXECUTABLE server cell dials exactly the
+      ``api_base`` its preceding relaunch records (review F1: a cell moved
+      under another engine's boundary would be served by whatever survived
+      an earlier boundary); an hf cell carries none, and a BLOCKED cell with
+      no registered endpoint carries none.
     """
     row = step.get("row_key")
     argv: Sequence[str] = step.get("argv") or []
+    env: Mapping[str, Any] = step.get("env") or {}
     problems: List[str] = []
     stale = ": stale plan, re-plan"
+
+    got_api = _argv_flag_value(argv, "--api-base")
+    if spec.engine == "hf":
+        if got_api is not None:
+            problems.append(
+                f"{label}: hf cell {row!r} carries --api-base {got_api!r} (the "
+                f"in-process oracle dials nothing; {ENGINE_PORTS_FINDING})" + stale
+            )
+    else:
+        try:
+            want_api = engine_api_base(spec.engine, spec.topology)
+        except PlanError as exc:
+            if step.get("blocked_on") is None:
+                problems.append(f"{label}: cell {row!r}: {exc}" + stale)
+            elif got_api is not None:
+                problems.append(
+                    f"{label}: blocked cell {row!r} carries --api-base {got_api!r} "
+                    f"but its engine has no registered endpoint ({exc})" + stale
+                )
+        else:
+            if got_api != want_api:
+                problems.append(
+                    f"{label}: cell {row!r} carries --api-base {got_api!r}, the "
+                    f"registered endpoint of engine {spec.engine!r} is "
+                    f"{want_api!r} ({ENGINE_PORTS_FINDING}: the runner's "
+                    "--api-base default is the vLLM port and never reaches a "
+                    "campaign cell)" + stale
+                )
+
+    got_skip = env.get(SKIP_QUALITY_ENV)
+    if got_skip != SKIP_QUALITY_VALUE:
+        problems.append(
+            f"{label}: cell {row!r} env {SKIP_QUALITY_ENV} is {got_skip!r}, the "
+            f"registered pin is {SKIP_QUALITY_VALUE!r} ({DECOUPLED_SCORING_ADR}: "
+            "scoring is a separate post-serving pass; inline model scoring "
+            "inside the measured window never rides a campaign cell)" + stale
+        )
 
     got_n = _argv_flag_value(argv, "--num-queries")
     if got_n is None:
@@ -2454,6 +2647,15 @@ def _stale_plan_problems(
                         + ("carries" if "--no-prefix-cache" in r_argv else "lacks")
                         + " --no-prefix-cache (ADR-0103)" + stale
                     )
+                # Batch 2 W2 (review F1): the endpoint the cell dials is the
+                # one the relaunch it runs under serves on.
+                if got_api != preceding_relaunch.get("api_base"):
+                    problems.append(
+                        f"{label}: cell {row!r} dials {got_api!r} but runs under a "
+                        f"relaunch serving {preceding_relaunch.get('api_base')!r} "
+                        f"({ENGINE_PORTS_FINDING}: a cell served by a boundary it "
+                        "does not dial is mislabeled data)" + stale
+                    )
 
     if spec.retriever == "rerank":
         pool = _argv_flag_value(argv, "--rerank-pool")
@@ -2471,7 +2673,6 @@ def _stale_plan_problems(
         )
 
     if retrieval is not None:
-        env: Mapping[str, Any] = step.get("env") or {}
         if spec.retriever != "none":
             expected_flags = {
                 "--top-k": str(RETRIEVAL_TOP_K),
@@ -2576,6 +2777,22 @@ def _cell_step(
         "--seed",
         str(seed),
     ]
+    if spec.engine != "hf":
+        # Batch 2 W2: the endpoint from the ONE port table the relaunch's
+        # launcher env derives from (never the runner's --api-base default,
+        # which is the vLLM port); the in-process oracle dials nothing. A
+        # BLOCKED cell on an engine/topology with no registered endpoint
+        # (today: a pd cell off vLLM) carries none, the gpu_count rule: the
+        # debt stays visible in the plan, never guessed; an executable one
+        # refuses.
+        try:
+            api_base: Optional[str] = engine_api_base(spec.engine, spec.topology)
+        except PlanError:
+            if cell.blocked_on is None:
+                raise
+            api_base = None
+        if api_base is not None:
+            argv += ["--api-base", api_base]
     # A9 per-row N: EVERY cell carries its registered --num-queries (the
     # runner's default query count must never reach a campaign cell); with a
     # manifest the runner measures the FIRST n ids of each trial.
@@ -2651,6 +2868,11 @@ def _cell_step(
         # emits windows (base, base+replications] so per-task resume can
         # never collide (campaign_session reads this env).
         env["CAGE_WINDOW_ORDINAL_BASE"] = str(cell.window_ordinal_base)
+    # ADR-0055 (Batch 2 W1): decoupled scoring on EVERY cell, hf oracle and
+    # blocked cells included. The runner's default is inline model scoring,
+    # and _exec applies this env on top of the operator's shell, so the pin
+    # wins over an exported inline switch. Behavior, never identity.
+    env[SKIP_QUALITY_ENV] = SKIP_QUALITY_VALUE
     return {
         "kind": "cell",
         "family": spec.family,
@@ -3009,6 +3231,11 @@ def build_plan(
             # family (corpus-fresh); F2 stays the prefix-OFF family.
             "prefix_off_arms": sorted(PREFIX_OFF_ARMS),
             "prefix_off_adr": "ADR-0103",
+            # ADR-0055 (Batch 2 W1): every cell env pins decoupled scoring;
+            # re-checked per cell by load_plan.
+            "quality_scoring": "decoupled",
+            "quality_scoring_env": SKIP_QUALITY_ENV,
+            "quality_scoring_adr": DECOUPLED_SCORING_ADR,
         },
         # W4.2/W4.6: the registered serving shapes — reviewable in the header
         # like the behavior knobs (design registrations, not measurements).
@@ -3022,6 +3249,16 @@ def build_plan(
             "max_model_len": grid.max_model_len,
             "max_model_len_env": MAX_MODEL_LEN_ENV,
             "max_model_len_backlog": "A10",
+            # Batch 2 W2: the ONE port table every relaunch's launcher env
+            # and every server cell's --api-base derive from (mirrors the
+            # frozen launchers' defaults); re-checked per relaunch and per
+            # cell by load_plan; the override envs 'run' refuses on presence.
+            "engine_ports": dict(ENGINE_PORTS),
+            "port_launch_env": dict(PORT_LAUNCH_ENV),
+            "pd_proxy_port": PD_PROXY_PORT,
+            "pd_proxy_port_env": PD_PROXY_PORT_ENV,
+            "api_base_override_envs": list(API_BASE_OVERRIDE_ENVS),
+            "engine_ports_finding": ENGINE_PORTS_FINDING,
         },
         # §6.4 anchor fine grid registration (null on non-anchor sessions).
         "fine_grid": (
@@ -3117,6 +3354,9 @@ _RELAUNCH_STEP_KEYS = (
     # A10: the uniform request-length cap this relaunch launches with
     # (also carried in env as MAX_MODEL_LEN_ENV; both re-checked below).
     "max_model_len",
+    # Batch 2 W2: the endpoint this relaunch serves on; every executable
+    # cell under it is checked against the record (review F1).
+    "api_base",
 )
 
 
@@ -3128,9 +3368,57 @@ def _stale_relaunch_problems(
     (ONE value per session, the uniform-regime rule) and the env carries
     MAX_MODEL_LEN_ENV with exactly that value (a relaunch without the env
     would launch at the pilot shell default 4096; a drifted env would make
-    the record lie about the server every cell under it ran against)."""
+    the record lie about the server every cell under it ran against).
+
+    Batch 2 W2: the env carries the launcher port (PORT_LAUNCH_ENV, or
+    PD_PROXY_PORT_ENV for pd) equal to the ONE registered port of the
+    engine, the port the cells under this relaunch pin --api-base to (a
+    relaunch without it would serve on the launcher's shell default; a
+    drifted one would serve on a port no cell dials)."""
     problems: List[str] = []
     stale = ": stale plan, re-plan"
+    env: Mapping[str, Any] = step.get("env") or {}
+    engine = str(step.get("engine"))
+    if step.get("topology") == "pd":
+        port_env: Optional[str] = PD_PROXY_PORT_ENV
+        want_port: Optional[int] = PD_PROXY_PORT
+    else:
+        port_env = PORT_LAUNCH_ENV.get(engine)
+        want_port = ENGINE_PORTS.get(engine)
+    if port_env is None or want_port is None:
+        problems.append(
+            f"{label}: relaunch engine {engine!r} has no registered port "
+            f"(ENGINE_PORTS: {sorted(ENGINE_PORTS)}; {ENGINE_PORTS_FINDING})"
+            + stale
+        )
+    else:
+        if env.get(port_env) != str(want_port):
+            problems.append(
+                f"{label}: relaunch env {port_env} is {env.get(port_env)!r}, the "
+                f"registered port is {want_port} ({ENGINE_PORTS_FINDING}: the cells "
+                "under this relaunch pin --api-base to that port; the launcher's "
+                "shell default never reaches a campaign server)" + stale
+            )
+        # Review F1: the record the cells under this relaunch are checked
+        # against must itself be the registered endpoint.
+        want_api = f"{API_BASE_HOST}:{want_port}"
+        if step.get("api_base") != want_api:
+            problems.append(
+                f"{label}: relaunch api_base record is {step.get('api_base')!r}, "
+                f"the registered endpoint is {want_api!r} ({ENGINE_PORTS_FINDING}: "
+                "the cells under this relaunch are checked against the record)"
+                + stale
+            )
+        if step.get("topology") == "pd":
+            # Review F3: the role ports the recorded telemetry endpoints name.
+            for role_env, role_port in PD_ROLE_PORT_ENVS.items():
+                if env.get(role_env) != str(role_port):
+                    problems.append(
+                        f"{label}: pd relaunch env {role_env} is "
+                        f"{env.get(role_env)!r}, the registered role port is "
+                        f"{role_port} ({ENGINE_PORTS_FINDING}: the recorded "
+                        "telemetry endpoints name that port)" + stale
+                    )
     value = step.get("max_model_len")
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         problems.append(
@@ -3145,7 +3433,6 @@ def _stale_relaunch_problems(
             "max_model_len (backlog A10, _serving_config.sh uniform-regime "
             "rule)" + stale
         )
-    env: Mapping[str, Any] = step.get("env") or {}
     got = env.get(MAX_MODEL_LEN_ENV)
     if got != str(value):
         problems.append(
@@ -3413,6 +3700,32 @@ def run_plan(
             f"({os.environ[STALE_INDEX_OPT_IN_ENV]!r}); the campaign path never "
             "serves a stale (pre-prefix) dense index, unset it before 'run'"
         )
+    # Batch 2 W2: the runner resolves CAGE_<ENGINE>_API_BASE BEFORE the
+    # plan's --api-base pin (adapter and cache flush alike), so an exported
+    # override would send every cell of that engine to an endpoint the plan
+    # never registered. Refused on PRESENCE (any value) before the first step.
+    for name in API_BASE_OVERRIDE_ENVS:
+        if name in os.environ:
+            raise RunError(
+                f"{name} is set in the environment ({os.environ[name]!r}); the "
+                "runner resolves it before the plan's --api-base pin, so a "
+                "campaign cell could dial an endpoint the plan never registered "
+                f"({ENGINE_PORTS_FINDING}); unset it before 'run'"
+            )
+    # Batch 2 W2 (review F5): the preflight gate dials the shell's launcher
+    # port env while every relaunch exports the registered port (the step env
+    # wins), so a shell value that DIFFERS would make the preflight evidence
+    # come from a port the campaign never serves on. Refused on mismatch
+    # before the first step; an equal value is fine.
+    for name, want in SHELL_PORT_ENVS.items():
+        got = os.environ.get(name)
+        if got is not None and got.strip() != str(want):
+            raise RunError(
+                f"{name} is {got!r} in the environment but the registered port is "
+                f"{want} ({ENGINE_PORTS_FINDING}): the preflight dials the shell "
+                "value while every relaunch pins the registered one; unset it or "
+                "set it to the registered port before 'run'"
+            )
     steps: List[Dict[str, Any]] = list(plan["steps"])
     cell_steps = [s for s in steps if s["kind"] == "cell"]
 
