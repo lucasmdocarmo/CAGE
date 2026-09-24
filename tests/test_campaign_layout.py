@@ -815,3 +815,188 @@ def test_session_refuses_malformed_seam_env(tmp_path: Path) -> None:
         CampaignCellSession.from_cli(
             _session_args(root), env={"CAGE_WINDOW_ORDINAL_BASE": "-3"}
         )
+
+
+# ---------------------------------------------------------------------------
+# Batch 2 W4 (ADR-0117), budget_plan producer: CellWriter persists the
+# driver's cache_budget.BudgetPlan record under the EXACT key the rho_own
+# consumer reads (run_campaign_analysis._BUDGET_PLAN_CELL_KEY == "budget_plan"),
+# with the gpu_count resume rules (adopt on resume, refuse a contradiction),
+# and a produced cell.json feeds the own-accounting pass past its labeled skip.
+# ---------------------------------------------------------------------------
+
+#: qwen3-14b BF16 KV = 163_840 B/token; 42 tokens of budget lands the
+#: canonical own-accounting rows on rho_own = 0.5 (tests/test_own_accounting.py).
+_BUDGET_42_TOK = 42 * 163_840
+
+
+def _budget_plan(**overrides: Any) -> dict[str, Any]:
+    doc: dict[str, Any] = {
+        "model": MODEL,
+        "engine": "vllm",
+        "r": 0.5,
+        "kv_dtype": "bf16",
+        "budget_bytes_total": _BUDGET_42_TOK,
+        "tp": 1,
+        "topology": "single",
+        "pools_bytes": None,
+        "engine_args": [{"engine": "vllm", "kind": "primary", "role": "single",
+                         "args": ["--kv-cache-memory-bytes", str(_BUDGET_42_TOK)],
+                         "note": "direct bytes knob."}],
+    }
+    doc.update(overrides)
+    return doc
+
+
+def _pressure_spec() -> CellSpec:
+    return CellSpec(
+        "gold-fresh", "none", "none", "single", "vllm", MODEL, "F2",
+        budget_r=0.5, rate_frac=0.85,
+    )
+
+
+def test_cell_json_persists_budget_plan_and_absence_stays_absent(tmp_path: Path) -> None:
+    assert cl.BUDGET_PLAN_CELL_KEY == "budget_plan"
+    run_root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    run = cl.CampaignRun.create(run_root, **_manifest_kwargs())
+    cell = run.cell(_pressure_spec(), budget_plan=_budget_plan())
+    _add_window(cell, "qasper")
+    meta = json.loads((cell.cell_dir / "cell.json").read_text(encoding="utf-8"))
+    assert meta["budget_plan"] == _budget_plan()
+    # tuples given by a direct caller land as JSON lists, once, at write time
+    tupled = _budget_plan(pools_bytes=(1, 2), engine_args=())
+    other = run.cell(
+        CellSpec("gold-fresh", "none", "none", "single", "vllm", MODEL, "F2",
+                 budget_r=0.25, rate_frac=0.85),
+        budget_plan=tupled,
+    )
+    _add_window(other, "qasper")
+    meta = json.loads((other.cell_dir / "cell.json").read_text(encoding="utf-8"))
+    assert meta["budget_plan"]["pools_bytes"] == [1, 2]
+    # a cell WITHOUT a plan keeps the key ABSENT (never null, never a guess):
+    # the consumer's labeled skip stays the honest outcome for such trees
+    free = run.cell(_specs()[0])
+    _add_window(free, "squad_v2")
+    assert "budget_plan" not in json.loads((free.cell_dir / "cell.json").read_text(encoding="utf-8"))
+
+
+def test_budget_plan_write_time_refusals_are_named(tmp_path: Path) -> None:
+    run_root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    run = cl.CampaignRun.create(run_root, **_manifest_kwargs())
+    spec = _pressure_spec()
+    for bad, match in (
+        ("not a mapping", "mapping"),
+        ({"kv_dtype": "bf16"}, "budget_bytes_total"),
+        (_budget_plan(budget_bytes_total=True), "budget_bytes_total"),
+        (_budget_plan(budget_bytes_total=0), "budget_bytes_total"),
+        (_budget_plan(budget_bytes_total=1.5e9), "budget_bytes_total"),
+        (_budget_plan(kv_dtype=""), "kv_dtype"),
+        (_budget_plan(kv_dtype=8), "kv_dtype"),
+        (_budget_plan(gate_j=object()), "serializable"),
+    ):
+        with pytest.raises(cl.CampaignLayoutError, match=match):
+            cl.CellWriter(run_root, spec, budget_plan=bad)
+    # the in-process oracle has no budget to plan (cache_budget refuses hf)
+    hf = CellSpec.from_baseline("B3", model=MODEL, engine="hf")
+    with pytest.raises(cl.CampaignLayoutError, match="oracle"):
+        cl.CellWriter(run_root, hf, budget_plan=_budget_plan(engine="hf"))
+    assert not list(run_root.glob("cells/*/cell.json"))
+
+
+def test_budget_plan_resume_contradiction_refuses_and_adoption_works(tmp_path: Path) -> None:
+    run_root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    run = cl.CampaignRun.create(run_root, **_manifest_kwargs())
+    spec = _pressure_spec()
+    cell = run.cell(spec, budget_plan=_budget_plan())
+    _add_window(cell, "qasper")
+    # a fresh writer with a CONTRADICTING record refuses (two claims about
+    # one cell's budget cannot both be true)
+    with pytest.raises(cl.CampaignLayoutError, match="contradicts"):
+        cl.CellWriter(run_root, spec, budget_plan=_budget_plan(budget_bytes_total=1))
+    # a memoized writer re-requested with a different record refuses too
+    with pytest.raises(cl.CampaignLayoutError, match="contradicts"):
+        run.cell(spec, budget_plan=_budget_plan(kv_dtype="fp8"))
+    # the same record, tuple-vs-list spelling, is not a contradiction
+    assert run.cell(spec, budget_plan=_budget_plan(engine_args=tuple(_budget_plan()["engine_args"]))) is cell
+    # resume with NO fresh claim adopts the recorded fact and keeps it
+    resumed = cl.CellWriter(run_root, spec)
+    assert resumed.budget_plan == _budget_plan()
+    _add_window(resumed, "qasper", rep=2)
+    meta = json.loads((resumed.cell_dir / "cell.json").read_text(encoding="utf-8"))
+    assert meta["budget_plan"] == _budget_plan()
+    # a corrupt recorded plan refuses extension
+    meta["budget_plan"] = {"budget_bytes_total": "lots"}
+    (resumed.cell_dir / "cell.json").write_text(json.dumps(meta), encoding="utf-8")
+    with pytest.raises(cl.CampaignLayoutError, match="budget_bytes_total"):
+        cl.CellWriter(run_root, spec)
+
+
+def test_produced_cell_json_feeds_rho_own_past_the_skip(tmp_path: Path) -> None:
+    """W4 end-to-end: producer -> cell.json -> the rho_own consumer's read.
+
+    Before this producer existed, run_campaign_analysis.run_own_accounting_pass
+    found no ``budget_plan`` in any cell.json and the occupancy leg of every
+    window was the labeled '[WAVE-3 wiring]' skip. This test walks the chain
+    on the canonical own-accounting rows (tests/test_own_accounting.py:
+    84 token-seconds over [0, 4) against a 42-token budget): CellWriter
+    persists the record, the pass computes rho_own = 0.5 and records no skip.
+    """
+    import run_campaign_analysis as rca
+
+    run_root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    run = cl.CampaignRun.create(run_root, **_manifest_kwargs())
+    cell = run.cell(_pressure_spec(), budget_plan=_budget_plan())
+    rows = [
+        {"example_id": "r1", "record_index": None, "actual_send_ts": 0.0,
+         "first_token_ts": 2.0, "completion_ts": 4.0, "prompt_tokens": 10,
+         "num_tokens": 4, "group_id": 0, "cached_prompt_tokens": 4,
+         "dropped_by_cap": False},
+        {"example_id": "r2", "record_index": None, "actual_send_ts": 1.0,
+         "first_token_ts": None, "completion_ts": 3.0, "prompt_tokens": 20,
+         "num_tokens": 0, "group_id": 1, "cached_prompt_tokens": None,
+         "dropped_by_cap": False},
+    ]
+    handle = _add_window(
+        cell, "qasper", t_start=0.0, t_end=4.0, requests=rows,
+        qa_evidence=[{"example_id": r["example_id"]} for r in rows],
+    )
+    index = pd.DataFrame([{
+        "row_key": handle.row_key,
+        "dataset": "qasper",
+        "window_key": handle.window_key,
+        "window_dir": handle.window_dir.relative_to(run_root).as_posix(),
+        "cell_json": f"cells/{handle.row_key}/cell.json",
+        "model": MODEL,
+    }])
+    analysis_dir = tmp_path / "analysis"
+    summary = rca.run_own_accounting_pass(run_root, index, analysis_dir)
+    assert summary["n_emitted"] == 1 and summary["n_skipped_entirely"] == 0
+    doc = json.loads(
+        (analysis_dir / "own_accounting" / index.loc[0, "window_dir"] / "own_accounting.json")
+        .read_text(encoding="utf-8")
+    )
+    assert doc["rho_own"] == pytest.approx(0.5)
+    assert "skipped" not in doc["occupancy"]  # computed, not the labeled skip
+    assert "WAVE-3" not in json.dumps(doc)
+
+
+def test_budget_claim_over_a_populated_cell_without_a_record_refuses(tmp_path: Path) -> None:
+    """Review S4: unlike gpu_count (W4.2 adopts), a fresh budget claim over
+    windows that carry no record refuses; the record would otherwise cover
+    windows served under an unrecorded budget."""
+    run_root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    run = cl.CampaignRun.create(run_root, **_manifest_kwargs())
+    spec = _pressure_spec()
+    _add_window(run.cell(spec), "qasper")
+    with pytest.raises(cl.CampaignLayoutError, match="no budget_plan record"):
+        cl.CellWriter(run_root, spec, budget_plan=_budget_plan())
+    with pytest.raises(cl.CampaignLayoutError, match="no budget_plan record"):
+        cl.CampaignRun(run_root).cell(spec, budget_plan=_budget_plan())
+    # an empty cell directory (no windows) is not populated: the claim lands
+    empty = CellSpec(
+        "gold-fresh", "none", "none", "single", "vllm", MODEL, "F2",
+        budget_r=0.25, rate_frac=0.85,
+    )
+    (run_root / "cells" / empty.to_row_key()).mkdir(parents=True)
+    writer = cl.CellWriter(run_root, empty, budget_plan=_budget_plan())
+    assert writer.budget_plan == _budget_plan()

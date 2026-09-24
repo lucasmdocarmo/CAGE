@@ -13,6 +13,9 @@ Synthetic RESULTS_LAYOUT §1 fixture trees exercise every gate check:
 - cell.json windows[] coverage mismatches fail in both directions (§1);
 - an unsealed run fails (§5), a tampered sealed artifact fails (HASH-MISMATCH);
 - ``--out`` inside the run root is refused (exit 2);
+- a row absent from BOTH per-query chains (the ADR-0116 W3 signature, invisible
+  to the requests-vs-evidence reconciliation) fails the row-count check against
+  the window's offered population, and a nonzero consort counter fails too;
 - ``--pilot`` preserves the pilot-era metrics-vs-CSV behavior verbatim.
 """
 
@@ -79,11 +82,42 @@ def _row(
     return row
 
 
+ZERO_CONSORT: dict[str, Any] = {
+    "n_dropped_prepare": 0,
+    "n_dropped_record": 0,
+    "n_dropped_turn": 0,
+    "evidence_write_failures": 0,
+    "evidence_write_first_error": None,
+}
+
+
+def _window_metrics(
+    *,
+    mode: str = "single",
+    n_offered: int = N_ROWS,
+    consort: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The runner summary campaign_session writes beside the §1 artifacts: the
+    offered population (closed loop: experiment.num_measured_requests; open
+    loop: workload.open_loop.n_scheduled) and the §9.10 consort counters."""
+    doc: dict[str, Any] = {
+        "experiment": {"num_measured_requests": n_offered, "stale_index_opt_in": False},
+        "workload": {"mode": mode},
+        "consort": {**ZERO_CONSORT, **(consort or {})},
+    }
+    if mode == "open_loop":
+        doc["workload"]["open_loop"] = {"n_scheduled": n_offered}
+    return doc
+
+
 def _build_tree(
     tmp_path: Path,
     *,
     with_validity: bool = True,
     with_record_index: bool = True,
+    metrics: bool = True,
+    metrics_mode: str = "single",
+    consort: dict[str, Any] | None = None,
 ) -> Path:
     """UNSEALED §1 tree (2 cells x 2 windows x N_ROWS); seal with _seal()."""
     run_dir = tmp_path / "results" / CAMPAIGN / SESSION / RUN_ID
@@ -131,6 +165,11 @@ def _build_tree(
                 json.dumps({"snapshot": "before/after"}), encoding="utf-8"
             )
             _write_jsonl(wdir / "cage_stats.jsonl", [{"ts_s": 0.0, "kv_cache_usage": 0.1}])
+            if metrics:
+                (wdir / vr._WINDOW_METRICS_NAME).write_text(
+                    json.dumps(_window_metrics(mode=metrics_mode, consort=consort)),
+                    encoding="utf-8",
+                )
         (cell_dir / "cell.json").write_text(
             json.dumps(
                 {
@@ -419,3 +458,93 @@ def test_pilot_mode_gate_exit_on_mismatch(tmp_path: Path) -> None:
     csv = next(pilot.rglob("*_results.csv"))
     csv.write_text("example_id\n0\n", encoding="utf-8")  # 1 row vs expected 2
     assert vr.main(["--pilot", "--results-dir", str(pilot)]) == 1
+
+
+# ---------------------------------------------------------------------------
+# (i) row count vs the offered population + consort counters (ADR-0116, W3)
+# ---------------------------------------------------------------------------
+
+
+def test_window_metrics_name_and_counters_match_the_producer() -> None:
+    from src.orchestration import campaign_session as cs
+
+    assert vr._WINDOW_METRICS_NAME == cs.WINDOW_METRICS_NAME
+    assert set(vr._CONSORT_COUNTERS) == set(cs.CONSORT_COUNTERS)
+
+
+def test_expected_row_count_reads_the_offered_population() -> None:
+    assert vr.expected_row_count(_window_metrics()) == (
+        N_ROWS, "experiment.num_measured_requests",
+    )
+    assert vr.expected_row_count(_window_metrics(mode="open_loop", n_offered=7)) == (
+        7, "workload.open_loop.n_scheduled",
+    )
+    # Absence and non-integers are unknown, never coerced.
+    assert vr.expected_row_count({})[0] is None
+    assert vr.expected_row_count({"workload": {"mode": "open_loop"}})[0] is None
+    assert vr.expected_row_count({"experiment": {"num_measured_requests": "3"}})[0] is None
+    assert vr.expected_row_count({"experiment": {"num_measured_requests": True}})[0] is None
+
+
+def test_row_dropped_from_both_chains_fails_the_row_count_check(tmp_path: Path) -> None:
+    # The W3 signature: the request is absent from requests.jsonl AND
+    # qa_evidence.jsonl, so the requests-vs-evidence reconciliation passes;
+    # only the offered population reveals the loss.
+    run_dir = _build_tree(tmp_path)
+    wdir = _first_window(run_dir)
+    for name in ("requests.jsonl", "qa_evidence.jsonl"):
+        rows = _read_jsonl(wdir / name)
+        _write_jsonl(wdir / name, rows[:-1])
+    _seal(run_dir)
+    report = vr.verify_run(run_dir)
+    assert report["ok"] is False
+    assert not _findings(report, "FAIL", "reconciliation")  # both chains agree
+    (finding,) = _findings(report, "FAIL", "row-count")
+    assert f"{N_ROWS - 1} row(s)" in finding["detail"]
+    assert f"offered {N_ROWS}" in finding["detail"]
+    assert "num_measured_requests" in finding["detail"] and "ADR-0116" in finding["detail"]
+    row = next(r for r in report["accounting"]["per_window"] if r["window"] == finding["where"])
+    assert row["n_expected_rows"] == N_ROWS and row["n_requests_rows"] == N_ROWS - 1
+
+
+def test_nonzero_consort_counter_fails(tmp_path: Path) -> None:
+    run_dir = _mk_green(tmp_path, consort={"n_dropped_record": 1})
+    report = vr.verify_run(run_dir)
+    assert report["ok"] is False
+    fails = _findings(report, "FAIL", "row-count")
+    assert len(fails) == len(BASELINES) * N_WINDOWS
+    assert all("n_dropped_record = 1" in f["detail"] for f in fails)
+
+
+def test_open_loop_offered_population_is_the_schedule(tmp_path: Path) -> None:
+    run_dir = _mk_green(tmp_path, metrics_mode="open_loop")
+    report = vr.verify_run(run_dir)
+    assert report["ok"] is True and report["n_warn"] == 0
+    # One scheduled arrival without a row (no dispatch stub either) fails.
+    run_dir2 = _build_tree(tmp_path / "two", metrics_mode="open_loop")
+    wdir = _first_window(run_dir2)
+    doc = json.loads((wdir / vr._WINDOW_METRICS_NAME).read_text(encoding="utf-8"))
+    doc["workload"]["open_loop"]["n_scheduled"] = N_ROWS + 1
+    (wdir / vr._WINDOW_METRICS_NAME).write_text(json.dumps(doc), encoding="utf-8")
+    _seal(run_dir2)
+    report2 = vr.verify_run(run_dir2)
+    (finding,) = _findings(report2, "FAIL", "row-count")
+    assert "n_scheduled" in finding["detail"] and f"offered {N_ROWS + 1}" in finding["detail"]
+
+
+def test_absent_window_metrics_is_a_warn_and_an_incomplete_one_fails(tmp_path: Path) -> None:
+    run_dir = _mk_green(tmp_path, metrics=False)
+    report = vr.verify_run(run_dir)
+    assert report["ok"] is True  # a WARN never flips the gate
+    warns = _findings(report, "WARN", "row-count")
+    assert len(warns) == len(BASELINES) * N_WINDOWS
+    assert all("unknown" in f["detail"] for f in warns)
+    # A summary without the consort block or the offered population refuses:
+    # a present summary is the producer's own record, a gap in it is a defect.
+    run_dir2 = _build_tree(tmp_path / "two")
+    wdir = _first_window(run_dir2)
+    (wdir / vr._WINDOW_METRICS_NAME).write_text(json.dumps({"experiment": {}}), encoding="utf-8")
+    _seal(run_dir2)
+    report2 = vr.verify_run(run_dir2)
+    details = "\n".join(f["detail"] for f in _findings(report2, "FAIL", "row-count"))
+    assert "consort" in details and "offered population unknown" in details

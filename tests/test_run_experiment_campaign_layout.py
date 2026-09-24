@@ -1893,11 +1893,15 @@ class _RaisingEngine(StubEngine):
         raise RuntimeError("engine exploded on send")
 
 
-def test_campaign_multi_turn_window_with_no_completion_refuses_naming_the_cause(
+def test_campaign_multi_turn_raising_send_fails_the_cell_through_the_turn_guard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # multi_turn: the per-turn guard swallows a raising send, so t_start is
-    # stamped and t_end never is; the refusal names THAT cause.
+    # multi_turn: one guard covers prepare, send and record. Before ADR-0116
+    # it swallowed a raising send (t_start stamped, t_end never) and the
+    # window refused at the end of the stage for "sent but none completed".
+    # Since ADR-0116 (W3, option a) the guard fails the campaign cell at the
+    # FIRST dropped turn, before more GPU time is spent; the end-of-stage
+    # refusal stays as a defensive check.
     root = tmp_path / "results" / "camp1" / "a" / RUN_ID
     with pytest.raises(SystemExit) as exc:
         _run_cell(
@@ -1907,7 +1911,8 @@ def test_campaign_multi_turn_window_with_no_completion_refuses_naming_the_cause(
         )
     assert exc.value.code == 1
     out = capsys.readouterr().out
-    assert "sent measured requests but none completed" in out and "ADR-0055" in out
+    assert "turn stage failed for squad_v2-q000" in out
+    assert "engine exploded on send" in out and "ADR-0116" in out
     assert not _window_dirs(root, "no_cache", "squad_v2")
 
 
@@ -1933,3 +1938,289 @@ def test_campaign_mode_refuses_the_open_loop_warmup_trim(
     assert "open-loop-warmup-s" in out and "ADR-0055" in out
     assert _RecordingEngine.calls == []
     assert not _window_dirs(root, "no_cache", "squad_v2")
+
+
+# ---------------------------------------------------------------------------
+# Batch 2 finding W3 (ADR-0116, owner decision 2026-09-24, option a): a
+# per-query guard failure on the campaign path FAILS THE CELL. The pilot
+# guards keep counting the drop and skipping the row. A campaign window's
+# denominator is the offered schedule, so a skipped row is a changed
+# population that neither reconciliation can see (the row is absent from
+# requests.jsonl and qa_evidence.jsonl alike). Belt and braces: the emit seam
+# refuses a window whose consort counters are nonzero, and verify_results
+# compares every window's row count against its offered population.
+# ---------------------------------------------------------------------------
+
+import csv  # noqa: E402
+
+from src.orchestration import campaign_session as cs  # noqa: E402
+
+VICTIM_ID = "squad_v2-q002"
+OPEN_LOOP_ARGV = (
+    "--workload-mode", "open_loop", "--rate", "50", "--arrival-count", str(N_QUERIES),
+)
+
+
+def _honesty_columns_raising_for(victim: str) -> Any:
+    """adapter_honesty_columns that raises INSIDE record_result for one id:
+    after the evaluator and before the results append (a W3 raise site)."""
+    real = runner.adapter_honesty_columns
+
+    def _columns(response: Any) -> dict[str, Any]:
+        if str(getattr(response, "request_id", "")) == victim:
+            raise RuntimeError("provenance column exploded")
+        return real(response)
+
+    return _columns
+
+
+class _AsyncCampaignEngine(StubEngine):
+    """StubEngine with the async streaming seam the open-loop dispatcher needs."""
+
+    async def async_stream_generate(
+        self, request: Any, *, on_first_token: Any = None
+    ) -> InferenceResponse:
+        if on_first_token is not None:
+            on_first_token()
+        await asyncio.sleep(0.001)
+        return self._respond(request)
+
+
+def _async_engine(model: str) -> _AsyncCampaignEngine:
+    return _AsyncCampaignEngine(model, "no_cache", 200.0)
+
+
+class _SharedContextLoader(_FakeLoader):
+    """Every example shares ONE context, so batched mode groups all of them
+    into one unit and chunks it by --batch-size (the batch_generate path)."""
+
+    def load(self, max_examples: Optional[int] = None) -> list:
+        examples = super().load(max_examples)
+        for ex in examples:
+            ex.context = [f"The shared fact of {self.dataset} is answer-0."]
+        return examples
+
+
+@pytest.mark.parametrize(
+    "extra_argv, engine_factory, loader_factory, stage",
+    [
+        ((), None, None, "record"),
+        (("--workload-mode", "batched"), None, _SharedContextLoader, "record"),
+        (("--workload-mode", "multi_turn"), None, None, "turn"),
+        (OPEN_LOOP_ARGV, _async_engine, None, "record"),
+    ],
+    ids=["single", "batched", "multi-turn", "open-loop"],
+)
+def test_campaign_record_stage_failure_fails_the_cell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    extra_argv: tuple[str, ...], engine_factory: Any, loader_factory: Any, stage: str,
+) -> None:
+    monkeypatch.setattr(
+        runner, "adapter_honesty_columns", _honesty_columns_raising_for(VICTIM_ID)
+    )
+    root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    with pytest.raises(SystemExit) as exc:
+        _run_cell(
+            monkeypatch, root, "no_cache", "squad_v2", ttft_base=200.0, num_trials=1,
+            extra_argv=extra_argv, engine_factory=engine_factory,
+            loader_factory=loader_factory,
+        )
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert f"{stage} stage failed for {VICTIM_ID}" in out
+    assert "provenance column exploded" in out and "ADR-0116" in out
+    assert "skipping row" not in out and "skipping this turn" not in out
+    assert not _window_dirs(root, "no_cache", "squad_v2")
+
+
+def _run_pilot_cell(monkeypatch: pytest.MonkeyPatch, out_dir: Path) -> None:
+    """Drive the REAL runner main() on the PILOT path (no campaign root) with
+    the same stub seams: the pilot guards must stay unchanged."""
+    _campaign_env(monkeypatch, out_dir)
+    monkeypatch.delenv("CAGE_CAMPAIGN_ROOT")
+    monkeypatch.setattr(
+        runner,
+        "setup_inference_engine",
+        lambda model, cfg, *, backend, use_offline=False, strict=True: StubEngine(
+            model, "no_cache", 200.0
+        ),
+    )
+    monkeypatch.setattr(runner, "get_loader", lambda ds, split=None, seed=0: _FakeLoader(ds))
+    monkeypatch.setattr(runner, "start_http_server", lambda *a, **k: None)
+    monkeypatch.setattr(runner, "_safe_get_json", lambda url, timeout=5: None)
+    monkeypatch.setattr(sys, "argv", [
+        "run_experiment.py",
+        "--baseline", "no_cache", "--model", "Qwen/Qwen3-14B", "--dataset", "squad_v2",
+        "--num-queries", str(N_QUERIES), "--seed", "7", "--max-tokens", "16",
+        "--api-base", "http://127.0.0.1:9", "--reranker-model", "none",
+        "--output-dir", str(out_dir),
+    ])
+    assert runner.main() is None
+
+
+def test_pilot_record_stage_failure_still_counts_and_skips_the_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        runner, "adapter_honesty_columns", _honesty_columns_raising_for(VICTIM_ID)
+    )
+    out_dir = tmp_path / "pilot"
+    _run_pilot_cell(monkeypatch, out_dir)
+    out = capsys.readouterr().out
+    assert f"record failed for {VICTIM_ID}" in out and "skipping row" in out
+    assert "ADR-0116" not in out
+    meta = json.loads((out_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert meta["consort"]["n_dropped_record"] == 1
+    with (out_dir / "results.csv").open(encoding="utf-8", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    assert len(rows) == N_QUERIES - 1
+    assert VICTIM_ID not in {r["example_id"] for r in rows}
+
+
+def test_campaign_windows_carry_zero_consort_counters_the_gates_enforce(
+    campaign_tree: Path,
+) -> None:
+    # The runner's consort block names every counter the emit seam and the
+    # offline gate enforce; a clean tree reads zero on all of them, and the
+    # offline gate's offered population equals the emitted rows.
+    assert set(cs.CONSORT_COUNTERS) == set(vr._CONSORT_COUNTERS)
+    for baseline, _ in ARMS:
+        for dataset in DATASETS:
+            for wdir in _window_dirs(campaign_tree, baseline, dataset):
+                meta = json.loads((wdir / "metrics.json").read_text(encoding="utf-8"))
+                assert set(cs.CONSORT_COUNTERS) <= set(meta["consort"])
+                assert all(meta["consort"][k] == 0 for k in cs.CONSORT_COUNTERS)
+                expected, source = vr.expected_row_count(meta)
+                assert expected == N_QUERIES == len(_read_jsonl(wdir / "requests.jsonl"))
+                assert source == "experiment.num_measured_requests"
+
+
+def test_campaign_open_loop_window_offers_one_row_per_scheduled_arrival(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    _run_cell(
+        monkeypatch, root, "no_cache", "squad_v2", ttft_base=200.0, num_trials=1,
+        engine_factory=_async_engine, extra_argv=OPEN_LOOP_ARGV,
+    )
+    (wdir,) = _window_dirs(root, "no_cache", "squad_v2")
+    meta = json.loads((wdir / "metrics.json").read_text(encoding="utf-8"))
+    rows = _read_jsonl(wdir / "requests.jsonl")
+    expected, source = vr.expected_row_count(meta)
+    assert source == "workload.open_loop.n_scheduled"
+    assert expected == meta["workload"]["open_loop"]["n_scheduled"] == len(rows) == N_QUERIES
+    # Unsealed, so the ledger check fails; the row-count check must not.
+    report = vr.verify_run(root)
+    assert not [f for f in report["findings"] if f["check"] == "row-count"]
+
+
+class _ShortBatchEngine(StubEngine):
+    """batch_generate answers one request fewer than it was sent."""
+
+    def batch_generate(self, requests: list) -> list:
+        return [self._respond(r) for r in requests[:-1]]
+
+
+def test_campaign_short_batch_response_fails_the_cell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Review F4: the zip over (kept, metas, responses) would drop the
+    # unanswered tail of a unit without a counter; campaign mode fails the
+    # cell naming the unit's first example and the two counts.
+    root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    with pytest.raises(SystemExit) as exc:
+        _run_cell(
+            monkeypatch, root, "no_cache", "squad_v2", ttft_base=200.0, num_trials=1,
+            engine_factory=lambda model: _ShortBatchEngine(model, "no_cache", 200.0),
+            loader_factory=_SharedContextLoader,
+            extra_argv=("--workload-mode", "batched"),
+        )
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "send stage failed for squad_v2-q000" in out
+    assert "4 request(s) sent, 3 response(s) returned" in out and "ADR-0116" in out
+    assert not _window_dirs(root, "no_cache", "squad_v2")
+
+
+def test_campaign_prepare_drop_refuses_the_window_at_emit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A prepare-stage drop still skips in stage (outside W3: n_dropped_prepare
+    # counts); the emit seam refuses the window through that counter, so a
+    # shrunken population never seals.
+    real_messages, real_prompt = runner.format_qa_messages, runner.format_qa_prompt
+
+    def _messages(question: str, contexts: Any) -> Any:
+        if "fact 2 of" in question:
+            raise RuntimeError("no prompt for this example")
+        return real_messages(question, contexts)
+
+    def _prompt(question: str, contexts: Any) -> Any:
+        if "fact 2 of" in question:
+            raise RuntimeError("no prompt for this example")
+        return real_prompt(question, contexts)
+
+    monkeypatch.setattr(runner, "format_qa_messages", _messages)
+    monkeypatch.setattr(runner, "format_qa_prompt", _prompt)
+    root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    with pytest.raises(SystemExit) as exc:
+        _run_cell(monkeypatch, root, "no_cache", "squad_v2", ttft_base=200.0, num_trials=1)
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert f"prepare failed for {VICTIM_ID}" in out
+    assert "n_dropped_prepare = 1" in out and "ADR-0116" in out
+    assert not _window_dirs(root, "no_cache", "squad_v2")
+
+
+def test_campaign_lost_evidence_append_refuses_the_window_at_emit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # append_evidence_row never raises; it counts the loss. The emit seam
+    # refuses through evidence_write_failures BEFORE the count reconciliation
+    # (which a lost append on an error row would not even see).
+    real = runner.append_evidence_row
+
+    def _append(path: str, row: dict[str, Any], failures: dict[str, Any]) -> bool:
+        if row.get("example_id") == VICTIM_ID:
+            runner.count_evidence_failure(failures, OSError("disk full"))
+            return False
+        return real(path, row, failures)
+
+    monkeypatch.setattr(runner, "append_evidence_row", _append)
+    root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    with pytest.raises(SystemExit) as exc:
+        _run_cell(monkeypatch, root, "no_cache", "squad_v2", ttft_base=200.0, num_trials=1)
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "evidence_write_failures = 1" in out and "ADR-0116" in out
+    assert not _window_dirs(root, "no_cache", "squad_v2")
+
+
+class _WarmupRaisingEngine(StubEngine):
+    """Every warm-up pool send raises; measured sends answer."""
+
+    def generate(self, request: Any, stream: bool = False) -> InferenceResponse:
+        if "__warmup_pool" in str(request.request_id or ""):
+            raise RuntimeError("warm-up send exploded")
+        return self._respond(request)
+
+
+def test_campaign_warmup_stage_failure_never_fails_the_cell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # collect_results is False on the warm-up stages: a failure there is not a
+    # population change (warm-up rows are never in the window), so the guard
+    # keeps its print-and-continue behavior in campaign mode and every consort
+    # counter stays zero (multi_turn: the one guard that wraps the send).
+    root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    _run_cell(
+        monkeypatch, root, "no_cache", "squad_v2", ttft_base=200.0, num_trials=1,
+        engine_factory=lambda model: _WarmupRaisingEngine(model, "no_cache", 200.0),
+        loader_factory=_PoolLoader,
+        extra_argv=("--workload-mode", "multi_turn", "--warmup-pool-queries", "2"),
+    )
+    (wdir,) = _window_dirs(root, "no_cache", "squad_v2")
+    meta = json.loads((wdir / "metrics.json").read_text(encoding="utf-8"))
+    assert all(meta["consort"][k] == 0 for k in cs.CONSORT_COUNTERS)
+    assert meta["warmup_pool"]["num_requests"] == 2
+    assert len(_read_jsonl(wdir / "requests.jsonl")) == N_QUERIES

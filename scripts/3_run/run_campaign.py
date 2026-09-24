@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """
-Order:     stage 3 — THE campaign sweep driver (tranche P1, audit gap G1); 'plan' runs locally before any provisioning, 'run' executes on the pod after 2_serving; ends by invoking seal_campaign_run.py
+Order:     stage 3: THE campaign sweep driver (tranche P1, audit gap G1); 'plan' runs once the per-engine cal-v1 floor artifacts exist (calibrate_cell.py, before any cell), 'run' executes on the pod after 2_serving; ends by invoking seal_campaign_run.py
 Objective: Enumerate ONE session's registered D6 grid into a reviewable execution-plan JSON ('plan', pure), then execute the plan cell-by-cell with engine-relaunch boundaries, per-window resume and fail-continue ('run')
 Cloud:     both
 
 The single command that runs a campaign session (charter §6.1/§6.8/§7.6.1).
 
 PLAN / EXECUTE split (the design's load-bearing decision): ``plan`` is PURE —
-it reads the P6 floor table, enumerates the session's REGISTERED grid into an
-ordered list of steps, and writes nothing except ``--out``. No subprocess, no
-GPU, no network. That purity is what makes the driver testable offline and
-the plan JSON the artifact an operator reviews BEFORE any GPU spends a cent.
+it reads the P6 floor table and the per-engine cal-v1 floor artifacts,
+enumerates the session's REGISTERED grid into an ordered list of steps, and
+writes nothing except ``--out``. No subprocess, no GPU, no network. That
+purity is what makes the driver testable offline and the plan JSON the
+artifact an operator reviews BEFORE any campaign cell spends a cent (the
+calibration artifacts need a live engine, so ``plan`` runs after
+calibrate_cell.py on the pod, or locally on the pulled artifacts).
 ``run`` consumes a plan and shells the real scripts:
 
     python3 scripts/3_run/run_campaign.py plan --session a \\
         --floor-table results/preflight/floor_table_a.json \\
+        --calibration vllm=results/calibration/vllm.json \\
+        --calibration sglang=results/calibration/sglang.json \\
         --window-duration-s 300 --out plan_a.json
     python3 scripts/3_run/run_campaign.py run --plan plan_a.json \\
         --campaign-root results/<campaign>/a/<run_id> [--seal]
@@ -112,6 +117,28 @@ until their registrations land):
   summed. Threaded to the runner as CAGE_GPU_COUNT and persisted into
   cell.json by the campaign writer; underivable counts appear ONLY on
   blocked cells (an executable cell without one refuses at plan time).
+- slo_floors and budget_plan producers (Batch 2 finding W4, owner decision
+  2026-09-24, options 1A + 2A; ADR-0117): ``plan --calibration ENGINE=PATH``
+  registers ONE cal-v1 floor artifact (calibrate_cell.py) per executable
+  server engine, validated (procedure version, model, engine, the r = 1.5
+  floor rung unless ``--calibration-budget-fraction`` registers another,
+  30 median single-stream requests, confirmatory: false), recorded with its
+  sha256 in the header ``calibration`` and pinned on EVERY cell step (hf
+  oracle and blocked cells included) as the env CAGE_SLO_FLOORS_JSON; the
+  campaign session writes the pin into manifest.json["slo_floors"] when it
+  creates the manifest (the first emitting cell, the hf oracle on both
+  registered sessions; amended never, compared on reopen). Every BUDGETED
+  executable server cell (F2/F3 pressure coordinates, the DIST legs at
+  dist_budget_r) additionally pins the cache_budget.BudgetPlan record of
+  the relaunch it runs under (the same object the launcher env was derived
+  from, carried on the relaunch step as ``budget_plan``) as the env
+  CAGE_BUDGET_PLAN_JSON; the session threads it to CellWriter, which
+  persists it under cell.json["budget_plan"] (the rho_own basis). F1, hf
+  and blocked cells carry null and no env (absence stays absence).
+  ``load_plan`` refuses a plan without the header, a cell whose floors pin
+  differs from the header, a budgeted cell whose record differs from its
+  relaunch's, or a budget-free cell carrying one; ``run`` refuses while
+  either env is exported in the shell.
 - BLOCKED cells are ENUMERATED (never silently dropped) but carry a non-null
   ``blocked_on``: DIST tp-overlay cells until their registration lands, PD
   cells on any engine without a PD launcher (today: everything but vllm),
@@ -214,7 +241,7 @@ import os
 import shlex
 import subprocess
 import sys
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
@@ -237,9 +264,16 @@ from src.orchestration.campaign_layout import (  # noqa: E402
 )
 from src.orchestration.cache_budget import (  # noqa: E402
     MODEL_KV,
+    BudgetPlan,
     CacheBudgetError,
     plan_budget,
 )
+from src.orchestration.calibration import (  # noqa: E402
+    FLOOR_N_REQUESTS,
+    FLOOR_STATISTIC,
+    PROCEDURE_VERSION,
+)
+from src.orchestration.campaign_session import ENGINE_OF_BACKEND  # noqa: E402
 from src.orchestration.load_generator import (  # noqa: E402
     D6_RATE_FRACTIONS,
     D6_REDUCED_RATE_FRACTIONS,
@@ -255,16 +289,21 @@ __all__ = [
     "SessionGrid",
     "SESSION_GRIDS",
     "PlannedCell",
+    "CalibrationFloor",
     "build_plan",
+    "budget_plan_record",
     "cell_num_queries",
     "class_n",
     "classify_row",
     "engine_api_base",
     "enumerate_cells",
+    "load_calibration",
     "load_floor_table",
     "load_plan",
     "main",
+    "parse_calibration_args",
     "row_class",
+    "slo_floors_env_value",
 ]
 
 # v2 (2026-09-01): pd steps added required keys gate/topology/pd — a v1 plan
@@ -322,6 +361,15 @@ __all__ = [
 # plan built before W2 is refused per cell and per relaunch (its SGLang cells
 # would ride the runner's --api-base default, the vLLM port), so the operator
 # re-plans.
+# W4 (2026-09-24, Batch 2 finding W4, owner picked options 1A + 2A; ADR-0117):
+# the header gained ``calibration`` (the per-engine cal-v1 floors + sha256),
+# every cell env the pin CAGE_SLO_FLOORS_JSON, cell AND relaunch steps the
+# REQUIRED key ``budget_plan`` (the cache_budget.BudgetPlan record; null on
+# budget-free steps) and budgeted cell envs the pin CAGE_BUDGET_PLAN_JSON. No
+# schema bump: a v5 plan built before W4 is refused by the header check, the
+# required-key check and _stale_plan_problems (its manifest would carry no
+# slo_floors and its cell.json no budget_plan, so contrast #14 would refuse
+# and rho_own would skip on the whole tree), so the operator re-plans.
 PLAN_SCHEMA = "cage-campaign-plan-v5"
 FLOOR_TABLE_SCHEMA = "floor-table-v1"
 
@@ -454,6 +502,36 @@ SERVER_ENGINES: Tuple[str, ...] = ("vllm", "sglang", "lmdeploy")
 SKIP_QUALITY_ENV: str = "CAGE_SKIP_QUALITY"
 SKIP_QUALITY_VALUE: str = "1"
 DECOUPLED_SCORING_ADR: str = "ADR-0055"
+
+#: Batch 2 finding W4 (2026-09-24; owner picked options 1A + 2A of the Spec
+#: Block; ADR-0117): the two producer pins. Before W4 nothing produced
+#: manifest.json["slo_floors"] (contrast #14 refused on every tree) or
+#: cell.json["budget_plan"] (the rho_own leg skipped on every window); the
+#: floors existed only in the standalone cal-v1 artifact calibrate_cell.py
+#: writes and the budget plan was computed per relaunch and dropped.
+#: - SLO_FLOORS_ENV: the §6.1 single-stream floors of every registered engine
+#:   as compact JSON ({engine: {ttft_s, tpot_s, n_requests, statistic,
+#:   budget_fraction, source_sha256}}, seconds), pinned on EVERY cell step
+#:   because the manifest is created by whichever cell emits first and is
+#:   amended never; campaign_session writes it into the manifest under
+#:   SLO_FLOORS_MANIFEST_KEY and compares on reopen.
+#: - BUDGET_PLAN_ENV: the relaunch's cache_budget.BudgetPlan record (asdict,
+#:   plus the floor table's sha256) on BUDGETED cells only; campaign_session
+#:   threads it to CellWriter, which persists it under BUDGET_PLAN_CELL_KEY.
+#: BEHAVIOR/provenance, never identity: derive_cell_spec ignores both. The
+#: literals are mirrored in campaign_session (pinned equal by tests).
+SLO_FLOORS_ENV: str = "CAGE_SLO_FLOORS_JSON"
+BUDGET_PLAN_ENV: str = "CAGE_BUDGET_PLAN_JSON"
+CELL_PIN_ENVS: Tuple[str, ...] = (SLO_FLOORS_ENV, BUDGET_PLAN_ENV)
+SLO_FLOORS_MANIFEST_KEY: str = "slo_floors"
+BUDGET_PLAN_CELL_KEY: str = "budget_plan"
+#: Charter §6.1: the floor is measured at the comfortable control rung
+#: r = 1.5, concurrency 1 (goodput.SLOBaseline docstring); an artifact at
+#: another rung refuses unless the operator registers that rung explicitly
+#: with --calibration-budget-fraction (recorded in the header).
+FLOOR_BUDGET_FRACTION: float = 1.5
+SLO_FLOORS_FINDING: str = "Batch 2 W4"
+SLO_FLOORS_ADR: str = "ADR-0117"
 
 #: Backlog A9 / DECISION.md amendment A1 (MyDocs/registration/
 #: power_decision_2026-08-07/DECISION.md): the registered per-row N. These
@@ -1565,6 +1643,187 @@ def load_floor_table(path: Path) -> FloorTable:
 
 
 # ---------------------------------------------------------------------------
+# Calibration artifacts (cal-v1, calibrate_cell.py): the §6.1 floors source
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CalibrationFloor:
+    """Validated cal-v1 artifact (calibrate_cell.py --output): ONE model x
+    engine's §6.1 single-stream floor pair plus the provenance the plan
+    header records. ``engine`` is the §7.3 axis value (the adapter id the
+    artifact carries, normalized); ``model`` is as the artifact spells it."""
+
+    path: Path
+    sha256: str
+    engine: str
+    model: str
+    budget_fraction: float
+    ttft_s: float
+    tpot_s: float
+    n_requests: int
+    statistic: str
+    procedure_version: str
+    lambda_star_label: Optional[str]
+
+
+def load_calibration(
+    path: Path, budget_fraction: float = FLOOR_BUDGET_FRACTION
+) -> CalibrationFloor:
+    """Load + validate ONE cal-v1 calibration artifact (fail closed).
+
+    The artifact is ``CellCalibration.to_manifest`` as calibrate_cell.py
+    writes it: the registered procedure version, the served model, the
+    ADAPTER engine id (``lmdeploy-turbomind`` for LMDeploy; normalized here
+    through campaign_session.ENGINE_OF_BACKEND to the axis value the analysis
+    keys floors by), the budget ratio the floor was measured at,
+    ``confirmatory: false`` and the floor pair in SECONDS over
+    FLOOR_N_REQUESTS FLOOR_STATISTIC requests. A floor over fewer requests,
+    another statistic, another procedure version, a non-positive or
+    non-finite value, an unknown engine or the oracle refuses: a plan never
+    pins a floor the registered procedure did not produce. ``budget_fraction``
+    is the rung the plan registers, named in the not-found fix only (the
+    value itself is checked by the registration, review F7).
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise PlanError(
+            f"calibration artifact not found: {path} (run "
+            f"scripts/3_run/calibrate_cell.py --budget-fraction "
+            f"{budget_fraction:g} --output <path> per engine; "
+            f"{SLO_FLOORS_FINDING})"
+        )
+    raw = path.read_bytes()
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise PlanError(f"calibration artifact {path} is not valid JSON: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise PlanError(f"calibration artifact {path} is not a JSON object")
+    problems: List[str] = []
+    version = doc.get("procedure_version")
+    if version != PROCEDURE_VERSION:
+        problems.append(
+            f"procedure_version is {version!r}, the registered procedure is "
+            f"{PROCEDURE_VERSION!r} (src/orchestration/calibration.py)"
+        )
+    if doc.get("confirmatory") is not False:
+        problems.append(
+            f"confirmatory is {doc.get('confirmatory')!r}, must be the literal "
+            "false (calibration data never enters confirmatory analysis)"
+        )
+    raw_engine = doc.get("engine")
+    engine = ENGINE_OF_BACKEND.get(raw_engine) if isinstance(raw_engine, str) else None
+    if engine is None:
+        problems.append(
+            f"engine {raw_engine!r} is not a runner backend / adapter id "
+            f"({sorted(ENGINE_OF_BACKEND)})"
+        )
+    elif engine == "hf":
+        problems.append(
+            f"engine {raw_engine!r} is the in-process oracle, which serves no "
+            "floor (§7.3: hf is excluded from pressure)"
+        )
+    model = doc.get("model")
+    if not isinstance(model, str) or not model.strip():
+        problems.append(f"model {model!r} must be a non-empty string")
+    fraction = doc.get("budget_fraction")
+    if (
+        isinstance(fraction, bool)
+        or not isinstance(fraction, (int, float))
+        or not math.isfinite(fraction)
+        or fraction <= 0
+    ):
+        problems.append(f"budget_fraction {fraction!r} must be finite and > 0")
+    floor = doc.get("floor")
+    ttft_s = tpot_s = n_requests = statistic = None
+    if not isinstance(floor, dict):
+        problems.append("floor block missing or not an object")
+    else:
+        for key in ("ttft_s", "tpot_s"):
+            value = floor.get(key)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                problems.append(
+                    f"floor.{key} is {value!r}, must be a finite number > 0 (seconds)"
+                )
+        ttft_s, tpot_s = floor.get("ttft_s"), floor.get("tpot_s")
+        n_requests = floor.get("n_requests")
+        if (
+            isinstance(n_requests, bool)
+            or not isinstance(n_requests, int)
+            or n_requests < FLOOR_N_REQUESTS
+        ):
+            problems.append(
+                f"floor.n_requests is {n_requests!r}, the registered floor is "
+                f">= {FLOOR_N_REQUESTS} sequential single-stream requests"
+            )
+        statistic = floor.get("statistic")
+        if statistic != FLOOR_STATISTIC:
+            problems.append(
+                f"floor.statistic is {statistic!r}, the registered statistic is "
+                f"{FLOOR_STATISTIC!r}"
+            )
+    lambda_star = doc.get("lambda_star")
+    label = lambda_star.get("label") if isinstance(lambda_star, dict) else None
+    if problems:
+        raise PlanError(f"calibration artifact {path}: " + "; ".join(problems))
+    assert engine is not None and isinstance(model, str)
+    return CalibrationFloor(
+        path=path,
+        sha256=hashlib.sha256(raw).hexdigest(),
+        engine=engine,
+        model=model,
+        budget_fraction=float(fraction),  # type: ignore[arg-type]
+        ttft_s=float(ttft_s),  # type: ignore[arg-type]
+        tpot_s=float(tpot_s),  # type: ignore[arg-type]
+        n_requests=int(n_requests),  # type: ignore[arg-type]
+        statistic=str(statistic),
+        procedure_version=str(version),
+        lambda_star_label=label if isinstance(label, str) else None,
+    )
+
+
+def slo_floors_env_value(floors: Mapping[str, Any]) -> str:
+    """The ONE spelling of the floors pin: compact JSON, sorted keys, so the
+    plan builder, load_plan and the session compare byte-identical strings."""
+    return json.dumps(floors, sort_keys=True, separators=(",", ":"))
+
+
+def budget_plan_record(
+    plan: BudgetPlan,
+    floor: FloorTable,
+    pd_roles: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """The cell.json ``budget_plan`` record: the full BudgetPlan (asdict) plus
+    the floor table's sha256 (the demand source) and, on the pd stack, the
+    relaunch's role record (``pd_roles``: the §6.5 pools, the per-rank
+    slices the launcher was given and the expected realized total, review
+    F6; the BudgetPlan itself is per POOL, tp=1), JSON-normalized ONCE so the
+    relaunch step, the cell step and the env pin are the same object. The
+    consumer reads ``budget_bytes_total`` and ``kv_dtype``; the launched
+    knobs are ``engine_args`` (single/tp) or ``pd_roles`` (pd)."""
+    record = asdict(plan)
+    record["floor_table_sha256"] = floor.sha256
+    if pd_roles is not None:
+        record["pd_roles"] = dict(pd_roles)
+    return json.loads(json.dumps(record))
+
+
+def _json_norm(value: Any) -> Any:
+    return json.loads(json.dumps(value, sort_keys=True))
+
+
+#: _stale_plan_problems sentinel: "the caller did not pass the header floors"
+#: (None means "the plan registers no floor, pins must be absent").
+_UNCHECKED: Any = object()
+
+
+# ---------------------------------------------------------------------------
 # Enumeration (registration -> cells) + ordering
 # ---------------------------------------------------------------------------
 
@@ -2048,7 +2307,9 @@ def _budget_env(
     HALF the byte budget (§6.5 violation). ``tp`` > 1 plans the TP-sharded
     launch (plan_budget topology='tp': GQA shards → the primary knob carries
     the PER-RANK slice; MLA replicates, #20) — the TOTAL byte budget is
-    still floor(r × D). Returns (env, budget_bytes_total).
+    still floor(r × D). Returns (env, plan): the BudgetPlan the env was
+    derived from rides the relaunch step and every budgeted cell under it
+    (Batch 2 W4, cell.json["budget_plan"]).
     """
     row = floor.row(r)
     if served_kv_dtype is None and floor.kv_dtype != "bf16":
@@ -2091,12 +2352,12 @@ def _budget_env(
         raise PlanError(
             f"budget planner emitted no primary knob for engine={engine} r={r:g}"
         )
-    return env, plan.budget_bytes_total
+    return env, plan
 
 
 def _pd_budget_env(
     grid: SessionGrid, engine: str, model: str, floor: FloorTable, role_tp: int
-) -> Tuple[Dict[str, str], Dict[str, Any]]:
+) -> Tuple[Dict[str, str], Dict[str, Any], BudgetPlan]:
     """PD launcher env: the §6.5 split of floor(dist_budget_r × D) into the
     two REQUIRED per-role byte budgets, plus the role-tagged telemetry
     endpoints. ``role_tp`` is the TP degree BOTH role instances launch with
@@ -2106,7 +2367,7 @@ def _pd_budget_env(
     tp leg's _budget_env emits; live per-rank-vs-whole-pool semantics stays
     the plan's verify_live entry, closed by gate (j) at S0) — so a TP-sharded
     role's env carries the per-rank SLICE of its §6.5 pool, never the pool
-    total. Returns (env, pd-record-for-the-plan)."""
+    total. Returns (env, pd-record-for-the-plan, the BudgetPlan)."""
     if floor.kv_dtype != "bf16":
         # Same guard as _budget_env: DIST pd cells launch PLAIN (no fp8
         # lever), so a non-bf16 floor table would mis-denominate the pools.
@@ -2175,7 +2436,7 @@ def _pd_budget_env(
             if sharded
             else prefill_env + decode_env  # MLA: one latent copy is counted
         )
-    return env, record
+    return env, record, plan
 
 
 def _relaunch_step(
@@ -2205,7 +2466,7 @@ def _relaunch_step(
         # degree also shapes the budget env (per-rank slices — see
         # _pd_budget_env), so it is derived BEFORE the env is built.
         role_tp = grid.dist_pd_role_gpus[0]
-        env, pd_record = _pd_budget_env(grid, engine, model, floor, role_tp)
+        env, pd_record, plan = _pd_budget_env(grid, engine, model, floor, role_tp)
         if role_tp >= 2:
             env["CAGE_VLLM_TENSOR_PARALLEL"] = str(role_tp)
         # Backlog A10: the uniform request-length cap, applied by the pd
@@ -2234,6 +2495,10 @@ def _relaunch_step(
             "tp": role_tp,  # per ROLE instance (both roles, launcher contract)
             "pd": pd_record,
             "api_base": engine_api_base(engine, topology),  # W2: the proxy
+            # Batch 2 W4: the BudgetPlan the role budgets were split from
+            # (per POOL, tp=1) plus the pd role record (the per-rank slices
+            # the launcher was actually given, review F6).
+            "budget_plan": budget_plan_record(plan, floor, pd_roles=pd_record),
             "argv": argv,
             "env": env,
         }
@@ -2248,6 +2513,7 @@ def _relaunch_step(
         argv.append("--no-prefix-cache")
     env: Dict[str, str] = {}
     budget_bytes: Optional[int] = None
+    budget_plan: Optional[Dict[str, Any]] = None
     if topology == "tp":
         # W4.6: the DIST tp leg rides the SINGLE-INSTANCE launcher at the
         # registered dist_tp_size, serving floor(dist_budget_r × D) total
@@ -2262,17 +2528,21 @@ def _relaunch_step(
                 "— enumeration should have BLOCKED these cells (driver "
                 "invariant violated)"
             )
-        env, budget_bytes = _budget_env(
+        env, plan = _budget_env(
             engine, model, grid.dist_budget_r, floor,
             served_kv_dtype=kv_dtype, tp=tp_size,
         )
+        budget_bytes = plan.budget_bytes_total
+        budget_plan = budget_plan_record(plan, floor)
         launched_tp = tp_size
     else:
         if budget_r is not None:
-            env, budget_bytes = _budget_env(
+            env, plan = _budget_env(
                 engine, model, budget_r, floor,
                 served_kv_dtype=kv_dtype, tp=grid.serving_tp,
             )
+            budget_bytes = plan.budget_bytes_total
+            budget_plan = budget_plan_record(plan, floor)
         launched_tp = grid.serving_tp
     # T3.1 TP env (single-instance launchers): emitted for degrees >= 2 only
     # — degree 1 means the launcher omits the flag, so single-GPU relaunch
@@ -2334,6 +2604,9 @@ def _relaunch_step(
         "tp": launched_tp,  # the T3.1 degree this serving stack launches with
         "pd": None,  # single/tp relaunch: no §6.5 role split
         "api_base": api_base,  # W2: what the cells under this relaunch dial
+        # Batch 2 W4: the BudgetPlan the budget env was derived from (null on
+        # a budget-free relaunch); every budgeted cell under it pins it.
+        "budget_plan": budget_plan,
         "argv": argv,
         "env": env,
     }
@@ -2458,6 +2731,60 @@ def _argv_flag_value(argv: Sequence[str], flag: str) -> Optional[str]:
     return argv[i + 1] if i + 1 < len(argv) else None
 
 
+def _budget_plan_problems(
+    step: Mapping[str, Any], expected: Optional[Mapping[str, Any]], label: str
+) -> List[str]:
+    """Batch 2 W4 per-cell clause: ``expected`` is the budget record of the
+    relaunch the cell runs under (None for hf, blocked, or a budget-free
+    boundary). A budgeted cell carries EXACTLY that record and the env pin;
+    every other cell carries neither."""
+    row = step.get("row_key")
+    env: Mapping[str, Any] = step.get("env") or {}
+    record = step.get("budget_plan")
+    got_env = env.get(BUDGET_PLAN_ENV)
+    problems: List[str] = []
+    stale = ": stale plan, re-plan"
+    if expected is None:
+        if record is not None:
+            problems.append(
+                f"{label}: cell {row!r} carries a budget_plan record but runs "
+                "under no byte budget (hf, blocked, or a budget-free relaunch) "
+                f"({SLO_FLOORS_FINDING})" + stale
+            )
+        if got_env is not None:
+            problems.append(
+                f"{label}: cell {row!r} env {BUDGET_PLAN_ENV} is set but the cell "
+                f"runs under no byte budget ({SLO_FLOORS_FINDING})" + stale
+            )
+        return problems
+    want = _json_norm(expected)
+    if _json_norm(record) != want:
+        problems.append(
+            f"{label}: cell {row!r} budget_plan record differs from the record "
+            "of the relaunch it runs under (budget_bytes_total "
+            f"{want.get('budget_bytes_total')!r}) ({SLO_FLOORS_FINDING}: a cell "
+            "served under a budget it does not record is mislabeled data)"
+            + stale
+        )
+    if got_env is None:
+        problems.append(
+            f"{label}: cell {row!r} lacks env {BUDGET_PLAN_ENV} "
+            f"({SLO_FLOORS_FINDING}: the campaign session persists it into "
+            f"cell.json[{BUDGET_PLAN_CELL_KEY!r}], the rho_own basis)" + stale
+        )
+    else:
+        try:
+            parsed: Any = json.loads(got_env)
+        except (TypeError, json.JSONDecodeError):
+            parsed = None
+        if not isinstance(parsed, dict) or _json_norm(parsed) != want:
+            problems.append(
+                f"{label}: cell {row!r} env {BUDGET_PLAN_ENV} differs from the "
+                f"relaunch record ({SLO_FLOORS_FINDING})" + stale
+            )
+    return problems
+
+
 def _stale_plan_problems(
     step: Mapping[str, Any],
     spec: CellSpec,
@@ -2465,6 +2792,7 @@ def _stale_plan_problems(
     label: str,
     per_row_n: Optional[Mapping[str, Any]] = None,
     retrieval: Optional[Mapping[str, Any]] = None,
+    slo_floors_env: Any = _UNCHECKED,
 ) -> List[str]:
     """load_plan's fail-closed per-cell check against EVERY stale plan shape
     today's ADRs fail-close against (v4; one clause per ADR). A stale plan
@@ -2506,6 +2834,15 @@ def _stale_plan_problems(
       under another engine's boundary would be served by whatever survived
       an earlier boundary); an hf cell carries none, and a BLOCKED cell with
       no registered endpoint carries none.
+    - Batch 2 W4 (ADR-0117), given the plan header's ``calibration.floors``
+      (``slo_floors_env``): EVERY cell env carries SLO_FLOORS_ENV equal to
+      the header's canonical spelling (a pre-W4 plan, or a hand-edited
+      floor, would create a manifest whose SLO pair the analysis cannot
+      trust); an executable server cell carries the ``budget_plan`` record
+      of the relaunch it runs under plus BUDGET_PLAN_ENV when that relaunch
+      is budgeted, and neither when it is budget-free (a cell moved under
+      another budget boundary of the same engine passes the endpoint and
+      prefix clauses and is caught here); hf and blocked cells carry neither.
     """
     row = step.get("row_key")
     argv: Sequence[str] = step.get("argv") or []
@@ -2549,6 +2886,41 @@ def _stale_plan_problems(
             "scoring is a separate post-serving pass; inline model scoring "
             "inside the measured window never rides a campaign cell)" + stale
         )
+
+    if slo_floors_env is not _UNCHECKED:
+        got_floors = env.get(SLO_FLOORS_ENV)
+        if slo_floors_env is None:
+            if got_floors is not None:
+                problems.append(
+                    f"{label}: cell {row!r} env {SLO_FLOORS_ENV} is set but the "
+                    f"plan registers no floor (no executable server cell) "
+                    f"({SLO_FLOORS_FINDING})" + stale
+                )
+        elif got_floors != slo_floors_env:
+            problems.append(
+                f"{label}: cell {row!r} env {SLO_FLOORS_ENV} is "
+                + ("absent" if got_floors is None else "not the header's calibration.floors")
+                + f" ({SLO_FLOORS_FINDING}: the campaign session writes this pin "
+                f"into manifest.json[{SLO_FLOORS_MANIFEST_KEY!r}], the #14 SLO "
+                "source; the manifest is amended never)" + stale
+            )
+    # Review F3: the serving record is what every relaunch-agreement clause
+    # below keys on; a server cell without one escaped them all.
+    serving_record = step.get("serving")
+    if spec.engine == "hf":
+        if serving_record is not None:
+            problems.append(
+                f"{label}: hf cell {row!r} carries a serving record (the "
+                "in-process oracle has no relaunch boundary)" + stale
+            )
+    elif not isinstance(serving_record, dict):
+        problems.append(
+            f"{label}: server cell {row!r} has no serving record "
+            f"({serving_record!r}); the relaunch-agreement clauses (ADR-0103, "
+            f"{ENGINE_PORTS_FINDING}, {SLO_FLOORS_FINDING}) key on it" + stale
+        )
+    if spec.engine == "hf" or step.get("blocked_on") is not None:
+        problems.extend(_budget_plan_problems(step, None, label))
 
     got_n = _argv_flag_value(argv, "--num-queries")
     if got_n is None:
@@ -2656,6 +3028,12 @@ def _stale_plan_problems(
                         f"({ENGINE_PORTS_FINDING}: a cell served by a boundary it "
                         "does not dial is mislabeled data)" + stale
                     )
+                # Batch 2 W4: the budget record IS the relaunch's.
+                problems.extend(
+                    _budget_plan_problems(
+                        step, preceding_relaunch.get("budget_plan"), label
+                    )
+                )
 
     if spec.retriever == "rerank":
         pool = _argv_flag_value(argv, "--rerank-pool")
@@ -2759,6 +3137,9 @@ def _cell_step(
     window_duration_s: float,
     pins: RetrievalPins,
     query_manifest: Optional[str] = None,
+    *,
+    slo_floors_env: Optional[str],
+    budget_plan: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     spec = cell.spec
     argv = list(runner_cmd) + [
@@ -2873,6 +3254,17 @@ def _cell_step(
     # and _exec applies this env on top of the operator's shell, so the pin
     # wins over an exported inline switch. Behavior, never identity.
     env[SKIP_QUALITY_ENV] = SKIP_QUALITY_VALUE
+    # Batch 2 W4 (ADR-0117): the §6.1 floors ride EVERY cell (hf and blocked
+    # included: the manifest is created by whichever cell emits first and is
+    # amended never); the relaunch's BudgetPlan record rides BUDGETED cells
+    # only (absence stays absence for F1, hf and blocked cells). Provenance,
+    # never identity: derive_cell_spec ignores both.
+    if slo_floors_env is not None:
+        env[SLO_FLOORS_ENV] = slo_floors_env
+    if budget_plan is not None:
+        env[BUDGET_PLAN_ENV] = json.dumps(
+            budget_plan, sort_keys=True, separators=(",", ":")
+        )
     return {
         "kind": "cell",
         "family": spec.family,
@@ -2912,6 +3304,9 @@ def _cell_step(
         "offered_rate_rps": offered_rate,
         "lambda_star_pred_rps": lambda_star,
         "rate_basis": rate_basis,
+        # Batch 2 W4: the record of the relaunch this cell runs under (the
+        # same object; null on hf, blocked and budget-free cells).
+        "budget_plan": budget_plan,
         "argv": argv,
         "env": env,
         "blocked_on": cell.blocked_on,
@@ -3048,6 +3443,125 @@ def _check_manifest_coverage(
                 )
 
 
+def _session_engines(grid: SessionGrid) -> FrozenSet[str]:
+    """Every server engine a grid registers cells on (hf serves no floor)."""
+    engines = set(grid.f1_engines) | set(grid.f2_engines) | set(grid.f3_engines)
+    engines |= {engine for _bid, engine, _topology in grid.dist_cells}
+    return frozenset(engines - {"hf"})
+
+
+def _register_calibrations(
+    grid: SessionGrid,
+    calibrations: Optional[Mapping[str, Path]],
+    cells: Sequence[PlannedCell],
+    budget_fraction: float,
+) -> Dict[str, Any]:
+    """Validate the operator's per-engine cal-v1 registration (Batch 2 W4)
+    and return the plan-header ``calibration`` record.
+
+    Every EXECUTABLE server cell's engine needs a floor: the manifest the
+    first emitting cell creates must carry every engine the run serves, and
+    it is amended never. An engine no cell of the session registers refuses;
+    an engine whose cells are all blocked may carry one (recorded, unused).
+    Each artifact must describe the engine it is registered under, the
+    session's model (HF id or charter slug), and the ONE floor rung this plan
+    registers (``budget_fraction``: the charter's r = 1.5 unless the
+    operator passed --calibration-budget-fraction).
+    """
+    if (
+        isinstance(budget_fraction, bool)
+        or not isinstance(budget_fraction, (int, float))
+        or not math.isfinite(budget_fraction)
+        or budget_fraction <= 0
+    ):
+        raise PlanError(
+            f"--calibration-budget-fraction {budget_fraction!r} must be finite and > 0"
+        )
+    registered = {str(k): Path(v) for k, v in (calibrations or {}).items()}
+    session_engines = _session_engines(grid)
+    required = sorted(
+        {c.spec.engine for c in cells if c.blocked_on is None and c.spec.engine != "hf"}
+    )
+    fix = (
+        "run scripts/3_run/calibrate_cell.py --budget-fraction "
+        f"{budget_fraction:g} --output <path> against each engine's server, then "
+        f"plan --calibration <engine>=<path> per engine ({SLO_FLOORS_FINDING}, "
+        f"{SLO_FLOORS_ADR})"
+    )
+    unknown = sorted(set(registered) - session_engines)
+    if unknown:
+        raise PlanError(
+            f"--calibration {unknown}: not a server engine of session "
+            f"{grid.session!r} (registered engines: {sorted(session_engines)})"
+        )
+    missing = sorted(set(required) - set(registered))
+    if missing:
+        raise PlanError(
+            f"calibration missing for engine(s) {missing}: every executable "
+            "server cell's engine needs its §6.1 single-stream floor before the "
+            "plan is built (the first emitting cell writes them into "
+            f"manifest.json[{SLO_FLOORS_MANIFEST_KEY!r}], amended never); {fix}"
+        )
+    accepted_models = (grid.model, HF_ID_OF_SLUG[grid.model])
+    floors: Dict[str, Dict[str, Any]] = {}
+    artifacts: Dict[str, Dict[str, Any]] = {}
+    for engine in sorted(registered):
+        cal = load_calibration(registered[engine], budget_fraction)
+        if cal.engine != engine:
+            raise PlanError(
+                f"--calibration {engine}={cal.path}: the artifact describes engine "
+                f"{cal.engine!r} (its engine field normalizes to that), not "
+                f"{engine!r}; refusing a swapped floor"
+            )
+        if cal.model not in accepted_models:
+            raise PlanError(
+                f"--calibration {engine}={cal.path}: the artifact is for model "
+                f"{cal.model!r} but session {grid.session!r} runs {grid.model!r} "
+                f"({HF_ID_OF_SLUG[grid.model]}); a floor from another model would "
+                "mis-set every SLO"
+            )
+        if not math.isclose(cal.budget_fraction, budget_fraction, rel_tol=0.0, abs_tol=1e-9):
+            raise PlanError(
+                f"--calibration {engine}={cal.path}: the artifact's budget_fraction "
+                f"is {cal.budget_fraction:g} but this plan registers its floors at "
+                f"r = {budget_fraction:g} (charter §6.1: the floor is measured at "
+                f"r = {FLOOR_BUDGET_FRACTION:g}, concurrency 1; pass "
+                f"--calibration-budget-fraction {cal.budget_fraction:g} to register "
+                "another rung explicitly, and the same rung for every engine)"
+            )
+        floors[engine] = {
+            "ttft_s": cal.ttft_s,
+            "tpot_s": cal.tpot_s,
+            "n_requests": cal.n_requests,
+            "statistic": cal.statistic,
+            "budget_fraction": cal.budget_fraction,
+            "source_sha256": cal.sha256,
+        }
+        artifacts[engine] = {
+            "path": str(cal.path.resolve()),
+            "sha256": cal.sha256,
+            "model": cal.model,
+            "procedure_version": cal.procedure_version,
+            "lambda_star_label": cal.lambda_star_label,
+        }
+    return {
+        "procedure_version": PROCEDURE_VERSION,
+        "budget_fraction": float(budget_fraction),
+        "registered_budget_fraction": FLOOR_BUDGET_FRACTION,
+        "floors": floors,
+        "artifacts": artifacts,
+        "env": SLO_FLOORS_ENV,
+        "manifest_key": SLO_FLOORS_MANIFEST_KEY,
+        "finding": SLO_FLOORS_FINDING,
+        "adr": SLO_FLOORS_ADR,
+        "charter": (
+            "6.1: the primary SLO pair is TTFT <= 10x and TPOT <= 5x the "
+            "single-stream floor of the same model x engine, measured at "
+            "r = 1.5 and concurrency 1 (calibration.summarize_floor)"
+        ),
+    }
+
+
 def build_plan(
     session: str,
     floor: FloorTable,
@@ -3058,6 +3572,8 @@ def build_plan(
     launcher_cmds: Optional[Mapping[str, Sequence[str]]] = None,
     query_manifests: Optional[Mapping[str, Path]] = None,
     freeze_file: Optional[Path] = None,
+    calibrations: Optional[Mapping[str, Path]] = None,
+    calibration_budget_fraction: float = FLOOR_BUDGET_FRACTION,
 ) -> Dict[str, Any]:
     """PURE plan builder: registered grid -> ordered step list + counts.
 
@@ -3075,6 +3591,12 @@ def build_plan(
     ``freeze_file`` is the registration artifact the A5 retrieval pins are
     read from (``plan --freeze-file``; None = $CAGE_FREEZE_RESOLUTIONS, else
     DEFAULT_FREEZE_FILE). Reads only that artifact and the manifests.
+
+    ``calibrations`` maps engine -> cal-v1 artifact path (``plan
+    --calibration ENGINE=PATH``, Batch 2 W4): one per executable server
+    engine, validated and recorded in the header ``calibration``; every cell
+    step pins the floors as CAGE_SLO_FLOORS_JSON. ``calibration_budget_fraction``
+    is the floor rung every artifact must carry (the charter's r = 1.5).
     """
     grid = get_session_grid(session)
     pins = resolve_retrieval_pins(freeze_file)
@@ -3111,9 +3633,20 @@ def build_plan(
         floor.row(r)
     # A9: every registered manifest must supply each cell's n per trial.
     _check_manifest_coverage(grid, manifests, cells)
+    # Batch 2 W4: one §6.1 floor per executable server engine, pinned on
+    # every cell (the manifest is created by the first emitting cell). A plan
+    # with no executable server cell (an hf-only shakedown) registers no
+    # floor and pins nothing (review F4: an empty pin is not a pin).
+    calibration = _register_calibrations(
+        grid, calibrations, cells, calibration_budget_fraction
+    )
+    slo_floors_env: Optional[str] = (
+        slo_floors_env_value(calibration["floors"]) if calibration["floors"] else None
+    )
 
     steps: List[Dict[str, Any]] = []
     current: Optional[_ServingConfig] = None
+    current_budget_plan: Optional[Dict[str, Any]] = None
     relaunches = 0
     for cell in cells:
         config = _serving_config(cell)
@@ -3121,10 +3654,20 @@ def build_plan(
         # unrealizable) serving config must not emit a relaunch step nor
         # disturb the boundary the surrounding executable cells run under.
         if cell.blocked_on is None and config is not None and config != current:
-            steps.append(_relaunch_step(config, grid, floor, launcher_cmds))
+            relaunch = _relaunch_step(config, grid, floor, launcher_cmds)
+            steps.append(relaunch)
             current = config
+            current_budget_plan = relaunch["budget_plan"]
             relaunches += 1
         manifest_rec = manifests.get(cell.dataset)
+        # W4: an executable server cell pins the record of the relaunch it
+        # runs under (the same object, by construction; None under a
+        # budget-free boundary); hf and blocked cells carry none.
+        budget_plan = (
+            current_budget_plan
+            if cell.blocked_on is None and config is not None
+            else None
+        )
         steps.append(
             _cell_step(
                 cell,
@@ -3135,6 +3678,8 @@ def build_plan(
                 window_duration_s,
                 pins,
                 query_manifest=None if manifest_rec is None else manifest_rec["path"],
+                slo_floors_env=slo_floors_env,
+                budget_plan=budget_plan,
             )
         )
     for i, step in enumerate(steps):
@@ -3259,7 +3804,19 @@ def build_plan(
             "pd_proxy_port_env": PD_PROXY_PORT_ENV,
             "api_base_override_envs": list(API_BASE_OVERRIDE_ENVS),
             "engine_ports_finding": ENGINE_PORTS_FINDING,
+            # Batch 2 W4 (ADR-0117): the relaunch's cache_budget.BudgetPlan
+            # record rides every budgeted cell step as this env and lands in
+            # cell.json under this key (the rho_own consumer's read);
+            # re-checked per cell and per relaunch by load_plan.
+            "budget_plan_env": BUDGET_PLAN_ENV,
+            "budget_plan_cell_key": BUDGET_PLAN_CELL_KEY,
+            "budget_plan_finding": SLO_FLOORS_FINDING,
         },
+        # Batch 2 W4 (ADR-0117): the per-engine §6.1 floors this plan pins on
+        # every cell (path + sha256 + what was validated); re-checked per cell
+        # by load_plan; written into manifest.json["slo_floors"] by the
+        # campaign session at manifest creation.
+        "calibration": calibration,
         # §6.4 anchor fine grid registration (null on non-anchor sessions).
         "fine_grid": (
             None
@@ -3338,6 +3895,12 @@ _CELL_STEP_KEYS = (
     # v5 additions (A9 per-row N): the A1 row class and the n measured.
     "row_class",
     "num_queries",
+    # Batch 2 W4: the relaunch's BudgetPlan record on budgeted cells (null
+    # elsewhere); persisted into cell.json by the campaign session. The
+    # serving record every relaunch-agreement clause keys on is required
+    # too (review F3: a server cell with serving null escaped every clause).
+    "budget_plan",
+    "serving",
 )
 _RELAUNCH_STEP_KEYS = (
     "engine",
@@ -3357,6 +3920,12 @@ _RELAUNCH_STEP_KEYS = (
     # Batch 2 W2: the endpoint this relaunch serves on; every executable
     # cell under it is checked against the record (review F1).
     "api_base",
+    # Batch 2 W4: the BudgetPlan record the budget env was derived from
+    # (null on a budget-free relaunch); the cells under it pin it. The
+    # byte total is required beside it (review F2: budgeted-ness is derived
+    # from the relaunch identity, never inferred from an optional key).
+    "budget_plan",
+    "budget_bytes",
 )
 
 
@@ -3441,6 +4010,132 @@ def _stale_relaunch_problems(
             "the env; without it the pilot shell default 4096 would serve the "
             "cells under this relaunch)" + stale
         )
+    # Batch 2 W4 (ADR-0117): a budgeted relaunch carries the BudgetPlan
+    # record its launcher env was derived from (same total, engine and, off
+    # the pd stack, the same TP degree; a 'single' relaunch may be planned
+    # TP-sharded); a budget-free one carries null.
+    record = step.get("budget_plan")
+    budget_bytes = step.get("budget_bytes")
+    topology = str(step.get("topology"))
+    # Review F2: budgeted-ness follows the relaunch IDENTITY (a pressure
+    # coordinate, or the DIST overlay at dist_budget_r), never an optional
+    # key: a nulled budget_bytes must not read as budget-free.
+    budgeted = step.get("budget_r") is not None or topology in ("tp", "pd")
+    budget_env_names = sorted(_BUDGET_FLAG_ENV.values()) + [
+        "CAGE_KV_BUDGET_BYTES_PREFILL", "CAGE_KV_BUDGET_BYTES_DECODE",
+    ]
+    if not budgeted:
+        if budget_bytes is not None or record is not None:
+            problems.append(
+                f"{label}: budget-free relaunch (no budget_r, single topology) "
+                f"carries budget_bytes={budget_bytes!r} / budget_plan "
+                f"{'record' if record is not None else 'null'} "
+                f"({SLO_FLOORS_FINDING})" + stale
+            )
+        carried = [name for name in budget_env_names if name in env]
+        if carried:
+            problems.append(
+                f"{label}: budget-free relaunch env carries {carried} "
+                f"({SLO_FLOORS_FINDING}: a server launched under a budget the "
+                "plan does not record)" + stale
+            )
+    elif (
+        isinstance(budget_bytes, bool)
+        or not isinstance(budget_bytes, int)
+        or budget_bytes < 1
+    ):
+        problems.append(
+            f"{label}: budgeted relaunch (budget_r={step.get('budget_r')!r}, "
+            f"topology {topology!r}) has budget_bytes={budget_bytes!r}, must be "
+            f"an integer >= 1 ({SLO_FLOORS_FINDING})" + stale
+        )
+    elif not isinstance(record, dict):
+        problems.append(
+            f"{label}: budgeted relaunch (budget_bytes={budget_bytes}) has no "
+            f"budget_plan record ({SLO_FLOORS_FINDING}: the cells under it pin "
+            "this record into cell.json)" + stale
+        )
+    else:
+        # Review F1: the served dtype the record carries is the relaunch's
+        # lever, else bf16 (the only floor-table dtype a plain launch
+        # accepts); rho_own applies the bytes-per-token factor from it.
+        want_dtype = step.get("kv_dtype") or "bf16"
+        if record.get("kv_dtype") != want_dtype:
+            problems.append(
+                f"{label}: budget_plan.kv_dtype {record.get('kv_dtype')!r} != the "
+                f"served dtype {want_dtype!r} (the relaunch lever, else bf16) "
+                f"({SLO_FLOORS_FINDING}: rho_own would apply the wrong "
+                "bytes-per-token factor)" + stale
+            )
+        if topology == "pd":
+            pd = step.get("pd") if isinstance(step.get("pd"), dict) else {}
+            pools = [pd.get("prefill_bytes"), pd.get("decode_bytes")]
+            if record.get("pools_bytes") != pools or _json_norm(
+                record.get("pd_roles")
+            ) != _json_norm(pd):
+                problems.append(
+                    f"{label}: budget_plan pools/pd_roles differ from the "
+                    f"relaunch pd record ({SLO_FLOORS_FINDING}: the per-rank "
+                    "slices the launcher was given are the record's pd_roles)"
+                    + stale
+                )
+        else:
+            # Review F1: the launched knob IS the record's primary engine
+            # arg, verbatim (vLLM bytes, SGLang tokens).
+            primary = [
+                a for a in (record.get("engine_args") or [])
+                if isinstance(a, dict) and a.get("kind") == "primary"
+            ]
+            args = primary[0].get("args") if len(primary) == 1 else None
+            if not isinstance(args, list) or len(args) != 2:
+                problems.append(
+                    f"{label}: budget_plan carries no single primary knob "
+                    f"({SLO_FLOORS_FINDING})" + stale
+                )
+            else:
+                flag, value = args
+                env_name = _BUDGET_FLAG_ENV.get(str(flag))
+                if env_name is None or env.get(env_name) != value:
+                    problems.append(
+                        f"{label}: budget_plan primary knob {flag} {value!r} != "
+                        f"relaunch env {env_name}={env.get(env_name) if env_name else None!r} "
+                        f"({SLO_FLOORS_FINDING}: the record must be the plan the "
+                        "launcher env was derived from)" + stale
+                    )
+        if record.get("budget_bytes_total") != budget_bytes:
+            problems.append(
+                f"{label}: budget_plan.budget_bytes_total "
+                f"{record.get('budget_bytes_total')!r} != relaunch budget_bytes "
+                f"{budget_bytes!r} ({SLO_FLOORS_FINDING})" + stale
+            )
+        if step.get("budget_r") is not None and record.get("r") != step.get("budget_r"):
+            # Review T1: the DIST legs carry budget_r None (their r is the
+            # registered dist_budget_r, not a plan-visible coordinate).
+            problems.append(
+                f"{label}: budget_plan.r {record.get('r')!r} != relaunch budget_r "
+                f"{step.get('budget_r')!r} ({SLO_FLOORS_FINDING})" + stale
+            )
+        if record.get("engine") != engine:
+            problems.append(
+                f"{label}: budget_plan.engine {record.get('engine')!r} != relaunch "
+                f"engine {engine!r} ({SLO_FLOORS_FINDING})" + stale
+            )
+        allowed = {"single": ("single", "tp"), "tp": ("tp",), "pd": ("pd",)}
+        if record.get("topology") not in allowed.get(topology, ()):
+            problems.append(
+                f"{label}: budget_plan.topology {record.get('topology')!r} cannot "
+                f"plan a {topology!r} relaunch ({SLO_FLOORS_FINDING})" + stale
+            )
+        if topology != "pd" and record.get("tp") != step.get("tp"):
+            problems.append(
+                f"{label}: budget_plan.tp {record.get('tp')!r} != relaunch tp "
+                f"{step.get('tp')!r} ({SLO_FLOORS_FINDING})" + stale
+            )
+        if not isinstance(record.get("kv_dtype"), str):
+            problems.append(
+                f"{label}: budget_plan.kv_dtype {record.get('kv_dtype')!r} is not "
+                f"a string ({SLO_FLOORS_FINDING})" + stale
+            )
     return problems
 
 
@@ -3510,6 +4205,39 @@ def load_plan(path: Path) -> Dict[str, Any]:
             "shell default 4096 and refuse every RULER request) - stale plan, "
             "re-plan"
         )
+    calibration = plan.get("calibration")
+    header_floors = calibration.get("floors") if isinstance(calibration, dict) else None
+    if not isinstance(header_floors, dict):
+        raise RunError(
+            f"plan {path} has no calibration.floors header ({SLO_FLOORS_FINDING}: "
+            "the §6.1 single-stream floors every cell pins as "
+            f"{SLO_FLOORS_ENV} and the campaign session writes into "
+            f"manifest.json[{SLO_FLOORS_MANIFEST_KEY!r}]; a pre-W4 plan would "
+            "produce a manifest contrast #14 refuses) - stale plan, re-plan"
+        )
+    # Review F5: the header floors must cover every engine an executable
+    # server cell serves (build_plan enforces it; a hand-edited header would
+    # spend the GPU time before contrast #14 refuses the missing engine).
+    # Review F4: a plan with no executable server cell registers no floor
+    # and pins nothing (an empty floors object is legal only then).
+    executable_engines = sorted({
+        str(s["cellspec"].get("engine"))
+        for s in steps
+        if isinstance(s, dict) and s.get("kind") == "cell"
+        and s.get("blocked_on") is None and isinstance(s.get("cellspec"), dict)
+        and s["cellspec"].get("engine") != "hf"
+    })
+    uncovered = sorted(set(executable_engines) - set(header_floors))
+    if uncovered:
+        raise RunError(
+            f"plan {path} calibration.floors has no floor for executable "
+            f"engine(s) {uncovered} ({SLO_FLOORS_FINDING}: contrast #14 refuses "
+            "an in-regime window whose engine has no floor; re-plan with "
+            "--calibration for every engine) - stale plan, re-plan"
+        )
+    slo_floors_env: Optional[str] = (
+        slo_floors_env_value(header_floors) if header_floors else None
+    )
     preceding_relaunch: Optional[Dict[str, Any]] = None
     for i, step in enumerate(steps):
         if not isinstance(step, dict) or step.get("kind") not in ("cell", "relaunch"):
@@ -3552,6 +4280,7 @@ def load_plan(path: Path) -> Dict[str, Any]:
                     f"steps[{i}]",
                     per_row_n=per_row_n,
                     retrieval=retrieval_knobs,
+                    slo_floors_env=slo_floors_env,
                 )
             )
     if problems:
@@ -3726,6 +4455,19 @@ def run_plan(
                 "value while every relaunch pins the registered one; unset it or "
                 "set it to the registered port before 'run'"
             )
+    # Batch 2 W4: the floors/budget pins are plan facts the campaign session
+    # reads from the step env only; an exported shell value is an operator
+    # expecting it to matter (it never does: the step env wins, and a
+    # non-driver cell would carry a pin the plan never reviewed). Refused on
+    # PRESENCE before the first step, the STALE_INDEX_OPT_IN_ENV rule.
+    for name in CELL_PIN_ENVS:
+        if name in os.environ:
+            raise RunError(
+                f"{name} is set in the environment ({os.environ[name]!r}); the "
+                "plan pins it on every cell step and the campaign session reads "
+                f"only the plan's value ({SLO_FLOORS_FINDING}); unset it before "
+                "'run'"
+            )
     steps: List[Dict[str, Any]] = list(plan["steps"])
     cell_steps = [s for s in steps if s["kind"] == "cell"]
 
@@ -3884,6 +4626,21 @@ def parse_query_manifest_args(items: Sequence[str]) -> Dict[str, Path]:
     return out
 
 
+def parse_calibration_args(items: Sequence[str]) -> Dict[str, Path]:
+    """``ENGINE=PATH`` registrations -> {engine: path}; malformed or
+    duplicate entries refuse (PlanError). Batch 2 W4."""
+    out: Dict[str, Path] = {}
+    for item in items:
+        engine, sep, raw_path = item.partition("=")
+        if not sep or not engine.strip() or not raw_path.strip():
+            raise PlanError(f"--calibration {item!r}: expected ENGINE=PATH")
+        engine = engine.strip()
+        if engine in out:
+            raise PlanError(f"--calibration {engine}: registered twice")
+        out[engine] = Path(raw_path.strip())
+    return out
+
+
 def _cmd_plan(args: argparse.Namespace) -> int:
     floor = load_floor_table(Path(args.floor_table))
     launcher_cmds: Optional[Dict[str, Tuple[str, ...]]] = None
@@ -3899,6 +4656,8 @@ def _cmd_plan(args: argparse.Namespace) -> int:
         launcher_cmds=launcher_cmds,
         query_manifests=parse_query_manifest_args(args.query_manifest),
         freeze_file=Path(args.freeze_file) if args.freeze_file else None,
+        calibrations=parse_calibration_args(args.calibration),
+        calibration_budget_fraction=args.calibration_budget_fraction,
     )
     text = json.dumps(plan, indent=2, sort_keys=False) + "\n"
     if args.out:
@@ -3986,6 +4745,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"from (INSTRUMENT_REVISIONS.{FREEZE_DENSE_RETRIEVER_SLOT}, "
         f"{DENSE_RETRIEVER_ADR}); default ${FREEZE_FILE_ENV_VAR} else "
         f"{DEFAULT_FREEZE_FILE}; a missing artifact refuses",
+    )
+    p_plan.add_argument(
+        "--calibration",
+        action="append",
+        default=[],
+        metavar="ENGINE=PATH",
+        help="register the cal-v1 floor artifact (scripts/3_run/calibrate_cell.py "
+        "--output) of one server engine; repeatable, REQUIRED for every engine "
+        "with an executable cell. The floors are validated, recorded in the "
+        "header 'calibration' with their sha256, pinned on every cell step as "
+        f"{SLO_FLOORS_ENV} and written into manifest.json['slo_floors'] by the "
+        f"campaign session ({SLO_FLOORS_FINDING}, {SLO_FLOORS_ADR})",
+    )
+    p_plan.add_argument(
+        "--calibration-budget-fraction",
+        type=float,
+        default=FLOOR_BUDGET_FRACTION,
+        metavar="R",
+        help="the KV budget ratio every registered floor artifact must have been "
+        f"measured at (charter §6.1: r = {FLOOR_BUDGET_FRACTION:g}, concurrency 1); "
+        "pass another value ONLY to register a shakedown rung explicitly (recorded "
+        "in the header beside the registered value)",
     )
     p_plan.add_argument("--out", default=None, help="write the plan JSON here (else stdout)")
     p_plan.set_defaults(func=_cmd_plan)

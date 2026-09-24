@@ -157,6 +157,43 @@ CAGE_ISO_BYTES_LOGS="vllm=<log>,sglang=<log>" bash scripts/checks/preflight_chec
 #    NEVER proceed on an unverified budget (the cell would mis-state its r).
 ```
 
+On the campaign path the driver does steps 1 and 2 itself: every relaunch step
+carries the `cache_budget.BudgetPlan` record its launcher env was derived from
+(`budget_plan`), every budgeted cell step pins the same record as
+`CAGE_BUDGET_PLAN_JSON`, and the campaign session persists it into
+`cell.json["budget_plan"]` (Batch 2 W4, ADR-0117; `docs/RESULTS_LAYOUT.md` §3.1).
+Gate (j) stays the live verification of the realized bytes.
+
+### 3.2 SLO floor calibration: one cal-v1 artifact per engine, BEFORE `plan`
+
+The §6.1 primary SLO pair is relative to the measured single-stream floor of the
+same model x engine (TTFT <= 10x, TPOT <= 5x). The floor comes from the registered
+procedure in `src/orchestration/calibration.py` (30 sequential streamed requests
+at concurrency 1, median), driven by `scripts/3_run/calibrate_cell.py` against a
+live server at the r = 1.5 control rung, once per engine of the session:
+
+```bash
+# one artifact per server engine of the session, at the charter floor rung
+.venv/bin/python scripts/3_run/calibrate_cell.py \
+    --backend vllm --model Qwen/Qwen3-14B --api-base http://localhost:8000 \
+    --manifest data/manifests/qasper_2000x3_seed42.json \
+    --budget-fraction 1.5 --start-qps 0.5 \
+    --output results/calibration/vllm.json
+# then the same for sglang on its own server (--api-base http://localhost:30000)
+```
+
+`plan --calibration vllm=results/calibration/vllm.json --calibration sglang=...`
+registers them (Batch 2 W4, ADR-0117): the plan REFUSES without one per engine
+that has an executable cell, refuses an artifact whose engine, model,
+procedure version, request count or statistic is not the registered one, and
+refuses a `budget_fraction` other than 1.5 unless the operator passes
+`--calibration-budget-fraction <r>` explicitly (an S0 shakedown at 0.5 is
+registered that way, and the header records both values). The floors ride every
+cell step as `CAGE_SLO_FLOORS_JSON`, and the campaign session writes them into
+`manifest.json["slo_floors"]` when the first cell creates the manifest (amended
+never; a later cell pinning other floors refuses). `plan` therefore runs after
+calibration, on the pod or locally on the pulled artifacts, never before.
+
 The planner refuses HF (the oracle is excluded from pressure sweeps, P2), refuses
 P/D without an explicit split, and carries every live-only knob semantic as a
 `verify_live` entry — S0-19/S0-20 are where those close.
@@ -214,6 +251,17 @@ nohup bash scripts/3_run/cloud_run.sh <MODEL> <N> <T> > run.log 2>&1 &
   resolves them before the pin) and while a shell `VLLM_PORT` / `SGLANG_PORT` / pd
   port value differs from the table (the preflight dials the shell value).
 
+- Floors and budget records are pinned by the campaign driver (Batch 2 W4,
+  ADR-0117, §3.2): every cell step carries `CAGE_SLO_FLOORS_JSON` and every
+  budgeted cell step `CAGE_BUDGET_PLAN_JSON`; `load_plan` refuses a plan without
+  the `calibration` header, a cell whose floors pin differs from it, or a cell
+  whose budget record differs from its relaunch's; `run` refuses while either
+  env is exported in the shell. Run S0's cells through the driver, not through
+  the pilot shell drivers: a shell-driven tree carries neither pin, so contrast
+  #14 refuses and the rho_own leg skips on it. Pull the plan file and the
+  calibration artifacts together with the run (the plan header records each
+  artifact's path and sha256; the sealed tree carries only the floors).
+
 ### 4.0 Query manifests: build, register, and the blocked B12 rung cells
 
 Every QA dataset of a session measures ONE pre-drawn query manifest (the uniform
@@ -246,6 +294,9 @@ python3 scripts/1_setup/build_query_manifest.py --dataset squad_v2 \
     --block-budget 2800 --trunc-budgets 1400,700
 # register each one on the plan (repeatable); unregistered datasets keep their B12 rung cells BLOCKED
 python3 scripts/3_run/run_campaign.py plan --session a \
+    --floor-table results/preflight/floor_table_a.json --window-duration-s 300 \
+    --calibration vllm=results/calibration/vllm.json \
+    --calibration sglang=results/calibration/sglang.json \
     --query-manifest squad_v2=data/manifests/squad_v2_2000x3_seed42.json \
     --query-manifest hotpotqa=data/manifests/hotpotqa_2000x3_seed42_ov0.33.json \
     --out plan.json
@@ -340,6 +391,8 @@ manually, and only then uses `--force` — a user decision, reported as such.
 | `CAGE_SKIP_QUALITY=1` | run scripts, `run_campaign.py` (cell-step env pin), `run_experiment.py` (campaign-mode gate) | Decoupled-scoring regime (default in `run_full_sweep.sh`; pinned on every campaign cell step by the driver, W1 / ADR-0055): inline model-based quality is skipped and scored after the serving trees. A *declared* regime, not a mock. A campaign cell without it refuses before serving; the regime is recorded per window in `metrics.json["quality_scoring"]`. |
 | `VLLM_PORT` / `SGLANG_PORT` / `CAGE_PD_PROXY_PORT` / `CAGE_PD_PREFILL_PORT` / `CAGE_PD_DECODE_PORT` | launchers (`manage_vllm_server.sh`, `manage_sglang_server.sh`, `manage_vllm_pd.sh`), `run_campaign.py` (relaunch env) | Listening ports of the launchers (defaults 8000 / 30000 / 8000 / 8100 / 8200). The campaign driver exports them on every relaunch from its port table and pins the matching `--api-base` on every server-engine cell (W2); the operator's shell value never reaches a campaign relaunch (the step env wins). The preflight's own gate URL reads the shell `SGLANG_PORT`, so `run` refuses a shell value that differs from the table (an equal value is fine). |
 | `CAGE_SGLANG_API_BASE` / `CAGE_LMDEPLOY_API_BASE` | `run_experiment.py` (adapter + cache flush) | Per-engine endpoint override, resolved BEFORE `--api-base`. Pilot convenience only: `run_campaign.py run` refuses while either is set (W2), because it would beat the plan's pin. |
+| `CAGE_SLO_FLOORS_JSON` | `run_campaign.py` (cell-step env pin), `campaign_session.py` | Batch 2 W4 (ADR-0117): the §6.1 single-stream floors of every registered engine as compact JSON, pinned on EVERY cell step from the plan header `calibration` (one cal-v1 artifact per engine, §3.2); the session writes it into `manifest.json["slo_floors"]` at manifest creation and refuses a reopened manifest whose floors differ. `run` refuses while it is exported in the shell. Never set it by hand. |
+| `CAGE_BUDGET_PLAN_JSON` | `run_campaign.py` (budgeted cell-step env pin), `campaign_session.py`, `campaign_layout.CellWriter` | Batch 2 W4 (ADR-0117): the `cache_budget.BudgetPlan` record of the relaunch the cell runs under (`asdict` plus `floor_table_sha256`), pinned on budgeted cell steps only; cross-checked against the cell tuple by the session and persisted into `cell.json["budget_plan"]` (the rho_own basis). `run` refuses while it is exported in the shell. Never set it by hand. |
 | `CAGE_QUERY_MANIFEST` | `run_experiment.py` (loader), `campaign_session.py` | Path to the dataset's pre-drawn query manifest (`build_query_manifest.py`); the runner's `--query-manifest` sets it (the campaign driver passes that flag on every cell of a registered dataset, §4.0). The loader refuses a manifest built for another dataset, and the corpus-budget guard (A4, ADR-0106) refuses a served budget that is neither its `block_budget` nor one of its `trunc_rungs`. `campaign_session.py` resolves `dataset_manifests_sha256` from it when `CAGE_DATASET_MANIFESTS_SHA256` is unset. |
 | `HF_HUB_DOWNLOAD_TIMEOUT` | `setup_runpod.sh`, HF downloads | Stalled-read timeout in seconds (default 30). Exported BEFORE dataset staging AND model prefetch (J7 — a stalled socket must raise, then resume, not hang for an hour). |
 | `CAGE_BACKUP_INTERVAL` | `gcs_backup_daemon.sh` | Seconds between mirror passes (default 300). |

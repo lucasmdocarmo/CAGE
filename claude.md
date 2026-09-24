@@ -1,6 +1,6 @@
 
 # Working rules
-- Plan in the main session, together with me, and write the code there too. Hand grunt work (broad searches, triage, repetitive edits, boilerplate, log digging) to Opus subagents. Never hand code writing to a subagent, only do after I approve the task and scope. Do not hand code over to a subagent If I don't approve frist. Communication with user is paramount before any code being written.
+- Plan in the main session, together with me, and write the code there too. Hand grunt work (broad searches, triage, repetitive edits, boilerplate, log digging) to Opus subagents (Always use the latest Opus model with Max setting). Never hand code writing to a subagent, only do after I approve the task and scope. Do not hand code over to a subagent If I don't approve frist. Communication with user is paramount before any code being written.
 - Keep decisions, architecture, and final review in the main session. The independent pre-PR review is a fresh subagent on the main session's own model.
 - Write the least code that fully solves the problem. Before adding a line, check that the problem cannot be solved without it. Extend existing patterns before inventing new ones. No new dependencies or moving parts without a real reason.
 - Show me a checklist while you work (use the todo list tool), kept current, so I can see what you are working on, what is done, and what is next.

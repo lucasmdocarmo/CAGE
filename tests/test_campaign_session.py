@@ -464,3 +464,474 @@ def test_derive_corpus_budget_refusals_are_fail_closed() -> None:
             "CAGE_CELL_RETRIEVER": "none",
             "CAGE_CELL_CORPUS_BUDGET": "1400",
         })
+
+
+# ---------------------------------------------------------------------------
+# ADR-0116 (Batch 2 W3, option a): the emit seam refuses a window whose runner
+# summary counted a dropped row. A dropped row is absent from requests.jsonl
+# and qa_evidence.jsonl alike, so the count reconciliation cannot see it; the
+# consort counters are its only trace and every one of them must read zero.
+# ---------------------------------------------------------------------------
+
+ZERO_CONSORT: dict[str, Any] = {
+    "n_dropped_prepare": 0,
+    "n_dropped_record": 0,
+    "n_dropped_turn": 0,
+    "evidence_write_failures": 0,
+    "evidence_write_first_error": None,
+}
+
+
+def test_refuse_dropped_rows_summary_enforces_every_consort_counter() -> None:
+    assert cs.refuse_dropped_rows_summary({"consort": ZERO_CONSORT}) is None
+    assert set(cs.CONSORT_COUNTERS) == set(ZERO_CONSORT) - {"evidence_write_first_error"}
+    for key in cs.CONSORT_COUNTERS:
+        with pytest.raises(cs.CampaignSessionError, match=key):
+            cs.refuse_dropped_rows_summary({"consort": {**ZERO_CONSORT, key: 1}})
+    # Absence is not zero: a missing block, a missing counter and a
+    # non-integer value all refuse (never coerced).
+    with pytest.raises(cs.CampaignSessionError, match="consort"):
+        cs.refuse_dropped_rows_summary({})
+    with pytest.raises(cs.CampaignSessionError, match="n_dropped_turn"):
+        cs.refuse_dropped_rows_summary(
+            {"consort": {k: v for k, v in ZERO_CONSORT.items() if k != "n_dropped_turn"}}
+        )
+    with pytest.raises(cs.CampaignSessionError, match="n_dropped_record"):
+        cs.refuse_dropped_rows_summary({"consort": {**ZERO_CONSORT, "n_dropped_record": "0"}})
+    with pytest.raises(cs.CampaignSessionError, match="n_dropped_prepare"):
+        cs.refuse_dropped_rows_summary({"consort": {**ZERO_CONSORT, "n_dropped_prepare": True}})
+
+
+def test_emit_window_refuses_dropped_rows_before_any_artifact(tmp_path: Path) -> None:
+    session = _session(tmp_path)
+    summary = {
+        "experiment": {"stale_index_opt_in": False},
+        "consort": {**ZERO_CONSORT, "n_dropped_record": 1},
+    }
+    with pytest.raises(cs.CampaignSessionError, match="n_dropped_record"):
+        session.emit_window(
+            ordinal=1, trial_seed=7, results_rows=[], staging_dir=tmp_path,
+            experiment_summary=summary, backend_metadata={},
+            telemetry_snapshot=None, t_start=0.0, t_end=1.0,
+        )
+    assert not (session.run_root / "manifest.json").exists()
+    assert not session.cell_dir.exists()
+
+
+# ---------------------------------------------------------------------------
+# Batch 2 W4 (ADR-0117): the two pins run_campaign threads through the cell
+# env. CAGE_SLO_FLOORS_JSON lands in manifest.json["slo_floors"] when the
+# session creates the manifest and is compared on reopen; CAGE_BUDGET_PLAN_JSON
+# lands in cell.json["budget_plan"] through CellWriter. Both parse fail-closed
+# and the plan is cross-checked against the cell identity.
+# ---------------------------------------------------------------------------
+
+import types  # noqa: E402
+
+FLOORS: dict[str, Any] = {
+    "vllm": {"ttft_s": 0.12, "tpot_s": 0.02, "n_requests": 30, "statistic": "median"},
+    "sglang": {"ttft_s": 0.15, "tpot_s": 0.025},
+}
+
+#: qwen3-14b BF16 KV = 163_840 B/token; 42 tokens' worth of budget lands the
+#: canonical own-accounting rows (tests/test_own_accounting.py) on rho = 0.5.
+BUDGET_42_TOK = 42 * 163_840
+
+
+def _budget_plan_doc(**overrides: Any) -> dict[str, Any]:
+    doc: dict[str, Any] = {
+        "model": "qwen3-14b",
+        "engine": "vllm",
+        "r": 0.5,
+        "kv_dtype": "bf16",
+        "demand_bytes": 2 * BUDGET_42_TOK,
+        "budget_bytes_total": BUDGET_42_TOK,
+        "budget_tokens_total": 42,
+        "tp": 1,
+        "topology": "single",
+        "per_rank_bytes": BUDGET_42_TOK,
+        "per_rank_note": "single rank: pool == total budget",
+        "pd_split": None,
+        "pools_bytes": None,
+        "engine_args": [],
+        "verify_live": [],
+        "gate_j": {},
+        "floor_table_sha256": "0" * 64,
+    }
+    doc.update(overrides)
+    return doc
+
+
+PRESSURE_ENV: dict[str, str] = {
+    "CAGE_CELL_ARM": "gold-fresh",
+    "CAGE_CELL_RETRIEVER": "none",
+    "CAGE_CELL_FAMILY": "F2",
+    "CAGE_CELL_BUDGET_R": "0.5",
+    "CAGE_CELL_RATE_FRAC": "0.85",
+    "CAGE_GPU_COUNT": "1",
+}
+
+
+def _pressure_spec() -> CellSpec:
+    return CellSpec(
+        "gold-fresh", "none", "none", "single", "vllm", "qwen3-14b", "F2",
+        budget_r=0.5, rate_frac=0.85,
+    )
+
+
+def _pressure_args(root: Path) -> Any:
+    return types.SimpleNamespace(
+        campaign_root=str(root),
+        top_k_sweep=False,
+        baseline="no_cache",
+        baseline_label="B1_gold-fresh",
+        backend="vllm",
+        model="Qwen/Qwen3-14B",
+        dataset="qasper",
+        num_trials=2,
+        seed=1,
+        kv_cache_dtype=None,
+    )
+
+
+def test_pin_literals_match_the_driver_and_the_consumer() -> None:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "run_campaign_w4_pins", REPO_ROOT / "scripts" / "3_run" / "run_campaign.py"
+    )
+    rc = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = rc
+    spec.loader.exec_module(rc)
+    analysis_dir = str(REPO_ROOT / "scripts" / "4_analysis")
+    if analysis_dir not in sys.path:
+        sys.path.insert(0, analysis_dir)
+    import run_campaign_analysis as rca
+
+    assert cs.SLO_FLOORS_ENV == rc.SLO_FLOORS_ENV == "CAGE_SLO_FLOORS_JSON"
+    assert cs.BUDGET_PLAN_ENV == rc.BUDGET_PLAN_ENV == "CAGE_BUDGET_PLAN_JSON"
+    assert cs.SLO_FLOORS_MANIFEST_KEY == rca._SLO_FLOORS_MANIFEST_KEY == "slo_floors"
+    assert (
+        cs.BUDGET_PLAN_CELL_KEY == cl.BUDGET_PLAN_CELL_KEY
+        == rca._BUDGET_PLAN_CELL_KEY == "budget_plan"
+    )
+
+
+def test_parse_slo_floors_refusals() -> None:
+    assert cs.parse_slo_floors(json.dumps(FLOORS)) == FLOORS
+    bad = [
+        ("{not json", "not valid JSON"),
+        ("[]", "JSON object"),
+        ("{}", "empty"),
+        (json.dumps({"hf": {"ttft_s": 0.1, "tpot_s": 0.1}}), "hf"),
+        (json.dumps({"triton": {"ttft_s": 0.1, "tpot_s": 0.1}}), "triton"),
+        (json.dumps({"vllm": {"ttft_s": 0.1}}), "tpot_s"),
+        (json.dumps({"vllm": {"ttft_s": 0.0, "tpot_s": 0.1}}), "ttft_s"),
+        (json.dumps({"vllm": {"ttft_s": True, "tpot_s": 0.1}}), "ttft_s"),
+        (json.dumps({"vllm": {"ttft_s": "0.1", "tpot_s": 0.1}}), "ttft_s"),
+        (json.dumps({"vllm": {"ttft_s": float("nan"), "tpot_s": 0.1}}), "ttft_s"),
+        (json.dumps({"vllm": 0.1}), "vllm"),
+    ]
+    for raw, match in bad:
+        with pytest.raises(cs.CampaignSessionError, match=match):
+            cs.parse_slo_floors(raw)
+
+
+def test_parse_budget_plan_refusals() -> None:
+    spec = _pressure_spec()
+    plan = cs.parse_budget_plan(json.dumps(_budget_plan_doc()), spec)
+    assert plan["budget_bytes_total"] == BUDGET_42_TOK and plan["kv_dtype"] == "bf16"
+    with pytest.raises(cs.CampaignSessionError, match="not valid JSON"):
+        cs.parse_budget_plan("{nope", spec)
+    with pytest.raises(cs.CampaignSessionError, match="JSON object"):
+        cs.parse_budget_plan("[]", spec)
+    bad_fields = [
+        ({"budget_bytes_total": None}, "budget_bytes_total"),
+        ({"budget_bytes_total": True}, "budget_bytes_total"),
+        ({"budget_bytes_total": 0}, "budget_bytes_total"),
+        ({"budget_bytes_total": "5"}, "budget_bytes_total"),
+        ({"kv_dtype": "int4"}, "kv_dtype"),
+        ({"kv_dtype": None}, "kv_dtype"),
+        ({"model": "llama-3.3-70b"}, "model"),
+        ({"engine": "sglang"}, "engine"),
+        ({"r": 1.0}, "budget_r"),
+        ({"topology": "pd"}, "topology"),
+    ]
+    for override, match in bad_fields:
+        doc = _budget_plan_doc(**override)
+        for key, value in override.items():
+            if value is None:
+                del doc[key]
+        with pytest.raises(cs.CampaignSessionError, match=match):
+            cs.parse_budget_plan(json.dumps(doc), spec)
+    # A TP-sharded single-instance launch (session b: serving_tp=4) plans
+    # topology 'tp' while the cellspec topology is 'single': both are true.
+    sharded = _budget_plan_doc(topology="tp", tp=4, per_rank_bytes=BUDGET_42_TOK // 4)
+    assert cs.parse_budget_plan(json.dumps(sharded), spec)["tp"] == 4
+    # The DIST overlay carries no pressure coordinate: r is the registered
+    # dist_budget_r and cannot be cross-checked, the topology can.
+    dist_tp = CellSpec.from_baseline("B3", model="qwen3-14b", family="DIST", topology="tp")
+    tp_plan = _budget_plan_doc(topology="tp", tp=8, r=1.0, per_rank_bytes=BUDGET_42_TOK // 8)
+    assert cs.parse_budget_plan(json.dumps(tp_plan), dist_tp)["r"] == 1.0
+    with pytest.raises(cs.CampaignSessionError, match="topology"):
+        cs.parse_budget_plan(json.dumps(_budget_plan_doc(r=1.0)), dist_tp)
+
+
+def test_from_cli_parses_the_pins_and_the_constructor_validates(tmp_path: Path) -> None:
+    root = _run_root(tmp_path)
+    env = {
+        **PRESSURE_ENV,
+        "CAGE_SLO_FLOORS_JSON": json.dumps(FLOORS),
+        "CAGE_BUDGET_PLAN_JSON": json.dumps(_budget_plan_doc()),
+    }
+    session = cs.CampaignCellSession.from_cli(_pressure_args(root), env=env)
+    assert session is not None
+    assert session.slo_floors == FLOORS
+    assert session.budget_plan == _budget_plan_doc()
+    # unset pins keep the pre-W4 behavior: nothing recorded, nothing refused
+    legacy = cs.CampaignCellSession.from_cli(_pressure_args(root), env=PRESSURE_ENV)
+    assert legacy is not None
+    assert legacy.slo_floors is None and legacy.budget_plan is None
+    # malformed pins refuse naming the env
+    with pytest.raises(cs.CampaignSessionError, match="CAGE_SLO_FLOORS_JSON"):
+        cs.CampaignCellSession.from_cli(
+            _pressure_args(root), env={**PRESSURE_ENV, "CAGE_SLO_FLOORS_JSON": "{}"},
+        )
+    with pytest.raises(cs.CampaignSessionError, match="CAGE_BUDGET_PLAN_JSON"):
+        cs.CampaignCellSession.from_cli(
+            _pressure_args(root),
+            env={**PRESSURE_ENV, "CAGE_BUDGET_PLAN_JSON": json.dumps(_budget_plan_doc(engine="sglang"))},
+        )
+    # the constructor validates direct callers the same way
+    with pytest.raises(cs.CampaignSessionError, match="ttft_s"):
+        _session(tmp_path, slo_floors={"vllm": {"ttft_s": 0, "tpot_s": 0.1}})
+    with pytest.raises(cs.CampaignSessionError, match="engine"):
+        _session(tmp_path, spec=_pressure_spec(), budget_plan=_budget_plan_doc(engine="sglang"))
+    # the in-process oracle has no budget: a plan on an hf cell is a
+    # contradiction whatever its engine field says (review S2/T4: the
+    # session refuses at activation, before CellWriter and before serving)
+    hf = CellSpec.from_baseline("B3", model="qwen3-14b", engine="hf")
+    with pytest.raises(cs.CampaignSessionError, match="oracle"):
+        _session(tmp_path, spec=hf, budget_plan=_budget_plan_doc(engine="hf", r=1.0))
+    with pytest.raises(cs.CampaignSessionError, match="oracle"):
+        _session(tmp_path, spec=hf, budget_plan=_budget_plan_doc())
+    # the pinned floors must include THIS cell's engine (review S3)
+    sglang = CellSpec(
+        "gold-fresh", "none", "none", "single", "sglang", "qwen3-14b", "F2",
+        budget_r=0.5, rate_frac=0.85,
+    )
+    with pytest.raises(cs.CampaignSessionError, match="sglang"):
+        _session(tmp_path, spec=sglang, slo_floors={"vllm": FLOORS["vllm"]})
+    assert _session(tmp_path, spec=sglang, slo_floors=FLOORS).slo_floors == FLOORS
+    assert _session(tmp_path, spec=hf, slo_floors={"vllm": FLOORS["vllm"]}).slo_floors is not None
+    # the r cross-check tolerates the :g formatting of CAGE_CELL_BUDGET_R
+    # (review S5): a 1/3 grid level arrives as 0.333333 on the cell side
+    third = CellSpec(
+        "gold-fresh", "none", "none", "single", "vllm", "qwen3-14b", "F2",
+        budget_r=float("0.333333"), rate_frac=0.85,
+    )
+    assert cs.validate_budget_plan(_budget_plan_doc(r=1 / 3), third)["r"] == 1 / 3
+    with pytest.raises(cs.CampaignSessionError, match="budget_r"):
+        cs.validate_budget_plan(_budget_plan_doc(r=0.334), third)
+
+
+def _canonical_requests() -> list[dict[str, Any]]:
+    """tests/test_own_accounting.py::_canonical, as requests.jsonl rows:
+    84 token-seconds over [0, 4) -> 21 tokens average -> rho 0.5 at 42."""
+    return [
+        {
+            "example_id": "r1", "actual_send_ts": 0.0, "first_token_ts": 2.0,
+            "completion_ts": 4.0, "prompt_tokens": 10, "num_tokens": 4,
+            "group_id": 0, "cached_prompt_tokens": 4, "dropped_by_cap": False,
+            "ttft_ms": 2000.0, "tpot_ms": 500.0,
+        },
+        {
+            "example_id": "r2", "actual_send_ts": 1.0, "first_token_ts": None,
+            "completion_ts": 3.0, "prompt_tokens": 20, "num_tokens": 0,
+            "group_id": 1, "cached_prompt_tokens": None, "dropped_by_cap": False,
+            "ttft_ms": 1500.0, "tpot_ms": None,
+        },
+    ]
+
+
+def _emit(session: cs.CampaignCellSession, tmp_path: Path, ordinal: int) -> Any:
+    staging = tmp_path / f"staging-{session.row_key[:8]}-{ordinal}"
+    staging.mkdir(parents=True, exist_ok=True)
+    rows = _canonical_requests()
+    (staging / "qa_evidence.jsonl").write_text(
+        "".join(
+            json.dumps({
+                "example_id": r["example_id"], "repeat_index": None,
+                "record_index": None, "ok": True, "generated_answer": "x",
+            }) + "\n"
+            for r in rows
+        ),
+        encoding="utf-8",
+    )
+    return session.emit_window(
+        ordinal=ordinal, trial_seed=7, results_rows=rows, staging_dir=staging,
+        experiment_summary={
+            "experiment": {"stale_index_opt_in": False},
+            "consort": ZERO_CONSORT,
+        },
+        backend_metadata={"server_version": "0.0-test"},
+        telemetry_snapshot=None, t_start=0.0, t_end=4.0,
+    )
+
+
+MANIFEST_ENV: dict[str, str] = {
+    "CAGE_PROVIDER": "test",
+    "CAGE_HARDWARE": "test-gpu x1",
+    "CAGE_DATASET_MANIFESTS_SHA256": "0" * 64,
+}
+
+
+def test_emit_window_lands_the_pins_where_the_analysis_reads_them(tmp_path: Path) -> None:
+    """End to end through the seam: the plan-shaped env -> from_cli ->
+    emit_window -> manifest.json["slo_floors"] + cell.json["budget_plan"],
+    then the analysis consumer's EXACT reads recover both (the #14 floor
+    lookup and the rho_own budget), and the journaled tree still seals."""
+    from src.analysis.goodput import SLOBaseline, evaluate_window
+    import pandas as pd
+
+    analysis_dir = str(REPO_ROOT / "scripts" / "4_analysis")
+    if analysis_dir not in sys.path:
+        sys.path.insert(0, analysis_dir)
+    import run_campaign_analysis as rca
+
+    root = _run_root(tmp_path)
+    env = {
+        **PRESSURE_ENV, **MANIFEST_ENV,
+        "CAGE_SLO_FLOORS_JSON": json.dumps(FLOORS),
+        "CAGE_BUDGET_PLAN_JSON": json.dumps(_budget_plan_doc()),
+    }
+    session = cs.CampaignCellSession.from_cli(_pressure_args(root), env=env)
+    assert session is not None
+    handle = _emit(session, tmp_path, 1)
+
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["slo_floors"] == FLOORS
+    cell_meta = json.loads((session.cell_dir / "cell.json").read_text(encoding="utf-8"))
+    assert cell_meta["budget_plan"] == _budget_plan_doc()
+
+    # The #14 consumer's read: manifest[slo_floors][engine] -> SLOBaseline.
+    floors = manifest.get(rca._SLO_FLOORS_MANIFEST_KEY)
+    floor = floors[session.spec.engine]
+    assert {"ttft_s", "tpot_s"} <= set(floor)
+    baseline = SLOBaseline(ttft_s=float(floor["ttft_s"]), tpot_s=float(floor["tpot_s"]))
+    records = pd.DataFrame(
+        [{"ok": True, "veridical": True, "ttft_s": 2.0, "tpot_s": 0.5},
+         {"ok": True, "veridical": True, "ttft_s": 1.5, "tpot_s": 0.1}]
+    )
+    metrics = evaluate_window(records, baseline, duration_s=4.0)
+    assert metrics.n_issued == 2
+    # The rho_own consumer's read: cell.json[budget_plan] -> the own-accounting
+    # pass computes rho_own = 0.5 on the canonical rows (no labeled skip).
+    plan = cell_meta.get(rca._BUDGET_PLAN_CELL_KEY)
+    assert isinstance(plan["budget_bytes_total"], int) and isinstance(plan["kv_dtype"], str)
+    index = pd.DataFrame([{
+        "row_key": session.row_key,
+        "dataset": "qasper",
+        "window_key": handle.window_key,
+        "window_dir": handle.window_dir.relative_to(root).as_posix(),
+        "cell_json": f"cells/{session.row_key}/cell.json",
+        "model": "qwen3-14b",
+    }])
+    summary = rca.run_own_accounting_pass(root, index, tmp_path / "analysis")
+    assert summary["n_emitted"] == 1
+    doc = json.loads(
+        (tmp_path / "analysis" / "own_accounting" / index.loc[0, "window_dir"]
+         / "own_accounting.json").read_text(encoding="utf-8")
+    )
+    assert doc["rho_own"] == pytest.approx(0.5)
+    assert "skipped" not in doc["occupancy"]  # computed, not the labeled skip
+    # write-time journal covers the manifest and cell.json: the tree seals
+    assert cs.seal_campaign_run(root).is_file()
+
+
+def test_reopened_manifest_must_carry_the_same_floors(tmp_path: Path) -> None:
+    root = _run_root(tmp_path)
+    base_env = {**PRESSURE_ENV, **MANIFEST_ENV, "CAGE_BUDGET_PLAN_JSON": json.dumps(_budget_plan_doc())}
+    first = cs.CampaignCellSession.from_cli(
+        _pressure_args(root), env={**base_env, "CAGE_SLO_FLOORS_JSON": json.dumps(FLOORS)},
+    )
+    assert first is not None
+    _emit(first, tmp_path, 1)
+    # a later cell of the same run pinning DIFFERENT floors refuses at
+    # ACTIVATION (review S1: before a trial is served, not after it), and
+    # emit_window applies the same rule again
+    other = {"vllm": {"ttft_s": 0.5, "tpot_s": 0.02}, "sglang": FLOORS["sglang"]}
+    with pytest.raises(cs.CampaignSessionError, match="slo_floors"):
+        cs.CampaignCellSession.from_cli(
+            _pressure_args(root), env={**base_env, "CAGE_SLO_FLOORS_JSON": json.dumps(other)},
+        )
+    second = cs.CampaignCellSession(
+        run_root=root, dataset="qasper", spec=_pressure_spec(), num_trials=2, run_seed=1,
+        env={**base_env, "CAGE_SLO_FLOORS_JSON": json.dumps(other)},
+    )
+    second.slo_floors = cs.validate_slo_floors(other)  # bypass activation on purpose
+    with pytest.raises(cs.CampaignSessionError, match="slo_floors"):
+        _emit(second, tmp_path, 2)
+    assert not second.window_dir(2).exists()
+    # the same floors, in any key order, reopen fine
+    reordered = {"sglang": FLOORS["sglang"], "vllm": dict(reversed(list(FLOORS["vllm"].items())))}
+    third = cs.CampaignCellSession.from_cli(
+        _pressure_args(root), env={**base_env, "CAGE_SLO_FLOORS_JSON": json.dumps(reordered)},
+    )
+    assert third is not None
+    _emit(third, tmp_path, 2)
+    # a cell with NO floors pin still extends the run (pre-W4 producers),
+    # and with no budget pin the recorded budget_plan is adopted, not lost
+    # (review T10: the runner's path through emit_window)
+    no_pins = {k: v for k, v in base_env.items() if k != "CAGE_BUDGET_PLAN_JSON"}
+    fourth = cs.CampaignCellSession.from_cli(_pressure_args(root), env=no_pins)
+    assert fourth is not None
+    assert fourth.slo_floors is None and fourth.budget_plan is None
+    _emit(fourth, tmp_path, 3)
+    meta = json.loads((fourth.cell_dir / "cell.json").read_text(encoding="utf-8"))
+    assert meta["budget_plan"] == _budget_plan_doc()
+    assert set(meta["windows"]) == {"qasper-01", "qasper-02", "qasper-03"}
+    # a contradicting budget pin on the populated cell refuses at ACTIVATION
+    # (review S1/T10), before any window directory exists
+    with pytest.raises(cs.CampaignSessionError, match="contradicts"):
+        cs.CampaignCellSession.from_cli(
+            _pressure_args(root),
+            env={**base_env, "CAGE_SLO_FLOORS_JSON": json.dumps(FLOORS),
+                 "CAGE_BUDGET_PLAN_JSON": json.dumps(_budget_plan_doc(budget_bytes_total=BUDGET_42_TOK + 1))},
+        )
+    assert not (fourth.cell_dir / "window_qasper-04").exists()
+    # a manifest created WITHOUT floors cannot be extended by a pinned cell:
+    # the floors it lacks can never be added (amended never; new run_id)
+    bare_root = tmp_path / "results" / "camp1" / "a" / "20260821-1400-a-qwen3-14b"
+    bare = cs.CampaignCellSession.from_cli(_pressure_args(bare_root), env=base_env)
+    assert bare is not None
+    _emit(bare, tmp_path, 1)
+    assert "slo_floors" not in json.loads((bare_root / "manifest.json").read_text(encoding="utf-8"))
+    with pytest.raises(cs.CampaignSessionError, match="amended never"):
+        cs.CampaignCellSession.from_cli(
+            _pressure_args(bare_root), env={**base_env, "CAGE_SLO_FLOORS_JSON": json.dumps(FLOORS)},
+        )
+    assert not (bare_root / "cells" / bare.row_key / "window_qasper-02").exists()
+
+
+def test_populated_cell_without_a_budget_record_refuses_a_budget_pin(tmp_path: Path) -> None:
+    """Review S4: a cell populated by a no-pin session carries windows but no
+    budget_plan; a later pinned session must refuse at activation instead of
+    labeling those windows with a budget nobody recorded them under."""
+    root = _run_root(tmp_path)
+    no_pins = {**PRESSURE_ENV, **MANIFEST_ENV}
+    bare = cs.CampaignCellSession.from_cli(_pressure_args(root), env=no_pins)
+    assert bare is not None
+    _emit(bare, tmp_path, 1)
+    meta = json.loads((bare.cell_dir / "cell.json").read_text(encoding="utf-8"))
+    assert "budget_plan" not in meta and set(meta["windows"]) == {"qasper-01"}
+    with pytest.raises(cs.CampaignSessionError, match="no 'budget_plan' record"):
+        cs.CampaignCellSession.from_cli(
+            _pressure_args(root),
+            env={**no_pins, "CAGE_BUDGET_PLAN_JSON": json.dumps(_budget_plan_doc())},
+        )
+    # a fresh (unpopulated) cell of the same run takes the pin as usual
+    other_env = {**no_pins, "CAGE_CELL_RATE_FRAC": "1.05",
+                 "CAGE_BUDGET_PLAN_JSON": json.dumps(_budget_plan_doc())}
+    fresh = cs.CampaignCellSession.from_cli(_pressure_args(root), env=other_env)
+    assert fresh is not None and fresh.budget_plan == _budget_plan_doc()

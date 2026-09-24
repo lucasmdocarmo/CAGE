@@ -71,6 +71,7 @@ from src.analysis.stats.ledger import hash_artifacts, verify_ledger, write_ledge
 from src.observability.provenance import git_dirty, git_sha
 
 __all__ = [
+    "BUDGET_PLAN_CELL_KEY",
     "CampaignLayoutError",
     "CampaignRun",
     "CellWriter",
@@ -137,6 +138,14 @@ _ENGINES: frozenset[str] = frozenset(get_args(Engine))
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _CELL_META_NAME = "cell.json"
 _TMP_SUFFIX = ".tmp"
+
+#: Batch 2 W4 (ADR-0117): the cell.json key the cache_budget.BudgetPlan record
+#: of a budgeted cell is persisted under, EXACTLY the key the rho_own consumer
+#: reads (run_campaign_analysis._BUDGET_PLAN_CELL_KEY). The record travels
+#: run_campaign plan step -> CAGE_BUDGET_PLAN_JSON -> campaign_session ->
+#: CellWriter; a cell without one keeps the key ABSENT (the consumer's labeled
+#: skip is the honest outcome for pilot/shell trees), never null.
+BUDGET_PLAN_CELL_KEY = "budget_plan"
 
 #: Reverse of the §7.1 numbered layer, as organize_results.BASELINE_OF_CELL
 #: derives it: (arm, retriever) -> baseline id; cells outside the numbered
@@ -417,16 +426,35 @@ class CellWriter:
     silent 1-GPU guess. A single-topology cell without a count stays absent
     (pilot/shell producers predate the seam; the consumer's labeled skip is
     the correct downstream outcome for such trees).
+
+    ``budget_plan`` (Batch 2 W4, ADR-0117; feeds the T2.5 rho_own leg) is the
+    cache_budget.BudgetPlan record the cell's serving stack was launched
+    with, threaded the same way (run_campaign plan step -> the
+    CAGE_BUDGET_PLAN_JSON env -> campaign_session -> here) and persisted
+    top-level under BUDGET_PLAN_CELL_KEY. The write-time gate is the
+    consumer's contract (an integer ``budget_bytes_total`` >= 1 and a
+    ``kv_dtype`` string) plus the one structural impossibility (the hf
+    oracle serves no byte budget); the identity cross-checks against the
+    cell tuple live in campaign_session. Resume follows the gpu_count rules:
+    a fresh writer with no claim adopts the recorded plan, a contradicting
+    claim refuses, a corrupt record refuses extension, and a cell without a
+    plan keeps the key ABSENT.
     """
 
     def __init__(
-        self, run_root: Path, spec: CellSpec, *, gpu_count: int | None = None
+        self,
+        run_root: Path,
+        spec: CellSpec,
+        *,
+        gpu_count: int | None = None,
+        budget_plan: Mapping[str, Any] | None = None,
     ) -> None:
         self.run_root = Path(run_root)
         self.spec = spec
         self.row_key = spec.to_row_key()
         self.cell_dir = self.run_root / "cells" / self.row_key
         self.gpu_count = self._check_gpu_count(gpu_count)
+        self.budget_plan = self._check_budget_plan(budget_plan)
         self._windows: dict[str, dict[str, Any]] = {}
         self._registered: set[tuple[str, int]] = set()
         self._load_existing()
@@ -461,6 +489,47 @@ class CellWriter:
                 "refusing to record it"
             )
         return gpu_count
+
+    def _check_budget_plan(
+        self, budget_plan: Mapping[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """W4 write-time gate: the consumer's two fields, JSON-normalized
+        (tuples become lists ONCE, so a record and its on-disk copy compare
+        equal), NAMED refusals, never a guess."""
+        if budget_plan is None:
+            return None
+        if not isinstance(budget_plan, Mapping):
+            raise CampaignLayoutError(
+                f"cells/{self.row_key}: budget_plan must be a mapping (a "
+                f"cache_budget.BudgetPlan record), got {type(budget_plan).__name__}"
+            )
+        if self.spec.engine == "hf":
+            raise CampaignLayoutError(
+                f"cells/{self.row_key}: the in-process hf oracle serves no byte "
+                "budget (P2: excluded from pressure sweeps), refusing to record "
+                "a budget_plan on it"
+            )
+        problems: list[str] = []
+        budget = budget_plan.get("budget_bytes_total")
+        if isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
+            problems.append(
+                f"cells/{self.row_key}: budget_plan.budget_bytes_total={budget!r} "
+                "must be an integer >= 1 (bytes; the rho_own denominator)"
+            )
+        kv_dtype = budget_plan.get("kv_dtype")
+        if not isinstance(kv_dtype, str) or not kv_dtype:
+            problems.append(
+                f"cells/{self.row_key}: budget_plan.kv_dtype={kv_dtype!r} must be "
+                "a non-empty string (the SERVED KV dtype)"
+            )
+        if problems:
+            raise CampaignLayoutError(problems)
+        try:
+            return json.loads(json.dumps(dict(budget_plan)))
+        except TypeError as exc:
+            raise CampaignLayoutError(
+                f"cells/{self.row_key}: budget_plan is not JSON-serializable: {exc}"
+            ) from exc
 
     def _load_existing(self) -> None:
         """Resume support: rebuild the registry from disk, refusing aliases."""
@@ -520,6 +589,53 @@ class CellWriter:
                             "re-run on different hardware is a NEW cell tree, "
                             "not an extension"
                         )
+                # W4: the same three resume rules for the budget record.
+                recorded_plan = meta.get(BUDGET_PLAN_CELL_KEY)
+                if recorded_plan is not None:
+                    budget = (
+                        recorded_plan.get("budget_bytes_total")
+                        if isinstance(recorded_plan, dict)
+                        else None
+                    )
+                    if (
+                        not isinstance(recorded_plan, dict)
+                        or isinstance(budget, bool)
+                        or not isinstance(budget, int)
+                        or budget < 1
+                        or not isinstance(recorded_plan.get("kv_dtype"), str)
+                    ):
+                        problems.append(
+                            f"{meta_path}: recorded budget_plan is not a "
+                            "BudgetPlan record with an integer "
+                            "budget_bytes_total >= 1 and a kv_dtype string; "
+                            "the cell cannot be extended over a corrupt budget "
+                            "record"
+                        )
+                    elif self.budget_plan is None:
+                        # Resume without a fresh claim: the record IS the fact.
+                        self.budget_plan = recorded_plan
+                    elif recorded_plan != self.budget_plan:
+                        problems.append(
+                            f"{meta_path}: recorded budget_plan "
+                            f"(budget_bytes_total={budget}) contradicts this "
+                            "run's budget_plan (budget_bytes_total="
+                            f"{self.budget_plan.get('budget_bytes_total')}); "
+                            "the cell's budget facts disagree; a re-run under "
+                            "another budget is a NEW cell tree, not an extension"
+                        )
+                elif self.budget_plan is not None and (self._windows or self._registered):
+                    # Review S4: unlike gpu_count (W4.2, which adopts), a
+                    # fresh budget claim over windows that carry no record
+                    # would label them with a budget nobody recorded them
+                    # under; the rho_own consumer reads one record per cell.
+                    problems.append(
+                        f"{meta_path}: the cell already carries "
+                        f"{len(self._windows) or len(self._registered)} window(s) "
+                        "but no budget_plan record; a populated cell without a "
+                        "budget record cannot be extended under a budget claim "
+                        "(its windows were served under an unrecorded budget); "
+                        "wipe it (CAGE_FORCE_RERUN=1) or use a new cell tree"
+                    )
         if problems:
             raise CampaignLayoutError(problems)
 
@@ -639,6 +755,10 @@ class CellWriter:
         # never a fabricated 1.
         if self.gpu_count is not None:
             document["gpu_count"] = self.gpu_count
+        # W4: the budget record, persisted only when known (absence stays
+        # absence: the rho_own consumer's labeled skip names it).
+        if self.budget_plan is not None:
+            document[BUDGET_PLAN_CELL_KEY] = self.budget_plan
         return _atomic_write_json(self.cell_dir / _CELL_META_NAME, document)
 
 
@@ -681,12 +801,20 @@ class CampaignRun:
                 "sealed, then immutable; a re-run is a new run_id)"
             )
 
-    def cell(self, spec: CellSpec, *, gpu_count: int | None = None) -> CellWriter:
+    def cell(
+        self,
+        spec: CellSpec,
+        *,
+        gpu_count: int | None = None,
+        budget_plan: Mapping[str, Any] | None = None,
+    ) -> CellWriter:
         """The (memoized) writer for one cell tuple; §3: one run = one model.
 
         ``gpu_count`` threads the W4.2 serving-stack fact to the CellWriter;
         a memoized writer re-requested with a DIFFERENT count refuses (two
-        claims about one cell's hardware cannot both be true).
+        claims about one cell's hardware cannot both be true). ``budget_plan``
+        (Batch 2 W4) threads the cache_budget.BudgetPlan record the same way,
+        with the same contradiction refusal.
         """
         self._ensure_unsealed()
         if spec.model != self.manifest["model"]:
@@ -697,14 +825,26 @@ class CampaignRun:
             )
         key = spec.to_row_key()
         if key not in self._cells:
-            self._cells[key] = CellWriter(self.run_root, spec, gpu_count=gpu_count)
-        elif gpu_count is not None and self._cells[key].gpu_count != gpu_count:
+            self._cells[key] = CellWriter(
+                self.run_root, spec, gpu_count=gpu_count, budget_plan=budget_plan
+            )
+            return self._cells[key]
+        writer = self._cells[key]
+        if gpu_count is not None and writer.gpu_count != gpu_count:
             raise CampaignLayoutError(
                 f"cells/{key}: gpu_count={gpu_count} contradicts the writer's "
-                f"established gpu_count={self._cells[key].gpu_count} — the "
+                f"established gpu_count={writer.gpu_count}; the "
                 "cell's serving-stack facts disagree; refusing to guess"
             )
-        return self._cells[key]
+        if budget_plan is not None and writer._check_budget_plan(budget_plan) != writer.budget_plan:
+            raise CampaignLayoutError(
+                f"cells/{key}: budget_plan (budget_bytes_total="
+                f"{budget_plan.get('budget_bytes_total')!r}) contradicts the "
+                "writer's established budget_plan (budget_bytes_total="
+                f"{(writer.budget_plan or {}).get('budget_bytes_total')!r}); "
+                "the cell's budget facts disagree; refusing to guess"
+            )
+        return writer
 
     def seal(self) -> Path:
         """Run-end §5 seal over the raw tree; see module-level seal_run."""

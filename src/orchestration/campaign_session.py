@@ -39,7 +39,15 @@ This module is the seam that wires the runner INTO the campaign layout:
   provider/hardware (``CAGE_PROVIDER``/``CAGE_HARDWARE``),
   ``dataset_manifests_sha256`` (env override or the sha256 of the
   ``CAGE_QUERY_MANIFEST`` file), the optional dataset roster
-  (``CAGE_CAMPAIGN_DATASETS``) and the run-level ``kv_cache_dtype``.
+  (``CAGE_CAMPAIGN_DATASETS``), the run-level ``kv_cache_dtype`` and, when
+  the cell pins ``CAGE_SLO_FLOORS_JSON`` (Batch 2 W4, ADR-0117), the §6.1
+  single-stream floors under ``slo_floors`` (the #14 executor's SLO source;
+  a reopened manifest must carry the SAME floors or the cell refuses).
+- **Budget record** (W4): ``CAGE_BUDGET_PLAN_JSON`` carries the relaunch's
+  cache_budget.BudgetPlan record on budgeted cells; it is cross-checked
+  against the cell tuple here and persisted by ``CellWriter`` under
+  cell.json ``budget_plan`` (the T2.5 rho_own basis). Absent pins keep the
+  pre-W4 path byte-identical.
 - **Write-time hash ledger** (S0-15 / §9.10 UPGRADE 5): every emitted artifact
   is sha256-hashed AT WRITE TIME into the append-only run-root journal
   ``write_time_hashes.jsonl``; ``seal_campaign_run`` refuses to seal when any
@@ -72,6 +80,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import shutil
 import sys
@@ -82,6 +91,7 @@ from typing import Any, Iterable, Mapping, Optional
 from src.analysis.cellspec import (
     CellSpec,
     CellSpecError,
+    Engine,
     LEGACY_ALIASES,
     Model,
     from_legacy,
@@ -89,18 +99,29 @@ from src.analysis.cellspec import (
 from typing import get_args as _get_args
 
 from src.analysis.stats.ledger import hash_artifacts
+from src.orchestration.cache_budget import KV_DTYPE_FACTOR
 
 __all__ = [
+    "BUDGET_PLAN_CELL_KEY",
+    "BUDGET_PLAN_ENV",
+    "CONSORT_COUNTERS",
     "CampaignCellSession",
     "CampaignSessionError",
     "ENGINE_OF_BACKEND",
     "HF_MODEL_SLUGS",
     "JOURNAL_NAME",
+    "SLO_FLOORS_ENV",
+    "SLO_FLOORS_MANIFEST_KEY",
     "append_write_time_hashes",
     "derive_cell_spec",
+    "parse_budget_plan",
+    "parse_slo_floors",
     "read_write_time_journal",
+    "refuse_dropped_rows_summary",
     "resolve_model_slug",
     "seal_campaign_run",
+    "validate_budget_plan",
+    "validate_slo_floors",
 ]
 
 #: Append-only write-time hash journal at the run root (S0-15). Lives BESIDE
@@ -112,6 +133,45 @@ JOURNAL_NAME = "write_time_hashes.jsonl"
 #: auxiliary artifact (organize_results indexes extra window *.json files); it
 #: is the completeness sentinel the shell cell_complete gates parse.
 WINDOW_METRICS_NAME = "metrics.json"
+
+#: metrics.json["consort"] counters (run_experiment, task #127) that must ALL
+#: read zero on a campaign window (ADR-0116, Batch 2 W3): a nonzero count is a
+#: request the window's artifacts do not carry, invisible to the
+#: requests-vs-evidence reconciliation because it is absent from both chains.
+CONSORT_COUNTERS: tuple[str, ...] = (
+    "n_dropped_prepare",
+    "n_dropped_record",
+    "n_dropped_turn",
+    "evidence_write_failures",
+)
+
+#: Batch 2 W4 (ADR-0117): the two pins run_campaign threads through every
+#: cell step's env (mirrored literals; tests/test_campaign_session.py pins
+#: them equal to the driver's and to the analysis consumer's keys).
+#: SLO_FLOORS_ENV carries the §6.1 single-stream floors as JSON
+#: ({engine: {ttft_s, tpot_s, ...}}, seconds); the session writes them into
+#: manifest.json[SLO_FLOORS_MANIFEST_KEY] when it creates the manifest and
+#: refuses a reopened manifest whose floors differ (§3: amended never).
+#: BUDGET_PLAN_ENV carries the relaunch's cache_budget.BudgetPlan record on
+#: budgeted cells; CellWriter persists it under cell.json[BUDGET_PLAN_CELL_KEY]
+#: (the T2.5 rho_own denominator + served dtype). An absent pin is absence:
+#: the pre-W4 path stays byte-identical.
+SLO_FLOORS_ENV = "CAGE_SLO_FLOORS_JSON"
+BUDGET_PLAN_ENV = "CAGE_BUDGET_PLAN_JSON"
+SLO_FLOORS_MANIFEST_KEY = "slo_floors"
+BUDGET_PLAN_CELL_KEY = "budget_plan"
+#: The engines a floor may be keyed by: the §7.3 server engines (the
+#: in-process oracle serves no floor).
+_FLOOR_ENGINES: frozenset[str] = frozenset(_get_args(Engine)) - {"hf"}
+#: cellspec topology -> the planner topologies a BudgetPlan for that cell may
+#: carry: a 'single' cell may be planned TP-sharded (session b serves
+#: single-instance cells at serving_tp=4; run_campaign._budget_env plans
+#: topology='tp' for them), the distributed legs plan their own topology.
+_BUDGET_PLAN_TOPOLOGIES: dict[str, tuple[str, ...]] = {
+    "single": ("single", "tp"),
+    "tp": ("tp",),
+    "pd": ("pd",),
+}
 
 #: run_experiment --backend token -> charter §7.3 engine axis value.
 #: gemini/ollama are pilot-legacy backends with NO charter engine — campaign
@@ -463,6 +523,201 @@ def refuse_stale_index_summary(experiment_summary: Mapping[str, Any]) -> None:
     )
 
 
+def refuse_dropped_rows_summary(experiment_summary: Mapping[str, Any]) -> None:
+    """Refuse a window whose runner summary counted a dropped row (ADR-0116).
+
+    ``run_experiment.py`` persists the per-query guard counters under
+    ``metrics.json["consort"]``. On the campaign path the record and turn
+    guards fail the cell in stage (``RecordStageError``), so those two
+    counters read zero by construction and this seam is their belt; the
+    prepare counter and the evidence-append counter are enforced HERE only.
+    Checked BEFORE any artifact is written. Absence is not zero: a missing
+    block, a missing counter or a non-integer value refuses (a runner without
+    the counters cannot vouch for its population).
+    """
+    consort = experiment_summary.get("consort")
+    if not isinstance(consort, Mapping):
+        raise CampaignSessionError(
+            "metrics.json carries no consort block (task #127 per-query drop "
+            "counters); a campaign window without it cannot vouch for its "
+            "population (ADR-0116)"
+        )
+    problems: list[str] = []
+    for key in CONSORT_COUNTERS:
+        value = consort.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            problems.append(
+                f"consort.{key} is {value!r}, not an integer count (never coerced)"
+            )
+        elif value != 0:
+            problems.append(
+                f"consort.{key} = {value}: the runner dropped request(s) this "
+                "window's artifacts do not carry; a campaign window's denominator "
+                "is the offered schedule, so the window is refused (ADR-0116)"
+            )
+    if problems:
+        raise CampaignSessionError(problems)
+
+
+def _json_norm(value: Any) -> Any:
+    """One JSON round trip: tuples become lists, keys sort, so a pin, its
+    on-disk copy and a caller's tuple-spelled record compare equal."""
+    return json.loads(json.dumps(value, sort_keys=True))
+
+
+def validate_slo_floors(floors: Any) -> dict[str, dict[str, Any]]:
+    """The §6.1 floors pin as a plain dict, or refuse (every problem named).
+
+    Keys are §7.3 server engines; every value is an object whose ``ttft_s``
+    and ``tpot_s`` are finite numbers > 0 in SECONDS (the goodput.SLOBaseline
+    inputs). Extra provenance keys (n_requests, statistic, budget_fraction,
+    source_sha256) pass through; an empty object pins nothing and refuses.
+    """
+    if not isinstance(floors, Mapping):
+        raise CampaignSessionError(
+            f"{SLO_FLOORS_ENV}: floors must be a JSON object "
+            f"{{engine: {{ttft_s, tpot_s}}}}, got {type(floors).__name__}"
+        )
+    if not floors:
+        raise CampaignSessionError(
+            f"{SLO_FLOORS_ENV}: floors object is empty (no engine floor to pin; "
+            "the #14 SLO pair needs one per served engine)"
+        )
+    problems: list[str] = []
+    out: dict[str, dict[str, Any]] = {}
+    for engine, floor in floors.items():
+        if engine not in _FLOOR_ENGINES:
+            problems.append(
+                f"{SLO_FLOORS_ENV}: {engine!r} is not a §7.3 server engine "
+                f"({sorted(_FLOOR_ENGINES)}; the hf oracle serves no floor)"
+            )
+            continue
+        if not isinstance(floor, Mapping):
+            problems.append(
+                f"{SLO_FLOORS_ENV}: floor for {engine!r} must be an object with "
+                f"ttft_s/tpot_s, got {floor!r}"
+            )
+            continue
+        for key in ("ttft_s", "tpot_s"):
+            value = floor.get(key)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                problems.append(
+                    f"{SLO_FLOORS_ENV}: {engine}.{key} is {value!r}, must be a "
+                    "finite number > 0 (seconds; the §6.1 single-stream floor)"
+                )
+        out[str(engine)] = dict(floor)
+    if problems:
+        raise CampaignSessionError(problems)
+    return out
+
+
+def parse_slo_floors(raw: str) -> dict[str, dict[str, Any]]:
+    """``CAGE_SLO_FLOORS_JSON`` -> validated floors (fail closed)."""
+    try:
+        doc = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise CampaignSessionError(f"{SLO_FLOORS_ENV} is not valid JSON: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise CampaignSessionError(
+            f"{SLO_FLOORS_ENV} must be a JSON object {{engine: {{ttft_s, tpot_s}}}}, "
+            f"got {type(doc).__name__}"
+        )
+    return validate_slo_floors(doc)
+
+
+def validate_budget_plan(plan: Any, spec: CellSpec) -> dict[str, Any]:
+    """The BudgetPlan record pin, cross-checked against the cell tuple.
+
+    The rho_own consumer reads ``budget_bytes_total`` (int >= 1) and
+    ``kv_dtype`` (a cache_budget dtype); the record's ``model`` and ``engine``
+    must be the cell's, its ``topology`` one the cell may be planned under
+    (_BUDGET_PLAN_TOPOLOGIES) and its ``r`` the cell's ``budget_r`` when the
+    cell carries one (the DIST overlay carries none: its r is the registered
+    dist_budget_r and cannot be cross-checked here). A record planned for
+    another cell is mislabeled data and refuses.
+    """
+    if not isinstance(plan, Mapping):
+        raise CampaignSessionError(
+            f"{BUDGET_PLAN_ENV}: the budget plan must be a JSON object (a "
+            f"cache_budget.BudgetPlan record), got {type(plan).__name__}"
+        )
+    if spec.engine == "hf":
+        # Review S2: the same structural rule CellWriter applies, enforced at
+        # activation so an hf cell never serves a trial under a budget pin.
+        raise CampaignSessionError(
+            f"{BUDGET_PLAN_ENV}: the in-process hf oracle serves no byte budget "
+            "(P2: excluded from pressure sweeps); a budget plan on an hf cell "
+            "is a contradiction"
+        )
+    problems: list[str] = []
+    budget = plan.get("budget_bytes_total")
+    if isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
+        problems.append(
+            f"{BUDGET_PLAN_ENV}: budget_bytes_total is {budget!r}, must be an "
+            "integer >= 1 (bytes; the rho_own denominator)"
+        )
+    kv_dtype = plan.get("kv_dtype")
+    if not isinstance(kv_dtype, str) or kv_dtype not in KV_DTYPE_FACTOR:
+        problems.append(
+            f"{BUDGET_PLAN_ENV}: kv_dtype is {kv_dtype!r}, must be one of "
+            f"{sorted(KV_DTYPE_FACTOR)} (the SERVED KV dtype)"
+        )
+    for key, want in (("model", spec.model), ("engine", spec.engine)):
+        if plan.get(key) != want:
+            problems.append(
+                f"{BUDGET_PLAN_ENV}: {key} is {plan.get(key)!r} but this cell's "
+                f"{key} is {want!r} (a budget planned for another cell is "
+                "mislabeled data)"
+            )
+    topology = plan.get("topology")
+    if topology not in _BUDGET_PLAN_TOPOLOGIES.get(spec.topology, ()):
+        problems.append(
+            f"{BUDGET_PLAN_ENV}: topology is {topology!r} but this cell's topology "
+            f"is {spec.topology!r} (a 'single' cell may be planned TP-sharded; "
+            "tp/pd cells plan their own topology)"
+        )
+    r = plan.get("r")
+    if isinstance(r, bool) or not isinstance(r, (int, float)) or not math.isfinite(r) or r <= 0:
+        problems.append(f"{BUDGET_PLAN_ENV}: r is {r!r}, must be finite and > 0")
+    elif spec.budget_r is not None and not math.isclose(
+        # rel_tol 1e-6: the cell's budget_r arrives through CAGE_CELL_BUDGET_R,
+        # which run_campaign formats with :g (6 significant digits), while the
+        # plan carries the unformatted grid float (review S5).
+        r, spec.budget_r, rel_tol=1e-6, abs_tol=0.0
+    ):
+        problems.append(
+            f"{BUDGET_PLAN_ENV}: r is {r!r} but this cell's budget_r is "
+            f"{spec.budget_r!r}"
+        )
+    if problems:
+        raise CampaignSessionError(problems)
+    try:
+        return _json_norm(dict(plan))
+    except TypeError as exc:
+        raise CampaignSessionError(
+            f"{BUDGET_PLAN_ENV}: the budget plan is not JSON-serializable: {exc}"
+        ) from exc
+
+
+def parse_budget_plan(raw: str, spec: CellSpec) -> dict[str, Any]:
+    """``CAGE_BUDGET_PLAN_JSON`` -> validated record (fail closed)."""
+    try:
+        doc = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise CampaignSessionError(f"{BUDGET_PLAN_ENV} is not valid JSON: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise CampaignSessionError(
+            f"{BUDGET_PLAN_ENV} must be a JSON object (a cache_budget.BudgetPlan "
+            f"record), got {type(doc).__name__}"
+        )
+    return validate_budget_plan(doc, spec)
+
+
 def _normalize_json(value: Any) -> Any:
     """numpy scalars/arrays -> native JSON values, recursively.
 
@@ -518,6 +773,8 @@ class CampaignCellSession:
         gpu_count: Optional[int] = None,
         window_ordinal_base: int = 0,
         env: Mapping[str, str] | None = None,
+        slo_floors: Mapping[str, Any] | None = None,
+        budget_plan: Mapping[str, Any] | None = None,
     ) -> None:
         self.env = os.environ if env is None else env
         self.run_root = Path(run_root)
@@ -527,6 +784,27 @@ class CampaignCellSession:
         self.num_trials = int(num_trials)
         self.run_seed = int(run_seed)
         self.kv_cache_dtype = kv_cache_dtype
+        # Batch 2 W4 (ADR-0117): the §6.1 floors this cell pins (written into
+        # manifest.json at creation, compared on reopen) and the BudgetPlan
+        # record CellWriter persists into cell.json; None = pin not in use
+        # (pilot/shell producers), the pre-W4 path byte-identical.
+        self.slo_floors = None if slo_floors is None else validate_slo_floors(slo_floors)
+        self.budget_plan = (
+            None if budget_plan is None else validate_budget_plan(budget_plan, spec)
+        )
+        if (
+            self.slo_floors is not None
+            and spec.engine != "hf"
+            and spec.engine not in self.slo_floors
+        ):
+            # Review S3: the floor of THIS cell's engine is what contrast #14
+            # reads for its windows; a pin copied from another engine's plan
+            # would spend the GPU time before the analysis refused.
+            raise CampaignSessionError(
+                f"{SLO_FLOORS_ENV} pins floors for {sorted(self.slo_floors)} but "
+                f"this cell serves on {spec.engine!r}; every window needs the "
+                "floor of the engine it was served on (§6.1)"
+            )
         # W4.2: the GPU count this cell's serving stack launched with
         # (CAGE_GPU_COUNT, threaded from the run_campaign plan step) —
         # persisted into cell.json by CellWriter, which owns the
@@ -591,6 +869,60 @@ class CampaignCellSession:
                 )
         if problems:
             raise CampaignSessionError(problems)
+        self._check_existing_tree()
+
+    def _check_existing_tree(self) -> None:
+        """W4 activation checks (review S1): a pinned cell refuses BEFORE it
+        serves a trial when the run's manifest carries other floors, or when
+        the cell's recorded budget contradicts the pin, or when the cell is
+        already populated without a budget record (review S4). emit_window
+        and CellWriter apply the same rules again at write time."""
+        manifest_path = self.run_root / "manifest.json"
+        if self.slo_floors is not None and manifest_path.is_file():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise CampaignSessionError(
+                    f"{manifest_path} is not readable JSON ({exc}); refusing to "
+                    "extend the run"
+                ) from exc
+            if not isinstance(manifest, Mapping):
+                raise CampaignSessionError(
+                    f"{manifest_path} is not a JSON object; refusing to extend the run"
+                )
+            self._check_manifest_floors(manifest)
+        meta_path = self.cell_dir / "cell.json"
+        if self.budget_plan is None or not meta_path.is_file():
+            return
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CampaignSessionError(
+                f"{meta_path} is not valid JSON ({exc}); the cell cannot be "
+                "resumed; re-run it with CAGE_FORCE_RERUN=1 to wipe it"
+            ) from exc
+        if not isinstance(meta, Mapping):
+            return
+        recorded = meta.get(BUDGET_PLAN_CELL_KEY)
+        windows = meta.get("windows")
+        if recorded is None:
+            if isinstance(windows, Mapping) and windows:
+                raise CampaignSessionError(
+                    f"{meta_path} carries {len(windows)} window(s) but no "
+                    f"{BUDGET_PLAN_CELL_KEY!r} record; a populated cell without a "
+                    "budget record cannot be extended under a budget pin (its "
+                    "windows were served under an unrecorded budget); wipe it "
+                    "with CAGE_FORCE_RERUN=1 or use a new run_id"
+                )
+            return
+        if _json_norm(recorded) != _json_norm(self.budget_plan):
+            got = recorded.get("budget_bytes_total") if isinstance(recorded, Mapping) else recorded
+            raise CampaignSessionError(
+                f"{meta_path} recorded {BUDGET_PLAN_CELL_KEY!r} (budget_bytes_total="
+                f"{got!r}) contradicts this cell's {BUDGET_PLAN_ENV} pin "
+                f"(budget_bytes_total={self.budget_plan.get('budget_bytes_total')!r}); "
+                "a re-run under another budget is a new cell tree, not an extension"
+            )
 
     # -- activation -------------------------------------------------------
 
@@ -636,6 +968,12 @@ class CampaignCellSession:
         )
         if problems:
             raise CampaignSessionError(problems)
+        # W4: the two plan pins (an empty value is absence, like every other
+        # optional seam env; a malformed one refuses naming the env).
+        raw_floors = (env.get(SLO_FLOORS_ENV) or "").strip()
+        slo_floors = parse_slo_floors(raw_floors) if raw_floors else None
+        raw_plan = (env.get(BUDGET_PLAN_ENV) or "").strip()
+        budget_plan = parse_budget_plan(raw_plan, spec) if raw_plan else None
         return cls(
             run_root=Path(root),
             dataset=args.dataset,
@@ -646,6 +984,8 @@ class CampaignCellSession:
             gpu_count=gpu_count,
             window_ordinal_base=base or 0,
             env=env,
+            slo_floors=slo_floors,
+            budget_plan=budget_plan,
         )
 
     # -- paths / resume ---------------------------------------------------
@@ -774,6 +1114,10 @@ class CampaignCellSession:
                 or "auto"
             ),
         }
+        if self.slo_floors is not None:
+            # W4: the §6.1 floors, keyed as the #14 executor reads them
+            # (run_campaign_analysis._SLO_FLOORS_MANIFEST_KEY).
+            extra[SLO_FLOORS_MANIFEST_KEY] = self.slo_floors
         roster_raw = (self.env.get("CAGE_CAMPAIGN_DATASETS") or "").strip()
         if roster_raw:
             cl = _campaign_layout()
@@ -799,6 +1143,38 @@ class CampaignCellSession:
             problems.append(f"{key} is unset/empty — §3 requires {why}")
         return value
 
+    def _check_manifest_floors(self, manifest: Mapping[str, Any]) -> None:
+        """W4 reopen rule: a pinned cell extends only a run whose manifest
+        carries the SAME floors (§3: amended never; one run, one floor set).
+        A cell without a pin extends any run (pre-W4 producers)."""
+        if self.slo_floors is None:
+            return
+        recorded = manifest.get(SLO_FLOORS_MANIFEST_KEY)
+        if recorded is None:
+            raise CampaignSessionError(
+                f"manifest.json carries no {SLO_FLOORS_MANIFEST_KEY!r} but this "
+                f"cell pins {SLO_FLOORS_ENV}; §3: the manifest is amended never, "
+                "so the floors can never be added to this run (a re-run with the "
+                "pinned plan is a new run_id)"
+            )
+        if not isinstance(recorded, Mapping):
+            raise CampaignSessionError(
+                f"manifest.json {SLO_FLOORS_MANIFEST_KEY!r} is {recorded!r}, not an "
+                "object; refusing to extend a run whose floors cannot be read"
+            )
+        if _json_norm(recorded) != _json_norm(self.slo_floors):
+            differing = sorted(
+                engine
+                for engine in set(recorded) | set(self.slo_floors)
+                if _json_norm(recorded.get(engine)) != _json_norm(self.slo_floors.get(engine))
+            )
+            raise CampaignSessionError(
+                f"manifest.json {SLO_FLOORS_MANIFEST_KEY!r} differs from this "
+                f"cell's {SLO_FLOORS_ENV} pin for engine(s) {differing}; one run "
+                "serves ONE floor set (§3 amended never); a cell planned against "
+                "other floors belongs to a new run_id"
+            )
+
     def _ensure_run(self, backend_metadata: Mapping[str, Any]) -> Any:
         """Open the CampaignRun, creating manifest.json on first use (§3)."""
         if self._run is not None:
@@ -806,7 +1182,9 @@ class CampaignCellSession:
         cl = _campaign_layout()
         manifest_path = self.run_root / "manifest.json"
         if manifest_path.is_file():
-            self._run = cl.CampaignRun(self.run_root)
+            run = cl.CampaignRun(self.run_root)
+            self._check_manifest_floors(run.manifest)
+            self._run = run
             return self._run
         problems: list[str] = []
         provider = self._require_env("CAGE_PROVIDER", "the provider (neocloud name or gcp)", problems)
@@ -942,9 +1320,12 @@ class CampaignCellSession:
     ) -> Any:
         """Emit ONE §1 measurement window through campaign_layout's writers."""
         refuse_stale_index_summary(experiment_summary)
+        refuse_dropped_rows_summary(experiment_summary)
         cl = _campaign_layout()
         run = self._ensure_run(backend_metadata)
-        cell = run.cell(self.spec, gpu_count=self.gpu_count)
+        cell = run.cell(
+            self.spec, gpu_count=self.gpu_count, budget_plan=self.budget_plan
+        )
 
         requests_rows_n = [
             self._normalize_request_row(row, i) for i, row in enumerate(results_rows)

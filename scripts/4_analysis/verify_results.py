@@ -29,7 +29,13 @@ the first:
     into the run root is REFUSED (the old tool dropped unsealed report files
     onto a sealed root);
 (h) gate semantics — exit 0 only when no FAIL-severity finding exists
-    (WARNs allowed); 1 on failure; 2 on usage/refusal.
+    (WARNs allowed); 1 on failure; 2 on usage/refusal;
+(i) row count vs the offered population per window (ADR-0116, Batch 2 W3):
+    a request dropped by a per-query guard is absent from requests.jsonl AND
+    qa_evidence.jsonl, so (b) cannot see it; the window's runner summary
+    (metrics.json) carries the offered population (closed loop:
+    experiment.num_measured_requests; open loop: workload.open_loop.n_scheduled)
+    and the task #127 consort counters, and both must agree with the rows.
 
 ``--pilot --results-dir DIR`` preserves the pilot-era metrics-vs-CSV check
 (``verify_dir``) verbatim for pilot trees; that mode keeps writing its report
@@ -76,6 +82,19 @@ _WINDOWS_ENTRY_WARN_FIELDS: tuple[str, ...] = ("seed", "rep", "t_start", "t_end"
 
 #: Per-query artifacts subject to checks (a)-(c).
 _PER_QUERY_ARTIFACTS: tuple[str, ...] = ("requests.jsonl", "qa_evidence.jsonl")
+
+#: The per-window runner summary campaign_session writes beside the §1
+#: artifacts (campaign_session.WINDOW_METRICS_NAME; tests pin the two equal):
+#: check (i) reads the offered population and the consort counters from it.
+_WINDOW_METRICS_NAME = "metrics.json"
+#: metrics.json["consort"] counters that must all be zero on a campaign window
+#: (ADR-0116, Batch 2 W3; = campaign_session.CONSORT_COUNTERS, pinned equal).
+_CONSORT_COUNTERS: tuple[str, ...] = (
+    "n_dropped_prepare",
+    "n_dropped_record",
+    "n_dropped_turn",
+    "evidence_write_failures",
+)
 
 VERIFICATION_DIR_SUFFIX = "_verification"
 REPORT_JSON_NAME = "verification_report.json"
@@ -205,13 +224,135 @@ def _check_per_query_file(
         findings.append(Finding("FAIL", "duplicates", rel, detail))
 
 
+def expected_row_count(metrics: dict[str, Any]) -> tuple[int | None, str]:
+    """The number of requests.jsonl rows a window MUST carry, from its runner
+    summary: every offered request produces exactly one row (a result row or,
+    open loop, a dispatch stub). Closed loop: ``experiment.num_measured_requests``;
+    open loop: ``workload.open_loop.n_scheduled`` (campaign mode refuses the
+    warm-up trim, so no scheduled arrival is filtered). Returns
+    ``(count, source)``, or ``(None, why)`` when the summary lacks the field
+    (absence is unknown, never coerced)."""
+    workload = metrics.get("workload")
+    workload = workload if isinstance(workload, dict) else {}
+    if workload.get("mode") == "open_loop":
+        open_loop = workload.get("open_loop")
+        open_loop = open_loop if isinstance(open_loop, dict) else {}
+        value, source = open_loop.get("n_scheduled"), "workload.open_loop.n_scheduled"
+    else:
+        experiment = metrics.get("experiment")
+        experiment = experiment if isinstance(experiment, dict) else {}
+        value, source = experiment.get("num_measured_requests"), "experiment.num_measured_requests"
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None, f"{source} is {value!r}"
+    return value, source
+
+
+def _check_row_count(
+    window_dir: Path,
+    rel_window: str,
+    requests_rows: list[dict[str, Any]] | None,
+    findings: list[Finding],
+) -> int | None:
+    """Check (i): the window's rows vs its offered population and its consort
+    counters (ADR-0116). Returns the offered population, None when unknown."""
+    path = window_dir / _WINDOW_METRICS_NAME
+    where = f"{rel_window}/{_WINDOW_METRICS_NAME}"
+    if not path.is_file():
+        findings.append(
+            Finding(
+                "WARN",
+                "row-count",
+                where,
+                "no runner summary beside the §1 artifacts: the offered "
+                "population and the consort counters are unknown, so a dropped "
+                "row cannot be detected here (campaign_session writes "
+                f"{_WINDOW_METRICS_NAME} as the window's completeness sentinel)",
+            )
+        )
+        return None
+    try:
+        metrics = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        findings.append(Finding("FAIL", "schema", where, f"invalid JSON: {exc}"))
+        return None
+    if not isinstance(metrics, dict):
+        findings.append(
+            Finding(
+                "FAIL",
+                "schema",
+                where,
+                f"root must be an object, got {type(metrics).__name__}",
+            )
+        )
+        return None
+    consort = metrics.get("consort")
+    if not isinstance(consort, dict):
+        findings.append(
+            Finding(
+                "FAIL",
+                "row-count",
+                where,
+                "no consort block (task #127): the per-query drop counters are "
+                "unknown, never assumed zero (ADR-0116)",
+            )
+        )
+    else:
+        for key in _CONSORT_COUNTERS:
+            value = consort.get(key)
+            if isinstance(value, bool) or not isinstance(value, int):
+                findings.append(
+                    Finding(
+                        "FAIL",
+                        "row-count",
+                        where,
+                        f"consort.{key} is {value!r}, not an integer count",
+                    )
+                )
+            elif value != 0:
+                findings.append(
+                    Finding(
+                        "FAIL",
+                        "row-count",
+                        where,
+                        f"consort.{key} = {value}: the runner dropped request(s) "
+                        "this window's artifacts do not carry (ADR-0116)",
+                    )
+                )
+    expected, source = expected_row_count(metrics)
+    if expected is None:
+        findings.append(
+            Finding(
+                "FAIL",
+                "row-count",
+                where,
+                f"offered population unknown ({source}); the row count cannot "
+                "be checked (ADR-0116)",
+            )
+        )
+        return None
+    if requests_rows is not None and len(requests_rows) != expected:
+        findings.append(
+            Finding(
+                "FAIL",
+                "row-count",
+                rel_window,
+                f"requests.jsonl has {len(requests_rows)} row(s) but the window "
+                f"offered {expected} ({source}): a request without a row is a "
+                "changed population, invisible to the requests-vs-evidence "
+                "reconciliation because it is absent from both chains "
+                "(ADR-0116, Batch 2 W3)",
+            )
+        )
+    return expected
+
+
 def _check_window(
     run_dir: Path,
     window_dir: Path,
     dataset: str,
     findings: list[Finding],
 ) -> dict[str, Any]:
-    """Run checks (a)-(c) + accounting (e) for one window; returns its summary."""
+    """Run checks (a)-(c), (i) + accounting (e) for one window; returns its summary."""
     rel_window = window_dir.relative_to(run_dir).as_posix()
     per_file_rows: dict[str, list[dict[str, Any]] | None] = {}
     for name in _PER_QUERY_ARTIFACTS:
@@ -288,12 +429,16 @@ def _check_window(
                 detail += f"; first unmatched request identit(ies): {lost}"
             findings.append(Finding("FAIL", "reconciliation", rel_window, detail))
 
+    # (i) rows vs the offered population + consort counters (ADR-0116, W3).
+    n_expected = _check_row_count(window_dir, rel_window, requests_rows, findings)
+
     # (e) §9.10 exclusion accounting — absence is NOT zero: rows lacking any
     # validity field are counted as validity-unknown, never as valid.
     accounting: dict[str, Any] = {
         "window": rel_window,
         "dataset": dataset,
         "n_requests_rows": None,
+        "n_expected_rows": n_expected,
         "n_evidence_rows": None,
         "n_error": None,
         "n_ok_false": None,

@@ -3266,6 +3266,11 @@ def run_experiment(
                     except Exception as _ex:
                         # One guard covers the whole turn (prepare+send+record), so the
                         # drop is counted as a turn, not attributed to a stage (§9.10).
+                        # ADR-0116 (W3): a campaign window's denominator is the
+                        # offered schedule, so a dropped turn is a changed
+                        # population, not a lost sample: the cell fails instead.
+                        if collect_results and campaign_session is not None:
+                            raise RecordStageError(example.id, "turn", _ex) from _ex
                         if collect_results:
                             consort_counters["n_dropped_turn"] += 1
                         print(f"[{stage_name}] {example.id} failed: {_ex}; skipping this turn")
@@ -3340,6 +3345,22 @@ def run_experiment(
                     responses = engine.batch_generate(requests)
                 if collect_results:
                     measured_window_t_end = time.time()
+                if (
+                    collect_results
+                    and campaign_session is not None
+                    and len(responses) != len(requests)
+                ):
+                    # ADR-0116 (W3 review F4): the zip below would silently drop
+                    # the unanswered tail of the unit; on the campaign path that
+                    # is a changed population, so the cell fails instead.
+                    raise RecordStageError(
+                        kept[0].id,
+                        "send",
+                        ValueError(
+                            f"{len(requests)} request(s) sent, {len(responses)} "
+                            "response(s) returned"
+                        ),
+                    )
 
                 for example, meta, response in zip(kept, metas, responses):
                     # Per-query guard (B4): a failed record (metric-eval / OOM) drops one
@@ -3355,6 +3376,10 @@ def run_experiment(
                         # hide in n_dropped_record); it fails the cell.
                         raise
                     except Exception as _ex:
+                        # ADR-0116 (W3): on the campaign path the row would be
+                        # absent from every window artifact; the cell fails.
+                        if collect_results and campaign_session is not None:
+                            raise RecordStageError(example.id, "record", _ex) from _ex
                         if collect_results:
                             consort_counters["n_dropped_record"] += 1
                         print(f"[{stage_name}] record failed for {example.id}: {_ex}; skipping row")
@@ -3461,6 +3486,10 @@ def run_experiment(
                 except (AnswerabilityMismatchError, AnswerabilityFlagError):
                     raise  # A8: a label defect fails the cell, never a silent drop
                 except Exception as _ex:
+                    # ADR-0116 (W3): the campaign cell fails instead of dropping
+                    # the row (see the closed-loop guard).
+                    if campaign_session is not None:
+                        raise RecordStageError(example.id, "record", _ex) from _ex
                     consort_counters["n_dropped_record"] += 1
                     print(f"[open-loop] record failed for {example.id}: {_ex}; skipping row")
             else:
@@ -3627,7 +3656,9 @@ def run_experiment(
     # ADR-0055 amendment 2026-09-19 (option C): a campaign window whose stage
     # sent no measured request has no dispatch span. Refuse (no window is
     # emitted) instead of stamping bounds around nothing; the pilot path
-    # never reads the stamps and is unchanged.
+    # never reads the stamps and is unchanged. The second cause below was
+    # reachable through the multi-turn guard; since ADR-0116 that guard fails
+    # the cell at the first dropped turn, so the branch is defensive only.
     if campaign_session is not None and (
         measured_window_t_start is None or measured_window_t_end is None
     ):
@@ -4290,6 +4321,29 @@ class CacheResetError(RuntimeError):
     campaign mode refuses instead of warning. The pilot path keeps the
     historical warning.
     """
+
+
+class RecordStageError(RuntimeError):
+    """A per-query guard caught a failure on the campaign path (ADR-0116, W3).
+
+    The pilot guards count the drop (metrics.json consort) and skip the row.
+    A campaign window's denominator is the offered schedule, so a skipped row
+    is a changed population, not a lost sample: the request would be absent
+    from requests.jsonl and qa_evidence.jsonl alike and both reconciliations
+    would pass. Campaign mode fails the cell instead (the driver's resume
+    rules re-run it); the emit seam and verify_results enforce the counters
+    as belt and braces.
+    """
+
+    def __init__(self, example_id: str, stage: str, cause: BaseException) -> None:
+        self.example_id = example_id
+        self.stage = stage
+        super().__init__(
+            f"campaign mode: {stage} stage failed for {example_id} "
+            f"({type(cause).__name__}: {cause}); a per-query drop would change "
+            "the window population silently (ADR-0116, Batch 2 W3), so the "
+            "cell fails instead of skipping the row"
+        )
 
 
 class WarmupPoolError(ValueError):

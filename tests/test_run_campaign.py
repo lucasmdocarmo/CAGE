@@ -138,6 +138,90 @@ def floor_table(tmp_path: Path) -> Path:
     return path
 
 
+#: Batch 2 W4: the cal-v1 artifact scripts/3_run/calibrate_cell.py writes
+#: (CellCalibration.to_manifest), mirrored per engine. The driver consumes the
+#: floor pair, n_requests/statistic, budget_fraction, engine and model; the
+#: lambda_star block is provenance only. Distinct floors per engine so a
+#: swapped registration is detectable.
+_CAL_FLOORS: Dict[str, tuple] = {"vllm": (0.12, 0.02), "sglang": (0.15, 0.025)}
+
+
+def _calibration_doc(
+    engine: str,
+    *,
+    model: str = "Qwen/Qwen3-14B",
+    budget_fraction: float = 1.5,
+    n_requests: int = 30,
+    label: str = "ESTIMATED",
+) -> Dict[str, Any]:
+    ttft_s, tpot_s = _CAL_FLOORS.get(engine, (0.1, 0.01))
+    return {
+        "procedure_version": "cal-v1 (2026-08-12)",
+        "model": model,
+        "engine": engine,
+        "budget_fraction": budget_fraction,
+        "procedure": {
+            "floor_n_requests": 30,
+            "floor_statistic": "median",
+            "probe_ladder_factor": 1.3,
+            "probe_window_s": 75.0,
+            "probe_warmup_s": 10.0,
+            "probe_attainment_min": 0.9,
+            "probe_max_steps": 12,
+        },
+        "confirmatory": False,
+        "floor": {
+            "ttft_s": ttft_s,
+            "tpot_s": tpot_s,
+            "n_requests": n_requests,
+            "statistic": "median",
+        },
+        "lambda_star": {
+            "label": label,
+            "lambda_star_qps": 2.0 if label == "ESTIMATED" else None,
+            "sustained_rate_qps": 2.0,
+            "first_unsustainable_qps": 2.6 if label == "ESTIMATED" else None,
+            "n_steps": 2,
+            "steps": [],
+        },
+    }
+
+
+def _write_calibrations(
+    directory: Path, engines, **overrides: Any
+) -> Dict[str, Path]:
+    """One cal-v1 artifact per engine under ``directory`` -> {engine: path}."""
+    directory.mkdir(parents=True, exist_ok=True)
+    out: Dict[str, Path] = {}
+    for engine in engines:
+        path = directory / f"calibration_{engine}.json"
+        path.write_text(
+            json.dumps(_calibration_doc(engine, **overrides)), encoding="utf-8"
+        )
+        out[engine] = path
+    return out
+
+
+def _grid_engines(grid: Any) -> List[str]:
+    """Every server engine a grid registers cells on (hf has no floor)."""
+    engines = set(grid.f1_engines) | set(grid.f2_engines) | set(grid.f3_engines)
+    engines |= {engine for _bid, engine, _topology in grid.dist_cells}
+    return sorted(engines - {"hf"})
+
+
+@pytest.fixture()
+def calibrations_a(tmp_path: Path) -> Dict[str, Path]:
+    return _write_calibrations(tmp_path / "cal_a", ("vllm", "sglang"))
+
+
+def _calibration_args(calibrations: Dict[str, Path]) -> List[str]:
+    """The repeatable ``--calibration ENGINE=PATH`` CLI registrations."""
+    out: List[str] = []
+    for engine, path in calibrations.items():
+        out += ["--calibration", f"{engine}={path}"]
+    return out
+
+
 #: The dense-retriever freeze slot as the registration artifact carries it
 #: (INSTRUMENT_REVISIONS.dense_retriever, ADR-0099). Mirrored into a tmp
 #: artifact so every plan built here is hermetic (no dependency on the
@@ -185,9 +269,11 @@ def test_conftest_freeze_mirror_pins_the_same_literals() -> None:
 
 
 @pytest.fixture()
-def plan_a(floor_table: Path) -> Dict[str, Any]:
+def plan_a(floor_table: Path, calibrations_a: Dict[str, Path]) -> Dict[str, Any]:
     floor = rc.load_floor_table(floor_table)
-    return rc.build_plan("a", floor, window_duration_s=300.0)
+    return rc.build_plan(
+        "a", floor, window_duration_s=300.0, calibrations=calibrations_a
+    )
 
 
 def _cells(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -248,7 +334,7 @@ def stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("STUB_FAIL_MARKER", raising=False)
     # Hermetic endpoint env (Batch 2 W2): 'run' refuses a runner override or
     # a differing launcher port, so the developer's shell must not leak in.
-    for name in (*rc.API_BASE_OVERRIDE_ENVS, *rc.SHELL_PORT_ENVS):
+    for name in (*rc.API_BASE_OVERRIDE_ENVS, *rc.SHELL_PORT_ENVS, *rc.CELL_PIN_ENVS):
         monkeypatch.delenv(name, raising=False)
 
     class Stub:
@@ -268,8 +354,14 @@ def stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 def _stub_plan(grid: Any, floor_path: Path, stub_cmd) -> Dict[str, Any]:
-    """Build a plan against a synthetic grid with stubbed runner + launchers."""
+    """Build a plan against a synthetic grid with stubbed runner + launchers
+    (Batch 2 W4: one cal-v1 floor artifact per grid engine, beside the floor
+    table)."""
     floor = rc.load_floor_table(floor_path)
+    calibrations = _write_calibrations(
+        Path(floor_path).parent / "cal", _grid_engines(grid),
+        model=rc.HF_ID_OF_SLUG[grid.model],
+    )
     orig = rc.SESSION_GRIDS
     rc.SESSION_GRIDS = {grid.session: grid}
     try:
@@ -279,6 +371,7 @@ def _stub_plan(grid: Any, floor_path: Path, stub_cmd) -> Dict[str, Any]:
             window_duration_s=60.0,
             runner_cmd=stub_cmd,
             launcher_cmds={"vllm": stub_cmd, "sglang": stub_cmd},
+            calibrations=calibrations,
         )
     finally:
         rc.SESSION_GRIDS = orig
@@ -663,12 +756,15 @@ class TestCellSteps:
             s["rate_basis"] == "kv-bound-only [pending calibration]" for s in pressure
         )
 
-    def test_calibrated_lambda_compute_changes_basis(self, tmp_path):
+    def test_calibrated_lambda_compute_changes_basis(self, tmp_path, calibrations_a):
         path = tmp_path / "ft_cal.json"
         path.write_text(
             json.dumps(_floor_table_doc(lambda_compute=1.0)), encoding="utf-8"
         )
-        plan = rc.build_plan("a", rc.load_floor_table(path), window_duration_s=300.0)
+        plan = rc.build_plan(
+            "a", rc.load_floor_table(path), window_duration_s=300.0,
+            calibrations=calibrations_a,
+        )
         pressure = [s for s in _cells(plan) if s["family"] in ("F2", "F3")]
         assert all("pending calibration" not in s["rate_basis"] for s in pressure)
 
@@ -1077,7 +1173,9 @@ class TestCorpusTruncLadder:
 
 
 class TestPlanSchema:
-    def test_cli_plan_writes_loadable_plan_and_nothing_else(self, tmp_path, floor_table):
+    def test_cli_plan_writes_loadable_plan_and_nothing_else(
+        self, tmp_path, floor_table, calibrations_a
+    ):
         out = tmp_path / "plan_a.json"
         before = {p for p in tmp_path.rglob("*")}
         code = rc.main(
@@ -1091,6 +1189,7 @@ class TestPlanSchema:
                 "300",
                 "--out",
                 str(out),
+                *_calibration_args(calibrations_a),
             ]
         )
         assert code == 0
@@ -1721,7 +1820,7 @@ class TestGpuCountProducer:
         assert dist["gpu_count"] is None
         assert "CAGE_GPU_COUNT" not in dist["env"]
 
-    def test_pd_cell_gpu_count_is_role_sum(self, floor_table, stub):
+    def test_pd_cell_gpu_count_is_role_sum(self, floor_table, stub, tmp_path):
         # pd = prefill + decode role GPU counts summed; the default (1, 1)
         # single-node dev shape counts 2.
         grid = _tiny_grid(dist_cells=(("B3", "vllm", "pd"),))
@@ -1739,6 +1838,7 @@ class TestGpuCountProducer:
                     "sglang": stub.cmd,
                     rc.PD_LAUNCHER_KEY: stub.cmd,
                 },
+                calibrations=_write_calibrations(tmp_path / "cal", ("vllm",)),
             )
         finally:
             rc.SESSION_GRIDS = orig
@@ -1770,8 +1870,19 @@ def floor_table_b(tmp_path: Path) -> Path:
 
 
 @pytest.fixture()
-def plan_b(floor_table_b: Path) -> Dict[str, Any]:
-    return rc.build_plan("b", rc.load_floor_table(floor_table_b), window_duration_s=300.0)
+def calibrations_b(tmp_path: Path) -> Dict[str, Path]:
+    return _write_calibrations(
+        tmp_path / "cal_b", ("vllm", "sglang"),
+        model="meta-llama/Llama-3.3-70B-Instruct",
+    )
+
+
+@pytest.fixture()
+def plan_b(floor_table_b: Path, calibrations_b: Dict[str, Path]) -> Dict[str, Any]:
+    return rc.build_plan(
+        "b", rc.load_floor_table(floor_table_b), window_duration_s=300.0,
+        calibrations=calibrations_b,
+    )
 
 
 class TestSessionB:
@@ -2152,9 +2263,14 @@ def manifests_a(tmp_path: Path) -> Dict[str, Path]:
 
 
 @pytest.fixture()
-def plan_a_manifests(floor_table: Path, manifests_a: Dict[str, Path]) -> Dict[str, Any]:
+def plan_a_manifests(
+    floor_table: Path, manifests_a: Dict[str, Path], calibrations_a: Dict[str, Path]
+) -> Dict[str, Any]:
     floor = rc.load_floor_table(floor_table)
-    return rc.build_plan("a", floor, window_duration_s=300.0, query_manifests=manifests_a)
+    return rc.build_plan(
+        "a", floor, window_duration_s=300.0, query_manifests=manifests_a,
+        calibrations=calibrations_a,
+    )
 
 
 class TestQueryManifestRegistration:
@@ -2204,11 +2320,14 @@ class TestQueryManifestRegistration:
             }[key]
 
     def test_partial_registration_blocks_only_the_unmanifested_datasets(
-        self, floor_table, tmp_path
+        self, floor_table, tmp_path, calibrations_a
     ):
         floor = rc.load_floor_table(floor_table)
         only = {"squad_v2": _write_manifest(tmp_path, "squad_v2")}
-        plan = rc.build_plan("a", floor, window_duration_s=300.0, query_manifests=only)
+        plan = rc.build_plan(
+            "a", floor, window_duration_s=300.0, query_manifests=only,
+            calibrations=calibrations_a,
+        )
         for s in self._b12(plan):
             if s["dataset"] == "squad_v2":
                 assert s["blocked_on"] is None
@@ -2269,6 +2388,8 @@ class TestQueryManifestRegistration:
         path.write_text(json.dumps(manifest), encoding="utf-8")
         floor = rc.load_floor_table(floor_table)
 
+        calibrations = _write_calibrations(tmp_path / "cal", ("vllm",))
+
         def _plan(grid):
             orig = rc.SESSION_GRIDS
             rc.SESSION_GRIDS = {grid.session: grid}
@@ -2276,7 +2397,7 @@ class TestQueryManifestRegistration:
                 return rc.build_plan(
                     grid.session, floor, window_duration_s=60.0, runner_cmd=stub.cmd,
                     launcher_cmds={"vllm": stub.cmd, "sglang": stub.cmd},
-                    query_manifests={"squad_v2": path},
+                    query_manifests={"squad_v2": path}, calibrations=calibrations,
                 )
             finally:
                 rc.SESSION_GRIDS = orig
@@ -2300,11 +2421,14 @@ class TestQueryManifestRegistration:
         assert [s["row_class"] for s in cells] == ["primary", "secondary", "secondary"]
         assert plan["counts"]["blocked"] == 0
 
-    def test_cli_registers_manifests_and_refuses_malformed(self, tmp_path, floor_table):
+    def test_cli_registers_manifests_and_refuses_malformed(
+        self, tmp_path, floor_table, calibrations_a
+    ):
         out = tmp_path / "plan.json"
         squad = _write_manifest(tmp_path, "squad_v2")
         base = ["plan", "--session", "a", "--floor-table", str(floor_table),
-                "--window-duration-s", "300", "--out", str(out)]
+                "--window-duration-s", "300", "--out", str(out),
+                *_calibration_args(calibrations_a)]
         assert rc.main(base + ["--query-manifest", f"squad_v2={squad}"]) == 0
         plan = rc.load_plan(out)
         assert set(plan["query_manifests"]) == {"squad_v2"}
@@ -2574,7 +2698,7 @@ class TestPerRowN:
             _tiny_grid(**overrides)
 
     def test_manifest_shortfall_refuses_naming_dataset_trial_n_and_shortfall(
-        self, floor_table, tmp_path
+        self, floor_table, tmp_path, calibrations_a
     ):
         floor = rc.load_floor_table(floor_table)
         # squad_v2 carries primary cells (B3/B6 on vllm): trial 2 with 1999
@@ -2603,16 +2727,21 @@ class TestPerRowN:
         plan = rc.build_plan(
             "a", floor, window_duration_s=300.0,
             query_manifests={"squad_v2": _write_manifest(tmp_path, "squad_v2", name="ok.json")},
+            calibrations=calibrations_a,
         )
         assert plan["query_manifests"]["squad_v2"]["trial_sizes"] == {"1": 2000, "2": 2000, "3": 2000}
 
-    def test_achievable_n_lowers_the_class_n_with_a_header_caveat(self, floor_table, tmp_path):
+    def test_achievable_n_lowers_the_class_n_with_a_header_caveat(
+        self, floor_table, tmp_path, calibrations_a
+    ):
         floor = rc.load_floor_table(floor_table)
         grid = _dc_replace(rc.SESSION_GRIDS["a"], achievable_n={"qasper": 900})
         orig = rc.SESSION_GRIDS
         rc.SESSION_GRIDS = {"a": grid}
         try:
-            plan = rc.build_plan("a", floor, window_duration_s=300.0)
+            plan = rc.build_plan(
+                "a", floor, window_duration_s=300.0, calibrations=calibrations_a
+            )
             for s in _cells(plan):
                 base = _n_of_class(s["row_class"])
                 want = min(base, 900) if s["dataset"] == "qasper" else base
@@ -2630,7 +2759,10 @@ class TestPerRowN:
             assert "qasper" in head["achievable_n_caveat"] and "A5" in head["achievable_n_caveat"]
             # A 900-id qasper manifest now registers (it would refuse at 2000).
             m900 = _write_manifest(tmp_path, "qasper", ids_per_trial=900)
-            plan = rc.build_plan("a", floor, window_duration_s=300.0, query_manifests={"qasper": m900})
+            plan = rc.build_plan(
+                "a", floor, window_duration_s=300.0, query_manifests={"qasper": m900},
+                calibrations=calibrations_a,
+            )
             assert plan["query_manifests"]["qasper"]["trial_sizes"]["1"] == 900
         finally:
             rc.SESSION_GRIDS = orig
@@ -2748,6 +2880,7 @@ class TestRetrievalPinsA5:
             plan = rc.build_plan(
                 grid.session, floor, window_duration_s=60.0, runner_cmd=stub.cmd,
                 launcher_cmds={"vllm": stub.cmd}, freeze_file=path,
+                calibrations=_write_calibrations(tmp_path / "cal", ("vllm",)),
             )
         finally:
             rc.SESSION_GRIDS = orig
@@ -2782,14 +2915,19 @@ class TestRetrievalPinsA5:
         with pytest.raises(rc.PlanError, match=match):
             rc.resolve_retrieval_pins(path)
 
-    def test_build_plan_refuses_without_the_freeze_artifact(self, tmp_path, floor_table, monkeypatch):
+    def test_build_plan_refuses_without_the_freeze_artifact(
+        self, tmp_path, floor_table, monkeypatch, calibrations_a
+    ):
         monkeypatch.setenv(rc.FREEZE_FILE_ENV_VAR, str(tmp_path / "absent.json"))
         floor = rc.load_floor_table(floor_table)
         with pytest.raises(rc.PlanError, match="freeze"):
             rc.build_plan("a", floor, window_duration_s=300.0)
         # An explicit path wins over the env seam.
         good = _write_freeze(tmp_path / "explicit.json", _freeze_doc())
-        assert rc.build_plan("a", floor, window_duration_s=300.0, freeze_file=good)["counts"]["cells"] == 870
+        assert rc.build_plan(
+            "a", floor, window_duration_s=300.0, freeze_file=good,
+            calibrations=calibrations_a,
+        )["counts"]["cells"] == 870
 
     def test_every_retrieval_cell_pins_top_k_model_and_index_root(self, plan_a, plan_b):
         for plan in (plan_a, plan_b):
@@ -2943,12 +3081,13 @@ class TestRetrievalPinsA5:
         # And the untouched plan loads.
         assert rc.load_plan(_dump(tmp_path, plan_a, "fresh_a5.json"))["counts"]["cells"] == 870
 
-    def test_cli_plan_carries_freeze_file(self, tmp_path, floor_table):
+    def test_cli_plan_carries_freeze_file(self, tmp_path, floor_table, calibrations_a):
         good = _write_freeze(tmp_path / "cli_freeze.json", _freeze_doc())
         out = tmp_path / "plan.json"
         code = rc.main([
             "plan", "--session", "a", "--floor-table", str(floor_table),
             "--window-duration-s", "300", "--freeze-file", str(good), "--out", str(out),
+            *_calibration_args(calibrations_a),
         ])
         assert code == 0
         plan = rc.load_plan(out)
@@ -3583,3 +3722,866 @@ class TestEngineEndpointsW2:
         assert rc.run_plan(plan, _run_root(tmp_path)) == 0
         (launcher,) = [c for c in stub.calls() if c["argv"][0] == "restart"]
         assert launcher["env"]["VLLM_PORT"] == "8000"
+
+
+# ---------------------------------------------------------------------------
+# Batch 2 finding W4 (owner decision 2026-09-24, options 1A + 2A; ADR-0117):
+# the plan registers ONE cal-v1 floor artifact per executable server engine,
+# pins the §6.1 floors on EVERY cell step as CAGE_SLO_FLOORS_JSON (the
+# campaign session copies them into manifest.json["slo_floors"] when it
+# creates the manifest) and pins the relaunch's cache_budget.BudgetPlan record
+# on every BUDGETED cell step as CAGE_BUDGET_PLAN_JSON (the session threads
+# it to cell.json["budget_plan"]). Before W4 neither key had a producer:
+# contrast #14 refused and the rho_own leg skipped on every tree.
+# ---------------------------------------------------------------------------
+
+
+def _budgeted(step: Dict[str, Any]) -> bool:
+    """A cell whose serving stack launched with a byte budget: a pressure
+    coordinate (F2/F3) or the DIST overlay at the registered dist_budget_r;
+    executable server cells only."""
+    return (
+        step["serving"] is not None
+        and step["blocked_on"] is None
+        and (step["serving"]["budget_r"] is not None or step["family"] == "DIST")
+    )
+
+
+class TestSloFloorsProducerW4:
+    def test_registered_constants(self):
+        assert rc.SLO_FLOORS_ENV == "CAGE_SLO_FLOORS_JSON"
+        assert rc.BUDGET_PLAN_ENV == "CAGE_BUDGET_PLAN_JSON"
+        assert rc.CELL_PIN_ENVS == ("CAGE_SLO_FLOORS_JSON", "CAGE_BUDGET_PLAN_JSON")
+        assert rc.FLOOR_BUDGET_FRACTION == 1.5
+        assert rc.SLO_FLOORS_FINDING == "Batch 2 W4"
+        # One seam, two ends: the session parses the same literals.
+        from src.orchestration import campaign_session as cs
+
+        assert cs.SLO_FLOORS_ENV == rc.SLO_FLOORS_ENV
+        assert cs.BUDGET_PLAN_ENV == rc.BUDGET_PLAN_ENV
+
+    def test_load_calibration_reads_the_cal_v1_artifact(self, tmp_path):
+        path = tmp_path / "cal.json"
+        path.write_text(json.dumps(_calibration_doc("vllm")), encoding="utf-8")
+        cal = rc.load_calibration(path)
+        assert cal.engine == "vllm"
+        assert cal.model == "Qwen/Qwen3-14B"
+        assert cal.budget_fraction == 1.5
+        assert (cal.ttft_s, cal.tpot_s) == _CAL_FLOORS["vllm"]
+        assert cal.n_requests == 30 and cal.statistic == "median"
+        assert cal.procedure_version == "cal-v1 (2026-08-12)"
+        assert cal.lambda_star_label == "ESTIMATED"
+        import hashlib as _hashlib
+        assert cal.sha256 == _hashlib.sha256(path.read_bytes()).hexdigest()
+        assert cal.path == path
+        # calibrate_cell.py records the ADAPTER engine id; it normalizes to
+        # the §7.3 axis value the cellspec and the analysis key floors by.
+        path.write_text(
+            json.dumps(_calibration_doc("lmdeploy-turbomind")), encoding="utf-8"
+        )
+        assert rc.load_calibration(path).engine == "lmdeploy"
+
+    @pytest.mark.parametrize(
+        "spoil, match",
+        [
+            ("missing", "not found"),
+            ("json", "not valid JSON"),
+            ("list", "JSON object"),
+            ("version", "procedure_version"),
+            ("confirmatory", "confirmatory"),
+            ("engine", "engine"),
+            ("hf", "oracle"),
+            ("ttft_zero", "ttft_s"),
+            ("tpot_absent", "tpot_s"),
+            ("ttft_nan", "ttft_s"),
+            ("tpot_bool", "tpot_s"),
+            ("n_requests", "n_requests"),
+            ("statistic", "statistic"),
+            ("fraction", "budget_fraction"),
+            ("floor_missing", "floor"),
+        ],
+    )
+    def test_load_calibration_refusals(self, tmp_path, spoil, match):
+        path = tmp_path / "cal.json"
+        doc = _calibration_doc("vllm")
+        if spoil == "missing":
+            path = tmp_path / "absent.json"
+        elif spoil == "json":
+            path.write_text("{not json", encoding="utf-8")
+        elif spoil == "list":
+            path.write_text("[]", encoding="utf-8")
+        else:
+            if spoil == "version":
+                doc["procedure_version"] = "cal-v0"
+            elif spoil == "confirmatory":
+                doc["confirmatory"] = True
+            elif spoil == "engine":
+                doc["engine"] = "triton"
+            elif spoil == "hf":
+                doc["engine"] = "hf-oracle"
+            elif spoil == "ttft_zero":
+                doc["floor"]["ttft_s"] = 0.0
+            elif spoil == "tpot_absent":
+                del doc["floor"]["tpot_s"]
+            elif spoil == "ttft_nan":
+                doc["floor"]["ttft_s"] = float("nan")
+            elif spoil == "tpot_bool":
+                doc["floor"]["tpot_s"] = True
+            elif spoil == "n_requests":
+                doc["floor"]["n_requests"] = 29
+            elif spoil == "statistic":
+                doc["floor"]["statistic"] = "mean"
+            elif spoil == "fraction":
+                doc["budget_fraction"] = 0
+            elif spoil == "floor_missing":
+                del doc["floor"]
+            path.write_text(json.dumps(doc), encoding="utf-8")
+        with pytest.raises(rc.PlanError, match=match):
+            rc.load_calibration(path)
+
+    def test_header_records_the_floors_and_their_artifacts(self, plan_a, calibrations_a):
+        cal = plan_a["calibration"]
+        assert cal["procedure_version"] == "cal-v1 (2026-08-12)"
+        assert cal["budget_fraction"] == 1.5
+        assert cal["registered_budget_fraction"] == 1.5
+        assert cal["env"] == "CAGE_SLO_FLOORS_JSON"
+        assert cal["manifest_key"] == "slo_floors"
+        assert cal["finding"] == "Batch 2 W4"
+        assert set(cal["floors"]) == set(cal["artifacts"]) == {"vllm", "sglang"}
+        for engine, (ttft_s, tpot_s) in _CAL_FLOORS.items():
+            floor = cal["floors"][engine]
+            assert floor["ttft_s"] == ttft_s and floor["tpot_s"] == tpot_s
+            assert floor["n_requests"] == 30 and floor["statistic"] == "median"
+            assert floor["budget_fraction"] == 1.5
+            artifact = cal["artifacts"][engine]
+            assert artifact["path"] == str(calibrations_a[engine].resolve())
+            import hashlib as _hashlib
+            assert artifact["sha256"] == _hashlib.sha256(
+                calibrations_a[engine].read_bytes()
+            ).hexdigest()
+            assert floor["source_sha256"] == artifact["sha256"]
+            assert artifact["model"] == "Qwen/Qwen3-14B"
+            assert artifact["lambda_star_label"] == "ESTIMATED"
+
+    def test_every_cell_step_pins_the_floors_env(self, plan_a, plan_b):
+        for plan in (plan_a, plan_b):
+            want = rc.slo_floors_env_value(plan["calibration"]["floors"])
+            assert json.loads(want) == plan["calibration"]["floors"]
+            cells = _cells(plan)
+            assert cells
+            for s in cells:
+                # hf oracle and blocked cells included: the manifest is created
+                # by whichever cell emits first (the hf oracle on both sessions)
+                assert s["env"]["CAGE_SLO_FLOORS_JSON"] == want, s["row_key"]
+            for s in _relaunches(plan):
+                # server dials they are not: the relaunch env stays exactly as
+                # pinned by TestOrdering.test_budget_env_on_relaunch_steps
+                assert "CAGE_SLO_FLOORS_JSON" not in s["env"]
+                assert "CAGE_BUDGET_PLAN_JSON" not in s["env"]
+        assert [s for s in _cells(plan_a) if s["cellspec"]["engine"] == "hf"]
+        assert [s for s in _cells(plan_a) if s["blocked_on"]]
+
+    def test_pins_are_not_identity(self, plan_a):
+        cell = next(s for s in _cells(plan_a) if _budgeted(s))
+        argv = cell["argv"]
+
+        def val(flag: str) -> str:
+            return argv[argv.index(flag) + 1]
+
+        def derive(env: Dict[str, str]) -> str:
+            return derive_cell_spec(
+                baseline=val("--baseline"),
+                baseline_label=val("--baseline-label"),
+                backend=val("--backend"),
+                model=val("--model"),
+                env=env,
+            ).to_row_key()
+
+        with_env = dict(cell["env"])
+        assert "CAGE_SLO_FLOORS_JSON" in with_env and "CAGE_BUDGET_PLAN_JSON" in with_env
+        without = {k: v for k, v in with_env.items() if k not in rc.CELL_PIN_ENVS}
+        altered = {**with_env, "CAGE_SLO_FLOORS_JSON": "{}", "CAGE_BUDGET_PLAN_JSON": "{}"}
+        assert derive(with_env) == derive(without) == derive(altered) == cell["row_key"]
+
+    def test_plan_refuses_without_a_floor_for_every_executable_engine(
+        self, floor_table, tmp_path
+    ):
+        floor = rc.load_floor_table(floor_table)
+        with pytest.raises(rc.PlanError) as exc:
+            rc.build_plan("a", floor, window_duration_s=300.0)
+        message = str(exc.value)
+        assert "calibration" in message and "sglang" in message and "vllm" in message
+        assert "calibrate_cell.py" in message
+        only_vllm = _write_calibrations(tmp_path / "v", ("vllm",))
+        with pytest.raises(rc.PlanError, match="sglang"):
+            rc.build_plan("a", floor, window_duration_s=300.0, calibrations=only_vllm)
+
+    def test_registration_refusals(self, floor_table, tmp_path):
+        floor = rc.load_floor_table(floor_table)
+        good = _write_calibrations(tmp_path / "good", ("vllm", "sglang"))
+        # an artifact that describes another engine (vllm=<sglang artifact>)
+        swapped = {"vllm": good["sglang"], "sglang": good["vllm"]}
+        with pytest.raises(rc.PlanError, match="describes engine"):
+            rc.build_plan("a", floor, window_duration_s=300.0, calibrations=swapped)
+        # an engine the session registers no cell on
+        extra = dict(good, lmdeploy=_write_calibrations(tmp_path / "x", ("lmdeploy",))["lmdeploy"])
+        with pytest.raises(rc.PlanError, match="lmdeploy"):
+            rc.build_plan("a", floor, window_duration_s=300.0, calibrations=extra)
+        # the wrong model (a Llama floor on the anchor session)
+        llama = _write_calibrations(
+            tmp_path / "llama", ("vllm", "sglang"), model="meta-llama/Llama-3.3-70B-Instruct"
+        )
+        with pytest.raises(rc.PlanError, match="model"):
+            rc.build_plan("a", floor, window_duration_s=300.0, calibrations=llama)
+        # the charter floor rung is r = 1.5 unless the operator registers another
+        half = _write_calibrations(tmp_path / "half", ("vllm", "sglang"), budget_fraction=0.5)
+        with pytest.raises(rc.PlanError, match="budget_fraction"):
+            rc.build_plan("a", floor, window_duration_s=300.0, calibrations=half)
+        plan = rc.build_plan(
+            "a", floor, window_duration_s=300.0, calibrations=half,
+            calibration_budget_fraction=0.5,
+        )
+        assert plan["calibration"]["budget_fraction"] == 0.5
+        assert plan["calibration"]["registered_budget_fraction"] == 1.5
+        assert all(f["budget_fraction"] == 0.5 for f in plan["calibration"]["floors"].values())
+        # mixed fractions across engines refuse too (one rung per plan)
+        mixed = dict(good, sglang=half["sglang"])
+        with pytest.raises(rc.PlanError, match="budget_fraction"):
+            rc.build_plan("a", floor, window_duration_s=300.0, calibrations=mixed)
+        # the charter slug is accepted as the model spelling too
+        slug = _write_calibrations(tmp_path / "slug", ("vllm", "sglang"), model="qwen3-14b")
+        assert rc.build_plan(
+            "a", floor, window_duration_s=300.0, calibrations=slug
+        )["calibration"]["artifacts"]["vllm"]["model"] == "qwen3-14b"
+
+    def test_blocked_only_engine_needs_no_floor(self, floor_table, stub, tmp_path):
+        # An sglang pd cell is enumerated BLOCKED (the pd launcher is vLLM
+        # only): no executable sglang cell, so no sglang floor is required;
+        # one given is a session engine's and is accepted and recorded.
+        grid = _tiny_grid(dist_cells=(("B3", "sglang", "pd"),))
+        floor = rc.load_floor_table(floor_table)
+        orig = rc.SESSION_GRIDS
+        rc.SESSION_GRIDS = {grid.session: grid}
+        try:
+            kwargs = dict(
+                window_duration_s=60.0, runner_cmd=stub.cmd,
+                launcher_cmds={"vllm": stub.cmd},
+            )
+            only_vllm = _write_calibrations(tmp_path / "v", ("vllm",))
+            plan = rc.build_plan(grid.session, floor, calibrations=only_vllm, **kwargs)
+            assert set(plan["calibration"]["floors"]) == {"vllm"}
+            both = _write_calibrations(tmp_path / "b", ("vllm", "sglang"))
+            plan = rc.build_plan(grid.session, floor, calibrations=both, **kwargs)
+            assert set(plan["calibration"]["floors"]) == {"vllm", "sglang"}
+            # the blocked pd cell carries the floors pin (every cell does),
+            # no budget record and no budget env (review T11)
+            (dist,) = [s for s in _cells(plan) if s["family"] == "DIST"]
+            assert dist["blocked_on"]
+            assert dist["budget_plan"] is None
+            assert "CAGE_BUDGET_PLAN_JSON" not in dist["env"]
+            assert dist["env"]["CAGE_SLO_FLOORS_JSON"] == rc.slo_floors_env_value(
+                plan["calibration"]["floors"]
+            )
+        finally:
+            rc.SESSION_GRIDS = orig
+
+    def test_cli_registers_calibrations_and_refuses_malformed(
+        self, tmp_path, floor_table, calibrations_a
+    ):
+        out = tmp_path / "plan.json"
+        base = ["plan", "--session", "a", "--floor-table", str(floor_table),
+                "--window-duration-s", "300", "--out", str(out)]
+        assert rc.main(base + _calibration_args(calibrations_a)) == 0
+        plan = rc.load_plan(out)
+        assert set(plan["calibration"]["floors"]) == {"vllm", "sglang"}
+        # no --calibration at all: refused (exit 2), nothing written
+        out.unlink()
+        assert rc.main(base) == 2
+        assert not out.exists()
+        # malformed (no '=') and duplicate registrations refuse
+        assert rc.main(base + ["--calibration", str(calibrations_a["vllm"])]) == 2
+        assert rc.main(
+            base + _calibration_args(calibrations_a)
+            + ["--calibration", f"vllm={calibrations_a['vllm']}"]
+        ) == 2
+        # the 0.5 shakedown rung needs the explicit fraction flag
+        half = _write_calibrations(tmp_path / "half", ("vllm", "sglang"), budget_fraction=0.5)
+        assert rc.main(base + _calibration_args(half)) == 2
+        assert rc.main(
+            base + _calibration_args(half) + ["--calibration-budget-fraction", "0.5"]
+        ) == 0
+        assert rc.load_plan(out)["calibration"]["budget_fraction"] == 0.5
+        # the flag against 1.5 artifacts, and malformed flag values (review T9)
+        assert rc.main(
+            base + _calibration_args(calibrations_a) + ["--calibration-budget-fraction", "0.5"]
+        ) == 2
+        for bad in ("nan", "0", "-1", "inf"):
+            assert rc.main(
+                base + _calibration_args(calibrations_a) + ["--calibration-budget-fraction", bad]
+            ) == 2, bad
+
+    def test_load_plan_refuses_a_stale_or_drifted_floors_pin(self, tmp_path, plan_a):
+        # header missing (a pre-W4 plan)
+        plan = json.loads(json.dumps(plan_a))
+        del plan["calibration"]
+        with pytest.raises(rc.RunError, match="calibration"):
+            rc.load_plan(_dump(tmp_path, plan, "no_cal_header.json"))
+        # a cell without the pin, hf included
+        for engine, name in (("vllm", "no_pin_vllm.json"), ("hf", "no_pin_hf.json")):
+            plan = json.loads(json.dumps(plan_a))
+            cell = next(s for s in _cells(plan) if s["cellspec"]["engine"] == engine)
+            del cell["env"]["CAGE_SLO_FLOORS_JSON"]
+            with pytest.raises(rc.RunError, match="CAGE_SLO_FLOORS_JSON"):
+                rc.load_plan(_dump(tmp_path, plan, name))
+        # a cell whose pin drifted in VALUE from the header (a hand-edited
+        # floor, canonical spelling kept so only the value differs)
+        plan = json.loads(json.dumps(plan_a))
+        cell = _cells(plan)[-1]
+        drifted = json.loads(cell["env"]["CAGE_SLO_FLOORS_JSON"])
+        drifted["vllm"]["ttft_s"] = 9.0
+        cell["env"]["CAGE_SLO_FLOORS_JSON"] = rc.slo_floors_env_value(drifted)
+        with pytest.raises(rc.RunError, match="CAGE_SLO_FLOORS_JSON"):
+            rc.load_plan(_dump(tmp_path, plan, "drifted_pin.json"))
+        # the pin is byte-exact: an identical value in another JSON spelling
+        # is refused too (one spelling, so the session and the plan compare
+        # strings; review T6 pins this as the intended outcome)
+        plan = json.loads(json.dumps(plan_a))
+        cell = _cells(plan)[-1]
+        cell["env"]["CAGE_SLO_FLOORS_JSON"] = json.dumps(
+            json.loads(cell["env"]["CAGE_SLO_FLOORS_JSON"]), indent=1
+        )
+        with pytest.raises(rc.RunError, match="CAGE_SLO_FLOORS_JSON"):
+            rc.load_plan(_dump(tmp_path, plan, "respelled_pin.json"))
+        # the header edited under unchanged pins refuses the same way
+        plan = json.loads(json.dumps(plan_a))
+        plan["calibration"]["floors"]["vllm"]["tpot_s"] = 0.5
+        with pytest.raises(rc.RunError, match="CAGE_SLO_FLOORS_JSON"):
+            rc.load_plan(_dump(tmp_path, plan, "drifted_header.json"))
+        # and the untouched plan loads
+        assert rc.load_plan(_dump(tmp_path, plan_a, "fresh_w4.json"))["counts"]["cells"] == 870
+
+    @pytest.mark.parametrize("name", ["CAGE_SLO_FLOORS_JSON", "CAGE_BUDGET_PLAN_JSON"])
+    def test_run_refuses_while_a_pin_env_is_exported(
+        self, tmp_path, floor_table, stub, monkeypatch, name
+    ):
+        # _exec applies the step env on top of the shell, so the plan's pin
+        # would win anyway; refused on PRESENCE like the endpoint overrides,
+        # because an exported pin is an operator expecting it to matter.
+        monkeypatch.setenv(name, "{}")
+        plan = _stub_plan(_tiny_grid(), floor_table, stub.cmd)
+        with pytest.raises(rc.RunError, match=name):
+            rc.run_plan(plan, _run_root(tmp_path))
+        assert stub.calls() == [], "nothing may execute under an exported pin"
+
+    def test_run_passes_the_pins_to_the_runner(self, tmp_path, floor_table, stub):
+        grid = _tiny_grid(
+            f1_baselines=("B1",), f2_baselines=("B1",), f2_budgets=(0.5,), f2_rates=(0.85,),
+        )
+        plan = _stub_plan(grid, floor_table, stub.cmd)
+        root = _run_root(tmp_path)
+        assert rc.run_plan(plan, root) == 0
+        cell_calls = [c for c in stub.calls() if "--baseline" in c["argv"]]
+        assert len(cell_calls) == 2
+        want = rc.slo_floors_env_value(plan["calibration"]["floors"])
+        by_family = {c["env"]["CAGE_CELL_FAMILY"]: c for c in cell_calls}
+        assert by_family["F1"]["env"]["CAGE_SLO_FLOORS_JSON"] == want
+        assert by_family["F2"]["env"]["CAGE_SLO_FLOORS_JSON"] == want
+        assert "CAGE_BUDGET_PLAN_JSON" not in by_family["F1"]["env"]
+        record = json.loads(by_family["F2"]["env"]["CAGE_BUDGET_PLAN_JSON"])
+        assert record["budget_bytes_total"] == int(0.5 * _ANCHOR_DEMAND)
+        assert record["kv_dtype"] == "bf16"
+
+    def test_counts_unchanged_by_the_pins(self, plan_a, plan_b):
+        c = plan_a["counts"]
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (870, 2610, 36, 65)
+        c = plan_b["counts"]
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (352, 1056, 30, 65)
+
+
+class TestBudgetPlanProducerW4:
+    def test_budgeted_cells_carry_their_relaunch_record(self, plan_a, plan_b):
+        # a: F2 612 + executable F3 (144 - 45 blocked: B8 sglang 9, B12 36)
+        #    = 711 budgeted; F1 104 + hf 10 + 45 blocked F3 = 159 free.
+        # b: F2 90 + executable F3 99 + DIST 4 = 193 budgeted; 159 free.
+        for plan, want in ((plan_a, (711, 159)), (plan_b, (193, 159))):
+            current = None
+            n_budgeted = n_free = 0
+            for s in plan["steps"]:
+                if s["kind"] == "relaunch":
+                    current = s
+                    continue
+                if _budgeted(s):
+                    assert current is not None and current["budget_plan"] is not None, s["row_key"]
+                    assert s["budget_plan"] == current["budget_plan"], s["row_key"]
+                    assert json.loads(s["env"]["CAGE_BUDGET_PLAN_JSON"]) == current["budget_plan"]
+                    n_budgeted += 1
+                else:
+                    # absence stays absence: F1, hf and blocked cells carry
+                    # null and no env (the consumer's labeled skip names it)
+                    assert s["budget_plan"] is None, s["row_key"]
+                    assert "CAGE_BUDGET_PLAN_JSON" not in s["env"], s["row_key"]
+                    n_free += 1
+            assert (n_budgeted, n_free) == want
+
+    def test_record_fields_by_independent_arithmetic(self, plan_a):
+        sha = plan_a["floor_table"]["sha256"]
+        checked = 0
+        for s in _cells(plan_a):
+            if not _budgeted(s):
+                continue
+            rec = s["budget_plan"]
+            r = s["cellspec"]["budget_r"]
+            assert rec["r"] == r
+            assert rec["budget_bytes_total"] == int(r * _ANCHOR_DEMAND)  # floor(r x D)
+            assert rec["demand_bytes"] == _ANCHOR_DEMAND
+            assert rec["model"] == "qwen3-14b"
+            assert rec["engine"] == s["cellspec"]["engine"]
+            assert rec["topology"] == "single" and rec["tp"] == 1
+            # the SERVED dtype: fp8 on the corpus-comp lever, bf16 elsewhere
+            assert rec["kv_dtype"] == ("fp8" if s["cellspec"]["arm"] == "corpus-comp" else "bf16")
+            assert rec["floor_table_sha256"] == sha
+            assert rec["pd_split"] is None and rec["pools_bytes"] is None
+            # the two fields the analysis consumer reads, typed as it reads them
+            assert isinstance(rec["budget_bytes_total"], int)
+            assert not isinstance(rec["budget_bytes_total"], bool)
+            assert isinstance(rec["kv_dtype"], str)
+            checked += 1
+        assert checked == 711
+
+    def test_session_b_records_tp_and_the_dist_legs(self, plan_b):
+        singles = [
+            s for s in _cells(plan_b)
+            if _budgeted(s) and s["cellspec"]["topology"] == "single"
+        ]
+        assert singles
+        for s in singles:
+            rec = s["budget_plan"]
+            # planned TP-sharded at serving_tp=4: the planner's topology is
+            # 'tp' while the cellspec topology stays 'single' (both true)
+            assert rec["topology"] == "tp" and rec["tp"] == 4
+            assert rec["per_rank_bytes"] == rec["budget_bytes_total"] // 4
+            assert rec["model"] == "llama-3.3-70b"
+        dist = {
+            s["cellspec"]["topology"]: s
+            for s in _cells(plan_b)
+            if s["family"] == "DIST" and s["baseline"] == "B1"
+        }
+        tp, pd = dist["tp"]["budget_plan"], dist["pd"]["budget_plan"]
+        assert tp["topology"] == "tp" and tp["tp"] == 8 and tp["r"] == 1.0
+        assert tp["budget_bytes_total"] == 1 * _ANCHOR_DEMAND
+        assert pd["topology"] == "pd" and pd["pd_split"] == 0.5 and pd["r"] == 1.0
+        assert pd["budget_bytes_total"] == 1 * _ANCHOR_DEMAND
+        assert pd["pools_bytes"] == [5_000_000_000, 5_000_000_000]
+        assert sum(pd["pools_bytes"]) == pd["budget_bytes_total"]
+        # DIST cells carry no pressure coordinate; the record carries the
+        # registered dist_budget_r the overlay actually served at
+        assert dist["tp"]["cellspec"]["budget_r"] is None
+
+    def test_relaunch_steps_carry_the_record_they_launched(self, plan_a, plan_b):
+        for plan in (plan_a, plan_b):
+            for s in _relaunches(plan):
+                rec = s["budget_plan"]
+                if s["budget_bytes"] is None:
+                    assert rec is None and s["budget_r"] is None and s["topology"] == "single"
+                    continue
+                assert rec["budget_bytes_total"] == s["budget_bytes"]
+                assert rec["engine"] == s["engine"]
+                assert rec["kv_dtype"] == (s["kv_dtype"] or "bf16")
+                if s["topology"] == "pd":
+                    # the pd plan is per POOL (tp=1); the per-rank slicing by
+                    # role_tp is _pd_budget_env's, recorded under step["pd"]
+                    assert rec["tp"] == 1 and rec["topology"] == "pd"
+                else:
+                    assert rec["tp"] == s["tp"]
+                # the launcher knob IS the record's primary knob (vLLM: the
+                # per-rank bytes; pd: the two role pools)
+                if s["engine"] == "vllm" and s["topology"] != "pd":
+                    assert s["env"]["CAGE_KV_BUDGET_BYTES"] == str(rec["per_rank_bytes"])
+                if s["topology"] == "pd":
+                    assert rec["pools_bytes"] == [s["pd"]["prefill_bytes"], s["pd"]["decode_bytes"]]
+
+    def test_header_records_the_seam(self, plan_a, plan_b):
+        for plan in (plan_a, plan_b):
+            shapes = plan["serving_shapes"]
+            assert shapes["budget_plan_env"] == "CAGE_BUDGET_PLAN_JSON"
+            assert shapes["budget_plan_cell_key"] == "budget_plan"
+            assert shapes["budget_plan_finding"] == "Batch 2 W4"
+
+    def test_load_plan_refuses_a_stale_or_drifted_budget_plan(self, tmp_path, plan_a, plan_b):
+        def _budgeted_cell(plan):
+            return next(s for s in _cells(plan) if _budgeted(s))
+
+        # REQUIRED step keys on both step kinds (a pre-W4 plan)
+        for kind in ("cell", "relaunch"):
+            plan = json.loads(json.dumps(plan_a))
+            step = next(s for s in plan["steps"] if s["kind"] == kind)
+            del step["budget_plan"]
+            with pytest.raises(rc.RunError, match="budget_plan"):
+                rc.load_plan(_dump(tmp_path, plan, f"no_key_{kind}.json"))
+        # a budgeted cell without the env
+        plan = json.loads(json.dumps(plan_a))
+        del _budgeted_cell(plan)["env"]["CAGE_BUDGET_PLAN_JSON"]
+        with pytest.raises(rc.RunError, match="CAGE_BUDGET_PLAN_JSON"):
+            rc.load_plan(_dump(tmp_path, plan, "no_env.json"))
+        # the env drifted from the record (a hand-edited budget)
+        plan = json.loads(json.dumps(plan_a))
+        cell = _budgeted_cell(plan)
+        rec = json.loads(cell["env"]["CAGE_BUDGET_PLAN_JSON"])
+        rec["budget_bytes_total"] += 1
+        cell["env"]["CAGE_BUDGET_PLAN_JSON"] = json.dumps(rec)
+        with pytest.raises(rc.RunError, match="CAGE_BUDGET_PLAN_JSON"):
+            rc.load_plan(_dump(tmp_path, plan, "env_drift.json"))
+        # the record drifted from the relaunch it runs under
+        plan = json.loads(json.dumps(plan_a))
+        cell = _budgeted_cell(plan)
+        cell["budget_plan"] = dict(cell["budget_plan"], budget_bytes_total=1)
+        with pytest.raises(rc.RunError, match="budget_plan"):
+            rc.load_plan(_dump(tmp_path, plan, "record_drift.json"))
+        # an F1 (budget-free) server cell carrying a record
+        plan = json.loads(json.dumps(plan_a))
+        f1 = next(
+            s for s in _cells(plan)
+            if s["family"] == "F1" and s["cellspec"]["engine"] == "vllm" and not s["blocked_on"]
+        )
+        f1["budget_plan"] = _budgeted_cell(plan)["budget_plan"]
+        with pytest.raises(rc.RunError, match="budget_plan"):
+            rc.load_plan(_dump(tmp_path, plan, "f1_record.json"))
+        # an hf cell carrying the env
+        plan = json.loads(json.dumps(plan_a))
+        hf = next(s for s in _cells(plan) if s["cellspec"]["engine"] == "hf")
+        hf["env"]["CAGE_BUDGET_PLAN_JSON"] = _budgeted_cell(plan)["env"]["CAGE_BUDGET_PLAN_JSON"]
+        with pytest.raises(rc.RunError, match="CAGE_BUDGET_PLAN_JSON"):
+            rc.load_plan(_dump(tmp_path, plan, "hf_env.json"))
+        # a relaunch whose record disagrees with its budget_bytes
+        plan = json.loads(json.dumps(plan_a))
+        relaunch = next(s for s in _relaunches(plan) if s["budget_bytes"] is not None)
+        relaunch["budget_bytes"] += 1
+        with pytest.raises(rc.RunError, match="budget_plan"):
+            rc.load_plan(_dump(tmp_path, plan, "relaunch_drift.json"))
+        # a budgeted relaunch without a record (the relaunch clause's own
+        # line, not only the cells' lines; review T3)
+        plan = json.loads(json.dumps(plan_a))
+        next(s for s in _relaunches(plan) if s["budget_bytes"] is not None)["budget_plan"] = None
+        with pytest.raises(rc.RunError, match=r"budgeted relaunch \(budget_bytes="):
+            rc.load_plan(_dump(tmp_path, plan, "relaunch_none.json"))
+        # a budget-free relaunch carrying a record
+        plan = json.loads(json.dumps(plan_a))
+        free = next(s for s in _relaunches(plan) if s["budget_bytes"] is None)
+        free["budget_plan"] = _budgeted_cell(plan)["budget_plan"]
+        with pytest.raises(rc.RunError, match="budget-free relaunch"):
+            rc.load_plan(_dump(tmp_path, plan, "free_relaunch_record.json"))
+        # a cell moved under ANOTHER budget boundary of the same engine and
+        # prefix mode: the endpoint and prefix clauses pass, the W4 clause
+        # refuses (before W4 this mislabeled budget loaded silently)
+        plan = json.loads(json.dumps(plan_a))
+        cell = next(
+            s for s in _cells(plan)
+            if s["family"] == "F2" and s["cellspec"]["engine"] == "vllm"
+            and s["dataset"] == "qasper" and s["cellspec"]["budget_r"] == 1.5
+        )
+        other = next(
+            s for s in _relaunches(plan)
+            if s["engine"] == "vllm" and s["prefix_mode"] == "OFF" and s["budget_r"] == 1.0
+        )
+        plan["steps"].remove(cell)
+        plan["steps"].insert(plan["steps"].index(other) + 1, cell)
+        with pytest.raises(rc.RunError, match="budget_plan"):
+            rc.load_plan(_dump(tmp_path, plan, "moved_budget.json"))
+        # and the untouched plans load
+        assert rc.load_plan(_dump(tmp_path, plan_a, "fresh_bp_a.json"))["counts"]["cells"] == 870
+        assert rc.load_plan(_dump(tmp_path, plan_b, "fresh_bp_b.json"))["counts"]["cells"] == 352
+
+
+class TestW4ReviewFixes:
+    """Independent review 2026-09-24 (driver lens, 1 medium + 6 low), all
+    landed: the relaunch record must agree with the launched knob and dtype
+    (F1), budgeted-ness follows the relaunch identity (F2), the serving
+    record is required (F3), an hf-only plan pins nothing (F4), the header
+    floors cover every executable engine at load time (F5), the pd record
+    carries the role slices the launcher was given (F6), the not-found fix
+    names the rung the plan registers (F7)."""
+
+    def test_relaunch_record_must_match_the_launched_dtype_and_knob(self, tmp_path, plan_a, plan_b):
+        # F1: a bf16 launch whose record says fp8 would halve rho_own.
+        plan = json.loads(json.dumps(plan_a))
+        relaunch = next(
+            s for s in _relaunches(plan)
+            if s["budget_bytes"] is not None and s["kv_dtype"] is None and s["engine"] == "vllm"
+        )
+        relaunch["budget_plan"]["kv_dtype"] = "fp8"
+        for s in _cells(plan):
+            if s["budget_plan"] == relaunch["budget_plan"] or (
+                s["budget_plan"] and s["budget_plan"]["budget_bytes_total"] == relaunch["budget_bytes"]
+                and s["cellspec"]["engine"] == "vllm" and s["serving"]["kv_dtype"] is None
+                and s["serving"]["prefix_mode"] == relaunch["prefix_mode"]
+            ):
+                s["budget_plan"] = relaunch["budget_plan"]
+                s["env"]["CAGE_BUDGET_PLAN_JSON"] = json.dumps(
+                    relaunch["budget_plan"], sort_keys=True, separators=(",", ":")
+                )
+        with pytest.raises(rc.RunError, match="kv_dtype"):
+            rc.load_plan(_dump(tmp_path, plan, "dtype_drift.json"))
+        # F1: the launched knob is the record's primary engine arg, verbatim.
+        plan = json.loads(json.dumps(plan_a))
+        relaunch = next(s for s in _relaunches(plan) if s["engine"] == "vllm" and s["budget_bytes"])
+        relaunch["env"]["CAGE_KV_BUDGET_BYTES"] = str(int(relaunch["env"]["CAGE_KV_BUDGET_BYTES"]) + 1)
+        with pytest.raises(rc.RunError, match="primary knob"):
+            rc.load_plan(_dump(tmp_path, plan, "knob_drift.json"))
+        plan = json.loads(json.dumps(plan_a))
+        relaunch = next(s for s in _relaunches(plan) if s["engine"] == "sglang" and s["budget_bytes"])
+        relaunch["env"]["CAGE_SGLANG_MAX_TOTAL_TOKENS"] = "1"
+        with pytest.raises(rc.RunError, match="primary knob"):
+            rc.load_plan(_dump(tmp_path, plan, "sglang_knob_drift.json"))
+        # F6: the pd record's pools and role slices must be the relaunch's.
+        plan = json.loads(json.dumps(plan_b))
+        pd = next(s for s in _relaunches(plan) if s["topology"] == "pd")
+        pd["env"]["CAGE_KV_BUDGET_BYTES_PREFILL"] = "1"
+        pd["pd"]["prefill_bytes_per_rank"] = 1
+        with pytest.raises(rc.RunError, match="pd_roles"):
+            rc.load_plan(_dump(tmp_path, plan, "pd_slice_drift.json"))
+
+    def test_budgeted_ness_follows_the_relaunch_identity(self, tmp_path, plan_a):
+        # F2: nulling budget_bytes and the record on a budgeted relaunch
+        # (its env still carries the launcher budget) must refuse, not read
+        # as budget-free; and budget_bytes is a required relaunch key.
+        plan = json.loads(json.dumps(plan_a))
+        relaunch = next(
+            s for s in _relaunches(plan) if s["budget_r"] is not None and s["engine"] == "vllm"
+        )
+        record = relaunch["budget_plan"]
+        relaunch["budget_bytes"] = None
+        relaunch["budget_plan"] = None
+        for s in _cells(plan):
+            if s["budget_plan"] == record:
+                s["budget_plan"] = None
+                del s["env"]["CAGE_BUDGET_PLAN_JSON"]
+        with pytest.raises(rc.RunError, match="budget_bytes"):
+            rc.load_plan(_dump(tmp_path, plan, "nulled_budget.json"))
+        plan = json.loads(json.dumps(plan_a))
+        del _relaunches(plan)[0]["budget_bytes"]
+        with pytest.raises(rc.RunError, match="budget_bytes"):
+            rc.load_plan(_dump(tmp_path, plan, "no_budget_bytes_key.json"))
+        # a budget-free relaunch handed a budget env is a server launched
+        # under a budget the plan does not record
+        plan = json.loads(json.dumps(plan_a))
+        free = next(s for s in _relaunches(plan) if s["budget_r"] is None)
+        free["env"]["CAGE_KV_BUDGET_BYTES"] = "123"
+        with pytest.raises(rc.RunError, match="CAGE_KV_BUDGET_BYTES"):
+            rc.load_plan(_dump(tmp_path, plan, "free_with_budget_env.json"))
+
+    def test_serving_record_is_required_on_server_cells(self, tmp_path, plan_a):
+        # F3: a server cell whose serving is null escaped every
+        # relaunch-agreement clause (prefix, endpoint, budget).
+        plan = json.loads(json.dumps(plan_a))
+        cell = next(s for s in _cells(plan) if _budgeted(s))
+        cell["serving"] = None
+        with pytest.raises(rc.RunError, match="serving record"):
+            rc.load_plan(_dump(tmp_path, plan, "serving_null.json"))
+        plan = json.loads(json.dumps(plan_a))
+        del next(s for s in _cells(plan) if _budgeted(s))["serving"]
+        with pytest.raises(rc.RunError, match="serving"):
+            rc.load_plan(_dump(tmp_path, plan, "serving_missing.json"))
+        plan = json.loads(json.dumps(plan_a))
+        hf = next(s for s in _cells(plan) if s["cellspec"]["engine"] == "hf")
+        hf["serving"] = {"engine": "hf"}
+        with pytest.raises(rc.RunError, match="hf cell"):
+            rc.load_plan(_dump(tmp_path, plan, "hf_serving.json"))
+
+    def test_hf_only_plan_registers_no_floor_and_pins_nothing(self, tmp_path, floor_table, stub):
+        # F4: a plan with no executable server cell builds without any
+        # calibration, carries an empty floors header, pins no env, loads,
+        # and the session sees no pin (absence is not an empty pin).
+        grid = _tiny_grid(
+            f1_baselines=(), f1_datasets=("squad_v2",),
+            hf_oracle_cells=(("B3", ("squad_v2",)),),
+        )
+        floor = rc.load_floor_table(floor_table)
+        orig = rc.SESSION_GRIDS
+        rc.SESSION_GRIDS = {grid.session: grid}
+        try:
+            plan = rc.build_plan(
+                grid.session, floor, window_duration_s=60.0, runner_cmd=stub.cmd,
+                launcher_cmds={"vllm": stub.cmd},
+            )
+        finally:
+            rc.SESSION_GRIDS = orig
+        assert plan["calibration"]["floors"] == {}
+        cells = _cells(plan)
+        assert cells and all(s["cellspec"]["engine"] == "hf" for s in cells)
+        assert all("CAGE_SLO_FLOORS_JSON" not in s["env"] for s in cells)
+        loaded = rc.load_plan(_dump(tmp_path, plan, "hf_only.json"))
+        assert loaded["counts"]["cells"] == len(cells)
+        # a pin on such a plan is refused (the plan registers no floor)
+        plan["steps"][0]["env"]["CAGE_SLO_FLOORS_JSON"] = "{}"
+        with pytest.raises(rc.RunError, match="registers no floor"):
+            rc.load_plan(_dump(tmp_path, plan, "hf_only_pinned.json"))
+
+    def test_load_plan_requires_a_floor_for_every_executable_engine(self, tmp_path, plan_a):
+        # F5: a header that lost sglang (pins rewritten consistently) must
+        # refuse at load, before the GPU time, naming the engine.
+        plan = json.loads(json.dumps(plan_a))
+        del plan["calibration"]["floors"]["sglang"]
+        want = rc.slo_floors_env_value(plan["calibration"]["floors"])
+        for s in _cells(plan):
+            s["env"]["CAGE_SLO_FLOORS_JSON"] = want
+        with pytest.raises(rc.RunError, match="sglang"):
+            rc.load_plan(_dump(tmp_path, plan, "no_sglang_floor.json"))
+
+    def test_pd_record_carries_the_role_slices_the_launcher_was_given(self, plan_b):
+        # F6: the per-pool BudgetPlan (tp=1) rides with the relaunch's pd
+        # role record, so one cell.json reconciles the launched knobs.
+        pd = next(s for s in _relaunches(plan_b) if s["topology"] == "pd")
+        (cell,) = [s for s in _cells(plan_b) if s["cellspec"]["topology"] == "pd" and s["baseline"] == "B1"]
+        rec = cell["budget_plan"]
+        assert rec["pd_roles"] == pd["pd"]
+        assert rec["pd_roles"]["prefill_bytes_per_rank"] == int(pd["env"]["CAGE_KV_BUDGET_BYTES_PREFILL"])
+        assert rec["pd_roles"]["decode_bytes_per_rank"] == int(pd["env"]["CAGE_KV_BUDGET_BYTES_DECODE"])
+        assert rec["pools_bytes"] == [pd["pd"]["prefill_bytes"], pd["pd"]["decode_bytes"]]
+        single = next(s for s in _cells(plan_b) if _budgeted(s) and s["cellspec"]["topology"] == "single")
+        assert "pd_roles" not in single["budget_plan"]
+
+    def test_not_found_fix_names_the_registered_rung(self, tmp_path, floor_table):
+        # F7: an operator registering the 0.5 shakedown rung with a bad path
+        # is told to calibrate at 0.5, not at the charter 1.5.
+        floor = rc.load_floor_table(floor_table)
+        missing = {"vllm": tmp_path / "absent_vllm.json", "sglang": tmp_path / "absent_sglang.json"}
+        with pytest.raises(rc.PlanError, match=r"--budget-fraction 0\.5 "):
+            rc.build_plan(
+                "a", floor, window_duration_s=300.0, calibrations=missing,
+                calibration_budget_fraction=0.5,
+            )
+        with pytest.raises(rc.PlanError, match=r"--budget-fraction 1\.5 "):
+            rc.build_plan("a", floor, window_duration_s=300.0, calibrations=missing)
+
+
+def _rewrite_records(plan: Dict[str, Any], relaunch: Dict[str, Any], **edits: Any) -> None:
+    """Edit a relaunch's budget record and the same record on every cell
+    under it CONSISTENTLY (record + env re-dumped), so only the relaunch
+    clause can catch the drift."""
+    old = json.loads(json.dumps(relaunch["budget_plan"]))
+    relaunch["budget_plan"] = dict(relaunch["budget_plan"], **edits)
+    for s in _cells(plan):
+        if s["budget_plan"] == old:
+            s["budget_plan"] = dict(relaunch["budget_plan"])
+            s["env"]["CAGE_BUDGET_PLAN_JSON"] = json.dumps(
+                relaunch["budget_plan"], sort_keys=True, separators=(",", ":")
+            )
+
+
+class TestW4ReviewFixesTestsLens:
+    """Independent review 2026-09-24 (tests lens): the relaunch clause's
+    record consistency (T1, T3), the driver step through the session seam
+    (T2), and the real cal-v1 producer round trip (T8)."""
+
+    @pytest.mark.parametrize(
+        "edits, match",
+        [
+            ({"r": 0.25}, r"budget_plan\.r"),
+            ({"engine": "sglang"}, r"budget_plan\.engine"),
+            ({"topology": "pd"}, r"budget_plan\.topology"),
+            ({"tp": 7}, r"budget_plan\.tp"),
+        ],
+    )
+    def test_consistent_record_edits_are_caught_by_the_relaunch_clause(
+        self, tmp_path, plan_a, edits, match
+    ):
+        plan = json.loads(json.dumps(plan_a))
+        relaunch = next(
+            s for s in _relaunches(plan)
+            if s["engine"] == "vllm" and s["budget_r"] == 1.0 and s["prefix_mode"] == "OFF"
+        )
+        _rewrite_records(plan, relaunch, **edits)
+        with pytest.raises(rc.RunError, match=match):
+            rc.load_plan(_dump(tmp_path, plan, "consistent_edit.json"))
+
+    def test_driver_steps_activate_the_session_seam(self, tmp_path, plan_a, plan_b):
+        # T2: the two ends of the pin seam meet on REAL driver steps (six
+        # shapes), not on hand-mirrored documents: parse, cross-check and
+        # activate CampaignCellSession from each step's argv + env.
+        import types
+        from src.orchestration import campaign_session as cs
+
+        def pick(plan, **want):
+            for s in _cells(plan):
+                cs_ = s["cellspec"]
+                if all(
+                    (s.get(k) if k in s else cs_.get(k)) == v for k, v in want.items()
+                ) and s["blocked_on"] is None:
+                    return s
+            raise AssertionError(f"no cell for {want}")
+
+        shapes = [
+            (plan_a, pick(plan_a, family="F2", engine="vllm", dataset="qasper")),
+            (plan_a, pick(plan_a, family="F3", engine="sglang", arm="corpus-comp")),
+            (plan_a, pick(plan_a, engine="hf")),
+            (plan_b, pick(plan_b, family="F2", engine="vllm", topology="single")),
+            (plan_b, pick(plan_b, family="DIST", topology="tp")),
+            (plan_b, pick(plan_b, family="DIST", topology="pd")),
+        ]
+        for plan, step in shapes:
+            argv = step["argv"]
+
+            def val(flag: str, argv=argv) -> Optional[str]:
+                return argv[argv.index(flag) + 1] if flag in argv else None
+
+            spec = derive_cell_spec(
+                baseline=val("--baseline"), baseline_label=val("--baseline-label"),
+                backend=val("--backend"), model=val("--model"), env=step["env"],
+            )
+            assert spec.to_row_key() == step["row_key"]
+            assert cs.parse_slo_floors(step["env"]["CAGE_SLO_FLOORS_JSON"]) == plan["calibration"]["floors"]
+            if step["budget_plan"] is None:
+                assert "CAGE_BUDGET_PLAN_JSON" not in step["env"]
+            else:
+                assert cs.parse_budget_plan(step["env"]["CAGE_BUDGET_PLAN_JSON"], spec) == step["budget_plan"]
+            root = tmp_path / "results" / "camp" / plan["session"] / "run-001"
+            args = types.SimpleNamespace(
+                campaign_root=str(root), top_k_sweep=False,
+                baseline=val("--baseline"), baseline_label=val("--baseline-label"),
+                backend=val("--backend"), model=val("--model"), dataset=step["dataset"],
+                num_trials=step["windows"], seed=int(val("--seed")), kv_cache_dtype=val("--kv-cache-dtype"),
+            )
+            session = cs.CampaignCellSession.from_cli(args, env=step["env"])
+            assert session is not None, step["row_key"]
+            assert session.row_key == step["row_key"]
+            assert session.slo_floors == plan["calibration"]["floors"]
+            assert session.budget_plan == step["budget_plan"]
+            assert session.gpu_count == step["gpu_count"]
+
+    def test_real_cal_v1_artifact_loads_and_adapter_ids_normalize(self, tmp_path):
+        # T8: the artifact the REAL producer writes (CellCalibration.to_manifest
+        # with the real floor and lambda* records) is what load_calibration
+        # accepts, and every adapter's engine_id literal is a key the
+        # normalization knows (a rename on either side fails here).
+        import re
+        from src.orchestration.calibration import (
+            CellCalibration, FloorMeasurement, LambdaStarEstimate, ProbeStep,
+        )
+        from src.orchestration.campaign_session import ENGINE_OF_BACKEND
+
+        steps = (
+            ProbeStep(rate_qps=0.5, n_scheduled=30, n_completed=30, throughput_rps=0.5),
+            ProbeStep(rate_qps=0.65, n_scheduled=40, n_completed=20, throughput_rps=0.3),
+        )
+        estimate = LambdaStarEstimate(
+            label="ESTIMATED", lambda_star_qps=0.5, sustained_rate_qps=0.5,
+            first_unsustainable_qps=0.65, steps=steps,
+        )
+        for engine_id in ("vllm", "sglang", "lmdeploy-turbomind"):
+            doc = CellCalibration(
+                model="Qwen/Qwen3-14B", engine=engine_id, budget_fraction=1.5,
+                floor=FloorMeasurement(ttft_s=0.12, tpot_s=0.02, n_requests=30),
+                lambda_star=estimate,
+            ).to_manifest()
+            path = tmp_path / f"real_{engine_id}.json"
+            path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+            cal = rc.load_calibration(path)
+            assert cal.engine == ENGINE_OF_BACKEND[engine_id]
+            assert (cal.ttft_s, cal.tpot_s, cal.n_requests) == (0.12, 0.02, 30)
+            assert cal.lambda_star_label == "ESTIMATED"
+        for rel in ("src/inference/vllm_adapter.py", "src/inference/sglang_adapter.py",
+                    "src/inference/lmdeploy_adapter.py"):
+            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+            m = re.search(r'engine_id:\s*str\s*=\s*"([^"]+)"', text)
+            assert m, rel
+            assert m.group(1) in ENGINE_OF_BACKEND, (rel, m.group(1))

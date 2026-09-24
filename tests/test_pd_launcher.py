@@ -992,14 +992,41 @@ def _pd_grid(**overrides: Any):
     return rc.SessionGrid(**kwargs)
 
 
+def _calibrations_for(grid, directory: Path) -> Dict[str, Path]:
+    """Batch 2 W4: one cal-v1 floor artifact (calibrate_cell.py shape) per
+    server engine of the grid; the plan refuses without one per executable
+    engine. Floors are provenance here, never asserted."""
+    engines = set(grid.f1_engines) | set(grid.f2_engines) | set(grid.f3_engines)
+    engines |= {engine for _bid, engine, _topology in grid.dist_cells}
+    directory.mkdir(parents=True, exist_ok=True)
+    out: Dict[str, Path] = {}
+    for engine in sorted(engines - {"hf"}):
+        doc = {
+            "procedure_version": "cal-v1 (2026-08-12)",
+            "model": rc.HF_ID_OF_SLUG[grid.model],
+            "engine": engine,
+            "budget_fraction": 1.5,
+            "procedure": {},
+            "confirmatory": False,
+            "floor": {"ttft_s": 0.1, "tpot_s": 0.01, "n_requests": 30, "statistic": "median"},
+            "lambda_star": {"label": "ESTIMATED", "lambda_star_qps": 2.0},
+        }
+        path = directory / f"calibration_{engine}.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        out[engine] = path
+    return out
+
+
 def _plan_for(grid, floor_path: Path, launcher_cmds=None, runner_cmd=("stub",)):
     floor = rc.load_floor_table(floor_path)
+    calibrations = _calibrations_for(grid, Path(floor_path).parent / "cal")
     orig = rc.SESSION_GRIDS
     rc.SESSION_GRIDS = {grid.session: grid}
     try:
         return rc.build_plan(
             grid.session, floor, window_duration_s=60.0,
             runner_cmd=runner_cmd, launcher_cmds=launcher_cmds,
+            calibrations=calibrations,
         )
     finally:
         rc.SESSION_GRIDS = orig

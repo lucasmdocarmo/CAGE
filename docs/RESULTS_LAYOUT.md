@@ -17,8 +17,9 @@ results/<campaign>/<session>/<run_id>/
 ├── cells/
 │   └── <cellspec_row_key>/            # ONE directory per cell tuple (§2)
 │       ├── cell.json                  # the CellSpec (to_flat_dict), baseline id (B1-B12),
-│       │                              #   engine launch config, drive-manifest ref,
-│       │                              #   windows[] table: k -> {dataset, seed, rep,
+│       │                              #   gpu_count (W4.2), budget_plan (Batch 2 W4: the
+│       │                              #   BudgetPlan record of the relaunch, budgeted cells
+│       │                              #   only), windows[] table: k -> {dataset, seed, rep,
 │       │                              #   budget_r, rate_frac, t_start, t_end}
 │       └── window_<k>/                # one measurement window; k = <dataset>-<ordinal>
 │           ├── requests.jsonl         # per-request records (our clock at the boundary)
@@ -109,6 +110,15 @@ Required fields:
 | `cellspec_schema_version` | so a future axis change cannot silently re-key old data |
 | `created_utc` | ISO-8601 |
 
+Optional extra fields, written at the same moment (the writer refuses an extra that
+shadows a required field):
+
+| Field | Content |
+|---|---|
+| `kv_cache_dtype` | the run-level server launch dtype (S0-15 provenance) |
+| `datasets` | the optional dataset roster narrowing (`CAGE_CAMPAIGN_DATASETS`) |
+| `slo_floors` | Batch 2 W4 (ADR-0117): `{engine: {ttft_s, tpot_s, n_requests, statistic, budget_fraction, source_sha256}}`, the §6.1 single-stream floors in seconds, one per engine the run serves, copied verbatim from the campaign driver's plan pin `CAGE_SLO_FLOORS_JSON` (the plan header `calibration` records each cal-v1 artifact's path and sha256). The #14 executor and the DIST metrics read `slo_floors[engine].ttft_s/tpot_s`. Amended never: a cell that pins different floors, or pins floors on a manifest that carries none, refuses before serving; a cell without a pin (pilot/shell producers) extends any run. |
+
 ## 3.1 Writers — who produces this tree (task #116)
 
 The ONE production writer is **`scripts/3_run/run_experiment.py` in campaign mode**
@@ -131,6 +141,18 @@ bridge. No other code writes into a campaign tree's `cells/`.
   summary — it is the **completeness sentinel** the shell resume gates
   (`cell_complete`, campaign branch) parse with `metrics_json_valid` rigor;
   a missing/unparseable one makes the window incomplete → reset + re-emitted.
+- **`cell.json` extras** (Batch 2 W4, ADR-0117): the campaign driver threads
+  two plan facts through the cell env and the session persists them via
+  `CellWriter`: `gpu_count` (W4.2, `CAGE_GPU_COUNT`) and `budget_plan`
+  (`CAGE_BUDGET_PLAN_JSON`: the `cache_budget.BudgetPlan` record of the
+  relaunch the cell ran under, `asdict` plus `floor_table_sha256`; the
+  rho_own leg of the own-accounting pass reads `budget_bytes_total` and the
+  served `kv_dtype`). Budgeted cells only (F2/F3 pressure coordinates and
+  the DIST legs); F1, hf and blocked cells carry no key (absence stays
+  absence, the consumer's labeled skip names it). On resume a writer with
+  no fresh claim adopts the recorded value; a contradicting claim refuses.
+  The calibration artifacts and the plan file live outside the sealed tree:
+  pull them with the run (RUNBOOK §4).
 - **`write_time_hashes.jsonl` at the run root** (beside `manifest.json`,
   never under `cells/`): the append-only §9.10 write-time hash journal —
   every emitted artifact is sha256-hashed at write time.
