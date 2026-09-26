@@ -113,6 +113,7 @@ class StubEngine:
         response.cached_token_telemetry_available = True
         response.retries = 0
         response.reference_engine = False
+        response.num_tokens_source = "usage"  # ADR-0118 (W5) provenance
         return response
 
     def generate(self, request: Any, stream: bool = False) -> InferenceResponse:
@@ -361,8 +362,12 @@ def test_requests_rows_carry_join_triple_and_honesty_columns(campaign_tree: Path
                         "cached_token_telemetry_available",
                         "retries",
                         "reference_engine",
+                        "num_tokens_source",
                     ):
                         assert key in row, f"{wdir.name}: honesty column {key!r} missing"
+                    # ADR-0118 (W5): the token-count provenance the adapter
+                    # stamped reaches the sealed row verbatim.
+                    assert row["num_tokens_source"] == "usage"
                     checked += 1
     assert checked == len(ARMS) * len(DATASETS) * N_TRIALS * N_QUERIES
 
@@ -2194,6 +2199,41 @@ def test_campaign_lost_evidence_append_refuses_the_window_at_emit(
     out = capsys.readouterr().out
     assert "evidence_write_failures = 1" in out and "ADR-0116" in out
     assert not _window_dirs(root, "no_cache", "squad_v2")
+
+
+class _OneTokenEngine(StubEngine):
+    """StubEngine whose first measured request answers in one token, so no
+    second token ever arrives: total_time_ms == ttft_ms (ADR-0118, W5)."""
+
+    def _respond(self, request: Any) -> InferenceResponse:
+        response = super()._respond(request)
+        if str(request.request_id or "").endswith("q000"):
+            response.generated_text = "Yes"
+            response.num_tokens = 1
+            response.total_time_ms = response.ttft_ms
+        return response
+
+
+def test_one_token_completion_row_carries_null_tpot_and_passes_check_j(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review T6: the producer shape the fixtures assume (num_tokens 1 with a
+    # null tpot_ms) is pinned through the REAL runner, and verify_results
+    # check (j) counts the row instead of failing it.
+    root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    _run_cell(
+        monkeypatch, root, "no_cache", "squad_v2", ttft_base=200.0, num_trials=1,
+        engine_factory=lambda model: _OneTokenEngine(model, "no_cache", 200.0),
+    )
+    (wdir,) = _window_dirs(root, "no_cache", "squad_v2")
+    rows = {r["example_id"]: r for r in _read_jsonl(wdir / "requests.jsonl")}
+    one = rows["squad_v2-q000"]
+    assert one["ok"] is True and one["num_tokens"] == 1 and one["tpot_ms"] is None
+    assert all(r["tpot_ms"] > 0.0 for rid, r in rows.items() if rid != "squad_v2-q000")
+    report = vr.verify_run(root)  # unsealed: only the ledger check fails
+    assert not [f for f in report["findings"] if f["check"] == "tpot"]
+    (acct,) = report["accounting"]["per_window"]
+    assert acct["n_no_decode"] == 1
 
 
 class _WarmupRaisingEngine(StubEngine):

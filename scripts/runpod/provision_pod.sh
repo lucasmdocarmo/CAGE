@@ -44,18 +44,24 @@ usage() {
   printf '         --ports <s> --cloud-type SECURE|COMMUNITY --terminate-after <dur>\n' >&2
   printf '         --no-terminate-after --price-per-hour <f> --hours <f> --purpose <s>\n' >&2
   printf '         --data-center-ids <csv> --network-volume-id <id>\n' >&2
+  printf '         (--volume-gb is refused beside --network-volume-id: the volume replaces the disk)\n' >&2
   printf 'Default is PLAN mode: prints the plan and creates NOTHING. --yes = the owner GO.\n' >&2
   exit 2
 }
 
 NAME="cage-$(date -u +%Y%m%d-%H%M%S)"
-IMAGE="${CAGE_POD_IMAGE:-runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu24.04}"
+# Default image = the image behind RunPod's official "Runpod Pytorch 2.8.0" template
+# (runpod-torch-v280); its presence on Docker Hub was verified 2026-09-25. The
+# previous default (…cudnn-devel-ubuntu24.04) never existed: the docs example
+# is ubuntu22.04 and the tag was transcribed wrong. The image's own torch and
+# Python are irrelevant here: setup_runpod.sh builds its own canonical venv.
+IMAGE="${CAGE_POD_IMAGE:-runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404}"
 GPU_ID=""; GPU_COUNT="1"; DISK_GB="60"; VOL_GB="100"; PORTS="22/tcp"
 CLOUD_TYPE="SECURE"; TERMINATE_AFTER="12h"; NO_SEATBELT=0
 PRICE=""; HOURS=""; PURPOSE="unspecified"; YES=0
 # _SET flags distinguish "flag never given" from "flag given an empty value":
 # the latter must be REFUSED, not silently treated as absent (fail-closed).
-DC_IDS=""; DC_IDS_SET=0; NET_VOL_ID=""; NET_VOL_SET=0
+DC_IDS=""; DC_IDS_SET=0; NET_VOL_ID=""; NET_VOL_SET=0; VOL_GB_SET=0
 need_val() { [ "$#" -ge 2 ] || die "flag $1 requires a value"; }
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -64,7 +70,7 @@ while [ $# -gt 0 ]; do
     --image)              need_val "$@"; IMAGE="$2";           shift 2 ;;
     --gpu-count)          need_val "$@"; GPU_COUNT="$2";       shift 2 ;;
     --disk-gb)            need_val "$@"; DISK_GB="$2";         shift 2 ;;
-    --volume-gb)          need_val "$@"; VOL_GB="$2";          shift 2 ;;
+    --volume-gb)          need_val "$@"; VOL_GB="$2";     VOL_GB_SET=1;  shift 2 ;;
     --ports)              need_val "$@"; PORTS="$2";           shift 2 ;;
     --cloud-type)         need_val "$@"; CLOUD_TYPE="$2";      shift 2 ;;
     --data-center-ids)    need_val "$@"; DC_IDS="$2";     DC_IDS_SET=1;  shift 2 ;;
@@ -89,6 +95,14 @@ printf '%s' "$GPU_COUNT" | grep -qE '^[1-9][0-9]*$' || die "--gpu-count must be 
 [ "$DC_IDS_SET" -eq 0 ] || printf '%s' "$DC_IDS" | grep -qE '^[A-Za-z0-9-]+(,[A-Za-z0-9-]+)*$' \
   || die "--data-center-ids must be a non-empty CSV of ids matching [A-Za-z0-9-]+ (e.g. US-IL-1,EU-RO-1); got: '$DC_IDS'"
 [ "$NET_VOL_SET" -eq 0 ] || [ -n "$NET_VOL_ID" ] || die "--network-volume-id must be non-empty when given"
+# A network volume REPLACES the pod's volume disk at /workspace (docs:
+# pods/storage/types), so the volume disk is sent as 0 beside a network volume
+# and an explicit --volume-gb next to it is REFUSED (fail-closed, like the
+# other create-time-only levers), never silently dropped. The plan print says so.
+if [ "$NET_VOL_SET" -eq 1 ]; then
+  [ "$VOL_GB_SET" -eq 0 ] || die "--volume-gb cannot be combined with --network-volume-id: a network volume REPLACES the volume disk at /workspace (RunPod docs, pods/storage/types); drop --volume-gb"
+  VOL_GB=0
+fi
 
 # --- seatbelt resolution: operator duration -> absolute RFC3339 UTC ---------
 # runpodctl v2 `--terminate-after` takes an ABSOLUTE datetime, not a duration
@@ -162,7 +176,11 @@ log "=================== RunPod provisioning PLAN ==================="
 printf '  name              : %s\n' "$NAME"
 printf '  --gpu-id          : %s   (x%s, cloud-type %s)\n' "$GPU_ID" "$GPU_COUNT" "$CLOUD_TYPE"
 printf '  image             : %s\n' "$IMAGE"
-printf '  container disk    : %s GB   /workspace volume: %s GB\n' "$DISK_GB" "$VOL_GB"
+if [ "$NET_VOL_SET" -eq 1 ]; then
+  printf '  container disk    : %s GB   /workspace: network volume %s (replaces the volume disk; --volume-in-gb 0)\n' "$DISK_GB" "$NET_VOL_ID"
+else
+  printf '  container disk    : %s GB   /workspace volume: %s GB\n' "$DISK_GB" "$VOL_GB"
+fi
 printf '  ports             : %s\n' "$PORTS"
 if [ "$DC_IDS_SET" -eq 1 ]; then
   printf '  datacenter ids    : %s   (--data-center-ids pin)\n' "$DC_IDS"

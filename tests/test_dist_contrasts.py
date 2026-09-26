@@ -74,6 +74,7 @@ def _wm(
         n_timely=80,
         n_veridical=70,
         n_yield=60,
+        n_no_decode=None,
         duration_s=10.0,
         attainment=0.95,
         throughput_rps=9.5,
@@ -880,6 +881,7 @@ class TestDriverDispatch:
                     "ok": True,
                     "ttft_ms": 500.0,
                     "tpot_ms": 100.0,
+                    "num_tokens": 8,
                 }
                 for i in range(4)
             ]
@@ -1036,3 +1038,133 @@ class TestPressureAlignmentPass:
         )
         assert result is None
         assert not (tmp_path / rca.PRESSURE_ALIGNMENT_NAME).exists()
+
+
+# ---------------------------------------------------------------------------
+# ADR-0118 (Batch 2 W5): the #18 seam passes the decode-token count so a
+# one-token completion is judged on TTFT alone (counted), a null TPOT beside
+# decode tokens is a labeled skip naming the defect, and rows without a
+# num_tokens column are a labeled skip naming the column.
+# ---------------------------------------------------------------------------
+
+
+def _dist_18_tree(
+    tmp_path: Path, reqs_of: Any
+) -> tuple[Path, Path, list[dict[str, Any]]]:
+    """A complete #18 tree (manifest floors, tp + pd cells with gpu_count,
+    windows[] bounds, requests from ``reqs_of(topology)``, predicate rows)."""
+    run_dir = tmp_path / "run"
+    predicate_root = tmp_path / "predicate" / "score-1"
+    (run_dir / "manifest.json").parent.mkdir(parents=True)
+    (run_dir / "manifest.json").write_text(
+        json.dumps({"slo_floors": {"vllm": {"ttft_s": 0.1, "tpot_s": 0.05}}}),
+        encoding="utf-8",
+    )
+    rows = []
+    for topology, gpu_count in (("tp", 1), ("pd", 2)):
+        cell_dir = run_dir / "cells" / f"{topology}-cell"
+        wdir = cell_dir / "window_squad_v2-01"
+        wdir.mkdir(parents=True)
+        (cell_dir / "cell.json").write_text(
+            json.dumps(
+                {
+                    "gpu_count": gpu_count,
+                    "windows": {"squad_v2-01": {"t_start": 0.0, "t_end": 10.0}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        reqs = reqs_of(topology)
+        (wdir / "requests.jsonl").write_text(
+            "\n".join(json.dumps(r) for r in reqs) + "\n", encoding="utf-8"
+        )
+        pdir = predicate_root / f"cells/{topology}-cell/window_squad_v2-01"
+        pdir.mkdir(parents=True)
+        (pdir / "predicate.jsonl").write_text(
+            "\n".join(
+                json.dumps({"example_id": r["example_id"], "predicate": True})
+                for r in reqs
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        rows.append(
+            _index_row(
+                family="DIST",
+                topology=topology,
+                arm="gold-fresh",
+                budget_r=0.5,
+                rate_frac=0.9,
+                row_key=f"{topology}-cell",
+                window_dir=f"cells/{topology}-cell/window_squad_v2-01",
+                cell_json=f"cells/{topology}-cell/cell.json",
+            )
+        )
+    return run_dir, predicate_root, rows
+
+
+def _req(i: int, **over: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "example_id": f"e{i}", "ok": True, "ttft_ms": 500.0, "tpot_ms": 100.0,
+        "num_tokens": 8,
+    }
+    row.update(over)
+    return row
+
+
+def _dist_metrics(run_dir: Path, predicate_root: Path, row: dict[str, Any]) -> Any:
+    rec = next(_index_frame([row]).itertuples(index=False))
+    return rca._dist_window_metrics(
+        run_dir, rec, predicate_root, {"vllm": {"ttft_s": 0.1, "tpot_s": 0.05}}
+    )
+
+
+class TestContrast18OneTokenCompletionsW5:
+    def test_one_token_completion_executes_on_ttft_and_is_counted(
+        self, tmp_path: Path
+    ) -> None:
+        # e0 answers in one token on both sides: null TPOT, no decode phase.
+        run_dir, predicate_root, rows = _dist_18_tree(
+            tmp_path,
+            lambda _t: [_req(0, tpot_ms=None, num_tokens=1)] + [_req(i) for i in range(1, 4)],
+        )
+        for row in rows:
+            metrics, gpu_count, reason = _dist_metrics(run_dir, predicate_root, row)
+            assert reason is None
+            assert metrics.n_no_decode == 1
+            assert metrics.n_timely == 4  # e0 is timely on TTFT alone
+        analysis_dir = tmp_path / "analysis"
+        analysis_dir.mkdir()
+        result = rca.run_dist_contrasts_pass(
+            run_dir, _index_frame(rows), analysis_dir, rca.DESIGN_STAMP,
+            requested_ids=[18], gate_13={"endpoint": "contrast-13", "passed": True},
+            predicate_root=predicate_root, blinding_active=False,
+        )
+        assert result is not None and result["input_skips"] == []
+        (pair,) = result["contrast_18"]["pairs"]
+        assert pair["goodput_per_gpu_tp"] == pytest.approx(0.4)
+        assert pair["goodput_per_gpu_pd"] == pytest.approx(0.2)
+
+    def test_null_tpot_beside_decode_tokens_is_a_labeled_skip(
+        self, tmp_path: Path
+    ) -> None:
+        run_dir, predicate_root, rows = _dist_18_tree(
+            tmp_path, lambda _t: [_req(0, tpot_ms=None)] + [_req(i) for i in range(1, 4)]
+        )
+        metrics, gpu_count, reason = _dist_metrics(run_dir, predicate_root, rows[0])
+        assert metrics is None and gpu_count is None
+        assert "captured-timing defect" in reason
+
+    def test_rows_without_num_tokens_are_a_labeled_skip_naming_the_column(
+        self, tmp_path: Path
+    ) -> None:
+        def _legacy(_t: str) -> list[dict[str, Any]]:
+            rows = [_req(i) for i in range(4)]
+            for row in rows:
+                del row["num_tokens"]
+            return rows
+
+        run_dir, predicate_root, rows = _dist_18_tree(tmp_path, _legacy)
+        metrics, _gpu, reason = _dist_metrics(run_dir, predicate_root, rows[0])
+        assert metrics is None
+        assert "num_tokens" in reason

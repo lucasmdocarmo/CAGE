@@ -83,11 +83,18 @@ would record `sha=null` when git is absent):
 scripts/ops/package_repo.sh                    # -> /tmp/cage_<sha8>.tar.gz, warns if tree dirty
 scp ${CAGE_SSH_OPTS:-} /tmp/cage_<sha8>.tar.gz <user@pod>:~   # RunPod SSH, often non-standard port
 # pod
-mkdir -p ~/CAGE && tar xzf cage_*.tar.gz -C ~/CAGE
+[ ! -d ~/CAGE ] || [ -L ~/CAGE ] || { echo '~/CAGE is a real directory: remove it before linking'; false; }
+mkdir -p /workspace/CAGE && ln -sfn /workspace/CAGE ~/CAGE   # the network volume; ~/CAGE stays the path every script cites
+tar xzf cage_*.tar.gz -C ~/CAGE
 head -3 ~/CAGE/BUILD_INFO                      # verify sha/dirty/packaged_at
-cd ~/CAGE && bash scripts/runpod/setup_runpod.sh
+cd /workspace/CAGE && bash scripts/runpod/setup_runpod.sh   # every pod shell: the PHYSICAL path
 source cage-env/bin/activate
 ```
+
+One path spelling on every pod shell: `cd /workspace/CAGE`. Bash keeps the `~/CAGE`
+symlink spelling while Python resolves it physically, and two prefix strips in the
+tree assume one spelling (integration audit 2026-09-26, pod-10); the symlink stays
+for the scripts that cite `~/CAGE`.
 
 `setup_runpod.sh` is container-shaped (root, no sudo/systemd/PPA — finding J7): it
 installs the pinned vLLM + `requirements.txt` into `cage-env` built from the
@@ -203,7 +210,8 @@ P/D without an explicit split, and carries every live-only knob semantic as a
 The J4 refusal gate applies at launch: a run with NO off-box backup target **refuses to
 start** (`require_backup_target`, `scripts/lib/transport.sh`). Export
 `CAGE_BACKUP_TARGET` first — on RunPod normally the network-volume S3 API
-(`s3://<volume>[/prefix]` + `CAGE_S3_ENDPOINT` + AWS creds) or `ssh://[user@]host/path`.
+(`s3://<volume-id>[/prefix]` + `CAGE_S3_ENDPOINT` + `AWS_DEFAULT_REGION` + the S3 API
+key, §6 table) or `ssh://[user@]host/path`.
 
 ```bash
 export CAGE_BACKUP_TARGET=s3://<network-volume>[/prefix]     # see the §6 env table
@@ -256,11 +264,29 @@ nohup bash scripts/3_run/cloud_run.sh <MODEL> <N> <T> > run.log 2>&1 &
   budgeted cell step `CAGE_BUDGET_PLAN_JSON`; `load_plan` refuses a plan without
   the `calibration` header, a cell whose floors pin differs from it, or a cell
   whose budget record differs from its relaunch's; `run` refuses while either
-  env is exported in the shell. Run S0's cells through the driver, not through
-  the pilot shell drivers: a shell-driven tree carries neither pin, so contrast
-  #14 refuses and the rho_own leg skips on it. Pull the plan file and the
-  calibration artifacts together with the run (the plan header records each
+  env is exported in the shell. S0 runs its cells on the HAND PATH (close-out
+  sheet decision 0, 2026-09-24: the driver plans only sessions a and b of the D4
+  roster, so no S0 cell can be driver-run): `run_experiment.py --campaign-root
+  results/s0/a/<run_id>` with `CAGE_SLO_FLOORS_JSON` built by hand from the S0-6
+  cal-v1 artifacts and the `CAGE_CELL_*` coordinates exported per cell (the
+  runner's session reads both; only `run_campaign.py run` refuses shell-exported
+  pins), recorded as a deviation in the S0 session report
+  (`MyDocs/RunPod/S0_CHECKLIST.md`, "Hand path"); the rho_own leg is a labeled
+  skip at S0 because no budget-plan record is pinned there. The pilot shell
+  drivers stay out of S0: a shell-driven tree carries neither pin, so contrast
+  #14 refuses on it. Stage 1 runs through the driver and pulls the plan file and
+  the calibration artifacts together with the run (the plan header records each
   artifact's path and sha256; the sealed tree carries only the floors).
+
+- One-token completions (Batch 2 W5, ADR-0118): a completion with fewer than two
+  output tokens has no decode phase. The runner writes `tpot_ms: null` for it, the
+  analysis judges it on TTFT alone and counts it per window (`n_no_decode`), and
+  `verify_results` check (j) refuses a completed row whose `num_tokens` and
+  `tpot_ms` disagree (a null or zero TPOT beside two or more output tokens, a TPOT
+  value beside at most one) and warns when `num_tokens_source` reads `whitespace`
+  (the engine returned no `usage.completion_tokens`, so the count is words). S0 row S0-24 records what
+  each engine's `usage.completion_tokens` returns for a bare "Yes", so the exempt set
+  is known per engine before Stage 1.
 
 ### 4.0 Query manifests: build, register, and the blocked B12 rung cells
 
@@ -376,7 +402,7 @@ manually, and only then uses `--force` — a user decision, reported as such.
 | Variable | Consumed by | Contract |
 |---|---|---|
 | `CAGE_BACKUP_TARGET` | `transport.sh` (all sync/pull/teardown callers) | Off-box target: `gs://bucket[/prefix]` \| `s3://bucket[/prefix]` \| `ssh://[user@]host/abs/path` \| `file:///abs/path`. Anything else dies loud. Takes precedence over `CAGE_RESULTS_BUCKET`. |
-| `CAGE_S3_ENDPOINT` | s3 backend | Endpoint URL for `aws s3` — points it at the RunPod network-volume S3 API. Pair with `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` from the volume's credentials. |
+| `CAGE_S3_ENDPOINT` | s3 backend | Endpoint URL for `aws s3`: points it at the RunPod network-volume S3 API (`https://s3api-<dc>.runpod.io`, the 15 datacenters listed at docs.runpod.io/storage/s3-api). Pair with `AWS_DEFAULT_REGION=<datacenter id>` (REQUIRED: the endpoint rejects a request signed for any other region, verified 2026-09-25) and the account-level S3 API key created in the console (`AWS_ACCESS_KEY_ID` = its access key, `AWS_SECRET_ACCESS_KEY` = its secret; separate from `RUNPOD_API_KEY`); the bucket name is the network volume id. Both the pod (`setup_runpod.sh` installs the AWS CLI v2 by the official installer; Ubuntu 24.04 carries no `awscli` apt package) and the workstation (`brew install awscli`) need the CLI. |
 | `CAGE_SSH_OPTS` | ssh backend, `teardown_pod.sh` | Extra ssh options (e.g. `-p 2222` — RunPod pods expose SSH on non-standard ports). |
 | `CAGE_RESULTS_BUCKET` | legacy callers | Legacy GCS spelling (bare name or `gs://`); bare names are normalized to `gs://`. On a GCP box only, the metadata-derived `gs://<project>-cage-results` default still applies (Appendix A). |
 | `CAGE_TRANSPORT_DRYRUN=1` | `transport.sh` | Echo `DRYRUN: <exact command>` instead of executing — how gcs/s3/ssh argument construction is unit-tested offline (`tests/test_topic10_transport_runpod.py`). |
@@ -394,6 +420,15 @@ manually, and only then uses `--force` — a user decision, reported as such.
 | `CAGE_SLO_FLOORS_JSON` | `run_campaign.py` (cell-step env pin), `campaign_session.py` | Batch 2 W4 (ADR-0117): the §6.1 single-stream floors of every registered engine as compact JSON, pinned on EVERY cell step from the plan header `calibration` (one cal-v1 artifact per engine, §3.2); the session writes it into `manifest.json["slo_floors"]` at manifest creation and refuses a reopened manifest whose floors differ. `run` refuses while it is exported in the shell. Never set it by hand. |
 | `CAGE_BUDGET_PLAN_JSON` | `run_campaign.py` (budgeted cell-step env pin), `campaign_session.py`, `campaign_layout.CellWriter` | Batch 2 W4 (ADR-0117): the `cache_budget.BudgetPlan` record of the relaunch the cell runs under (`asdict` plus `floor_table_sha256`), pinned on budgeted cell steps only; cross-checked against the cell tuple by the session and persisted into `cell.json["budget_plan"]` (the rho_own basis). `run` refuses while it is exported in the shell. Never set it by hand. |
 | `CAGE_QUERY_MANIFEST` | `run_experiment.py` (loader), `campaign_session.py` | Path to the dataset's pre-drawn query manifest (`build_query_manifest.py`); the runner's `--query-manifest` sets it (the campaign driver passes that flag on every cell of a registered dataset, §4.0). The loader refuses a manifest built for another dataset, and the corpus-budget guard (A4, ADR-0106) refuses a served budget that is neither its `block_budget` nor one of its `trunc_rungs`. `campaign_session.py` resolves `dataset_manifests_sha256` from it when `CAGE_DATASET_MANIFESTS_SHA256` is unset. |
+| `CAGE_MODEL_WEIGHTS_GIB` | `manage_lmdeploy_server.sh` | REQUIRED for an LMDeploy start: the served checkpoint's weight footprint in GiB, measured on the pod (`du -sh` of its safetensors), the section 6.5 input that maps the byte budget to TurboMind's post-weights `cache_max_entry_count`; the launcher refuses to start without it (or an explicit `LMDEPLOY_CACHE_MAX_ENTRY_COUNT`, a recorded deviation). Integration audit 2026-09-26, models-8. |
+| `CAGE_KV_BUDGET_BYTES` | `manage_vllm_server.sh` | Positive integer; when set the launch adds `--kv-cache-memory-bytes <B>` (the planner's vLLM knob, S0-19) and the running-server check requires the same value on the live command line. |
+| `VLLM_MAX_MODEL_LEN` | `manage_vllm_server.sh`, `manage_sglang_server.sh` (`--context-length`), `_serving_config.sh` | Served context length; the launcher default is 4,096 (`manage_vllm_server.sh:288`). The campaign relaunches and every S0 cell export 32,768 (backlog A10). |
+| `CAGE_SGLANG_PYTHON` / `CAGE_LMDEPLOY_BIN` | `manage_sglang_server.sh`, `manage_lmdeploy_server.sh` | The engine interpreter and entry point; default to `sglang-env/bin/python3` and `lmdeploy-env/bin/lmdeploy` (setup step 3c), accept an absolute path or a bare name resolved through `command -v`, and fail closed in the start gate on a missing or non-importable engine before any teardown (pre-GO item 10, `docs/VLLM_COMPATIBILITY.md` section 7). |
+| `CAGE_PROMPT_MODE` | `run_experiment.py` | `chat` (default: the model's chat template through `/v1/chat/completions`, Qwen3 thinking pinned off on vLLM) or `raw` (the legacy raw-completions path). The prefix-aware router serves no chat route, so a runner smoke through it uses `raw` (S0-9; audit distributed-7). |
+| `CAGE_<ENGINE>_CHAT_TEMPLATE_KWARGS` | `run_experiment.py` (`_adapter_env_extras`) | JSON object forwarded as the adapter's `chat_template_kwargs` for `SGLANG` and `LMDEPLOY`; the `VLLM` variant is REFUSED because the vLLM adapter pins its own verified kwargs (ADR-0007). Malformed values refuse. S0-5 is the only live verification. |
+| `CAGE_MODEL_SLUG` | `campaign_session.py` | The design-input model label of a campaign-mode cell when the served model is outside the D4 roster (S0 stand-in: `qwen3-14b` for the BF16 Qwen3-8B); the session refuses a non-roster model without it. Never set it for a roster model. |
+| `CAGE_CELL_FAMILY` / `CAGE_CELL_BUDGET_R` / `CAGE_CELL_RATE_FRAC` (also `CAGE_CELL_POLICY`, `CAGE_CELL_TOPOLOGY`, `CAGE_CELL_ARM`, `CAGE_CELL_RETRIEVER`, `CAGE_CELL_CORPUS_BUDGET`) | `campaign_session.py` (`from_cli`) | Per-cell coordinate overrides on the hand path (the driver sets them on the campaign path): family and the F2/F3 pressure coordinates the window records. A hand-run F2 pressure cell exports family `F2`, `budget_r` and `rate_frac` beside the launcher's byte knob. |
+| `CAGE_PROVIDER` / `CAGE_HARDWARE` / `CAGE_GPU_COUNT` | `campaign_session.py` | Provenance the run manifest requires (`CAGE_PROVIDER`, `CAGE_HARDWARE`: refused when unset) and the serving stack's GPU count (optional, W4.2; the driver threads it). S0: `runpod`, `L40S x1`, `1`. |
 | `HF_HUB_DOWNLOAD_TIMEOUT` | `setup_runpod.sh`, HF downloads | Stalled-read timeout in seconds (default 30). Exported BEFORE dataset staging AND model prefetch (J7 — a stalled socket must raise, then resume, not hang for an hour). |
 | `CAGE_BACKUP_INTERVAL` | `gcs_backup_daemon.sh` | Seconds between mirror passes (default 300). |
 | `CAGE_POD_SSH` / `CAGE_ASSUME_YES` | `teardown_pod.sh` | `user@host` of the pod for the final on-pod sync (unset = that step skipped loudly); `CAGE_ASSUME_YES=1` answers the confirm ceremony for non-interactive teardowns. |

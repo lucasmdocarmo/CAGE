@@ -77,6 +77,10 @@ def stub_bin(tmp_path_factory: pytest.TempPathFactory) -> Path:
         "nvidia-smi": "#!/bin/sh\nexit 1\n",
         "pkill": "#!/bin/sh\nexit 0\n",
         "vllm": "#!/bin/sh\nexit 0\n",
+        # item 10 (2026-09-26): the SGLang launcher's gate imports sglang
+        # through its resolved interpreter; this stub exits 0 for the probe
+        # and for the inert backgrounded launch (see _run_launcher).
+        "sglang-python": "#!/bin/sh\nexit 0\n",
     }.items():
         p = d / name
         p.write_text(body, encoding="utf-8")
@@ -87,6 +91,10 @@ def stub_bin(tmp_path_factory: pytest.TempPathFactory) -> Path:
 def _run_launcher(script: Path, stub_bin: Path, *args: str, **env_extra: str):
     env = _clean_env(**env_extra)
     env["PATH"] = f"{stub_bin}:{env.get('PATH', '/usr/bin:/bin')}"
+    # item 10 (2026-09-26): the SGLang launcher fails closed unless its
+    # interpreter imports sglang; the stub interpreter satisfies the probe so
+    # the composed argv is reached (the vLLM launcher ignores the variable).
+    env.setdefault("CAGE_SGLANG_PYTHON", str(stub_bin / "sglang-python"))
     # TIMEOUT=0 skips the readiness wait entirely: the launcher echoes the
     # composed argv, backgrounds the inert stub, then fails fast (exit 1).
     env.setdefault("VLLM_START_TIMEOUT", "0")
@@ -198,7 +206,9 @@ def test_budget_knobs_land_in_serving_config_capture() -> None:
     sglang = SGLANG_SH.read_text(encoding="utf-8")
     assert 'SC_MAX_TOTAL_TOKENS="${CAGE_SGLANG_MAX_TOTAL_TOKENS:-}"' in sglang
     assert '"max_total_tokens"' in sglang
-    assert 'SC_ARGS="python3 -m sglang.launch_server ${sglang_args[*]}"' in sglang
+    # item 10 (2026-09-26): the argv string records the RESOLVED interpreter
+    # (CAGE_SGLANG_PYTHON / sglang-env / PATH python3), never a bare python3.
+    assert 'SC_ARGS="$SGLANG_PYTHON -m sglang.launch_server ${sglang_args[*]}"' in sglang
 
 
 def test_reuse_dial_parity_covers_the_budget_knobs() -> None:

@@ -213,8 +213,9 @@ cage_validate_sglang_budget_env() {
 #   CAGE_VLLM_TENSOR_PARALLEL  positive int -> vllm `--tensor-parallel-size N`
 #   CAGE_SGLANG_TP             positive int -> sglang `--tp-size N`
 #                              [VERIFY-LIVE at Run-C-prime preflight: exact
-#                              SGLang flag spelling — docs say --tp-size with
-#                              --tp as alias, but no SGLang pin exists yet]
+#                              SGLang flag spelling, docs say --tp-size with
+#                              --tp as alias, unproven against the pinned
+#                              0.5.10.post1 (VLLM_COMPATIBILITY.md section 7)]
 # Value 1 is VALID and means the flag is OMITTED ENTIRELY: the single-GPU
 # argv must stay byte-identical to the pre-T3.1 launch (pinned differentially
 # in tests/test_tp_flags.py), so engine-default TP handling is untouched.

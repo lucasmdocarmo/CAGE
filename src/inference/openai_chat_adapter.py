@@ -32,7 +32,9 @@ Telemetry honesty contract: every response carries explicit availability
 flags -- ``usage_telemetry_available`` / ``cached_token_telemetry_available``
 plus ``engine_id`` -- as plain attributes (consumed via getattr, so the shared
 ``InferenceResponse`` dataclass schema in src/inference/engine.py is
-untouched). ``capabilities()`` exposes each adapter's declared surface so the
+untouched), and since ADR-0118 (Batch 2 W5) the ``num_tokens_source`` label
+saying whether ``num_tokens`` is the engine's usage.completion_tokens or the
+whitespace word count of the text (no usage chunk). ``capabilities()`` exposes each adapter's declared surface so the
 charter-D2 telemetry-parity preflight gate can be driven from data.
 
 Retry semantics: ``max_retries``/``retry_backoff_s`` (default 0 -- behavior
@@ -52,7 +54,13 @@ import aiohttp
 import asyncio
 import requests
 
-from .engine import InferenceEngine, InferenceRequest, InferenceResponse
+from .engine import (
+    InferenceEngine,
+    InferenceRequest,
+    InferenceResponse,
+    NUM_TOKENS_SOURCE_USAGE,
+    NUM_TOKENS_SOURCE_WHITESPACE,
+)
 from .errors import EngineCapabilityUnavailableError
 
 
@@ -262,22 +270,37 @@ class OpenAIChatAdapter(InferenceEngine):
             response.mean_token_logprob = None
         return response
 
+    @staticmethod
+    def _completion_token_count(
+        completion_tokens: Optional[int], generated_text: str
+    ) -> Tuple[int, str]:
+        """(num_tokens, provenance): the engine's usage.completion_tokens when
+        the usage chunk carried one, else the whitespace word count of the
+        text, labeled so a consumer can tell a counted token from a counted
+        word (ADR-0118, Batch 2 W5: the decode-phase rule keys on it)."""
+        if isinstance(completion_tokens, int):
+            return completion_tokens, NUM_TOKENS_SOURCE_USAGE
+        return len(generated_text.split()), NUM_TOKENS_SOURCE_WHITESPACE
+
     def _finalize(
         self,
         response: InferenceResponse,
         *,
         prompt_tokens: Optional[int],
         cached_prompt_tokens: Optional[int],
+        num_tokens_source: Optional[str] = None,
     ) -> InferenceResponse:
         """Stamp telemetry-provenance flags as plain attributes.
 
         ``None`` telemetry is recorded as unavailable, never fabricated
         (charter D2: None-with-provenance). Plain attributes keep the shared
-        InferenceResponse schema untouched.
+        InferenceResponse schema untouched. ``num_tokens_source`` is the
+        ADR-0118 token-count label; error rows carry None.
         """
         response.engine_id = self.engine_id
         response.usage_telemetry_available = prompt_tokens is not None
         response.cached_token_telemetry_available = cached_prompt_tokens is not None
+        response.num_tokens_source = num_tokens_source
         return response
 
     def _extract_header_kv_transfer_params(self, headers: Any) -> Optional[Dict[str, Any]]:
@@ -410,7 +433,11 @@ class OpenAIChatAdapter(InferenceEngine):
         ttft_ms = ((first_token_time - start_time) * 1000) if first_token_time else total_time_ms
         generated_text = "".join(full_text_parts)
 
-        num_tokens = completion_tokens if isinstance(completion_tokens, int) else len(generated_text.split())
+        num_tokens, num_tokens_source = self._completion_token_count(
+
+            completion_tokens, generated_text
+
+        )
 
         return self._finalize(
             InferenceResponse(
@@ -428,6 +455,7 @@ class OpenAIChatAdapter(InferenceEngine):
             ),
             prompt_tokens=prompt_tokens,
             cached_prompt_tokens=cached_prompt_tokens,
+            num_tokens_source=num_tokens_source,
         )
 
     def _stream_chat_completion(
@@ -531,7 +559,11 @@ class OpenAIChatAdapter(InferenceEngine):
         ttft_ms = ((first_token_time - start_time) * 1000) if first_token_time else total_time_ms
         generated_text = "".join(full_text_parts)
 
-        num_tokens = completion_tokens if isinstance(completion_tokens, int) else len(generated_text.split())
+        num_tokens, num_tokens_source = self._completion_token_count(
+
+            completion_tokens, generated_text
+
+        )
 
         return self._finalize(
             self._attach_logprob_stats(
@@ -552,6 +584,7 @@ class OpenAIChatAdapter(InferenceEngine):
             ),
             prompt_tokens=prompt_tokens,
             cached_prompt_tokens=cached_prompt_tokens,
+            num_tokens_source=num_tokens_source,
         )
 
     def _chat_completion(
@@ -588,10 +621,10 @@ class OpenAIChatAdapter(InferenceEngine):
             if kv_transfer_params is None:
                 kv_transfer_params = self._header_kv_transfer(resp.headers)
 
-            num_tokens = (
-                completion_tokens
-                if isinstance(completion_tokens, int)
-                else len(generated_text.split())
+            num_tokens, num_tokens_source = self._completion_token_count(
+
+                completion_tokens, generated_text
+
             )
 
             return self._finalize(
@@ -613,6 +646,7 @@ class OpenAIChatAdapter(InferenceEngine):
                 ),
                 prompt_tokens=prompt_tokens,
                 cached_prompt_tokens=cached_prompt_tokens,
+                num_tokens_source=num_tokens_source,
             )
 
         except (requests.exceptions.RequestException, ValueError) as e:
@@ -667,10 +701,10 @@ class OpenAIChatAdapter(InferenceEngine):
             if kv_transfer_params is None:
                 kv_transfer_params = self._header_kv_transfer(resp.headers)
 
-            num_tokens = (
-                completion_tokens
-                if isinstance(completion_tokens, int)
-                else len(generated_text.split())
+            num_tokens, num_tokens_source = self._completion_token_count(
+
+                completion_tokens, generated_text
+
             )
 
             # Non-streaming: TTFT is unobservable (full response arrives at once), so report
@@ -694,6 +728,7 @@ class OpenAIChatAdapter(InferenceEngine):
                 ),
                 prompt_tokens=prompt_tokens,
                 cached_prompt_tokens=cached_prompt_tokens,
+                num_tokens_source=num_tokens_source,
             )
 
         except (requests.exceptions.RequestException, ValueError) as e:
@@ -808,10 +843,10 @@ class OpenAIChatAdapter(InferenceEngine):
                     if kv_transfer_params is None:
                         kv_transfer_params = self._header_kv_transfer(resp.headers)
 
-                    num_tokens = (
-                        completion_tokens
-                        if isinstance(completion_tokens, int)
-                        else len(generated_text.split())
+                    num_tokens, num_tokens_source = self._completion_token_count(
+
+                        completion_tokens, generated_text
+
                     )
                     # Non-streaming: TTFT unobservable -> report full response time.
                     ttft_ms = total_time_ms
@@ -832,6 +867,7 @@ class OpenAIChatAdapter(InferenceEngine):
                         ),
                         prompt_tokens=prompt_tokens,
                         cached_prompt_tokens=cached_prompt_tokens,
+                        num_tokens_source=num_tokens_source,
                     )
                     # Provenance: this ttft_ms is the full-response PROXY, not
                     # a streamed first-token time. Measured open-loop rows must
@@ -1002,10 +1038,8 @@ class OpenAIChatAdapter(InferenceEngine):
             else total_time_ms
         )
         generated_text = "".join(full_text_parts)
-        num_tokens = (
-            completion_tokens
-            if isinstance(completion_tokens, int)
-            else len(generated_text.split())
+        num_tokens, num_tokens_source = self._completion_token_count(
+            completion_tokens, generated_text
         )
 
         response = self._finalize(
@@ -1027,6 +1061,7 @@ class OpenAIChatAdapter(InferenceEngine):
             ),
             prompt_tokens=prompt_tokens,
             cached_prompt_tokens=cached_prompt_tokens,
+            num_tokens_source=num_tokens_source,
         )
         response.ttft_methodology = "streamed-first-delta"
         return response

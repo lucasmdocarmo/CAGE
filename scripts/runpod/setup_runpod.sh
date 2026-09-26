@@ -1,6 +1,6 @@
 #!/bin/bash
 # Order:     provisioning bracket — on the fresh pod, before/as stage 1 (it stages datasets + prefetches models itself)
-# Objective: Container-shaped RunPod bootstrap (root, no sudo/systemd/PPA): canonical-CPython venv, pinned vLLM, charter datasets, model prefetch
+# Objective: Container-shaped RunPod bootstrap (root, no sudo/systemd/PPA): canonical-CPython venv, pinned vLLM, SGLang and LMDeploy in their own venvs, charter datasets, model prefetch
 # Cloud:     runpod
 # =============================================================================
 # CAGE RunPod bootstrap — PRIMARY provider setup (task #137, finding J7)
@@ -28,7 +28,8 @@
 #   bash scripts/runpod/setup_runpod.sh
 # Then (the docs/RUNBOOK.md lifecycle — the preflight gate is NOT optional):
 #   source cage-env/bin/activate
-#   export CAGE_BACKUP_TARGET=s3://<network-volume>[/prefix]   # or ssh://... (J4 gate)
+#   export CAGE_BACKUP_TARGET=s3://<network-volume-id>[/prefix]   # or ssh://... (J4 gate)
+#   export CAGE_S3_ENDPOINT=https://s3api-<dc>.runpod.io AWS_DEFAULT_REGION=<DC>   # s3: region REQUIRED
 #   <start the serving engine: scripts/2_serving/manage_vllm_server.sh>
 #   bash scripts/checks/preflight_check.sh <MODEL> <API_BASE>   # gates (a)-(p); red = do NOT launch
 #   nohup bash scripts/3_run/run_full_sweep.sh <model> <N> <T> > sweep.log 2>&1 &
@@ -39,11 +40,25 @@
 #   PREFETCH_MODELS       override the model prefetch roster (space-separated HF ids)
 #   SKIP_MODEL_PREFETCH=1 bypass model prefetch (e.g. a single-model pod)
 #   HF_HUB_DOWNLOAD_TIMEOUT  stalled-read timeout seconds (default 30)
+#   SGLANG_VERSION        SGLang pin override (default: the section 7 pin below; own venv sglang-env)
+#   LMDEPLOY_VERSION      LMDeploy pin override (default: the section 7 pin below; own venv lmdeploy-env)
+#   LMDEPLOY_TORCH_VERSION  torch pinned inside lmdeploy-env (default 2.10.0: vLLM 0.19.1's CUDA 12.8 line)
+#   SKIP_ENGINE_INSTALL=1 bypass the SGLang/LMDeploy venvs (a vLLM-only pod)
 # =============================================================================
 set -euo pipefail
 
 # Keep in sync with docs/VLLM_COMPATIBILITY.md (the single pinned version).
 VLLM_VERSION="${VLLM_VERSION:-0.19.1}"
+# Charter engines #2 and #3 (docs/VLLM_COMPATIBILITY.md section 7; pre-GO item 10,
+# 2026-09-26). Each gets its OWN venv beside cage-env: SGLang pins transformers 5.x
+# against the repo's transformers<5, and every SGLang release since 2026-05 pins a
+# CUDA 13 torch, so the pins below stay on the CUDA 12.8 runtime line the image
+# (cu1281) and vLLM 0.19.1 (torch 2.10.0) run on: SGLang 0.5.10.post1 pins torch
+# 2.9.1 (cu12.8); LMDeploy 0.17.0 accepts torch 2.0 to 2.12.1, so its venv pins
+# torch explicitly or pip would resolve a CUDA 13 build. Keep in sync with section 7.
+SGLANG_VERSION="${SGLANG_VERSION:-0.5.10.post1}"
+LMDEPLOY_VERSION="${LMDEPLOY_VERSION:-0.17.0}"
+LMDEPLOY_TORCH_VERSION="${LMDEPLOY_TORCH_VERSION:-2.10.0}"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$PROJECT_DIR"
 # shellcheck source=scripts/lib/_common.sh
@@ -80,6 +95,27 @@ fi
 if ! redis-cli ping >/dev/null 2>&1; then
   redis-server --daemonize yes 2>/dev/null \
     || warn "could not start redis-server (--daemonize failed); redis/hybrid baselines will fail until it is started"
+fi
+
+# 0d. AWS CLI v2 for the s3 transport (the RunPod network-volume S3 API; scripts/lib/
+#     transport.sh refuses s3:// targets without `aws`). Ubuntu 24.04 (the pod image)
+#     carries NO `awscli` apt package (removed from noble), so the official installer
+#     is used; it lives under /usr/local, OUTSIDE cage-env, so the S0-16 lockfile stays
+#     clean. Guarded and loud, never silent: the s3 backend fails closed later anyway.
+if command -v aws >/dev/null 2>&1; then
+  echo "[cage] [0d] aws already present: $(aws --version 2>&1 | head -1)"
+else
+  echo "[cage] [0d] installing AWS CLI v2 (official installer; no awscli apt package in Ubuntu 24.04)..."
+  _awsdir="$(mktemp -d)"
+  if { command -v unzip >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -y unzip; } \
+     && curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "$_awsdir/awscliv2.zip" \
+     && unzip -q -o "$_awsdir/awscliv2.zip" -d "$_awsdir" \
+     && "$_awsdir/aws/install" >/dev/null; then
+    echo "[cage]   aws: $(aws --version 2>&1 | head -1)"
+  else
+    warn "AWS CLI v2 install failed; the s3 transport refuses s3:// targets without it (transport.sh)"
+  fi
+  rm -rf "$_awsdir"
 fi
 
 # 0c. Canonical interpreter (finding B1): the Tier-1 exact pins in
@@ -138,6 +174,40 @@ pip install -r requirements.txt
 #     same reconcile as the GCP port (see setup_gpu_cloud.sh [3b] for history).
 echo "[cage] [3b] reconciling openai for vLLM ${VLLM_VERSION}..."
 pip install -U "openai>=2.0"
+
+# 3c. Charter engines #2 and #3 in their OWN venvs (pre-GO item 10). Created from
+#     the canonical interpreter like cage-env, installed through each venv's own
+#     pip and without a pip cache (the 60 GB container disk also holds the model
+#     prefetch; cage-env stays the active environment for the steps below). Loud and
+#     non-fatal like the dataset step: the launchers resolve these venvs by
+#     default (manage_sglang_server.sh CAGE_SGLANG_PYTHON, manage_lmdeploy_server.sh
+#     CAGE_LMDEPLOY_BIN) and fail closed at start when one is missing. Idempotent
+#     without deleting anything: an existing venv is reused and pip completes a
+#     killed install on the rerun.
+install_engine_venv() {
+  # $1 venv dir, $2 label, $3.. pip install arguments
+  local venv="$1" label="$2"
+  shift 2
+  echo "[cage] [3c] installing ${label} into ${venv} (${PYBIN})..."
+  if "$PYBIN" -m venv "$venv" \
+     && "$venv/bin/pip" install --quiet --no-cache-dir --upgrade pip setuptools wheel \
+     && "$venv/bin/pip" install --no-cache-dir "$@"; then
+    return 0
+  fi
+  warn "${label} install FAILED (${venv}); its launcher refuses to start until this is fixed"
+  return 1
+}
+if [ "${SKIP_ENGINE_INSTALL:-0}" != "1" ]; then
+  if install_engine_venv sglang-env "SGLang ${SGLANG_VERSION}" "sglang==${SGLANG_VERSION}"; then
+    echo "[cage]   sglang: $(sglang-env/bin/python3 -c 'import sglang; print(sglang.__version__)' 2>&1 | tail -1)"
+  fi
+  if install_engine_venv lmdeploy-env "LMDeploy ${LMDEPLOY_VERSION} + torch ${LMDEPLOY_TORCH_VERSION}" \
+       "torch==${LMDEPLOY_TORCH_VERSION}" "lmdeploy==${LMDEPLOY_VERSION}"; then
+    echo "[cage]   lmdeploy: $(lmdeploy-env/bin/python3 -c 'import lmdeploy; print(lmdeploy.__version__)' 2>&1 | tail -1)"
+  fi
+else
+  echo "[cage] [3c] SGLang/LMDeploy venvs SKIPPED (SKIP_ENGINE_INSTALL=1)"
+fi
 
 # 4. HF download robustness FIRST (finding J7: this export must precede BOTH
 #    the dataset staging and the model prefetch — the GCP pilot script exported
@@ -230,10 +300,16 @@ echo
 echo "[cage] ============================================================"
 echo "[cage]  RunPod bootstrap complete. Next (docs/RUNBOOK.md lifecycle):"
 echo "[cage]    source cage-env/bin/activate"
-echo "[cage]    export CAGE_BACKUP_TARGET=s3://<network-volume>[/prefix]   # or ssh://[user@]host/path"
-echo "[cage]    #   (s3 backend: also export CAGE_S3_ENDPOINT + AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY"
-echo "[cage]    #    from the RunPod network-volume S3 API credentials)"
-echo "[cage]    # 1. start the serving engine (scripts/2_serving/manage_vllm_server.sh)"
+echo "[cage]    export CAGE_BACKUP_TARGET=s3://<network-volume-id>[/prefix]   # or ssh://[user@]host/path"
+echo "[cage]    #   (s3 backend: also export CAGE_S3_ENDPOINT=https://s3api-<dc>.runpod.io,"
+echo "[cage]    #    AWS_DEFAULT_REGION=<DC> (REQUIRED: the endpoint rejects any other signing region),"
+echo "[cage]    #    and the account-level S3 API key from the console (AWS_ACCESS_KEY_ID = its"
+echo "[cage]    #    access key, AWS_SECRET_ACCESS_KEY = its secret; separate from RUNPOD_API_KEY);"
+echo "[cage]    #    the bucket name is the network volume id. The AWS CLI v2 was installed above by"
+echo "[cage]    #    the official installer (Ubuntu 24.04 has no awscli apt package).)"
+echo "[cage]    # 1. start the serving engine (scripts/2_serving/manage_vllm_server.sh;"
+echo "[cage]    #    manage_sglang_server.sh / manage_lmdeploy_server.sh use sglang-env /"
+echo "[cage]    #    lmdeploy-env from step 3c by default, no activation needed)"
 echo "[cage]    # 2. GATE the launch -- a red gate means do NOT launch:"
 echo "[cage]    bash scripts/checks/preflight_check.sh <MODEL> <API_BASE>"
 echo "[cage]    # 3. run (one run-id for the whole matrix; resume via CAGE_RUN_ID):"

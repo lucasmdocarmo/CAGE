@@ -1359,6 +1359,9 @@ def adapter_honesty_columns(response: Any) -> Dict[str, Any]:
     (OpenAIChatAdapter._finalize, HFOracleAdapter.generate); absent attributes
     stay None -- provenance is recorded, never fabricated. Appended AFTER the
     existing result columns via the union-of-keys CSV convention.
+    ``num_tokens_source`` (ADR-0118, Batch 2 W5) says whether the row's
+    num_tokens is the engine's usage count, the whitespace word count of the
+    text, or the in-process token ids; the decode-phase rule keys on it.
     """
     return {
         "engine_id": getattr(response, "engine_id", None),
@@ -1368,6 +1371,7 @@ def adapter_honesty_columns(response: Any) -> Dict[str, Any]:
         ),
         "retries": getattr(response, "retries", None),
         "reference_engine": getattr(response, "reference_engine", None),
+        "num_tokens_source": getattr(response, "num_tokens_source", None),
     }
 
 

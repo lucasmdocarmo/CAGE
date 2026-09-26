@@ -892,16 +892,77 @@ def _datasets_env(stub: Path, cache: Path, **extra: str) -> Dict[str, str]:
     return _clean_env(PYTHONPATH=str(stub), HF_DATASETS_CACHE=str(cache), **extra)
 
 
-# The default campaign roster's HF-cache directory names ("/" -> "___"), from
+# The default campaign roster's HF-cache directory names as the datasets
+# library writes them: {namespace}___{camelcase_to_snakecase(name)}
+# (datasets/builder.py builder_data_dir; 4.8.5 read 2026-09-26), from
 # download_datasets.dataset_specs() at the default (un-overridden) HF paths.
+# Before 2026-09-26 this table (and the gate) used a plain slash replacement,
+# which named three directories the library never creates (integration audit
+# datasets-1): gate (p) refused musique, scbench and sharegpt on every pod.
 _DEFAULT_ROSTER_CACHE_DIRS = (
-    "hotpotqa___hotpot_qa",     # hotpotqa (namespaced 2026-09-02)
-    "dgslibisey___MuSiQue",     # musique
-    "allenai___qasper",         # qasper
-    "microsoft___SCBench",      # scbench (both configs share the dir)
-    "RyokoAI___ShareGPT52K",    # sharegpt
-    "rajpurkar___squad_v2",     # squad_v2 (namespaced 2026-09-02)
+    "hotpotqa___hotpot_qa",       # hotpotqa (namespaced 2026-09-02)
+    "dgslibisey___mu_si_que",     # musique (MuSiQue snake-cased)
+    "allenai___qasper",           # qasper
+    "microsoft___sc_bench",       # scbench (SCBench snake-cased; both configs share the dir)
+    "RyokoAI___share_gpt52_k",    # sharegpt (ShareGPT52K snake-cased; namespace verbatim)
+    "rajpurkar___squad_v2",       # squad_v2 (namespaced 2026-09-02)
 )
+
+#: The names the pre-2026-09-26 rule produced for the three mixed-case repos.
+_PLAIN_SLASH_NAMES = ("dgslibisey___MuSiQue", "microsoft___SCBench", "RyokoAI___ShareGPT52K")
+
+
+def _naming_ns() -> dict:
+    """exec only the naming helpers of the gate (p) snippet (the rest of the
+    snippet runs the gate at import time)."""
+    snippet = _snippet("CAGE-DATASET-STALENESS-GATE")
+    part = snippet[snippet.index("_UPPER_UPPER = "):snippet.index("def staged(")]
+    ns: dict = {"re": re}
+    exec(compile(part, "gate-p-naming", "exec"), ns)
+    return ns
+
+
+def test_datasets_gate_cache_dir_names_follow_the_datasets_library() -> None:
+    """Audit datasets-1 (2026-09-26): the gate must name cache directories
+    exactly as datasets.builder does, namespace verbatim and the repo name
+    through camelcase_to_snakecase; a mixed-case repo id is the case that
+    broke."""
+    ns = _naming_ns()
+    expected = {
+        "dgslibisey/MuSiQue": "dgslibisey___mu_si_que",
+        "microsoft/SCBench": "microsoft___sc_bench",
+        "RyokoAI/ShareGPT52K": "RyokoAI___share_gpt52_k",
+        "hotpotqa/hotpot_qa": "hotpotqa___hotpot_qa",
+        "allenai/qasper": "allenai___qasper",
+        "rajpurkar/squad_v2": "rajpurkar___squad_v2",
+        "squad_v2": "squad_v2",  # a bare (un-namespaced) id
+        "Org/HTMLParserDataset": "Org___html_parser_dataset",
+    }
+    for hf_path, name in expected.items():
+        assert ns["cache_dir_name"](hf_path) == name, hf_path
+    # The replicated rule equals the pinned library's own function, when installed.
+    naming = pytest.importorskip("datasets.naming")
+    for raw in ("MuSiQue", "SCBench", "ShareGPT52K", "hotpot_qa", "qasper",
+                "HTMLParserDataset", "squad_v2", "ABCDef", "a1B2c"):
+        assert ns["snake_case"](raw) == naming.camelcase_to_snakecase(raw), raw
+
+
+def test_datasets_gate_refuses_a_cache_staged_under_plain_slash_names(
+        fake_datasets_path: Path, tmp_path: Path) -> None:
+    """The directories the OLD rule looked for never exist on a pod; a cache
+    that carries only those names must be reported NOT staged for the three
+    mixed-case repos (the datasets-1 scenario, inverted)."""
+    cache = tmp_path / "cache"
+    for dirname in _PLAIN_SLASH_NAMES + ("hotpotqa___hotpot_qa", "allenai___qasper",
+                                         "rajpurkar___squad_v2"):
+        _stage(cache, dirname)
+    proc = _run_gate("CAGE-DATASET-STALENESS-GATE",
+                     env=_datasets_env(fake_datasets_path, cache))
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "REFUSING" in proc.stdout
+    for key in ("musique", "scbench", "sharegpt"):
+        assert key in proc.stdout.split("REFUSING")[1], f"{key} must be named as missing"
+    assert proc.stdout.count("[PASS] dataset") == 3  # hotpotqa, qasper, squad_v2
 
 
 def test_datasets_gate_unset_env_evaluates_default_roster_and_refuses(

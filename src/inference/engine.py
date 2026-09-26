@@ -9,6 +9,17 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict, Any
 import time
 
+#: ``num_tokens`` provenance labels (ADR-0118, Batch 2 W5), stamped by the
+#: adapters as the plain attribute ``num_tokens_source`` and persisted per row
+#: by run_experiment.adapter_honesty_columns. "usage": the engine's
+#: usage.completion_tokens; "whitespace": the word count of the generated text
+#: because no usage.completion_tokens arrived (words, not tokens); "token_ids": the
+#: in-process engine's own generated ids. None on an error row and on an
+#: adapter that does not label.
+NUM_TOKENS_SOURCE_USAGE: str = "usage"
+NUM_TOKENS_SOURCE_WHITESPACE: str = "whitespace"
+NUM_TOKENS_SOURCE_TOKEN_IDS: str = "token_ids"
+
 
 @dataclass
 class InferenceRequest:

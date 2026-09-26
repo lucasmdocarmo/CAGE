@@ -13,8 +13,9 @@ MyDocs/runpod-cli-reference.md §2), plus three new ops scripts:
                     runaway-cost alarm).
   cost_report.sh    fully-OFFLINE cost table from the ledger create/delete
                     pairs; malformed lines are refused loudly by line number;
-                    --billing shells `runpodctl billing` as the account
-                    authority.
+                    --billing shells `runpodctl billing pods` + `runpodctl
+                    billing network-volume` as the account authority (the
+                    bare `billing` group prints help and exits 0 on 2.11.0).
 
 $0 DOCTRINE: everything here is offline. runpodctl is a PATH-shim FAKE written
 into a tmp dir that records argv and serves canned outputs — the real CLI/API
@@ -483,6 +484,64 @@ def test_provision_refuses_bad_data_center_ids(tmp_path: Path, bad: str) -> None
     )
 
 
+def test_provision_default_image_is_a_published_tag(tmp_path: Path) -> None:
+    """The default image must be a tag that exists on Docker Hub.
+
+    The pre-2026-09-25 default (…cudnn-devel-ubuntu24.04) never existed (the docs
+    example is ubuntu22.04), so every S0-1 create would have failed or stalled.
+    A hermetic test cannot reach Docker Hub; it pins the literal so any future
+    edit is reviewed against the registry (verified 2026-09-25).
+    """
+    fake, _ = _install_fake(tmp_path)
+    proc = _bash(f'bash "{PROVISION}" --gpu-id "{GPU}" --hours 6', env=_env(fake))
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    assert "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404" in proc.stdout
+
+
+def test_provision_network_volume_zeroes_the_volume_disk(tmp_path: Path) -> None:
+    """A network volume REPLACES the volume disk at /workspace (RunPod docs,
+    pods/storage/types), and runpodctl omits volumeInGb when it is 0, so the
+    create must send --volume-in-gb 0 beside --network-volume-id and the PLAN
+    print must say the volume disk is replaced; without a volume the 100 GB
+    default still rides the create."""
+    fake, log = _install_fake(tmp_path)
+    ledger = tmp_path / "pod_ledger.jsonl"
+    plan = _bash(
+        f'bash "{PROVISION}" --gpu-id "{GPU}" --network-volume-id nvol1234abcd --hours 6',
+        env=_env(fake),
+    )
+    assert plan.returncode == 0, f"stdout:\n{plan.stdout}\nstderr:\n{plan.stderr}"
+    assert "replaces the volume disk" in plan.stdout and "--volume-in-gb 0" in plan.stdout
+    assert "/workspace volume: 100 GB" not in plan.stdout
+    proc = _bash(
+        f'bash "{PROVISION}" --gpu-id "{GPU}" --network-volume-id nvol1234abcd --yes',
+        env=_env(fake, CAGE_POD_LEDGER=str(ledger)),
+    )
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    creates = [c for c in _argv_lines(log) if c.startswith("pod create")]
+    assert len(creates) == 1 and "--volume-in-gb 0 " in creates[0] + " "
+    assert "--volume-mount-path /workspace" in creates[0], "the mount path is the network volume's"
+    proc2 = _bash(f'bash "{PROVISION}" --gpu-id "{GPU}" --yes',
+                  env=_env(fake, CAGE_POD_LEDGER=str(ledger)))
+    assert proc2.returncode == 0
+    creates = [c for c in _argv_lines(log) if c.startswith("pod create")]
+    assert len(creates) == 2 and "--volume-in-gb 100 " in creates[1] + " "
+
+
+def test_provision_refuses_volume_gb_beside_network_volume(tmp_path: Path) -> None:
+    """An explicit --volume-gb next to --network-volume-id is refused, never
+    silently zeroed: the network volume replaces the volume disk, and the script's
+    rule for create-time-only levers is fail-closed."""
+    fake, log = _install_fake(tmp_path)
+    proc = _bash(
+        f'bash "{PROVISION}" --gpu-id "{GPU}" --volume-gb 200 --network-volume-id nvol1234abcd --yes',
+        env=_env(fake),
+    )
+    assert proc.returncode != 0, f"must refuse; stdout:\n{proc.stdout}"
+    assert "--volume-gb" in proc.stderr and "--network-volume-id" in proc.stderr
+    assert not any(c.startswith("pod create") for c in _argv_lines(log))
+
+
 def test_provision_refuses_empty_network_volume_id(tmp_path: Path) -> None:
     fake, log = _install_fake(tmp_path)
     proc = _bash(
@@ -600,7 +659,14 @@ def test_cost_report_billing_flag_is_labeled_authority(tmp_path: Path) -> None:
     assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
     assert "AUTHORITY" in proc.stdout, "the account view must be labeled as the authority"
     assert "Account balance: $12.34" in proc.stdout
-    assert "billing" in _argv_lines(log)
+    argv = _argv_lines(log)
+    assert "billing pods --grouping podId" in argv and "billing network-volume" in argv, (
+        "the bare 'billing' group prints help and exits 0 on runpodctl 2.11.0; the "
+        "subcommands carry the account view"
+    )
+    assert not any(l == "billing" or l.startswith("billing -") for l in argv), (
+        "the bare group verb must never be called, with or without flags"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ from src.analysis.goodput import (
     ATTAINMENT_MIN,
     CORRECTED_YIELD_ASSUMPTION,
     CORRECTED_YIELD_ESTIMATOR,
+    DECODE_TOKENS_COLUMN,
     CorrectedYield,
     GoldStratum,
     GoodputError,
@@ -907,3 +908,138 @@ class TestReweightGoldSample:
                 n_gold_true=2,
                 population_count=10,
             )
+
+
+# --------------------------------------------------------------------------- #
+# ADR-0118 (Batch 2 W5): a completion with fewer than two output tokens has no
+# decode phase, so the TPOT clause does not apply to it and the exemption is
+# counted (n_no_decode). With decode tokens present, a null or exactly-zero
+# TPOT is a captured-timing defect and refuses. Without the optional
+# decode_tokens column every existing caller is byte-identical.
+# --------------------------------------------------------------------------- #
+
+
+def _decode_window() -> pd.DataFrame:
+    """The canonical window plus a decode_tokens column: every completed row
+    carries a decode phase (5 tokens), so the column changes no currency."""
+    frame = _window()
+    frame[DECODE_TOKENS_COLUMN] = [5.0] * 8 + [np.nan, np.nan]
+    return frame
+
+
+class TestOneTokenCompletionsW5:
+    def test_column_name_is_the_exported_constant(self) -> None:
+        assert DECODE_TOKENS_COLUMN == "decode_tokens"
+
+    def test_without_the_column_results_are_byte_identical_and_uncounted(self) -> None:
+        m = evaluate_window(_window(), BASELINE, duration_s=10.0)
+        assert m.n_no_decode is None
+        assert m.n_timely == 6 and m.n_yield == 4
+        assert m.goodput_frac == 6 / 10 and m.yield_frac == 4 / 10
+
+    def test_column_with_decode_on_every_completion_changes_no_currency(self) -> None:
+        plain = evaluate_window(_window(), BASELINE, duration_s=10.0)
+        decoded = evaluate_window(_decode_window(), BASELINE, duration_s=10.0)
+        assert decoded.n_no_decode == 0
+        for name in WindowMetrics.__dataclass_fields__:
+            if name == "n_no_decode":
+                continue
+            assert getattr(decoded, name) == getattr(plain, name), name
+
+    def test_one_token_completion_is_timely_on_ttft_alone(self) -> None:
+        frame = _decode_window()
+        frame.loc[0, DECODE_TOKENS_COLUMN] = 0.0
+        frame.loc[0, "tpot_s"] = np.nan  # the runner writes null: no decode phase
+        m = evaluate_window(frame, BASELINE, duration_s=10.0)
+        assert m.n_no_decode == 1
+        assert m.n_timely == 6 and m.n_yield == 4  # row 0 stays timely and veridical
+
+    def test_one_token_completion_with_slow_ttft_is_not_timely_but_counted(self) -> None:
+        frame = _decode_window()
+        frame.loc[0, DECODE_TOKENS_COLUMN] = 0.0
+        frame.loc[0, "tpot_s"] = np.nan
+        frame.loc[0, "ttft_s"] = 2.0  # above 10x the 0.1 s floor
+        m = evaluate_window(frame, BASELINE, duration_s=10.0)
+        assert m.n_no_decode == 1
+        assert m.n_timely == 5 and m.n_yield == 3
+
+    def test_a_window_of_one_token_completions_is_judged_on_ttft(self) -> None:
+        frame = _decode_window()
+        frame.loc[:7, DECODE_TOKENS_COLUMN] = 0.0
+        frame.loc[:7, "tpot_s"] = np.nan
+        m = evaluate_window(frame, BASELINE, duration_s=10.0)
+        assert m.n_no_decode == m.n_completed == 8
+        assert m.n_timely == 6  # the two slow-TTFT rows still fail the TTFT clause
+
+    def test_null_tpot_with_decode_tokens_refuses(self) -> None:
+        frame = _decode_window()
+        frame.loc[0, "tpot_s"] = np.nan
+        with pytest.raises(GoodputError, match="captured-timing defect"):
+            evaluate_window(frame, BASELINE, duration_s=10.0)
+
+    def test_zero_tpot_with_decode_tokens_refuses(self) -> None:
+        # Decision 2 (ADR-0118): exactly 0.0 is the no-first-token fallback
+        # signature (ttft_ms == total_time_ms), never a fast decode.
+        frame = _decode_window()
+        frame.loc[0, "tpot_s"] = 0.0
+        with pytest.raises(GoodputError, match="exactly zero"):
+            evaluate_window(frame, BASELINE, duration_s=10.0)
+
+    def test_zero_tpot_without_the_column_is_accepted_as_before(self) -> None:
+        # The pre-W5 contract (finite and >= 0) is unchanged for a caller that
+        # supplies no decode count: the byte-identity guarantee.
+        frame = _window()
+        frame.loc[0, "tpot_s"] = 0.0
+        m = evaluate_window(frame, BASELINE, duration_s=10.0)
+        assert m.n_timely == 6 and m.n_no_decode is None
+
+    @pytest.mark.parametrize("value", [0.05, 0.0, np.inf, -1.0])
+    def test_tpot_value_on_a_no_decode_row_refuses(self, value: float) -> None:
+        # Any present value, finite or not, contradicts "no decode phase"
+        # (review R2: an inf slipped through an isfinite mask).
+        frame = _decode_window()
+        frame.loc[0, DECODE_TOKENS_COLUMN] = 0.0
+        frame.loc[0, "tpot_s"] = value
+        with pytest.raises(GoodputError, match="no decode phase"):
+            evaluate_window(frame, BASELINE, duration_s=10.0)
+
+    @pytest.mark.parametrize("value", [-1.0, np.inf, -np.inf])
+    def test_negative_or_non_finite_tpot_with_decode_tokens_names_a_clock_defect(
+        self, value: float
+    ) -> None:
+        frame = _decode_window()
+        frame.loc[0, "tpot_s"] = value
+        with pytest.raises(GoodputError, match="clock defect"):
+            evaluate_window(frame, BASELINE, duration_s=10.0)
+
+    @pytest.mark.parametrize("bad", [np.nan, -1.0, 1.5, np.inf])
+    def test_decode_tokens_must_be_a_count_on_completed_rows(self, bad: float) -> None:
+        frame = _decode_window()
+        frame.loc[0, DECODE_TOKENS_COLUMN] = bad
+        with pytest.raises(GoodputError, match=DECODE_TOKENS_COLUMN):
+            evaluate_window(frame, BASELINE, duration_s=10.0)
+
+    def test_decode_tokens_on_failed_rows_is_ignored(self) -> None:
+        # Not-ok rows are never timely; their count (NaN or anything) never
+        # refuses and never enters n_no_decode.
+        frame = _decode_window()
+        frame.loc[8, DECODE_TOKENS_COLUMN] = np.nan
+        frame.loc[9, DECODE_TOKENS_COLUMN] = -3.0
+        m = evaluate_window(frame, BASELINE, duration_s=10.0)
+        assert m.n_no_decode == 0 and m.n_completed == 8
+
+    def test_non_numeric_decode_tokens_refuses(self) -> None:
+        frame = _decode_window()
+        frame[DECODE_TOKENS_COLUMN] = frame[DECODE_TOKENS_COLUMN].astype(object)
+        frame.loc[0, DECODE_TOKENS_COLUMN] = "five"
+        with pytest.raises(GoodputError, match=DECODE_TOKENS_COLUMN):
+            evaluate_window(frame, BASELINE, duration_s=10.0)
+
+    def test_flat_dict_and_corrected_yield_carry_the_count(self) -> None:
+        frame = _decode_window()
+        frame.loc[0, DECODE_TOKENS_COLUMN] = 0.0
+        frame.loc[0, "tpot_s"] = np.nan
+        m = evaluate_window(frame, BASELINE, duration_s=10.0)
+        assert m.to_flat_dict()["n_no_decode"] == 1
+        rec = corrected_yield_from_window(m, sensitivity=1.0, specificity=1.0)
+        assert rec.n_slo_met == m.n_timely == 6

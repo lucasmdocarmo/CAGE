@@ -160,6 +160,9 @@ celerybeat.pid
 env/
 venv/
 cage-env/
+# Charter engines #2/#3 in their own venvs (setup_runpod.sh step 3c, pre-GO item 10)
+sglang-env/
+lmdeploy-env/
 ENV/
 env.bak/
 venv.bak/

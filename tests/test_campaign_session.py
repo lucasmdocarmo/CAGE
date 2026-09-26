@@ -935,3 +935,211 @@ def test_populated_cell_without_a_budget_record_refuses_a_budget_pin(tmp_path: P
                  "CAGE_BUDGET_PLAN_JSON": json.dumps(_budget_plan_doc())}
     fresh = cs.CampaignCellSession.from_cli(_pressure_args(root), env=other_env)
     assert fresh is not None and fresh.budget_plan == _budget_plan_doc()
+
+
+# ---------------------------------------------------------------------------
+# V8 slice (S0 close-out sheet row 1): the §6.1 regime referee runs at emission.
+# Every window gets regime.json from campaign_layout.write_window_regime with
+# the measured bounds, the sampled telemetry and completed-over-issued
+# attainment, written before the metrics sentinel and inside the hash journal.
+# ---------------------------------------------------------------------------
+
+from src.analysis.goodput import IN_REGIME, PAST_CLIFF, UNPRESSURED  # noqa: E402
+from src.analysis.regime_inputs import REGIME_UNKNOWN  # noqa: E402
+
+
+def _regime_series(
+    kv: float, *, ts: tuple[float, ...] = (0.0, 1.0, 2.0, 3.0), instance: str | None = None
+) -> list[dict[str, Any]]:
+    """Canonical sampler records inside the [0, 4) test window: constant
+    occupancy ``kv``, a cumulative preemption counter that climbs by one per
+    sample (3 scarcity events), full coverage; optionally role-tagged."""
+    rows = []
+    for i, t in enumerate(ts):
+        rec: dict[str, Any] = {"ts_s": t, "kv_cache_usage": kv, "preemptions_total": i}
+        if instance is not None:
+            rec["instance"] = instance
+        rows.append(rec)
+    return rows
+
+
+def _emit_regime(
+    session: cs.CampaignCellSession,
+    tmp_path: Path,
+    ordinal: int,
+    *,
+    series: list[dict[str, Any]] | None = None,
+    rows: list[dict[str, Any]] | None = None,
+) -> Any:
+    """_emit with an optional staged telemetry series and custom rows."""
+    staging = tmp_path / f"staging-regime-{session.row_key[:8]}-{ordinal}"
+    staging.mkdir(parents=True, exist_ok=True)
+    rows = _canonical_requests() if rows is None else rows
+    (staging / "qa_evidence.jsonl").write_text(
+        "".join(
+            json.dumps({
+                "example_id": r["example_id"], "repeat_index": None,
+                "record_index": None, "ok": not r.get("error"), "generated_answer": "x",
+            }) + "\n"
+            for r in rows
+        ),
+        encoding="utf-8",
+    )
+    if series is not None:
+        (staging / "telemetry_series.jsonl").write_text(
+            "".join(json.dumps(rec) + "\n" for rec in series), encoding="utf-8"
+        )
+    return session.emit_window(
+        ordinal=ordinal, trial_seed=7, results_rows=rows, staging_dir=staging,
+        experiment_summary={
+            "experiment": {"stale_index_opt_in": False},
+            "consort": ZERO_CONSORT,
+        },
+        backend_metadata={"server_version": "0.0-test"},
+        telemetry_snapshot=None, t_start=0.0, t_end=4.0,
+    )
+
+
+def _regime_doc(handle: Any) -> dict[str, Any]:
+    return json.loads((handle.window_dir / "regime.json").read_text(encoding="utf-8"))
+
+
+def test_attainment_is_completed_over_issued_and_undefined_on_no_rows() -> None:
+    assert cs._attainment([]) is None
+    rows = [{"ok": True}, {"ok": False}, {"ok": None}, {}]
+    assert cs._attainment(rows) == pytest.approx(0.25)  # only a literal True completes
+    assert cs._attainment([{"ok": True}, {"ok": True}]) == 1.0
+
+
+def test_emit_window_writes_regime_json_into_the_journal_and_unknown_without_telemetry(
+    tmp_path: Path,
+) -> None:
+    session = _session(tmp_path, env=MANIFEST_ENV, num_trials=3)
+    handle = _emit_regime(session, tmp_path, 1)  # no staged series at all
+    doc = _regime_doc(handle)
+    assert doc["label"] == REGIME_UNKNOWN == "UNKNOWN_TELEMETRY"
+    assert doc["telemetry_ok"] is False and doc["inputs"] is None
+    assert "sample" in doc["refusal_reason"]  # zero in-window samples: the refusal lane
+    assert doc["attainment"] == pytest.approx(1.0)  # both canonical rows are ok
+    assert (doc["t_start"], doc["t_end"]) == (0.0, 4.0)
+    assert doc["telemetry_source"] == "cage_stats.jsonl"
+    # S0-15: the referee's file is a write-time-hashed artifact and the tree seals.
+    rel = handle.window_dir.relative_to(session.run_root).as_posix() + "/regime.json"
+    assert rel in cs.read_write_time_journal(session.run_root)
+    assert cs.seal_campaign_run(session.run_root).is_file()
+
+
+def test_emit_window_regime_labels_follow_the_section_6_1_criterion(tmp_path: Path) -> None:
+    session = _session(tmp_path, env=MANIFEST_ENV, num_trials=4)
+    # (a) rho 0.95 >= 0.9, (b) 3 scarcity events, (c) attainment 1.0 -> IN_REGIME
+    doc = _regime_doc(_emit_regime(session, tmp_path, 1, series=_regime_series(0.95)))
+    assert doc["label"] == IN_REGIME and doc["telemetry_ok"] is True
+    assert doc["inputs"]["rho_kv_time_avg"] == pytest.approx(0.95)
+    assert doc["inputs"]["scarcity_events"] == 3
+    assert doc["attainment"] == pytest.approx(1.0)
+    # failing (a): occupancy 0.5 -> UNPRESSURED
+    doc = _regime_doc(_emit_regime(session, tmp_path, 2, series=_regime_series(0.5)))
+    assert doc["label"] == UNPRESSURED
+    # failing (c): one of two rows errored -> attainment 0.5 < 0.9 -> PAST_CLIFF,
+    # and (c) wins the tie-break even though (a) and (b) hold
+    rows = _canonical_requests()
+    rows[1] = {**rows[1], "error": "timeout"}
+    doc = _regime_doc(_emit_regime(session, tmp_path, 3, series=_regime_series(0.95), rows=rows))
+    assert doc["label"] == PAST_CLIFF and doc["attainment"] == pytest.approx(0.5)
+
+
+def test_emit_window_refuses_a_role_tagged_series_on_a_single_cell_before_the_sentinel(
+    tmp_path: Path,
+) -> None:
+    session = _session(tmp_path, env=MANIFEST_ENV, num_trials=2)
+    series = _regime_series(0.95, instance="prefill") + _regime_series(0.9, instance="decode")
+    with pytest.raises(cl.CampaignLayoutError, match="distinct instance roles"):
+        _emit_regime(session, tmp_path, 1, series=series)
+    wdir = session.window_dir(1)
+    assert wdir.is_dir() and (wdir / "cage_stats.jsonl").is_file()
+    assert not (wdir / "regime.json").exists(), "no quiet pooled label"
+    # the referee runs BEFORE the sentinel: the window is incomplete and the
+    # resume reset re-emits it instead of treating it as done
+    assert not (wdir / "metrics.json").exists()
+    assert session.window_complete(1) is False
+    assert session.reset_incomplete_windows() == [1]
+    assert not wdir.exists()
+
+
+def test_emit_window_pd_cell_routes_the_recorded_split_to_the_summed_pool_lane(
+    tmp_path: Path,
+) -> None:
+    pd_spec = CellSpec.from_baseline("B3", model="qwen3-14b", family="DIST", topology="pd")
+    total = 4 * BUDGET_42_TOK
+    plan = _budget_plan_doc(
+        topology="pd", r=1.0, tp=2, pd_split=0.75, budget_bytes_total=total,
+        pools_bytes=[3 * BUDGET_42_TOK, BUDGET_42_TOK], per_rank_bytes=total // 2,
+    )
+    session = cs.CampaignCellSession(
+        run_root=_run_root(tmp_path), dataset="squad_v2", spec=pd_spec, num_trials=3,
+        run_seed=7, gpu_count=2, env=MANIFEST_ENV, budget_plan=plan,
+    )
+    budgets = {"prefill": 3 * BUDGET_42_TOK, "decode": BUDGET_42_TOK}
+    assert session._role_budgets(plan, [{"ts_s": 0.0}]) == budgets
+    assert session._role_budgets(plan, []) is None  # empty series: the refusal lane
+    series = _regime_series(0.95, instance="prefill") + _regime_series(0.95, instance="decode")
+    doc = _regime_doc(_emit_regime(session, tmp_path, 1, series=series))
+    assert doc["telemetry_ok"] is True and doc["label"] == IN_REGIME
+    assert doc["pd"]["budgets_by_role"] == budgets
+    assert set(doc["pd"]["per_role"]) == {"prefill", "decode"}
+    assert doc["inputs"]["scarcity_events"] == 6  # summed over the two roles
+    # review MEDIUM 1: a budgeted pd cell with NO staged series records
+    # UNKNOWN_TELEMETRY like every other cell; the emission succeeds
+    doc = _regime_doc(_emit_regime(session, tmp_path, 2))
+    assert doc["label"] == REGIME_UNKNOWN and doc["telemetry_ok"] is False
+    assert "pd" not in doc
+    # a PD pair with one dead sampler (prefill-only series) is NOT certified
+    # from half the gauges: the writer names the missing budgeted role
+    with pytest.raises(cl.CampaignLayoutError, match="role_budgets carries"):
+        _emit_regime(session, tmp_path, 3, series=_regime_series(0.95, instance="prefill"))
+    assert not session.window_complete(3)
+    # review LOW 3: a resume WITHOUT the env pin adopts the cell record
+    # (CellWriter) and still routes the recorded split
+    resumed = cs.CampaignCellSession(
+        run_root=_run_root(tmp_path), dataset="squad_v2", spec=pd_spec, num_trials=3,
+        run_seed=7, gpu_count=2, env=MANIFEST_ENV,
+    )
+    assert resumed.budget_plan is None
+    assert resumed.reset_incomplete_windows() == [3]
+    doc = _regime_doc(_emit_regime(resumed, tmp_path, 3, series=series))
+    assert doc["label"] == IN_REGIME and doc["pd"]["budgets_by_role"] == budgets
+    # a pd record without the split is malformed: refused by name at emission
+    # (adopted records) and at activation (validate_budget_plan, LOW 4)
+    with pytest.raises(cs.CampaignSessionError, match="pools_bytes"):
+        session._role_budgets({**plan, "pools_bytes": None}, [{"ts_s": 0.0}])
+    # a pd cell with NO budget pin routes nothing: the writer's T4.1 gate
+    # refuses the tagged series instead of pooling it against unrecorded budgets
+    bare = cs.CampaignCellSession(
+        run_root=tmp_path / "results" / "camp1" / "a" / "20260821-1500-a-qwen3-14b",
+        dataset="squad_v2", spec=pd_spec, num_trials=1, run_seed=7, gpu_count=2,
+        env=MANIFEST_ENV,
+    )
+    assert bare._role_budgets(None, [{"ts_s": 0.0}]) is None
+    with pytest.raises(cl.CampaignLayoutError, match="per-role budgets"):
+        _emit_regime(bare, tmp_path, 1, series=series)
+
+
+def test_single_cell_never_routes_role_budgets(tmp_path: Path) -> None:
+    session = _session(tmp_path, spec=_pressure_spec(), budget_plan=_budget_plan_doc())
+    assert session.spec.topology == "single" and session.budget_plan is not None
+    assert session._role_budgets(session.budget_plan, [{"ts_s": 0.0}]) is None
+
+
+def test_validate_budget_plan_checks_the_pd_split_at_activation() -> None:
+    # review LOW 4: a pd plan's pools_bytes is validated before serving, not
+    # at emission; plan_budget always emits a 2-tuple of ints, so only a
+    # hand-built or corrupted pin can reach this refusal
+    pd_spec = CellSpec.from_baseline("B3", model="qwen3-14b", family="DIST", topology="pd")
+    pd_plan = _budget_plan_doc(topology="pd", r=1.0, tp=2, pd_split=0.75, pools_bytes=[3, 1])
+    assert cs.validate_budget_plan(pd_plan, pd_spec)["pools_bytes"] == [3, 1]
+    assert cs.validate_budget_plan({**pd_plan, "pools_bytes": (3, 1)}, pd_spec)["pools_bytes"] == [3, 1]
+    for bad in (None, [3], [3, 1, 1], [3.0, 1], [3, 0], [True, 1], "3,1", {"prefill": 3}):
+        with pytest.raises(cs.CampaignSessionError, match="pools_bytes"):
+            cs.validate_budget_plan({**pd_plan, "pools_bytes": bad}, pd_spec)
+    # non-pd plans never carry the check (single/tp plans have pools_bytes None)
+    assert cs.validate_budget_plan(_budget_plan_doc(), _pressure_spec())["pools_bytes"] is None

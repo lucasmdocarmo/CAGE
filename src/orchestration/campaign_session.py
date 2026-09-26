@@ -33,6 +33,20 @@ This module is the seam that wires the runner INTO the campaign layout:
   is written INTO the window as an auxiliary artifact — it is the completeness
   sentinel the shell resume gates (``cell_complete``) key on, campaign mode
   included (same ``metrics_json_valid`` rigor).
+- **Regime referee** (V8 slice, close-out sheet row 1; §6.1): every emitted
+  window gets its ``regime.json`` from ``campaign_layout.write_window_regime``
+  at emission time: the measured window bounds, the telemetry the runner
+  sampled during the window (``cage_stats.jsonl``) and the completed-over-
+  issued attainment of its request rows (the quotient
+  ``goodput.evaluate_window`` reports). An empty or short series is recorded
+  as ``UNKNOWN_TELEMETRY`` on every cell (a label, never a numeric). A pd
+  cell with a non-empty series routes the ``pools_bytes`` split of its cell
+  record (the pin, or the value adopted from cell.json on resume) down the
+  summed-pool lane; a series carrying two or more distinct roles on any
+  other cell, or a pd series missing a budgeted role, RAISES (the writer's
+  gates) and fails the cell. Written BEFORE the metrics sentinel, so a failed referee
+  leaves an incomplete window for the resume reset, and before the hash
+  journal, so the label is a sealed artifact.
 - **Manifest** (§3): created once, at the first window emission of the run
   (create-if-absent; `write_manifest` itself refuses amendment), with non-null
   provenance — git SHA/dirty from the repo, seed, engine/engine_version,
@@ -638,8 +652,11 @@ def validate_budget_plan(plan: Any, spec: CellSpec) -> dict[str, Any]:
     must be the cell's, its ``topology`` one the cell may be planned under
     (_BUDGET_PLAN_TOPOLOGIES) and its ``r`` the cell's ``budget_r`` when the
     cell carries one (the DIST overlay carries none: its r is the registered
-    dist_budget_r and cannot be cross-checked here). A record planned for
-    another cell is mislabeled data and refuses.
+    dist_budget_r and cannot be cross-checked here). A pd plan must carry
+    ``pools_bytes`` as two integer byte budgets >= 1 (prefill, decode): the
+    §6.5 split the regime referee's summed-pool lane consumes at emission,
+    checked HERE so a malformed split refuses before serving. A record
+    planned for another cell is mislabeled data and refuses.
     """
     if not isinstance(plan, Mapping):
         raise CampaignSessionError(
@@ -681,6 +698,18 @@ def validate_budget_plan(plan: Any, spec: CellSpec) -> dict[str, Any]:
             f"is {spec.topology!r} (a 'single' cell may be planned TP-sharded; "
             "tp/pd cells plan their own topology)"
         )
+    if topology == "pd":
+        pools = plan.get("pools_bytes")
+        if (
+            not isinstance(pools, (list, tuple))
+            or len(pools) != 2
+            or any(isinstance(b, bool) or not isinstance(b, int) or b < 1 for b in pools)
+        ):
+            problems.append(
+                f"{BUDGET_PLAN_ENV}: pools_bytes is {pools!r}; a pd plan must carry "
+                "[prefill_bytes, decode_bytes] as two integers >= 1 (the §6.5 "
+                "split, the regime referee's summed-pool budgets)"
+            )
     r = plan.get("r")
     if isinstance(r, bool) or not isinstance(r, (int, float)) or not math.isfinite(r) or r <= 0:
         problems.append(f"{BUDGET_PLAN_ENV}: r is {r!r}, must be finite and > 0")
@@ -751,6 +780,21 @@ def _atomic_write_json(path: Path, document: Mapping[str, Any]) -> Path:
         tmp.unlink(missing_ok=True)
         raise
     return path
+
+
+def _attainment(rows: list[Mapping[str, Any]]) -> Optional[float]:
+    """§6.1 (c) attainment of one window: completed over issued, the quotient
+    ``goodput.evaluate_window`` reports as ``WindowMetrics.attainment``
+    (``n_completed / n_issued``), computed here from the normalized request
+    rows so the regime referee and the yield analysis share one definition.
+    Completed = the row's shared validity predicate ``ok`` is literally True
+    (task #127); issued = every row (the dropped-rows refusal upstream makes
+    the rows equal the offered schedule, ADR-0116). No rows -> None:
+    attainment is undefined and the writer leaves the label null (absence,
+    never 0.0)."""
+    if not rows:
+        return None
+    return sum(1 for row in rows if row.get("ok") is True) / len(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -1234,6 +1278,40 @@ class CampaignCellSession:
             out["ok"] = (not out.get("error")) and not bool(out.get("empty_generation"))
         return out
 
+    def _role_budgets(
+        self,
+        plan: Mapping[str, Any] | None,
+        cage_stats_rows: list[Mapping[str, Any]],
+    ) -> Optional[dict[str, Any]]:
+        """Per-role byte budgets for the regime writer's summed-pool lane
+        (§6.5, T2.3), or None.
+
+        ``plan`` is the cell's effective BudgetPlan record (the CellWriter's:
+        the session pin, or the value adopted from cell.json on a resume
+        without the pin). Only a pd cell with a NON-EMPTY staged series routes
+        there, from the record's ``pools_bytes`` (prefill, decode): the §6.5
+        split is an explicit recorded input, never inferred from the stream.
+        An empty series returns None so the writer records UNKNOWN_TELEMETRY
+        like every other cell (budgets on an empty stream are a caller bug
+        there). A pd cell without any record returns None, so the writer
+        refuses a multi-role series (T4.1) and the cell fails instead of
+        certifying a pooled window against budgets nobody recorded; a pd
+        record without the split refuses here by name (validate_budget_plan
+        already refuses it at activation; adopted records are re-checked).
+        Non-pd cells always return None. The role keys are the planner's
+        (cache_budget: prefill, decode); the writer refuses a stream whose
+        roles do not match them exactly, a missing role included."""
+        if self.spec.topology != "pd" or plan is None or not cage_stats_rows:
+            return None
+        pools = plan.get("pools_bytes")
+        if not isinstance(pools, (list, tuple)) or len(pools) != 2:
+            raise CampaignSessionError(
+                f"{BUDGET_PLAN_ENV}: a pd cell's plan must carry pools_bytes "
+                f"[prefill, decode] for the §6.5 summed-pool regime lane, got "
+                f"{pools!r}"
+            )
+        return {"prefill": pools[0], "decode": pools[1]}
+
     def _load_staging_jsonl(self, path: Path) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         if not path.is_file():
@@ -1365,6 +1443,21 @@ class CampaignCellSession:
             engine_metrics=engine_metrics,
             qa_evidence=qa_evidence,
             ordinal=shifted,
+        )
+        # §6.1 regime referee (V8 slice): label the window from the telemetry
+        # sampled during it plus completed-over-issued attainment. Runs BEFORE
+        # the metrics sentinel (a failed referee leaves an incomplete window
+        # that reset_incomplete_windows re-emits) and before the hash journal
+        # below (regime.json is a sealed artifact). An empty series is
+        # recorded as UNKNOWN_TELEMETRY by the writer on every cell; a series
+        # with two or more roles on a non-pd cell, or a pd series missing a
+        # budgeted role, raises there (T4.1), never a pooled label.
+        cl.write_window_regime(
+            handle.window_dir,
+            t_start=float(t_start),
+            t_end=float(t_end),
+            attainment=_attainment(requests_rows_n),
+            role_budgets=self._role_budgets(cell.budget_plan, cage_stats_rows),
         )
         metrics_path = _atomic_write_json(
             handle.window_dir / WINDOW_METRICS_NAME, _normalize_json(experiment_summary)

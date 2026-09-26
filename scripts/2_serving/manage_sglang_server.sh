@@ -29,9 +29,10 @@
 # across engines (never assumed from the dial).
 #
 # [VERIFY-LIVE at S0]: every SGLang CLI flag below follows SGLang's documented
-# server CLI, but none has been exercised by this codebase yet (SGLang is not
-# installed locally; its exact pin is minted at S0 -- VLLM_COMPATIBILITY.md
-# §7). S0 shakedown item 2 proves this launcher end-to-end.
+# server CLI, but none has been exercised by this codebase yet: SGLang is not
+# installed on the dev box; the pod gets the pinned 0.5.10.post1
+# (VLLM_COMPATIBILITY.md section 7, pinned 2026-09-26) through setup_runpod.sh
+# step 3c. S0-3 proves this launcher end-to-end.
 #
 # Usage:
 #   ./scripts/2_serving/manage_sglang_server.sh start <model> [--no-prefix-cache]
@@ -55,13 +56,25 @@
 #                                 adds `--tp-size <N>` — SGLang's documented
 #                                 TP flag spelling (--tp is its alias), chosen
 #                                 to match this launcher's long-form flag
-#                                 convention; unproven against any pinned
-#                                 SGLang (no pin exists yet, §7)
+#                                 convention; unproven against the pinned
+#                                 SGLang 0.5.10.post1 (section 7)
 #                                 [VERIFY-LIVE at Run-C-prime preflight].
 #                                 Value 1 = flag OMITTED ENTIRELY (single-GPU
 #                                 argv stays byte-identical to pre-T3.1).
 # Validated BEFORE any server is stopped or launched
 # (cage_validate_sglang_tp_env in scripts/lib/_serving_config.sh).
+#
+# Interpreter contract (pre-GO item 10, 2026-09-26): SGLang lives in its OWN
+# venv (setup_runpod.sh step 3c, <repo>/sglang-env; its transformers and torch
+# pins conflict with cage-env), so this launcher never depends on the caller's
+# PATH: CAGE_SGLANG_PYTHON when set (an absolute path, or a bare command name
+# resolved through command -v), else <repo>/sglang-env/bin/python3 when it
+# exists, else the PATH python3 (a hand-activated environment). Whatever is
+# resolved must be an executable FILE that imports sglang, checked in the
+# start|restart gate BEFORE any server is touched (review 2026-09-26): a
+# missing or half-installed venv fails closed here, never after the readiness
+# wait. The resolved interpreter is printed at every start and recorded in the
+# serving-config args.
 # =============================================================================
 
 set -euo pipefail
@@ -77,6 +90,23 @@ source "$PROJECT_DIR/scripts/lib/_common.sh"
 # shellcheck source=scripts/lib/_serving_config.sh
 source "$PROJECT_DIR/scripts/lib/_serving_config.sh"
 
+# Interpreter resolution (see the header): explicit env, else the item-10 venv,
+# else the PATH python3; a bare name resolves through command -v (an
+# unresolvable one keeps the bare name and fails the gate below). Never a
+# silent guess: the choice is printed at start.
+SGLANG_PYTHON="${CAGE_SGLANG_PYTHON:-}"
+if [ -z "$SGLANG_PYTHON" ]; then
+    if [ -x "$PROJECT_DIR/sglang-env/bin/python3" ]; then
+        SGLANG_PYTHON="$PROJECT_DIR/sglang-env/bin/python3"
+    else
+        SGLANG_PYTHON="python3"
+    fi
+fi
+case "$SGLANG_PYTHON" in
+    */*) ;;
+    *) SGLANG_PYTHON="$(command -v "$SGLANG_PYTHON" 2>/dev/null || printf '%s' "$SGLANG_PYTHON")" ;;
+esac
+
 # Budget-knob refusal gate (T2.1): a malformed budget env must be refused
 # BEFORE any server is touched — on `restart` it must not even tear down the
 # healthy server it would fail to replace. Gated to launch commands only:
@@ -90,6 +120,15 @@ case "${1:-}" in
         # the healthy server it would fail to replace.
         cage_validate_sglang_tp_env \
             || die "invalid tensor-parallel environment (see refusal above) -- not touching any server"
+        # Interpreter gate (item 10; review 2026-09-26 MEDIUM 1): the resolved
+        # interpreter must be an executable FILE (a directory passes -x alone)
+        # that imports sglang; a missing or half-installed venv, or a PATH
+        # python3 without the package, refuses here, before any teardown,
+        # never after a 300 s readiness wait on a launch that cannot succeed.
+        { [ -f "$SGLANG_PYTHON" ] && [ -x "$SGLANG_PYTHON" ]; } \
+            || die "SGLang interpreter '$SGLANG_PYTHON' is not an executable file (CAGE_SGLANG_PYTHON, <repo>/sglang-env/bin/python3, or python3 on PATH) -- not touching any server (setup_runpod.sh step 3c creates sglang-env)"
+        "$SGLANG_PYTHON" -c 'import sglang' >/dev/null 2>&1 \
+            || die "SGLang is not importable from '$SGLANG_PYTHON' -- not touching any server (setup_runpod.sh step 3c installs it into sglang-env; CAGE_SGLANG_PYTHON selects another interpreter)"
         ;;
 esac
 
@@ -264,8 +303,8 @@ start_server() {
 
     # Tensor parallelism (T3.1; Wave-3 distributed stack). `--tp-size` is
     # SGLang's documented long-form TP flag (--tp is its alias; long form
-    # matches this launcher's convention), but NO SGLang pin exists yet (§7)
-    # so the exact spelling is unproven [VERIFY-LIVE at Run-C-prime
+    # matches this launcher's convention); the exact spelling is unproven
+    # against the pinned 0.5.10.post1 [VERIFY-LIVE at Run-C-prime
     # preflight]. Value 1 OMITS the flag entirely so the single-GPU argv
     # stays byte-identical to pre-T3.1; validated positive-integer at the
     # top-of-script gate.
@@ -293,12 +332,13 @@ start_server() {
         echo "KV-cache compression enabled: --kv-cache-dtype ${SGLANG_KV_CACHE_DTYPE}"
     fi
 
-    # Engine-version provenance (the SGLang pin is minted at S0; record what
-    # actually served every start).
+    # Engine-version provenance (the pin is section 7's 0.5.10.post1; record
+    # what actually served every start).
     local engine_version
-    engine_version=$(python3 -c "import sglang; print(getattr(sglang, '__version__', 'unknown'))" 2>/dev/null || echo "unavailable")
+    engine_version=$("$SGLANG_PYTHON" -c "import sglang; print(getattr(sglang, '__version__', 'unknown'))" 2>/dev/null || echo "unavailable")
 
-    echo "Server args: python3 -m sglang.launch_server ${sglang_args[*]}  (sglang=$engine_version)"
+    echo "Interpreter: $SGLANG_PYTHON"
+    echo "Server args: $SGLANG_PYTHON -m sglang.launch_server ${sglang_args[*]}  (sglang=$engine_version)"
 
     # Per-(re)start serving-config capture (same contract as the vLLM launcher:
     # run_manifest.json is built once, so per-tree restarts must self-record).
@@ -322,7 +362,7 @@ start_server() {
         SC_TENSOR_PARALLEL="${CAGE_SGLANG_TP:-}" \
         SC_KV_DTYPE="${SGLANG_KV_CACHE_DTYPE:-auto}" \
         SC_EAGER="${VLLM_ENFORCE_EAGER:-0}" \
-        SC_ARGS="python3 -m sglang.launch_server ${sglang_args[*]}" \
+        SC_ARGS="$SGLANG_PYTHON -m sglang.launch_server ${sglang_args[*]}" \
         SC_FILE="$cfg_file" \
         python3 - <<'PYEOF' || echo "  (serving-config capture failed; non-fatal)"
 import datetime
@@ -372,7 +412,7 @@ PYEOF
     export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-30}"
 
     echo "Starting SGLang server (logging to $log_file)..."
-    nohup python3 -m sglang.launch_server "${sglang_args[@]}" > "$log_file" 2>&1 &
+    nohup "$SGLANG_PYTHON" -m sglang.launch_server "${sglang_args[@]}" > "$log_file" 2>&1 &
 
     local server_pid=$!
     printf '%s\n' "$server_pid" > "$PID_FILE"

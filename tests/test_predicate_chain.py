@@ -747,11 +747,16 @@ def _build_sealed_run(tmp_path: Path) -> Path:
             evidence_lines = []
             for i in range(N_EXAMPLES):
                 ok = i != N_EXAMPLES - 1  # one serving failure per window
+                # ADR-0118 (W5): the first completion of every window is a
+                # one-token answer, so it has no decode phase and a null TPOT
+                # (exactly what the runner writes for num_tokens <= 1).
+                one_token = ok and i == 0
                 requests_lines.append(json.dumps({
                     "example_id": f"e{i:03d}",
                     "ok": ok,
                     "ttft_ms": 200.0 + i if ok else None,
-                    "tpot_ms": 20.0 if ok else None,
+                    "tpot_ms": None if (one_token or not ok) else 20.0,
+                    "num_tokens": 0 if not ok else (1 if one_token else 8),
                     "latency_ms": 250.0 + i,
                 }))
                 evidence_lines.append(json.dumps(_evidence_row(i, ok=ok)))
@@ -1173,4 +1178,86 @@ def test_tampered_predicate_table_refuses_at_analysis(predicate_run: Path) -> No
         rca.run_analysis(
             predicate_run, contrast_ids=[4], metrics=["ttft_ms", "predicate"],
             mode="design-input",
+        )
+
+
+# ---------------------------------------------------------------------------
+# ADR-0118 (Batch 2 W5): the #14 seam passes the decode-token count so the
+# one-token completion every fixture window carries (e000: num_tokens 1,
+# tpot_ms null) is timely on TTFT alone and counted, instead of aborting the
+# whole analysis; a null TPOT beside decode tokens refuses by name.
+# ---------------------------------------------------------------------------
+
+
+def test_truth_tax_exempts_one_token_completions_and_counts_them(
+    predicate_run: Path,
+) -> None:
+    index = rca.load_index(predicate_run)
+    predicate_root, _manifest = rca.resolve_predicate_root(predicate_run, None)
+    family_ctx = rca.build_family_context(index, ["ttft_ms"], 0.05)
+    section, primaries, ladder = rca.compute_truth_tax(
+        predicate_run, index, family_ctx, predicate_root=predicate_root, alpha=0.05
+    )
+    assert len(primaries) == 1 and len(ladder) == 4  # 2 engines x 2 windows
+    for metrics in ladder.values():
+        assert metrics.n_no_decode == 1
+        assert metrics.n_completed == N_EXAMPLES - 1
+        assert metrics.n_timely == N_EXAMPLES - 1  # e000 timely on TTFT alone
+
+
+def _reseal_and_prepare(run_dir: Path) -> None:
+    (run_dir / "ledger.json").unlink()
+    sealed = [p for p in (run_dir / "cells").rglob("*") if p.is_file()]
+    sealed.append(run_dir / "manifest.json")
+    write_ledger(hash_artifacts(sealed, base_dir=run_dir), run_dir / "ledger.json")
+    _write_scoring_pass(run_dir)
+    assert bpt.main([
+        str(run_dir), "--scoring-run-id", SCORING_ID,
+        "--max-null-fraction", "0.5",
+    ]) == 0
+    assert org.main([str(run_dir)]) == 0
+
+
+def _vllm_f2_requests(run_dir: Path) -> Path:
+    """The requests.jsonl of the first vllm F2 window: the #14 population
+    (an F1 window is never evaluated by the truth-tax executor)."""
+    paths = [
+        p for p in sorted(run_dir.glob("cells/*/window_*/requests.jsonl"))
+        if "|vllm|" in p.parts[-3] and "|F2" in p.parts[-3]
+    ]
+    assert paths, "fixture carries no vllm F2 window"
+    return paths[0]
+
+
+def _rewrite_requests(path: Path, mutate: Callable[[dict[str, Any]], None]) -> None:
+    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    for row in rows:
+        mutate(row)
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+
+def test_truth_tax_refuses_a_null_tpot_beside_decode_tokens(tmp_path: Path) -> None:
+    run_dir = _build_sealed_run(tmp_path)
+    victim = _vllm_f2_requests(run_dir)
+
+    def _defect(row: dict[str, Any]) -> None:
+        if row["example_id"] == "e001":
+            row["tpot_ms"] = None  # 8 output tokens, no TPOT: a timing defect
+
+    _rewrite_requests(victim, _defect)
+    _reseal_and_prepare(run_dir)
+    with pytest.raises(rca.AnalysisError, match="captured-timing defect"):
+        rca.run_analysis(
+            run_dir, contrast_ids=[14], metrics=["ttft_ms"], mode="design-input",
+        )
+
+
+def test_truth_tax_refuses_rows_without_num_tokens(tmp_path: Path) -> None:
+    run_dir = _build_sealed_run(tmp_path)
+    victim = _vllm_f2_requests(run_dir)
+    _rewrite_requests(victim, lambda row: row.pop("num_tokens"))
+    _reseal_and_prepare(run_dir)
+    with pytest.raises(rca.AnalysisError, match="num_tokens"):
+        rca.run_analysis(
+            run_dir, contrast_ids=[14], metrics=["ttft_ms"], mode="design-input",
         )

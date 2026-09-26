@@ -36,9 +36,24 @@
 #
 # [VERIFY-LIVE at S0]: every LMDeploy CLI flag below follows LMDeploy's
 # documented api_server CLI, but none has been exercised by this codebase yet
-# (LMDeploy is not installed locally; its exact pin is minted at S0 --
-# VLLM_COMPATIBILITY.md §7). The TurboMind log-marker patterns are likewise
-# VERIFY-LIVE. S0 shakedown item 2 proves this launcher end-to-end.
+# (LMDeploy is not installed on the dev box; the pod gets the pinned 0.17.0,
+# VLLM_COMPATIBILITY.md section 7, pinned 2026-09-26, through setup_runpod.sh
+# step 3c). The TurboMind log-marker patterns are likewise VERIFY-LIVE. S0-3
+# proves this launcher end-to-end.
+#
+# Entry-point contract (pre-GO item 10, 2026-09-26): LMDeploy lives in its OWN
+# venv (setup_runpod.sh step 3c, <repo>/lmdeploy-env, torch pinned to vLLM's
+# CUDA 12.8 line), so this launcher never depends on the caller's PATH:
+# CAGE_LMDEPLOY_BIN when set (an absolute path, or a bare command name resolved
+# through command -v), else <repo>/lmdeploy-env/bin/lmdeploy when it exists,
+# else the PATH lmdeploy (a hand-activated environment). Whatever is resolved
+# must be an executable FILE, checked in the start|restart gate BEFORE any
+# server is touched (review 2026-09-26): a missing venv with no PATH lmdeploy
+# fails closed here, never after the readiness wait. The version probe uses
+# the python3 beside the resolved entry point. Printed at every start and
+# recorded in the serving-config args. TurboMind serves FP16/BF16 weights (plus
+# KV INT8/INT4 and W4A16), never an FP8 checkpoint: the S0 cross-engine rows run
+# the BF16 Qwen/Qwen3-8B (docs/VLLM_COMPATIBILITY.md section 7).
 #
 # Usage:
 #   ./scripts/2_serving/manage_lmdeploy_server.sh start <model> [--no-prefix-cache]
@@ -59,6 +74,40 @@ source "$PROJECT_DIR/scripts/lib/_common.sh"
 # Serving-uniformity source of truth (Option A) + §6.5 budget-mapping helpers.
 # shellcheck source=scripts/lib/_serving_config.sh
 source "$PROJECT_DIR/scripts/lib/_serving_config.sh"
+
+# Entry-point resolution (see the header): explicit env, else the item-10 venv,
+# else the PATH lmdeploy. Never a silent guess: the choice is printed at start.
+LMDEPLOY_BIN="${CAGE_LMDEPLOY_BIN:-}"
+if [ -z "$LMDEPLOY_BIN" ]; then
+    if [ -x "$PROJECT_DIR/lmdeploy-env/bin/lmdeploy" ]; then
+        LMDEPLOY_BIN="$PROJECT_DIR/lmdeploy-env/bin/lmdeploy"
+    else
+        LMDEPLOY_BIN="lmdeploy"
+    fi
+fi
+# A bare name (the PATH fallback or an explicit command name) resolves through
+# command -v; an unresolvable one keeps the bare name and fails the gate below.
+case "$LMDEPLOY_BIN" in
+    */*) ;;
+    *) LMDEPLOY_BIN="$(command -v "$LMDEPLOY_BIN" 2>/dev/null || printf '%s' "$LMDEPLOY_BIN")" ;;
+esac
+# The interpreter beside the console script serves the version probe; without
+# one (or with an unresolved entry point) the PATH python3 probes, non-fatally.
+LMDEPLOY_PYTHON="python3"
+case "$LMDEPLOY_BIN" in
+    */*) [ -x "$(dirname "$LMDEPLOY_BIN")/python3" ] && LMDEPLOY_PYTHON="$(dirname "$LMDEPLOY_BIN")/python3" ;;
+esac
+# Entry-point gate (item 10; review 2026-09-26): the resolved entry point must
+# be an executable FILE (a directory passes -x alone); a missing venv with no
+# PATH lmdeploy refuses here, BEFORE any server is touched, never after the
+# 600 s readiness wait. `stop` and `status` are never blocked (teardown
+# discipline).
+case "${1:-}" in
+    start|restart)
+        { [ -f "$LMDEPLOY_BIN" ] && [ -x "$LMDEPLOY_BIN" ]; } \
+            || die "LMDeploy entry point '$LMDEPLOY_BIN' is not an executable file (CAGE_LMDEPLOY_BIN, <repo>/lmdeploy-env/bin/lmdeploy, or lmdeploy on PATH) -- not touching any server (setup_runpod.sh step 3c creates lmdeploy-env)"
+        ;;
+esac
 
 PORT="${LMDEPLOY_PORT:-23333}"   # LMDeployAdapter's default api_base port
 LOG_DIR="$PROJECT_DIR/logs/lmdeploy"
@@ -269,12 +318,13 @@ start_server() {
         echo "KV quantization enabled: --quant-policy ${LMDEPLOY_QUANT_POLICY}"
     fi
 
-    # Engine-version provenance (the LMDeploy pin is minted at S0; record what
+    # Engine-version provenance (the pin is section 7's 0.17.0; record what
     # actually served every start).
     local engine_version
-    engine_version=$(python3 -c "import lmdeploy; print(getattr(lmdeploy, '__version__', 'unknown'))" 2>/dev/null || echo "unavailable")
+    engine_version=$("$LMDEPLOY_PYTHON" -c "import lmdeploy; print(getattr(lmdeploy, '__version__', 'unknown'))" 2>/dev/null || echo "unavailable")
 
-    echo "Server args: lmdeploy ${lmdeploy_args[*]}  (lmdeploy=$engine_version)"
+    echo "Entry point: $LMDEPLOY_BIN (probe interpreter: $LMDEPLOY_PYTHON)"
+    echo "Server args: $LMDEPLOY_BIN ${lmdeploy_args[*]}  (lmdeploy=$engine_version)"
 
     # Per-(re)start serving-config capture (same contract as the vLLM launcher:
     # run_manifest.json is built once, so per-tree restarts must self-record).
@@ -297,7 +347,7 @@ start_server() {
         SC_MAPPING_INPUTS="$mapping_inputs" \
         SC_QUANT_POLICY="${LMDEPLOY_QUANT_POLICY:-}" \
         SC_EAGER="${VLLM_ENFORCE_EAGER:-0}" \
-        SC_ARGS="lmdeploy ${lmdeploy_args[*]}" \
+        SC_ARGS="$LMDEPLOY_BIN ${lmdeploy_args[*]}" \
         SC_FILE="$cfg_file" \
         python3 - <<'PYEOF' || echo "  (serving-config capture failed; non-fatal)"
 import datetime
@@ -346,7 +396,7 @@ PYEOF
     export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-30}"
 
     echo "Starting LMDeploy server (logging to $log_file)..."
-    nohup lmdeploy "${lmdeploy_args[@]}" > "$log_file" 2>&1 &
+    nohup "$LMDEPLOY_BIN" "${lmdeploy_args[@]}" > "$log_file" 2>&1 &
 
     local server_pid=$!
     printf '%s\n' "$server_pid" > "$PID_FILE"

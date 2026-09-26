@@ -72,6 +72,9 @@ def _row(i: int) -> dict[str, Any]:
         "error": None,
         "empty_generation": False,
         "ttft_ms": 100.0 + i,
+        # The runner writes both on every result row (check (j), ADR-0118).
+        "num_tokens": 8,
+        "tpot_ms": 12.0,
     }
 
 

@@ -25,7 +25,9 @@ results/<campaign>/<session>/<run_id>/
 │           ├── requests.jsonl         # per-request records (our clock at the boundary)
 │           ├── qa_evidence.jsonl      # raw outputs + evidence for OFFLINE scoring
 │           ├── engine_metrics.json    # engine /metrics snapshots (before/after + samples)
-│           └── cage_stats.jsonl       # cage-stats telemetry stream (policy events feed)
+│           ├── cage_stats.jsonl       # cage-stats telemetry stream (policy events feed)
+│           └── regime.json            # §6.1 regime referee verdict for the window (label,
+│                                      #   inputs, attainment; §3.1), written at emission
 └── scoring/
     └── <scoring_run_id>/              # offline quality-scoring pass (§6) — NEVER writes
         └── ...                        #   into cells/; mirrors cells/<row_key>/ inside itself
@@ -141,6 +143,22 @@ bridge. No other code writes into a campaign tree's `cells/`.
   summary — it is the **completeness sentinel** the shell resume gates
   (`cell_complete`, campaign branch) parse with `metrics_json_valid` rigor;
   a missing/unparseable one makes the window incomplete → reset + re-emitted.
+- **`regime.json` per window** (V8 slice, 2026-09-26; auxiliary artifact
+  indexed like `metrics.json`): the §6.1 regime referee's verdict, written
+  by `campaign_layout.write_window_regime` from `campaign_session.emit_window`
+  right after the four window files and BEFORE `metrics.json`, so a failed
+  referee leaves an incomplete window. Fields: `label` (`IN_REGIME`,
+  `UNPRESSURED`, `PAST_CLIFF` from `goodput.classify_regime`, or
+  `UNKNOWN_TELEMETRY` when the window's `cage_stats.jsonl` cannot be
+  certified: empty or short series, low coverage, absent gauge or counter),
+  `telemetry_ok`, `inputs` (rho_kv time average, scarcity events, samples,
+  coverage), `attainment` (completed over issued request rows, the quotient
+  `goodput.evaluate_window` reports), `refusal_reason`. A pd cell with a
+  non-empty series adds the per-role breakdown under `pd` from the recorded
+  `budget_plan.pools_bytes` split. Contrast #14 reads the label for
+  population membership (only `IN_REGIME` enters); the DIST metrics read
+  `inputs` as the demoted engine gauge. Journaled at write time like every
+  window file.
 - **`cell.json` extras** (Batch 2 W4, ADR-0117): the campaign driver threads
   two plan facts through the cell env and the session persists them via
   `CellWriter`: `gpu_count` (W4.2, `CAGE_GPU_COUNT`) and `budget_plan`

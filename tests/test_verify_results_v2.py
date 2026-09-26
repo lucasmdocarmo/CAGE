@@ -16,6 +16,11 @@ Synthetic RESULTS_LAYOUT §1 fixture trees exercise every gate check:
 - a row absent from BOTH per-query chains (the ADR-0116 W3 signature, invisible
   to the requests-vs-evidence reconciliation) fails the row-count check against
   the window's offered population, and a nonzero consort counter fails too;
+- check (j), ADR-0118 (Batch 2 W5): a completed row with two or more output
+  tokens must carry a finite positive tpot_ms, a completed row with at most
+  one output token must carry a null tpot_ms (no decode phase; counted as
+  n_no_decode), a completed row must carry an integer num_tokens, and a
+  whitespace-sourced token count is a WARN naming the missing usage chunk;
 - ``--pilot`` preserves the pilot-era metrics-vs-CSV behavior verbatim.
 """
 
@@ -74,6 +79,10 @@ def _row(
         "example_id": f"e{i}",
         "repeat_index": 0,
         "ttft_ms": 100.0 + i,
+        # The runner writes both on every result row (run_experiment
+        # record_result): a decode phase of 7 tokens at 12 ms per token.
+        "num_tokens": 8,
+        "tpot_ms": 12.0,
     }
     if with_record_index:
         row["record_index"] = i
@@ -548,3 +557,167 @@ def test_absent_window_metrics_is_a_warn_and_an_incomplete_one_fails(tmp_path: P
     report2 = vr.verify_run(run_dir2)
     details = "\n".join(f["detail"] for f in _findings(report2, "FAIL", "row-count"))
     assert "consort" in details and "offered population unknown" in details
+
+
+# ---------------------------------------------------------------------------
+# (j) per-row TPOT vs the output-token count (ADR-0118, Batch 2 W5)
+# ---------------------------------------------------------------------------
+
+
+def _rewrite_first_window_row(run_dir: Path, **fields: Any) -> Path:
+    """Overwrite the first request row of the first window with ``fields``
+    (a None value writes JSON null) and seal; returns the window dir."""
+    wdir = _first_window(run_dir)
+    rows = _read_jsonl(wdir / "requests.jsonl")
+    rows[0].update(fields)
+    _write_jsonl(wdir / "requests.jsonl", rows)
+    _seal(run_dir)
+    return wdir
+
+
+def _accounting_row(report: dict[str, Any], run_dir: Path, wdir: Path) -> dict[str, Any]:
+    rel = wdir.relative_to(run_dir).as_posix()
+    return next(r for r in report["accounting"]["per_window"] if r["window"] == rel)
+
+
+@pytest.mark.parametrize("num_tokens", [0, 1])
+def test_completion_without_a_decode_phase_passes_and_is_counted(
+    tmp_path: Path, num_tokens: int
+) -> None:
+    run_dir = _build_tree(tmp_path)
+    wdir = _rewrite_first_window_row(run_dir, num_tokens=num_tokens, tpot_ms=None)
+    report = vr.verify_run(run_dir)
+    assert report["ok"] is True and report["n_warn"] == 0
+    assert _accounting_row(report, run_dir, wdir)["n_no_decode"] == 1
+    assert all(
+        r["n_no_decode"] == 0
+        for r in report["accounting"]["per_window"]
+        if r["window"] != wdir.relative_to(run_dir).as_posix()
+    )
+    totals = report["accounting"]["totals"]["n_no_decode"]
+    assert totals == {"sum_over_known_windows": 1, "n_windows_known": len(BASELINES) * N_WINDOWS}
+
+
+@pytest.mark.parametrize("tpot_ms", [None, 0.0, -1.0, "12"], ids=["null", "zero", "negative", "string"])
+def test_decode_tokens_without_a_positive_tpot_fails(tmp_path: Path, tpot_ms: Any) -> None:
+    run_dir = _build_tree(tmp_path)
+    _rewrite_first_window_row(run_dir, num_tokens=5, tpot_ms=tpot_ms)
+    report = vr.verify_run(run_dir)
+    assert report["ok"] is False
+    (finding,) = _findings(report, "FAIL", "tpot")
+    assert "1 completed (ok) row(s)" in finding["detail"]
+    assert "ADR-0118" in finding["detail"] and "e0" in finding["detail"]
+
+
+def test_one_token_completion_with_a_tpot_value_fails(tmp_path: Path) -> None:
+    run_dir = _build_tree(tmp_path)
+    _rewrite_first_window_row(run_dir, num_tokens=1, tpot_ms=12.0)
+    report = vr.verify_run(run_dir)
+    assert report["ok"] is False
+    (finding,) = _findings(report, "FAIL", "tpot")
+    assert "no decode phase" in finding["detail"] and "e0" in finding["detail"]
+
+
+@pytest.mark.parametrize(
+    "num_tokens", ["absent", None, "8", 8.0, True, -1],
+    ids=["absent", "null", "string", "float", "bool", "negative"],
+)
+def test_completed_row_without_an_integer_num_tokens_fails(
+    tmp_path: Path, num_tokens: Any
+) -> None:
+    run_dir = _build_tree(tmp_path)
+    wdir = _first_window(run_dir)
+    rows = _read_jsonl(wdir / "requests.jsonl")
+    if num_tokens == "absent":
+        del rows[0]["num_tokens"]
+    else:
+        rows[0]["num_tokens"] = num_tokens
+    _write_jsonl(wdir / "requests.jsonl", rows)
+    _seal(run_dir)
+    report = vr.verify_run(run_dir)
+    assert report["ok"] is False
+    (finding,) = _findings(report, "FAIL", "tpot")
+    assert "num_tokens" in finding["detail"] and "e0" in finding["detail"]
+
+
+def test_not_ok_rows_are_exempt_from_the_tpot_check(tmp_path: Path) -> None:
+    run_dir = _build_tree(tmp_path)
+    wdir = _rewrite_first_window_row(
+        run_dir, ok=False, error="HTTP 500", num_tokens=0, tpot_ms=None
+    )
+    report = vr.verify_run(run_dir)
+    assert not _findings(report, "FAIL", "tpot")
+    # A failed request has no completion to exempt: never counted.
+    assert _accounting_row(report, run_dir, wdir)["n_no_decode"] == 0
+
+
+def test_validity_unknown_rows_are_exempt_from_the_tpot_check(tmp_path: Path) -> None:
+    run_dir = _build_tree(tmp_path, with_validity=False)
+    wdir = _rewrite_first_window_row(run_dir, num_tokens=1, tpot_ms=None)
+    report = vr.verify_run(run_dir)
+    assert report["ok"] is True  # the validity WARN stands alone
+    assert not _findings(report, "FAIL", "tpot")
+    # The file's accounting convention (review T2, kept): the count is over
+    # known completions, so a validity-unknown window reads 0 beside its
+    # n_validity_unknown, exactly like n_valid_known.
+    row = _accounting_row(report, run_dir, wdir)
+    assert row["n_no_decode"] == 0 and row["n_valid_known"] == 0
+    assert row["n_validity_unknown"] == N_ROWS
+
+
+def test_whitespace_token_count_is_a_warn_naming_the_missing_usage_chunk(
+    tmp_path: Path,
+) -> None:
+    run_dir = _build_tree(tmp_path)
+    _rewrite_first_window_row(run_dir, num_tokens_source="whitespace")
+    report = vr.verify_run(run_dir)
+    assert report["ok"] is True
+    (warn,) = _findings(report, "WARN", "tpot")
+    assert "1 completed (ok) row(s)" in warn["detail"]
+    assert "whitespace" in warn["detail"] and "usage" in warn["detail"]
+    # A usage-sourced count (or a row without the column) never warns.
+    run_dir2 = _build_tree(tmp_path / "two")
+    _rewrite_first_window_row(run_dir2, num_tokens_source="usage")
+    assert not _findings(vr.verify_run(run_dir2), "WARN", "tpot")
+
+
+def test_markdown_report_renders_the_no_decode_column(tmp_path: Path) -> None:
+    run_dir = _build_tree(tmp_path)
+    wdir = _rewrite_first_window_row(run_dir, num_tokens=1, tpot_ms=None)
+    md = vr.render_markdown(vr.verify_run(run_dir))
+    lines = md.splitlines()
+    header = next(l for l in lines if l.startswith("| window |"))
+    assert header.split("|")[-2].strip() == "no-decode"  # the last column
+    rel = wdir.relative_to(run_dir).as_posix()
+    rewritten = next(l for l in lines if l.startswith(f"| {rel} |"))
+    assert rewritten.split("|")[-2].strip() == "1"  # the cell, not just the header
+    other = next(l for l in lines if l.startswith("| cells/") and not l.startswith(f"| {rel} |"))
+    assert other.split("|")[-2].strip() == "0"
+
+
+def test_reference_engine_rows_are_exempt_from_the_tpot_clauses(tmp_path: Path) -> None:
+    # The HF oracle never streams: ttft_ms == total_time_ms by contract, so the
+    # runner's formula writes tpot_ms 0.0 on every multi-token completion. That
+    # is the engine's documented shape, not a captured-timing defect (review
+    # R1); the oracle is never scored for timeliness.
+    run_dir = _build_tree(tmp_path)
+    wdir = _rewrite_first_window_row(
+        run_dir, num_tokens=9, tpot_ms=0.0, engine_id="hf_reference",
+        reference_engine=True, num_tokens_source="token_ids",
+    )
+    report = vr.verify_run(run_dir)
+    assert report["ok"] is True and not _findings(report, "FAIL", "tpot")
+    assert _accounting_row(report, run_dir, wdir)["n_no_decode"] == 0
+    # A one-token oracle completion still counts as no-decode.
+    run_dir2 = _build_tree(tmp_path / "two")
+    wdir2 = _rewrite_first_window_row(
+        run_dir2, num_tokens=1, tpot_ms=None, engine_id="hf_reference", reference_engine=True,
+    )
+    report2 = vr.verify_run(run_dir2)
+    assert report2["ok"] is True
+    assert _accounting_row(report2, run_dir2, wdir2)["n_no_decode"] == 1
+    # The same 0.0 on a serving engine IS the defect; a false flag exempts nothing.
+    run_dir3 = _build_tree(tmp_path / "three")
+    _rewrite_first_window_row(run_dir3, num_tokens=9, tpot_ms=0.0, engine_id="vllm", reference_engine=False)
+    (finding,) = _findings(vr.verify_run(run_dir3), "FAIL", "tpot")
+    assert "captured-timing defect" in finding["detail"]

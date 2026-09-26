@@ -22,6 +22,14 @@ Charter bindings (PUBLICATION.md):
   INCONCLUSIVE_AT_RESOLUTION (multiplicative ×/÷1.15 band) — labeled, never
   guessed. Knee point estimate = interpolated Chiu-Jain argmax over the three
   nearest rate points.
+- ADR-0118 (Batch 2 W5): a completion with fewer than two output tokens has
+  no decode phase, so the TPOT clause of the primary pair does not apply to
+  it; it is timely on TTFT alone and the exemption is counted
+  (``n_no_decode``). The rule runs only when the caller passes the optional
+  ``decode_tokens`` column (output tokens beyond the first); with the column
+  present, a null or exactly-zero TPOT beside decode tokens is a
+  captured-timing defect and refuses. Without the column every earlier
+  caller is byte-identical.
 - Audit F1 scale note: G and Y ship in BOTH named scales — fraction-of-issued
   (``*_frac``) and per-window rate (``*_rps``) — and one figure never mixes
   them.
@@ -59,6 +67,7 @@ __all__ = [
     "CORRECTED_YIELD_ASSUMPTION",
     "CORRECTED_YIELD_ESTIMATOR",
     "CorrectedYield",
+    "DECODE_TOKENS_COLUMN",
     "GoldStratum",
     "GoodputError",
     "InstrumentAccuracy",
@@ -157,6 +166,11 @@ _BASIS_FIELDS: dict[str, tuple[str, ...]] = {
 
 _WINDOW_COLUMNS: tuple[str, ...] = ("ttft_s", "tpot_s", "ok", "veridical")
 
+#: Optional per-request column (ADR-0118, Batch 2 W5): output tokens beyond
+#: the first, i.e. the length of the decode phase; the analysis seams pass
+#: max(num_tokens - 1, 0). Absent column: the pre-W5 contract applies.
+DECODE_TOKENS_COLUMN: str = "decode_tokens"
+
 
 class GoodputError(ValueError):
     """Contract violation in window records, sweep grids, or correction inputs."""
@@ -227,6 +241,11 @@ class WindowMetrics:
     so pooled figures can be audited (``assert_single_basis``). All fields are
     required at construction: a hand-built WindowMetrics must state its basis
     facts explicitly rather than inherit a silent 1-GPU default.
+
+    ``n_no_decode`` (ADR-0118, Batch 2 W5): completed requests with no decode
+    phase (fewer than two output tokens), exempt from the TPOT clause and
+    judged on TTFT alone; None when the caller supplied no ``decode_tokens``
+    column (the rule was not applied, which is not zero exemptions).
     """
 
     n_issued: int
@@ -234,6 +253,7 @@ class WindowMetrics:
     n_timely: int
     n_veridical: int
     n_yield: int
+    n_no_decode: int | None
     duration_s: float
     attainment: float
     throughput_rps: float
@@ -253,7 +273,9 @@ class WindowMetrics:
     yield_per_gpu: float
     bases: BasisRecord
 
-    def to_flat_dict(self) -> dict[str, int | float | dict[str, tuple[str, ...]]]:
+    def to_flat_dict(
+        self,
+    ) -> dict[str, int | float | None | dict[str, tuple[str, ...]]]:
         """One key per field, for JSON serialization (joins a CellSpec row
         key). NOT flat-CSV-safe: ``bases`` is a nested mapping (tuple values;
         JSON turns them into lists — ``assert_single_basis`` accepts both), so
@@ -310,6 +332,54 @@ def _latency_array(values: pd.Series, name: str, ok: np.ndarray) -> np.ndarray:
     return np.where(ok, arr, np.inf)
 
 
+def _decode_tokens_array(values: pd.Series, ok: np.ndarray) -> np.ndarray:
+    """ADR-0118: the decode-phase length per row (output tokens beyond the
+    first). On completed rows it must be a non-negative integer count; on
+    failed rows it is irrelevant (they are never timely) and reads as 0."""
+    arr = _numeric(values, DECODE_TOKENS_COLUMN)
+    bad = ok & (~np.isfinite(arr) | (arr < 0.0) | (arr != np.floor(arr)))
+    if bad.any():
+        raise GoodputError(
+            f"column {DECODE_TOKENS_COLUMN!r} must hold a non-negative integer "
+            f"count on completed rows; {int(bad.sum())} violation(s): a "
+            "completion without its output-token count has no decidable "
+            "decode phase (ADR-0118)"
+        )
+    return np.where(ok, arr, 0.0)
+
+
+def _decoded_tpot_array(
+    values: pd.Series, ok: np.ndarray, decode: np.ndarray
+) -> np.ndarray:
+    """ADR-0118: TPOT on completed rows, split by decode phase. With decode
+    tokens the value must be finite and > 0: a null or exactly-zero TPOT
+    beside a decode phase is the no-first-token fallback signature
+    (ttft_ms == total_time_ms), a captured-timing defect, never a fast
+    decode. Without a decode phase the value must be absent: TPOT is
+    undefined before a second output token."""
+    arr = _numeric(values, "tpot_s")
+    decoded = ok & (decode > 0.0)
+    bad = decoded & (~np.isfinite(arr) | (arr <= 0.0))
+    if bad.any():
+        raise GoodputError(
+            "column 'tpot_s' must be finite and > 0 on completed rows with "
+            f"decode tokens; {int(bad.sum())} violation(s): a null or exactly "
+            "zero TPOT beside a decode phase is a captured-timing defect (the "
+            "no-first-token fallback signature) and a negative or non-finite "
+            "one is a clock defect; neither is a fast decode (ADR-0118)"
+        )
+    # Any present value (finite or not) on a no-decode row is a contradiction.
+    fabricated = ok & (decode == 0.0) & ~np.isnan(arr)
+    if fabricated.any():
+        raise GoodputError(
+            f"column 'tpot_s' carries a value on {int(fabricated.sum())} "
+            "completed row(s) with no decode phase (decode_tokens == 0); TPOT "
+            "is undefined before a second output token (ADR-0118)"
+        )
+    # Rows without a decode phase and failed rows are never gated on TPOT.
+    return np.where(decoded, arr, np.inf)
+
+
 def _arrival_span(records: pd.DataFrame) -> float:
     if "arrival_s" not in records.columns:
         raise GoodputError(
@@ -357,6 +427,18 @@ def evaluate_window(
     window; it feeds ONLY the §6.6b per-GPU fields — every aggregate currency
     is computed exactly as for a single GPU, so gpu_count=1 callers see
     byte-identical values.
+
+    Optional column ``decode_tokens`` (ADR-0118, Batch 2 W5): output tokens
+    beyond the first on each row (the analysis seams pass
+    max(num_tokens - 1, 0)). When present, a completed row with 0 decode
+    tokens has no decode phase: the TPOT clause does not apply, the row is
+    timely iff ok AND the TTFT clause holds, and it is counted in
+    ``n_no_decode``; a completed row with decode tokens must carry a finite
+    TPOT > 0 (a null or exactly-zero TPOT beside a decode phase is a
+    captured-timing defect and refuses); a completed row with 0 decode
+    tokens and a TPOT value refuses too. When absent, ``n_no_decode`` is
+    None and the pre-W5 contract (finite, >= 0) applies to every completed
+    row, byte-identically.
     """
     if records.empty:
         raise GoodputError("empty window: no issued requests")
@@ -370,17 +452,23 @@ def evaluate_window(
     ok = _ok_array(records["ok"])
     verid = _veridical_array(records["veridical"], ok)
     ttft = _latency_array(records["ttft_s"], "ttft_s", ok)
-    tpot = _latency_array(records["tpot_s"], "tpot_s", ok)
+    if DECODE_TOKENS_COLUMN in records.columns:
+        # ADR-0118: no decode phase, no TPOT clause; the exemption is counted.
+        decode = _decode_tokens_array(records[DECODE_TOKENS_COLUMN], ok)
+        tpot = _decoded_tpot_array(records["tpot_s"], ok, decode)
+        no_decode = ok & (decode == 0.0)
+        n_no_decode: int | None = int(no_decode.sum())
+        tpot_within = no_decode | (tpot <= tpot_multiplier * baseline.tpot_s)
+    else:
+        tpot = _latency_array(records["tpot_s"], "tpot_s", ok)
+        n_no_decode = None
+        tpot_within = tpot <= tpot_multiplier * baseline.tpot_s
     if duration_s is None:
         duration = _arrival_span(records)
     else:
         duration = _check_positive_scalar("duration_s", duration_s)
 
-    timely = (
-        ok
-        & (ttft <= ttft_multiplier * baseline.ttft_s)
-        & (tpot <= tpot_multiplier * baseline.tpot_s)
-    )
+    timely = ok & (ttft <= ttft_multiplier * baseline.ttft_s) & tpot_within
     yielded = timely & verid
 
     n_issued = int(len(records))
@@ -403,6 +491,7 @@ def evaluate_window(
         n_timely=n_timely,
         n_veridical=n_veridical,
         n_yield=n_yield,
+        n_no_decode=n_no_decode,
         duration_s=duration,
         attainment=n_completed / n_issued,
         throughput_rps=n_completed / duration,

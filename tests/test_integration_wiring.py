@@ -899,6 +899,7 @@ def test_adapter_honesty_columns_from_a_stamped_response():
         "cached_token_telemetry_available": False,
         "retries": 2,
         "reference_engine": None,
+        "num_tokens_source": None,  # ADR-0118: unstamped stays None, never a guess
     }
 
 
@@ -911,7 +912,16 @@ def test_adapter_honesty_columns_never_fabricated_when_unstamped():
         "cached_token_telemetry_available",
         "retries",
         "reference_engine",
+        "num_tokens_source",
     ]
+
+
+def test_adapter_honesty_columns_carry_the_num_tokens_source_label():
+    # ADR-0118 (Batch 2 W5): the adapters' token-count provenance reaches the
+    # row verbatim; an adapter that does not label leaves None.
+    resp = _plain_response()
+    resp.num_tokens_source = "whitespace"
+    assert runner.adapter_honesty_columns(resp)["num_tokens_source"] == "whitespace"
 
 
 def test_adapter_honesty_columns_carry_the_hf_oracle_reference_flag():

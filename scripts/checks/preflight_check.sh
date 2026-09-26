@@ -1135,10 +1135,12 @@ python3 - <<'PY'
 # that `--dataset all` stages) and says so loudly; it never silently skips.
 # Staging ground truth: the HF datasets cache filled by
 # scripts/1_setup/download_datasets.py (HF_DATASETS_CACHE > HF_HOME/datasets >
-# ~/.cache/huggingface/datasets); the cache-directory layout convention is
-# [VERIFY-LIVE at S0].
+# ~/.cache/huggingface/datasets). The cache-directory NAME follows the datasets
+# library's builder_data_dir rule, replicated below (read from the pinned 4.x
+# install on 2026-09-26); the printed cache path is confirmed live at S0-2.
 import importlib.util
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -1178,8 +1180,34 @@ else:
              else Path.home() / ".cache" / "huggingface") / "datasets"
 
 
+# The datasets library names a cache directory {namespace}___{snake(name)}:
+# datasets/builder.py builder_data_dir applies naming.camelcase_to_snakecase
+# to the repo name and keeps the namespace verbatim (datasets 4.8.5, read
+# 2026-09-26), so dgslibisey/MuSiQue lives under dgslibisey___mu_si_que,
+# microsoft/SCBench under microsoft___sc_bench and RyokoAI/ShareGPT52K under
+# RyokoAI___share_gpt52_k. The pre-2026-09-26 rule (a plain slash replacement)
+# reported those three as NOT staged on every pod (integration audit
+# datasets-1). Replicated here rather than imported: this gate must load
+# without the datasets package (the tests stub it).
+_UPPER_UPPER = re.compile(r"([A-Z]+)([A-Z][a-z])")
+_LOWER_UPPER = re.compile(r"([a-z\d])([A-Z])")
+
+
+def snake_case(name):
+    """datasets.naming.camelcase_to_snakecase, verbatim."""
+    name = _UPPER_UPPER.sub(r"\1_\2", name)
+    name = _LOWER_UPPER.sub(r"\1_\2", name)
+    return name.lower()
+
+
+def cache_dir_name(hf_path):
+    """'namespace/Name' -> 'namespace___name'; a bare name is snake-cased alone."""
+    namespace, sep, name = hf_path.rpartition("/")
+    return f"{namespace}___{snake_case(name)}" if sep else snake_case(name)
+
+
 def staged(hf_path):
-    d = cache / hf_path.replace("/", "___")
+    d = cache / cache_dir_name(hf_path)
     return d.is_dir() and any(d.iterdir())
 
 

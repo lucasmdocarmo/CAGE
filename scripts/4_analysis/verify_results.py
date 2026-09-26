@@ -35,7 +35,16 @@ the first:
     qa_evidence.jsonl, so (b) cannot see it; the window's runner summary
     (metrics.json) carries the offered population (closed loop:
     experiment.num_measured_requests; open loop: workload.open_loop.n_scheduled)
-    and the task #127 consort counters, and both must agree with the rows.
+    and the task #127 consort counters, and both must agree with the rows;
+(j) per-row TPOT vs the output-token count (ADR-0118, Batch 2 W5): every
+    completed (ok) row must carry an integer ``num_tokens``; with two or more
+    output tokens its ``tpot_ms`` must be a finite positive number (a null or
+    zero TPOT beside a decode phase is a captured-timing defect); with at
+    most one output token its ``tpot_ms`` must be null (no decode phase; the
+    row is timely on TTFT alone downstream and counted as ``n_no_decode`` in
+    the accounting); a whitespace-sourced token count
+    (``num_tokens_source == "whitespace"``) is a WARN naming the missing
+    usage chunk.
 
 ``--pilot --results-dir DIR`` preserves the pilot-era metrics-vs-CSV check
 (``verify_dir``) verbatim for pilot trees; that mode keeps writing its report
@@ -47,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from dataclasses import asdict, dataclass
@@ -95,6 +105,11 @@ _CONSORT_COUNTERS: tuple[str, ...] = (
     "n_dropped_turn",
     "evidence_write_failures",
 )
+
+#: The producer's whitespace-fallback label for ``num_tokens_source``
+#: (= src.inference.engine.NUM_TOKENS_SOURCE_WHITESPACE; tests pin the two
+#: equal): the engine returned no usage.completion_tokens, so the count is words.
+_NUM_TOKENS_SOURCE_FALLBACK = "whitespace"
 
 VERIFICATION_DIR_SUFFIX = "_verification"
 REPORT_JSON_NAME = "verification_report.json"
@@ -346,13 +361,113 @@ def _check_row_count(
     return expected
 
 
+def _check_tpot_rows(
+    rows: list[dict[str, Any]], rel: str, findings: list[Finding]
+) -> int:
+    """Check (j), ADR-0118 (Batch 2 W5): on every completed (ok) row the
+    per-request TPOT must agree with the output-token count, and the count
+    must be an integer. Returns the number of completed rows with no decode
+    phase (num_tokens <= 1): the §9.10 exemption count the analysis applies.
+    Rows that are not ok, or carry no validity field, are outside the rule
+    (they are never timely). Rows of a reference engine (``reference_engine``
+    true: the HF oracle, which never streams, so its ttft_ms is the whole
+    call by contract and the runner's formula yields tpot_ms 0.0 on every
+    multi-token completion) are exempt from the two TPOT clauses: that value
+    is the engine's documented shape, not a captured-timing defect, and the
+    oracle is never scored for timeliness (sub-pressure only, charter P3)."""
+    no_decode = 0
+    bad_count: list[str] = []
+    missing_tpot: list[str] = []
+    fabricated_tpot: list[str] = []
+    fallback_counted: list[str] = []
+    for row in rows:
+        if row.get("ok") is not True:
+            continue
+        rid = str(row.get("example_id"))
+        num_tokens = row.get("num_tokens")
+        if (
+            isinstance(num_tokens, bool)
+            or not isinstance(num_tokens, int)
+            or num_tokens < 0
+        ):
+            bad_count.append(rid)
+            continue
+        tpot = row.get("tpot_ms")
+        reference = row.get("reference_engine") is True
+        if num_tokens <= 1:
+            no_decode += 1
+            if tpot is not None and not reference:
+                fabricated_tpot.append(rid)
+        elif not reference and (
+            isinstance(tpot, bool)
+            or not isinstance(tpot, (int, float))
+            or not math.isfinite(tpot)
+            or tpot <= 0.0
+        ):
+            missing_tpot.append(rid)
+        if row.get("num_tokens_source") == _NUM_TOKENS_SOURCE_FALLBACK:
+            fallback_counted.append(rid)
+    if bad_count:
+        findings.append(
+            Finding(
+                "FAIL",
+                "tpot",
+                rel,
+                f"{len(bad_count)} completed (ok) row(s) carry no non-negative "
+                f"integer num_tokens (first: {bad_count[:3]}); the decode-phase "
+                "rule cannot be applied without the output-token count "
+                "(ADR-0118)",
+            )
+        )
+    if missing_tpot:
+        findings.append(
+            Finding(
+                "FAIL",
+                "tpot",
+                rel,
+                f"{len(missing_tpot)} completed (ok) row(s) with two or more "
+                "output tokens carry no finite positive tpot_ms (first: "
+                f"{missing_tpot[:3]}): a null or zero TPOT beside a decode phase "
+                "is a captured-timing defect (ADR-0118)",
+            )
+        )
+    if fabricated_tpot:
+        findings.append(
+            Finding(
+                "FAIL",
+                "tpot",
+                rel,
+                f"{len(fabricated_tpot)} completed (ok) row(s) with at most one "
+                "output token carry a tpot_ms value although they have no "
+                f"decode phase (first: {fabricated_tpot[:3]}): the runner writes "
+                "null there, TPOT is undefined before a second output token "
+                "(ADR-0118)",
+            )
+        )
+    if fallback_counted:
+        findings.append(
+            Finding(
+                "WARN",
+                "tpot",
+                rel,
+                f"{len(fallback_counted)} completed (ok) row(s) count output "
+                "tokens by the whitespace fallback (num_tokens_source == "
+                f"{_NUM_TOKENS_SOURCE_FALLBACK!r}): the engine returned no "
+                "usage.completion_tokens, so num_tokens is a word count and the "
+                f"decode-phase rule keys on it (first: {fallback_counted[:3]}; "
+                "ADR-0118)",
+            )
+        )
+    return no_decode
+
+
 def _check_window(
     run_dir: Path,
     window_dir: Path,
     dataset: str,
     findings: list[Finding],
 ) -> dict[str, Any]:
-    """Run checks (a)-(c), (i) + accounting (e) for one window; returns its summary."""
+    """Run checks (a)-(c), (i), (j) + accounting (e) for one window; returns its summary."""
     rel_window = window_dir.relative_to(run_dir).as_posix()
     per_file_rows: dict[str, list[dict[str, Any]] | None] = {}
     for name in _PER_QUERY_ARTIFACTS:
@@ -432,6 +547,14 @@ def _check_window(
     # (i) rows vs the offered population + consort counters (ADR-0116, W3).
     n_expected = _check_row_count(window_dir, rel_window, requests_rows, findings)
 
+    # (j) per-row TPOT vs the output-token count (ADR-0118, W5); the returned
+    # exemption count rides the accounting (None when the rows are unreadable).
+    n_no_decode = (
+        _check_tpot_rows(requests_rows, f"{rel_window}/requests.jsonl", findings)
+        if requests_rows is not None
+        else None
+    )
+
     # (e) §9.10 exclusion accounting — absence is NOT zero: rows lacking any
     # validity field are counted as validity-unknown, never as valid.
     accounting: dict[str, Any] = {
@@ -445,6 +568,7 @@ def _check_window(
         "n_empty_generation": None,
         "n_validity_unknown": None,
         "n_valid_known": None,
+        "n_no_decode": n_no_decode,
     }
     if requests_rows is not None:
         n_error = sum(1 for r in requests_rows if r.get("error"))
@@ -759,6 +883,7 @@ def verify_run(run_dir: Path) -> dict[str, Any]:
         "n_empty_generation",
         "n_validity_unknown",
         "n_valid_known",
+        "n_no_decode",
     ):
         known = [row[key] for row in accounting_rows if row[key] is not None]
         # Absence-is-not-zero: a total over windows with unknown counts is
@@ -815,9 +940,9 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines.append("")
     lines.append(
         "| window | requests | evidence | error | ok=False | empty | "
-        "validity-unknown | valid-known |"
+        "validity-unknown | valid-known | no-decode |"
     )
-    lines.append("|---|---|---|---|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---|---|---|---|")
 
     def _cell(value: Any) -> str:
         return "?" if value is None else str(value)
@@ -827,7 +952,8 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"| {row['window']} | {_cell(row['n_requests_rows'])} "
             f"| {_cell(row['n_evidence_rows'])} | {_cell(row['n_error'])} "
             f"| {_cell(row['n_ok_false'])} | {_cell(row['n_empty_generation'])} "
-            f"| {_cell(row['n_validity_unknown'])} | {_cell(row['n_valid_known'])} |"
+            f"| {_cell(row['n_validity_unknown'])} | {_cell(row['n_valid_known'])} "
+            f"| {_cell(row['n_no_decode'])} |"
         )
     lines.append("")
     lines.append(

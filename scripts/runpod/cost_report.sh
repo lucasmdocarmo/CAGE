@@ -11,10 +11,12 @@
 # gpu_count), prints a per-pod table + total. Open pods (create without a
 # delete) use NOW as the end and are flagged LIVE/BILLING.
 #
-# --billing additionally shells `runpodctl billing` for the ACCOUNT view —
-# that output is the AUTHORITY on real spend; the ledger table is the local
-# estimate (it cannot see storage, volumes, or pods created outside the
-# wrapper).
+# --billing additionally shells `runpodctl billing pods` and `runpodctl billing
+# network-volume` for the ACCOUNT view (JSON; `[]` = no billed usage in the
+# window). That output is the AUTHORITY on real spend; the ledger table is the
+# local estimate (it cannot see storage, volumes, or pods created outside the
+# wrapper). The bare `runpodctl billing` is a command GROUP on runpodctl 2.11.0:
+# it prints its own help and exits 0, so it is never called here.
 #
 # Malformed ledger lines are REFUSED loudly with their line number (exit 2),
 # never skipped silently — a wrong cost table is worse than no cost table.
@@ -134,10 +136,11 @@ PY
 fi
 
 if [ "$BILLING" -eq 1 ]; then
-  printf '=== RunPod ACCOUNT billing (runpodctl billing) — the AUTHORITY on real spend; ===\n'
-  printf '=== the ledger table above is only the local estimate.                       ===\n'
+  printf '=== RunPod ACCOUNT billing (runpodctl billing pods + network-volume): the AUTHORITY on real spend; ===\n'
+  printf '=== JSON output; [] means no billed usage in the window. The ledger table above is the local estimate. ===\n'
   if command -v runpodctl >/dev/null 2>&1; then
-    runpodctl billing || warn "'runpodctl billing' failed (auth/network?) — no account view; the ledger estimate above stands alone"
+    runpodctl billing pods --grouping podId || warn "'runpodctl billing pods' failed (auth/network?): no account view; the ledger estimate above stands alone"
+    runpodctl billing network-volume || warn "'runpodctl billing network-volume' failed (auth/network?): no volume billing view"
   else
     warn "runpodctl not on PATH — cannot fetch the account billing view"
   fi

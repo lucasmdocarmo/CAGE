@@ -8,7 +8,9 @@
 # src/observability/provenance.py falls back to it when git is unavailable.
 #
 # Usage: scripts/ops/package_repo.sh [out.tar.gz]     (default /tmp/cage_<sha8>.tar.gz)
-# Then:  scp the tarball; on the VM: mkdir -p ~/CAGE && tar xzf cage_*.tar.gz -C ~/CAGE
+# Then:  scp the tarball; on the pod (network volume at /workspace, fresh pod so ~/CAGE
+#        is not yet a real directory): mkdir -p /workspace/CAGE && ln -sfn /workspace/CAGE ~/CAGE
+#        && tar xzf cage_*.tar.gz -C ~/CAGE
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

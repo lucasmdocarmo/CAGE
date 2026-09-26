@@ -46,7 +46,12 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from .engine import InferenceEngine, InferenceRequest, InferenceResponse
+from .engine import (
+    InferenceEngine,
+    InferenceRequest,
+    InferenceResponse,
+    NUM_TOKENS_SOURCE_TOKEN_IDS,
+)
 from .errors import EngineCapabilityUnavailableError, EngineDependencyUnavailableError
 
 ENGINE_ID = "hf_reference"
@@ -366,6 +371,8 @@ class HFOracleAdapter(InferenceEngine):
         response.corpus_prefill_ms = self._corpus_prefill_ms if reuse else None
         response.usage_telemetry_available = error is None
         response.cached_token_telemetry_available = error is None
+        # ADR-0118 (W5): the count is the generated id count, never a word count.
+        response.num_tokens_source = NUM_TOKENS_SOURCE_TOKEN_IDS if error is None else None
         return response
 
     def batch_generate(self, requests: List[InferenceRequest]) -> List[InferenceResponse]:

@@ -980,3 +980,103 @@ def test_hf_oracle_clear_corpus_prefix_returns_to_prefixfree_serving(monkeypatch
     assert resp.error is None
     assert resp.cached_prompt_tokens == 0
     assert model.generate_calls[-1]["past_key_values"] is None
+
+
+# ------------------------------------------------------------------------- #
+# ADR-0118 (Batch 2 W5): num_tokens provenance. The adapters label whether a
+# row's num_tokens is the engine's usage.completion_tokens, the whitespace
+# word count of the text (no usage chunk), or the in-process token ids; an
+# error row carries no label.
+# ------------------------------------------------------------------------- #
+
+from src.inference.engine import (  # noqa: E402
+    NUM_TOKENS_SOURCE_TOKEN_IDS,
+    NUM_TOKENS_SOURCE_USAGE,
+    NUM_TOKENS_SOURCE_WHITESPACE,
+)
+
+
+def test_num_tokens_source_literals_are_the_row_vocabulary():
+    assert NUM_TOKENS_SOURCE_USAGE == "usage"
+    assert NUM_TOKENS_SOURCE_WHITESPACE == "whitespace"
+    assert NUM_TOKENS_SOURCE_TOKEN_IDS == "token_ids"
+
+
+def test_stream_chat_labels_usage_counted_tokens(monkeypatch):
+    lines = chat_stream_lines(["Hello", " world"], usage=USAGE_WITH_CACHED)
+    install_post(monkeypatch, lambda _c: FakeStreamResponse(lines))
+    resp = VLLMAdapter(model_name="m").generate(chat_request(), stream=True)
+    assert resp.num_tokens == 2
+    assert resp.num_tokens_source == NUM_TOKENS_SOURCE_USAGE
+
+
+def test_stream_chat_labels_the_whitespace_fallback(monkeypatch):
+    lines = chat_stream_lines(["Hello", " wide world"], usage=None)
+    install_post(monkeypatch, lambda _c: FakeStreamResponse(lines))
+    resp = VLLMAdapter(model_name="m").generate(chat_request(), stream=True)
+    assert resp.num_tokens == 3  # words, not tokens
+    assert resp.num_tokens_source == NUM_TOKENS_SOURCE_WHITESPACE
+
+
+def test_stream_raw_path_labels_the_token_count(monkeypatch):
+    lines = [
+        _sse({"choices": [{"text": "Par", "finish_reason": None}]}),
+        _sse({"choices": [{"text": "is", "finish_reason": "stop"}]}),
+        _sse({"choices": [], "usage": USAGE_NO_DETAILS}),
+        "data: [DONE]",
+    ]
+    install_post(monkeypatch, lambda _c: FakeStreamResponse(lines))
+    req = InferenceRequest(prompt="capital?", max_tokens=8, temperature=0.0, request_id="r")
+    resp = VLLMAdapter(model_name="m").generate(req, stream=True)
+    assert resp.num_tokens == 2 and resp.num_tokens_source == NUM_TOKENS_SOURCE_USAGE
+
+
+def test_non_stream_paths_label_the_token_count(monkeypatch):
+    payload = {
+        "choices": [{"message": {"content": "Paris"}, "finish_reason": "stop"}],
+        "usage": USAGE_WITH_CACHED,
+    }
+    install_post(monkeypatch, lambda _c: FakeJSONResponse(payload))
+    resp = VLLMAdapter(model_name="m").generate(chat_request(), stream=False)
+    assert resp.num_tokens_source == NUM_TOKENS_SOURCE_USAGE
+
+    raw = {"choices": [{"text": "Paris is nice", "finish_reason": "stop"}]}  # no usage
+    install_post(monkeypatch, lambda _c: FakeJSONResponse(raw))
+    req = InferenceRequest(prompt="p", max_tokens=8, temperature=0.0, request_id="r")
+    resp = SGLangAdapter(model_name="m").generate(req, stream=False)
+    assert resp.num_tokens == 3 and resp.num_tokens_source == NUM_TOKENS_SOURCE_WHITESPACE
+
+
+def test_async_stream_labels_the_token_count(monkeypatch):
+    lines = chat_stream_lines(["Hello", " world"], usage=USAGE_WITH_CACHED)
+    install_async_session(monkeypatch, FakeAsyncStreamResponse(lines))
+    resp = _run_async(VLLMAdapter(model_name="m").async_stream_generate(chat_request()))
+    assert resp.num_tokens_source == NUM_TOKENS_SOURCE_USAGE
+    lines = chat_stream_lines(["Hello", " world"], usage=None)
+    install_async_session(monkeypatch, FakeAsyncStreamResponse(lines))
+    resp = _run_async(VLLMAdapter(model_name="m").async_stream_generate(chat_request()))
+    assert resp.num_tokens_source == NUM_TOKENS_SOURCE_WHITESPACE
+
+
+def test_error_rows_carry_no_token_count_label(monkeypatch):
+    def fake_post(url, json=None, timeout=None, stream=False, **kw):
+        raise requests.exceptions.ConnectionError("down")
+
+    monkeypatch.setattr(base_mod.requests, "post", fake_post)
+    resp = VLLMAdapter(model_name="m").generate(chat_request(), stream=True)
+    assert resp.finish_reason == "error"
+    assert resp.num_tokens == 0 and resp.num_tokens_source is None
+    install_async_session(monkeypatch, RuntimeError("refused"))
+    resp = _run_async(VLLMAdapter(model_name="m").async_stream_generate(chat_request()))
+    assert resp.num_tokens_source is None
+
+
+def test_hf_oracle_labels_token_ids_and_no_label_on_error(monkeypatch):
+    adapter, model, _tok = _oracle(monkeypatch, generated_text="Paris")
+    req = InferenceRequest(prompt="capital of France ?", temperature=0.0, request_id="q1")
+    resp = adapter.generate(req)
+    assert resp.num_tokens == 1
+    assert resp.num_tokens_source == NUM_TOKENS_SOURCE_TOKEN_IDS
+    model.raise_on_generate = RuntimeError("boom")
+    resp = adapter.generate(req)
+    assert resp.finish_reason == "error" and resp.num_tokens_source is None

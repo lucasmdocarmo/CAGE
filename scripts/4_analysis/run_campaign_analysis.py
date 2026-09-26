@@ -219,6 +219,7 @@ from src.analysis.stats.tests_by_unit import (  # noqa: E402
 )
 from src.analysis.stats.wlt import win_loss_tie  # noqa: E402
 from src.analysis.goodput import (  # noqa: E402
+    DECODE_TOKENS_COLUMN,
     GoodputError,
     IN_REGIME,
     SLOBaseline,
@@ -405,7 +406,11 @@ _TRUTH_TAX_ANCHOR_ENGINE = "vllm"
 _TRUTH_TAX_GROUP_AXES: tuple[str, ...] = (
     "model", "arm", "retriever", "policy", "topology", "budget_r", "rate_frac",
 )
-_TRUTH_TAX_REQUEST_COLUMNS: tuple[str, ...] = ("ok", "ttft_ms", "tpot_ms")
+#: num_tokens (ADR-0118, Batch 2 W5) feeds the decode-phase rule: a completion
+#: with fewer than two output tokens has no TPOT and is judged on TTFT alone.
+_TRUTH_TAX_REQUEST_COLUMNS: tuple[str, ...] = (
+    "ok", "ttft_ms", "tpot_ms", "num_tokens",
+)
 #: §3-extra manifest key carrying the §6.1 single-stream floors per engine:
 #: {"slo_floors": {"<engine>": {"ttft_s": ..., "tpot_s": ...}}} — produced by
 #: the E3 floor calibration (src/orchestration/calibration.summarize_floor).
@@ -3235,6 +3240,19 @@ def _predicate_join_key(obj: Mapping[str, Any]) -> tuple[Any, str, Any]:
     )
 
 
+def _decode_tokens_of(num_tokens: Any) -> float:
+    """ADR-0118 (W5): the row's decode-phase length for
+    ``goodput.evaluate_window`` (output tokens beyond the first, floored at
+    zero). A missing, non-integer or negative count is NaN: evaluate_window
+    refuses it on a completed row and ignores it on a failed one (absence is
+    never coerced to a count)."""
+    if isinstance(num_tokens, bool) or not isinstance(num_tokens, int):
+        return float("nan")
+    if num_tokens < 0:
+        return float("nan")
+    return float(max(num_tokens - 1, 0))
+
+
 def _window_truth_tax(
     run_dir: Path,
     rec: Any,
@@ -3259,6 +3277,10 @@ def _window_truth_tax(
     - An ok request without a predicate row fails loud (§9.10: the predicate
       must be scored for every completion); not-ok rows are non-veridical by
       registration (audit §2.6).
+    - ADR-0118 (W5): ``num_tokens`` becomes the ``decode_tokens`` column, so
+      a one-token completion (null TPOT, no decode phase) is timely on TTFT
+      alone and counted, while a null or zero TPOT beside decode tokens
+      refuses by name.
     """
     window_dir = run_dir / str(rec.window_dir)
     window_label = str(rec.window_dir)
@@ -3318,8 +3340,8 @@ def _window_truth_tax(
         raise AnalysisError(
             f"contrast #14 (truth_tax): MISSING ARTIFACT — requests.jsonl "
             f"rows in {window_label} carry no {missing_cols} column(s); Y "
-            "needs the #127 ok stamp and per-request ttft_ms/tpot_ms for "
-            "the §6.1 SLO gate"
+            "needs the #127 ok stamp, per-request ttft_ms/tpot_ms for the "
+            "§6.1 SLO gate and num_tokens for the ADR-0118 decode-phase rule"
         )
 
     predicate_by_key: dict[tuple[Any, str, Any], Any] = {}
@@ -3358,6 +3380,8 @@ def _window_truth_tax(
                 "tpot_s": (
                     float("nan") if tpot_ms is None else float(tpot_ms) / 1000.0
                 ),
+                # ADR-0118: the decode-phase length keys the TPOT clause.
+                DECODE_TOKENS_COLUMN: _decode_tokens_of(req.get("num_tokens")),
             }
         )
     if unscored_ok:
@@ -4599,6 +4623,10 @@ def _dist_window_metrics(
     ([VERIFY-LIVE at Run-C-prime preflight] — no producer persists it yet,
     so on today's trees every window returns the labeled skip naming it;
     the pending state is a skip that lists the gap, never a PASS).
+
+    ADR-0118 (W5): ``num_tokens`` becomes the ``decode_tokens`` column
+    exactly as in the #14 seam (one-token completions judged on TTFT alone
+    and counted; a defective TPOT beside decode tokens is a labeled skip).
     """
     window_dir = run_dir / str(rec.window_dir)
     label = str(rec.window_dir)
@@ -4656,7 +4684,8 @@ def _dist_window_metrics(
     if missing_cols:
         return None, None, (
             f"requests.jsonl rows in {label} carry no {missing_cols} "
-            "column(s) — Y needs the ok stamp and per-request ttft_ms/tpot_ms"
+            "column(s): Y needs the ok stamp, per-request ttft_ms/tpot_ms "
+            "and num_tokens (ADR-0118 decode-phase rule)"
         )
 
     if predicate_root is None:
@@ -4697,6 +4726,8 @@ def _dist_window_metrics(
                 "tpot_s": (
                     float("nan") if tpot_ms is None else float(tpot_ms) / 1000.0
                 ),
+                # ADR-0118: the decode-phase length keys the TPOT clause.
+                DECODE_TOKENS_COLUMN: _decode_tokens_of(req.get("num_tokens")),
             }
         )
     if unscored_ok:
