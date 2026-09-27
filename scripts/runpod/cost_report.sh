@@ -5,8 +5,9 @@
 # cost_report.sh — RunPod cost analysis from the pod-ops ledger (OFFLINE-first).
 #
 # PRIMARY source = results/ops/pod_ledger.jsonl (override: CAGE_POD_LEDGER),
-# written by provision_pod.sh (create events) and teardown_pod.sh (delete
-# events). Fully OFFLINE by default — no network, no CLI: pairs create/delete
+# written by provision_pod.sh (create events), teardown_pod.sh (delete events)
+# and pod_watchdog.sh (delete events carrying "by":"watchdog" when the
+# client-side seatbelt fired). Fully OFFLINE by default, no network, no CLI: pairs create/delete
 # per pod_id, computes runtime and cost (runtime × price_per_hour_usd ×
 # gpu_count), prints a per-pod table + total. Open pods (create without a
 # delete) use NOW as the end and are flagged LIVE/BILLING.
@@ -85,6 +86,11 @@ for n, raw in enumerate(open(path, encoding="utf-8"), 1):
             refuse(n, "price_per_hour_usd must be number|null", raw)
         if e.get("terminate_after") is not None and not isinstance(e["terminate_after"], str):
             refuse(n, "terminate_after must be string|null", raw)
+        if e.get("watchdog_pid") is not None and (
+                isinstance(e["watchdog_pid"], bool) or not isinstance(e["watchdog_pid"], int)):
+            refuse(n, "watchdog_pid must be int|null (the client-side seatbelt's pid)", raw)
+    if e["event"] == "delete" and e.get("by") is not None and not isinstance(e["by"], str):
+        refuse(n, "delete event 'by' must be string|null (e.g. \"watchdog\")", raw)
     try:
         e["_ts"] = ts(e["ts_utc"])
     except ValueError:

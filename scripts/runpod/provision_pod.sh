@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Order:     provisioning bracket — before 1_setup; PLAN by default, creates only with --yes (the owner's recorded GO)
-# Objective: Approval-gated RunPod pod provisioning with a server-side --terminate-after cost seatbelt + pod-ledger create event
+# Order:     provisioning bracket: before 1_setup; PLAN by default, creates only with --yes (the owner's recorded GO)
+# Objective: Approval-gated RunPod pod provisioning with a CLIENT-SIDE cost seatbelt (pod_watchdog.sh armed at create) + pod-ledger create event
 # Cloud:     runpod
 # provision_pod.sh — approval-gate-aware RunPod provisioning wrapper (CLI v2).
 #
@@ -9,19 +9,28 @@
 # creating anything. Creation happens ONLY with the explicit --yes flag — the
 # owner's recorded GO (standing run-approval gate: no pod without approval).
 #
-# COST SEATBELT (owner-mandated; MyDocs/runpod-cli-reference.md §3): pods are
-# created with a server-side --terminate-after deadline (default 12h) that
-# survives a dead laptop. Disabling it requires the explicit
+# COST SEATBELT (owner-mandated; MyDocs/RunPod/runpod-cli-reference.md §3): the
+# operator's --terminate-after <dur|RFC3339> (default 12h) is resolved to an
+# absolute UTC instant and enforced by pod_watchdog.sh, a detached loop on THIS
+# workstation that runs `runpodctl pod delete` at that instant. It is CLIENT-SIDE
+# because RunPod has no server-side auto-terminate: `runpodctl pod create` has
+# no --terminate-after and no --stop-after (2.11.0 and 2.14.0 both refuse the
+# flag with code usage_error, live 2026-09-26) and the v2 CreatePodRequest has
+# no such field. The watchdog dies with this machine (off or asleep at the
+# deadline = it fires at the next wake); backstops = pod_status.sh
+# --max-age-hours + the console. Disabling it requires the explicit
 # --no-terminate-after flag and is announced LOUDLY.
 #
 # LEDGER: every real create appends one JSON line to
 #   results/ops/pod_ledger.jsonl        (override: CAGE_POD_LEDGER)
 # schema: {"ts_utc","pod_id","name","gpu_id","gpu_count",
-#          "price_per_hour_usd"(number|null),"terminate_after"(string|null),
+#          "price_per_hour_usd"(number|null),"terminate_after"(string|null: the
+#          watchdog deadline instant),"watchdog_pid"(int|null),
 #          "data_center_ids"(string|null),"network_volume_id"(string|null),
 #          "purpose","event":"create"}
-# teardown_pod.sh appends the matching {"event":"delete"} line;
-# pod_status.sh / cost_report.sh consume the pairs.
+# teardown_pod.sh appends the matching {"event":"delete"} line (pod_watchdog.sh
+# appends it with "by":"watchdog" when the seatbelt fires); pod_status.sh /
+# cost_report.sh consume the pairs.
 #
 # Plan mode touches the network AT MOST via one optional read-only
 # `runpodctl gpu list` (price derivation; skipped/degraded to price=null with a
@@ -105,13 +114,12 @@ if [ "$NET_VOL_SET" -eq 1 ]; then
 fi
 
 # --- seatbelt resolution: operator duration -> absolute RFC3339 UTC ---------
-# runpodctl v2 `--terminate-after` takes an ABSOLUTE datetime, not a duration
-# (its --help: "auto-terminate datetime (e.g., 2026-04-15T00:00:00Z)"). Until
-# 2026-08-25 this script passed the raw "12h" default straight through, so the
-# seatbelt was never a valid deadline: the create either fails or the pod comes
-# up with NO server-side auto-delete and bills until a manual teardown. Keep the
-# duration form for the operator, resolve it to the wall-clock instant here, and
-# print that instant so the plan states exactly when RunPod will kill the pod.
+# The instant is what pod_watchdog.sh guards (it compares the wall clock to it
+# every tick, so a workstation that slept through the deadline fires at wake).
+# It is NEVER passed to `runpodctl pod create`: that CLI has no auto-terminate
+# flag, and the flag this script sent until 2026-09-26 made EVERY create fail
+# with usage_error. Keep the duration form for the operator, resolve it here,
+# and print the instant so the plan states exactly when the watchdog deletes the pod.
 abs_from_secs() {  # BSD date (macOS workstation) first, GNU date (Linux) second
   date -u -v+"$1"S +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
     || date -u -d "@$(( $(date -u +%s) + $1 ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
@@ -129,6 +137,12 @@ if [ "$NO_SEATBELT" -eq 0 ]; then
   else
     die "--terminate-after must be a duration (24h, 90m) or an RFC3339 UTC datetime (2026-08-26T01:40:00Z); got: $TERMINATE_AFTER"
   fi
+  # A deadline that can never be armed (unparseable, calendar-invalid under BSD
+  # date, or already past) is refused HERE, before the plan print and the create:
+  # the watchdog could only refuse it AFTER the pod bills. ONE validator for both
+  # scripts: the watchdog's own `check` (format, calendar round-trip, future).
+  _chk="$(bash "$SCRIPT_DIR/pod_watchdog.sh" check "$TERMINATE_AT" 2>&1)" \
+    || die "--terminate-after $TERMINATE_AT cannot be armed (a pod created now would be UNGUARDED): $_chk"
 fi
 
 LEDGER="${CAGE_POD_LEDGER:-$CAGE_ROOT/results/ops/pod_ledger.jsonl}"
@@ -169,7 +183,7 @@ EST_TOTAL="unknown (need both a price and --hours <est>)"
 if [ -n "$PRICE" ] && [ -n "$HOURS" ]; then
   EST_TOTAL="\$$(awk -v p="$PRICE" -v h="$HOURS" -v g="$GPU_COUNT" 'BEGIN { printf "%.2f", p*h*g }') (${HOURS}h x \$${PRICE}/h x ${GPU_COUNT} GPU)"
 fi
-SEATBELT="$TERMINATE_AFTER (deletes at $TERMINATE_AT)"
+SEATBELT="$TERMINATE_AFTER (workstation watchdog deletes the pod at $TERMINATE_AT)"
 [ "$NO_SEATBELT" -eq 0 ] || SEATBELT="DISABLED (--no-terminate-after)"
 
 log "=================== RunPod provisioning PLAN ==================="
@@ -193,9 +207,10 @@ else
   printf '  network volume    : none (no --network-volume-id)\n'
 fi
 if [ "$NO_SEATBELT" -eq 1 ]; then
-  printf '  seatbelt          : DISABLED (--no-terminate-after) — NO server-side auto-delete\n'
+  printf '  seatbelt          : DISABLED (--no-terminate-after): NO automatic delete of any kind; teardown_pod.sh is the only stop\n'
 else
-  printf '  seatbelt          : --terminate-after %s -> server-side auto-delete at %s\n' "$TERMINATE_AFTER" "$TERMINATE_AT"
+  printf '  seatbelt          : --terminate-after %s -> pod_watchdog.sh on THIS workstation deletes the pod at %s\n' "$TERMINATE_AFTER" "$TERMINATE_AT"
+  printf '                      (client-side: RunPod has no server-side auto-terminate; dies with this machine; backstops = pod_status.sh --max-age-hours + console)\n'
 fi
 PRICE_DISPLAY="unknown"; [ -z "$PRICE" ] || PRICE_DISPLAY="\$$PRICE/h"
 printf '  price             : %s %s\n' "$PRICE_DISPLAY" "$PRICE_NOTE"
@@ -212,13 +227,14 @@ fi
 require_cmd runpodctl "brew install runpod/runpodctl/runpodctl"
 require_cmd python3 "needed to write the schema-valid ledger line"
 if [ "$NO_SEATBELT" -eq 1 ]; then
-  warn "COST SEATBELT DISABLED (--no-terminate-after): this pod will BILL UNTIL torn down"
-  warn "manually — a dead laptop no longer stops it; teardown_pod.sh becomes the ONLY stop."
+  warn "COST SEATBELT DISABLED (--no-terminate-after): no watchdog will be armed; this pod BILLS UNTIL"
+  warn "teardown_pod.sh (or the console) deletes it. pod_status.sh --max-age-hours stays the only alarm."
 fi
 CREATE_ARGS=( pod create --name "$NAME" --image "$IMAGE" --gpu-id "$GPU_ID"
   --gpu-count "$GPU_COUNT" --container-disk-in-gb "$DISK_GB" --volume-in-gb "$VOL_GB"
   --volume-mount-path /workspace --ports "$PORTS" --cloud-type "$CLOUD_TYPE" )
-[ "$NO_SEATBELT" -eq 1 ] || CREATE_ARGS+=( --terminate-after "$TERMINATE_AT" )
+# No --terminate-after here: runpodctl has no such flag (usage_error, live
+# 2026-09-26). The seatbelt is armed AFTER the create, see pod_watchdog.sh below.
 [ "$DC_IDS_SET" -eq 0 ]  || CREATE_ARGS+=( --data-center-ids "$DC_IDS" )
 [ "$NET_VOL_SET" -eq 0 ] || CREATE_ARGS+=( --network-volume-id "$NET_VOL_ID" )
 log "creating pod (cost-STARTING action): runpodctl$(printf ' %s' "${CREATE_ARGS[@]}")"
@@ -228,11 +244,25 @@ POD_ID="$(printf '%s\n' "$OUT" | sed -nE 's/.*"id"[[:space:]]*:[[:space:]]*"([A-
 [ -n "$POD_ID" ] || POD_ID="$(printf '%s\n' "$OUT" | tr -c 'a-z0-9' '\n' | awk 'length($0) >= 13 && length($0) <= 20' | head -1 || true)"
 [ -n "$POD_ID" ] || die "pod CREATED (it IS billing) but its id could not be parsed from the output above — find it with 'runpodctl pod list' and append the create event to $LEDGER manually"
 
+# --- seatbelt: arm the workstation watchdog BEFORE the ledger line so the line
+# carries its pid. An arming failure is LOUD but never fatal here: the pod IS
+# billing and the create event below must still land as the audit trail.
+WD_PID=""; WD_FAILED=0
+if [ "$NO_SEATBELT" -eq 0 ]; then
+  if WD_OUT="$(bash "$SCRIPT_DIR/pod_watchdog.sh" arm "$POD_ID" "$TERMINATE_AT" 2>&1)"; then
+    printf '%s\n' "$WD_OUT" | grep -v '^WATCHDOG_PID=' || true
+    WD_PID="$(printf '%s\n' "$WD_OUT" | sed -nE 's/^WATCHDOG_PID=([0-9]+)$/\1/p' | head -1)"
+  else
+    WD_FAILED=1
+    printf '%s\n' "$WD_OUT" >&2
+  fi
+fi
+
 mkdir -p "$(dirname "$LEDGER")"
 LINE="$(CAGE_LJ_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)" CAGE_LJ_ID="$POD_ID" CAGE_LJ_NAME="$NAME" \
   CAGE_LJ_GPU="$GPU_ID" CAGE_LJ_COUNT="$GPU_COUNT" CAGE_LJ_PRICE="$PRICE" \
   CAGE_LJ_TA="$([ "$NO_SEATBELT" -eq 1 ] || printf '%s' "$TERMINATE_AT")" \
-  CAGE_LJ_DC="$DC_IDS" CAGE_LJ_NV="$NET_VOL_ID" \
+  CAGE_LJ_DC="$DC_IDS" CAGE_LJ_NV="$NET_VOL_ID" CAGE_LJ_WD="$WD_PID" \
   CAGE_LJ_PURPOSE="$PURPOSE" python3 -c '
 import json, os
 e = os.environ
@@ -240,21 +270,27 @@ price = e.get("CAGE_LJ_PRICE", "")
 ta = e.get("CAGE_LJ_TA", "")
 dc = e.get("CAGE_LJ_DC", "")
 nv = e.get("CAGE_LJ_NV", "")
+wd = e.get("CAGE_LJ_WD", "")
 print(json.dumps({
     "ts_utc": e["CAGE_LJ_TS"], "pod_id": e["CAGE_LJ_ID"], "name": e["CAGE_LJ_NAME"],
     "gpu_id": e["CAGE_LJ_GPU"], "gpu_count": int(e["CAGE_LJ_COUNT"]),
     "price_per_hour_usd": float(price) if price else None,
     "terminate_after": ta if ta else None,
+    "watchdog_pid": int(wd) if wd else None,
     "data_center_ids": dc if dc else None,
     "network_volume_id": nv if nv else None,
     "purpose": e["CAGE_LJ_PURPOSE"], "event": "create",
 }))')" || die "pod $POD_ID CREATED and BILLING but the ledger line could not be built — append the create event to $LEDGER manually NOW"
 printf '%s\n' "$LINE" >> "$LEDGER"
 log "ledger: create event appended -> $LEDGER"
+if [ "$WD_FAILED" -eq 1 ]; then
+  warn "SEATBELT NOT ARMED: pod_watchdog.sh arm failed (see above). Pod $POD_ID IS BILLING with NO automatic delete."
+  warn "Arm it by hand NOW: bash $SCRIPT_DIR/pod_watchdog.sh arm $POD_ID $TERMINATE_AT   (or tear down: teardown_pod.sh)"
+fi
 
 log "pod CREATED: $POD_ID   (seatbelt: $SEATBELT)"
 log "NEXT STEPS:"
 log "  1) ship the repo tarball (scripts/ops/package_repo.sh), then ON the pod: bash scripts/runpod/setup_runpod.sh"
 log "  2) monitor age/spend from the workstation: bash scripts/runpod/pod_status.sh   (cost table: cost_report.sh)"
 log "  3) after the run + verified pull: bash scripts/runpod/teardown_pod.sh $POD_ID <backup_target> <local_run_dir>"
-[ "$NO_SEATBELT" -eq 1 ] || log "  seatbelt: RunPod auto-deletes this pod at $TERMINATE_AT (server-side, in $TERMINATE_AFTER)"
+[ "$NO_SEATBELT" -eq 1 ] || log "  seatbelt: pod_watchdog.sh on THIS workstation deletes the pod at $TERMINATE_AT (in $TERMINATE_AFTER; keep this machine on and awake; status/disarm: bash scripts/runpod/pod_watchdog.sh status|disarm $POD_ID)"

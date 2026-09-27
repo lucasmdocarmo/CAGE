@@ -9,9 +9,11 @@ the gcloud-hard operator tools this doc describes (`gpu_vm.sh`, `remote_job.sh`)
 > **Provisioning:** RunPod is the PRIMARY provider (owner directive 2026-08-18; lifecycle in
 > `docs/RUNBOOK.md`). RunPod pods are created via **`scripts/runpod/provision_pod.sh`**
 > (PLAN by default; `--yes` only after the recorded owner GO; `--terminate-after 12h`
-> seatbelt; ledger `results/ops/pod_ledger.jsonl` — see `scripts/runpod/README.md`).
+> seatbelt, enforced CLIENT-SIDE by `scripts/runpod/pod_watchdog.sh` on the operator's Mac
+> because RunPod has no server-side auto-terminate (live 2026-09-26); ledger
+> `results/ops/pod_ledger.jsonl` — see `scripts/runpod/README.md`).
 > On the retained GCP port, provisioning goes via **`terraform/gcp/`**
-> (`sessions/*.tfvars`; `terraform apply` gated by explicit user approval — see `terraform/gcp/main.tf`).
+> (`sessions/*.tfvars`; `terraform apply` gated by explicit user approval: see `terraform/gcp/main.tf`).
 > `scripts/gcp/gpu_vm.sh create` is the pilot-era GCP L4 zone-hunt, `scripts/gcp/remote_job.sh`
 > drives work on any existing box over gcloud SSH, and `gpu_vm.sh sweep` stays the prove-$0
 > check on GCP.

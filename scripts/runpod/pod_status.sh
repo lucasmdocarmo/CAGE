@@ -5,11 +5,13 @@
 # pod_status.sh — READ-ONLY RunPod monitoring + runaway-cost alarm (CLI v2).
 #
 # Joins `runpodctl pod list --all` (+ per-pod `runpodctl pod get`) with the
-# pod-ops ledger (results/ops/pod_ledger.jsonl — provision_pod.sh writes create
-# events, teardown_pod.sh delete events) and prints, per live pod: uptime
-# (now − create ts) and estimated spend (uptime × price_per_hour_usd ×
+# pod-ops ledger (results/ops/pod_ledger.jsonl: provision_pod.sh writes create
+# events, teardown_pod.sh delete events, pod_watchdog.sh delete events with
+# "by":"watchdog" when the seatbelt fired) and prints, per live pod: uptime
+# (now minus the create ts), estimated spend (uptime x price_per_hour_usd x
 # gpu_count when the ledger knows the price, else
-# "unknown — pass --price-per-hour at provision").
+# "unknown, pass --price-per-hour at provision"), and the seatbelt state
+# (watchdog: ALIVE, DEAD or NONE, from the pidfile beside the ledger).
 #
 # ALARM: exits 1 when any pod's KNOWN age exceeds --max-age-hours (default 24)
 # — run it in a watch loop as the runaway-cost alarm. A live pod with NO
@@ -18,7 +20,7 @@
 #
 # Degrades gracefully: no runpodctl / listing failure -> ledger-only view over
 # the OPEN create events (the alarm still applies to them — the offline
-# watchdog); no ledger -> live listing with unknown age/spend. Never mutates.
+# alarm); no ledger -> live listing with unknown age/spend. Never mutates.
 #
 # Usage: scripts/runpod/pod_status.sh [--max-age-hours <n>]
 # Env:   CAGE_POD_LEDGER  ledger path override (default results/ops/pod_ledger.jsonl)
@@ -82,10 +84,22 @@ for i in ids:
 PY
 
 # Per-pod detail (read-only `pod get`; a failed get is announced, not fatal).
+# Seatbelt state per live pod: the client-side watchdog (pod_watchdog.sh) is the
+# ONLY automatic delete that exists (RunPod has no server-side one), so a DEAD or
+# absent watchdog means the pod bills until teardown_pod.sh or the console.
+WD_DIR="$(dirname "$LEDGER")"
 if [ "$LIVE_OK" -eq 1 ] && [ -s "$TMP/ids.txt" ]; then
   while IFS= read -r pid; do
     printf -- '-- runpodctl pod get %s --\n' "$pid"
     runpodctl pod get "$pid" 2>&1 | sed -n '1,6p' || warn "'runpodctl pod get $pid' failed"
+    wd_pf="$WD_DIR/watchdog_${pid}.pid"
+    if pidfile_alive "$wd_pf" "pod_watchdog.sh run $pid"; then
+      printf '   watchdog: ALIVE (pid %s, deletes the pod at %s)\n' "$(cat "$wd_pf")" "$(cat "$WD_DIR/watchdog_${pid}.deadline" 2>/dev/null || printf '?')"
+    elif [ -f "$wd_pf" ]; then
+      printf '   watchdog: DEAD (stale pidfile; the pod is UNGUARDED: re-arm with pod_watchdog.sh arm %s <deadline> or tear down)\n' "$pid"
+    else
+      printf '   watchdog: NONE on this machine (no client-side seatbelt armed; RunPod has no server-side one)\n'
+    fi
   done < "$TMP/ids.txt"
 fi
 

@@ -127,3 +127,10 @@ Use a hedge word in place of a check.
 Proceed past a one-way door without explicit confirmation.
 Report a single-run measurement as a absolute result.
 
+## Process safety (hard rule)
+- Never signal processes by parent PID, name pattern, or broadcast: no `pkill`, `killall`,
+  `kill -1`, `kill 0`, `-P 1`, `os.kill(-1, …)`, `os.killpg(0, …)`.
+- Tests and scripts terminate only processes they started, by recorded PID or process group
+  (`set -m` + `kill -- -$PID`, or `start_new_session=True` + `os.killpg(pid, sig)`).
+- Process-lifecycle tests run inside a container, never on the macOS host.
+- IF you need to run any of these commands, inform the owner and THEN request approval even in Ultracode mode with bypass permissions. ANY of these commands cannot be run without my permission.

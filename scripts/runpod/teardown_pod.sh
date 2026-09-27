@@ -149,6 +149,12 @@ else
   echo "    WARNING: could not append the delete event to $LEDGER — the pod IS deleted; record it manually or cost_report.sh keeps it LIVE/BILLING." >&2
 fi
 
+# Seatbelt hook: the workstation watchdog armed by provision_pod.sh has nothing
+# left to guard. Disarm it (never fatal: the pod IS deleted; a surviving loop
+# would find the pod gone at its deadline and exit on its own).
+bash "$SCRIPT_DIR/pod_watchdog.sh" disarm "$POD_ID" 2>&1 | sed 's/^/    /' \
+  || echo "    WARNING: pod_watchdog.sh disarm failed; a live watchdog exits by itself once it sees the pod gone" >&2
+
 # --- [5/5] prove $0 (READ-ONLY listings; this step deletes NOTHING) ----------
 # Clean-room rule (MyDocs/runpod-cli-reference.md §6): a surviving network
 # volume still bills storage — the $0 verdict needs the pod listing pod-free
