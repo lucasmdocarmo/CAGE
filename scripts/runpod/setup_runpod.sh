@@ -41,6 +41,8 @@
 #   SKIP_MODEL_PREFETCH=1 bypass model prefetch (e.g. a single-model pod)
 #   HF_HUB_DOWNLOAD_TIMEOUT  stalled-read timeout seconds (default 30)
 #   SGLANG_VERSION        SGLang pin override (default: the section 7 pin below; own venv sglang-env)
+#   SGLANG_PYTHON_VERSION CPython for sglang-env (default 3.12; ADR-0120: SGLang 0.5.10.post1 pulls
+#                         outlines_core 0.1.26, which ships no cp313 wheel, and the image has no Rust)
 #   LMDEPLOY_VERSION      LMDeploy pin override (default: the section 7 pin below; own venv lmdeploy-env)
 #   LMDEPLOY_TORCH_VERSION  torch pinned inside lmdeploy-env (default 2.10.0: vLLM 0.19.1's CUDA 12.8 line)
 #   SKIP_ENGINE_INSTALL=1 bypass the SGLang/LMDeploy venvs (a vLLM-only pod)
@@ -57,6 +59,13 @@ VLLM_VERSION="${VLLM_VERSION:-0.19.1}"
 # 2.9.1 (cu12.8); LMDeploy 0.17.0 accepts torch 2.0 to 2.12.1, so its venv pins
 # torch explicitly or pip would resolve a CUDA 13 build. Keep in sync with section 7.
 SGLANG_VERSION="${SGLANG_VERSION:-0.5.10.post1}"
+# ADR-0120 (backlog W30, live L40S 2026-09-27): sglang-env is the ONE venv off the
+# canonical interpreter. SGLang 0.5.10.post1 -> outlines 0.1.11 -> outlines_core 0.1.26,
+# which ships no cp313 wheel (PyPI read 2026-09-27; the cp313 wheels start in the 0.2.x
+# line vLLM uses), so on 3.13 pip builds it from source and the image has no Rust. A
+# rustup toolchain plus libssl-dev built it on the pod (about 4 min), the heavier fix;
+# the cp312 wheel exists and Ubuntu 24.04's system interpreter is 3.12.
+SGLANG_PYTHON_VERSION="${SGLANG_PYTHON_VERSION:-3.12}"
 LMDEPLOY_VERSION="${LMDEPLOY_VERSION:-0.17.0}"
 LMDEPLOY_TORCH_VERSION="${LMDEPLOY_TORCH_VERSION:-2.10.0}"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -175,8 +184,9 @@ pip install -r requirements.txt
 echo "[cage] [3b] reconciling openai for vLLM ${VLLM_VERSION}..."
 pip install -U "openai>=2.0"
 
-# 3c. Charter engines #2 and #3 in their OWN venvs (pre-GO item 10). Created from
-#     the canonical interpreter like cage-env, installed through each venv's own
+# 3c. Charter engines #2 and #3 in their OWN venvs (pre-GO item 10). lmdeploy-env is
+#     created from the canonical interpreter like cage-env; sglang-env from CPython
+#     SGLANG_PYTHON_VERSION (ADR-0120). Both are installed through each venv's own
 #     pip and without a pip cache (the 60 GB container disk also holds the model
 #     prefetch; cage-env stays the active environment for the steps below). Loud and
 #     non-fatal like the dataset step: the launchers resolve these venvs by
@@ -185,11 +195,26 @@ pip install -U "openai>=2.0"
 #     without deleting anything: an existing venv is reused and pip completes a
 #     killed install on the rerun.
 install_engine_venv() {
-  # $1 venv dir, $2 label, $3.. pip install arguments
+  # $1 venv dir, $2 label, $3.. pip install arguments. The interpreter is the canonical
+  # PYBIN unless the caller sets ENGINE_PYBIN for the call (ADR-0120: sglang-env only).
   local venv="$1" label="$2"
+  local pybin="${ENGINE_PYBIN:-$PYBIN}"
   shift 2
-  echo "[cage] [3c] installing ${label} into ${venv} (${PYBIN})..."
-  if "$PYBIN" -m venv "$venv" \
+  # Rerun guard (review 2026-09-27, MEDIUM 1): `venv` without --clear keeps an existing
+  # venv's bin/python links and only rewrites pyvenv.cfg, so re-creating a venv with a
+  # DIFFERENT CPython would leave a mixed tree (the 3.13 sglang-env of an earlier
+  # bootstrap, for instance). Refuse LOUDLY and name the operator action; never delete.
+  if [ -f "$venv/pyvenv.cfg" ] && [ -x "$venv/bin/python3" ]; then
+    local have want
+    have="$("$venv/bin/python3" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo unknown)"
+    want="$("$pybin" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo unknown)"
+    if [ "$have" != "$want" ]; then
+      warn "${label}: existing ${venv} runs CPython ${have} but ${pybin} is CPython ${want}; refusing to re-create it in place (a rerun would mix the two). Remove ${venv} by hand, then rerun this bootstrap"
+      return 1
+    fi
+  fi
+  echo "[cage] [3c] installing ${label} into ${venv} (${pybin})..."
+  if "$pybin" -m venv "$venv" \
      && "$venv/bin/pip" install --quiet --no-cache-dir --upgrade pip setuptools wheel \
      && "$venv/bin/pip" install --no-cache-dir "$@"; then
     return 0
@@ -197,9 +222,38 @@ install_engine_venv() {
   warn "${label} install FAILED (${venv}); its launcher refuses to start until this is fixed"
   return 1
 }
+# An ambient ENGINE_PYBIN must never reach the calls below (review 2026-09-27, LOW 3):
+# only the sglang-env call sets it, for that call alone.
+unset ENGINE_PYBIN
 if [ "${SKIP_ENGINE_INSTALL:-0}" != "1" ]; then
-  if install_engine_venv sglang-env "SGLang ${SGLANG_VERSION}" "sglang==${SGLANG_VERSION}"; then
-    echo "[cage]   sglang: $(sglang-env/bin/python3 -c 'import sglang; print(sglang.__version__)' 2>&1 | tail -1)"
+  # sglang-env interpreter (ADR-0120): python${SGLANG_PYTHON_VERSION} with a venv module,
+  # resolved like step 0c (default archives, then uv). A miss skips SGLang LOUDLY and
+  # leaves cage-env and lmdeploy-env on the canonical interpreter.
+  SGLANG_PYBIN="python${SGLANG_PYTHON_VERSION}"
+  if ! "$SGLANG_PYBIN" -m venv --help >/dev/null 2>&1; then
+    echo "[cage] [3c] ${SGLANG_PYBIN} (or its venv module) not available; attempting apt install (default archives only)..."
+    if command -v apt-get >/dev/null 2>&1; then
+      DEBIAN_FRONTEND=noninteractive apt-get install -y "${SGLANG_PYBIN}-venv" "${SGLANG_PYBIN}-dev" 2>/dev/null \
+        || echo "[cage] [3c] ${SGLANG_PYBIN} not in the image's default archives"
+    fi
+  fi
+  if ! "$SGLANG_PYBIN" -m venv --help >/dev/null 2>&1; then
+    # uv goes into the SYSTEM interpreter, never into the activated cage-env (the S0-16
+    # lockfile is cage-env's pip freeze; review 2026-09-27, LOW 2): drop the activation
+    # inside a subshell first.
+    command -v uv >/dev/null 2>&1 || ( deactivate >/dev/null 2>&1; python3 -m pip install --quiet uv ) 2>/dev/null || true
+    if command -v uv >/dev/null 2>&1; then
+      uv python install "${SGLANG_PYTHON_VERSION}" || warn "uv python install ${SGLANG_PYTHON_VERSION} failed"
+      _uv_sg="$(uv python find "${SGLANG_PYTHON_VERSION}" 2>/dev/null || true)"
+      if [ -n "${_uv_sg}" ] && [ -x "${_uv_sg}" ]; then SGLANG_PYBIN="${_uv_sg}"; fi
+    fi
+  fi
+  if "$SGLANG_PYBIN" -m venv --help >/dev/null 2>&1; then
+    if ENGINE_PYBIN="$SGLANG_PYBIN" install_engine_venv sglang-env "SGLang ${SGLANG_VERSION}" "sglang==${SGLANG_VERSION}"; then
+      echo "[cage]   sglang: $(sglang-env/bin/python3 -c 'import sglang, sys; print(sglang.__version__, "on CPython", sys.version.split()[0])' 2>&1 | tail -1)"
+    fi
+  else
+    warn "SGLang ${SGLANG_VERSION} SKIPPED: no CPython ${SGLANG_PYTHON_VERSION} with a venv module in this container (ADR-0120); its launcher refuses to start until sglang-env exists"
   fi
   if install_engine_venv lmdeploy-env "LMDeploy ${LMDEPLOY_VERSION} + torch ${LMDEPLOY_TORCH_VERSION}" \
        "torch==${LMDEPLOY_TORCH_VERSION}" "lmdeploy==${LMDEPLOY_VERSION}"; then

@@ -10,8 +10,10 @@ wheels, so its venv pins torch explicitly. TurboMind serves no FP8 weights.
 
 What is pinned:
 1. setup_runpod.sh declares the three overridable pins, equal to the section 7
-   table of docs/VLLM_COMPATIBILITY.md, and creates both venvs from the
-   canonical interpreter through each venv's own pip, deleting nothing.
+   table of docs/VLLM_COMPATIBILITY.md, and creates both venvs through each
+   venv's own pip, deleting nothing; lmdeploy-env comes from the canonical
+   interpreter, sglang-env from SGLANG_PYTHON_VERSION (ADR-0120, 2026-09-27:
+   outlines_core 0.1.26 has no cp313 wheel; see tests/test_w29_w30_live_fixes.py).
 2. .gitignore covers both venvs.
 3. Both launchers resolve CAGE_SGLANG_PYTHON / CAGE_LMDEPLOY_BIN (absolute
    path or a bare name through command -v), default to the venvs, fall back
@@ -68,7 +70,10 @@ def test_setup_declares_engine_pins_equal_to_section_7() -> None:
 def test_setup_creates_engine_venvs_from_the_canonical_interpreter_deleting_nothing() -> None:
     text = SETUP.read_text(encoding="utf-8")
     code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
-    assert '"$PYBIN" -m venv "$venv"' in code, "engine venvs must come from the canonical interpreter"
+    # ADR-0120 (2026-09-27): the venv interpreter is the canonical PYBIN unless the
+    # caller overrides it for ONE call (sglang-env); never a bare python3.
+    assert 'local pybin="${ENGINE_PYBIN:-$PYBIN}"' in code
+    assert '"$pybin" -m venv "$venv"' in code, "engine venvs come from PYBIN or the explicit per-call override"
     assert re.search(r"^\s*python3 -m venv", code, re.M) is None
     assert '"$venv/bin/pip" install --no-cache-dir "$@"' in code, (
         "install through the venv's own pip and without a pip cache; cage-env stays active"

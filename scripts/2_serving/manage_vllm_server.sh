@@ -244,9 +244,13 @@ start_server() {
 
     # Per-request logging is unbounded over a multi-day sweep (the dominant boot-disk-fill
     # vector: one multi-line log block per request x 500 queries x 3 trials x ~14 cells).
-    # Default OFF; set VLLM_DISABLE_LOG_REQUESTS=0 to keep per-request logs for debugging.
-    if [ "${VLLM_DISABLE_LOG_REQUESTS:-1}" != "0" ]; then
-        vllm_args+=( --disable-log-requests )
+    # Default OFF. vLLM 0.19.1 logs requests only on --enable-log-requests and REJECTS the
+    # old --disable-log-requests ("unrecognized arguments"; live L40S 2026-09-27, backlog
+    # W29; the v0.19.1 cli_args.py knows only enable_log_requests), so the default passes
+    # NO flag and VLLM_DISABLE_LOG_REQUESTS=0 (keep per-request logs for debugging) passes
+    # the enable form. Same contract in manage_vllm_pd.sh and manage_vllm_cluster.py.
+    if [ "${VLLM_DISABLE_LOG_REQUESTS:-1}" = "0" ]; then
+        vllm_args+=( --enable-log-requests )
     fi
 
     # Optional server-side KV-cache compression for the compressed_cag baseline:

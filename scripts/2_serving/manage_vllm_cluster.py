@@ -235,8 +235,11 @@ def build_serve_args(model: str, port: int, *, gpu_memory_utilization: str) -> L
     kv_dtype = (os.environ.get("VLLM_KV_CACHE_DTYPE") or "").strip()
     if kv_dtype:
         args += ["--kv-cache-dtype", kv_dtype]
-    if os.environ.get("VLLM_DISABLE_LOG_REQUESTS", "1") == "1":
-        args.append("--disable-log-requests")
+    # W29 (live L40S 2026-09-27): vLLM 0.19.1 rejects --disable-log-requests; per-request
+    # logging is off unless --enable-log-requests (mirrors manage_vllm_server.sh:
+    # VLLM_DISABLE_LOG_REQUESTS=0 keeps the logs, anything else passes no flag).
+    if os.environ.get("VLLM_DISABLE_LOG_REQUESTS", "1") == "0":
+        args.append("--enable-log-requests")
     return args
 
 

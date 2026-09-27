@@ -329,8 +329,11 @@ compose_role_args() {
     # so the connector JSON is never word-split).
     local role="$1" port="$2" kv_cfg="$3" budget="$4" cache_flag="$5"
     ROLE_ARGS=( --port "$port" "$cache_flag" --trust-remote-code )
-    if [ "${VLLM_DISABLE_LOG_REQUESTS:-1}" != "0" ]; then
-        ROLE_ARGS+=( --disable-log-requests )
+    # W29 (live L40S 2026-09-27): vLLM 0.19.1 has no --disable-log-requests; request
+    # logging is off unless --enable-log-requests (mirrors manage_vllm_server.sh:
+    # VLLM_DISABLE_LOG_REQUESTS=0 keeps the logs, anything else passes no flag).
+    if [ "${VLLM_DISABLE_LOG_REQUESTS:-1}" = "0" ]; then
+        ROLE_ARGS+=( --enable-log-requests )
     fi
     # Per-role connector config — the disaggregation wiring itself.
     ROLE_ARGS+=( --kv-transfer-config "$kv_cfg" )
