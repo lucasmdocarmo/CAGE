@@ -54,8 +54,10 @@ sys.path.insert(0, str(REPO_ROOT))
 # in the lean analysis venv; adapters / numpy import lazily inside functions).
 from src.orchestration.calibration import (
     FLOOR_N_REQUESTS,
+    PROBE_BISECT_STEPS,
     PROBE_WARMUP_S,
     PROBE_WINDOW_S,
+    START_QPS_RULE,
     CalibrationError,
     CellCalibration,
     FloorMeasurement,
@@ -63,6 +65,7 @@ from src.orchestration.calibration import (
     PROBE_ATTAINMENT_MIN,
     ProbeStep,
     decide_lambda_star,
+    floor_start_qps,
     geometric_rate_ladder,
     summarize_floor,
 )
@@ -161,7 +164,8 @@ async def measure_floor(adapter: Any, requests: Sequence[Any]) -> FloorMeasureme
 
 
 async def probe_rate(
-    adapter: Any, requests: Sequence[Any], rate_qps: float, seed: int
+    adapter: Any, requests: Sequence[Any], rate_qps: float, seed: int,
+    *, phase: str = "ladder",
 ) -> ProbeStep:
     """One probe window: open-loop Poisson dispatch, warmup-trimmed counts."""
     from src.orchestration.load_generator import (
@@ -201,19 +205,26 @@ async def probe_rate(
         n_scheduled=len(kept),
         n_completed=n_completed,
         throughput_rps=n_completed / (PROBE_WINDOW_S - PROBE_WARMUP_S),
+        phase=phase,
     )
 
 
 async def run_probe_ladder(
     adapter: Any, requests: Sequence[Any], start_qps: float
 ) -> LambdaStarEstimate:
-    """Probe stage: climb the ladder, stop once saturation is bracketed.
+    """Probe stage: climb until the first unsustainable rung, then bisect.
 
-    The early exit only saves probe time; the REGISTERED decision is
-    ``decide_lambda_star``'s alone, applied to the full step sequence.
+    ADR-0122: the climb runs the geometric ladder from ``start_qps`` until
+    the FIRST unsustainable rung (attainment < PROBE_ATTAINMENT_MIN, the only
+    test since ADR-0121) or the PROBE_MAX_STEPS ceiling. Once bracketed
+    (a sustainable rung immediately below the failing one), PROBE_BISECT_STEPS
+    midpoint windows narrow the bracket; each one moves the bracket's lower
+    edge up (sustainable) or its upper edge down (unsustainable). The
+    REGISTERED decision is ``decide_lambda_star``'s alone, applied to every
+    probed step sorted by rate (the rule wants a ladder, not a bag; pass and
+    fail are monotone in rate, so sorting changes nothing but the order).
     """
     steps: List[ProbeStep] = []
-    last_sustained_throughput: Optional[float] = None
     for k, rate in enumerate(geometric_rate_ladder(start_qps)):
         print(f"[calibrate] probe {k + 1}: {rate:.4g} qps for {PROBE_WINDOW_S:.0f}s ...")
         step = await probe_rate(adapter, requests, rate, seed=CAL_SEED + k)
@@ -222,14 +233,33 @@ async def run_probe_ladder(
             f"[calibrate]   attainment={step.attainment:.3f} "
             f"throughput={step.throughput_rps:.4g} rps"
         )
-        unsustainable = step.attainment < PROBE_ATTAINMENT_MIN or (
-            last_sustained_throughput is not None
-            and step.throughput_rps < last_sustained_throughput
-        )
-        if unsustainable:
+        # ADR-0121: attainment alone decides (the same test as
+        # decide_lambda_star); a throughput fall between rungs is the
+        # Poisson arrival draw, never a stop signal.
+        if step.attainment < PROBE_ATTAINMENT_MIN:
             break  # saturation bracketed; no need to probe higher rates
-        last_sustained_throughput = step.throughput_rps
-    return decide_lambda_star(steps)
+    # ADR-0122: refine the bracket [last sustainable, first unsustainable].
+    if len(steps) >= 2 and steps[-1].attainment < PROBE_ATTAINMENT_MIN:
+        lo, hi = steps[-2].rate_qps, steps[-1].rate_qps
+        for j in range(PROBE_BISECT_STEPS):
+            mid = (lo + hi) / 2.0
+            print(
+                f"[calibrate] bisect {j + 1}/{PROBE_BISECT_STEPS}: {mid:.4g} qps "
+                f"(bracket {lo:.4g} to {hi:.4g}) for {PROBE_WINDOW_S:.0f}s ..."
+            )
+            step = await probe_rate(
+                adapter, requests, mid, seed=CAL_SEED + 1000 + j, phase="bisect"
+            )
+            steps.append(step)
+            print(
+                f"[calibrate]   attainment={step.attainment:.3f} "
+                f"throughput={step.throughput_rps:.4g} rps"
+            )
+            if step.attainment >= PROBE_ATTAINMENT_MIN:
+                lo = mid
+            else:
+                hi = mid
+    return decide_lambda_star(sorted(steps, key=lambda s: s.rate_qps))
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -249,8 +279,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--start-qps",
         type=float,
-        required=True,
-        help="lowest probe rate; must be comfortably below expected lambda*",
+        default=None,
+        help="first probe rate (operator prior, recorded as such). Unset = "
+             "ADR-0122 default: the floor's single-stream service rate, "
+             "1 / (ttft + (max_tokens - 1) x tpot), derived after the floor stage",
     )
     parser.add_argument(
         "--budget-fraction",
@@ -277,7 +309,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"({floor.statistic} of {floor.n_requests})"
     )
 
-    estimate = asyncio.run(run_probe_ladder(adapter, requests, args.start_qps))
+    # ADR-0122: the first rung comes from the floor unless the operator gave one.
+    if args.start_qps is None:
+        start_qps = floor_start_qps(floor, max_tokens=CAL_MAX_TOKENS)
+        start_source = START_QPS_RULE
+    else:
+        start_qps = float(args.start_qps)
+        start_source = "operator"
+    print(f"[calibrate] start rung: {start_qps:.4g} qps (source: {start_source})")
+
+    estimate = asyncio.run(run_probe_ladder(adapter, requests, start_qps))
     print(
         f"[calibrate] lambda*: label={estimate.label} "
         f"lambda_star_qps={estimate.lambda_star_qps}"
@@ -289,6 +330,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         budget_fraction=args.budget_fraction,
         floor=floor,
         lambda_star=estimate,
+        start_qps=start_qps,
+        start_qps_source=start_source,
     )
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)

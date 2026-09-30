@@ -156,7 +156,7 @@ def _calibration_doc(
 ) -> Dict[str, Any]:
     ttft_s, tpot_s = _CAL_FLOORS.get(engine, (0.1, 0.01))
     return {
-        "procedure_version": "cal-v1 (2026-08-12)",
+        "procedure_version": "cal-v2 (2026-09-30)",
         "model": model,
         "engine": engine,
         "budget_fraction": budget_fraction,
@@ -3769,7 +3769,7 @@ class TestSloFloorsProducerW4:
         assert cal.budget_fraction == 1.5
         assert (cal.ttft_s, cal.tpot_s) == _CAL_FLOORS["vllm"]
         assert cal.n_requests == 30 and cal.statistic == "median"
-        assert cal.procedure_version == "cal-v1 (2026-08-12)"
+        assert cal.procedure_version == "cal-v2 (2026-09-30)"
         assert cal.lambda_star_label == "ESTIMATED"
         import hashlib as _hashlib
         assert cal.sha256 == _hashlib.sha256(path.read_bytes()).hexdigest()
@@ -3841,7 +3841,7 @@ class TestSloFloorsProducerW4:
 
     def test_header_records_the_floors_and_their_artifacts(self, plan_a, calibrations_a):
         cal = plan_a["calibration"]
-        assert cal["procedure_version"] == "cal-v1 (2026-08-12)"
+        assert cal["procedure_version"] == "cal-v2 (2026-09-30)"
         assert cal["budget_fraction"] == 1.5
         assert cal["registered_budget_fraction"] == 1.5
         assert cal["env"] == "CAGE_SLO_FLOORS_JSON"

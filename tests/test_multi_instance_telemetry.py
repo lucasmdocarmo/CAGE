@@ -361,6 +361,29 @@ def test_merged_two_sampler_series_sorted_and_role_tagged(
         assert rec["kv_cache_usage"] == rec["kv_usage"]
 
 
+def test_sampler_clock_survives_a_snapshot_ts_key(tmp_path: Path, monkeypatch):
+    """S0F-15 (live 2026-09-30): cage-stats snapshots carry their OWN ``ts`` key
+    (1.0 on every snapshot), and the record builder let it overwrite the
+    sampler's wall clock, so every window read UNKNOWN_TELEMETRY (0 in-window
+    samples against epoch-bounded windows). The sampler's ``time.time()`` at
+    capture is the ONLY clock the regime bridge may see: it must win over any
+    same-named snapshot field, exactly as ``instance`` does.
+    """
+    sampler = vt.VllmTelemetrySampler("http://p:8000", role="single")
+    _drive_ticks(
+        monkeypatch, sampler,
+        [{"ts": 1.0, "kv_usage": 0.1}, {"ts": 1.0, "kv_usage": 0.2}],
+        [1790787535.0, 1790787536.0],
+    )
+    out = tmp_path / "telemetry_series.jsonl"
+    assert sampler.save_series(str(out)) == str(out)
+    records = [json.loads(line) for line in out.read_text().splitlines()]
+    assert [r["ts"] for r in records] == [1790787535.0, 1790787536.0]
+    assert [r["ts_s"] for r in records] == [1790787535.0, 1790787536.0]
+    # Every other snapshot field still passes through untouched.
+    assert [r["kv_usage"] for r in records] == [0.1, 0.2]
+
+
 def test_merged_series_refuses_duplicate_roles(tmp_path: Path):
     a = _sampler_with([{"kv_usage": 0.1}], [1.0], role="prefill")
     b = _sampler_with([{"kv_usage": 0.2}], [2.0], role="prefill")

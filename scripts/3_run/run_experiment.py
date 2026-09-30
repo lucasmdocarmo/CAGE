@@ -883,6 +883,7 @@ def stage_tagged_retrieve(
     reranker: Any = None,
     pool_k: int = 100,
     served_k: int = 5,
+    rerank_k: Optional[int] = None,
 ) -> Tuple[List[IRHit], Any]:
     """One stage-tagged retrieval pass for the non-dense ``--retriever`` paths.
 
@@ -892,6 +893,8 @@ def stage_tagged_retrieve(
     (pool / reranked / served -- charter sec. 8.2 Layer 0) is threaded into the
     qa-evidence records. Fail-closed on a missing index: a silently absent
     BM25/dense leg would serve the wrong retriever under the cell's name.
+    ``rerank_k`` (S0F-16, ADR-0123) is the head of the pool the cross-encoder
+    scores; None reranks the whole pool (the pre-S0 behavior).
     """
     if retriever == "bm25":
         if bm25_index is None:
@@ -903,6 +906,7 @@ def stage_tagged_retrieve(
             served_k=served_k,
             reranker=reranker,
             retriever_label="bm25",
+            rerank_k=rerank_k,
         )
         return list(stage.served), stage
     if retriever == "hybrid-rrf":
@@ -924,12 +928,42 @@ def stage_tagged_retrieve(
             reranker=reranker,
             resolve_index=bm25_index,
             retriever_label="hybrid-rrf",
+            rerank_k=rerank_k,
         )
         return list(stage.served), stage
     raise ValueError(
         f"stage_tagged_retrieve does not handle retriever '{retriever}' "
         f"(the dense path stays on the pre-existing pipeline)"
     )
+
+
+def validate_retriever_for_baseline(retriever: str, baseline: str) -> None:
+    """Refuse a retriever/baseline pair that must never burn a GPU run.
+
+    Two rules, both fail-closed (ValueError): an unknown retriever token, and
+    a non-dense retriever on the retrieval-cache baselines (redis/hybrid),
+    whose Redis payloads are keyed by the dense embedding model, so mixing
+    retrievers would silently serve cross-retriever cache hits.
+
+    S0F-17: on S0 this check lived only inside ``run_experiment``, which
+    ``_run_trials`` reaches AFTER the per-window resume SKIP and AFTER the
+    campaign-mode strict cache flush (``_reset_prefix_cache``, an engine
+    POST), so a cell that should be refused needed a live engine to be
+    refused at all (S0: ConnectionRefusedError with the engine down), and a
+    completed root skipped the refusal entirely. ``main()`` now calls this
+    right after ``parse_args``; ``run_experiment`` keeps its call for direct
+    (non-CLI) callers. One function, so the two sites cannot drift.
+    """
+    if retriever not in RETRIEVER_CHOICES:
+        raise ValueError(
+            f"Unknown retriever '{retriever}'. Supported: {list(RETRIEVER_CHOICES)}"
+        )
+    if retriever != "dense" and baseline in {"redis", "hybrid"}:
+        raise ValueError(
+            f"--retriever {retriever} is not wired for the retrieval-cache "
+            f"baselines (redis/hybrid): their cache keys pin the dense "
+            f"embedding-model pipeline. Use the dense retriever for these arms."
+        )
 
 
 class RerankPoolError(ValueError):
@@ -990,6 +1024,18 @@ def resolve_rerank_pool(
             f"construction (ADR-0104 pins pool 10, served 3)."
         )
     return pool
+
+
+def resolve_stage_rerank_k(rerank_pool: Optional[int], *, top_k: int) -> int:
+    """The head of the stage-tagged pool the cross-encoder scores (S0F-16, ADR-0123).
+
+    The resolved ADR-0104 rerank pool when the cell passes ``--rerank-pool``
+    (``resolve_rerank_pool`` output, already >= top_k), else exactly the served
+    ``top_k``: the dense path's legacy rule (rerank the hits it serves). Never
+    the whole stage-tagged pool of 100, which is what stalled the S0 bm25 and
+    hybrid-rrf cells on the CPU cross-encoder.
+    """
+    return int(rerank_pool) if rerank_pool is not None else int(top_k)
 
 
 def dense_retrieve(
@@ -1865,17 +1911,9 @@ def run_experiment(
     # fail-closed: an unknown retriever token, or a non-dense retriever on the
     # retrieval-cache baselines (whose Redis payloads are keyed by the dense
     # embedding model -- mixing retrievers would silently serve cross-retriever
-    # cache hits), must never burn a GPU run.
-    if retriever not in RETRIEVER_CHOICES:
-        raise ValueError(
-            f"Unknown retriever '{retriever}'. Supported: {list(RETRIEVER_CHOICES)}"
-        )
-    if retriever != "dense" and baseline in {"redis", "hybrid"}:
-        raise ValueError(
-            f"--retriever {retriever} is not wired for the retrieval-cache "
-            f"baselines (redis/hybrid): their cache keys pin the dense "
-            f"embedding-model pipeline. Use the dense retriever for these arms."
-        )
+    # cache hits), must never burn a GPU run. main() runs the same rule before
+    # campaign activation (S0F-17); this call covers direct callers.
+    validate_retriever_for_baseline(retriever, baseline)
     # ADR-0104 rerank pool, EARLY (same fail-closed slot): a pool without a
     # reranker model is refused before any dataset or engine work. The
     # definitive check (against whether this ARM builds a reranker at all)
@@ -2552,14 +2590,27 @@ def run_experiment(
         )
 
     # Stage-tagged candidate-pool size for the non-dense retrievers (charter
-    # sec. 8.2: pool recall@100 default), never below the served top_k.
+    # sec. 8.2: pool recall@100 default), never below the served top_k nor
+    # below the reranked head (S0F-16, ADR-0123).
     _retriever_pool_k = max(
         int(os.getenv("CAGE_RETRIEVER_POOL_K", "100") or "100"),
         int(baseline_config.top_k_retrieval or 1),
+        int(_rerank_pool or 0),
+    )
+    # S0F-16 (ADR-0123): on S0 the bm25 and hybrid-rrf cells reranked the
+    # WHOLE 100-hit pool per query on the CPU cross-encoder (26 min per cell,
+    # both killed). The cross-encoder now scores only a head of the pool: the
+    # ADR-0104 rerank pool when the cell passes --rerank-pool (run_campaign
+    # pins 10 on its ranked dense cells; bm25 and hybrid-rrf cells have no
+    # driver argv yet), else exactly the served top_k, which is the dense
+    # path's legacy rule. The pool stage stays pool_k wide for pool recall@100.
+    _retriever_rerank_k = resolve_stage_rerank_k(
+        _rerank_pool, top_k=int(baseline_config.top_k_retrieval)
     )
     if retriever != "dense":
         print(
             f"RETRIEVER: {retriever} (stage-tagged pool_k={_retriever_pool_k}, "
+            f"rerank_k={_retriever_rerank_k}, "
             f"served_k={baseline_config.top_k_retrieval}; dense path untouched "
             f"for --retriever dense)"
         )
@@ -2723,6 +2774,7 @@ def run_experiment(
                 reranker=reranker,
                 pool_k=_retriever_pool_k,
                 served_k=baseline_config.top_k_retrieval,
+                rerank_k=_retriever_rerank_k,
             )
             retrieval_reranked = _stage.reranked is not None
             retrieval_stages = _stage.stage_ranks()
@@ -4737,11 +4789,19 @@ def _reset_prefix_cache(
 
 
 def main():
+    # S0F-16 (ADR-0123): under nohup / a log redirect stdout is block-buffered,
+    # so on S0 the pod log showed nothing for 26 minutes while the bm25 and
+    # hybrid-rrf cells reranked a 100-hit pool per query on CPU. Line-buffer
+    # it off a TTY so the per-query progress lines land as they are printed.
+    # A TTY is already line-buffered; a non-TextIOWrapper stdout is left alone.
+    if not sys.stdout.isatty() and hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+
     parser = argparse.ArgumentParser(
         description="Run CAGE baseline experiments",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    
+
     # Required arguments
     parser.add_argument(
         "--baseline",
@@ -5186,6 +5246,17 @@ def main():
     )
 
     args = parser.parse_args()
+    # S0F-17: the retriever/baseline refusal runs HERE, before the campaign
+    # activation below, before the per-window resume SKIP inside _run_trials
+    # and before its strict cache flush (the first engine contact), so a
+    # refused cell is refused with no engine and on a completed root alike. Same
+    # rule and message as the in-run_experiment call; exit 2 (the argument
+    # and activation convention here) where the generic handler gave 1.
+    try:
+        validate_retriever_for_baseline(args.retriever, args.baseline)
+    except ValueError as e:
+        print(f"\nError: {e}", file=sys.stderr)
+        sys.exit(2)
     if args.skip_quality:
         os.environ["CAGE_SKIP_QUALITY"] = "1"
     if args.corpus_prefix_budget and args.corpus_prefix_budget > 0:

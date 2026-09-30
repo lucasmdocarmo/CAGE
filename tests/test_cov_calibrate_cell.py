@@ -271,7 +271,13 @@ class TestMainReportContract:
             "probe_warmup_s": PROBE_WARMUP_S,
             "probe_attainment_min": PROBE_ATTAINMENT_MIN,
             "probe_max_steps": PROBE_MAX_STEPS,
+            "probe_bisect_steps": 2,  # ADR-0122
+            "start_qps_rule": "floor-service-rate",  # ADR-0122
         }
+        # ADR-0122: --start-qps was given, so the artifact records it as an
+        # operator prior (the floor rule applies only when it is absent).
+        assert doc["start_qps"] == 0.5
+        assert doc["start_qps_source"] == "operator"
         assert doc["floor"] == {
             "ttft_s": 0.1, "tpot_s": 0.02,
             "n_requests": FLOOR_N_REQUESTS, "statistic": "median",
@@ -307,3 +313,118 @@ class TestMainReportContract:
         doc = json.loads(out_path.read_text(encoding="utf-8"))
         assert doc["lambda_star"]["label"] == label
         assert doc["lambda_star"]["lambda_star_qps"] is None
+
+
+# --------------------------------------------------------------------------- #
+# ADR-0122: the climb-and-bisect probe loop and the floor-derived start rung
+# --------------------------------------------------------------------------- #
+
+
+def _probe_stub(knee_qps: float, calls: list):
+    """A probe_rate stand-in: rungs below the knee complete fully, rungs at
+    or above it complete 80% (attainment 0.8 < 0.9). Records every probed
+    rate and phase in ``calls``."""
+    async def fake_probe_rate(adapter, requests, rate_qps, seed, *, phase="ladder"):
+        calls.append((round(rate_qps, 4), phase))
+        done = 100 if rate_qps < knee_qps else 80
+        return ProbeStep(
+            rate_qps=float(rate_qps), n_scheduled=100, n_completed=done,
+            throughput_rps=done / 65.0, phase=phase,
+        )
+    return fake_probe_rate
+
+
+def test_probe_ladder_climbs_to_the_first_failure_then_bisects(monkeypatch):
+    calls: list = []
+    monkeypatch.setattr(cc, "probe_rate", _probe_stub(40.0, calls))
+
+    est = asyncio.run(cc.run_probe_ladder(object(), [object()], 20.0))
+
+    # Climb: 20, 26, 33.8 pass; 43.94 fails and stops the climb (no 12-rung
+    # tail is probed). Bisect twice inside [33.8, 43.94]: 38.87 passes (lo
+    # moves up), 41.405 fails (hi moves down).
+    assert [c for c in calls if c[1] == "ladder"] == [
+        (20.0, "ladder"), (26.0, "ladder"), (33.8, "ladder"), (43.94, "ladder"),
+    ]
+    assert [c for c in calls if c[1] == "bisect"] == [(38.87, "bisect"), (41.405, "bisect")]
+    assert est.label == "ESTIMATED"
+    assert est.lambda_star_qps == pytest.approx(38.87)
+    assert est.first_unsustainable_qps == pytest.approx(41.405)
+    assert [s.phase for s in est.steps].count("bisect") == 2
+
+
+def test_probe_ladder_without_a_bracket_does_not_bisect(monkeypatch):
+    calls: list = []
+    # The knee is above every rung the ceiling allows: no bracket, no bisection.
+    monkeypatch.setattr(cc, "probe_rate", _probe_stub(1e9, calls))
+
+    est = asyncio.run(cc.run_probe_ladder(object(), [object()], 1.0))
+
+    assert len(calls) == PROBE_MAX_STEPS == 30
+    assert all(phase == "ladder" for _, phase in calls)
+    assert est.label == "LADDER_EXHAUSTED"
+
+
+def test_probe_ladder_first_rung_failure_does_not_bisect(monkeypatch):
+    calls: list = []
+    monkeypatch.setattr(cc, "probe_rate", _probe_stub(0.1, calls))
+
+    est = asyncio.run(cc.run_probe_ladder(object(), [object()], 1.0))
+
+    assert calls == [(1.0, "ladder")]
+    assert est.label == "NONE_SUSTAINABLE"
+
+
+def test_probe_ladder_climb_survives_a_throughput_dip_at_full_attainment(monkeypatch):
+    """ADR-0121 at the driver level (review F9): the S0 draw, rung 1 completes
+    42 of 42 and rung 2 completes 34 of 34 (throughput 0.646 then 0.523 rps,
+    attainment 1.0 both). The HEAD driver carried its own retrograde clause
+    and stopped the climb here; the climb must continue to the knee."""
+    calls: list = []
+    arrivals = {0.5: 42, 0.65: 34}
+
+    async def fake_probe_rate(adapter, requests, rate_qps, seed, *, phase="ladder"):
+        calls.append((round(rate_qps, 4), phase))
+        n = arrivals.get(round(rate_qps, 4), 100)
+        done = n if rate_qps < 1.0 else int(n * 0.8)
+        return ProbeStep(
+            rate_qps=float(rate_qps), n_scheduled=n, n_completed=done,
+            throughput_rps=done / 65.0, phase=phase,
+        )
+
+    monkeypatch.setattr(cc, "probe_rate", fake_probe_rate)
+    est = asyncio.run(cc.run_probe_ladder(object(), [object()], 0.5))
+
+    ladder = [r for r, p in calls if p == "ladder"]
+    assert ladder[:3] == [0.5, 0.65, 0.845]  # the dip at 0.65 did not stop the climb
+    assert est.label == "ESTIMATED"
+    assert est.lambda_star_qps > 0.65
+
+
+def test_main_derives_the_start_rung_from_the_floor_when_unset(tmp_path, monkeypatch):
+    manifest = _green_manifest(tmp_path)
+    out_path = tmp_path / "out" / "calibration.json"
+    monkeypatch.setattr(cc, "build_adapter", lambda *a, **k: StubAdapter())
+    seen = {}
+
+    async def fake_measure_floor(adapter, requests):
+        return _floor()  # ttft 0.1 s, tpot 0.02 s
+
+    async def fake_run_probe_ladder(adapter, requests, start_qps):
+        seen["start"] = start_qps
+        return _estimate("ESTIMATED")
+
+    monkeypatch.setattr(cc, "measure_floor", fake_measure_floor)
+    monkeypatch.setattr(cc, "run_probe_ladder", fake_run_probe_ladder)
+    rc = cc.main([
+        "--backend", "vllm", "--model", "Qwen/Qwen3-8B",
+        "--api-base", "http://localhost:8000",
+        "--manifest", str(manifest), "--output", str(out_path),
+        "--budget-fraction", "0.5",  # no --start-qps
+    ])
+    assert rc == 0
+    expected = 1.0 / (0.1 + (cc.CAL_MAX_TOKENS - 1) * 0.02)
+    assert seen["start"] == pytest.approx(expected)
+    doc = json.loads(out_path.read_text(encoding="utf-8"))
+    assert doc["start_qps"] == pytest.approx(expected)
+    assert doc["start_qps_source"] == "floor-service-rate"

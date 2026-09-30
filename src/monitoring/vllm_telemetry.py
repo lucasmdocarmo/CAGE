@@ -347,9 +347,16 @@ class VllmTelemetrySampler:
         for ts, snap in zip(self._sample_ts, self._samples):
             if not isinstance(snap, dict):
                 continue
-            rec = {"ts": round(ts, 3)}
-            rec.update(snap)
-            rec.setdefault("ts_s", rec["ts"])
+            rec = dict(snap)
+            # The sampler's own capture clock is the ONLY timestamp the
+            # regime bridge may see, and it is stamped AFTER the snapshot
+            # merge so a same-named snapshot field can never replace it
+            # (S0F-15, live 2026-09-30: cage-stats snapshots carry ``ts``
+            # = 1.0 on every tick; the pre-fix order let it overwrite the
+            # wall clock and every S0 window read UNKNOWN_TELEMETRY). Same
+            # policy as ``instance`` below: the sampler is the ground truth.
+            rec["ts"] = round(ts, 3)
+            rec["ts_s"] = rec["ts"]
             if "kv_usage" in rec:
                 rec.setdefault("kv_cache_usage", rec["kv_usage"])
             rec["instance"] = self.role

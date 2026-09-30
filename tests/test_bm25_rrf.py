@@ -380,3 +380,60 @@ def test_stage_tagged_validation_fail_closed():
     with pytest.raises(ValueError):
         # Reranker over a pre-built pool with no resolver: cannot resolve texts.
         stage_tagged_search("q", pool=[_hit("d1")], served_k=1, reranker=_ReversingReranker())
+
+
+# --------------------------------------------------------------------------- #
+# Rerank head (S0F-16, ADR-0123): the cross-encoder scores only the head
+# --------------------------------------------------------------------------- #
+
+
+def test_stage_tagged_rerank_k_scores_only_the_pool_head():
+    """S0F-16: with rerank_k set the reranker sees exactly rerank_k hits; the
+    pool stage keeps its full pool_k so pool recall@100 is untouched."""
+    docs = [_doc(f"passage number {i}") for i in range(6)]
+    index = _FakeIndex(docs)
+    reranker = _ReversingReranker()
+
+    result = stage_tagged_search(
+        "q", index=index, pool_k=6, served_k=2, reranker=reranker, rerank_k=3
+    )
+    assert len(result.pool) == 6
+    assert len(reranker.resolved_texts) == 3  # the head, not the whole pool
+    assert result.reranked is not None and len(result.reranked) == 3
+    # The head was docs[0:3]; the reversing reranker serves docs[2], docs[1].
+    assert [h.doc_id for h in result.reranked] == [d.doc_id for d in reversed(docs[:3])]
+    assert [h.doc_id for h in result.served] == [docs[2].doc_id, docs[1].doc_id]
+    assert len(result.stage_ranks()["reranked"]) == 3
+
+
+def test_stage_tagged_rerank_k_none_keeps_the_whole_pool_legacy():
+    docs = [_doc(f"passage number {i}") for i in range(6)]
+    index = _FakeIndex(docs)
+    reranker = _ReversingReranker()
+
+    result = stage_tagged_search(
+        "q", index=index, pool_k=6, served_k=2, reranker=reranker, rerank_k=None
+    )
+    assert len(reranker.resolved_texts) == 6
+    assert result.reranked is not None and len(result.reranked) == 6
+
+
+def test_stage_tagged_rerank_k_is_ignored_without_a_reranker():
+    docs = [_doc(f"passage number {i}") for i in range(4)]
+    result = stage_tagged_search("q", index=_FakeIndex(docs), pool_k=4, served_k=2, rerank_k=3)
+    assert result.reranked is None
+    assert len(result.pool) == 4
+    assert [h.doc_id for h in result.served] == [docs[0].doc_id, docs[1].doc_id]
+
+
+def test_stage_tagged_rerank_k_bounds_fail_closed():
+    index = _FakeIndex([_doc(f"passage number {i}") for i in range(5)])
+    reranker = _ReversingReranker()
+    with pytest.raises(ValueError, match="rerank_k"):
+        stage_tagged_search("q", index=index, pool_k=5, served_k=2, reranker=reranker, rerank_k=0)
+    with pytest.raises(ValueError, match="rerank_k"):
+        # Head smaller than the served count: served_k docs could not be ranked.
+        stage_tagged_search("q", index=index, pool_k=5, served_k=3, reranker=reranker, rerank_k=2)
+    with pytest.raises(ValueError, match="rerank_k"):
+        # Head larger than the pool: nothing to rerank beyond pool_k.
+        stage_tagged_search("q", index=index, pool_k=5, served_k=2, reranker=reranker, rerank_k=6)

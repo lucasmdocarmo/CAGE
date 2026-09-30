@@ -811,6 +811,7 @@ def stage_tagged_search(
     reranker: Optional[Any] = None,
     resolve_index: Optional[SupportsHitResolution] = None,
     retriever_label: str = "dense",
+    rerank_k: Optional[int] = None,
 ) -> StageTaggedRetrieval:
     """Run retrieval with charter sec. 8.2 stage tags: pool -> (reranked) -> served.
 
@@ -826,7 +827,13 @@ def stage_tagged_search(
       the 'rrf' retriever variant), truncated to pool_k.
 
     When ``reranker`` is given, texts are resolved via ``resolve_index``
-    (default: ``index``); fail-closed if neither can resolve.
+    (default: ``index``); fail-closed if neither can resolve. ``rerank_k``
+    (S0F-16, ADR-0123) bounds what the reranker scores: the HEAD
+    ``pool_hits[:rerank_k]`` instead of the whole pool. None keeps the
+    pre-S0 behavior (rerank all ``pool_k`` hits). The pool stage is never
+    shortened by it, so pool recall@100 reads the same either way. Must
+    satisfy ``served_k <= rerank_k <= pool_k`` when set (validated always);
+    applied only when a reranker runs (without one there is no stage to bound).
     """
     if (index is None) == (pool is None):
         raise ValueError("stage_tagged_search requires exactly one of index= or pool=")
@@ -838,6 +845,12 @@ def stage_tagged_search(
         raise ValueError(
             f"served_k ({served_k}) cannot exceed pool_k ({pool_k}): the served "
             f"context is a subset of the candidate pool by construction."
+        )
+    if rerank_k is not None and not (served_k <= rerank_k <= pool_k):
+        raise ValueError(
+            f"rerank_k ({rerank_k}) must satisfy served_k ({served_k}) <= rerank_k "
+            f"<= pool_k ({pool_k}): the reranked head must cover the served "
+            f"context and cannot exceed the candidate pool."
         )
 
     if index is not None:
@@ -853,7 +866,8 @@ def stage_tagged_search(
                 "stage_tagged_search with a reranker over a pre-built pool needs "
                 "resolve_index= (an index able to resolve hit texts)."
             )
-        reranked_hits = list(reranker.rerank(query, pool_hits, resolver))
+        head = pool_hits if rerank_k is None else pool_hits[:rerank_k]
+        reranked_hits = list(reranker.rerank(query, head, resolver))
 
     final = reranked_hits if reranked_hits is not None else pool_hits
     return StageTaggedRetrieval(

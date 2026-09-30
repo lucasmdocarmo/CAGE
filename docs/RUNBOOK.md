@@ -171,7 +171,7 @@ carries the `cache_budget.BudgetPlan` record its launcher env was derived from
 `cell.json["budget_plan"]` (Batch 2 W4, ADR-0117; `docs/RESULTS_LAYOUT.md` §3.1).
 Gate (j) stays the live verification of the realized bytes.
 
-### 3.2 SLO floor calibration: one cal-v1 artifact per engine, BEFORE `plan`
+### 3.2 SLO floor calibration: one cal-v2 artifact per engine, BEFORE `plan`
 
 The §6.1 primary SLO pair is relative to the measured single-stream floor of the
 same model x engine (TTFT <= 10x, TPOT <= 5x). The floor comes from the registered
@@ -184,10 +184,22 @@ live server at the r = 1.5 control rung, once per engine of the session:
 .venv/bin/python scripts/3_run/calibrate_cell.py \
     --backend vllm --model Qwen/Qwen3-14B --api-base http://localhost:8000 \
     --manifest data/manifests/qasper_2000x3_seed42.json \
-    --budget-fraction 1.5 --start-qps 0.5 \
+    --budget-fraction 1.5 \
     --output results/calibration/vllm.json
 # then the same for sglang on its own server (--api-base http://localhost:30000)
 ```
+
+The lambda* probe (cal-v2, 2026-09-30, ADR-0121 and ADR-0122) starts at the floor's
+single-stream service rate (1 / (TTFT floor + 255 x TPOT floor); `--start-qps` overrides
+it and the artifact records which one was used), climbs a 1.3x ladder of 75 s windows
+until the first rung whose attainment falls under 0.9, then probes two midpoints of
+the bracket so lambda* carries a 7.5% resolution. Attainment is the only
+sustainability test; per-rung throughput is recorded, never judged. The ladder stops
+at 30 rungs with `LADDER_EXHAUSTED` (about 2,000 times the start rate; never
+extrapolate). Budget about 20 windows (25 min) per engine from a floor-derived start;
+gate (n) accepts cal-v2 artifacts only. On S0 (cal-v1: fixed 12 rungs from a
+hand-picked start, plus a retrograde-throughput clause) vLLM needed three passes and
+SGLang two; see `MyDocs/RunPod/S0_RUN_2026-09-30.md` and backlog S0F-11/12.
 
 `plan --calibration vllm=results/calibration/vllm.json --calibration sglang=...`
 registers them (Batch 2 W4, ADR-0117): the plan REFUSES without one per engine
@@ -417,7 +429,7 @@ manually, and only then uses `--force` — a user decision, reported as such.
 | `CAGE_SKIP_QUALITY=1` | run scripts, `run_campaign.py` (cell-step env pin), `run_experiment.py` (campaign-mode gate) | Decoupled-scoring regime (default in `run_full_sweep.sh`; pinned on every campaign cell step by the driver, W1 / ADR-0055): inline model-based quality is skipped and scored after the serving trees. A *declared* regime, not a mock. A campaign cell without it refuses before serving; the regime is recorded per window in `metrics.json["quality_scoring"]`. |
 | `VLLM_PORT` / `SGLANG_PORT` / `CAGE_PD_PROXY_PORT` / `CAGE_PD_PREFILL_PORT` / `CAGE_PD_DECODE_PORT` | launchers (`manage_vllm_server.sh`, `manage_sglang_server.sh`, `manage_vllm_pd.sh`), `run_campaign.py` (relaunch env) | Listening ports of the launchers (defaults 8000 / 30000 / 8000 / 8100 / 8200). The campaign driver exports them on every relaunch from its port table and pins the matching `--api-base` on every server-engine cell (W2); the operator's shell value never reaches a campaign relaunch (the step env wins). The preflight's own gate URL reads the shell `SGLANG_PORT`, so `run` refuses a shell value that differs from the table (an equal value is fine). |
 | `CAGE_SGLANG_API_BASE` / `CAGE_LMDEPLOY_API_BASE` | `run_experiment.py` (adapter + cache flush) | Per-engine endpoint override, resolved BEFORE `--api-base`. Pilot convenience only: `run_campaign.py run` refuses while either is set (W2), because it would beat the plan's pin. |
-| `CAGE_SLO_FLOORS_JSON` | `run_campaign.py` (cell-step env pin), `campaign_session.py` | Batch 2 W4 (ADR-0117): the §6.1 single-stream floors of every registered engine as compact JSON, pinned on EVERY cell step from the plan header `calibration` (one cal-v1 artifact per engine, §3.2); the session writes it into `manifest.json["slo_floors"]` at manifest creation and refuses a reopened manifest whose floors differ. `run` refuses while it is exported in the shell. Never set it by hand. |
+| `CAGE_SLO_FLOORS_JSON` | `run_campaign.py` (cell-step env pin), `campaign_session.py` | Batch 2 W4 (ADR-0117): the §6.1 single-stream floors of every registered engine as compact JSON, pinned on EVERY cell step from the plan header `calibration` (one cal-v2 artifact per engine, §3.2); the session writes it into `manifest.json["slo_floors"]` at manifest creation and refuses a reopened manifest whose floors differ. `run` refuses while it is exported in the shell. Never set it by hand. |
 | `CAGE_BUDGET_PLAN_JSON` | `run_campaign.py` (budgeted cell-step env pin), `campaign_session.py`, `campaign_layout.CellWriter` | Batch 2 W4 (ADR-0117): the `cache_budget.BudgetPlan` record of the relaunch the cell runs under (`asdict` plus `floor_table_sha256`), pinned on budgeted cell steps only; cross-checked against the cell tuple by the session and persisted into `cell.json["budget_plan"]` (the rho_own basis). `run` refuses while it is exported in the shell. Never set it by hand. |
 | `CAGE_QUERY_MANIFEST` | `run_experiment.py` (loader), `campaign_session.py` | Path to the dataset's pre-drawn query manifest (`build_query_manifest.py`); the runner's `--query-manifest` sets it (the campaign driver passes that flag on every cell of a registered dataset, §4.0). The loader refuses a manifest built for another dataset, and the corpus-budget guard (A4, ADR-0106) refuses a served budget that is neither its `block_budget` nor one of its `trunc_rungs`. `campaign_session.py` resolves `dataset_manifests_sha256` from it when `CAGE_DATASET_MANIFESTS_SHA256` is unset. |
 | `CAGE_MODEL_WEIGHTS_GIB` | `manage_lmdeploy_server.sh` | REQUIRED for an LMDeploy start: the served checkpoint's weight footprint in GiB, measured on the pod (`du -sh` of its safetensors), the section 6.5 input that maps the byte budget to TurboMind's post-weights `cache_max_entry_count`; the launcher refuses to start without it (or an explicit `LMDEPLOY_CACHE_MAX_ENTRY_COUNT`, a recorded deviation). Integration audit 2026-09-26, models-8. |

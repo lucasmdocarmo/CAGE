@@ -662,6 +662,68 @@ def test_stage_tagged_retrieve_fails_closed_on_missing_indexes():
         )
 
 
+class _CountingReranker:
+    """Records how many hits it was asked to score; keeps the order."""
+
+    def __init__(self) -> None:
+        self.seen: List[int] = []
+
+    def rerank(self, query: str, hits: Any, index: Any) -> List[IRHit]:
+        hits = list(hits)
+        self.seen.append(len(hits))
+        return hits
+
+
+@pytest.mark.parametrize("retriever", ["bm25", "hybrid-rrf"])
+def test_stage_tagged_retrieve_forwards_rerank_k_to_the_search(retriever):
+    """S0F-16 (ADR-0123): the cross-encoder scores rerank_k hits, not pool_k."""
+    docs = _ir_docs()
+    # Both legs are duck-typed fixed rankings so every doc lands in the pool.
+    bm25 = _FakeDenseIndex(docs, order=["d1", "d2", "d3"])
+    dense = _FakeDenseIndex(docs, order=["d3", "d2", "d1"])
+    reranker = _CountingReranker()
+    hits, stage = runner.stage_tagged_retrieve(
+        "q",
+        retriever=retriever,
+        bm25_index=bm25,
+        dense_index=dense,
+        reranker=reranker,
+        pool_k=3,
+        served_k=1,
+        rerank_k=2,
+    )
+    assert reranker.seen == [2]
+    assert len(stage.pool) == 3
+    assert stage.reranked is not None and len(stage.reranked) == 2
+    assert len(hits) == 1
+
+
+def test_resolve_stage_rerank_k_is_the_pool_or_the_served_top_k():
+    """S0F-16 (ADR-0123), review F1: the runner's own rule for the head the
+    cross-encoder scores on the stage-tagged paths. Never the 100-hit pool."""
+    assert runner.resolve_stage_rerank_k(None, top_k=3) == 3
+    assert runner.resolve_stage_rerank_k(10, top_k=3) == 10
+    assert runner.resolve_stage_rerank_k(None, top_k=1) == 1
+    assert runner.resolve_stage_rerank_k(10, top_k=3) < int(
+        os.getenv("CAGE_RETRIEVER_POOL_K", "100")
+    )
+
+
+def test_validate_retriever_for_baseline_is_the_single_refusal_rule():
+    """S0F-17: one function, called by run_experiment AND by main()
+    before campaign activation, so a refused cell never contacts the engine."""
+    with pytest.raises(ValueError, match="Unknown retriever"):
+        runner.validate_retriever_for_baseline("sparse", "rag")
+    for baseline in ("redis", "hybrid"):
+        with pytest.raises(ValueError, match="not wired for the retrieval-cache"):
+            runner.validate_retriever_for_baseline("bm25", baseline)
+        with pytest.raises(ValueError, match="not wired for the retrieval-cache"):
+            runner.validate_retriever_for_baseline("hybrid-rrf", baseline)
+        runner.validate_retriever_for_baseline("dense", baseline)  # allowed
+    runner.validate_retriever_for_baseline("bm25", "rag")  # allowed
+    runner.validate_retriever_for_baseline("hybrid-rrf", "no_cache")  # allowed
+
+
 def test_run_experiment_unknown_retriever_fails_closed_before_any_work():
     with pytest.raises(ValueError, match="Unknown retriever"):
         runner.run_experiment(
@@ -738,6 +800,47 @@ def test_cli_threads_dataset_retriever_and_ruler_args(monkeypatch):
     assert calls[0]["retriever"] == "bm25"
     assert os.environ["CAGE_RULER_CONTEXT_TOKENS"] == "512"
     assert os.environ["CAGE_RULER_TASK"] == "niah_multikey"
+
+
+@pytest.mark.parametrize("baseline", ["redis", "hybrid"])
+def test_cli_refuses_non_dense_retriever_before_campaign_activation(
+    monkeypatch, capsys, baseline
+):
+    """S0F-17: on S0 the refusal sat inside run_experiment, AFTER the resume
+    SKIP and AFTER the campaign-mode strict cache flush (an engine POST); a
+    refused cell therefore needed a live engine to be refused. main() now
+    refuses right after parse_args, before campaign activation (stubbed
+    here to prove it is never reached)."""
+
+    def _activation_reached(args: Any) -> None:
+        raise AssertionError("campaign activation ran before the retriever refusal")
+
+    def _experiment_reached(**kwargs: Any) -> None:
+        raise AssertionError("run_experiment ran before the retriever refusal")
+
+    monkeypatch.setattr(runner.CampaignCellSession, "from_cli", _activation_reached)
+    monkeypatch.setattr(runner, "run_experiment", _experiment_reached)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["run_experiment.py", "--baseline", baseline, "--model", "m/x",
+         "--retriever", "bm25", "--campaign-root", "results/x/y/z"],
+    )
+    with pytest.raises(SystemExit) as excinfo:
+        runner.main()
+    assert excinfo.value.code == 2
+    assert "not wired for the retrieval-cache" in capsys.readouterr().err
+
+
+def test_cli_line_buffers_stdout_when_it_is_not_a_tty(monkeypatch):
+    """S0F-16: under nohup the pod log showed nothing for 26 minutes because
+    stdout was block-buffered; main() switches to line buffering off a TTY."""
+    buf = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", line_buffering=False)
+    assert buf.isatty() is False
+    monkeypatch.setattr(sys, "stdout", buf)
+    monkeypatch.setattr(sys, "argv", ["run_experiment.py", "--help"])
+    with pytest.raises(SystemExit):
+        runner.main()
+    assert buf.line_buffering is True
 
 
 def test_get_loader_ruler_env_params_and_per_run_seed(monkeypatch):

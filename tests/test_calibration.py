@@ -20,16 +20,19 @@ from src.orchestration.calibration import (
     FLOOR_N_REQUESTS,
     FLOOR_STATISTIC,
     PROBE_ATTAINMENT_MIN,
+    PROBE_BISECT_STEPS,
     PROBE_LADDER_FACTOR,
     PROBE_MAX_STEPS,
     PROBE_WARMUP_S,
     PROBE_WINDOW_S,
+    START_QPS_RULE,
     CalibrationError,
     CellCalibration,
     FloorMeasurement,
     LambdaStarEstimate,
     ProbeStep,
     decide_lambda_star,
+    floor_start_qps,
     geometric_rate_ladder,
     summarize_floor,
 )
@@ -54,7 +57,9 @@ def test_registered_constants_are_the_registered_values():
     assert PROBE_WINDOW_S == 75.0
     assert PROBE_WARMUP_S == 10.0
     assert PROBE_ATTAINMENT_MIN == 0.9
-    assert PROBE_MAX_STEPS == 12
+    assert PROBE_MAX_STEPS == 30  # ADR-0122: a ceiling for the climb, not the ladder length
+    assert PROBE_BISECT_STEPS == 2
+    assert START_QPS_RULE == "floor-service-rate"
 
 
 # --------------------------------------------------------------------------- #
@@ -181,24 +186,45 @@ def test_all_sustainable_is_ladder_exhausted_never_extrapolated():
     assert est.first_unsustainable_qps is None
 
 
-def test_retrograde_throughput_with_good_attainment_is_unsustainable():
-    # The third step completes 100% of arrivals but total throughput FALLS —
-    # the §6.1 cliff signature; the registered rule marks it unsustainable.
+def test_throughput_dip_with_full_attainment_stays_sustainable():
+    # ADR-0121 (S0F-11, live 2026-09-30): the pre-cal-v2 rule marked a rung
+    # unsustainable when its throughput fell below the previous rung's. With
+    # attainment >= 0.9, throughput_rps = n_completed / measured seconds is the
+    # rung's REALIZED Poisson arrival rate times attainment, a random draw: the
+    # H100 run drew 42 arrivals at 0.5 qps and 34 at 0.65 qps (both 100%
+    # complete) and the rule declared 0.65 unsustainable on an idle GPU. The
+    # registered currency is attainment alone (charter (c): >= 90% complete);
+    # the cliff is retrograde GOODPUT in the analysis, never a ladder verdict.
+    steps = [
+        _step(0.5, n=42, completed=42, tput=42 / 65.0),
+        _step(0.65, n=34, completed=34, tput=34 / 65.0),  # fewer arrivals, all complete
+    ]
+
+    est = decide_lambda_star(steps)
+
+    assert est.label == "LADDER_EXHAUSTED"  # both rungs pass: no bracket, never a guess
+    assert est.lambda_star_qps is None
+    assert est.sustained_rate_qps == pytest.approx(0.65)
+
+
+def test_attainment_is_the_only_sustainability_test():
+    # A throughput fall with attainment still >= 0.9 does not bracket lambda*;
+    # a fall WITH an attainment shortfall does (the completed fraction decides).
     steps = [
         _step(1.0, completed=100, tput=1.0),
         _step(1.3, completed=100, tput=1.3),
-        _step(1.69, completed=100, tput=1.1),  # retrograde despite attainment 1.0
+        _step(1.69, completed=100, tput=1.1),  # dip, attainment 1.0: still sustainable
+        _step(2.197, completed=80, tput=1.0),  # attainment 0.8 < 0.9: unsustainable
     ]
 
     est = decide_lambda_star(steps)
 
     assert est.label == "ESTIMATED"
-    assert est.lambda_star_qps == pytest.approx(1.3)
-    assert est.first_unsustainable_qps == pytest.approx(1.69)
+    assert est.lambda_star_qps == pytest.approx(1.69)
+    assert est.first_unsustainable_qps == pytest.approx(2.197)
 
 
-def test_first_step_has_no_retrograde_test():
-    # A single sustainable step cannot be retrograde-flagged (nothing before it).
+def test_single_sustainable_step_is_ladder_exhausted():
     est = decide_lambda_star([_step(1.0, completed=100, tput=1.0)])
 
     assert est.label == "LADDER_EXHAUSTED"
@@ -333,7 +359,7 @@ def test_cell_calibration_manifest_shape_and_json_round_trip():
     assert restored["model"] == "qwen3-8b"
     assert restored["engine"] == "vllm"
     assert restored["budget_fraction"] == 0.5
-    assert restored["procedure_version"] == "cal-v1 (2026-08-12)"
+    assert restored["procedure_version"] == "cal-v2 (2026-09-30)"
     assert restored["confirmatory"] is False  # never enters confirmatory analysis
     assert restored["procedure"] == {
         "floor_n_requests": 30,
@@ -342,7 +368,9 @@ def test_cell_calibration_manifest_shape_and_json_round_trip():
         "probe_window_s": 75.0,
         "probe_warmup_s": 10.0,
         "probe_attainment_min": 0.9,
-        "probe_max_steps": 12,
+        "probe_max_steps": 30,  # ADR-0122 ceiling
+        "probe_bisect_steps": 2,  # ADR-0122
+        "start_qps_rule": "floor-service-rate",  # ADR-0122
     }
     assert restored["floor"] == {
         "ttft_s": 0.05,
@@ -382,4 +410,76 @@ def test_cell_calibration_validates_identity_fields():
         CellCalibration(
             model="qwen3-8b", engine="vllm", budget_fraction=0.5,
             floor={"ttft_s": 0.05}, lambda_star=good.lambda_star,  # type: ignore[arg-type]
+        )
+
+
+# --------------------------------------------------------------------------- #
+# ADR-0122 (S0F-12): climb-until-failure ceiling, bisection, floor-derived start
+# --------------------------------------------------------------------------- #
+
+
+def test_probe_step_phase_is_ladder_or_bisect():
+    assert _step(1.0).phase == "ladder"
+    bis = ProbeStep(rate_qps=1.5, n_scheduled=10, n_completed=10, throughput_rps=0.1, phase="bisect")
+    assert bis.to_manifest()["phase"] == "bisect"
+    with pytest.raises(CalibrationError):
+        ProbeStep(rate_qps=1.5, n_scheduled=10, n_completed=10, throughput_rps=0.1, phase="guess")
+
+
+def test_floor_start_qps_is_the_single_stream_service_rate():
+    # S0 floors (vLLM, H100, 2026-09-30): ttft 0.1011 s, tpot 6.58 ms; one
+    # 256-token stream takes 0.1011 + 255 x 0.00658 = 1.779 s -> 0.562 qps.
+    floor = FloorMeasurement(ttft_s=0.1011, tpot_s=0.00658, n_requests=30)
+    assert floor_start_qps(floor, max_tokens=256) == pytest.approx(1.0 / (0.1011 + 255 * 0.00658))
+    with pytest.raises(CalibrationError):
+        floor_start_qps(floor, max_tokens=1)  # TPOT needs a second token
+
+
+def test_decision_over_rate_sorted_bisection_steps_refines_the_bracket():
+    # Climb: 20, 26, 33.8 pass; 43.94 fails. Bisect: 38.87 passes, 41.41 fails.
+    # Sorted by rate, the highest pass-then-fail transition is 38.87 -> 41.41.
+    climb = [
+        _step(20.0, completed=100), _step(26.0, completed=100),
+        _step(33.8, completed=100), _step(43.94, completed=80),
+    ]
+    bisect = [
+        ProbeStep(rate_qps=38.87, n_scheduled=100, n_completed=100, throughput_rps=1.0, phase="bisect"),
+        ProbeStep(rate_qps=41.41, n_scheduled=100, n_completed=85, throughput_rps=1.0, phase="bisect"),
+    ]
+    est = decide_lambda_star(sorted(climb + bisect, key=lambda s: s.rate_qps))
+
+    assert est.label == "ESTIMATED"
+    assert est.lambda_star_qps == pytest.approx(38.87)
+    assert est.first_unsustainable_qps == pytest.approx(41.41)
+    assert est.to_manifest()["n_steps"] == 6
+    assert [s["phase"] for s in est.to_manifest()["steps"]].count("bisect") == 2
+
+
+def test_ladder_ceiling_keeps_the_refusal():
+    # 30 rungs all sustainable: the ceiling is reached without a bracket and
+    # the rule still refuses to guess.
+    steps = [_step(r, completed=100) for r in geometric_rate_ladder(0.5)]
+    assert len(steps) == PROBE_MAX_STEPS == 30
+    est = decide_lambda_star(steps)
+    assert est.label == "LADDER_EXHAUSTED"
+    assert est.lambda_star_qps is None
+
+
+def test_calibration_records_the_start_rung_provenance():
+    floor = FloorMeasurement(ttft_s=0.1, tpot_s=0.005, n_requests=30)
+    est = decide_lambda_star([_step(1.0, completed=100), _step(1.3, completed=10)])
+    cal = CellCalibration(
+        model="qwen3-8b", engine="vllm", budget_fraction=1.5, floor=floor,
+        lambda_star=est, start_qps=0.72, start_qps_source=START_QPS_RULE,
+    )
+    doc = cal.to_manifest()
+    assert doc["procedure_version"] == "cal-v2 (2026-09-30)"
+    assert doc["start_qps"] == pytest.approx(0.72)
+    assert doc["start_qps_source"] == "floor-service-rate"
+    assert doc["procedure"]["probe_bisect_steps"] == PROBE_BISECT_STEPS
+    assert doc["procedure"]["probe_max_steps"] == 30
+    with pytest.raises(CalibrationError):
+        CellCalibration(
+            model="qwen3-8b", engine="vllm", budget_fraction=1.5, floor=floor,
+            lambda_star=est, start_qps=0.72, start_qps_source="guess",
         )
