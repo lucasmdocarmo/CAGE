@@ -135,6 +135,10 @@ def test_lmdeploy_launcher_resolves_its_entry_point() -> None:
 def _clean_env(**extra: str) -> dict:
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("CAGE_", "VLLM_", "SGLANG_", "LMDEPLOY_"))}
+    # S0F-23: the suite's tmp log root (tests/conftest.py) rides through the
+    # CAGE_ strip so a launcher start never writes under <repo>/logs/.
+    if "CAGE_LOG_ROOT" in os.environ:
+        env["CAGE_LOG_ROOT"] = os.environ["CAGE_LOG_ROOT"]
     env.update(extra)
     return env
 

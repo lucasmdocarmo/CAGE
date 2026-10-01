@@ -643,6 +643,50 @@ def test_iso_cli_explicit_log_pins_override_discovery(iso: dict, tmp_path: Path,
     assert str(pinned) in out
 
 
+def test_iso_newest_log_skips_empty_files_with_a_note(iso: dict, tmp_path: Path,
+                                                      capsys) -> None:
+    # S0F-23: the suite leaves 0-byte launcher logs (a start whose fake engine
+    # never wrote); discovery must step over them, say so, and never pick one.
+    d = tmp_path / "vllm"
+    d.mkdir()
+    real = d / "vllm_Qwen_Qwen3-8B_20260930_133127.log"
+    real.write_text(VLLM_V1_LOG, encoding="utf-8")
+    os.utime(real, (1_700_000_000, 1_700_000_000))
+    for i in range(3):  # newer, empty: exactly what the launcher tests leave
+        p = d / f"vllm_fake_test-model_2026100{i}.log"
+        p.write_text("", encoding="utf-8")
+        os.utime(p, (1_700_000_100 + i, 1_700_000_100 + i))
+    assert iso["newest_log"](tmp_path, "vllm") == real
+    out = capsys.readouterr().out
+    assert "[note] vllm: skipped 3 empty log file(s)" in out
+    # only empty files left: no log at all (the gate's FAIL path), noted again
+    real.unlink()
+    assert iso["newest_log"](tmp_path, "vllm") is None
+    assert "skipped 3 empty log file(s)" in capsys.readouterr().out
+
+
+def test_iso_cli_log_root_falls_back_to_cage_log_root(iso: dict, tmp_path: Path,
+                                                      monkeypatch, capsys) -> None:
+    # S0F-23: the launchers write under CAGE_LOG_ROOT when it is set, so
+    # discovery must look there too; the gate-specific variable still wins.
+    sglang = ("[x] KV Cache is allocated. #tokens: 430913, "
+              "K size: 10.25 GB, V size: 10.25 GB\n")
+    _write_logs(tmp_path / "launcher-root", vllm=VLLM_V1_LOG, sglang=sglang)
+    monkeypatch.delenv("CAGE_ISO_BYTES_LOG_ROOT", raising=False)
+    monkeypatch.setenv("CAGE_LOG_ROOT", str(tmp_path / "launcher-root"))
+    monkeypatch.delenv("CAGE_ISO_BYTES_LOGS", raising=False)
+    monkeypatch.delenv("CAGE_ISO_POOL_SUM_BYTES", raising=False)
+    rc = iso["main"](["gate", "vllm,sglang"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert str(tmp_path / "launcher-root" / "vllm") in out
+    # precedence: the gate-specific root, when set, is the one searched
+    monkeypatch.setenv("CAGE_ISO_BYTES_LOG_ROOT", str(tmp_path / "empty"))
+    rc = iso["main"](["gate", "vllm"])
+    out = capsys.readouterr().out
+    assert rc == 1 and "no startup log under" in out and "empty" in out
+
+
 def test_iso_cli_bad_tolerance_fails(iso: dict, tmp_path: Path,
                                      monkeypatch, capsys) -> None:
     monkeypatch.setenv("CAGE_ISO_BYTES_LOG_ROOT", str(tmp_path))
@@ -985,7 +1029,11 @@ def test_calibration_gate_rejects_malformed_manifests(tmp_path: Path, mutate,
 
 
 class _MetricsStub(BaseHTTPRequestHandler):
-    kv_line = "vllm:gpu_cache_usage_perc{model_name=\"m\"} 0.42\n"
+    # The live vLLM 0.19.1 gauge name (S0 2026-09-30, S0F-8); the pre-rename
+    # spelling gpu_cache_usage_perc is what the override test serves.
+    KV_LINE_019 = "vllm:kv_cache_usage_perc{model_name=\"m\"} 0.42\n"
+    KV_LINE_OLD = "vllm:gpu_cache_usage_perc{model_name=\"m\"} 0.42\n"
+    kv_line = KV_LINE_019
     preempt = True
     hits = 0
 
@@ -1009,6 +1057,7 @@ class _MetricsStub(BaseHTTPRequestHandler):
 def metrics_server():
     _MetricsStub.hits = 0
     _MetricsStub.preempt = True
+    _MetricsStub.kv_line = _MetricsStub.KV_LINE_019
     server = HTTPServer(("127.0.0.1", 0), _MetricsStub)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1045,6 +1094,29 @@ def test_regime_gate_missing_metric_fails_loud(metrics_server: str) -> None:
                      env=_regime_env())
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert "exposes no 'vllm:num_preemptions_total'" in proc.stdout
+
+
+def test_regime_gate_default_kv_gauge_is_the_vllm_0_19_spelling() -> None:
+    # S0F-8: the live 0.19.1 /metrics names the gauge vllm:kv_cache_usage_perc
+    # (no gpu_cache_usage_perc), the same name cage-stats reads; S0 had to
+    # export CAGE_REGIME_KV_METRIC by hand. The default now matches the pin.
+    snippet = _snippet("CAGE-REGIME-BRIDGE-GATE")
+    assert re.search(
+        r'kv_metric = os\.environ\.get\("CAGE_REGIME_KV_METRIC", "vllm:kv_cache_usage_perc"\)',
+        snippet), "gate (o) must default to vllm:kv_cache_usage_perc (vLLM 0.19.x)"
+    assert 'os.environ.get("CAGE_REGIME_KV_METRIC", "vllm:gpu_cache_usage_perc")' not in snippet
+
+
+def test_regime_gate_old_kv_spelling_fails_loud_unless_overridden(metrics_server: str) -> None:
+    _MetricsStub.kv_line = _MetricsStub.KV_LINE_OLD
+    proc = _run_gate("CAGE-REGIME-BRIDGE-GATE", metrics_server, env=_regime_env())
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "exposes no 'vllm:kv_cache_usage_perc'" in proc.stdout
+    assert "CAGE_REGIME_KV_METRIC" in proc.stdout  # the message names the override
+    proc = _run_gate("CAGE-REGIME-BRIDGE-GATE", metrics_server,
+                     env=_regime_env(CAGE_REGIME_KV_METRIC="vllm:gpu_cache_usage_perc"))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "[PASS] regime bridge certified live telemetry" in proc.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -1676,6 +1748,32 @@ def gm() -> dict:
     exec(compile(_snippet("CAGE-ENGINE-MODEL-GATE-MATRIX"),
                  "CAGE-ENGINE-MODEL-GATE-MATRIX", "exec"), ns)
     return ns
+
+
+def test_gate_s_turbomind_check_skips_empty_logs_and_shares_gate_j_log_root(
+        gm: dict, tmp_path: Path) -> None:
+    # Review of Group D (2026-10-01, LOW 1): gate (s) says it reads "the same
+    # logs tree gate (j) discovers from", so it must follow the same root rule
+    # (CAGE_ISO_BYTES_LOG_ROOT, then CAGE_LOG_ROOT, then logs) and step over
+    # the 0-byte launcher logs the way gate (j) does (S0F-23): on the S0 volume
+    # a newer empty fake log would otherwise turn a real TurboMind PASS into
+    # PENDING "no backend marker".
+    d = tmp_path / "lmdeploy"
+    d.mkdir()
+    real = d / "lmdeploy_Qwen_Qwen3-8B_20260930_143423.log"
+    real.write_text("[TM][INFO] TurboMind engine start\n", encoding="utf-8")
+    os.utime(real, (1_700_000_000, 1_700_000_000))
+    empty = d / "lmdeploy_fake_test-model_20260930_193600.log"
+    empty.write_text("", encoding="utf-8")
+    os.utime(empty, (1_700_000_100, 1_700_000_100))
+    verdict, msg = gm["check_turbomind"](tmp_path)
+    assert verdict == gm["PASS"], msg
+    assert str(real) in msg and str(empty) not in msg
+    snippet = _snippet("CAGE-ENGINE-MODEL-GATE-MATRIX")
+    assert re.search(
+        r'log_root = Path\(os\.environ\.get\("CAGE_ISO_BYTES_LOG_ROOT"\)\s*\n?\s*'
+        r'or os\.environ\.get\("CAGE_LOG_ROOT"\) or "logs"\)', snippet), (
+        "gate (s) must resolve its log root exactly as gate (j) does")
 
 
 def test_gate_matrix_table_structure_matches_section7(gm: dict) -> None:

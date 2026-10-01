@@ -10,7 +10,9 @@
 # Usage: scripts/ops/package_repo.sh [out.tar.gz]     (default /tmp/cage_<sha8>.tar.gz)
 # Then:  scp the tarball; on the pod (network volume at /workspace, fresh pod so ~/CAGE
 #        is not yet a real directory): mkdir -p /workspace/CAGE && ln -sfn /workspace/CAGE ~/CAGE
-#        && tar xzf cage_*.tar.gz -C ~/CAGE
+#        && tar xzf cage_*.tar.gz --no-same-owner -C ~/CAGE
+#        (--no-same-owner: root extracting onto the network volume must not restore
+#        recorded owners, the volume refuses chown; S0F-7, 2026-09-30)
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -29,8 +31,11 @@ if [ "$DIRTY" -eq 1 ]; then
   echo "         uncommitted changes that will NOT be in the tarball. BUILD_INFO says dirty=1." >&2
 fi
 
-# git archive = exactly HEAD, reproducible, no venvs/results/junk. BUILD_INFO is appended
-# as a plain tar member so the name inside the archive is exactly BUILD_INFO.
+# git archive = exactly HEAD, reproducible, no venvs/results/junk. BUILD_INFO enters
+# through --add-file (git 2.30+), so git writes it like every tracked member: top-level
+# name BUILD_INFO, owner root/root. The earlier `tar -rf` append ran macOS bsdtar, which
+# stamped the workstation uid (501) and added the AppleDouble side file ._BUILD_INFO;
+# root extracting that onto the network volume failed on the chown (S0F-7, S0 2026-09-30).
 TMPD="$(mktemp -d)"
 trap 'rm -rf "$TMPD"' EXIT
 {
@@ -39,8 +44,7 @@ trap 'rm -rf "$TMPD"' EXIT
   echo "packaged_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$TMPD/BUILD_INFO"
 
-git archive --format=tar -o "$TMPD/repo.tar" HEAD
-tar -rf "$TMPD/repo.tar" -C "$TMPD" BUILD_INFO
+git archive --format=tar --add-file="$TMPD/BUILD_INFO" -o "$TMPD/repo.tar" HEAD
 gzip -f "$TMPD/repo.tar"
 mv "$TMPD/repo.tar.gz" "$OUT"
 

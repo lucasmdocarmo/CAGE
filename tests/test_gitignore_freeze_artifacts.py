@@ -20,13 +20,30 @@ caught by behavior, not by grep. Pure local checks: no GPU, no network.
 """
 from __future__ import annotations
 
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GITIGNORE = REPO_ROOT / ".gitignore"
+
+
+def _require_git_checkout() -> None:
+    """Skip the git-backed pins on a tarball deploy (S0F-20a, S0-11 2026-09-30).
+
+    The pod runs the packaged repo (scripts/ops/package_repo.sh): no .git, so
+    ``git check-ignore`` exits 128 and the ten parametrized pins below failed as
+    "errored" on a box where there is no ignore rule to check. Same rule and
+    wording as tests/test_scripts_doctrine.py::_git_ls_files; the two static
+    pins at the bottom keep running everywhere.
+    """
+    if not (REPO_ROOT / ".git").exists():
+        pytest.skip("not a git checkout (tarball deploy)")
+    if shutil.which("git") is None:
+        pytest.skip("git unavailable")
 
 #: The two freeze artifacts the confirmatory driver binds to (paths mirror
 #: PREREG_PATH / REGISTERED_MARGINS_PATH in scripts/4_analysis/run_campaign_analysis.py).
@@ -53,6 +70,7 @@ MUST_STAY_IGNORED = (
 
 def _is_ignored(rel_path: str) -> bool:
     """True iff git's ignore rules would ignore rel_path (works for absent files)."""
+    _require_git_checkout()
     proc = subprocess.run(
         ["git", "check-ignore", "-q", "--", rel_path],
         cwd=REPO_ROOT,
@@ -87,6 +105,14 @@ def test_other_mydocs_paths_stay_ignored(path: str) -> None:
         f"{path} is NOT gitignored -- the MyDocs privacy boundary (ADR-0079) "
         f"leaked. Only the two freeze artifacts may be negated."
     )
+
+
+def test_git_backed_pins_skip_on_a_tarball_deploy(tmp_path: Path, monkeypatch) -> None:
+    """S0F-20a: with no .git beside the tests (the packaged repo on a pod), the
+    check-ignore pins skip with the doctrine wording instead of erroring."""
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
+    with pytest.raises(pytest.skip.Exception, match="not a git checkout"):
+        _is_ignored("MyDocs/PUBLICATION.md")
 
 
 def test_gitignore_carries_the_negation_block() -> None:

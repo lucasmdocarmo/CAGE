@@ -105,6 +105,10 @@ def _clean_env(**extra: str) -> dict:
         k: v for k, v in os.environ.items()
         if not k.startswith(("CAGE_", "VLLM_", "SGLANG_", "PD_", "UCX_"))
     }
+    # S0F-23: the suite's tmp log root (tests/conftest.py) rides through the
+    # CAGE_ strip so a launcher start never writes under <repo>/logs/.
+    if "CAGE_LOG_ROOT" in os.environ:
+        env["CAGE_LOG_ROOT"] = os.environ["CAGE_LOG_ROOT"]
     env.update(extra)
     return env
 

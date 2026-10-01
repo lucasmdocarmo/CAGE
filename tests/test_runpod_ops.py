@@ -114,8 +114,8 @@ set -u
 d="{d}"
 printf '%s\\n' "$*" >> "$d/argv.log"
 {fail_clause}case "$* " in
-  "pod delete "*) [ -f "$d/hang_delete" ] && sleep 30; [ -f "$d/keep_listed" ] || printf '[]\\n' > "$d/pod_list.out"; exit 0 ;;
-  "pod list --all "*) [ -f "$d/hang_list" ] && sleep 30; cat "$d/pod_list.out" ;;
+  "pod delete "*) [ -f "$d/hang_delete" ] && sleep 30 >/dev/null 2>&1; [ -f "$d/keep_listed" ] || printf '[]\\n' > "$d/pod_list.out"; exit 0 ;;
+  "pod list --all "*) [ -f "$d/hang_list" ] && sleep 30 >/dev/null 2>&1; cat "$d/pod_list.out" ;;
   "pod get "*) printf 'id: %s\\nstatus: RUNNING\\n' "$3" ;;
   "network-volume list "*) cat "$d/nv_list.out" ;;
   "gpu list "*) cat "$d/gpu_list.out" ;;
@@ -885,6 +885,27 @@ def test_watchdog_run_exits_when_its_pidfile_is_removed(tmp_path: Path) -> None:
     _wait_dead(pid, timeout=8.0)
     assert not any(c.startswith("pod delete") for c in _argv_lines(log)), "exiting is not firing"
     assert not (tmp_path / "l.jsonl").exists()
+
+
+def test_hung_cli_fixtures_hold_no_pipe_and_the_exit_trap_keeps_stdout() -> None:
+    """S0F-20c (pod S0-11, 2026-09-30; host-runnable pin of the two container
+    cases below). hang_list took 62 s because the fake's `sleep 30` child
+    inherited the `$(...)` capture pipe of `pod list --all`: the killer stops the
+    fake's bash at CLI_TIMEOUT, the orphaned sleep keeps the pipe open, and the
+    capture waits for it, twice (2 x 30 s + 2 ticks; hang_delete passed because
+    the delete's stdout went to /dev/null). The TERM test saw no `exit:` line
+    because the EXIT trap fired inside `cli_timed ... >/dev/null 2>&1`, so the
+    trap's own output went to /dev/null (call-site redirects scope the trap too).
+    Fixes: the fake's hang sleeps write nowhere; the delete's redirect lives
+    INSIDE cli_timed (--quiet), never at the call site."""
+    assert 'hang_delete" ] && sleep 30 >/dev/null 2>&1;' in _FAKE
+    assert 'hang_list" ] && sleep 30 >/dev/null 2>&1;' in _FAKE
+    code = _code_lines(WATCHDOG.read_text(encoding="utf-8"))
+    assert 'if cli_timed --quiet runpodctl pod delete "$pod"; then' in code
+    assert re.search(r'cli_timed runpodctl[^\n]* >/dev/null', code) is None, (
+        "no cli_timed call may redirect STDOUT at the call site (the EXIT trap "
+        "inherits it); the listing's 2>/dev/null touches stderr only")
+    assert 'if [ "$quiet" -eq 1 ]; then "$@" >/dev/null 2>&1 & else "$@" & fi' in code
 
 
 @_LIFECYCLE

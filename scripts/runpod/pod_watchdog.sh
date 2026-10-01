@@ -100,12 +100,17 @@ epoch_of() {  # RFC3339 UTC -> epoch seconds.
   [ "$back" = "$s" ] || die "deadline $s is not a calendar-valid instant (it normalizes to ${back:-?})"
   printf '%s' "$e"
 }
-# cli_timed <cmd...>: one runpodctl call under a hard timeout. A hung CLI at the
-# deadline must count as a failed attempt, never stall the seatbelt. The bound
-# covers the direct child only (runpodctl is one process and spawns none [A]).
+# cli_timed [--quiet] <cmd...>: one runpodctl call under a hard timeout. A hung
+# CLI at the deadline must count as a failed attempt, never stall the seatbelt.
+# The bound covers the direct child only (runpodctl is one process and spawns
+# none [A]). --quiet discards the CHILD's output here, inside the function: a
+# redirect at the call site would also swallow the EXIT trap's own log line when
+# a TERM lands mid-call (pod S0-11, 2026-09-30, S0F-20c).
 cli_timed() {
-  local p k rc
-  "$@" & p=$!
+  local p k rc quiet=0
+  if [ "${1:-}" = --quiet ]; then quiet=1; shift; fi
+  if [ "$quiet" -eq 1 ]; then "$@" >/dev/null 2>&1 & else "$@" & fi
+  p=$!
   # The killer subshell must NOT inherit stdout/stderr: inside a $(...) capture
   # its `sleep` would hold the pipe open and block the caller for CLI_TIMEOUT.
   # Before it signals, it re-checks that $p is still alive AND still a runpodctl
@@ -241,7 +246,7 @@ cmd_run() {
   n=0
   while [ "$n" -lt "$RETRIES" ]; do
     n=$((n + 1))
-    if cli_timed runpodctl pod delete "$pod" >/dev/null 2>&1; then
+    if cli_timed --quiet runpodctl pod delete "$pod"; then
       wlog "attempt $n: pod delete accepted"
     else
       wlog "attempt $n: pod delete returned nonzero (already gone, or auth/network); checking the listing"

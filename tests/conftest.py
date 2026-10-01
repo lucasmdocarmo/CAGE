@@ -91,6 +91,22 @@ def _hermetic_freeze_env(tmp_path_factory: pytest.TempPathFactory) -> Iterator[P
         yield path
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _hermetic_log_root(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
+    """Point $CAGE_LOG_ROOT at a tmp dir for the WHOLE session (S0F-23).
+
+    Every engine launcher the suite starts with a fake engine writes its start
+    log under this root instead of <repo>/logs/<engine>/, where gate (j)'s
+    newest-file discovery would pick the 0-byte file up on a pod. The launcher
+    tests' ``_clean_env`` helpers strip ``CAGE_*`` and re-add this one variable
+    (tests/test_log_root_s0f23.py pins both halves).
+    """
+    root = tmp_path_factory.mktemp("logs")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("CAGE_LOG_ROOT", str(root))
+        yield root
+
+
 @pytest.fixture()
 def freeze_file(_hermetic_freeze_env: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """The hermetic freeze artifact's path (re-pinned per test, so a test that

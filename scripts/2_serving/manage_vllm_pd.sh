@@ -122,7 +122,8 @@ PD_PYTHON="${CAGE_PD_PYTHON:-python3}"
 # Must equal setup_runpod.sh NIXL_VERSION (the refusal messages name the fix).
 NIXL_PIN="0.9.0"
 
-LOG_DIR="$PROJECT_DIR/logs/vllm"
+# CAGE_LOG_ROOT redirects the root (S0F-23, test hygiene); unset on a pod.
+LOG_DIR="${CAGE_LOG_ROOT:-$PROJECT_DIR/logs}/vllm"
 PREFILL_PID_FILE="$LOG_DIR/vllm_pd_prefill.pid"
 DECODE_PID_FILE="$LOG_DIR/vllm_pd_decode.pid"
 PROXY_PID_FILE="$LOG_DIR/vllm_pd_proxy.pid"

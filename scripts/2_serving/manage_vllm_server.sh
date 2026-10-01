@@ -47,7 +47,10 @@
 set -euo pipefail
 
 # Anchor paths to the repo root so vLLM logs ALWAYS land in <repo>/logs/vllm/ where
-# collect_logs.sh looks, regardless of the caller's working directory.
+# collect_logs.sh looks, regardless of the caller's working directory. CAGE_LOG_ROOT
+# redirects the root (S0F-23: the test suite points it at a tmp dir so its fake-engine
+# starts leave no 0-byte logs for gate (j) to pick up); leave it unset on a pod, since
+# collect_logs.sh and the backup mirror read <repo>/logs.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_DIR"
@@ -79,7 +82,7 @@ case "${1:-}" in
 esac
 
 PORT="${VLLM_PORT:-8000}"
-LOG_DIR="$PROJECT_DIR/logs/vllm"
+LOG_DIR="${CAGE_LOG_ROOT:-$PROJECT_DIR/logs}/vllm"
 # Daemon discipline: the launched server's PID is recorded here at start and cleared
 # at stop, so status/stop have an authoritative handle instead of pgrep-guessing.
 PID_FILE="$LOG_DIR/vllm_server.pid"

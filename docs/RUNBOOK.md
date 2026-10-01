@@ -85,7 +85,7 @@ scp ${CAGE_SSH_OPTS:-} /tmp/cage_<sha8>.tar.gz <user@pod>:~   # RunPod SSH, ofte
 # pod
 [ ! -d ~/CAGE ] || [ -L ~/CAGE ] || { echo '~/CAGE is a real directory: remove it before linking'; false; }
 mkdir -p /workspace/CAGE && ln -sfn /workspace/CAGE ~/CAGE   # the network volume; ~/CAGE stays the path every script cites
-tar xzf cage_*.tar.gz -C ~/CAGE
+tar xzf cage_*.tar.gz --no-same-owner -C ~/CAGE   # root on the volume: never restore owners (S0F-7)
 head -3 ~/CAGE/BUILD_INFO                      # verify sha/dirty/packaged_at
 cd /workspace/CAGE && bash scripts/runpod/setup_runpod.sh   # every pod shell: the PHYSICAL path
 source cage-env/bin/activate
@@ -183,9 +183,9 @@ pool as `[turbomind.cc] Object cache budget: <X> MB from free <Y> MB and ratio <
 (MB = 2^20; the line sits behind tqdm carriage returns and the gate splits on `\r`).
 The gate parses only the tail after a log's LAST engine-start marker and prints a
 `[note]` when one file holds several starts (the cluster manager appends restarts to
-one replica file). Pin the logs with `CAGE_ISO_BYTES_LOGS` on a pod that has run the
-test suite: the suite leaves 0-byte fake `lmdeploy_*.log` files that newest-file
-discovery would pick (S0F-23).
+one replica file). Unpinned discovery skips 0-byte logs with a `[note]`, and the test
+suite writes its fake-engine start logs under a tmp `CAGE_LOG_ROOT` instead of the repo
+(S0F-23, 2026-10-01); pinning with `CAGE_ISO_BYTES_LOGS` stays the exact path.
 
 Cold windows (ADR-0131, S0F-10): LMDeploy has no cache-reset route, so an LMDeploy
 prefix-ON window gets its cold start from an engine restart before the window; the
@@ -493,7 +493,9 @@ manually, and only then uses `--force` — a user decision, reported as such.
 | `CAGE_RUN_ROOT` / `CAGE_RUN_ID` / `CAGE_PHASE` | run scripts, observability | Minted by `cloud_run.sh`/`run_full_sweep.sh` (`mint_run_id`: `<YYYY-MM-DD_HHMMSS>_<model-slug>_<Q>x<T>_<4hex>_<dataset>`) and exported so every child writes the SAME `results/<phase>/<run-id>/` tree. Export `CAGE_RUN_ID` to resume into an existing tree. |
 | `CAGE_PREFLIGHT_BACKENDS` | `preflight_check.sh` gates (j)/(k) | Comma-separated adapter list to check (default `vllm,sglang,lmdeploy`). Scope down for single-engine pods. |
 | `CAGE_ISO_BYTES_TOL` | gate (j) | Relative tolerance for §6.5 realized-KV iso-bytes parity (default `0.05`; must be a float in (0,1) or the gate FAILS). |
-| `CAGE_ISO_BYTES_LOGS` | gate (j) | Pin exact engine startup logs: `vllm=/path/a.log,sglang=/path/b.log,lmdeploy=/path/c.log` (e.g. one budget point of a pressure sweep). Pin them after the test suite has run on the pod: the suite leaves 0-byte fake `lmdeploy_*.log` files that the unpinned newest-file discovery picks (S0F-23). |
+| `CAGE_ISO_BYTES_LOGS` | gate (j) | Pin exact engine startup logs: `vllm=/path/a.log,sglang=/path/b.log,lmdeploy=/path/c.log` (e.g. one budget point of a pressure sweep). Unpinned discovery takes the newest NON-EMPTY log per engine and prints a `[note]` for every 0-byte file it stepped over (S0F-23). |
+| `CAGE_LOG_ROOT` | the four `scripts/2_serving/manage_*.sh` launchers; gate (j) discovery | Redirects the launchers' log root (default `<repo>/logs`; the engine subdirectory stays). A test and dev knob (S0F-23): `tests/conftest.py` points it at a tmp dir so the suite's fake-engine starts leave no 0-byte logs in the repo. Leave it UNSET on a pod: `collect_logs.sh` and the backup mirror read `<repo>/logs`. Gate (j) looks there when `CAGE_ISO_BYTES_LOG_ROOT` is unset. |
+| `CAGE_REGIME_KV_METRIC` | gate (o) | Name of the engine's KV occupancy gauge on `/metrics`. Default `vllm:kv_cache_usage_perc`, the vLLM 0.19.1 spelling that cage-stats reads (S0F-8; S0 had to export it by hand); set `vllm:gpu_cache_usage_perc` for a pre-rename engine. |
 | `CAGE_QUALITY_STRICT` | `src/evaluation/quality.py`, gate (e) | Unset/`1` = strict fail-closed quality layer (default). An explicit falsy (`0`/`false`/`no`) downgrades instrument failures to `score=None` for the whole run — preflight FAILS on it; forbidden for confirmatory runs. |
 | `CAGE_CLAIM_CHECKER` | `src/evaluation/quality.py` | Claim-check instrument selection. Default `nli` (owner decision #120/F8, 2026-08-19; in-process-safe). `alignscore` is Instrument B and is requested explicitly by `scripts/4_analysis/score_instrument_b.py` — never as the run default. Preflight prints the state either way. |
 | `CAGE_SKIP_QUALITY=1` | run scripts, `run_campaign.py` (cell-step env pin), `run_experiment.py` (campaign-mode gate) | Decoupled-scoring regime (default in `run_full_sweep.sh`; pinned on every campaign cell step by the driver, W1 / ADR-0055): inline model-based quality is skipped and scored after the serving trees. A *declared* regime, not a mock. A campaign cell without it refuses before serving; the regime is recorded per window in `metrics.json["quality_scoring"]`. |

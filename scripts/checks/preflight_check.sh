@@ -689,6 +689,14 @@ def compare_pair(ra, rb, tol):
 
 def newest_log(root, engine):
     logs = sorted((root / engine).glob("*.log"), key=lambda p: p.stat().st_mtime)
+    # S0F-23: a start whose engine never wrote leaves a 0-byte log (the test
+    # suite's fake-engine starts, a launch killed before the first line); an
+    # empty file can never carry a KV-pool line, so it is never "the newest log".
+    empty = [p for p in logs if p.stat().st_size == 0]
+    if empty:
+        print(f"  [note] {engine}: skipped {len(empty)} empty log file(s) under "
+              f"{root / engine}/ (a start that never wrote; S0F-23)")
+    logs = [p for p in logs if p.stat().st_size > 0]
     return logs[-1] if logs else None
 
 
@@ -769,7 +777,10 @@ def main(argv):
                   "or pin the role logs")
             return 1
 
-    log_root = Path(os.environ.get("CAGE_ISO_BYTES_LOG_ROOT", "logs"))
+    # The launchers write under CAGE_LOG_ROOT when it is set (S0F-23), so
+    # discovery follows it; the gate-specific root still wins when both are set.
+    log_root = Path(os.environ.get("CAGE_ISO_BYTES_LOG_ROOT")
+                    or os.environ.get("CAGE_LOG_ROOT") or "logs")
     readings, ok = [], True
     for engine in engines:
         engine_pins = pins.get(engine, {})
@@ -1155,7 +1166,10 @@ import urllib.request
 api = (sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000").rstrip("/")
 n = int(os.environ.get("CAGE_REGIME_GATE_SAMPLES", "5"))
 interval = float(os.environ.get("CAGE_REGIME_GATE_INTERVAL", "1.0"))
-kv_metric = os.environ.get("CAGE_REGIME_KV_METRIC", "vllm:gpu_cache_usage_perc")
+# vLLM 0.19.1 names the occupancy gauge vllm:kv_cache_usage_perc (live S0
+# 2026-09-30, S0F-8; cage-stats reads the same name); gpu_cache_usage_perc is
+# the pre-rename spelling, selectable through the override for an older engine.
+kv_metric = os.environ.get("CAGE_REGIME_KV_METRIC", "vllm:kv_cache_usage_perc")
 pre_metric = os.environ.get("CAGE_REGIME_PREEMPT_METRIC", "vllm:num_preemptions_total")
 if n < 2 or interval <= 0:
     print(f"  [FAIL] CAGE_REGIME_GATE_SAMPLES={n} / CAGE_REGIME_GATE_INTERVAL="
@@ -1568,9 +1582,9 @@ from pathlib import Path
 #: the recorded granularity (every match is kept as evidence).
 FIELDS = (
     # KV occupancy gauge: cage-stats engine.py kv_usage reads
-    # vllm:kv_cache_usage_perc (multi-label-set = refusal there);
-    # vllm:gpu_cache_usage_perc is the pre-rename spelling (gate (o)'s
-    # default), sglang:token_usage the pre-translation SGLang dialect
+    # vllm:kv_cache_usage_perc (multi-label-set = refusal there; gate (o)'s
+    # default since S0F-8); vllm:gpu_cache_usage_perc is the pre-rename
+    # spelling (gate (o)'s override), sglang:token_usage the pre-translation SGLang dialect
     # (sglang_dialect.SGLANG_TO_VLLM).
     ("occupancy_gauge", "metrics", (
         ("vllm:kv_cache_usage_perc", "exact", "gauge (0..1 of the KV pool)"),
@@ -1960,8 +1974,15 @@ def check_deterministic(url, model):
 
 
 def check_turbomind(log_root):
-    """TurboMind-actually-selected from the newest LMDeploy launch log."""
-    logs = sorted((log_root / "lmdeploy").glob("*.log"),
+    """TurboMind-actually-selected from the newest NON-EMPTY LMDeploy launch log.
+
+    Same rule as gate (j)'s discovery (S0F-23): a 0-byte log is a start whose
+    engine never wrote (the test suite's fake-engine starts), so it is never
+    "the newest log"; without this filter the S0 volume's newer empty fake
+    turned a real TurboMind PASS into PENDING.
+    """
+    logs = sorted((p for p in (log_root / "lmdeploy").glob("*.log")
+                   if p.stat().st_size > 0),
                   key=lambda p: p.stat().st_mtime)
     if not logs:
         return (PENDING, f"no LMDeploy launch log under {log_root / 'lmdeploy'}/ "
@@ -2057,9 +2078,10 @@ def main(argv):
     adapters = {"vllm": VLLMAdapter, "sglang": SGLangAdapter,
                 "lmdeploy": LMDeployAdapter}
 
-    # Same logs tree gate (j) discovers from (one env var, already part of
-    # the gate-env contract).
-    log_root = Path(os.environ.get("CAGE_ISO_BYTES_LOG_ROOT", "logs"))
+    # Same logs tree gate (j) discovers from, resolved by the same rule: the
+    # gate-specific root, else the launchers' CAGE_LOG_ROOT (S0F-23), else logs.
+    log_root = Path(os.environ.get("CAGE_ISO_BYTES_LOG_ROOT")
+                    or os.environ.get("CAGE_LOG_ROOT") or "logs")
 
     ok = True
     results = {}

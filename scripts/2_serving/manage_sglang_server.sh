@@ -81,6 +81,7 @@ set -euo pipefail
 
 # Anchor paths to the repo root so logs ALWAYS land in <repo>/logs/sglang/,
 # regardless of the caller's working directory (same rule as the vLLM launcher).
+# CAGE_LOG_ROOT redirects the root (S0F-23, test hygiene); unset on a pod.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_DIR"
@@ -133,7 +134,7 @@ case "${1:-}" in
 esac
 
 PORT="${SGLANG_PORT:-30000}"   # SGLangAdapter's default api_base port
-LOG_DIR="$PROJECT_DIR/logs/sglang"
+LOG_DIR="${CAGE_LOG_ROOT:-$PROJECT_DIR/logs}/sglang"
 # Daemon discipline: the launched server's PID is recorded here at start and
 # cleared at stop, so status/stop have an authoritative handle.
 PID_FILE="$LOG_DIR/sglang_server.pid"
