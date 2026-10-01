@@ -64,25 +64,49 @@ TICKET: Dict[str, Any] = {
 }
 
 
-def _row(ticket: Any, *, ok: bool = True, example_id: str = "q1") -> Dict[str, Any]:
+def _row(ticket: Any, *, error: Any = None, example_id: str = "q1") -> Dict[str, Any]:
+    """A closed-loop results row as run_experiment writes it: ``error`` and
+    ``empty_generation`` are the row's validity fields; there is no ``ok`` key
+    (that derived key is written to qa_evidence.jsonl only)."""
     if isinstance(ticket, dict):
         ticket = json.dumps(ticket, sort_keys=True)  # the results writer's spelling
-    return {"example_id": example_id, "ok": ok, "kv_transfer_params": ticket}
+    return {
+        "example_id": example_id,
+        "error": error,
+        "empty_generation": False,
+        "kv_transfer_params": ticket,
+    }
 
 
 def test_gate_accepts_engine_shaped_tickets_as_string_or_dict() -> None:
     rows = [
         _row(TICKET),
-        {"example_id": "q2", "ok": True, "kv_transfer_params": dict(TICKET)},
-        # a failed request legitimately carries no ticket (the proxy refused it)
-        _row("", ok=False, example_id="q3"),
-        {"example_id": "q4", "ok": False},
+        {"example_id": "q2", "error": None, "empty_generation": False,
+         "kv_transfer_params": dict(TICKET)},
+        # a refused or timed-out request legitimately carries no ticket: the
+        # adapter's error response has none, so the results writer stores ""
+        _row("", error="HTTP 502: prefill returned no usable KV transfer ticket", example_id="q3"),
+        # the open-loop dropped-by-cap / no_response stub row has no
+        # kv_transfer_params key at all (run_experiment, open-loop stage)
+        {"example_id": "q4", "baseline": "no_cache", "baseline_family": "no_cache",
+         "workload_mode": "open_loop", "error": "dropped_by_cap"},
     ]
     runner.enforce_pd_transfer_tickets(rows)  # must not raise
 
 
+def test_gate_checks_an_empty_generation_row_that_was_served() -> None:
+    # The skip rule is ``error``, not the derived ``ok``: an empty generation
+    # is a 2xx the proxy answered, and the proxy answers 2xx only with a
+    # ticket, so the row must carry one.
+    served_empty = {**_row(TICKET, example_id="q5"), "empty_generation": True}
+    runner.enforce_pd_transfer_tickets([served_empty])  # must not raise
+    served_empty_no_ticket = {**_row("", example_id="q6"), "empty_generation": True}
+    with pytest.raises(RuntimeError, match="CAMPAIGN PD TICKET.*q6"):
+        runner.enforce_pd_transfer_tickets([served_empty_no_ticket])
+
+
 @pytest.mark.parametrize("value", ["", None, "missing"], ids=["empty", "none", "absent"])
-def test_gate_refuses_an_ok_row_without_a_ticket(value: Any) -> None:
+def test_gate_refuses_a_served_row_without_a_ticket(value: Any) -> None:
     row = _row(TICKET)
     if value == "missing":
         del row["kv_transfer_params"]
@@ -126,8 +150,11 @@ def test_gate_is_wired_on_the_pd_topology_outside_the_distributed_block() -> Non
     guard = src.rindex("campaign_session is not None", 0, call)
     assert call - guard < 400, "the campaign guard must govern the call"
     guard_text = src[guard:call]
-    assert '"topology"' in guard_text and '== "pd"' in guard_text, (
-        "keyed on the cell topology, never the baseline token")
+    # the hard attribute path: a missing ``spec`` or ``topology`` raises on
+    # every campaign cell instead of silently skipping the gate (fail-closed)
+    assert 'campaign_session.spec.topology == "pd"' in guard_text, (
+        "keyed on the cell topology, never the baseline token, never via getattr defaults")
+    assert "getattr(" not in guard_text
     # after the distributed block, and not inside it: the two gates are independent
     dist = src.index('== "distributed"')
     assert dist < guard

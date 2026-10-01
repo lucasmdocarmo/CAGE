@@ -180,8 +180,8 @@ engine for its KV transfer ticket (`kv_transfer_params.do_remote_decode`, `ignor
 no `stream_options`) and refuses the request (502) when the prefill returns none, so a
 pd request never silently falls back to a decode that recomputes the prompt. The ticket
 rides the decode request and the `x-kv-transfer-params` response header verbatim; in
-campaign mode every ok row of a pd window must carry it (the runner's pd gate keys on
-the cell topology). A pd cell carries `--vllm-telemetry` and the two role endpoints, the
+campaign mode every row the proxy answered (no `error`) must carry it (the runner's pd
+gate keys on the cell topology; refused, timed-out and dropped rows are skipped). A pd cell carries `--vllm-telemetry` and the two role endpoints, the
 proxy relays `GET /v1/models` and `/version` from the decode, and the launcher's
 readiness probes fail on an HTTP error. The per-window transfer proof (the decode's
 `vllm:nixl_bytes_transferred` delta) and checklist rows RC-13/RC-14 are Batch 2.

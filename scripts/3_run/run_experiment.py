@@ -643,22 +643,28 @@ def enforce_pd_transfer_tickets(results: List[Dict[str, Any]]) -> None:
     (PD_TICKET_REQUIRED_KEYS present, ``do_remote_prefill`` true, a non-empty
     nested ``remote_block_ids``), fields the proxy cannot invent. It proves
     the prefill OFFERED the blocks; the decode-side counters (Batch 2) prove
-    the pull. Rows with ``ok`` false are skipped (a request the proxy refused
-    legitimately carries no ticket; the row-count and attainment seams count
-    it). Pilot (non-campaign) runs never reach this gate.
+    the pull. Rows with ``error`` set are skipped: a refused, timed-out or
+    dropped request never saw a 2xx from the proxy, so the adapter's error
+    response carries no ticket (closed loop: ``kv_transfer_params == ""``;
+    the open-loop dropped-by-cap stub row has no such key at all), and the
+    row-count and attainment seams already count it. Results rows carry
+    ``error`` and ``empty_generation``, never the derived ``ok`` (that key is
+    written to qa_evidence.jsonl only). An empty generation IS checked: the
+    proxy answers 2xx only with a ticket. Pilot (non-campaign) runs never
+    reach this gate.
     """
     for idx, row in enumerate(results):
-        if not row.get("ok", True):
+        if row.get("error"):
             continue
         row_id = row.get("example_id", f"row {idx}")
         raw = row.get("kv_transfer_params")
         if raw is None or raw == "":
             raise RuntimeError(
-                f"CAMPAIGN PD TICKET: ok row {row_id!r} carries no "
+                f"CAMPAIGN PD TICKET: served row {row_id!r} carries no "
                 "kv_transfer_params: the prefill wrote no KV transfer ticket (or "
                 "the proxy relayed none), so the decode recomputed the prompt "
                 "under a pd label (S0F-22, ADR-0133). A pd window needs the "
-                "engine's ticket on every ok row."
+                "engine's ticket on every row the proxy answered."
             )
         if isinstance(raw, dict):
             ticket: Any = raw
@@ -4205,10 +4211,10 @@ def run_experiment(
         )
     # S0F-22 (ADR-0133): the pd ticket gate keys on the CELL TOPOLOGY the
     # campaign session resolved (CAGE_CELL_TOPOLOGY), independent of the
-    # baseline token above, before any window artifact is written.
-    if campaign_session is not None and getattr(
-        getattr(campaign_session, "spec", None), "topology", None
-    ) == "pd":
+    # baseline token above, before any window artifact is written. The hard
+    # attribute path is deliberate: a renamed field raises on every campaign
+    # cell instead of silently skipping the gate.
+    if campaign_session is not None and campaign_session.spec.topology == "pd":
         enforce_pd_transfer_tickets(results)
 
     git_metadata = capture_git_metadata()

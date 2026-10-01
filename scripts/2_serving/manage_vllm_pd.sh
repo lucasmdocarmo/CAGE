@@ -364,7 +364,7 @@ print("ok")
             return 0
             ;;
         2)
-            printf '[cage] REFUSING pd launch: %s cannot import nixl._api, nixl._bindings (%s) -- the NixlConnector cannot load; install nixl==%s nixl-cu12==%s beside vLLM (setup_runpod.sh step 2, S0F-13 layer 1)\n' \
+            printf '[cage] REFUSING pd launch: %s cannot import nixl._api, nixl._bindings, nixl_agent_config (%s) -- the NixlConnector cannot load, or the installed nixl predates the telemetry config the KV transfer counters need; install nixl==%s nixl-cu12==%s beside vLLM (setup_runpod.sh step 2, S0F-13 layer 1)\n' \
                 "$PD_PYTHON" "$out" "$NIXL_PIN" "$NIXL_PIN" >&2
             return 1
             ;;

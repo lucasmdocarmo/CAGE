@@ -249,7 +249,7 @@ the decode that reached ready, not a failure.
   prefill leg sends vLLM's own request shape plus `ignore_eos`, drops `stream_options`
   (refused with `stream=false`), refuses a missing ticket before the decode, and relays
   the ticket verbatim in the `x-kv-transfer-params` response header; the runner's pd gate
-  checks that shape on every ok row. `remote_host` is `localhost` unless
+  checks that shape on every served row (rows with `error` set are skipped). `remote_host` is `localhost` unless
   `VLLM_NIXL_SIDE_CHANNEL_HOST` is set on the prefill: the cross-node rung needs it.
 
 ### 8.5 Validation instruments (the act-2 measurement toolkit)
