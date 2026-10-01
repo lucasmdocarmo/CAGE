@@ -616,6 +616,91 @@ def enforce_campaign_transfer_provenance(results: List[Dict[str, Any]]) -> None:
             )
 
 
+#: S0F-22 (ADR-0133, Batch 1): the ticket keys the DECODE reads before it
+#: pulls (vLLM v0.19.1 nixl_connector.py:818-828); the prefill writes them at
+#: request_finished (:989-998) and never a "source" key. Mirrored literally
+#: in scripts/2_serving/pd_proxy.py TICKET_REQUIRED_KEYS (pinned equal).
+PD_TICKET_REQUIRED_KEYS: Tuple[str, ...] = (
+    "remote_block_ids",
+    "remote_engine_id",
+    "remote_request_id",
+    "remote_host",
+    "remote_port",
+)
+
+
+def enforce_pd_transfer_tickets(results: List[Dict[str, Any]]) -> None:
+    """Campaign pd gate (S0F-22, ADR-0133): every ok row carries the engine's
+    KV transfer ticket, in the shape the decode consumes.
+
+    Keyed on the cell TOPOLOGY by the caller, never on the ``distributed``
+    baseline token: the driver's pd cells run under ``no_cache`` /
+    ``prefix_cache``, so the T3.3 provenance gate above never saw them and a
+    window with zero transfers was emitted with no refusal. The ticket
+    reaches the row through the proxy's verbatim ``x-kv-transfer-params``
+    response header (pd_proxy.TICKET_HEADER), which the vLLM adapter parses;
+    the engine never stamps ``source``, so this gate checks SHAPE
+    (PD_TICKET_REQUIRED_KEYS present, ``do_remote_prefill`` true, a non-empty
+    nested ``remote_block_ids``), fields the proxy cannot invent. It proves
+    the prefill OFFERED the blocks; the decode-side counters (Batch 2) prove
+    the pull. Rows with ``ok`` false are skipped (a request the proxy refused
+    legitimately carries no ticket; the row-count and attainment seams count
+    it). Pilot (non-campaign) runs never reach this gate.
+    """
+    for idx, row in enumerate(results):
+        if not row.get("ok", True):
+            continue
+        row_id = row.get("example_id", f"row {idx}")
+        raw = row.get("kv_transfer_params")
+        if raw is None or raw == "":
+            raise RuntimeError(
+                f"CAMPAIGN PD TICKET: ok row {row_id!r} carries no "
+                "kv_transfer_params: the prefill wrote no KV transfer ticket (or "
+                "the proxy relayed none), so the decode recomputed the prompt "
+                "under a pd label (S0F-22, ADR-0133). A pd window needs the "
+                "engine's ticket on every ok row."
+            )
+        if isinstance(raw, dict):
+            ticket: Any = raw
+        else:
+            try:
+                ticket = json.loads(str(raw))
+            except Exception:
+                raise RuntimeError(
+                    f"CAMPAIGN PD TICKET: kv_transfer_params for {row_id!r} is "
+                    f"unparseable ({str(raw)[:120]!r}) (S0F-22, ADR-0133)."
+                )
+        if not isinstance(ticket, dict):
+            raise RuntimeError(
+                f"CAMPAIGN PD TICKET: kv_transfer_params for {row_id!r} is not an "
+                f"object ({type(ticket).__name__}) (S0F-22, ADR-0133)."
+            )
+        if ticket.get("do_remote_prefill") is not True:
+            raise RuntimeError(
+                f"CAMPAIGN PD TICKET: ticket for {row_id!r} has do_remote_prefill "
+                f"{ticket.get('do_remote_prefill')!r}; the decode pulls only when "
+                "it is true (nixl_connector.py:818) (S0F-22, ADR-0133)."
+            )
+        missing = [k for k in PD_TICKET_REQUIRED_KEYS if k not in ticket]
+        if missing:
+            raise RuntimeError(
+                f"CAMPAIGN PD TICKET: ticket for {row_id!r} lacks {missing}, the "
+                "keys the decode reads before it pulls (nixl_connector.py:818-828) "
+                "(S0F-22, ADR-0133)."
+            )
+        ids = ticket.get("remote_block_ids")
+        flat = (
+            [i for group in ids for i in (group if isinstance(group, list) else [group])]
+            if isinstance(ids, list) else []
+        )
+        if not flat:
+            raise RuntimeError(
+                f"CAMPAIGN PD TICKET: ticket for {row_id!r} has remote_block_ids "
+                f"{ids!r}: no block to pull, so the decode computed the prompt "
+                "itself (S0F-22, ADR-0133)."
+            )
+
+
 #: T4.1 role-token grammar for CAGE_TELEMETRY_ENDPOINTS. MUST stay identical
 #: to src.monitoring.vllm_telemetry._ROLE_RE — a role accepted here must be
 #: constructible as a sampler role, and vice versa.
@@ -4118,6 +4203,13 @@ def run_experiment(
             sharding_policy=sharding_policy,
             require_distinct_replicas=require_distinct_replicas,
         )
+    # S0F-22 (ADR-0133): the pd ticket gate keys on the CELL TOPOLOGY the
+    # campaign session resolved (CAGE_CELL_TOPOLOGY), independent of the
+    # baseline token above, before any window artifact is written.
+    if campaign_session is not None and getattr(
+        getattr(campaign_session, "spec", None), "topology", None
+    ) == "pd":
+        enforce_pd_transfer_tickets(results)
 
     git_metadata = capture_git_metadata()
     backend_metadata = capture_backend_metadata(

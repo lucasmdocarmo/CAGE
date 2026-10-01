@@ -218,7 +218,11 @@ def test_headers_carry_verify_live_and_provenance_interplay() -> None:
     proxy_doc = pd_proxy.__doc__ or ""
     assert "VERIFY-LIVE at Run-C-prime preflight" in proxy_doc
     assert "never" in proxy_doc.lower() and "source" in proxy_doc
-    assert "REFUSING" in proxy_doc  # the gate-refuses-is-correct interplay
+    # S0F-22 Batch 1 replaced the "gate refusing is the correct outcome"
+    # doctrine: the proxy itself asks for the ticket, refuses a missing one
+    # (502) before the decode, and relays it verbatim in the header.
+    assert "502" in proxy_doc and "TICKET_HEADER" in proxy_doc
+    assert "do_remote_decode" in proxy_doc and "ignore_eos" in proxy_doc
 
 
 # ---------------------------------------------------------------------------
@@ -783,6 +787,34 @@ def test_import_gate_probe_text_matches_what_the_connector_imports() -> None:
     text = PD_SH.read_text(encoding="utf-8")
     assert "import nixl._api, nixl._bindings" in text
     assert 'find_spec("nixl_ep")' in text
+    # S0F-22 Batch 1: the connector records transfer stats (the Batch 2 proof)
+    # only when nixl_agent_config imports (nixl_connector.py:131-138 at
+    # v0.19.1: "NIXL agent config is not available" means no telemetry), so
+    # the probe imports it too, in the same refusal lane.
+    assert "from nixl._api import nixl_agent_config" in text
+
+
+def test_launcher_readiness_probes_fail_on_http_errors() -> None:
+    # S0F-22 Batch 1 (integration audit distributed-9): `curl -s` without
+    # `-f` exits 0 on a 503, so the proxy's fail-closed /health (503 while a
+    # role is down) read as READY; the two role probes get the same flag.
+    code = "\n".join(
+        l for l in PD_SH.read_text(encoding="utf-8").splitlines()
+        if not l.lstrip().startswith("#")
+    )
+    probes = re.findall(r'curl (-\w+) "http://localhost:\$\{[A-Za-z_]+\}/health"', code)
+    assert len(probes) == 3, probes
+    assert all(p == "-sf" for p in probes), probes
+    assert re.search(r'curl -s "http://localhost', code) is None
+
+
+def test_side_channel_comment_names_the_upstream_ports() -> None:
+    # Review addition A14 (2026-10-01): vLLM's own harness uses 5559+i for
+    # the prefill side channel and 5659+i*TP for the decode
+    # (run_accuracy_test.sh:152, 205 at v0.19.1), not 5600 and 5601.
+    text = PD_SH.read_text(encoding="utf-8")
+    assert "harness uses 5600 and 5601" not in text
+    assert "5559" in text and "5659" in text
 
 
 def test_stop_is_never_gated_by_the_import_gate(stub_bin: Path) -> None:
@@ -892,10 +924,25 @@ def test_a_role_that_dies_after_reporting_ready_fails_the_start_at_once(
 # 3. pd_proxy unit tests — in-process stub upstreams, http.client
 # ---------------------------------------------------------------------------
 
-#: The engine-shaped kv_transfer_params the prefill stub returns. NO "source"
-#: field — exactly the pre-NIXL-verification reality the campaign gate must
-#: refuse downstream; the proxy must forward it verbatim and add nothing.
-STUB_KV_TRANSFER_PARAMS = {"remote_engine_id": "stub", "remote_block_ids": [1, 2, 3]}
+#: The ticket vLLM 0.19.1's prefill returns when the request asked for a
+#: remote decode: the eight keys of ``NixlConnector.request_finished``
+#: (nixl_connector.py:989-998), ``remote_block_ids`` NESTED per KV group, and
+#: NO "source" field (the engine never writes one; S0F-22). The proxy must
+#: forward it verbatim, relay it to the client verbatim, and add nothing.
+STUB_KV_TRANSFER_PARAMS = {
+    "do_remote_prefill": True,
+    "do_remote_decode": False,
+    "remote_block_ids": [[1, 2, 3]],
+    "remote_engine_id": "stub-prefill-engine",
+    "remote_request_id": "cmpl-stub-1",
+    "remote_host": "localhost",
+    "remote_port": 5600,
+    "tp_size": 1,
+}
+
+#: Sentinel: the prefill stub answers with NO kv_transfer_params key at all
+#: (the no-ticket case the S0 proxy produced on every request).
+_NO_TICKET_KEY = object()
 
 DECODE_PAYLOAD = json.dumps(
     {"id": "decode-1", "choices": [{"text": "answer"}]}
@@ -908,7 +955,11 @@ class _StubUpstream:
     ``running`` is the in-flight count its /metrics reports (beside a decoy
     occupancy family the proxy must NOT relay); ``metrics_text`` overrides
     the whole exposition; ``reset_status`` is what POST /reset_prefix_cache
-    answers (the reset is journaled as (role, {"reset": path})).
+    answers (the reset is journaled as (role, {"reset": path}));
+    ``prefill_ticket`` is the ``kv_transfer_params`` value the prefill role
+    returns (``_NO_TICKET_KEY`` omits the key). GET /v1/models and GET
+    /version answer a role-tagged document so a relay test can tell which
+    role served it.
     """
 
     def __init__(self, role: str, journal: List[Tuple[str, Dict[str, Any]]]):
@@ -917,6 +968,7 @@ class _StubUpstream:
         self.running = 0
         self.metrics_text: Optional[str] = None
         self.reset_status = 200
+        self.prefill_ticket: Any = STUB_KV_TRANSFER_PARAMS
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -939,8 +991,15 @@ class _StubUpstream:
                     self.end_headers()
                     self.wfile.write(body)
                     return
-                body = b'{"status":"ok"}'
-                self.send_response(200 if self.path == "/health" else 404)
+                if self.path == "/v1/models":
+                    body = json.dumps(
+                        {"object": "list", "data": [{"id": "m", "served_by": outer.role}]}
+                    ).encode("utf-8")
+                elif self.path == "/version":
+                    body = json.dumps({"version": "0.19.1", "served_by": outer.role}).encode("utf-8")
+                else:
+                    body = b'{"status":"ok"}'
+                self.send_response(200 if self.path in ("/health", "/v1/models", "/version") else 404)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -960,13 +1019,10 @@ class _StubUpstream:
                 payload = json.loads(self.rfile.read(length).decode("utf-8"))
                 outer.journal.append((outer.role, payload))
                 if outer.role == "prefill":
-                    body = json.dumps(
-                        {
-                            "id": "prefill-1",
-                            "choices": [{"text": "x"}],
-                            "kv_transfer_params": STUB_KV_TRANSFER_PARAMS,
-                        }
-                    ).encode("utf-8")
+                    doc: Dict[str, Any] = {"id": "prefill-1", "choices": [{"text": "x"}]}
+                    if outer.prefill_ticket is not _NO_TICKET_KEY:
+                        doc["kv_transfer_params"] = outer.prefill_ticket
+                    body = json.dumps(doc).encode("utf-8")
                 else:
                     body = DECODE_PAYLOAD
                 self.send_response(200)
@@ -1005,7 +1061,8 @@ def pd_stack():
         decode.close()
 
 
-def _post(port: int, path: str, body: Dict[str, Any]):
+def _post_full(port: int, path: str, body: Dict[str, Any]):
+    """(status, response headers, body) of one POST through the proxy."""
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
     try:
         conn.request(
@@ -1013,9 +1070,14 @@ def _post(port: int, path: str, body: Dict[str, Any]):
             headers={"Content-Type": "application/json"},
         )
         resp = conn.getresponse()
-        return resp.status, resp.read()
+        return resp.status, dict(resp.getheaders()), resp.read()
     finally:
         conn.close()
+
+
+def _post(port: int, path: str, body: Dict[str, Any]):
+    status, _headers, data = _post_full(port, path, body)
+    return status, data
 
 
 def _get(port: int, path: str):
@@ -1026,6 +1088,21 @@ def _get(port: int, path: str):
         return resp.status, resp.read()
     finally:
         conn.close()
+
+
+#: What the prefill leg must carry so vLLM 0.19.1 writes the ticket: the
+#: request-side kv_transfer_params of vLLM's own NIXL proxy
+#: (tests/v1/kv_connector/nixl_integration/toy_proxy_server.py:162-169 at
+#: v0.19.1) and ignore_eos (a prefill whose single sampled token is EOS
+#: finishes STOPPED and writes no ticket, nixl_connector.py:960-966).
+PREFILL_REQUEST_TICKET = {
+    "do_remote_decode": True,
+    "do_remote_prefill": False,
+    "remote_engine_id": None,
+    "remote_block_ids": None,
+    "remote_host": None,
+    "remote_port": None,
+}
 
 
 def test_proxy_prefill_then_decode_ordering_and_clamp(pd_stack) -> None:
@@ -1040,31 +1117,122 @@ def test_proxy_prefill_then_decode_ordering_and_clamp(pd_stack) -> None:
     )
     prefill_body = journal[0][1]
     decode_body = journal[1][1]
-    # prefill: generation clamped to 1 token, stream forced off, same prompt
+    # prefill: generation clamped to 1 token, stream forced off, same prompt,
+    # and (S0F-22) the request that makes the engine write a ticket
     assert prefill_body["max_tokens"] == 1
     assert prefill_body["stream"] is False
     assert prefill_body["prompt"] == "p"
-    # decode: the ORIGINAL request's generation budget
+    assert prefill_body["kv_transfer_params"] == PREFILL_REQUEST_TICKET
+    assert prefill_body["ignore_eos"] is True
+    # decode: the ORIGINAL request's generation budget, no prefill-only knobs
     assert decode_body["max_tokens"] == 64
     assert decode_body["prompt"] == "p"
+    assert "ignore_eos" not in decode_body
     # client sees the decode response verbatim (streaming passthrough)
     assert body == DECODE_PAYLOAD
+
+
+def test_proxy_prefill_leg_strips_stream_options_and_keeps_the_client_stream_for_decode(
+    pd_stack,
+) -> None:
+    # S0F-22 F1: the runner streams every vLLM request with
+    # stream_options.include_usage; vLLM 0.19.1 refuses stream_options when
+    # stream is false (completion/protocol.py:409-414), so a prefill leg that
+    # forced stream=false but kept stream_options got a 400 and the proxy
+    # turned it into a 502 on EVERY streamed request.
+    journal, _, _, port = pd_stack
+    status, _ = _post(
+        port, "/v1/chat/completions",
+        {
+            "model": "m", "messages": [{"role": "user", "content": "p"}],
+            "max_completion_tokens": 32, "stream": True,
+            "stream_options": {"include_usage": True},
+        },
+    )
+    assert status == 200
+    prefill_body, decode_body = journal[0][1], journal[1][1]
+    assert prefill_body["stream"] is False
+    assert "stream_options" not in prefill_body
+    assert prefill_body["max_completion_tokens"] == 1
+    # the decode leg is the client's request: streamed, with its usage chunk
+    assert decode_body["stream"] is True
+    assert decode_body["stream_options"] == {"include_usage": True}
+    assert decode_body["max_completion_tokens"] == 32
 
 
 def test_proxy_passes_kv_transfer_params_untouched_and_never_stamps_source(
     pd_stack,
 ) -> None:
     journal, _, _, port = pd_stack
-    _post(port, "/v1/completions", {"model": "m", "prompt": "p", "max_tokens": 8})
+    status, headers, _ = _post_full(
+        port, "/v1/completions", {"model": "m", "prompt": "p", "max_tokens": 8}
+    )
+    assert status == 200
     decode_body = journal[1][1]
     # verbatim passthrough: byte-equal structure, nothing added or renamed
     assert decode_body["kv_transfer_params"] == STUB_KV_TRANSFER_PARAMS
-    # THE T3.3 interplay: no proxy-invented "source" anywhere in the
-    # forwarded body — provenance belongs to the engine alone, and the
-    # campaign gate refusing a source-less stamp is the correct outcome.
+    # S0F-22: the client sees the SAME engine ticket, verbatim, in the response
+    # header the adapter already parses (openai_chat_adapter.py
+    # _extract_header_kv_transfer_params); the decode response body carries
+    # none (the decode's request_finished returns no params).
+    relayed = json.loads(headers["x-kv-transfer-params"])
+    assert relayed == STUB_KV_TRANSFER_PARAMS
+    # no proxy-invented "source" anywhere: provenance belongs to the engine
+    # alone; the runner's gate checks the engine's ticket SHAPE, never a stamp.
     assert "source" not in decode_body["kv_transfer_params"]
     assert "source" not in decode_body
     assert "source" not in json.dumps(decode_body)
+    assert "source" not in headers["x-kv-transfer-params"]
+
+
+@pytest.mark.parametrize("ticket,reason", [
+    (_NO_TICKET_KEY, "absent"),
+    (None, "absent"),
+    ({}, "absent"),
+    ({**STUB_KV_TRANSFER_PARAMS, "remote_block_ids": []}, "remote_block_ids"),
+    ({**STUB_KV_TRANSFER_PARAMS, "remote_block_ids": [[]]}, "remote_block_ids"),
+    ({**STUB_KV_TRANSFER_PARAMS, "remote_block_ids": None}, "remote_block_ids"),
+    ({k: v for k, v in STUB_KV_TRANSFER_PARAMS.items() if k != "remote_host"}, "remote_host"),
+    ({k: v for k, v in STUB_KV_TRANSFER_PARAMS.items() if k != "remote_request_id"}, "remote_request_id"),
+    ({**STUB_KV_TRANSFER_PARAMS, "do_remote_prefill": False}, "do_remote_prefill"),
+    ("not-a-dict", "object"),
+], ids=[
+    "no-key", "null", "empty", "ids-empty", "ids-empty-group", "ids-null",
+    "no-host", "no-request-id", "prefill-flag-false", "not-a-dict",
+])
+def test_proxy_refuses_a_missing_or_malformed_ticket_before_the_decode(
+    pd_stack, ticket: Any, reason: str,
+) -> None:
+    # S0F-22: a prefill that returns no usable ticket means the decode would
+    # recompute the prompt under a pd label (the silent path S0 produced), and
+    # a ticket with do_remote_prefill true but empty block ids kills the
+    # decode engine (nixl_connector.py:855-856 asserts). Refuse, loudly,
+    # before the decode is ever called.
+    journal, prefill, _, port = pd_stack
+    prefill.prefill_ticket = ticket
+    status, body = _post(port, "/v1/completions", {"model": "m", "prompt": "p", "max_tokens": 8})
+    assert status == 502
+    doc = json.loads(body)
+    assert "ticket" in doc["error"]
+    assert reason in doc["reason"]
+    assert [role for role, _ in journal] == ["prefill"], "no decode call after a refused ticket"
+
+
+def test_proxy_relays_models_and_version_to_the_decode_role_only(pd_stack) -> None:
+    # S0F-22 (integration audit distributed-1): the runner's readiness check
+    # dials GET /v1/models and its engine-version capture GET /version; the
+    # proxy answered 404 to both, so every campaign pd cell refused at engine
+    # setup. Both are relayed from the DECODE role, the instance that answers
+    # the client's generation requests.
+    _, _, _, port = pd_stack
+    status, body = _get(port, "/v1/models")
+    assert status == 200
+    doc = json.loads(body)
+    assert doc["data"][0]["id"] == "m" and doc["data"][0]["served_by"] == "decode"
+    status, body = _get(port, "/version")
+    assert status == 200 and json.loads(body)["served_by"] == "decode"
+    status, _ = _get(port, "/v1/other")
+    assert status == 404
 
 
 def test_proxy_health_requires_both_upstreams_and_reports_pending(pd_stack) -> None:
@@ -1398,6 +1566,68 @@ class TestPdPlanEmission:
             with pytest.raises(rc.PlanError, match="dist_pd_split"):
                 _pd_grid(dist_pd_split=bad)
 
+    # -- S0F-22 Batch 1 (integration audit distributed-4): the pd CELL carries
+    # the per-role telemetry pair the pd RELAUNCH already carried, so its
+    # windows sample both roles (the regime pd lane) and the runner can reach
+    # the decode role's /metrics for the Batch 2 transfer proof.
+
+    def test_pd_cell_carries_the_role_telemetry_pair(self, tmp_path):
+        plan = _plan_for(
+            _pd_grid(f1_baselines=("B1",)), _floor_table(tmp_path)
+        )
+        pd = [s for s in _cells(plan) if s["cellspec"]["topology"] == "pd"]
+        single = [s for s in _cells(plan) if s["cellspec"]["topology"] != "pd"]
+        assert len(pd) == 1 and len(single) == 1
+        assert "--vllm-telemetry" in pd[0]["argv"]
+        assert pd[0]["env"]["CAGE_TELEMETRY_ENDPOINTS"] == rc.PD_TELEMETRY_ENDPOINTS
+        # the same value its relaunch carries (one table, never two spellings)
+        relaunch = [s for s in _relaunches(plan) if s["topology"] == "pd"][0]
+        assert pd[0]["env"]["CAGE_TELEMETRY_ENDPOINTS"] == relaunch["env"]["CAGE_TELEMETRY_ENDPOINTS"]
+        # a single-topology cell carries neither (its sampler, when any, dials
+        # --api-base; the role grammar is the pd stack's)
+        assert "CAGE_TELEMETRY_ENDPOINTS" not in single[0]["env"]
+        assert "--vllm-telemetry" not in single[0]["argv"]
+
+    def test_load_plan_refuses_a_pd_cell_without_the_telemetry_pair(self, tmp_path):
+        plan = _plan_for(_pd_grid(), _floor_table(tmp_path))
+        pd = [s for s in plan["steps"] if s["kind"] == "cell"][0]
+        out = tmp_path / "plan_pd.json"
+        # (a) the flag dropped
+        stale = json.loads(json.dumps(plan))
+        cell = [s for s in stale["steps"] if s["kind"] == "cell"][0]
+        cell["argv"] = [a for a in cell["argv"] if a != "--vllm-telemetry"]
+        out.write_text(json.dumps(stale), encoding="utf-8")
+        with pytest.raises(rc.RunError, match="vllm-telemetry"):
+            rc.load_plan(out)
+        # (b) the env dropped
+        stale = json.loads(json.dumps(plan))
+        cell = [s for s in stale["steps"] if s["kind"] == "cell"][0]
+        del cell["env"]["CAGE_TELEMETRY_ENDPOINTS"]
+        out.write_text(json.dumps(stale), encoding="utf-8")
+        with pytest.raises(rc.RunError, match="CAGE_TELEMETRY_ENDPOINTS"):
+            rc.load_plan(out)
+        # (c) the env hand-pointed elsewhere
+        stale = json.loads(json.dumps(plan))
+        cell = [s for s in stale["steps"] if s["kind"] == "cell"][0]
+        cell["env"]["CAGE_TELEMETRY_ENDPOINTS"] = "decode=http://localhost:9999"
+        out.write_text(json.dumps(stale), encoding="utf-8")
+        with pytest.raises(rc.RunError, match="CAGE_TELEMETRY_ENDPOINTS"):
+            rc.load_plan(out)
+        assert pd["env"]["CAGE_TELEMETRY_ENDPOINTS"] == rc.PD_TELEMETRY_ENDPOINTS
+
+    def test_load_plan_refuses_the_role_pair_on_a_single_topology_cell(self, tmp_path):
+        plan = _plan_for(_pd_grid(f1_baselines=("B1",)), _floor_table(tmp_path))
+        stale = json.loads(json.dumps(plan))
+        single = [
+            s for s in stale["steps"]
+            if s["kind"] == "cell" and s["cellspec"]["topology"] != "pd"
+        ][0]
+        single["env"]["CAGE_TELEMETRY_ENDPOINTS"] = rc.PD_TELEMETRY_ENDPOINTS
+        out = tmp_path / "plan_single.json"
+        out.write_text(json.dumps(stale), encoding="utf-8")
+        with pytest.raises(rc.RunError, match="CAGE_TELEMETRY_ENDPOINTS"):
+            rc.load_plan(out)
+
 
 # ---------------------------------------------------------------------------
 # 'run' gating on stubs
@@ -1483,6 +1713,20 @@ class TestAllowPdGating:
         assert cell["env"]["CAGE_CELL_TOPOLOGY"] == "pd"
         assert cell["env"]["CAGE_CELL_FAMILY"] == "DIST"
         assert cell["argv"][-2:] == ["--campaign-root", str(root)]
+        # S0F-22 Batch 1: the cell subprocess carries the role telemetry pair
+        assert cell["env"]["CAGE_TELEMETRY_ENDPOINTS"] == rc.PD_TELEMETRY_ENDPOINTS
+        assert "--vllm-telemetry" in cell["argv"]
+
+    def test_run_refuses_a_shell_telemetry_endpoints_export(self, tmp_path, stub, monkeypatch):
+        # The runner refuses CAGE_TELEMETRY_ENDPOINTS without --vllm-telemetry
+        # and would otherwise sample whatever the shell named: a plan fact the
+        # step env owns, refused on presence like the other cell pins.
+        plan = _stub_pd_plan(tmp_path, stub)
+        monkeypatch.setenv("CAGE_TELEMETRY_ENDPOINTS", "decode=http://localhost:9999")
+        with pytest.raises(rc.RunError, match="CAGE_TELEMETRY_ENDPOINTS"):
+            rc.run_plan(plan, _run_root(tmp_path), allow_pd=True)
+        assert stub.calls() == []
+        assert "CAGE_TELEMETRY_ENDPOINTS" in rc.CELL_PIN_ENVS
 
     def test_cli_help_names_the_preflight_gate(self, capsys):
         with pytest.raises(SystemExit):

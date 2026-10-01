@@ -175,6 +175,17 @@ stack, whichever shell started it (S0: attempt 3 died at 16:45:10 to attempt 2's
 pd test runs with `UCX_LOG_LEVEL=info` so the selected transports are in the log; the
 launcher records the operator's `UCX_*` values per role and sets none.
 
+Prefill/decode transfer (ADR-0133, S0F-22, Batch 1): the proxy's prefill leg asks the
+engine for its KV transfer ticket (`kv_transfer_params.do_remote_decode`, `ignore_eos`,
+no `stream_options`) and refuses the request (502) when the prefill returns none, so a
+pd request never silently falls back to a decode that recomputes the prompt. The ticket
+rides the decode request and the `x-kv-transfer-params` response header verbatim; in
+campaign mode every ok row of a pd window must carry it (the runner's pd gate keys on
+the cell topology). A pd cell carries `--vllm-telemetry` and the two role endpoints, the
+proxy relays `GET /v1/models` and `/version` from the decode, and the launcher's
+readiness probes fail on an HTTP error. The per-window transfer proof (the decode's
+`vllm:nixl_bytes_transferred` delta) and checklist rows RC-13/RC-14 are Batch 2.
+
 Gate (j) parsers (ADR-0130, S0F-9/S0F-14): a budgeted vLLM 0.19.1 start prints no
 `Available KV cache memory` line; the bytes channel is the `gpu_worker.py` line
 `reserved <X> GiB memory for KV Cache as specified by kv_cache_memory_bytes config`

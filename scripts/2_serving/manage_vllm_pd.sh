@@ -83,9 +83,11 @@
 #     per-role spellings are unproven until the pd preflight smoke;
 #   - --kv-cache-memory-bytes per-role pool semantics under a connector
 #     (§6.5 pool-sum realization; gate (j) closes on the startup logs);
-#   - the whole NIXL data path (transfer, kv_transfer_params provenance):
-#     until it passes live, run_experiment's campaign PD gate REFUSING
-#     source-less transfer params is the CORRECT end-to-end outcome.
+#   - the whole NIXL data path (transfer, the kv_transfer_params ticket):
+#     S0F-22 Batch 1 (ADR-0133): the proxy asks the prefill for its ticket,
+#     refuses a missing one before the decode, and relays it verbatim; the
+#     runner's pd gate checks the ticket's engine shape on every ok row; the
+#     per-window decode counters (Batch 2, RC-13) prove the pull.
 # These are surfaced in the start banner below, not just in comments.
 # =============================================================================
 
@@ -113,7 +115,9 @@ PROXY_PORT="${CAGE_PD_PROXY_PORT:-8000}"
 # NixlConnector binds tcp://<host>:<VLLM_NIXL_SIDE_CHANNEL_PORT> for its KV
 # handshake; the default is 5600 for every worker, so two roles on one host
 # collide (S0: the prefill's listener died EADDRINUSE and never served
-# /health). vLLM's own 1P1D harness uses 5600 and 5601.
+# /health). vLLM's own 1P1D harness uses 5559+i for the prefill and 5659+i*TP
+# for the decode (tests/v1/kv_connector/nixl_integration/run_accuracy_test.sh:152,
+# 205 at v0.19.1); any two distinct ports work, these keep the S0 defaults.
 NIXL_PORT_PREFILL="${CAGE_PD_NIXL_PORT_PREFILL:-5600}"
 NIXL_PORT_DECODE="${CAGE_PD_NIXL_PORT_DECODE:-5601}"
 # The interpreter that runs `vllm serve` (the activated cage-env); the nixl
@@ -341,6 +345,7 @@ if importlib.util.find_spec("vllm") is None:
     sys.exit(4)
 try:
     import nixl._api, nixl._bindings  # noqa: F401  (what the vLLM NixlConnector imports)
+    from nixl._api import nixl_agent_config  # noqa: F401  (telemetry config: without it the connector records no transfer stats, nixl_connector.py:131-138)
 except Exception as exc:
     print(f"nixl: {type(exc).__name__}: {exc}")
     sys.exit(2)
@@ -355,7 +360,7 @@ print("ok")
     out="$(printf '%s' "$probe" | "$PD_PYTHON" - 2>&1)" && rc=0 || rc=$?
     case "$rc" in
         0)
-            echo "[cage] nixl import gate: ok ($PD_PYTHON imports nixl._api, nixl._bindings)"
+            echo "[cage] nixl import gate: ok ($PD_PYTHON imports nixl._api, nixl._bindings, nixl_agent_config)"
             return 0
             ;;
         2)
@@ -428,7 +433,9 @@ wait_for_health() {
     local label="$1" port="$2" max_wait="$3" waited=0
     echo "Waiting for $label on port $port..."
     while [ "$waited" -lt "$max_wait" ]; do
-        if curl -s "http://localhost:${port}/health" > /dev/null 2>&1; then
+        # -f: an HTTP error (the proxy answers 503 while a role is down) is NOT ready
+        # (integration audit distributed-9; S0F-22 Batch 1).
+        if curl -sf "http://localhost:${port}/health" > /dev/null 2>&1; then
             echo -e "${GREEN}✓ $label ready (port $port)${NC}"
             return 0
         fi
@@ -472,11 +479,11 @@ wait_for_roles() {
         if role_exited decode "$DECODE_PID_FILE" "$decode_log"; then
             return 1
         fi
-        if [ "$prefill_ready" = 0 ] && curl -s "http://localhost:${PREFILL_PORT}/health" > /dev/null 2>&1; then
+        if [ "$prefill_ready" = 0 ] && curl -sf "http://localhost:${PREFILL_PORT}/health" > /dev/null 2>&1; then
             prefill_ready=1
             echo -e "${GREEN}✓ prefill instance ready (port $PREFILL_PORT) after ${waited}s${NC}"
         fi
-        if [ "$decode_ready" = 0 ] && curl -s "http://localhost:${DECODE_PORT}/health" > /dev/null 2>&1; then
+        if [ "$decode_ready" = 0 ] && curl -sf "http://localhost:${DECODE_PORT}/health" > /dev/null 2>&1; then
             decode_ready=1
             echo -e "${GREEN}✓ decode instance ready (port $DECODE_PORT) after ${waited}s${NC}"
         fi
@@ -641,9 +648,9 @@ start_stack() {
     echo "[cage]   connector=NixlConnector  roles: prefill=kv_producer decode=kv_consumer"
     echo "[cage]   [VERIFY-LIVE at Run-C-prime preflight] exact kv_role tokens, per-role"
     echo "[cage]   --kv-cache-memory-bytes pool semantics under the connector, and the"
-    echo "[cage]   whole NIXL data path are UNPROVEN offline; until the pd preflight"
-    echo "[cage]   smoke passes, the campaign PD provenance gate refusing source-less"
-    echo "[cage]   kv_transfer_params is the CORRECT outcome, not a bug."
+    echo "[cage]   whole NIXL data path are UNPROVEN offline until the pd preflight"
+    echo "[cage]   smoke (RC-3, RC-13, RC-14); the proxy refuses a request whose prefill"
+    echo "[cage]   returned no KV transfer ticket (S0F-22, ADR-0133), never decode-only."
     local share_rule="DISTINCT_GPU_MEM_UTIL"
     [ "$PD_GPU_SHARE" = shared ] && share_rule="SHARED_GPU_MEM_UTIL"
     echo "[cage] gpu-share decision: $PD_GPU_SHARE (prefill=${PD_PREFILL_CUDA:-unpinned} decode=${PD_DECODE_CUDA:-unpinned}) -> --gpu-memory-utilization $PD_MEM_UTIL per instance [$PD_MEM_UTIL_SOURCE; rule $share_rule, backlog A1 / S0-9 / S0-20]"

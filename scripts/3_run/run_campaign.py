@@ -155,8 +155,10 @@ until their registrations land):
   ``blocked_on=null`` but ``gate: "--allow-pd + PD preflight smoke"``:
   ``run`` executes pd cells ONLY under the explicit ``--allow-pd`` flag,
   because the PD data path is unverified until the Run-C-prime preflight PD
-  smoke passes (and until then the campaign provenance gate refusing is the
-  correct downstream outcome).
+  smoke passes. S0F-22 Batch 1 (ADR-0133): the pd cell also carries the
+  role telemetry pair (PD_TELEMETRY_FLAG + CAGE_TELEMETRY_ENDPOINTS), the
+  proxy asks the prefill for its KV transfer ticket and relays it, and the
+  runner's pd gate refuses any ok row without an engine-shaped ticket.
 
 Cell BEHAVIOR realization (repair of the T1.2 verifier blocker): the runner's
 ``--baseline`` token selects only the serving PIPELINE; the arm's remaining
@@ -522,7 +524,7 @@ DECOUPLED_SCORING_ADR: str = "ADR-0055"
 #: literals are mirrored in campaign_session (pinned equal by tests).
 SLO_FLOORS_ENV: str = "CAGE_SLO_FLOORS_JSON"
 BUDGET_PLAN_ENV: str = "CAGE_BUDGET_PLAN_JSON"
-CELL_PIN_ENVS: Tuple[str, ...] = (SLO_FLOORS_ENV, BUDGET_PLAN_ENV)
+CELL_PIN_ENVS: Tuple[str, ...] = (SLO_FLOORS_ENV, BUDGET_PLAN_ENV, "CAGE_TELEMETRY_ENDPOINTS")
 SLO_FLOORS_MANIFEST_KEY: str = "slo_floors"
 BUDGET_PLAN_CELL_KEY: str = "budget_plan"
 #: Charter §6.1: the floor is measured at the comfortable control rung
@@ -607,13 +609,23 @@ PD_GATE = "--allow-pd + PD preflight smoke"
 PD_PREFILL_PORT = 8100
 PD_DECODE_PORT = 8200
 
-#: CAGE_TELEMETRY_ENDPOINTS value for pd relaunches (T4.1 role=url grammar,
-#: run_experiment.parse_telemetry_endpoints): one role-tagged sampler per
-#: instance, so PD windows carry per-role serving telemetry.
+#: CAGE_TELEMETRY_ENDPOINTS value for pd relaunches AND pd cells (T4.1
+#: role=url grammar, run_experiment.parse_telemetry_endpoints): one
+#: role-tagged sampler per instance, so PD windows carry per-role serving
+#: telemetry. S0F-22 Batch 1 (integration audit distributed-4): the pd CELL
+#: step carries the pair too (the env plus PD_TELEMETRY_FLAG), because the
+#: runner reads the env, refuses it without the flag, and samples nothing
+#: without either; without them every pd window read UNKNOWN_TELEMETRY and
+#: the runner had no address for the decode role's /metrics (the Batch 2
+#: transfer proof). Pinned by load_plan per cell; a single-topology cell
+#: carries neither (its sampler, when any, dials --api-base).
+PD_TELEMETRY_ENDPOINTS_ENV = "CAGE_TELEMETRY_ENDPOINTS"
+PD_TELEMETRY_FLAG = "--vllm-telemetry"
 PD_TELEMETRY_ENDPOINTS = (
     f"prefill=http://localhost:{PD_PREFILL_PORT},"
     f"decode=http://localhost:{PD_DECODE_PORT}"
 )
+PD_TELEMETRY_FINDING = "S0F-22 Batch 1 / integration audit distributed-4"
 
 #: Batch 2 finding W2 (2026-09-18; owner picked option A of A/B/C; ADR-0059
 #: amendment of the same date): the ONE port table the launcher env AND every
@@ -2415,7 +2427,7 @@ def _pd_budget_env(
         "CAGE_KV_BUDGET_BYTES_PREFILL": str(prefill_env),
         "CAGE_KV_BUDGET_BYTES_DECODE": str(decode_env),
         # T4.1 role-tagged telemetry — one sampler per instance.
-        "CAGE_TELEMETRY_ENDPOINTS": PD_TELEMETRY_ENDPOINTS,
+        PD_TELEMETRY_ENDPOINTS_ENV: PD_TELEMETRY_ENDPOINTS,
     }
     record = {
         "split": grid.dist_pd_split,
@@ -2987,6 +2999,30 @@ def _stale_plan_problems(
                     + stale
                 )
 
+    # S0F-22 Batch 1: a pd cell carries the role telemetry pair (flag + env,
+    # the registered value); every other cell carries the env NOT at all (the
+    # runner would sample whatever it named under a single server).
+    got_endpoints = env.get(PD_TELEMETRY_ENDPOINTS_ENV)
+    if spec.topology == "pd":
+        if PD_TELEMETRY_FLAG not in argv:
+            problems.append(
+                f"{label}: pd cell {row!r} lacks {PD_TELEMETRY_FLAG} "
+                f"({PD_TELEMETRY_FINDING}: its windows would read UNKNOWN_TELEMETRY "
+                "and the decode role could not be scraped)" + stale
+            )
+        if got_endpoints != PD_TELEMETRY_ENDPOINTS:
+            problems.append(
+                f"{label}: pd cell {row!r} env {PD_TELEMETRY_ENDPOINTS_ENV} is "
+                f"{got_endpoints!r}, the registered role pair is "
+                f"{PD_TELEMETRY_ENDPOINTS!r} ({PD_TELEMETRY_FINDING})" + stale
+            )
+    elif got_endpoints is not None:
+        problems.append(
+            f"{label}: cell {row!r} (topology {spec.topology!r}) carries env "
+            f"{PD_TELEMETRY_ENDPOINTS_ENV} ({PD_TELEMETRY_FINDING}: the role pair "
+            "rides pd cells only)" + stale
+        )
+
     expected_mode = "OFF" if _prefix_off(spec) else "ON"
     serving = step.get("serving")
     if isinstance(serving, dict):
@@ -3181,6 +3217,10 @@ def _cell_step(
     argv += ["--num-queries", str(num_queries)]
     argv += _behavior_argv(spec, grid, pins)
     argv += _cold_start_argv(spec)
+    if spec.topology == "pd":
+        # S0F-22 Batch 1: the pd cell samples BOTH role instances (the
+        # regime pd lane; the Batch 2 transfer proof reads the decode role).
+        argv.append(PD_TELEMETRY_FLAG)
     if query_manifest is not None:
         # The uniform yardstick (build_query_manifest.py): every cell of a
         # dataset with a registered manifest measures the manifest's
@@ -3244,6 +3284,11 @@ def _cell_step(
         # NOT identity (derive_cell_spec ignores it): the serving-stack fact
         # the campaign writer persists into cell.json (W4.2 → §6.6b / #18).
         env["CAGE_GPU_COUNT"] = str(gpu_count)
+    if spec.topology == "pd":
+        # S0F-22 Batch 1: the SAME value the pd relaunch carries (one table);
+        # the runner refuses the env without PD_TELEMETRY_FLAG, so both ride
+        # the cell together. Behavior, never identity.
+        env[PD_TELEMETRY_ENDPOINTS_ENV] = PD_TELEMETRY_ENDPOINTS
     if cell.window_ordinal_base:
         # Per-task RULER steps share a row key; each task's runner invocation
         # emits windows (base, base+replications] so per-task resume can

@@ -231,9 +231,26 @@ the decode that reached ready, not a failure.
   unsupported for NixlConnector) [revalidate on 0.19.1].
 - The **NIXL wheel's CUDA major must match** the node's CUDA/driver major, or transfers
   fail (sometimes silently into fallback).
-- The `nixl_*` Prometheus metrics require the nixl-metrics PR — verify the pinned vLLM
-  actually exposes them (`curl /metrics | grep nixl_`); without them check 5 and the
-  transfer-cost instrumentation are blind.
+- The `nixl_*` Prometheus metrics: read from the 0.19.1 connector source on 2026-10-01
+  (ADR-0133, S0F-22), the connector registers `vllm:nixl_xfer_time_seconds`,
+  `vllm:nixl_post_time_seconds`, `vllm:nixl_bytes_transferred` and
+  `vllm:nixl_num_descriptors` (histograms), `vllm:nixl_num_failed_transfers`,
+  `vllm:nixl_num_failed_notifications` and `vllm:nixl_num_kv_expired_reqs` (counters),
+  labels `model_name` and `engine`, on every instance whose config names the connector;
+  bytes, times and descriptors move on the DECODE (the reader) only, expiries on the
+  prefill, and only when `nixl._api.nixl_agent_config` imports (no telemetry config, no
+  stats; the launcher's import gate checks it). Still [VERIFY-LIVE]: `curl :8200/metrics |
+  grep nixl_` on the provisioned node (RC-5, RC-13).
+- The ticket (ADR-0133): the prefill writes `kv_transfer_params` on its NON-stream
+  response only when the request carried `kv_transfer_params.do_remote_decode` and
+  finished by its length cap; the eight keys are `do_remote_prefill`, `do_remote_decode`,
+  `remote_block_ids` (nested per KV group), `remote_engine_id`, `remote_request_id`,
+  `remote_host`, `remote_port`, `tp_size`, and there is no `source` key. The proxy's
+  prefill leg sends vLLM's own request shape plus `ignore_eos`, drops `stream_options`
+  (refused with `stream=false`), refuses a missing ticket before the decode, and relays
+  the ticket verbatim in the `x-kv-transfer-params` response header; the runner's pd gate
+  checks that shape on every ok row. `remote_host` is `localhost` unless
+  `VLLM_NIXL_SIDE_CHANNEL_HOST` is set on the prefill: the cross-node rung needs it.
 
 ### 8.5 Validation instruments (the act-2 measurement toolkit)
 

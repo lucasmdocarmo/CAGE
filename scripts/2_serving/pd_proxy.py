@@ -10,29 +10,46 @@ PREFILL instance with ``max_tokens=1`` (so prefill computes/stages the KV and
 generates nothing beyond the mandatory first token), then sends the FULL
 request to the DECODE instance and streams the decode response back verbatim.
 
-kv_transfer_params provenance (the T3.3 campaign-gate interplay — read this
-before "fixing" a refusing run): any ``kv_transfer_params`` the prefill
-ENGINE returns is forwarded to the decode request UNTOUCHED, and this proxy
-NEVER stamps, invents, or normalizes a ``source`` field (or any other field)
-inside it. run_experiment.py's campaign PD provenance gate accepts only
-engine-real source stamps (allowlist: ``nixl``); until the live NIXL path is
-verified at the Run-C-prime preflight, the CORRECT end-to-end outcome is that
-gate REFUSING (absent/unknown source is not evidence) — a proxy that stamped
-``source`` to appease the gate would be fabricating provenance, the exact
-fail-closed violation the gate exists to catch.
+The ticket (S0F-22, ADR-0133, Batch 1; vLLM v0.19.1 source read 2026-10-01):
+the prefill ENGINE writes its KV transfer ticket (``kv_transfer_params`` on
+the non-stream response: ``do_remote_prefill``, ``do_remote_decode``,
+``remote_block_ids`` nested per KV group, ``remote_engine_id``,
+``remote_request_id``, ``remote_host``, ``remote_port``, ``tp_size``;
+nixl_connector.py:989-998) ONLY when the prefill request asked for a remote
+decode (``kv_transfer_params.do_remote_decode``, :958) and finished by its
+length cap (an EOS first token finishes STOPPED and writes nothing, :960-966).
+So the prefill leg carries PREFILL_REQUEST_TICKET and ``ignore_eos``, as
+vLLM's own NIXL proxy does (tests/v1/kv_connector/nixl_integration/
+toy_proxy_server.py:162-175 at v0.19.1), and drops ``stream_options``
+(vLLM refuses it when ``stream`` is false, completion/protocol.py:409-414;
+the runner streams every request with it). Before this, every request
+through the proxy recomputed the prompt on the decode under a pd label.
 
-[VERIFY-LIVE at Run-C-prime preflight] — the WHOLE data path: whether the
-pinned vLLM's NixlConnector returns kv_transfer_params on the prefill
-response, whether the decode instance consumes them from the request body,
-whether ``max_tokens=1`` (+ ``stream=false``) is the correct prefill-side
-request shape, and whether transfer actually happens. /health reports this as
-PENDING, never PASS. No serving-behavior claim in this file is proven until
-that smoke runs.
+The ticket is forwarded to the decode request VERBATIM and relayed to the
+client VERBATIM in the response header TICKET_HEADER (the one the vLLM
+adapter already parses; the decode's own response carries no ticket, its
+request_finished returns none). This proxy NEVER stamps, invents or
+normalizes a field inside it: the engine never writes a ``source`` key, and
+run_experiment.py's pd gate checks the ticket's SHAPE (the keys the decode
+reads, nixl_connector.py:818-828), never a stamp. A prefill response with
+no usable ticket (absent, null, empty, an address key missing, or empty
+block ids: the last one kills the decode engine, :855-856) is a LOUD 502
+and the decode is never called.
+
+[VERIFY-LIVE at Run-C-prime preflight] whether the pinned vLLM's
+NixlConnector returns the ticket on this request shape, whether the decode
+consumes it from the request body, and whether the transfer happens: the
+Batch 2 per-window decode counters and checklist rows RC-13 and RC-14 are
+the proof. /health reports this as PENDING, never PASS.
 
 Fail-closed doctrine: an unparseable client body, a failed/unparseable
-prefill response, or an unreachable upstream is a LOUD 4xx/5xx — the proxy
-never silently degrades to decode-only serving (that would measure a
-non-disaggregated path under a PD label).
+prefill response, a missing ticket, or an unreachable upstream is a LOUD
+4xx/5xx; the proxy never silently degrades to decode-only serving (that
+would measure a non-disaggregated path under a PD label).
+
+GET /v1/models and GET /version are relayed from the DECODE role (the
+instance that answers the client's generation): the runner's readiness check
+and its engine-version capture dial them (integration audit distributed-1).
 
 Cold start per window on the pd topology (ADR-0102 amendment 2026-09-19,
 Batch 2 W2-R1): a pd cell dials THIS port for everything, including the
@@ -101,6 +118,36 @@ RESET_PATH = "/reset_prefix_cache"
 #: probe timeout, about 28 s against its 30 s flush timeout.
 _METRICS_TIMEOUT = 4.0
 _RESET_TIMEOUT = 14.0
+#: GET paths relayed from the decode role (readiness + engine-version capture).
+MODELS_PATH = "/v1/models"
+VERSION_PATH = "/version"
+_RELAY_GET_TIMEOUT = 5.0
+
+#: The request-side kv_transfer_params that make the prefill engine write its
+#: ticket: vLLM's own NIXL proxy sends exactly this (toy_proxy_server.py:162-169
+#: at v0.19.1); NixlConnector reads do_remote_decode at request_finished
+#: (nixl_connector.py:958). Mirrored literally, pinned by the proxy tests.
+PREFILL_REQUEST_TICKET: Dict[str, Any] = {
+    "do_remote_decode": True,
+    "do_remote_prefill": False,
+    "remote_engine_id": None,
+    "remote_block_ids": None,
+    "remote_host": None,
+    "remote_port": None,
+}
+#: The ticket keys the DECODE reads before it pulls (nixl_connector.py:818-828);
+#: a ticket missing one leaves the decode request waiting with no read
+#: scheduled. Mirrored in run_experiment.PD_TICKET_REQUIRED_KEYS (pinned equal).
+TICKET_REQUIRED_KEYS: Tuple[str, ...] = (
+    "remote_block_ids",
+    "remote_engine_id",
+    "remote_request_id",
+    "remote_host",
+    "remote_port",
+)
+#: The response header the engine's ticket is relayed in, verbatim: the vLLM
+#: adapter already parses it (openai_chat_adapter._extract_header_kv_transfer_params).
+TICKET_HEADER = "x-kv-transfer-params"
 
 
 def _split_url(url: str) -> Tuple[str, int]:
@@ -206,19 +253,56 @@ def _upstream_call(
 
 
 def _prefill_body(body: Dict[str, Any]) -> Dict[str, Any]:
-    """The prefill-side request: same prompt, generation clamped to 1 token.
+    """The prefill-side request: same prompt, generation clamped to 1 token,
+    asking the engine to stage the KV for a remote decode.
 
-    ``stream`` is forced off — the proxy consumes this response itself and
-    needs one JSON object, not an SSE stream. Both the max_tokens=1 clamp and
-    the stream-off override are request-shape assumptions
-    [VERIFY-LIVE at Run-C-prime preflight].
+    ``stream`` is forced off (the proxy consumes this response itself and
+    needs one JSON object; only the non-stream response carries the ticket)
+    and ``stream_options`` is dropped with it (vLLM 0.19.1 refuses the pair
+    stream=false + stream_options, completion/protocol.py:409-414).
+    ``kv_transfer_params`` is PREFILL_REQUEST_TICKET, what makes
+    request_finished write the ticket; ``ignore_eos`` keeps a prompt whose
+    first sampled token is EOS from finishing STOPPED, which writes none
+    (nixl_connector.py:960-966; sched/utils.py:104-117). The decode leg is
+    the client's own request, untouched but for the forwarded ticket.
+    [VERIFY-LIVE at Run-C-prime preflight] for the whole request shape.
     """
     out = dict(body)
     out["max_tokens"] = 1
     if "max_completion_tokens" in out:
         out["max_completion_tokens"] = 1  # chat-completions spelling
     out["stream"] = False
+    out.pop("stream_options", None)
+    out["kv_transfer_params"] = dict(PREFILL_REQUEST_TICKET)
+    out["ignore_eos"] = True
     return out
+
+
+def validate_ticket(ticket: Any) -> Optional[str]:
+    """None when ``ticket`` is a usable prefill ticket, else the reason it is
+    not: absent/null/empty, not an object, ``do_remote_prefill`` not true, a
+    TICKET_REQUIRED_KEYS key missing, or ``remote_block_ids`` empty (a list
+    with no ids in any group). The engine's own shape only; nothing is added.
+    """
+    if ticket is None or ticket == {} or ticket == "":
+        return "ticket absent: the prefill returned no kv_transfer_params"
+    if not isinstance(ticket, dict):
+        return f"ticket is not an object ({type(ticket).__name__})"
+    if ticket.get("do_remote_prefill") is not True:
+        return (
+            f"ticket do_remote_prefill is {ticket.get('do_remote_prefill')!r}, "
+            "the decode pulls only when it is true"
+        )
+    missing = [k for k in TICKET_REQUIRED_KEYS if k not in ticket]
+    if missing:
+        return f"ticket lacks the key(s) the decode reads: {missing}"
+    ids = ticket.get("remote_block_ids")
+    if not isinstance(ids, list):
+        return f"ticket remote_block_ids is {ids!r}, not a list of block id groups"
+    flat = [i for group in ids for i in (group if isinstance(group, list) else [group])]
+    if not flat:
+        return "ticket remote_block_ids carries no block ids (nothing to pull)"
+    return None
 
 
 class PDProxyHandler(BaseHTTPRequestHandler):
@@ -337,9 +421,29 @@ class PDProxyHandler(BaseHTTPRequestHandler):
 
     # -- health ------------------------------------------------------------
 
+    def _relay_decode_get(self, path: str) -> None:
+        """GET ``path`` from the DECODE role, status and JSON body verbatim;
+        503 when the role is unreachable (the readiness probe then reads
+        not-ready, never a fabricated model list)."""
+        status, body = _upstream_call(self.decode_url, "GET", path, _RELAY_GET_TIMEOUT)
+        if status is None:
+            self._reply_json(
+                503, {"error": f"decode role unreachable for GET {path}: {body}"}
+            )
+            return
+        data = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
         if self.path == METRICS_PATH:
             self._relay_metrics()
+            return
+        if self.path in (MODELS_PATH, VERSION_PATH):
+            self._relay_decode_get(self.path)
             return
         if self.path != "/health":
             self._reply_json(404, {"error": f"unknown path {self.path!r}"})
@@ -412,26 +516,45 @@ class PDProxyHandler(BaseHTTPRequestHandler):
             )
             return
 
-        # 2) DECODE: the ORIGINAL request, plus any engine-provided
-        # kv_transfer_params forwarded VERBATIM. No field inside them is
-        # added, removed, or rewritten here — in particular no "source"
-        # stamp: provenance belongs to the engine alone, and the campaign
-        # gate refusing engine-less provenance is correct (module docstring).
+        # 2) The TICKET (S0F-22): the engine's kv_transfer_params, validated
+        # for the shape the decode reads and nothing else. No field inside it
+        # is added, removed, or rewritten here (no "source" stamp: provenance
+        # belongs to the engine alone, module docstring). A prefill answer
+        # with no usable ticket is refused HERE, before the decode is called:
+        # forwarding nothing would make the decode recompute the prompt under
+        # a pd label (the silent S0 path), and forwarding an empty block list
+        # with do_remote_prefill true kills the decode engine.
+        ticket = prefill_json.get("kv_transfer_params") if isinstance(prefill_json, dict) else None
+        reason = validate_ticket(ticket)
+        if reason is not None:
+            self._reply_json(
+                502,
+                {
+                    "error": "prefill returned no usable KV transfer ticket -- "
+                             "refusing decode-only fallback (S0F-22)",
+                    "reason": reason,
+                    "prefill_body": prefill_raw.decode("utf-8", "replace")[:512],
+                },
+            )
+            return
+        # 3) DECODE: the ORIGINAL request plus the ticket, VERBATIM.
         decode_body = dict(body)
-        if isinstance(prefill_json, dict) and "kv_transfer_params" in prefill_json:
-            decode_body["kv_transfer_params"] = prefill_json["kv_transfer_params"]
+        decode_body["kv_transfer_params"] = ticket
         try:
             conn, resp = self._upstream_post(self.decode_url, self.path, decode_body)
         except OSError as exc:
             self._reply_json(502, {"error": f"decode upstream unreachable: {exc}"})
             return
         try:
-            # 3) Streaming passthrough: status + content-type + raw body
-            # chunks, verbatim (SSE streams flow through untouched).
+            # 4) Streaming passthrough: status + content-type + raw body
+            # chunks, verbatim (SSE streams flow through untouched), plus the
+            # engine's ticket relayed VERBATIM in TICKET_HEADER so the client
+            # row carries what the prefill offered (the decode body never does).
             self.send_response(resp.status)
             ctype = resp.getheader("Content-Type")
             if ctype:
                 self.send_header("Content-Type", ctype)
+            self.send_header(TICKET_HEADER, json.dumps(ticket, separators=(",", ":")))
             self.end_headers()
             while True:
                 chunk = resp.read(_CHUNK)

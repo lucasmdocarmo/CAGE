@@ -3751,7 +3751,12 @@ class TestSloFloorsProducerW4:
     def test_registered_constants(self):
         assert rc.SLO_FLOORS_ENV == "CAGE_SLO_FLOORS_JSON"
         assert rc.BUDGET_PLAN_ENV == "CAGE_BUDGET_PLAN_JSON"
-        assert rc.CELL_PIN_ENVS == ("CAGE_SLO_FLOORS_JSON", "CAGE_BUDGET_PLAN_JSON")
+        # S0F-22 Batch 1: the pd role telemetry pair is a cell pin too (the
+        # step env owns it; a shell export is refused on presence by 'run').
+        assert rc.CELL_PIN_ENVS == (
+            "CAGE_SLO_FLOORS_JSON", "CAGE_BUDGET_PLAN_JSON", "CAGE_TELEMETRY_ENDPOINTS",
+        )
+        assert rc.PD_TELEMETRY_ENDPOINTS_ENV == "CAGE_TELEMETRY_ENDPOINTS"
         assert rc.FLOOR_BUDGET_FRACTION == 1.5
         assert rc.SLO_FLOORS_FINDING == "Batch 2 W4"
         # One seam, two ends: the session parses the same literals.
