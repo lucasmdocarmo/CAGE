@@ -96,6 +96,26 @@ symlink spelling while Python resolves it physically, and two prefix strips in t
 tree assume one spelling (integration audit 2026-09-26, pod-10); the symlink stays
 for the scripts that cite `~/CAGE`.
 
+Pod shape (S0F-18, live 2026-09-30): the image `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`
+runs its own nginx on 3001, 7270, 7861, 8001, 8081 and 9091, forwarding to 3000, 7271,
+7860, 8000, 8080 and 9090; its 502 page answers HTTP 200, so a health probe on one of
+those ports can read 200 with nothing of ours behind it. The cluster manager's default
+`--base-port` is therefore 8101 (replicas take 8101 to 8100+N; router 9000), it refuses
+a bound port before any launch and names the holder, and a replica or router that exits
+during its wait fails the start at once with its log tail. Knobs: `CAGE_CLUSTER_BASE_PORT`
+and `CAGE_CLUSTER_ROUTER_PORT` for `run_tests.sh --with-cluster`, `VLLM_START_TIMEOUT`
+and `ROUTER_START_TIMEOUT` for the readiness budgets (the same knob the engine launchers
+read). Two or more replicas on one GPU need `CAGE_KV_BUDGET_BYTES_REPLICA` (ADR-0124).
+
+Venv siting (ADR-0125, S0F-6): the bootstrap builds the three venvs at their real
+paths under `CAGE_VENV_ROOT` (default `/root/cage-venvs`, the container disk) and links
+`cage-env`, `sglang-env` and `lmdeploy-env` at the repo root to them, so every command
+above keeps its spelling. On a volume-backed pod the repo is on the MooseFS network
+volume, and a venv there cost S0 20 s per `import vllm`, 4 to 7.5 min per engine start
+and 79 min per bootstrap (1.8 to 2.4 h of pod time per day). `logs/` and `results/` stay
+on the volume. A pod restart wipes the container disk; rerun the bootstrap and it rebuilds
+the venvs and re-points the links. `provision_pod.sh` sizes the container disk at 120 GB.
+
 `setup_runpod.sh` is container-shaped (root, no sudo/systemd/PPA — finding J7): it
 installs the pinned vLLM + `requirements.txt` into `cage-env` built from the
 **canonical interpreter** (`CAGE_CANONICAL_PYTHON`, finding B1 — it fails closed rather
@@ -125,11 +145,35 @@ pair, (c) cage-stats importable, (d) FAISS + embedding + reranker, (e) no
 mock/disable/unrecorded-deviation env var set (incl. `CAGE_ALLOW_NO_BACKUP`,
 `CAGE_QUALITY_STRICT` poison values, `CAGE_CLAIM_CHECKER` state), (f) disk space,
 (g) vllm CLI importable at the venv level, (h) D2 telemetry parity, (i)
-environment-vs-registration pins, (j) charter §6.5 realized-KV **iso-BYTES parity**
+environment-vs-registration pins (a `pip check` line listed in
+`scripts/checks/pip_check_allowlist.txt` with its reason and ADR id is printed as an
+accepted deviation; today the one vLLM 0.19.1 / numba 0.67.0 line, ADR-0126; any
+other line fails), (j) charter §6.5 realized-KV **iso-BYTES parity**
 across engine startup logs (`CAGE_ISO_BYTES_TOL`/`CAGE_ISO_BYTES_LOGS`), (k)
 per-backend endpoint liveness (`CAGE_PREFLIGHT_BACKENDS`), (l) campaign-layout
 round-trip, (m) open-loop schedule + measured-replay guard, (n) calibration artifact,
 (o) regime-inputs bridge on live telemetry, (p) dataset staleness refusal.
+
+Qasper (ADR-0127, S0F-5): `datasets` 4.x refuses the repo's loading script, so the
+loader and `download_datasets.py` read the Hub's parquet export at one pinned commit
+(`QASPER_REVISION`, `src/data/loader.py`; `DATASET_REVISIONS`,
+`scripts/1_setup/download_datasets.py`). The bootstrap proves the route on every pod
+after staging (`CAGE_HF_LIVE=1 python -m pytest tests/test_qasper_revision_s0f5.py -m
+integration`: the rebuilt 50x3 manifest must hash to the tracked
+`data/manifests/qasper_50x3_seed42.json`). The cache directory stays `allenai___qasper`,
+so gate (p) is unchanged. In offline mode `datasets` ignores `revision`, which is why
+both call sites carry the same commit.
+
+Prefill/decode pair (ADR-0128, S0F-13): `manage_vllm_pd.sh start` refuses, before its
+self-cleaning stop, when the serving interpreter cannot import `nixl._api` /
+`nixl._bindings` or a top-level `nixl_ep` is present but broken; each role gets its own
+`VLLM_NIXL_SIDE_CHANNEL_PORT` (5600 / 5601); both roles are awaited in one loop that
+fails at once with the log tail when a role process is gone. Operating rule:
+never run a pd `stop` while another chain's `start` is live. The pidfiles are shared
+and the stop sweeps by command pattern, so a stop from one shell kills the newest
+stack, whichever shell started it (S0: attempt 3 died at 16:45:10 to attempt 2's stop). The Run-C-prime
+pd test runs with `UCX_LOG_LEVEL=info` so the selected transports are in the log; the
+launcher records the operator's `UCX_*` values per role and sets none.
 
 Version pins: record the actually-served engine versions into the run manifest; the
 engine×model VERIFY-LIVE matrix is `docs/VLLM_COMPATIBILITY.md` §7. Re-run gate (a)
@@ -428,6 +472,13 @@ manually, and only then uses `--force` — a user decision, reported as such.
 | `CAGE_CLAIM_CHECKER` | `src/evaluation/quality.py` | Claim-check instrument selection. Default `nli` (owner decision #120/F8, 2026-08-19; in-process-safe). `alignscore` is Instrument B and is requested explicitly by `scripts/4_analysis/score_instrument_b.py` — never as the run default. Preflight prints the state either way. |
 | `CAGE_SKIP_QUALITY=1` | run scripts, `run_campaign.py` (cell-step env pin), `run_experiment.py` (campaign-mode gate) | Decoupled-scoring regime (default in `run_full_sweep.sh`; pinned on every campaign cell step by the driver, W1 / ADR-0055): inline model-based quality is skipped and scored after the serving trees. A *declared* regime, not a mock. A campaign cell without it refuses before serving; the regime is recorded per window in `metrics.json["quality_scoring"]`. |
 | `VLLM_PORT` / `SGLANG_PORT` / `CAGE_PD_PROXY_PORT` / `CAGE_PD_PREFILL_PORT` / `CAGE_PD_DECODE_PORT` | launchers (`manage_vllm_server.sh`, `manage_sglang_server.sh`, `manage_vllm_pd.sh`), `run_campaign.py` (relaunch env) | Listening ports of the launchers (defaults 8000 / 30000 / 8000 / 8100 / 8200). The campaign driver exports them on every relaunch from its port table and pins the matching `--api-base` on every server-engine cell (W2); the operator's shell value never reaches a campaign relaunch (the step env wins). The preflight's own gate URL reads the shell `SGLANG_PORT`, so `run` refuses a shell value that differs from the table (an equal value is fine). |
+| `CAGE_VENV_ROOT` | `setup_runpod.sh` | ADR-0125 (S0F-6): the directory the three venvs are REALLY created in (default `/root/cage-venvs`, the container disk); the repo-root names are links to them. Never the network volume. |
+| `CAGE_KV_BUDGET_BYTES_REPLICA` | `manage_vllm_cluster.py` | ADR-0124 (S0F-19): the KV pool of EVERY cluster replica in bytes, passed as `--kv-cache-memory-bytes` so vLLM skips its device-wide memory profiler (two replicas profiling at once on one GPU collapse each other's pool). REQUIRED when the replicas share a GPU, optional with distinct `--replica-gpus`; refused beside `CAGE_KV_BUDGET_BYTES` or `CAGE_VLLM_GPU_BLOCKS_OVERRIDE`. Recorded in `cluster_state.json`. Shared-GPU replicas start one at a time. |
+| `CAGE_CLUSTER_BASE_PORT` / `CAGE_CLUSTER_ROUTER_PORT` | `run_tests.sh --with-cluster` | S0F-18: forwarded to the cluster manager as `--base-port` / `--router-port` when set (the manager's defaults are 8101 and 9000; 8001 is the image's nginx); the router port also sets `ROUTER_TEST_API_BASE` for the router tests. |
+| `ROUTER_START_TIMEOUT` | `manage_vllm_cluster.py` | S0F-18: default `--router-timeout` in seconds (60). The replica budget reads `VLLM_START_TIMEOUT` (300), the engine launchers' knob. |
+| `CAGE_PD_NIXL_PORT_PREFILL` / `CAGE_PD_NIXL_PORT_DECODE` | `manage_vllm_pd.sh` | ADR-0128 (S0F-13): the NIXL handshake side-channel port of each role (defaults 5600 / 5601), passed to the role as `VLLM_NIXL_SIDE_CHANNEL_PORT` in its child env and recorded in the per-role serving-config capture. Equal values, a value equal to an HTTP port, or a shell `VLLM_NIXL_SIDE_CHANNEL_PORT` refuse the start. |
+| `CAGE_PD_PYTHON` | `manage_vllm_pd.sh` | ADR-0128: the interpreter the nixl import gate probes before the self-cleaning stop (default `python3`, the activated cage-env that runs `vllm serve`). Test seam; never set it on a pod. |
+| `CAGE_HF_LIVE=1` | `tests/test_qasper_revision_s0f5.py` (`setup_runpod.sh` step 4a-live) | ADR-0127 (S0F-5): opt-in for the live qasper check (loads the pinned Hub route with the real `datasets` library and compares the rebuilt 50x3 manifest digest). Unset, the test skips; the bootstrap sets it on every pod. |
 | `CAGE_SGLANG_API_BASE` / `CAGE_LMDEPLOY_API_BASE` | `run_experiment.py` (adapter + cache flush) | Per-engine endpoint override, resolved BEFORE `--api-base`. Pilot convenience only: `run_campaign.py run` refuses while either is set (W2), because it would beat the plan's pin. |
 | `CAGE_SLO_FLOORS_JSON` | `run_campaign.py` (cell-step env pin), `campaign_session.py` | Batch 2 W4 (ADR-0117): the §6.1 single-stream floors of every registered engine as compact JSON, pinned on EVERY cell step from the plan header `calibration` (one cal-v2 artifact per engine, §3.2); the session writes it into `manifest.json["slo_floors"]` at manifest creation and refuses a reopened manifest whose floors differ. `run` refuses while it is exported in the shell. Never set it by hand. |
 | `CAGE_BUDGET_PLAN_JSON` | `run_campaign.py` (budgeted cell-step env pin), `campaign_session.py`, `campaign_layout.CellWriter` | Batch 2 W4 (ADR-0117): the `cache_budget.BudgetPlan` record of the relaunch the cell runs under (`asdict` plus `floor_table_sha256`), pinned on budgeted cell steps only; cross-checked against the cell tuple by the session and persisted into `cell.json["budget_plan"]` (the rho_own basis). `run` refuses while it is exported in the shell. Never set it by hand. |

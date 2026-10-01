@@ -336,8 +336,13 @@ fi
 #     installed at exactly its pinned version, and — once B2's lockfile exists
 #     (requirements.lock.gpu.txt) — the full locked set must match. Runs with
 #     the SAME python3 every other gate probes (the activated cage-env).
+#     ADR-0126 (S0F-1): `pip check` lines listed in
+#     scripts/checks/pip_check_allowlist.txt (exact text, reason, ADR id) are
+#     printed as accepted deviations; any other line still fails.
 echo "[gate i] environment-vs-registration (interpreter + Tier-1 pins + pip check)..."
 if ! python3 - "$CAGE_CANONICAL_PYTHON" "$CAGE_ROOT" <<'PY'
+# CAGE-ENV-REGISTRATION-GATE (extracted and executed against a fake pip by
+# tests/test_gate_i_allowlist_s0f1.py).
 import importlib.metadata as md
 import re
 import subprocess
@@ -393,13 +398,56 @@ if lock.is_file():
 else:
     print("  [note] requirements.lock.gpu.txt absent (B2 pending; minted at S0)")
 
+#: ADR-0126 (S0F-1): accepted `pip check` lines, keyed by their exact text.
+#: Entry format: `<pip check line> ## <reason> ## ADR-NNNN`; a malformed entry
+#: fails the gate (an exception without a reason or an ADR id is not recorded).
+_ADR = re.compile(r"^ADR-\d{4}$")
+_ALLOWLIST = root / "scripts" / "checks" / "pip_check_allowlist.txt"
+
+
+def read_allowlist(path):
+    accepted = {}
+    if not path.is_file():
+        print(f"  [note] {path.name} absent: no pip check deviation is accepted")
+        return accepted
+    for n, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p.strip() for p in line.split(" ## ")]
+        if len(parts) != 3 or not all(parts) or not _ADR.match(parts[2]):
+            pf(f"{path.name}:{n}: entry is not `<pip check line> ## <reason> "
+               f"## ADR-NNNN`: {line!r}")
+            continue
+        accepted[parts[0]] = (parts[1], parts[2])
+    return accepted
+
+
+allow = read_allowlist(_ALLOWLIST)
 res = subprocess.run(
     [sys.executable, "-m", "pip", "check"], capture_output=True, text=True
 )
-if res.returncode != 0:
-    pf(f"pip check reports broken requirements:\n{res.stdout.strip()}")
-else:
+if res.returncode == 0:
     print("  [ok] pip check clean")
+else:
+    reported = [ln.strip() for ln in res.stdout.splitlines() if ln.strip()]
+    rejected = []
+    for line in reported:
+        if line in allow:
+            reason, adr = allow[line]
+            print(f"  [accepted] {line} ({adr}: {reason})")
+        else:
+            rejected.append(line)
+    if rejected:
+        pf("pip check reports broken requirements:\n" + "\n".join(rejected))
+    elif not reported:
+        # pip writes its own metadata parse errors to stderr only (rc 1, empty
+        # stdout): never a silent pass.
+        pf(f"pip check exited {res.returncode} with no report on stdout "
+           f"(stderr: {res.stderr.strip() or 'empty'})")
+    elif ok:
+        print(f"  [ok] pip check: {len(reported)} accepted deviation(s), "
+              f"nothing else reported")
 
 sys.exit(0 if ok else 1)
 PY

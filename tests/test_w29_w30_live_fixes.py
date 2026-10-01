@@ -86,6 +86,9 @@ def stub_bin(tmp_path_factory: pytest.TempPathFactory) -> Path:
         "nvidia-smi": "#!/bin/sh\nexit 1\n",
         "pkill": "#!/bin/sh\nexit 0\n",
         "vllm": "#!/bin/sh\nexit 0\n",
+        # ADR-0128: the pd launcher's nixl import gate probes CAGE_PD_PYTHON
+        # before composing anything; this host has no nixl, so the stub answers ok.
+        "pd_python_stub": "#!/bin/sh\ncat >/dev/null\necho ok\nexit 0\n",
     }.items():
         p = d / name
         p.write_text(body, encoding="utf-8")
@@ -97,6 +100,7 @@ def _run(script: Path, stub_bin: Path, *args: str, **env_extra: str) -> subproce
     env = _clean_env(**env_extra)
     env["PATH"] = f"{stub_bin}:{env.get('PATH', '/usr/bin:/bin')}"
     env.setdefault("VLLM_START_TIMEOUT", "0")
+    env.setdefault("CAGE_PD_PYTHON", str(stub_bin / "pd_python_stub"))
     return subprocess.run(["bash", str(script), *args], capture_output=True, text=True, env=env, timeout=120)
 
 

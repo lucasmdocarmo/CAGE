@@ -113,6 +113,16 @@ seaborn==0.13.2
 jupyter>=1.0.0
 pandas==3.0.3
 numpy==2.5.1
+# numba: exact pin, co-resolved with vllm==0.19.1 on the GPU host and tested at
+# S0 (2026-09-30) and in this venv. vLLM 0.19.1 declares numba==0.61.2, which
+# needs numpy<2.3 and cannot coexist with numpy==2.5.1 above, so pip resolves a
+# newer numba on every pod; numba 0.68.0 appeared on PyPI on 2026-09-30, so an
+# unpinned pod would drift from the S0-tested 0.67.0. vLLM imports numba only
+# in the ngram speculative proposer (retired by the charter). The one resulting
+# `pip check` line is accepted by preflight gate (i) through
+# scripts/checks/pip_check_allowlist.txt (ADR-0126, S0F-1). No vLLM release
+# through 0.30.0 accepts numpy 2.5.1 (all pin numba 0.65.0, numpy<2.5).
+numba==0.67.0
 
 # Utilities (Tier 3)
 loguru>=0.7.2

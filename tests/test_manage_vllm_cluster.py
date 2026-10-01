@@ -26,6 +26,7 @@ and readiness seams.
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
 import sys
 from pathlib import Path
@@ -259,10 +260,11 @@ def wired(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> _Launches:
     monkeypatch.setattr(mc, "LOG_DIR", tmp_path / "cluster")
     monkeypatch.setattr(mc, "STATE_FILE", tmp_path / "cluster" / "cluster_state.json")
     monkeypatch.setattr(mc, "launch_process", launches)
-    monkeypatch.setattr(mc, "wait_for", lambda predicate, timeout, label: None)
+    monkeypatch.setattr(mc, "wait_for", lambda predicate, timeout, label, **kw: 0.0)
     monkeypatch.setattr(mc, "is_pid_running", lambda pid: True)
     monkeypatch.setattr(mc, "replica_ready", lambda api_base, model: True)
     monkeypatch.setattr(mc, "terminate_process_group", lambda *a, **k: None)
+    monkeypatch.setattr(mc, "refuse_bound_ports", lambda ports: None)
     monkeypatch.setattr(
         mc, "fetch_router_stats",
         lambda url: {"num_replicas": mc._EXPECTED_REPLICAS, "distinct_api_bases": mc._EXPECTED_REPLICAS},
@@ -270,6 +272,11 @@ def wired(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> _Launches:
     monkeypatch.setattr(mc.importlib.util, "find_spec", lambda name: object())
     monkeypatch.delenv("VLLM_GPU_MEMORY_UTILIZATION", raising=False)
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    # ADR-0124 (S0F-19): shared mode REQUIRES the per-replica KV pin; the wired
+    # starts below carry the S0 pd value so the shared cases keep launching.
+    monkeypatch.setenv(mc.KV_BUDGET_ENV, "5713920000")
+    monkeypatch.delenv("CAGE_KV_BUDGET_BYTES", raising=False)
+    monkeypatch.delenv("CAGE_VLLM_GPU_BLOCKS_OVERRIDE", raising=False)
     return launches
 
 
@@ -382,3 +389,441 @@ def test_main_reports_gpu_share_refusal_as_error_exit_1(
     err = capsys.readouterr().err
     assert "Error:" in err and "vLLM startup check" in err
     assert wired.calls == []
+
+
+# ---------------------------------------------------------------------------
+# 6. ADR-0124 (S0F-19): the per-replica KV byte pin and the sequential start
+# ---------------------------------------------------------------------------
+
+
+def test_kv_budget_env_and_typed_refusal() -> None:
+    assert mc.KV_BUDGET_ENV == "CAGE_KV_BUDGET_BYTES_REPLICA"
+    assert issubclass(mc.KvBudgetError, ValueError)
+
+
+def test_resolve_kv_budget_shared_requires_the_pin() -> None:
+    with pytest.raises(mc.KvBudgetError) as excinfo:
+        mc.resolve_kv_budget(mode="shared", env={})
+    msg = str(excinfo.value)
+    assert "CAGE_KV_BUDGET_BYTES_REPLICA" in msg and "--kv-cache-memory-bytes" in msg
+    assert "pd" in msg.lower()  # the precedent the operator already knows
+    assert mc.resolve_kv_budget(mode="shared", env={"CAGE_KV_BUDGET_BYTES_REPLICA": "5713920000"}) == 5713920000
+    assert mc.resolve_kv_budget(mode="distinct", env={}) is None
+    assert mc.resolve_kv_budget(mode="distinct", env={"CAGE_KV_BUDGET_BYTES_REPLICA": " 42 "}) == 42
+    # empty is unset, like the bash launchers
+    assert mc.resolve_kv_budget(mode="distinct", env={"CAGE_KV_BUDGET_BYTES_REPLICA": "  "}) is None
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "1.5", "1e9", "abc", "5_000"])
+def test_resolve_kv_budget_refuses_bad_values(bad: str) -> None:
+    with pytest.raises(mc.KvBudgetError) as excinfo:
+        mc.resolve_kv_budget(mode="shared", env={"CAGE_KV_BUDGET_BYTES_REPLICA": bad})
+    assert "positive integer" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("clash", ["CAGE_KV_BUDGET_BYTES", "CAGE_VLLM_GPU_BLOCKS_OVERRIDE"])
+def test_resolve_kv_budget_refuses_single_instance_knobs_alongside(clash: str) -> None:
+    # Mirrors manage_vllm_pd.sh: two caps for the same pools is a refusal, never
+    # a precedence rule.
+    env = {"CAGE_KV_BUDGET_BYTES_REPLICA": "100", clash: "7"}
+    with pytest.raises(mc.KvBudgetError) as excinfo:
+        mc.resolve_kv_budget(mode="distinct", env=env)
+    assert clash in str(excinfo.value)
+
+
+def test_build_serve_args_places_the_kv_pin_before_the_log_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_DISABLE_LOG_REQUESTS", "0")
+    args = mc.build_serve_args("fake/model", 8101, gpu_memory_utilization="0.45", kv_budget_bytes=123)
+    i = args.index("--kv-cache-memory-bytes")
+    assert args[i + 1] == "123"
+    assert i > args.index("--gpu-memory-utilization")
+    assert args[-1] == "--enable-log-requests"  # the W29 contract: the log flag stays last
+    assert "--kv-cache-memory-bytes" not in mc.build_serve_args(
+        "fake/model", 8101, gpu_memory_utilization="0.90", kv_budget_bytes=None
+    )
+
+
+def test_start_shared_without_pin_refuses_before_touching_any_process(
+    wired: _Launches, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(mc.KV_BUDGET_ENV, raising=False)
+    stops: List[bool] = []
+    monkeypatch.setattr(mc, "stop_cluster", lambda *a, **k: stops.append(True) or 0)
+    with pytest.raises(mc.KvBudgetError):
+        _start(2, None)
+    assert wired.calls == [] and stops == []
+    assert not mc.STATE_FILE.exists()
+
+
+def test_start_shared_pins_every_replica_and_records_it(
+    wired: _Launches, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _start(2, None)
+    out = capsys.readouterr().out
+    assert "kv-cache-memory-bytes 5713920000" in out or "5713920000" in out
+    replica_cmds = [cmd for cmd, _ in wired.calls if cmd[:2] == ["vllm", "serve"]]
+    assert len(replica_cmds) == 2
+    for cmd in replica_cmds:
+        assert cmd[cmd.index("--kv-cache-memory-bytes") + 1] == "5713920000"
+    state = mc.load_state()
+    assert state["kv_budget_bytes"] == 5713920000
+    assert state["start_order"] == "sequential"
+
+
+def test_start_distinct_without_pin_keeps_the_legacy_argv(wired: _Launches, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(mc.KV_BUDGET_ENV, raising=False)
+    _start(2, "0,1")
+    replica_cmds = [cmd for cmd, _ in wired.calls if cmd[:2] == ["vllm", "serve"]]
+    assert all("--kv-cache-memory-bytes" not in cmd for cmd in replica_cmds)
+    state = mc.load_state()
+    assert state["kv_budget_bytes"] is None
+    assert state["start_order"] == "concurrent"
+
+
+def _events_start(monkeypatch: pytest.MonkeyPatch, wired: _Launches, replicas: int, pins: Optional[str]) -> List[Tuple[str, str]]:
+    events: List[Tuple[str, str]] = []
+
+    def _launch(cmd: List[str], log_path: Path, env: Optional[Dict[str, str]] = None) -> int:
+        label = cmd[cmd.index("--port") + 1] if "--port" in cmd else "router"
+        events.append(("launch", label))
+        return wired(cmd, log_path, env)
+
+    def _wait(predicate, timeout, label, **kw) -> float:
+        events.append(("wait", label.split(" on ")[0]))
+        return 0.0
+
+    monkeypatch.setattr(mc, "launch_process", _launch)
+    monkeypatch.setattr(mc, "wait_for", _wait)
+    _start(replicas, pins)
+    return events
+
+
+def test_start_shared_launches_replicas_one_at_a_time(wired: _Launches, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Spec 9 option C: on a shared GPU replica k+1 launches only after replica k
+    answered, so vLLM's init-time fraction check meets a settled device."""
+    events = _events_start(monkeypatch, wired, 3, None)
+    assert events[:6] == [
+        ("launch", "8001"), ("wait", "replica-1"),
+        ("launch", "8002"), ("wait", "replica-2"),
+        ("launch", "8003"), ("wait", "replica-3"),
+    ]
+    assert events[6] == ("launch", "router")
+
+
+def test_start_distinct_keeps_the_concurrent_launch(wired: _Launches, monkeypatch: pytest.MonkeyPatch) -> None:
+    events = _events_start(monkeypatch, wired, 2, "0,1")
+    assert events[:4] == [
+        ("launch", "8001"), ("launch", "8002"),
+        ("wait", "replica-1"), ("wait", "replica-2"),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# 7. S0F-18: port probe, fail-fast, env-backed timeouts, default port
+# ---------------------------------------------------------------------------
+
+
+def test_default_base_port_is_off_the_image_nginx_on_start_and_restart() -> None:
+    parser = mc.build_parser()
+    for verb in ("start", "restart"):
+        ns = parser.parse_args([verb, "--model", "m"])
+        assert ns.base_port == 8101, "8001 is the RunPod image's nginx (S0F-18); 8101 was proven live"
+    text = (REPO_ROOT / "scripts" / "3_run" / "run_baselines.sh").read_text(encoding="utf-8")
+    assert "CLUSTER_BASE_PORT=${CLUSTER_BASE_PORT:-8101}" in text
+
+
+def test_port_probe_refuses_a_bound_port_naming_the_holder() -> None:
+    import socket
+
+    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    holder.bind(("0.0.0.0", 0))
+    holder.listen(1)
+    port = holder.getsockname()[1]
+    try:
+        free, reason = mc.port_is_free(port)
+        assert free is False and reason
+        with pytest.raises(mc.PortInUseError) as excinfo:
+            mc.refuse_bound_ports({"replica-1": port})
+        msg = str(excinfo.value)
+        assert f"replica-1 port {port}" in msg and "already bound" in msg
+        assert "holder:" in msg
+        assert "--base-port" in msg and "nginx" in msg
+    finally:
+        holder.close()
+    free, _ = mc.port_is_free(port)
+    assert free is True  # SO_REUSEADDR: the closed listener does not false-refuse
+
+
+def test_start_probes_every_port_after_the_stale_stop_and_before_any_launch(
+    wired: _Launches, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: List[Dict[str, int]] = []
+
+    def _probe(ports: Dict[str, int]) -> None:
+        seen.append(dict(ports))
+        raise mc.PortInUseError("replica-1 port 8001 is already bound")
+
+    monkeypatch.setattr(mc, "refuse_bound_ports", _probe)
+    with pytest.raises(mc.PortInUseError):
+        _start(2, "0,1")
+    assert wired.calls == [], "the probe must precede every launch"
+    assert seen == [{"replica-1": 8001, "replica-2": 8002, "router": 9000}]
+    assert not mc.STATE_FILE.exists()
+
+
+def _parse(argv: List[str]):
+    return mc.build_parser().parse_args(argv)
+
+
+def test_timeout_defaults_come_from_the_launchers_env_knobs() -> None:
+    assert mc.REPLICA_TIMEOUT_ENV == "VLLM_START_TIMEOUT"
+    assert mc.ROUTER_TIMEOUT_ENV == "ROUTER_START_TIMEOUT"
+    ns = _parse(["start", "--model", "m"])
+    assert (ns.replica_timeout, ns.router_timeout) == (None, None)  # resolved in main, not argparse
+    assert mc.resolve_timeouts(ns, {}) == (300, 60)
+    assert mc.resolve_timeouts(ns, {"VLLM_START_TIMEOUT": "900", "ROUTER_START_TIMEOUT": "120"}) == (900, 120)
+    # explicit flags still win
+    ns = _parse(["start", "--model", "m", "--replica-timeout", "5", "--router-timeout", "7"])
+    assert mc.resolve_timeouts(ns, {"VLLM_START_TIMEOUT": "900"}) == (5, 7)
+    # empty is unset (the manager's rule for VLLM_GPU_MEMORY_UTILIZATION too)
+    ns = _parse(["start", "--model", "m"])
+    assert mc.resolve_timeouts(ns, {"VLLM_START_TIMEOUT": "  "}) == (300, 60)
+    # 0 is the bash launchers' and the suite's fail-fast idiom: accepted
+    assert mc.resolve_timeouts(ns, {"VLLM_START_TIMEOUT": "0"}) == (0, 60)
+
+
+@pytest.mark.parametrize("bad", ["abc", "-5", "1.5"])
+def test_malformed_timeout_env_exits_2_on_start_only(
+    wired: _Launches, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], bad: str
+) -> None:
+    monkeypatch.setenv("VLLM_START_TIMEOUT", bad)
+    monkeypatch.setattr(sys, "argv", ["manage_vllm_cluster.py", "start", "--model", "m", "--replicas", "1"])
+    with pytest.raises(SystemExit) as excinfo:
+        mc.main()
+    assert excinfo.value.code == 2
+    assert wired.calls == []
+    assert "usage:" in capsys.readouterr().err  # the start refusal, consumed here
+    # Review 2026-09-30 (MEDIUM 2): stop and status, the cleanup traps' commands,
+    # never read the knob and never exit 2 because of it.
+    monkeypatch.setattr(sys, "argv", ["manage_vllm_cluster.py", "stop"])
+    assert mc.main() == 0
+    monkeypatch.setattr(sys, "argv", ["manage_vllm_cluster.py", "status"])
+    assert mc.main() == 1  # "Cluster is not running."
+    assert "usage:" not in capsys.readouterr().err
+
+
+def test_zero_timeout_env_is_accepted_on_start(wired: _Launches, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: List[int] = []
+
+    def _start(**kw: Any) -> int:
+        seen.append(kw["replica_timeout"])
+        return 0
+
+    monkeypatch.setenv("VLLM_START_TIMEOUT", "0")
+    monkeypatch.setattr(mc, "start_cluster", _start)
+    monkeypatch.setattr(sys, "argv", ["manage_vllm_cluster.py", "start", "--model", "m"])
+    assert mc.main() == 0
+    assert seen == [0]
+
+
+class _FakeChild:
+    def __init__(self, pid: int, rc: Optional[int]) -> None:
+        self.pid = pid
+        self._rc = rc
+
+    def poll(self) -> Optional[int]:
+        return self._rc
+
+
+def test_wait_for_fails_fast_when_the_child_exits(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """S0F-18 run 2: both replicas died at 18:51:13 and the manager waited until
+    19:03:05 (11 min 54 s of billed idle H100) because it never looked at its
+    own children. The wait must raise on the first poll after the exit."""
+    log = tmp_path / "replica-1.log"
+    log.write_text("".join(f"line {i}\n" for i in range(40)), encoding="utf-8")
+    monkeypatch.setitem(mc._CHILDREN, 777001, _FakeChild(777001, 1))
+    with pytest.raises(mc.ChildExitedError) as excinfo:
+        mc.wait_for(lambda: False, 30, "replica-1 on http://localhost:8101", pid=777001, log_path=log)
+    msg = str(excinfo.value)
+    assert "replica-1" in msg and "exit code 1" in msg and str(log) in msg
+    assert "line 39" in msg and "line 10" not in msg  # the tail, not the whole log
+
+
+def test_wait_for_returns_the_elapsed_seconds_when_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(mc._CHILDREN, 777002, _FakeChild(777002, None))
+    elapsed = mc.wait_for(lambda: True, 30, "router on http://localhost:9000", pid=777002, log_path=None)
+    assert isinstance(elapsed, float) and 0.0 <= elapsed < 2.0
+
+
+def test_is_pid_running_reports_a_reaped_child_as_dead(monkeypatch: pytest.MonkeyPatch) -> None:
+    import os as _os
+
+    me = _os.getpid()  # os.kill(me, 0) succeeds, so only the child table can say "dead"
+    monkeypatch.setitem(mc._CHILDREN, me, _FakeChild(me, 0))
+    assert mc.is_pid_running(me) is False
+
+
+def test_terminate_process_group_signals_the_group_of_an_exited_leader(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review 2026-09-30 (MEDIUM 1): a replica's `vllm serve` leader can exit while
+    its EngineCore keeps the GPU. The cleanup must signal the GROUP (pgid == pid
+    under start_new_session) even though the leader is dead and reaped."""
+    import os as _os
+    import signal as _signal
+
+    sent: List[Tuple[int, int]] = []
+    alive = {"group": True}
+
+    def _killpg(pgid: int, sig: int) -> None:
+        sent.append((pgid, sig))
+        if sig == 0 and not alive["group"]:
+            raise ProcessLookupError
+        if sig == _signal.SIGTERM:
+            alive["group"] = False
+
+    def _getpgid(pid: int) -> int:
+        raise ProcessLookupError  # the leader is reaped: no pgid lookup possible
+
+    monkeypatch.setattr(_os, "killpg", _killpg)
+    monkeypatch.setattr(_os, "getpgid", _getpgid)
+    monkeypatch.setitem(mc._CHILDREN, 777003, _FakeChild(777003, 3))
+    mc.terminate_process_group(777003, "replica-1", silent=True)
+    assert (777003, _signal.SIGTERM) in sent, "the group must be signaled through pgid == pid"
+    assert (777003, _signal.SIGKILL) not in sent  # the group was gone after SIGTERM
+
+
+def test_terminate_process_group_does_nothing_when_the_group_is_gone(monkeypatch: pytest.MonkeyPatch) -> None:
+    import os as _os
+
+    sent: List[Tuple[int, int]] = []
+
+    def _killpg(pgid: int, sig: int) -> None:
+        sent.append((pgid, sig))
+        raise ProcessLookupError
+
+    monkeypatch.setattr(_os, "killpg", _killpg)
+    monkeypatch.setattr(_os, "getpgid", lambda pid: (_ for _ in ()).throw(ProcessLookupError))
+    monkeypatch.setitem(mc._CHILDREN, 777004, _FakeChild(777004, 0))
+    mc.terminate_process_group(777004, "replica-2", silent=True)
+    assert sent == [(777004, 0)]  # one liveness probe, no signal
+
+
+@pytest.mark.skipif(
+    os.environ.get("CAGE_PROCESS_TESTS") != "1",
+    reason="process-lifecycle test: runs only inside a container (CAGE_PROCESS_TESTS=1), never on the macOS host",
+)
+def test_terminate_process_group_reaches_a_survivor_live(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Live counterpart (container only): a leader that exits leaves a child in
+    its session; the manager's own cleanup must reach that child by group."""
+    import os as _os
+    import time as _time
+
+    monkeypatch.setattr(mc, "LOG_DIR", tmp_path)
+    pid = mc.launch_process(["sh", "-c", "sleep 30 & exit 3"], tmp_path / "x.log")
+    for _ in range(50):
+        if mc.child_exit_code(pid) is not None:
+            break
+        _time.sleep(0.1)
+    assert mc.child_exit_code(pid) == 3
+    mc.terminate_process_group(pid, "leader-exited", silent=True)
+    with pytest.raises(ProcessLookupError):
+        _os.killpg(pid, 0)
+
+
+def test_refuse_bound_ports_sees_a_bound_but_not_listening_socket(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review 2026-09-30 (MEDIUM 3): a vLLM still loading weights holds its port
+    bound without listening; on Linux the SO_REUSEADDR probe would call it free."""
+    monkeypatch.setattr(mc, "_psutil_sockets_on", lambda port: [("CLOSE", 4242)] if port == 48123 else [])
+    with pytest.raises(mc.PortInUseError) as excinfo:
+        mc.refuse_bound_ports({"replica-1": 48123})
+    assert "state CLOSE" in str(excinfo.value) and "4242" in str(excinfo.value)
+    # TIME_WAIT alone is a dead server's leftover: not a refusal
+    monkeypatch.setattr(mc, "_psutil_sockets_on", lambda port: [("TIME_WAIT", None)])
+    mc.refuse_bound_ports({"replica-1": 48124})
+
+
+def test_refuse_bound_ports_refuses_colliding_planned_ports() -> None:
+    with pytest.raises(mc.PortInUseError, match="collide"):
+        mc.refuse_bound_ports({"replica-1": 8998, "replica-2": 8999, "replica-3": 9000, "router": 9000})
+
+
+def test_existing_state_reuse_requires_the_same_kv_pin(
+    wired: _Launches, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Review 2026-09-30 (LOW 5): the KV byte pin is a dial like the GPU pins; a
+    running cluster under another pin is relaunched, never reused."""
+    _start(2, None)
+    n = len(wired.calls)
+    capsys.readouterr()
+    _start(2, None)
+    assert len(wired.calls) == n and "already running" in capsys.readouterr().out
+    monkeypatch.setenv(mc.KV_BUDGET_ENV, "100")
+    _start(2, None)
+    assert len(wired.calls) > n
+
+
+def test_start_prints_ready_after_seconds(wired: _Launches, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr(mc, "wait_for", lambda predicate, timeout, label, **kw: 12.4)
+    _start(1, None)
+    out = capsys.readouterr().out
+    assert "replica-1 ready after 12 s" in out
+    assert "router ready after 12 s" in out
+
+
+# ---------------------------------------------------------------------------
+# 8. S0F-18: run_tests.sh passes the cluster knobs through, RUNBOOK names the listeners
+# ---------------------------------------------------------------------------
+
+
+RUN_TESTS = REPO_ROOT / "scripts" / "checks" / "run_tests.sh"
+
+
+def test_run_tests_cluster_knobs_are_env_backed_and_the_start_line_stays_single() -> None:
+    text = RUN_TESTS.read_text(encoding="utf-8")
+    for knob in ("CAGE_CLUSTER_BASE_PORT", "CAGE_CLUSTER_ROUTER_PORT", "ROUTER_TEST_API_BASE"):
+        assert knob in text, f"run_tests.sh must honor {knob}"
+    assert text.count("manage_vllm_cluster.py start") == 1
+
+
+def _run_tests_with_stub_python(tmp_path: Path, env_extra: Dict[str, str]) -> str:
+    import os as _os
+    import subprocess
+
+    stub_bin = tmp_path / "bin"
+    stub_bin.mkdir(parents=True)
+    argv_log = tmp_path / "argv.log"
+    stub = stub_bin / "python3"
+    stub.write_text(f'#!/bin/sh\necho "$@" >> "{argv_log}"\nexit 0\n', encoding="utf-8")
+    stub.chmod(0o755)
+    env = dict(_os.environ)
+    env.update({
+        "PATH": f"{stub_bin}:{env.get('PATH', '')}",
+        "VIRTUAL_ENV": str(tmp_path),  # keeps PYTHON=python3 (the stub)
+        "CAGE_TESTS_WITH_CLUSTER": "1",
+        "VLLM_TEST_MODEL": "fake/model",
+    })
+    for k in ("CAGE_CLUSTER_BASE_PORT", "CAGE_CLUSTER_ROUTER_PORT", "ROUTER_TEST_API_BASE"):
+        env.pop(k, None)
+    env.update(env_extra)
+    subprocess.run(["bash", str(RUN_TESTS)], env=env, capture_output=True, text=True, timeout=60, cwd=str(REPO_ROOT))
+    return argv_log.read_text(encoding="utf-8") if argv_log.exists() else ""
+
+
+def test_run_tests_appends_the_cluster_flags_only_when_the_knobs_are_set(tmp_path: Path) -> None:
+    plain = _run_tests_with_stub_python(tmp_path / "plain", {})
+    start = [l for l in plain.splitlines() if "manage_vllm_cluster.py start" in l]
+    assert len(start) == 1 and "--base-port" not in start[0] and "--router-port" not in start[0]
+
+    knobbed = _run_tests_with_stub_python(
+        tmp_path / "knobbed", {"CAGE_CLUSTER_BASE_PORT": "8301", "CAGE_CLUSTER_ROUTER_PORT": "9100"}
+    )
+    start = [l for l in knobbed.splitlines() if "manage_vllm_cluster.py start" in l]
+    assert len(start) == 1
+    assert "--base-port 8301" in start[0] and "--router-port 9100" in start[0]
+
+
+def test_runbook_names_the_image_listeners() -> None:
+    text = (REPO_ROOT / "docs" / "RUNBOOK.md").read_text(encoding="utf-8")
+    for port in ("3001", "7270", "7861", "8001", "8081", "9091"):
+        assert port in text, f"docs/RUNBOOK.md must list the RunPod image's nginx listener {port} (S0F-18)"
+    assert "CAGE_CLUSTER_BASE_PORT" in text

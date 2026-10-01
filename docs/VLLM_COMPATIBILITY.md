@@ -148,6 +148,8 @@ Engine pins for the campaign:
 | SGLang | **0.5.10.post1** (PyPI, released 2026-04-08; own venv `sglang-env` created by `scripts/runpod/setup_runpod.sh` step 3c; pins torch 2.9.1 on the CUDA 12.8 runtime, the same line as the pod image and vLLM 0.19.1's torch 2.10.0; pinned 2026-09-26, pre-GO item 10; **sglang-env runs on CPython 3.12 (`SGLANG_PYTHON_VERSION`, ADR-0120, 2026-09-27): SGLang pulls `outlines_core==0.1.26`, which ships no cp313 wheel, and the image has no Rust to build it, while the cp312 wheel exists; served Qwen3-8B live on an L40S on 2026-09-27 after a source build**) | [VERIFY-LIVE at S0-3] incl. **deterministic-mode availability** (T=0 reproducible sampling) per model. Bump rule: every SGLang release since 2026-05 (0.5.11 and later) pins a CUDA 13 torch (2.11 or 2.13); a bump first needs the host driver read on the pod (`nvidia-smi`, setup step 0) to support CUDA 13, then the S0-3 gate again |
 | LMDeploy | **0.17.0** (PyPI, released 2026-09-02; own venv `lmdeploy-env` with torch pinned to 2.10.0 by `LMDEPLOY_TORCH_VERSION`, since the package accepts torch 2.0 to 2.12.1 and pip would otherwise resolve a CUDA 13 build; **TurboMind backend only**; pinned 2026-09-26) | [VERIFY-LIVE at S0-3] gate: TurboMind is actually selected (not the silent PyTorch-engine fallback). **TurboMind weight formats are FP16/BF16, KV INT8, KV INT4 and W4A16 only (supported-models table read 2026-09-26; no FP8 weight path), so the S0 cross-engine rows serve the BF16 `Qwen/Qwen3-8B` on every engine and `Qwen/Qwen3-8B-FP8` runs on vLLM alone for gate (s)** |
 | HF Transformers | TBD — pin `transformers` at session-A preflight (the old `transformers<5` was a 0.11-era workaround; re-verify) | [VERIFY-LIVE] |
+| NIXL (vLLM NixlConnector transfer library, prefill/decode pair) | **0.9.0** (`nixl==0.9.0` + `nixl-cu12==0.9.0`, installed in the same pip call as vLLM by `scripts/runpod/setup_runpod.sh` step 2, `NIXL_VERSION`; ADR-0128, S0F-13, 2026-09-30). The newest release inside vLLM 0.19.1's own declared range (`requirements/kv_connectors.txt`: `>=0.7.1,<0.10.0`); its wheels ship no `nixl_ep`, so nothing is stripped. Not `nixl-cu13`: the pod runs CUDA 12.8 torch and the 0.9.0 dispatcher tries cu13 first when present. Each role gets its own `VLLM_NIXL_SIDE_CHANNEL_PORT` (5600 prefill, 5601 decode; `manage_vllm_pd.sh`), the handshake listener port both roles shared at S0 | [VERIFY-LIVE at Run-C-prime preflight]: 0.9.0 never ran on a pod (S0 proved nixl 1.5.0's core up to engine init; API names and agent-config keywords match). The launcher's import gate refuses a start when `nixl._api` / `nixl._bindings` do not import or a top-level `nixl_ep` is present but broken (the S0 layer-2 crash) |
+| numba (vLLM 0.19.1 dependency; used only by the ngram speculative proposer, retired by the charter) | **0.67.0** (`requirements.txt`, exact; the version S0 ran on 2026-09-30). vLLM declares `numba==0.61.2` (numpy<2.3), which cannot coexist with the Tier-1 `numpy==2.5.1`; preflight gate (i) accepts the one resulting `pip check` line through `scripts/checks/pip_check_allowlist.txt` (ADR-0126, S0F-1) and fails on any other line, including the 0.68.0 drift | PINNED; no vLLM release through 0.30.0 accepts numpy 2.5.1 (all pin numba 0.65.0), so a vLLM bump does not clear the line |
 
 The matrix (cell = supported? · pin · preflight gate):
 
@@ -215,6 +217,14 @@ stop, re-run the five-check smoke.
 
 The transfer stack is pinned as a **triple — (vLLM, NIXL wheel, UCX)** — recorded
 together in the manifest; bump any element → re-run this whole section.
+
+Current triple (ADR-0128, 2026-09-30): vLLM 0.19.1; NIXL 0.9.0 (`nixl` + `nixl-cu12`,
+section 7 row); UCX as bundled by that wheel (version read live at the Run-C-prime
+preflight and written to the per-role serving-config capture). The launcher records
+every `UCX_*` variable the operator sets in that capture (`ucx_env`) and exports none
+itself: the intra-node TCP rung runs on UCX's own transport selection, while the RDMA
+rung sets the 8.3 allowlist by hand. The S0 `UCX ... IB` line was a warning printed by
+the decode that reached ready, not a failure.
 
 - **UCX backend, NOT LIBFABRIC** (vLLM issue #27055: the LIBFABRIC path is broken/
   unsupported for NixlConnector) [revalidate on 0.19.1].

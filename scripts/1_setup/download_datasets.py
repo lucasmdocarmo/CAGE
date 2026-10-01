@@ -58,6 +58,17 @@ PILOT_EXTRA_KEYS = ["crag", "natural_questions", "trivia_qa"]
 #: Instrument-calibration anchors (staged only on explicit request).
 CALIBRATION_KEYS = ["ragtruth", "true"]
 
+#: ADR-0127 (S0F-5): Hub revisions pinned per HF path. datasets 4.x refuses
+#: allenai/qasper's loading script, so it is staged from the Hub's parquet
+#: export at the converter commit the loader reads at run time
+#: (src/data/loader.py QASPER_REVISION; tests/test_qasper_revision_s0f5.py pins
+#: the two values equal). In offline mode datasets ignores `revision`, so the
+#: staged cache and the run-time call must name one commit. Paths absent here
+#: are staged exactly as before (no revision argument).
+DATASET_REVISIONS: Dict[str, str] = {
+    "allenai/qasper": "06806e4608976fc2fac0a090ac425d5b2b29caf4",
+}
+
 
 def _true_anchor_specs() -> List[Tuple[str, Optional[str]]]:
     """Parse CAGE_TRUE_HF_SPECS ("path[:config],..." — HF paths never contain
@@ -105,14 +116,20 @@ def dataset_specs() -> DatasetSpecs:
     }
 
 
-def download_dataset(name: str, config: str = None, split: str = None) -> None:
-    """Download a single dataset from HuggingFace."""
-    print(f"Downloading {name}" + (f" ({config})" if config else "") + "...")
+def download_dataset(name: str, config: str = None, split: str = None,
+                     revision: Optional[str] = None) -> None:
+    """Download a single dataset from HuggingFace (`revision` = a pinned Hub
+    commit, passed only when DATASET_REVISIONS names one for this path)."""
+    print(f"Downloading {name}" + (f" ({config})" if config else "")
+          + (f" @ {revision}" if revision else "") + "...")
+    kwargs = {"split": split}
+    if revision:
+        kwargs["revision"] = revision
     try:
         if config:
-            dataset = load_dataset(name, config, split=split)
+            dataset = load_dataset(name, config, **kwargs)
         else:
-            dataset = load_dataset(name, split=split)
+            dataset = load_dataset(name, **kwargs)
 
         if split:
             print(f"✓ {name} downloaded ({len(dataset)} examples in {split} split)")
@@ -161,7 +178,8 @@ def main() -> int:
     for name, spec_list in selected:
         for dataset_name, config in spec_list:
             try:
-                download_dataset(dataset_name, config)
+                download_dataset(dataset_name, config,
+                                 revision=DATASET_REVISIONS.get(dataset_name))
             except Exception as e:
                 print(f"\nWarning: Skipping {name} ({dataset_name}) due to error\n")
                 failed.append((name, e))

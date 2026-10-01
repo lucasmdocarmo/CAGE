@@ -120,14 +120,25 @@ def stub_bin(tmp_path_factory: pytest.TempPathFactory) -> Path:
     d = tmp_path_factory.mktemp("stub_bin")
     # The vllm stub journals the env it was launched with (A1 / S0-20: the
     # per-role GPU pin must ride CUDA_VISIBLE_DEVICES in the child env and
-    # nowhere else) when CAGE_TEST_VLLM_JOURNAL names a file.
+    # nowhere else; S0F-13: the per-role NIXL side-channel port likewise) when
+    # CAGE_TEST_VLLM_JOURNAL names a file.
     vllm_stub = (
         "#!/bin/sh\n"
         'if [ -n "${CAGE_TEST_VLLM_JOURNAL:-}" ]; then\n'
-        "  printf 'CUDA_VISIBLE_DEVICES=%s args=%s\\n' "
-        '"${CUDA_VISIBLE_DEVICES-unset}" "$*" >> "$CAGE_TEST_VLLM_JOURNAL"\n'
+        "  printf 'CUDA_VISIBLE_DEVICES=%s args=%s nixl_port=%s\\n' "
+        '"${CUDA_VISIBLE_DEVICES-unset}" "$*" "${VLLM_NIXL_SIDE_CHANNEL_PORT-unset}" '
+        '>> "$CAGE_TEST_VLLM_JOURNAL"\n'
         "fi\n"
         "exit 0\n"
+    )
+    # The interpreter the nixl import gate probes (CAGE_PD_PYTHON): drains the
+    # probe script, then answers with CAGE_TEST_PD_PY_MSG / CAGE_TEST_PD_PY_RC
+    # (default: "ok", 0 -- the gate passes, as on a pod with nixl 0.9.0).
+    pd_python_stub = (
+        "#!/bin/sh\n"
+        "cat >/dev/null\n"
+        'echo "${CAGE_TEST_PD_PY_MSG:-ok}"\n'
+        'exit "${CAGE_TEST_PD_PY_RC:-0}"\n'
     )
     for name, body in {
         "pgrep": "#!/bin/sh\nexit 1\n",
@@ -135,6 +146,7 @@ def stub_bin(tmp_path_factory: pytest.TempPathFactory) -> Path:
         "nvidia-smi": "#!/bin/sh\nexit 1\n",
         "pkill": "#!/bin/sh\nexit 0\n",
         "vllm": vllm_stub,
+        "pd_python_stub": pd_python_stub,
     }.items():
         p = d / name
         p.write_text(body, encoding="utf-8")
@@ -148,6 +160,9 @@ def _run_pd(stub_bin: Path, *args: str, **env_extra: str):
     # TIMEOUT=0: the launcher composes + echoes BOTH instances' argv, then
     # fails the readiness wait fast — the echo is what we assert.
     env.setdefault("VLLM_START_TIMEOUT", "0")
+    # S0F-13: the nixl import gate probes CAGE_PD_PYTHON; the stub passes by
+    # default (a pod with nixl 0.9.0), refusal tests flip CAGE_TEST_PD_PY_RC.
+    env.setdefault("CAGE_PD_PYTHON", str(stub_bin / "pd_python_stub"))
     return subprocess.run(
         ["bash", str(PD_SH), *args],
         capture_output=True, text=True, env=env, timeout=120,
@@ -618,6 +633,184 @@ def test_status_reports_pending_data_path_never_pass(stub_bin: Path) -> None:
     # must be there regardless (a pending check reports PENDING, never PASS).
     assert proc.returncode != 0
     assert "PENDING [VERIFY-LIVE at Run-C-prime preflight]" in proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# 2b. S0F-13 (ADR-0128): nixl install pins, per-role side-channel ports, the
+# import gate before the self-cleaning stop, and the joint liveness wait.
+# S0 facts (MyDocs/RunPod/S0_RUN_2026-09-30.md, backlog S0F-13): nothing
+# installed nixl (layer 1); the nixl 1.x wheels ship nixl_ep built for torch
+# 2.11+ and vLLM imports it on sight (layer 2); both roles defaulted
+# VLLM_NIXL_SIDE_CHANNEL_PORT to 5600 on one host and the prefill's handshake
+# listener died EADDRINUSE (layer 3); attempts 1 and 2 waited 11 min each on
+# dead role processes.
+# ---------------------------------------------------------------------------
+
+SETUP_RUNPOD_SH = REPO_ROOT / "scripts" / "runpod" / "setup_runpod.sh"
+VLLM_COMPAT_MD = REPO_ROOT / "docs" / "VLLM_COMPATIBILITY.md"
+RUNBOOK_MD = REPO_ROOT / "docs" / "RUNBOOK.md"
+
+
+def test_setup_installs_nixl_0_9_0_in_the_vllm_pip_call() -> None:
+    text = SETUP_RUNPOD_SH.read_text(encoding="utf-8")
+    assert 'NIXL_VERSION="${NIXL_VERSION:-0.9.0}"' in text
+    # one pip call: vLLM's resolver sees the connector wheels at install time
+    assert ('pip install "vllm==${VLLM_VERSION}" "nixl==${NIXL_VERSION}" '
+            '"nixl-cu12==${NIXL_VERSION}"') in text, (
+        "step 2 must install vllm, nixl and nixl-cu12 in ONE pip call")
+    # the pod runs CUDA 12.8 torch; the 0.9.0 dispatcher tries cu13 first when present
+    assert '"nixl-cu13==' not in text
+
+
+def test_compatibility_doc_pins_the_same_nixl_version() -> None:
+    doc = VLLM_COMPAT_MD.read_text(encoding="utf-8")
+    script = SETUP_RUNPOD_SH.read_text(encoding="utf-8")
+    pinned = re.search(r'NIXL_VERSION="\$\{NIXL_VERSION:-([^}]+)\}"', script).group(1)
+    row = [ln for ln in doc.splitlines() if ln.startswith("| NIXL")]
+    assert len(row) == 1, "section 7 engine-pin table needs exactly one NIXL row"
+    assert f"**{pinned}**" in row[0]
+    assert "nixl-cu12" in row[0] and "VLLM_NIXL_SIDE_CHANNEL_PORT" in doc
+
+
+def test_runbook_carries_the_no_overlapping_stop_rule() -> None:
+    text = RUNBOOK_MD.read_text(encoding="utf-8")
+    assert "never run a pd `stop` while another chain's `start` is live" in text
+    assert "UCX_LOG_LEVEL=info" in text
+
+
+def test_start_gives_each_role_its_own_side_channel_port(stub_bin: Path, tmp_path: Path) -> None:
+    journal = tmp_path / "vllm_journal.txt"
+    proc = _run_pd(
+        stub_bin, "start", "fake/test-model",
+        CAGE_RUN_ROOT=str(tmp_path), CAGE_TEST_VLLM_JOURNAL=str(journal), **GOOD_BUDGETS,
+    )
+    lines = _read_journal(journal, 2)
+    prefill = [ln for ln in lines if "--port 8100" in ln]
+    decode = [ln for ln in lines if "--port 8200" in ln]
+    assert len(prefill) == 1 and len(decode) == 1, lines
+    assert prefill[0].endswith(" nixl_port=5600")
+    assert decode[0].endswith(" nixl_port=5601")
+    # the banner says so, and the per-role capture records it
+    assert "nixl side channel: prefill=tcp://localhost:5600 decode=tcp://localhost:5601" in proc.stdout
+    cfg_dir = tmp_path / "observability" / "serving_configs"
+    pcap = json.loads(next(cfg_dir.glob("*_pd-prefill.json")).read_text(encoding="utf-8"))
+    dcap = json.loads(next(cfg_dir.glob("*_pd-decode.json")).read_text(encoding="utf-8"))
+    assert pcap["nixl_side_channel_port"] == 5600
+    assert dcap["nixl_side_channel_port"] == 5601
+    # part 5 (record only): no UCX_* set -> an empty record, never an export
+    assert pcap["ucx_env"] == {} and dcap["ucx_env"] == {}
+    assert "UCX_TLS" not in prefill[0] and "UCX_TLS" not in decode[0]
+
+
+def test_side_channel_port_overrides_and_ucx_record(stub_bin: Path, tmp_path: Path) -> None:
+    journal = tmp_path / "vllm_journal.txt"
+    _run_pd(
+        stub_bin, "start", "fake/test-model",
+        CAGE_RUN_ROOT=str(tmp_path), CAGE_TEST_VLLM_JOURNAL=str(journal),
+        CAGE_PD_NIXL_PORT_PREFILL="5700", CAGE_PD_NIXL_PORT_DECODE="5701",
+        UCX_LOG_LEVEL="info", **GOOD_BUDGETS,
+    )
+    lines = _read_journal(journal, 2)
+    assert any(ln.endswith(" nixl_port=5700") and "--port 8100" in ln for ln in lines), lines
+    assert any(ln.endswith(" nixl_port=5701") and "--port 8200" in ln for ln in lines), lines
+    cfg_dir = tmp_path / "observability" / "serving_configs"
+    pcap = json.loads(next(cfg_dir.glob("*_pd-prefill.json")).read_text(encoding="utf-8"))
+    assert pcap["nixl_side_channel_port"] == 5700
+    # the operator's UCX_* values are RECORDED (ADR-0128 part 5), nothing added
+    assert pcap["ucx_env"] == {"UCX_LOG_LEVEL": "info"}
+
+
+@pytest.mark.parametrize(
+    "env, needle",
+    [
+        ({"CAGE_PD_NIXL_PORT_PREFILL": "5700", "CAGE_PD_NIXL_PORT_DECODE": "5700"}, "EADDRINUSE"),
+        ({"CAGE_PD_NIXL_PORT_PREFILL": "8200"}, "8200"),            # equals the decode HTTP port
+        ({"CAGE_PD_NIXL_PORT_DECODE": "abc"}, "CAGE_PD_NIXL_PORT_DECODE"),
+        ({"CAGE_PD_NIXL_PORT_PREFILL": "0"}, "CAGE_PD_NIXL_PORT_PREFILL"),
+        ({"VLLM_NIXL_SIDE_CHANNEL_PORT": "5600"}, "VLLM_NIXL_SIDE_CHANNEL_PORT"),  # the launcher owns it
+    ],
+    ids=["equal-roles", "collides-with-http", "non-numeric", "zero", "ambient-env"],
+)
+def test_start_refuses_side_channel_port_misconfiguration(
+    stub_bin: Path, env: Dict[str, str], needle: str
+) -> None:
+    proc = _run_pd(stub_bin, "start", "fake/test-model", **GOOD_BUDGETS, **env)
+    _assert_refused_before_anything(proc)
+    assert needle in proc.stderr, proc.stderr
+
+
+def test_import_gate_passes_and_is_printed(stub_bin: Path) -> None:
+    proc = _run_pd(stub_bin, "start", "fake/test-model", **GOOD_BUDGETS)
+    assert "[cage] nixl import gate: ok" in proc.stdout
+    # it ran BEFORE the self-cleaning teardown
+    assert proc.stdout.index("nixl import gate") < proc.stdout.index("Stopping")
+
+
+def test_import_gate_refuses_missing_nixl_before_anything(stub_bin: Path) -> None:
+    proc = _run_pd(
+        stub_bin, "start", "fake/test-model",
+        CAGE_TEST_PD_PY_RC="2", CAGE_TEST_PD_PY_MSG="nixl: ModuleNotFoundError: No module named 'nixl'",
+        **GOOD_BUDGETS,
+    )
+    _assert_refused_before_anything(proc)
+    assert "nixl._api" in proc.stderr and "nixl==0.9.0" in proc.stderr
+    assert "No module named 'nixl'" in proc.stderr  # the probe's own words are shown
+
+
+def test_import_gate_refuses_broken_nixl_ep_before_anything(stub_bin: Path) -> None:
+    proc = _run_pd(
+        stub_bin, "start", "fake/test-model",
+        CAGE_TEST_PD_PY_RC="3", CAGE_TEST_PD_PY_MSG="nixl_ep: ImportError: undefined symbol: torch",
+        **GOOD_BUDGETS,
+    )
+    _assert_refused_before_anything(proc)
+    assert "nixl_ep" in proc.stderr and "undefined symbol" in proc.stderr
+    assert "0.9.0" in proc.stderr  # the fix is named
+
+
+def test_import_gate_probe_text_matches_what_the_connector_imports() -> None:
+    text = PD_SH.read_text(encoding="utf-8")
+    assert "import nixl._api, nixl._bindings" in text
+    assert 'find_spec("nixl_ep")' in text
+
+
+def test_stop_is_never_gated_by_the_import_gate(stub_bin: Path) -> None:
+    proc = _run_pd(stub_bin, "stop", CAGE_TEST_PD_PY_RC="2")
+    assert proc.returncode == 0, proc.stderr
+    assert "Stopping" in proc.stdout and "nixl import gate" not in proc.stdout
+
+
+def test_dead_role_fails_the_start_at_once_with_its_log_tail(stub_bin: Path, tmp_path: Path) -> None:
+    # The stubbed vllm exits at once; with a 20 s budget the old per-role wait
+    # would have burned all of it (S0: 11 min per attempt).
+    import time
+    t0 = time.monotonic()
+    proc = _run_pd(
+        stub_bin, "start", "fake/test-model",
+        VLLM_START_TIMEOUT="20", CAGE_TEST_VLLM_JOURNAL=str(tmp_path / "j.txt"), **GOOD_BUDGETS,
+    )
+    elapsed = time.monotonic() - t0
+    assert proc.returncode != 0
+    assert "exited before serving /health" in proc.stdout
+    assert "last 20 log lines" in proc.stdout
+    assert "not ready within" not in proc.stdout
+    assert elapsed < 12, f"liveness check did not short-circuit the wait ({elapsed:.1f}s)"
+
+
+def test_both_roles_are_launched_before_one_joint_wait(stub_bin: Path, tmp_path: Path) -> None:
+    journal = tmp_path / "vllm_journal.txt"
+    proc = _run_pd(
+        stub_bin, "start", "fake/test-model",
+        CAGE_TEST_VLLM_JOURNAL=str(journal), **GOOD_BUDGETS,
+    )
+    out = proc.stdout
+    assert len(_read_journal(journal, 2)) == 2
+    wait_line = "Waiting for prefill (port 8100) and decode (port 8200)"
+    assert wait_line in out
+    # both argv echoes precede the single wait line
+    assert out.index("Server args [prefill]") < out.index(wait_line)
+    assert out.index("Server args [decode]") < out.index(wait_line)
+    assert out.count("Waiting for") == 1  # one joint loop, no per-role serial waits
 
 
 # ---------------------------------------------------------------------------

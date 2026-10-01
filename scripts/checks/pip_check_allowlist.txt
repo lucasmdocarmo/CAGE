@@ -1,0 +1,9 @@
+# Accepted `pip check` deviations for preflight gate (i) (ADR-0126, S0F-1).
+#
+# One entry per line: <exact pip check line> ## <reason> ## ADR-NNNN
+# Gate (i) compares every stdout line of `pip check` with the first field by
+# exact string equality. A matching line is printed as an accepted deviation;
+# any other line still FAILS the gate, and so does an entry without a reason
+# or an ADR id. Versions are part of the match on purpose: when the installed
+# numba or the vLLM pin moves, the line changes and this entry stops matching.
+vllm 0.19.1 has requirement numba==0.61.2, but you have numba 0.67.0. ## vLLM 0.19.1 pins numba 0.61.2 (numpy<2.3), which cannot coexist with the Tier-1 numpy==2.5.1; vLLM imports numba only in the ngram speculative proposer, retired by the charter (27 S0 engine inits ran speculative_config=None); requirements.txt pins the S0-tested numba 0.67.0 so the line stays exact ## ADR-0126

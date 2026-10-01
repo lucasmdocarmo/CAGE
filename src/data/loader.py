@@ -218,6 +218,20 @@ class HotpotQALoader(DatasetLoader):
         return examples
 
 
+QASPER_REVISION: str = "06806e4608976fc2fac0a090ac425d5b2b29caf4"
+"""ADR-0127 (S0F-5): the Hub's parquet-converter commit for allenai/qasper
+(branch refs/convert/parquet, read 2026-09-30).
+
+datasets 4.x refuses the repo's loading script, so the loader reads the parquet
+export at this commit with no config name (the only config is "default"). The
+route reproduces the S0 50x3 manifest digest end to end
+(tests/test_qasper_revision_s0f5.py). The same pin rides
+scripts/1_setup/download_datasets.py: in offline mode datasets ignores
+``revision`` and serves whatever is cached, so the staged cache and the run-time
+call must name one commit.
+"""
+
+
 class QasperLoader(DatasetLoader):
     """Loader for QASPER (Dasigi et al., NAACL 2021) — charter D5 item 4.
 
@@ -294,7 +308,8 @@ class QasperLoader(DatasetLoader):
         bounds PAPERS, each contributing all its questions)."""
         from datasets import load_dataset  # lazy: see module-level note
 
-        dataset = load_dataset("allenai/qasper", split=self.split)
+        # ADR-0127: the parquet export at the pinned commit (see QASPER_REVISION).
+        dataset = load_dataset("allenai/qasper", split=self.split, revision=QASPER_REVISION)
 
         if max_examples:
             # Seeded shuffle BEFORE select so different seeds (per trial) draw

@@ -50,7 +50,19 @@ if [ "$WITH_CLUSTER" = "1" ]; then
   # Always stop the test cluster on exit so a red test run cannot hold the GPU/port.
   trap '"$PYTHON" scripts/2_serving/manage_vllm_cluster.py stop >/dev/null 2>&1 || true' EXIT
   "$PYTHON" scripts/2_serving/manage_vllm_cluster.py stop || true
-  "$PYTHON" scripts/2_serving/manage_vllm_cluster.py start --model "$VLLM_TEST_MODEL" --replicas 1
+  # S0F-18: the port knobs ride the env (every unknown token above goes to pytest,
+  # so value flags here would need a stateful parser). The readiness budgets ride
+  # VLLM_START_TIMEOUT / ROUTER_START_TIMEOUT, which the manager reads itself.
+  CLUSTER_ARGS=()
+  if [ -n "${CAGE_CLUSTER_BASE_PORT:-}" ]; then
+    CLUSTER_ARGS+=( --base-port "$CAGE_CLUSTER_BASE_PORT" )
+  fi
+  if [ -n "${CAGE_CLUSTER_ROUTER_PORT:-}" ]; then
+    CLUSTER_ARGS+=( --router-port "$CAGE_CLUSTER_ROUTER_PORT" )
+    # tests/test_router_integration.py dials ROUTER_TEST_API_BASE (default :9000)
+    export ROUTER_TEST_API_BASE="${ROUTER_TEST_API_BASE:-http://localhost:${CAGE_CLUSTER_ROUTER_PORT}}"
+  fi
+  "$PYTHON" scripts/2_serving/manage_vllm_cluster.py start --model "$VLLM_TEST_MODEL" --replicas 1 ${CLUSTER_ARGS[@]+"${CLUSTER_ARGS[@]}"}
 else
   log "local mode: running pytest with NO GPU/cluster requirement (--with-cluster opts in)"
 fi

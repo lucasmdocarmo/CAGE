@@ -77,7 +77,8 @@ else
 fi
 SEED=${SEED:-42}
 VLLM_PORT=${VLLM_PORT:-8000}
-CLUSTER_BASE_PORT=${CLUSTER_BASE_PORT:-8001}
+# S0F-18: 8001 is the RunPod image's nginx; the cluster manager's default moved to 8101.
+CLUSTER_BASE_PORT=${CLUSTER_BASE_PORT:-8101}
 ROUTER_REPLICAS_COUNT=${ROUTER_REPLICAS_COUNT:-3}
 ROUTER_PORT=${ROUTER_PORT:-9000}
 # Default OFF on a single L4: the distributed (3-replica router) family is a Phase-3

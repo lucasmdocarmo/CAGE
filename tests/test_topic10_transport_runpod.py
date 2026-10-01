@@ -610,8 +610,10 @@ def test_setup_runpod_is_container_shaped() -> None:
     assert re.search(r"^\s*python3 -m venv", text, re.M) is None, (
         "the venv must be created with the canonical interpreter, never bare python3"
     )
-    assert re.search(r'^\s*"\$PYBIN" -m venv cage-env', text, re.M), (
-        "the cage-env venv must come from $PYBIN"
+    # ADR-0125 (S0F-6): the venv lives at its real container-disk path under
+    # CAGE_VENV_ROOT and is linked at the repo root; still created from $PYBIN.
+    assert re.search(r'^\s*"\$PYBIN" -m venv "\$CAGE_VENV_ROOT/cage-env"', text, re.M), (
+        "the cage-env venv must come from $PYBIN, at its CAGE_VENV_ROOT path"
     )
     assert "pip install -r requirements.txt" in text, "the repo's pinned manifest must be installed"
     assert "cage_stats.api" in text, "the standard verify step must close the bootstrap"

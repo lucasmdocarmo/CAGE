@@ -46,11 +46,25 @@
 #   LMDEPLOY_VERSION      LMDeploy pin override (default: the section 7 pin below; own venv lmdeploy-env)
 #   LMDEPLOY_TORCH_VERSION  torch pinned inside lmdeploy-env (default 2.10.0: vLLM 0.19.1's CUDA 12.8 line)
 #   SKIP_ENGINE_INSTALL=1 bypass the SGLang/LMDeploy venvs (a vLLM-only pod)
+#   CAGE_VENV_ROOT        where the three venvs REALLY live (default /root/cage-venvs, the
+#                         container disk; ADR-0125, S0F-6). The repo-root names cage-env,
+#                         sglang-env and lmdeploy-env are symlinks to them, so every consumer
+#                         keeps its path. On a volume-backed pod the repo is on the MooseFS
+#                         network volume and a venv there costs 20 s per `import vllm`,
+#                         7.5 min per engine start and 79 min per bootstrap (S0, 2026-09-30).
 # =============================================================================
 set -euo pipefail
 
 # Keep in sync with docs/VLLM_COMPATIBILITY.md (the single pinned version).
 VLLM_VERSION="${VLLM_VERSION:-0.19.1}"
+# ADR-0128 (S0F-13, S0 2026-09-30): the NIXL transfer library for the prefill/decode
+# pair, installed in the SAME pip call as vLLM. Nothing installed it at S0 (layer 1), and
+# the nixl 1.x wheels ship nixl_ep built for torch 2.11+, which vLLM imports on sight
+# (layer 2). 0.9.0 is the newest release inside vLLM 0.19.1's own declared range
+# (requirements/kv_connectors.txt: >=0.7.1,<0.10.0) and its wheels contain no nixl_ep.
+# nixl-cu12, not nixl-cu13: the pod runs CUDA 12.8 torch and the 0.9.0 dispatcher tries
+# cu13 first when it is present. Keep in sync with section 7 and manage_vllm_pd.sh NIXL_PIN.
+NIXL_VERSION="${NIXL_VERSION:-0.9.0}"
 # Charter engines #2 and #3 (docs/VLLM_COMPATIBILITY.md section 7; pre-GO item 10,
 # 2026-09-26). Each gets its OWN venv beside cage-env: SGLang pins transformers 5.x
 # against the repo's transformers<5, and every SGLang release since 2026-05 pins a
@@ -72,6 +86,41 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$PROJECT_DIR"
 # shellcheck source=scripts/lib/_common.sh
 source "$PROJECT_DIR/scripts/lib/_common.sh"
+
+# ADR-0125 (S0F-6, live H100 2026-09-30): the venvs live on the container disk, never
+# on the network volume the repo sits on. Measured on S0 against the two local boxes
+# on the same code: bootstrap 79 min vs 7 to 13 min, vLLM launch to API up 246 to 446 s
+# vs 62 to 86 s, `import vllm` 21.9 s; 1.8 to 2.4 h of pod time per S0-sized day. The
+# venvs are created at their REAL paths under CAGE_VENV_ROOT and the repo-root names are
+# links to them (CPython refuses to create a venv through a link and fails on a dangling
+# one, venv/__init__.py, so the real path comes first and the link after). logs/ and
+# results/ stay on the volume: collect_logs.sh finds logs through no link, and logs must
+# outlive a seatbelt kill.
+CAGE_VENV_ROOT="${CAGE_VENV_ROOT:-/root/cage-venvs}"
+link_venv() {
+  # $1 venv name: links $PROJECT_DIR/$1 -> $CAGE_VENV_ROOT/$1. A dangling link (the
+  # container disk was wiped by a pod stop or restart) is re-pointed; a REAL directory
+  # at the repo root (a pre-ADR-0125 venv on the volume) is refused and never deleted.
+  # Returns 1 on refusal (the caller decides whether that is fatal; review 2026-09-30
+  # LOW 4: the engine step stays loud and non-fatal).
+  local name="$1" real="$CAGE_VENV_ROOT/$1" link="$PROJECT_DIR/$1"
+  if [ -e "$link" ] && [ ! -L "$link" ]; then
+    warn "${name}: ${link} is a real directory at the repo root (a venv created on the volume before ADR-0125); move it aside by hand (e.g. mv ${link} ${link}.volume), then rerun this bootstrap. Nothing was deleted."
+    return 1
+  fi
+  if ! ln -sfn "$real" "$link"; then
+    warn "${name}: could not link ${link} -> ${real}"
+    return 1
+  fi
+  echo "[cage]   ${name}: ${link} -> ${real}"
+}
+mkdir -p "$CAGE_VENV_ROOT" || die "CAGE_VENV_ROOT=${CAGE_VENV_ROOT} is not writable (ADR-0125: the venvs live there, on the container disk)"
+# Name every pre-ADR-0125 real venv directory at once, before any work (review LOW 4).
+_real_venv_dirs=""
+for _n in cage-env sglang-env lmdeploy-env; do
+  if [ -e "$PROJECT_DIR/$_n" ] && [ ! -L "$PROJECT_DIR/$_n" ]; then _real_venv_dirs="${_real_venv_dirs} ${_n}"; fi
+done
+[ -z "$_real_venv_dirs" ] || die "real venv directories at the repo root (created on the volume before ADR-0125):${_real_venv_dirs}; move each aside by hand (mv <name> <name>.volume), then rerun. Nothing was deleted."
 
 echo "[cage] ============================================================"
 echo "[cage]  RunPod bootstrap (PRIMARY provider; vLLM ${VLLM_VERSION})"
@@ -163,16 +212,20 @@ command -v "$PYBIN" >/dev/null 2>&1 || [ -x "$PYBIN" ] \
 "$PYBIN" -m venv --help >/dev/null 2>&1 \
   || die "python${CAGE_CANONICAL_PYTHON} exists but its venv module is missing, refusing to continue"
 
-# 1. Isolated virtual environment (canonical interpreter, never bare python3).
-echo "[cage] [1/5] creating venv cage-env with ${PYBIN}..."
-"$PYBIN" -m venv cage-env
+# 1. Isolated virtual environment (canonical interpreter, never bare python3), at its
+#    REAL container-disk path, then linked at the repo root (ADR-0125).
+echo "[cage] [1/5] creating venv cage-env with ${PYBIN} under ${CAGE_VENV_ROOT}..."
+"$PYBIN" -m venv "$CAGE_VENV_ROOT/cage-env"
+link_venv cage-env || die "cage-env could not be linked at the repo root (see the warning above)"
 # shellcheck disable=SC1091
 source cage-env/bin/activate
 pip install --upgrade pip setuptools wheel
 
-# 2. Official pinned vLLM GPU wheel (provides `vllm serve`).
-echo "[cage] [2/5] installing vLLM ${VLLM_VERSION} (GPU wheel)..."
-pip install "vllm==${VLLM_VERSION}"
+# 2. Official pinned vLLM GPU wheel (provides `vllm serve`) plus the NIXL pair for the
+#    prefill/decode launcher (ADR-0128), resolved together so vLLM's own range check
+#    sees them.
+echo "[cage] [2/5] installing vLLM ${VLLM_VERSION} (GPU wheel) + nixl ${NIXL_VERSION} (cu12)..."
+pip install "vllm==${VLLM_VERSION}" "nixl==${NIXL_VERSION}" "nixl-cu12==${NIXL_VERSION}"
 
 # 3. CAGE requirements (the repo's pinned manifest: cage-stats, pynvml,
 #    datasets, transformers, FAISS, the metric stack, ...).
@@ -187,17 +240,21 @@ pip install -U "openai>=2.0"
 # 3c. Charter engines #2 and #3 in their OWN venvs (pre-GO item 10). lmdeploy-env is
 #     created from the canonical interpreter like cage-env; sglang-env from CPython
 #     SGLANG_PYTHON_VERSION (ADR-0120). Both are installed through each venv's own
-#     pip and without a pip cache (the 60 GB container disk also holds the model
-#     prefetch; cage-env stays the active environment for the steps below). Loud and
+#     pip and without a pip cache (the 120 GB container disk holds the three venvs
+#     and the model prefetch, ADR-0125; cage-env stays the active environment for
+#     the steps below). Loud and
 #     non-fatal like the dataset step: the launchers resolve these venvs by
 #     default (manage_sglang_server.sh CAGE_SGLANG_PYTHON, manage_lmdeploy_server.sh
 #     CAGE_LMDEPLOY_BIN) and fail closed at start when one is missing. Idempotent
 #     without deleting anything: an existing venv is reused and pip completes a
 #     killed install on the rerun.
 install_engine_venv() {
-  # $1 venv dir, $2 label, $3.. pip install arguments. The interpreter is the canonical
-  # PYBIN unless the caller sets ENGINE_PYBIN for the call (ADR-0120: sglang-env only).
-  local venv="$1" label="$2"
+  # $1 venv NAME (created at $CAGE_VENV_ROOT/<name> and linked at the repo root,
+  # ADR-0125) or an absolute venv path (used as is, no link); $2 label, $3.. pip
+  # install arguments. The interpreter is the canonical PYBIN unless the caller sets
+  # ENGINE_PYBIN for the call (ADR-0120: sglang-env only).
+  local name="$1" label="$2" venv
+  case "$1" in /*) venv="$1" ;; *) venv="$CAGE_VENV_ROOT/$1" ;; esac
   local pybin="${ENGINE_PYBIN:-$PYBIN}"
   shift 2
   # Rerun guard (review 2026-09-27, MEDIUM 1): `venv` without --clear keeps an existing
@@ -214,10 +271,15 @@ install_engine_venv() {
     fi
   fi
   echo "[cage] [3c] installing ${label} into ${venv} (${pybin})..."
-  if "$pybin" -m venv "$venv" \
-     && "$venv/bin/pip" install --quiet --no-cache-dir --upgrade pip setuptools wheel \
-     && "$venv/bin/pip" install --no-cache-dir "$@"; then
-    return 0
+  if "$pybin" -m venv "$venv"; then
+    # The link lands right after the venv exists, before pip: a rerun after a killed
+    # install then resumes through the same name, and a missing package still fails
+    # closed at the launcher's start gate.
+    case "$name" in /*) : ;; *) link_venv "$name" || return 1 ;; esac
+    if "$venv/bin/pip" install --quiet --no-cache-dir --upgrade pip setuptools wheel \
+       && "$venv/bin/pip" install --no-cache-dir "$@"; then
+      return 0
+    fi
   fi
   warn "${label} install FAILED (${venv}); its launcher refuses to start until this is fixed"
   return 1
@@ -296,6 +358,19 @@ else
   echo "[cage]   all charter datasets staged: ${CHARTER_DATASETS}"
 fi
 
+# 4a-live. ADR-0127 (S0F-5): prove the qasper route on THIS pod. datasets 4.x refuses
+#     allenai/qasper's loading script, so the loader and the stage above read the Hub's
+#     parquet export at one pinned commit; the real library must load it here and the
+#     rebuilt 50x3 manifest must hash to the tracked digest. The fake-module unit tests
+#     prove only the call shape; this is the live proof. Loud and non-fatal like the
+#     stage above: gate (p) refuses an unstaged cache and the loader fails closed.
+echo "[cage] [4a-live] qasper: rebuilding the 50x3 manifest through the pinned Hub route..."
+if CAGE_HF_LIVE=1 python -m pytest tests/test_qasper_revision_s0f5.py -m integration -q -p no:cacheprovider; then
+  echo "[cage]   qasper: the pinned Hub route reproduces data/manifests/qasper_50x3_seed42.json"
+else
+  warn "qasper live digest check FAILED (tests/test_qasper_revision_s0f5.py): do NOT launch a qasper cell until the pinned route reproduces the manifest"
+fi
+
 # 4b. Prefetch model weights ROBUSTLY (bounded by HF_HUB_DOWNLOAD_TIMEOUT above;
 #     the retry loop covers a shard that dies mid-transfer; the vLLM server
 #     start is the backstop, so this is non-fatal by design).
@@ -353,6 +428,8 @@ PY
 echo
 echo "[cage] ============================================================"
 echo "[cage]  RunPod bootstrap complete. Next (docs/RUNBOOK.md lifecycle):"
+echo "[cage]    # venvs live under ${CAGE_VENV_ROOT} (container disk, ADR-0125); the repo-root"
+echo "[cage]    # names cage-env / sglang-env / lmdeploy-env are links to them"
 echo "[cage]    source cage-env/bin/activate"
 echo "[cage]    export CAGE_BACKUP_TARGET=s3://<network-volume-id>[/prefix]   # or ssh://[user@]host/path"
 echo "[cage]    #   (s3 backend: also export CAGE_S3_ENDPOINT=https://s3api-<dc>.runpod.io,"

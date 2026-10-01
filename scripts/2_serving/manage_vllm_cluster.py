@@ -25,7 +25,9 @@ import importlib.util
 import json
 import math
 import os
+import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -39,6 +41,36 @@ import requests
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 LOG_DIR = PROJECT_DIR / "logs" / "cluster"
 STATE_FILE = LOG_DIR / "cluster_state.json"
+
+# S0F-18 (live 2026-09-30): the RunPod image runpod/pytorch:1.0.2-cu1281-torch280-
+# ubuntu2404 runs its own nginx on these ports (8001 forwards to 8000 and its 502
+# page answers HTTP 200), so the old default --base-port 8001 could never bind.
+IMAGE_NGINX_PORTS: Tuple[int, ...] = (3001, 7270, 7861, 8001, 8081, 9091)
+DEFAULT_BASE_PORT: int = 8101   # proven live at S0 run 6; replicas take base..base+N-1
+DEFAULT_ROUTER_PORT: int = 9000
+
+# S0F-18: the readiness budgets read the same env knobs the engine launchers read
+# (manage_vllm_server.sh VLLM_START_TIMEOUT), so one exported value covers every
+# launcher on a slow box; an explicit flag still wins. Empty means unset.
+REPLICA_TIMEOUT_ENV = "VLLM_START_TIMEOUT"
+REPLICA_TIMEOUT_DEFAULT = 300
+ROUTER_TIMEOUT_ENV = "ROUTER_START_TIMEOUT"
+ROUTER_TIMEOUT_DEFAULT = 60
+
+
+def env_timeout_default(name: str, fallback: int, env: Mapping[str, str]) -> int:
+    """The readiness budget for start/restart: ``env[name]`` when set and a
+    non-negative integer (0 = check once, then fail, the bash launchers' and the
+    test suite's idiom), ``fallback`` when unset or blank; anything else raises
+    ValueError (main turns it into exit 2 before any work). Resolved only on
+    start/restart (review 2026-09-30, MEDIUM 2): stop and status, which the
+    cleanup traps call, never read this knob."""
+    raw = (env.get(name) or "").strip()
+    if not raw:
+        return fallback
+    if not raw.isdigit():
+        raise ValueError(f"{name}={raw!r} must be a non-negative integer number of seconds")
+    return int(raw)
 
 
 # =============================================================================
@@ -208,7 +240,73 @@ def resolve_gpu_share(
     return GpuShareDecision(mode, raw, "explicit", tuple(replica_gpus))
 
 
-def build_serve_args(model: str, port: int, *, gpu_memory_utilization: str) -> List[str]:
+# =============================================================================
+# Per-replica KV pool pin  (ADR-0124; S0F-19, live H100 2026-09-30)
+# =============================================================================
+
+KV_BUDGET_ENV = "CAGE_KV_BUDGET_BYTES_REPLICA"
+"""Byte budget of EVERY replica's KV pool, passed as --kv-cache-memory-bytes.
+
+Why a pin and not the fraction: vLLM 0.19.1's memory profiler measures the whole
+device, so two replicas profiling at the same time on one GPU each book the
+other's allocations as their own overhead and the pool collapses (S0: 1.31 GiB
+instead of about 18 GiB at 0.45, both replicas dead at the KV check). With the
+byte pin vLLM skips the profiler (gpu_worker.determine_available_memory); the S0
+pd pair proved it live: two instances at 0.45, 5,713,920,000 B each, started in
+the same second, identical 38,736-token pools. The pd launcher's per-role
+contract (CAGE_KV_BUDGET_BYTES_PREFILL / _DECODE) is the model; the planner has
+no replica topology, so the operator supplies one value for every replica and
+the cluster state records it. REQUIRED in shared mode; optional in distinct mode.
+"""
+
+SINGLE_INSTANCE_BUDGET_ENVS: Tuple[str, ...] = ("CAGE_KV_BUDGET_BYTES", "CAGE_VLLM_GPU_BLOCKS_OVERRIDE")
+"""The single-launcher knobs; set beside the replica pin they are a refusal (which
+pool would they cap?), never a precedence rule, like manage_vllm_pd.sh."""
+
+
+class KvBudgetError(ValueError):
+    """Typed refusal for the replica KV pin: missing in shared mode, malformed, or
+    set beside a single-instance budget knob. Raised BEFORE any process is
+    stopped or started."""
+
+
+def resolve_kv_budget(*, mode: str, env: Mapping[str, str]) -> Optional[int]:
+    """Apply the ADR-0124 pin rule for one cluster launch.
+
+    Returns the byte budget (int) or None (distinct mode, no pin: the legacy
+    argv). Shared mode without the pin refuses, naming the knob and the fix.
+    """
+    clash = [name for name in SINGLE_INSTANCE_BUDGET_ENVS if (env.get(name) or "").strip()]
+    if clash:
+        raise KvBudgetError(
+            f"REFUSING cluster launch: single-instance budget env {', '.join(clash)} is "
+            f"set beside the cluster's per-replica pin {KV_BUDGET_ENV}; which pool "
+            f"would it cap? Unset it for cluster launches (the same rule as the pd "
+            f"launcher's per-role budgets)."
+        )
+    raw = (env.get(KV_BUDGET_ENV) or "").strip()
+    if not raw:
+        if mode == "shared":
+            raise KvBudgetError(
+                f"REFUSING cluster launch: the replicas share one GPU and "
+                f"{KV_BUDGET_ENV} is unset. vLLM profiles the whole device, so "
+                f"concurrent replicas see each other's memory as their own overhead "
+                f"and their KV pools collapse (S0F-19, live 2026-09-30). Set "
+                f"{KV_BUDGET_ENV}=<bytes per replica>; it becomes "
+                f"--kv-cache-memory-bytes on every replica and vLLM skips the profiler, "
+                f"the contract the pd launcher already uses per role (ADR-0124)."
+            )
+        return None
+    if not raw.isdigit() or int(raw) <= 0:
+        raise KvBudgetError(
+            f"{KV_BUDGET_ENV}={raw!r} must be a positive integer number of bytes"
+        )
+    return int(raw)
+
+
+def build_serve_args(
+    model: str, port: int, *, gpu_memory_utilization: str, kv_budget_bytes: Optional[int] = None
+) -> List[str]:
     """vLLM serve argv honoring the Option-A serving contract (lib/_serving_config.sh).
 
     The cluster path previously hardcoded --max-model-len 2048 with no gpu-mem-util and
@@ -219,7 +317,8 @@ def build_serve_args(model: str, port: int, *, gpu_memory_utilization: str) -> L
 
     gpu_memory_utilization is REQUIRED and comes from resolve_gpu_share (backlog
     A1): there is no inline per-instance default, because the value depends on
-    whether the replicas share a GPU.
+    whether the replicas share a GPU. kv_budget_bytes (ADR-0124) adds the per-replica
+    --kv-cache-memory-bytes pin right after it; None keeps the legacy argv.
     """
     args = [
         "vllm", "serve", model,
@@ -230,6 +329,8 @@ def build_serve_args(model: str, port: int, *, gpu_memory_utilization: str) -> L
         "--max-model-len", os.environ.get("VLLM_MAX_MODEL_LEN", "4096"),
         "--gpu-memory-utilization", gpu_memory_utilization,
     ]
+    if kv_budget_bytes is not None:
+        args += ["--kv-cache-memory-bytes", str(int(kv_budget_bytes))]
     if os.environ.get("VLLM_ENFORCE_EAGER", "0") == "1":
         args.append("--enforce-eager")
     kv_dtype = (os.environ.get("VLLM_KV_CACHE_DTYPE") or "").strip()
@@ -277,8 +378,144 @@ def remove_state() -> None:
         STATE_FILE.unlink()
 
 
+# --- S0F-18: bound-port probe, before any process is stopped or started --------
+
+PORT_PROBE_HOST = "0.0.0.0"   # the address vLLM and uvicorn bind
+
+
+class PortInUseError(RuntimeError):
+    """Typed refusal: a replica or router port already has a listener."""
+
+
+def port_is_free(port: int) -> Tuple[bool, str]:
+    """Bind a throwaway socket the way vLLM does NOT: SO_REUSEADDR on (a closed
+    listener's TIME_WAIT never false-refuses) and SO_REUSEPORT OFF (vLLM sets it,
+    and Linux lets two SO_REUSEPORT sockets of one user share a port, so a probe
+    that copied vLLM's options would walk past a stale replica). Returns
+    (True, "") or (False, the OSError text)."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        probe.bind((PORT_PROBE_HOST, port))
+        return True, ""
+    except OSError as exc:
+        return False, str(exc)
+    finally:
+        probe.close()
+
+
+def _psutil_sockets_on(port: int) -> List[Tuple[str, Optional[int]]]:
+    """[(status, pid)] of every TCP socket whose local port is ``port``, from
+    psutil; [] when psutil is absent or refuses (macOS without root raises
+    AccessDenied). Never raises."""
+    try:
+        import psutil  # a vLLM dependency and in requirements.txt; absent locally is fine
+
+        return [
+            (str(conn.status), conn.pid)
+            for conn in psutil.net_connections(kind="tcp")
+            if conn.laddr and conn.laddr.port == port
+        ]
+    except Exception:
+        return []
+
+
+def port_has_live_socket(port: int) -> Optional[str]:
+    """Review 2026-09-30 (MEDIUM 3): on Linux a SO_REUSEADDR bind succeeds over a
+    socket that is bound but not yet listening, and vLLM binds its port before
+    the engine is up and listens only afterwards. The bind probe alone would
+    call such a port free and a second replica would then share it (both carry
+    SO_REUSEPORT). So any socket on the port in a state other than TIME_WAIT
+    (the one state a dead server legitimately leaves behind) refuses too.
+    Returns a description of the first such socket, or None."""
+    for status, pid in _psutil_sockets_on(port):
+        if status.upper() == "TIME_WAIT":
+            continue
+        return f"socket in state {status} (pid {pid if pid else 'unknown'})"
+    return None
+
+
+def describe_port_owner(port: int) -> str:
+    """Best effort: the listening process on ``port`` (psutil first, then the
+    platform tool), or "unknown". Never raises."""
+    try:
+        import psutil  # a vLLM dependency and in requirements.txt; absent locally is fine
+
+        for conn in psutil.net_connections(kind="tcp"):
+            if conn.status == psutil.CONN_LISTEN and conn.laddr and conn.laddr.port == port:
+                name = "?"
+                if conn.pid:
+                    try:
+                        name = psutil.Process(conn.pid).name()
+                    except Exception:
+                        pass
+                return f"pid {conn.pid} ({name})"
+    except Exception:
+        pass
+    for tool, argv in (
+        ("ss", ["ss", "-ltnp", f"sport = :{port}"]),
+        ("lsof", ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"]),
+    ):
+        if shutil.which(tool) is None:
+            continue
+        try:
+            out = subprocess.run(argv, capture_output=True, text=True, timeout=5).stdout.strip()
+        except Exception:
+            continue
+        lines = [l for l in out.splitlines()[1:] if l.strip()]
+        if lines:
+            return f"{tool}: {lines[0].strip()}"
+    return "unknown"
+
+
+def refuse_bound_ports(ports: Mapping[str, int]) -> None:
+    """Refuse the launch when any planned port already has a listener (bind
+    probe) or any non-TIME_WAIT socket (psutil; a vLLM still loading weights is
+    bound but not yet listening), or when two planned ports coincide, naming the
+    port, its holder and the fix (S0F-18: the image's nginx on 8001 cost a full
+    readiness budget per attempt at S0)."""
+    values = [int(p) for p in ports.values()]
+    if len(set(values)) != len(values):
+        raise PortInUseError(
+            f"REFUSING cluster launch: planned ports collide ({dict(ports)}); the replica "
+            f"range base..base+N-1 and --router-port must be distinct."
+        )
+    for label, port in ports.items():
+        free, reason = port_is_free(int(port))
+        if free:
+            live = port_has_live_socket(int(port))
+            if live is None:
+                continue
+            reason = live
+        raise PortInUseError(
+            f"REFUSING cluster launch: {label} port {port} is already bound ({reason}); "
+            f"holder: {describe_port_owner(int(port))}. Pick another --base-port / "
+            f"--router-port or stop the holder. The RunPod image's nginx listens on "
+            f"{', '.join(str(p) for p in IMAGE_NGINX_PORTS)} (S0F-18)."
+        )
+
+
+# --- S0F-18: the manager's own children, so a dead replica is noticed ---------
+
+_CHILDREN: Dict[int, Any] = {}
+"""pid -> the Popen handle launch_process created. CPython reaps a dropped child
+only when the next Popen is built, so os.kill(pid, 0) reports a zombie as alive;
+at S0 the manager waited 11 min 54 s on two replicas dead since 18:51:13."""
+
+
+class ChildExitedError(RuntimeError):
+    """A launched child exited while the manager was waiting for it."""
+
+
+def child_exit_code(pid: Optional[int]) -> Optional[int]:
+    proc = _CHILDREN.get(pid) if pid else None
+    return None if proc is None else proc.poll()
+
+
 def is_pid_running(pid: Optional[int]) -> bool:
     if not pid:
+        return False
+    if child_exit_code(pid) is not None:
         return False
     try:
         os.kill(pid, 0)
@@ -287,13 +524,42 @@ def is_pid_running(pid: Optional[int]) -> bool:
         return False
 
 
-def wait_for(predicate, timeout_seconds: int, label: str) -> None:
-    deadline = time.time() + timeout_seconds
-    while time.time() < deadline:
+def _log_tail(log_path: Optional[Path], n: int = 20) -> str:
+    try:
+        lines = Path(log_path).read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return ""
+    return "\n".join(lines[-n:])
+
+
+def wait_for(
+    predicate,
+    timeout_seconds: int,
+    label: str,
+    *,
+    pid: Optional[int] = None,
+    log_path: Optional[Path] = None,
+) -> float:
+    """Poll ``predicate`` every 2 s until true (returns the elapsed seconds) or the
+    budget ends (RuntimeError). With ``pid`` the wait also stops on the first poll
+    after that child exits (ChildExitedError with the exit code and the log tail),
+    instead of idling the GPU for the whole budget."""
+    t0 = time.time()
+    deadline = t0 + timeout_seconds
+    while True:
         if predicate():
-            return
+            return time.time() - t0
+        rc = child_exit_code(pid)
+        if rc is not None:
+            tail = _log_tail(log_path)
+            raise ChildExitedError(
+                f"{label} exited with exit code {rc} after {time.time() - t0:.0f}s "
+                f"(pid {pid}); log: {log_path}" + (f"\n--- last lines ---\n{tail}" if tail else "")
+            )
+        if time.time() >= deadline:
+            break
         time.sleep(2)
-    raise RuntimeError(f"Timed out waiting for {label}")
+    raise RuntimeError(f"Timed out waiting for {label} after {timeout_seconds}s")
 
 
 def get_loaded_model(api_base: str) -> Optional[str]:
@@ -357,15 +623,45 @@ def launch_process(cmd: List[str], log_path: Path, env: Optional[Dict[str, str]]
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
+    _CHILDREN[proc.pid] = proc   # S0F-18: keep the handle so an exit is visible
     return proc.pid
 
 
+def _group_alive(pgid: int) -> bool:
+    """True while any process of the group can be signaled (killpg with signal 0)."""
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
 def terminate_process_group(pid: Optional[int], name: str, *, silent: bool = False) -> None:
-    if not pid or not is_pid_running(pid):
+    """SIGTERM, then SIGKILL after 15 s, the whole process group of ``pid``.
+
+    Review 2026-09-30 (MEDIUM 1): the group is signaled even when its leader
+    has already exited. A replica's `vllm serve` parent can die while its
+    EngineCore child keeps the GPU (manage_vllm_server.sh documents that case),
+    and an exited leader of OUR child is a zombie until reaped, so the liveness
+    test here is "does the group still have a member", never the leader's pid.
+    Under start_new_session=True the child is its own session leader, so its
+    group id equals its pid; the group is reached through that even after the
+    leader is reaped.
+    """
+    if not pid:
         return
+    proc = _CHILDREN.get(pid)
+    if proc is not None:
+        proc.poll()   # reap an exited leader so a zombie does not read as alive
     try:
         pgid = os.getpgid(pid)
     except (ProcessLookupError, PermissionError):
+        # launch_process starts every child as a session leader, so the group
+        # id equals the pid; a reaped leader still leaves its group reachable.
+        pgid = pid
+    if not _group_alive(pgid):
         return
     if not silent:
         print(f"Stopping {name} (pid={pid})...")
@@ -376,7 +672,9 @@ def terminate_process_group(pid: Optional[int], name: str, *, silent: bool = Fal
 
     deadline = time.time() + 15
     while time.time() < deadline:
-        if not is_pid_running(pid):
+        if proc is not None:
+            proc.poll()
+        if not _group_alive(pgid):
             return
         time.sleep(1)
 
@@ -450,9 +748,11 @@ def state_matches_requested_config(
     router_port: int,
     router_strategy: str,
     replica_gpus: Optional[str],
+    kv_budget_bytes: Optional[int] = None,
 ) -> bool:
     # The pin spec is a dial: a running cluster under other pins (or none) is
-    # never reused for a launch that asked for these (backlog A1).
+    # never reused for a launch that asked for these (backlog A1). The KV byte
+    # pin is a dial too (ADR-0124; review 2026-09-30, LOW 5).
     return (
         state.get("model") == model
         and int(state.get("replica_count") or 0) == replica_count
@@ -460,6 +760,7 @@ def state_matches_requested_config(
         and int(state.get("router_port") or 0) == router_port
         and state.get("router_strategy") == router_strategy
         and (state.get("replica_gpus") or None) == (replica_gpus or None)
+        and (state.get("kv_budget_bytes") or None) == (kv_budget_bytes or None)
     )
 
 
@@ -512,6 +813,19 @@ def start_cluster(
         replica_count=replica_count, replica_gpus=pins, env=os.environ
     )
     print(decision.banner())
+    # ADR-0124 (S0F-19): the per-replica KV pin, resolved in the same
+    # before-anything slot; shared mode without it is a refusal.
+    kv_budget = resolve_kv_budget(mode=decision.mode, env=os.environ)
+    # Spec 9 option C: on a shared GPU the replicas start one at a time, so each
+    # one's init-time fraction check meets a settled device and a start failure
+    # names one replica; distinct GPUs keep the concurrent launch.
+    start_order = "sequential" if decision.mode == "shared" else "concurrent"
+    print(
+        f"[cage] kv pool pin: "
+        + (f"--kv-cache-memory-bytes {kv_budget} per replica [{KV_BUDGET_ENV}; ADR-0124]"
+           if kv_budget is not None else "none (distinct GPUs, vLLM profiles each device)")
+        + f"; start order: {start_order}"
+    )
 
     replicas = build_replica_configs(replica_count, base_port)
     for replica, pin in zip(replicas, pins):
@@ -527,6 +841,7 @@ def start_cluster(
         router_port=router_port,
         router_strategy=router_strategy,
         replica_gpus=replica_gpus,
+        kv_budget_bytes=kv_budget,
     ):
         healthy, detail = validate_cluster_state(existing_state, model=model)
         if healthy:
@@ -537,6 +852,12 @@ def start_cluster(
     elif existing_state:
         stop_cluster(silent=True)
 
+    # S0F-18: every planned port must be free NOW (after the managed stale
+    # cluster, if any, was stopped and before anything is launched).
+    refuse_bound_ports(
+        {**{r["replica_id"]: int(r["port"]) for r in replicas}, "router": int(router_port)}
+    )
+
     model_slug = sanitize_name(model)
     state: Dict[str, Any] = {
         "model": model,
@@ -546,6 +867,8 @@ def start_cluster(
         "router_strategy": router_strategy,
         "replica_gpus": replica_gpus or None,
         "gpu_share": decision.as_state(),
+        "kv_budget_bytes": kv_budget,
+        "start_order": start_order,
         "replicas": replicas,
         "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -558,32 +881,46 @@ def start_cluster(
                 f"interpreter ({sys.executable}). Install it and retry."
             )
 
+    def _launch_replica(replica: Dict[str, Any]) -> None:
+        log_path = LOG_DIR / f"vllm_{model_slug}_{replica['replica_id']}_{replica['port']}.log"
+        replica_env = os.environ.copy()
+        pin = replica.get("cuda_visible_devices")
+        if pin is not None:
+            # The pin rides CUDA_VISIBLE_DEVICES in the child env only.
+            replica_env["CUDA_VISIBLE_DEVICES"] = pin
+        pid = launch_process(
+            build_serve_args(
+                model, replica["port"],
+                gpu_memory_utilization=decision.mem_util,
+                kv_budget_bytes=kv_budget,
+            ),
+            log_path,
+            env=replica_env,
+        )
+        replica["pid"] = pid
+        replica["log_file"] = str(log_path)
+        save_state(state)   # the cleanup path reads the pids from the state file
+
+    def _await_replica(replica: Dict[str, Any]) -> None:
+        elapsed = wait_for(
+            lambda api_base=replica["api_base"]: replica_ready(api_base, model),
+            replica_timeout,
+            f"{replica['replica_id']} on {replica['api_base']}",
+            pid=replica.get("pid"),
+            log_path=Path(replica["log_file"]) if replica.get("log_file") else None,
+        )
+        print(f"{replica['replica_id']} ready after {elapsed:.0f} s")
+
     try:
-        for replica in replicas:
-            log_path = LOG_DIR / f"vllm_{model_slug}_{replica['replica_id']}_{replica['port']}.log"
-            replica_env = os.environ.copy()
-            pin = replica.get("cuda_visible_devices")
-            if pin is not None:
-                # The pin rides CUDA_VISIBLE_DEVICES in the child env only.
-                replica_env["CUDA_VISIBLE_DEVICES"] = pin
-            pid = launch_process(
-                build_serve_args(
-                    model, replica["port"], gpu_memory_utilization=decision.mem_util
-                ),
-                log_path,
-                env=replica_env,
-            )
-            replica["pid"] = pid
-            replica["log_file"] = str(log_path)
-
-        save_state(state)
-
-        for replica in replicas:
-            wait_for(
-                lambda api_base=replica["api_base"]: replica_ready(api_base, model),
-                replica_timeout,
-                f"{replica['replica_id']} on {replica['api_base']}",
-            )
+        if start_order == "sequential":
+            for replica in replicas:
+                _launch_replica(replica)
+                _await_replica(replica)
+        else:
+            for replica in replicas:
+                _launch_replica(replica)
+            for replica in replicas:
+                _await_replica(replica)
 
         router_env = os.environ.copy()
         router_env["ROUTER_REPLICAS"] = build_router_replicas_env(replicas)
@@ -603,11 +940,14 @@ def start_cluster(
         }
         save_state(state)
 
-        wait_for(
+        elapsed = wait_for(
             lambda: router_ready(router_url, replica_count),
             router_timeout,
             f"router on {router_url}",
+            pid=router_pid,
+            log_path=router_log,
         )
+        print(f"router ready after {elapsed:.0f} s")
 
         stats = fetch_router_stats(router_url)
         if not isinstance(stats, dict):
@@ -643,8 +983,20 @@ def build_parser() -> argparse.ArgumentParser:
         sub = subparsers.add_parser(name)
         sub.add_argument("--model", required=True, help="Model name to serve on every replica.")
         sub.add_argument("--replicas", type=int, default=3, help="Number of vLLM replicas to launch.")
-        sub.add_argument("--base-port", type=int, default=8001, help="First vLLM replica port.")
-        sub.add_argument("--router-port", type=int, default=9000, help="Port for the CAGE router.")
+        sub.add_argument(
+            "--base-port",
+            type=int,
+            default=DEFAULT_BASE_PORT,
+            help=(
+                f"First vLLM replica port (replicas take base..base+N-1). Default "
+                f"{DEFAULT_BASE_PORT}: the RunPod image's nginx holds "
+                f"{', '.join(str(p) for p in IMAGE_NGINX_PORTS)} (S0F-18); a bound port "
+                f"is refused before launch, naming its holder."
+            ),
+        )
+        sub.add_argument(
+            "--router-port", type=int, default=DEFAULT_ROUTER_PORT, help="Port for the CAGE router."
+        )
         sub.add_argument(
             "--router-strategy",
             default="hash",
@@ -654,14 +1006,20 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument(
             "--replica-timeout",
             type=int,
-            default=300,
-            help="Maximum time to wait for each replica to become ready.",
+            default=None,
+            help=(
+                f"Maximum seconds to wait for each replica (default {REPLICA_TIMEOUT_ENV} "
+                f"when set, else {REPLICA_TIMEOUT_DEFAULT}; a dead replica fails the wait at once)."
+            ),
         )
         sub.add_argument(
             "--router-timeout",
             type=int,
-            default=60,
-            help="Maximum time to wait for the router to become ready.",
+            default=None,
+            help=(
+                f"Maximum seconds to wait for the router (default {ROUTER_TIMEOUT_ENV} "
+                f"when set, else {ROUTER_TIMEOUT_DEFAULT})."
+            ),
         )
         sub.add_argument(
             "--replica-gpus",
@@ -681,9 +1039,29 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def resolve_timeouts(args: argparse.Namespace, env: Mapping[str, str]) -> Tuple[int, int]:
+    """(replica_timeout, router_timeout) for start/restart: the explicit flag,
+    else the env knob, else the default. ValueError on a malformed knob."""
+    replica = args.replica_timeout
+    if replica is None:
+        replica = env_timeout_default(REPLICA_TIMEOUT_ENV, REPLICA_TIMEOUT_DEFAULT, env)
+    router = args.router_timeout
+    if router is None:
+        router = env_timeout_default(ROUTER_TIMEOUT_ENV, ROUTER_TIMEOUT_DEFAULT, env)
+    return int(replica), int(router)
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.command in ("start", "restart"):
+        # S0F-18: the env-backed budgets are read HERE, for start and restart
+        # only; stop and status (the cleanup traps' commands) never see them.
+        try:
+            replica_timeout, router_timeout = resolve_timeouts(args, os.environ)
+        except ValueError as exc:
+            parser.error(str(exc))
 
     try:
         if args.command == "start":
@@ -693,8 +1071,8 @@ def main() -> int:
                 base_port=args.base_port,
                 router_port=args.router_port,
                 router_strategy=args.router_strategy,
-                replica_timeout=args.replica_timeout,
-                router_timeout=args.router_timeout,
+                replica_timeout=replica_timeout,
+                router_timeout=router_timeout,
                 replica_gpus=args.replica_gpus,
             )
         if args.command == "restart":
@@ -705,8 +1083,8 @@ def main() -> int:
                 base_port=args.base_port,
                 router_port=args.router_port,
                 router_strategy=args.router_strategy,
-                replica_timeout=args.replica_timeout,
-                router_timeout=args.router_timeout,
+                replica_timeout=replica_timeout,
+                router_timeout=router_timeout,
                 replica_gpus=args.replica_gpus,
             )
         if args.command == "stop":

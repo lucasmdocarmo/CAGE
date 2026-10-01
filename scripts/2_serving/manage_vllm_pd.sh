@@ -35,6 +35,24 @@
 #                                 defaults 8100 / 8200 / 8000 (mirrored by
 #                                 run_campaign.py's telemetry-endpoint
 #                                 emission — override BOTH sides together).
+#   CAGE_PD_NIXL_PORT_PREFILL / CAGE_PD_NIXL_PORT_DECODE
+#                                 NIXL handshake side-channel port per role,
+#                                 defaults 5600 / 5601, passed to each role as
+#                                 VLLM_NIXL_SIDE_CHANNEL_PORT in its child env
+#                                 (ADR-0128, S0F-13 layer 3: both roles on one
+#                                 host defaulted to 5600 at S0 and the prefill's
+#                                 listener died EADDRINUSE). Equal values, a
+#                                 value equal to an HTTP port, or an ambient
+#                                 VLLM_NIXL_SIDE_CHANNEL_PORT are refused.
+#   CAGE_PD_PYTHON                the interpreter the nixl import gate probes
+#                                 (default python3: the activated cage-env that
+#                                 runs `vllm serve`); the offline suite points it
+#                                 at a stub. The gate refuses, before the
+#                                 self-cleaning stop, when nixl._api /
+#                                 nixl._bindings do not import (layer 1) or a
+#                                 top-level nixl_ep is findable but broken
+#                                 (layer 2: a nixl 1.x wheel built for another
+#                                 torch).
 #   CAGE_PD_PREFILL_GPUS / CAGE_PD_DECODE_GPUS
 #                                 OPTIONAL per-role CUDA_VISIBLE_DEVICES pins
 #                                 (comma-separated GPU indices, e.g. "0" and
@@ -91,6 +109,18 @@ source "$PROJECT_DIR/scripts/lib/_serving_config.sh"
 PREFILL_PORT="${CAGE_PD_PREFILL_PORT:-8100}"
 DECODE_PORT="${CAGE_PD_DECODE_PORT:-8200}"
 PROXY_PORT="${CAGE_PD_PROXY_PORT:-8000}"
+# ADR-0128 (S0F-13 layer 3): one NIXL side-channel port PER ROLE. vLLM's
+# NixlConnector binds tcp://<host>:<VLLM_NIXL_SIDE_CHANNEL_PORT> for its KV
+# handshake; the default is 5600 for every worker, so two roles on one host
+# collide (S0: the prefill's listener died EADDRINUSE and never served
+# /health). vLLM's own 1P1D harness uses 5600 and 5601.
+NIXL_PORT_PREFILL="${CAGE_PD_NIXL_PORT_PREFILL:-5600}"
+NIXL_PORT_DECODE="${CAGE_PD_NIXL_PORT_DECODE:-5601}"
+# The interpreter that runs `vllm serve` (the activated cage-env); the nixl
+# import gate probes it. Override only for the offline suite.
+PD_PYTHON="${CAGE_PD_PYTHON:-python3}"
+# Must equal setup_runpod.sh NIXL_VERSION (the refusal messages name the fix).
+NIXL_PIN="0.9.0"
 
 LOG_DIR="$PROJECT_DIR/logs/vllm"
 PREFILL_PID_FILE="$LOG_DIR/vllm_pd_prefill.pid"
@@ -258,10 +288,80 @@ cage_validate_pd_env() {
             "$PREFILL_PORT" "$DECODE_PORT" "$PROXY_PORT" >&2
         return 1
     fi
+    # ADR-0128 (S0F-13 layer 3): the NIXL side-channel ports, one per role,
+    # distinct from each other and from the three HTTP ports; the launcher
+    # owns VLLM_NIXL_SIDE_CHANNEL_PORT like the connector JSON.
+    cage_require_positive_int CAGE_PD_NIXL_PORT_PREFILL "$NIXL_PORT_PREFILL" || return 1
+    cage_require_positive_int CAGE_PD_NIXL_PORT_DECODE  "$NIXL_PORT_DECODE"  || return 1
+    if [ "$NIXL_PORT_PREFILL" = "$NIXL_PORT_DECODE" ]; then
+        printf '[cage] REFUSING pd launch: NIXL side-channel ports collide (prefill=%s decode=%s): both roles on one host would bind the same handshake listener and the second dies EADDRINUSE (S0F-13 layer 3, S0 2026-09-30); set CAGE_PD_NIXL_PORT_PREFILL / CAGE_PD_NIXL_PORT_DECODE to distinct values\n' \
+            "$NIXL_PORT_PREFILL" "$NIXL_PORT_DECODE" >&2
+        return 1
+    fi
+    local _p
+    for _p in "$NIXL_PORT_PREFILL" "$NIXL_PORT_DECODE"; do
+        if [ "$_p" = "$PREFILL_PORT" ] || [ "$_p" = "$DECODE_PORT" ] || [ "$_p" = "$PROXY_PORT" ]; then
+            printf '[cage] REFUSING pd launch: NIXL side-channel port %s equals an HTTP port (prefill=%s decode=%s proxy=%s); pick a free port for CAGE_PD_NIXL_PORT_PREFILL / CAGE_PD_NIXL_PORT_DECODE\n' \
+                "$_p" "$PREFILL_PORT" "$DECODE_PORT" "$PROXY_PORT" >&2
+            return 1
+        fi
+    done
+    if [ -n "${VLLM_NIXL_SIDE_CHANNEL_PORT:-}" ]; then
+        printf '[cage] REFUSING pd launch: VLLM_NIXL_SIDE_CHANNEL_PORT is set in the shell -- the pd launcher assigns one side-channel port per role (CAGE_PD_NIXL_PORT_PREFILL / CAGE_PD_NIXL_PORT_DECODE); unset it\n' >&2
+        return 1
+    fi
     # Backlog A1 (S0-9 / S0-20): shared-vs-distinct GPU decision, resolved
     # here so a refusal fires BEFORE the self-cleaning teardown.
     cage_resolve_pd_gpu_share || return 1
     return 0
+}
+
+cage_pd_nixl_import_gate() {
+    # ADR-0128 (S0F-13 layers 1 and 2), start only, BEFORE the self-cleaning
+    # stop: the interpreter that runs `vllm serve` must import what the
+    # NixlConnector imports, and a top-level nixl_ep that is findable but
+    # broken (the nixl 1.x wheels build it for torch 2.11+; vLLM imports it on
+    # sight) is the exact S0 layer-2 crash. Probe exit codes: 0 ok, 2 nixl
+    # missing, 3 nixl_ep broken; the probe's own message is shown.
+    local probe out rc
+    # (a heredoc inside $(...) does not parse on bash 3.2, the macOS test host)
+    probe='import importlib.util
+import sys
+try:
+    import nixl._api, nixl._bindings  # noqa: F401  (what the vLLM NixlConnector imports)
+except Exception as exc:
+    print(f"nixl: {type(exc).__name__}: {exc}")
+    sys.exit(2)
+if importlib.util.find_spec("nixl_ep") is not None:
+    try:
+        import nixl_ep  # noqa: F401
+    except Exception as exc:
+        print(f"nixl_ep: {type(exc).__name__}: {exc}")
+        sys.exit(3)
+print("ok")
+'
+    out="$(printf '%s' "$probe" | "$PD_PYTHON" - 2>&1)" && rc=0 || rc=$?
+    case "$rc" in
+        0)
+            echo "[cage] nixl import gate: ok ($PD_PYTHON imports nixl._api, nixl._bindings)"
+            return 0
+            ;;
+        2)
+            printf '[cage] REFUSING pd launch: %s cannot import nixl._api, nixl._bindings (%s) -- the NixlConnector cannot load; install nixl==%s nixl-cu12==%s beside vLLM (setup_runpod.sh step 2, S0F-13 layer 1)\n' \
+                "$PD_PYTHON" "$out" "$NIXL_PIN" "$NIXL_PIN" >&2
+            return 1
+            ;;
+        3)
+            printf '[cage] REFUSING pd launch: a top-level nixl_ep is installed but fails to import (%s) -- a nixl 1.x wheel built for another torch, the S0F-13 layer-2 crash; reinstall nixl==%s nixl-cu12==%s, whose wheels ship no nixl_ep\n' \
+                "$out" "$NIXL_PIN" "$NIXL_PIN" >&2
+            return 1
+            ;;
+        *)
+            printf '[cage] REFUSING pd launch: nixl import probe failed under %s (exit %s): %s\n' \
+                "$PD_PYTHON" "$rc" "$out" >&2
+            return 1
+            ;;
+    esac
 }
 
 case "${1:-}" in
@@ -271,6 +371,9 @@ case "${1:-}" in
         # T3.1 TP gate, same before-any-teardown discipline; applied per role.
         cage_validate_vllm_tp_env \
             || die "invalid tensor-parallel environment (see refusal above) -- not touching any server"
+        # ADR-0128: the connector's imports, before any process is touched.
+        cage_pd_nixl_import_gate \
+            || die "nixl import gate failed (see refusal above) -- not touching any server"
         ;;
 esac
 
@@ -320,6 +423,56 @@ wait_for_health() {
     return 1
 }
 
+role_exited() {
+    # $1 = role label, $2 = pidfile, $3 = log. 0 iff the role's API-server pid
+    # is gone (bash reaps a dead background child, so kill -0 fails); prints the
+    # log tail so the S0 failure class is read at once, not after the budget.
+    local pid
+    pid="$(cat "$2" 2>/dev/null || true)"
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+        echo -e "\n${RED}✗ $1 instance exited before serving /health (pid ${pid:-none}); last 20 log lines ($3):${NC}"
+        tail -n 20 "$3" 2>/dev/null || true
+        return 0
+    fi
+    return 1
+}
+
+wait_for_roles() {
+    # $1 = timeout seconds, $2 = prefill log, $3 = decode log. BOTH roles in
+    # ONE loop (ADR-0128 part 4): they become ready in either order, and a role
+    # whose process is gone fails the start at once. At S0, attempts 1 and 2
+    # each waited the full 11 min on role processes that had already died.
+    local max_wait="$1" prefill_log="$2" decode_log="$3" waited=0
+    local prefill_ready=0 decode_ready=0
+    echo "Waiting for prefill (port $PREFILL_PORT) and decode (port $DECODE_PORT) instances..."
+    while [ "$waited" -lt "$max_wait" ]; do
+        if [ "$prefill_ready" = 0 ]; then
+            if curl -s "http://localhost:${PREFILL_PORT}/health" > /dev/null 2>&1; then
+                prefill_ready=1
+                echo -e "${GREEN}✓ prefill instance ready (port $PREFILL_PORT) after ${waited}s${NC}"
+            elif role_exited prefill "$PREFILL_PID_FILE" "$prefill_log"; then
+                return 1
+            fi
+        fi
+        if [ "$decode_ready" = 0 ]; then
+            if curl -s "http://localhost:${DECODE_PORT}/health" > /dev/null 2>&1; then
+                decode_ready=1
+                echo -e "${GREEN}✓ decode instance ready (port $DECODE_PORT) after ${waited}s${NC}"
+            elif role_exited decode "$DECODE_PID_FILE" "$decode_log"; then
+                return 1
+            fi
+        fi
+        if [ "$prefill_ready" = 1 ] && [ "$decode_ready" = 1 ]; then
+            return 0
+        fi
+        sleep 2
+        waited=$((waited + 2))
+        echo -n "."
+    done
+    echo -e "\n${RED}✗ pd roles not ready within ${max_wait}s (prefill ready=$prefill_ready decode ready=$decode_ready)${NC}"
+    return 1
+}
+
 # --- start -------------------------------------------------------------------
 
 compose_role_args() {
@@ -360,7 +513,7 @@ capture_role_config() {
     # Per-(re)start serving-config capture, one file PER ROLE (audit M7/COMP-5
     # discipline carried from manage_vllm_server.sh). Skipped silently when
     # CAGE_RUN_ROOT is unset; never fatal to startup.
-    local role="$1" model="$2" port="$3" kv_cfg="$4" budget="$5" args_line="$6" prefix="$7"
+    local role="$1" model="$2" port="$3" kv_cfg="$4" budget="$5" args_line="$6" prefix="$7" nixl_port="$8"
     [ -n "${CAGE_RUN_ROOT:-}" ] || return 0
     local cuda_pin=""
     if [ "$role" = prefill ]; then cuda_pin="$PD_PREFILL_CUDA"; else cuda_pin="$PD_DECODE_CUDA"; fi
@@ -382,6 +535,7 @@ capture_role_config() {
     SC_MEM_UTIL_SOURCE="$PD_MEM_UTIL_SOURCE" \
     SC_CUDA="$cuda_pin" \
     SC_EAGER="${VLLM_ENFORCE_EAGER:-0}" \
+    SC_NIXL_PORT="$nixl_port" \
     SC_ARGS="$args_line" \
     SC_FILE="$cfg_file" \
     python3 - <<'PYEOF' || echo "  (pd serving-config capture failed; non-fatal)"
@@ -423,6 +577,12 @@ cfg = {
     "gpu_memory_utilization_source": os.environ["SC_MEM_UTIL_SOURCE"],
     "cuda_visible_devices": os.environ.get("SC_CUDA") or None,
     "enforce_eager": os.environ.get("SC_EAGER") == "1",
+    # ADR-0128 (S0F-13): this role's NIXL handshake listener port, and the
+    # operator's UCX_* values as found (RECORDED, never set by the launcher:
+    # part 5 of the ADR is record-only; the RDMA rung has its own UCX_TLS rule,
+    # docs/VLLM_COMPATIBILITY.md section 8.3).
+    "nixl_side_channel_port": int(os.environ["SC_NIXL_PORT"]),
+    "ucx_env": {k: v for k, v in sorted(os.environ.items()) if k.startswith("UCX_")},
     "args": os.environ["SC_ARGS"],
 }
 with open(os.environ["SC_FILE"], "w", encoding="utf-8") as fh:
@@ -434,14 +594,17 @@ PYEOF
 
 launch_role_instance() {
     # $1 = CUDA_VISIBLE_DEVICES pin ('' = unpinned, ambient visibility), $2 =
-    # log file, $3 = pidfile, rest = vllm serve argv. The pin rides the child
-    # env ONLY (backlog A1): nothing is exported into this shell.
-    local cuda_pin="$1" log_file="$2" pid_file="$3"
-    shift 3
+    # this role's NIXL side-channel port, $3 = log file, $4 = pidfile, rest =
+    # vllm serve argv. The pin and the port ride the child env ONLY (backlog
+    # A1, ADR-0128): nothing is exported into this shell.
+    local cuda_pin="$1" nixl_port="$2" log_file="$3" pid_file="$4"
+    shift 4
     if [ -n "$cuda_pin" ]; then
-        CUDA_VISIBLE_DEVICES="$cuda_pin" nohup vllm serve "$@" > "$log_file" 2>&1 &
+        VLLM_NIXL_SIDE_CHANNEL_PORT="$nixl_port" CUDA_VISIBLE_DEVICES="$cuda_pin" \
+            nohup vllm serve "$@" > "$log_file" 2>&1 &
     else
-        nohup vllm serve "$@" > "$log_file" 2>&1 &
+        VLLM_NIXL_SIDE_CHANNEL_PORT="$nixl_port" \
+            nohup vllm serve "$@" > "$log_file" 2>&1 &
     fi
     printf '%s\n' "$!" > "$pid_file"
 }
@@ -466,6 +629,7 @@ start_stack() {
     local share_rule="DISTINCT_GPU_MEM_UTIL"
     [ "$PD_GPU_SHARE" = shared ] && share_rule="SHARED_GPU_MEM_UTIL"
     echo "[cage] gpu-share decision: $PD_GPU_SHARE (prefill=${PD_PREFILL_CUDA:-unpinned} decode=${PD_DECODE_CUDA:-unpinned}) -> --gpu-memory-utilization $PD_MEM_UTIL per instance [$PD_MEM_UTIL_SOURCE; rule $share_rule, backlog A1 / S0-9 / S0-20]"
+    echo "[cage] nixl side channel: prefill=tcp://localhost:${NIXL_PORT_PREFILL} decode=tcp://localhost:${NIXL_PORT_DECODE} (VLLM_NIXL_SIDE_CHANNEL_PORT per role, ADR-0128 / S0F-13)"
 
     # start is self-cleaning: a stale pd stack (or a lone single-instance
     # server on these ports) must never be reused under new dials — the
@@ -492,9 +656,9 @@ start_stack() {
     local -a prefill_args=( "${ROLE_ARGS[@]}" )
     echo "Server args [prefill]: vllm serve $model ${prefill_args[*]}"
     capture_role_config prefill "$model" "$PREFILL_PORT" "$PREFILL_KV_TRANSFER_CONFIG" \
-        "$CAGE_KV_BUDGET_BYTES_PREFILL" "vllm serve $model ${prefill_args[*]}" "$want_prefix_cache"
+        "$CAGE_KV_BUDGET_BYTES_PREFILL" "vllm serve $model ${prefill_args[*]}" "$want_prefix_cache" "$NIXL_PORT_PREFILL"
     echo "Starting prefill instance (logging to $prefill_log)..."
-    launch_role_instance "$PD_PREFILL_CUDA" "$prefill_log" "$PREFILL_PID_FILE" "$model" "${prefill_args[@]}"
+    launch_role_instance "$PD_PREFILL_CUDA" "$NIXL_PORT_PREFILL" "$prefill_log" "$PREFILL_PID_FILE" "$model" "${prefill_args[@]}"
     echo "Prefill PID: $(cat "$PREFILL_PID_FILE") (pidfile: $PREFILL_PID_FILE)"
 
     compose_role_args decode "$DECODE_PORT" "$DECODE_KV_TRANSFER_CONFIG" \
@@ -502,16 +666,16 @@ start_stack() {
     local -a decode_args=( "${ROLE_ARGS[@]}" )
     echo "Server args [decode]: vllm serve $model ${decode_args[*]}"
     capture_role_config decode "$model" "$DECODE_PORT" "$DECODE_KV_TRANSFER_CONFIG" \
-        "$CAGE_KV_BUDGET_BYTES_DECODE" "vllm serve $model ${decode_args[*]}" "$want_prefix_cache"
+        "$CAGE_KV_BUDGET_BYTES_DECODE" "vllm serve $model ${decode_args[*]}" "$want_prefix_cache" "$NIXL_PORT_DECODE"
     echo "Starting decode instance (logging to $decode_log)..."
-    launch_role_instance "$PD_DECODE_CUDA" "$decode_log" "$DECODE_PID_FILE" "$model" "${decode_args[@]}"
+    launch_role_instance "$PD_DECODE_CUDA" "$NIXL_PORT_DECODE" "$decode_log" "$DECODE_PID_FILE" "$model" "${decode_args[@]}"
     echo "Decode PID: $(cat "$DECODE_PID_FILE") (pidfile: $DECODE_PID_FILE)"
 
-    # Readiness: BOTH instances, then the proxy (whose /health requires both
-    # upstreams — a proxy over a half-up pair must never report ready).
+    # Readiness: BOTH instances in one loop that fails at once on a dead role
+    # (ADR-0128 part 4), then the proxy (whose /health requires both upstreams;
+    # a proxy over a half-up pair must never report ready).
     local max_wait="${VLLM_START_TIMEOUT:-300}"
-    wait_for_health "prefill instance" "$PREFILL_PORT" "$max_wait" || return 1
-    wait_for_health "decode instance" "$DECODE_PORT" "$max_wait" || return 1
+    wait_for_roles "$max_wait" "$prefill_log" "$decode_log" || return 1
 
     echo "Starting pd_proxy on port $PROXY_PORT (logging to $proxy_log)..."
     nohup python3 "$SCRIPT_DIR/pd_proxy.py" \

@@ -65,7 +65,11 @@ NAME="cage-$(date -u +%Y%m%d-%H%M%S)"
 # is ubuntu22.04 and the tag was transcribed wrong. The image's own torch and
 # Python are irrelevant here: setup_runpod.sh builds its own canonical venv.
 IMAGE="${CAGE_POD_IMAGE:-runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404}"
-GPU_ID=""; GPU_COUNT="1"; DISK_GB="60"; VOL_GB="100"; PORTS="22/tcp"
+# Container disk 120 GB (ADR-0125, S0F-6): it now holds the three venvs (about 40 GB)
+# beside the model prefetch, and preflight gate (f) ran at zero margin (20 GB free vs a
+# 20 GB floor) on the 60 GB disk at S0. Container disk bills 0.10 USD/GB/month per second
+# while the pod runs (docs.runpod.io/pods/pricing): about 0.07 USD per 8 h day for the extra 60 GB.
+GPU_ID=""; GPU_COUNT="1"; DISK_GB="120"; VOL_GB="100"; PORTS="22/tcp"
 CLOUD_TYPE="SECURE"; TERMINATE_AFTER="12h"; NO_SEATBELT=0
 PRICE=""; HOURS=""; PURPOSE="unspecified"; YES=0
 # _SET flags distinguish "flag never given" from "flag given an empty value":
