@@ -300,6 +300,12 @@ cage_validate_pd_env() {
     fi
     local _p
     for _p in "$NIXL_PORT_PREFILL" "$NIXL_PORT_DECODE"; do
+        # review 2026-10-01 LOW 3: a positive int is not yet a TCP port.
+        if [ "$_p" -gt 65535 ]; then
+            printf '[cage] REFUSING pd launch: NIXL side-channel port %s is above 65535 (CAGE_PD_NIXL_PORT_PREFILL / CAGE_PD_NIXL_PORT_DECODE take a TCP port, 1 to 65535)\n' \
+                "$_p" >&2
+            return 1
+        fi
         if [ "$_p" = "$PREFILL_PORT" ] || [ "$_p" = "$DECODE_PORT" ] || [ "$_p" = "$PROXY_PORT" ]; then
             printf '[cage] REFUSING pd launch: NIXL side-channel port %s equals an HTTP port (prefill=%s decode=%s proxy=%s); pick a free port for CAGE_PD_NIXL_PORT_PREFILL / CAGE_PD_NIXL_PORT_DECODE\n' \
                 "$_p" "$PREFILL_PORT" "$DECODE_PORT" "$PROXY_PORT" >&2
@@ -321,12 +327,17 @@ cage_pd_nixl_import_gate() {
     # stop: the interpreter that runs `vllm serve` must import what the
     # NixlConnector imports, and a top-level nixl_ep that is findable but
     # broken (the nixl 1.x wheels build it for torch 2.11+; vLLM imports it on
-    # sight) is the exact S0 layer-2 crash. Probe exit codes: 0 ok, 2 nixl
+    # sight) is the exact S0 layer-2 crash. Probe exit codes: 0 ok, 4 the
+    # interpreter cannot even find vllm (review 2026-10-01 LOW 2: then it is
+    # not the serving interpreter and a nixl verdict would mislead), 2 nixl
     # missing, 3 nixl_ep broken; the probe's own message is shown.
     local probe out rc
     # (a heredoc inside $(...) does not parse on bash 3.2, the macOS test host)
     probe='import importlib.util
 import sys
+if importlib.util.find_spec("vllm") is None:
+    print("vllm: not findable by this interpreter")
+    sys.exit(4)
 try:
     import nixl._api, nixl._bindings  # noqa: F401  (what the vLLM NixlConnector imports)
 except Exception as exc:
@@ -354,6 +365,11 @@ print("ok")
         3)
             printf '[cage] REFUSING pd launch: a top-level nixl_ep is installed but fails to import (%s) -- a nixl 1.x wheel built for another torch, the S0F-13 layer-2 crash; reinstall nixl==%s nixl-cu12==%s, whose wheels ship no nixl_ep\n' \
                 "$out" "$NIXL_PIN" "$NIXL_PIN" >&2
+            return 1
+            ;;
+        4)
+            printf '[cage] REFUSING pd launch: %s is not the interpreter that runs vllm serve (%s); activate cage-env before the start, or point CAGE_PD_PYTHON at the serving interpreter\n' \
+                "$PD_PYTHON" "$out" >&2
             return 1
             ;;
         *)
@@ -430,7 +446,7 @@ role_exited() {
     local pid
     pid="$(cat "$2" 2>/dev/null || true)"
     if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
-        echo -e "\n${RED}✗ $1 instance exited before serving /health (pid ${pid:-none}); last 20 log lines ($3):${NC}"
+        echo -e "\n${RED}✗ $1 instance exited before both roles were ready (pid ${pid:-none}); last 20 log lines ($3):${NC}"
         tail -n 20 "$3" 2>/dev/null || true
         return 0
     fi
@@ -446,21 +462,22 @@ wait_for_roles() {
     local prefill_ready=0 decode_ready=0
     echo "Waiting for prefill (port $PREFILL_PORT) and decode (port $DECODE_PORT) instances..."
     while [ "$waited" -lt "$max_wait" ]; do
-        if [ "$prefill_ready" = 0 ]; then
-            if curl -s "http://localhost:${PREFILL_PORT}/health" > /dev/null 2>&1; then
-                prefill_ready=1
-                echo -e "${GREEN}✓ prefill instance ready (port $PREFILL_PORT) after ${waited}s${NC}"
-            elif role_exited prefill "$PREFILL_PID_FILE" "$prefill_log"; then
-                return 1
-            fi
+        # Liveness first, for BOTH roles on every pass, ready or not (review
+        # 2026-10-01 LOW 5): a role that dies after its first /health while the
+        # other is still starting fails the start here, not at the proxy wait.
+        if role_exited prefill "$PREFILL_PID_FILE" "$prefill_log"; then
+            return 1
         fi
-        if [ "$decode_ready" = 0 ]; then
-            if curl -s "http://localhost:${DECODE_PORT}/health" > /dev/null 2>&1; then
-                decode_ready=1
-                echo -e "${GREEN}✓ decode instance ready (port $DECODE_PORT) after ${waited}s${NC}"
-            elif role_exited decode "$DECODE_PID_FILE" "$decode_log"; then
-                return 1
-            fi
+        if role_exited decode "$DECODE_PID_FILE" "$decode_log"; then
+            return 1
+        fi
+        if [ "$prefill_ready" = 0 ] && curl -s "http://localhost:${PREFILL_PORT}/health" > /dev/null 2>&1; then
+            prefill_ready=1
+            echo -e "${GREEN}✓ prefill instance ready (port $PREFILL_PORT) after ${waited}s${NC}"
+        fi
+        if [ "$decode_ready" = 0 ] && curl -s "http://localhost:${DECODE_PORT}/health" > /dev/null 2>&1; then
+            decode_ready=1
+            echo -e "${GREEN}✓ decode instance ready (port $DECODE_PORT) after ${waited}s${NC}"
         fi
         if [ "$prefill_ready" = 1 ] && [ "$decode_ready" = 1 ]; then
             return 0

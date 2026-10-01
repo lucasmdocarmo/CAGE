@@ -31,8 +31,10 @@
 # a RECORDED deviation. No mapping -> refuse to launch (fail-closed): an
 # unmapped dial silently breaks §6.5 budget parity. Preflight gate (j) -- the
 # CAGE-ISO-BYTES-GATE in scripts/checks/preflight_check.sh -- parses this
-# launcher's startup log ([BlockManager] block_size/max_block_count) and
-# asserts the REALIZED KV-pool bytes; the mapping only sets the dial.
+# launcher's startup log for the pool TurboMind allocated: on 0.17.0 the INFO
+# line "[turbomind.cc:319] Object cache budget: <MB> MB from free <MB> MB and
+# ratio <f>" (ADR-0130, S0F-9; the [BlockManager] pair left the source at
+# 0.15.0), which needs --log-level INFO below; the mapping only sets the dial.
 #
 # [VERIFY-LIVE at S0]: every LMDeploy CLI flag below follows LMDeploy's
 # documented api_server CLI, but none has been exercised by this codebase yet

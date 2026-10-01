@@ -61,6 +61,7 @@ into the row (``cache_relevance_method``).
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, List, NamedTuple, Optional, Protocol, Sequence, Tuple
 import os
@@ -222,6 +223,38 @@ def _hf_commit_hash(*candidates: Any) -> Optional[str]:
         if isinstance(rev, str) and rev.strip():
             return rev
     return None
+
+
+@contextmanager
+def _torchscript_disabled():
+    """Load a checkpoint with TorchScript off, then restore the prior flag (ADR-0129, S0F-4).
+
+    The pod could not import the NLI instrument: CPython 3.13.8's
+    ``inspect.getsourcelines`` stops at a comment between a ``@torch.jit.script``
+    decorator and its ``def`` (fixed in 3.13.9), transformers'
+    ``modeling_deberta_v2.py:105-107`` has that layout, and torch 2.10 then raises
+    ``IndentationError`` from ``torch/_sources.py`` while scripting the function.
+    torch reads ``PYTORCH_JIT`` once at import, so an environment variable set
+    here would come too late, and one set in the shell leaks into child engines
+    (the S0 preflight prefix reached the fp8 gate's vLLM restart). The private
+    ``torch.jit._state`` flag can be flipped at any time: with it off,
+    ``torch.jit.script`` returns the function unchanged and nothing parses source.
+    The PRIOR value is restored afterwards (``enable()`` would force True and
+    override an operator's ``PYTORCH_JIT=0``). On the Mac, JIT on and off gave
+    identical NLI probabilities (45 values, max difference 0.0; 2026-10-01).
+    Without torch the block is a no-op (the caller's own import then fails loud).
+    """
+    try:
+        from torch.jit import _state as jit_state
+    except Exception:
+        yield
+        return
+    prior = jit_state._enabled.enabled
+    jit_state.disable()
+    try:
+        yield
+    finally:
+        jit_state._enabled.enabled = prior
 
 
 def _split_sentences(text: str) -> List[str]:
@@ -999,11 +1032,14 @@ class QualityEvaluator:
             try:
                 from transformers import pipeline
 
-                self._nli_model = pipeline(
-                    "text-classification",
-                    model=self.nli_model_name,
-                    device=self._hf_pipeline_device(),
-                )
+                # ADR-0129 (S0F-4): TorchScript off for the load only, prior
+                # flag restored (see _torchscript_disabled).
+                with _torchscript_disabled():
+                    self._nli_model = pipeline(
+                        "text-classification",
+                        model=self.nli_model_name,
+                        device=self._hf_pipeline_device(),
+                    )
             except Exception as e:
                 self._mark_unavailable("nli", self.nli_model_name, e)
             else:

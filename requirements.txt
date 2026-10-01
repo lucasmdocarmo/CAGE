@@ -52,9 +52,13 @@ bert-score==0.3.13
 # Tier 1: 0.1.2 is both the tested floor and the PyPI-latest release
 # (verified 2026-08-04).
 rouge-score==0.1.2
-# Tier 2: declared for the pre-registered RAGAS secondary but never imported
-# yet (review §5.1); PyPI latest 0.4.3 on 2026-08-04.
-ragas>=0.1.0,<0.5
+# ragas is NOT declared (ADR-0129, S0F-2, live H100 2026-09-30): nothing in src/,
+# scripts/ or tests/ imports it; the section 8.6(d) RAGAS-style judge
+# (scripts/4_analysis/ragas_head_to_head.py) is a prompt sent over HTTP with
+# `requests`. Every ragas 0.3.2+ release pulls `instructor`, and every instructor
+# release caps openai below the version vLLM 0.19.1 installs (0.4.0 also pins
+# typer<0.10), so on the pod pip downgraded typer and openai against vLLM and
+# fastapi-cli until the three packages were uninstalled by hand.
 # Tier 2: PyPI latest 0.4.6 on 2026-08-04.
 evaluate>=0.4.1,<0.5
 # Context/prompt compression for the compressed_rag baseline (LLMLingua-2, client-side).

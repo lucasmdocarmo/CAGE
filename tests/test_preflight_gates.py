@@ -267,6 +267,52 @@ LMDEPLOY_LOG = """\
 [TM][INFO] [BlockManager] chunk_size = 1274
 """
 
+# --- S0 2026-09-30 shapes (ADR-0130, S0F-14 and S0F-9) -------------------------
+# Cut verbatim from results/s0/vm_logs/2f54e73fb2dc/. A vLLM 0.19.1 start with
+# --kv-cache-memory-bytes prints the gpu_worker.py:361 "reserved" line and
+# never "Available KV cache memory"; the launch echo at the top of the same log
+# also carries the words kv_cache_memory_bytes and must not trip the anchor.
+VLLM_019_ECHO_LINE = (
+    "(APIServer pid=28971) INFO 09-30 16:04:44 [utils.py:233] non-default args: "
+    "{'model_tag': 'Qwen/Qwen3-8B', 'max_model_len': 32768, 'gpu_memory_utilization': 0.45, "
+    "'kv_cache_memory_bytes': 5713920000, 'enable_prefix_caching': True}\n"
+)
+VLLM_019_START_LINE = (
+    "(EngineCore pid=29655) INFO 09-30 16:06:26 [core.py:105] Initializing a V1 LLM engine "
+    "(v0.19.1) with config: model='Qwen/Qwen3-8B', speculative_config=None\n"
+)
+VLLM_019_RESERVED_LINE = (
+    "(EngineCore pid=29655) INFO 09-30 16:07:24 [gpu_worker.py:361] Initial free memory 77.91 GiB, "
+    "reserved 5.32 GiB memory for KV Cache as specified by kv_cache_memory_bytes config and skipped "
+    "memory profiling. This does not respect the gpu_memory_utilization config. Only use "
+    "kv_cache_memory_bytes config when you want manual control of KV cache memory size. If OOM'ed, "
+    "check the difference of initial free memory between the current run and the previous run where "
+    "kv_cache_memory_bytes is suggested and update it correspondingly.\n"
+)
+VLLM_019_BUDGETED_LOG = (
+    VLLM_019_ECHO_LINE + VLLM_019_START_LINE + VLLM_019_RESERVED_LINE
+    + "(EngineCore pid=29655) INFO 09-30 16:07:24 [kv_cache_utils.py:1319] GPU KV cache size: 38,736 tokens\n"
+    + "(EngineCore pid=29655) INFO 09-30 16:07:24 [kv_cache_utils.py:1324] Maximum concurrency for 32,768 tokens per request: 1.18x\n"
+)
+#: A profiled 0.19.1 start (no byte budget): Available + tokens, with the start marker.
+VLLM_019_PROFILED_LOG = (
+    "(EngineCore pid=22150) INFO 09-30 15:27:10 [core.py:105] Initializing a V1 LLM engine (v0.19.1) with config: model='Qwen/Qwen3-8B'\n"
+    "(EngineCore pid=22150) INFO 09-30 15:28:52 [gpu_worker.py:436] Available KV cache memory: 53.54 GiB\n"
+    "(EngineCore pid=22150) INFO 09-30 15:28:52 [kv_cache_utils.py:1319] GPU KV cache size: 389,888 tokens\n"
+)
+# LMDeploy 0.17.0 prints no [BlockManager] lines (gone since 0.15.0); its pool
+# is the turbomind.cc:319 budget line, which the tqdm weight-loading bar hides
+# behind carriage returns on one physical line (MB means 2^20 there).
+LMDEPLOY_017_LOG = (
+    "2026-09-30 14:36:57,224 - lmdeploy - INFO - async_engine.py:130 - input backend=turbomind, "
+    "backend_config=TurbomindEngineConfig(dtype='auto', session_len=32768, cache_max_entry_count=0.8763)\n"
+    "Loading:   0%|          | 0/36 [00:00<?, ?it/s]\rLoading:  50%|█████     | 18/36 [00:01<00:01, 15.0it/s]\r"
+    "Loading: 100%|██████████| 36/36 [00:02<00:00, 15.2it/s]\r"
+    "[TM][INFO][0930.14:37:15.641964][turbomind.cc:319] Object cache budget: 55634.70 MB from free 63488.19 MB and ratio 0.876\n"
+    "[TM][WARN][0930.14:37:16.035615][slab.h:136] slab_size 67108864, object_size 9437184, object_count 7, ratio 0.984375\n"
+)
+SGLANG_START_LINE = "[2026-09-30 14:27:37] server_args=ServerArgs(model_path='Qwen/Qwen3-8B', tokenizer_path='Qwen/Qwen3-8B')\n"
+
 
 @pytest.fixture(scope="module")
 def iso() -> dict:
@@ -337,6 +383,145 @@ def test_iso_unknown_engine_is_loud(iso: dict) -> None:
 def test_iso_negative_quantity_is_loud(iso: dict) -> None:
     with pytest.raises(iso["IsoBytesError"], match="negative"):
         iso["parse_engine_log"]("vllm", "INFO: # GPU blocks: -5\n")
+
+
+# --- ADR-0130 (S0F-14, S0F-9): the two S0 log shapes and the start-tail rule ---
+
+
+def test_iso_parses_vllm_019_budgeted_reserved_line(iso: dict) -> None:
+    """S0F-14: a vLLM 0.19.1 start under --kv-cache-memory-bytes reports its pool
+    on the gpu_worker.py:361 'reserved' line (bytes) and the tokens line; the
+    launch echo carrying the words kv_cache_memory_bytes is not a pool line."""
+    r = iso["parse_engine_log"]("vllm", VLLM_019_BUDGETED_LOG)
+    assert r["bytes"] == int(5.32 * GIB)
+    assert r["tokens"] == 38736
+    assert len(r["evidence"]) == 2
+    assert not any("non-default args" in e for e in r["evidence"])
+    # S0-20 arithmetic: 38,736 tokens x 147,456 B/token vs the reserved figure, 0.008%
+    assert iso["relative_gap"](38736 * 147456, r["bytes"]) < 0.001
+
+
+def test_iso_vllm_echo_line_alone_is_not_a_pool_line(iso: dict) -> None:
+    with pytest.raises(iso["IsoBytesError"], match="NO recognizable KV-pool line"):
+        iso["parse_engine_log"]("vllm", VLLM_019_ECHO_LINE + VLLM_019_START_LINE)
+
+
+def test_iso_vllm_corrupted_reserved_line_is_loud(iso: dict) -> None:
+    bad = VLLM_019_RESERVED_LINE.replace("reserved 5.32 GiB", "reserved ??? GiB")
+    with pytest.raises(iso["IsoBytesError"], match="corrupted"):
+        iso["parse_engine_log"]("vllm", bad)
+
+
+def test_iso_parses_lmdeploy_017_budget_line_behind_carriage_returns(iso: dict) -> None:
+    """S0F-9: LMDeploy 0.17.0's pool is the turbomind.cc:319 budget line, MB = 2^20;
+    bytes only (the token capacity depends on the allocator's page and slab rules)."""
+    r = iso["parse_engine_log"]("lmdeploy", LMDEPLOY_017_LOG)
+    assert r["bytes"] == int(55634.70 * MIB)
+    assert r["tokens"] is None
+    assert any("Object cache budget" in e for e in r["evidence"])
+    assert not any("slab_size" in e for e in r["evidence"])
+
+
+def test_iso_lmdeploy_corrupted_budget_line_is_loud(iso: dict) -> None:
+    bad = LMDEPLOY_017_LOG.replace("55634.70 MB", "many MB")
+    with pytest.raises(iso["IsoBytesError"], match="corrupted"):
+        iso["parse_engine_log"]("lmdeploy", bad)
+
+
+def test_iso_lmdeploy_017_within_tolerance_of_vllm_profiled_start(iso: dict) -> None:
+    """S0 numbers: TurboMind's region 54.33 GiB vs vLLM's 53.54 GiB at the same
+    0.90 budget, gap 1.46%, inside the 0.05 tolerance."""
+    lm = iso["parse_engine_log"]("lmdeploy", LMDEPLOY_017_LOG)
+    vl = iso["parse_engine_log"]("vllm", VLLM_019_PROFILED_LOG)
+    basis, gap, within = iso["compare_pair"](vl, lm, 0.05)
+    assert basis == "bytes" and within and 0.01 < gap < 0.02
+
+
+def test_iso_tail_rule_reads_only_the_last_engine_start(iso: dict) -> None:
+    """The cluster manager appends every start of a replica to one file (S0:
+    2 to 5 starts per log). Only the lines after the LAST start marker count,
+    so a budgeted start after a profiled one never reads the old Available line."""
+    two_starts = VLLM_019_PROFILED_LOG + VLLM_019_BUDGETED_LOG
+    r = iso["parse_engine_log"]("vllm", two_starts)
+    assert r["bytes"] == int(5.32 * GIB) and r["tokens"] == 38736
+    assert r["starts"] == 2
+    # and the other way round: the profiled start is the newest
+    r = iso["parse_engine_log"]("vllm", VLLM_019_BUDGETED_LOG + VLLM_019_PROFILED_LOG)
+    assert r["bytes"] == int(53.54 * GIB) and r["tokens"] == 389888
+    assert r["starts"] == 2
+    # sglang: the server_args dump is the start marker
+    sg = SGLANG_START_LINE + SGLANG_LOG + SGLANG_START_LINE + SGLANG_SCHEDULER_ONLY_LOG
+    r = iso["parse_engine_log"]("sglang", sg)
+    assert r["bytes"] is None and r["tokens"] == 430913 and r["starts"] == 2
+    # lmdeploy: the 'input backend=' line is the start marker
+    lm = LMDEPLOY_017_LOG + LMDEPLOY_017_LOG.replace("55634.70 MB", "24628.67 MB")
+    r = iso["parse_engine_log"]("lmdeploy", lm)
+    assert r["bytes"] == int(24628.67 * MIB) and r["starts"] == 2
+
+
+def test_iso_tail_rule_without_a_marker_reads_the_whole_log(iso: dict) -> None:
+    """Older shapes (V0, legacy, the synthetic BlockManager fixture) carry no
+    marker: the whole text is parsed as before and starts reads 0."""
+    for engine, text in (("vllm", VLLM_V0_LOG), ("vllm", VLLM_V1_LOG),
+                         ("lmdeploy", LMDEPLOY_LOG), ("sglang", SGLANG_LOG)):
+        assert iso["parse_engine_log"](engine, text)["starts"] == 0
+
+
+def test_iso_cli_pool_sum_passes_on_budgeted_019_role_logs(
+        iso: dict, tmp_path: Path, monkeypatch, capsys) -> None:
+    """S0-20 runs 1 and 3 failed 'no bytes channel' on exactly these logs; with
+    the reserved rule the two 5.32 GiB roles sum to the planned 11,427,840,000 B
+    within 0.03%."""
+    _pin_roles(tmp_path, monkeypatch,
+               {"vllm:prefill": VLLM_019_BUDGETED_LOG,
+                "vllm:decode": VLLM_019_BUDGETED_LOG.replace("pid=29655", "pid=29656")},
+               pool_sum=11_427_840_000)
+    rc = iso["main"](["gate", "vllm"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "[PASS] vllm: pool SUM" in out and "no bytes channel" not in out
+
+
+def test_iso_cli_multi_start_log_prints_a_note(iso: dict, tmp_path: Path,
+                                              monkeypatch, capsys) -> None:
+    _write_logs(tmp_path, vllm=VLLM_019_PROFILED_LOG + VLLM_019_BUDGETED_LOG)
+    monkeypatch.setenv("CAGE_ISO_BYTES_LOG_ROOT", str(tmp_path))
+    monkeypatch.delenv("CAGE_ISO_BYTES_LOGS", raising=False)
+    monkeypatch.delenv("CAGE_ISO_POOL_SUM_BYTES", raising=False)
+    rc = iso["main"](["gate", "vllm"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "[note] vllm: 2 engine starts in" in out and "parsed the last" in out
+    assert "bytes=5.320 GiB tokens=38736" in out
+
+
+def test_iso_cli_lmdeploy_017_log_file_read_through_the_gate(
+        iso: dict, tmp_path: Path, monkeypatch, capsys) -> None:
+    """The real file path: the tqdm carriage returns are in the bytes on disk and
+    the gate's read_text splits them; LMDeploy enters bytes parity with vLLM."""
+    (tmp_path / "lmdeploy").mkdir()
+    (tmp_path / "lmdeploy" / "lmdeploy_Qwen_Qwen3-8B_20260930_143423.log").write_bytes(
+        LMDEPLOY_017_LOG.encode("utf-8"))
+    _write_logs(tmp_path, vllm=VLLM_019_PROFILED_LOG)
+    monkeypatch.setenv("CAGE_ISO_BYTES_LOG_ROOT", str(tmp_path))
+    monkeypatch.delenv("CAGE_ISO_BYTES_TOL", raising=False)
+    monkeypatch.delenv("CAGE_ISO_BYTES_LOGS", raising=False)
+    monkeypatch.delenv("CAGE_ISO_POOL_SUM_BYTES", raising=False)
+    rc = iso["main"](["gate", "vllm,lmdeploy"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "[pool] lmdeploy: bytes=54.331 GiB tokens=n/a" in out
+    assert "[PASS] vllm vs lmdeploy: bytes gap 0.01" in out
+
+
+def test_lmdeploy_launcher_keeps_the_info_log_level() -> None:
+    """The turbomind.cc:319 budget line is INFO; the launcher must pass
+    --log-level INFO and never pre-set a stricter TM_LOG_LEVEL."""
+    text = LMDEPLOY_LAUNCHER.read_text(encoding="utf-8")
+    code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+    assert "--log-level INFO" in code
+    assert "TM_LOG_LEVEL" not in code
+    assert "Object cache budget" in text, "the header must name the line gate (j) parses"
 
 
 def _reading(engine: str, *, b: Optional[int] = None,

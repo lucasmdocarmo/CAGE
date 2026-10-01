@@ -27,13 +27,14 @@ logger = logging.getLogger("cage.observability.provenance")
 # Scoring-stack packages whose installed versions must travel with every manifest
 # (charter PUBLICATION.md D8 §8.1: "every score row carries instrument id+version";
 # CAGE_TECHNICAL_REVIEW_2026-08-04.md §4.8). Distribution names as pip declares them.
+# ragas left the list with requirements.txt (ADR-0129, S0F-2): the section 8.6(d)
+# judge is a prompt over HTTP, and the entry only ever recorded None with a warning.
 SCORING_STACK_PACKAGES: Tuple[str, ...] = (
     "transformers",
     "sentence-transformers",
     "lettucedetect",
     "bert-score",
     "rouge-score",
-    "ragas",
     "torch",
     "scipy",
     "numpy",

@@ -525,6 +525,14 @@ _RULES = {
         # V1 gpu_worker.py: realized pool memory.
         ("Available KV cache memory:",
          re.compile(rf"Available KV cache memory:\s*{_NUM}\s*GiB"), "bytes", float(GIB)),
+        # V1 0.19.1 gpu_worker.py:361 under --kv-cache-memory-bytes: the worker
+        # skips profiling, prints the budget it reserved and never the
+        # "Available" line (ADR-0130, S0F-14; six S0 logs). The anchor is the
+        # long phrase on purpose: the launch echo at the top of the same log
+        # carries the bare words kv_cache_memory_bytes and must not trip it.
+        ("memory for KV Cache as specified by kv_cache_memory_bytes config",
+         re.compile(rf"reserved\s*{_NUM}\s*GiB memory for KV Cache as specified by "
+                    rf"kv_cache_memory_bytes config"), "bytes", float(GIB)),
         # V0 0.6.x memory-profile summary ("...the rest of the memory reserved
         # for KV Cache is 5.33GiB").
         ("memory reserved for KV Cache is",
@@ -546,7 +554,18 @@ _RULES = {
          re.compile(rf"max_total_num_tokens\s*[=:]\s*{_NUM}"), "tokens", 1.0),
     ],
     "lmdeploy": [
-        # TurboMind BlockManager pair: bytes = block_size(MB=2^20) x count.
+        # TurboMind 0.17.0 turbomind.cc:319 (ADR-0130, S0F-9): the cache buffer
+        # TurboMind measured and allocated, MB = 2^20 (cache_bytes = free x
+        # ratio). It is the engine's one pool-size line; the [BlockManager] pair
+        # below left the source at 0.15.0. Bytes only: the token capacity needs
+        # the allocator's page and slab rules (the region sits about 1.6% above
+        # the usable blocks at S0, inside the 0.05 tolerance). The tqdm weight
+        # bar hides this line behind carriage returns; read_text and
+        # splitlines() separate it.
+        ("Object cache budget:",
+         re.compile(rf"Object cache budget:\s*{_NUM}\s*MB from free\s*{_NUM}\s*MB "
+                    rf"and ratio\s*{_NUM}"), "bytes", float(MIB)),
+        # TurboMind <= 0.14 BlockManager pair: bytes = block_size(MB=2^20) x count.
         ("[BlockManager] block_size",
          re.compile(rf"\[BlockManager\]\s*block_size\s*=\s*{_NUM}\s*MB"),
          "lmdeploy-block-mb", None),
@@ -556,14 +575,38 @@ _RULES = {
     ],
 }
 
+#: One line each engine prints exactly once per engine start, before any pool
+#: line (ADR-0130 tail rule): a log that holds several starts (the cluster
+#: manager appends every start of a replica to one file; S0 had 2 to 5) is
+#: parsed from its LAST marker on, so a budgeted start can never read the
+#: Available line of an earlier profiled start. Older shapes carry no marker
+#: and are parsed whole, as before.
+_START_MARKERS = {
+    "vllm": "Initializing a V1 LLM engine",   # core.py:105 (v0.19.1), the EngineCore banner
+    "sglang": "server_args=",                   # the ServerArgs dump at launch
+    "lmdeploy": "input backend=",               # async_engine.py:130 (0.17.0)
+}
+
+
+def last_start_tail(engine, lines):
+    """(lines from the last start marker on, number of markers seen)."""
+    marker = _START_MARKERS.get(engine)
+    if marker is None:
+        return lines, 0
+    hits = [i for i, line in enumerate(lines) if marker in line]
+    if not hits:
+        return lines, 0
+    return lines[hits[-1]:], len(hits)
+
 
 def parse_engine_log(engine, text):
-    """Parse one engine startup log -> {'engine', 'bytes', 'tokens', 'evidence'}.
+    """Parse one engine startup log -> {'engine', 'bytes', 'tokens', 'evidence', 'starts'}.
 
-    'bytes'/'tokens' are ints or None (channel not present in this log); the
-    LAST occurrence of a channel wins (a log holds exactly one server start,
-    but a re-profiled pool must supersede its predecessor). 'evidence' keeps
-    every matched line verbatim for the run log."""
+    'bytes'/'tokens' are ints or None (channel not present in this log); only
+    the lines after the LAST engine-start marker count (last_start_tail), and
+    within them the LAST occurrence of a channel wins (a re-profiled pool must
+    supersede its predecessor). 'evidence' keeps every matched line verbatim
+    for the run log; 'starts' is the number of start markers in the file."""
     rules = _RULES.get(engine)
     if rules is None:
         raise IsoBytesError(
@@ -571,7 +614,8 @@ def parse_engine_log(engine, text):
             f"rules before scoping it into the iso-bytes gate")
     found = {}
     evidence = []
-    for line in text.splitlines():
+    lines, starts = last_start_tail(engine, text.splitlines())
+    for line in lines:
         for anchor, pattern, channel, scale in rules:
             if anchor in line:
                 m = pattern.search(line)
@@ -607,7 +651,15 @@ def parse_engine_log(engine, text):
         "bytes": int(found["bytes"]) if "bytes" in found else None,
         "tokens": int(found["tokens"]) if "tokens" in found else None,
         "evidence": evidence,
+        "starts": starts,
     }
+
+
+def note_multi_start(label, reading, path):
+    """One [note] line when a log holds several engine starts (tail rule)."""
+    if reading.get("starts", 0) > 1:
+        print(f"  [note] {label}: {reading['starts']} engine starts in {path}; "
+              f"parsed the last one (ADR-0130 tail rule)")
 
 
 def relative_gap(a, b):
@@ -740,6 +792,7 @@ def main(argv):
                 continue
             reading["log"] = str(path)
             readings.append(reading)
+            note_multi_start(engine, reading, path)
             size = "n/a" if reading["bytes"] is None else f"{reading['bytes'] / GIB:.3f} GiB"
             toks = "n/a" if reading["tokens"] is None else str(reading["tokens"])
             # mtime printed so a STALE log (older budget point) is visible in the run log.
@@ -768,6 +821,7 @@ def main(argv):
                 continue
             part["log"] = str(path)
             parts.append(part)
+            note_multi_start(label, part, path)
             size = "n/a" if part["bytes"] is None else f"{part['bytes'] / GIB:.3f} GiB"
             toks = "n/a" if part["tokens"] is None else str(part["tokens"])
             print(f"  [pool] {label}: bytes={size} tokens={toks} "

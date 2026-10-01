@@ -4682,9 +4682,11 @@ def _reset_prefix_cache(
     declares a flush endpoint in ``capabilities()`` the typed
     ``adapter.flush_cache()`` is used (vLLM POST /reset_prefix_cache, SGLang
     POST /flush_cache). The legacy raw vLLM dev-endpoint POST is KEPT as the
-    fallback for backends without an adapter flush capability (e.g. LMDeploy,
-    which documents none, or unknown backends) -- behavior-preserving for
-    them. Failures WARN loudly but never abort the trial loop, matching the
+    pilot-path fallback for backends without an adapter flush capability
+    (LMDeploy, which has no reset route at all, or unknown backends); in
+    campaign mode a known adapter without a flush endpoint REFUSES instead
+    (ADR-0131, S0F-10: a cold window there needs an engine restart). Failures
+    WARN loudly but never abort the trial loop, matching the
     historical helper, UNLESS ``strict`` (campaign mode, ADR-0102): then a
     failed reset raises ``CacheResetError`` because a window that starts
     warm when the plan says cold is a mislabeled row. In strict mode the
@@ -4718,13 +4720,47 @@ def _reset_prefix_cache(
         resolved_api_base = (
             os.getenv(f"CAGE_{env_key}_API_BASE", "").strip() or api_base
         )
-    if strict:
-        record["quiescence_probe"] = _await_quiescence(resolved_api_base, backend)
+    # ADR-0131 (S0F-10): a known adapter that declares NO flush endpoint has no
+    # cache-reset path at all (LMDeploy 0.17.0: no route, no engine method).
+    # In campaign mode that is a refusal BEFORE the quiescence probe and before
+    # any HTTP request: the legacy POST below goes to --api-base, where a
+    # dev-mode vLLM on the default port would be flushed and this window
+    # logged as a verified cold start for another engine. A cold window on
+    # such an engine needs an engine restart, not a flush. The pilot path
+    # keeps its historical fall-through (its record never claims verification).
+    def _adapter_failure(e: Exception) -> None:
+        # The adapter targets the same endpoint the legacy path would;
+        # retrying raw would fail identically, so warn and return
+        # (or refuse, in campaign mode).
+        if strict:
+            raise CacheResetError(
+                f"could not reset the {backend} cache before this window "
+                f"({e}); campaign mode refuses to serve a window under a "
+                f"cold-start label from an unflushed cache (ADR-0102). For "
+                f"vLLM, start the server with VLLM_SERVER_DEV_MODE=1 to "
+                f"enable /reset_prefix_cache."
+            ) from e
+        print(f"[cache] WARNING: could not reset prefix cache ({e}). "
+              f"For vLLM, start the server with VLLM_SERVER_DEV_MODE=1 to "
+              f"enable /reset_prefix_cache.")
 
-    def _verified() -> bool:
-        probe = record["quiescence_probe"]
-        return bool(probe and probe["readable"] and probe["running_before_flush"] == 0)
-
+    adapter: Any = None
+    caps: Dict[str, Any] = {}
+    if adapter_cls is None and strict:
+        # Same refusal for a backend with no adapter in the map above (the
+        # in-process HF oracle, gemini, ollama): there is nothing to flush
+        # through, and the legacy POST would hit --api-base (review of
+        # ADR-0131, 2026-10-01). The driver never emits the reset flag for a
+        # non-server engine; this guards the hand path.
+        raise CacheResetError(
+            f"backend {backend!r} has no cache-reset adapter: campaign mode "
+            f"refuses to fall through to the legacy POST "
+            f"{api_base.rstrip('/')}/reset_prefix_cache, which would flush "
+            f"whatever engine answers on --api-base and label this window cold "
+            f"(ADR-0131, ADR-0102). Drop --reset-cache-between-trials for this "
+            f"backend; a cold window on an engine without a flush route needs an "
+            f"engine restart before the window."
+        )
     if adapter_cls is not None:
         try:
             adapter = adapter_cls(
@@ -4735,6 +4771,29 @@ def _reset_prefix_cache(
                 if callable(getattr(adapter, "capabilities", None))
                 else {}
             ) or {}
+        except Exception as e:
+            _adapter_failure(e)
+            return record
+        if strict and not caps.get("flush_endpoint"):
+            raise CacheResetError(
+                f"the {backend} adapter declares no flush endpoint "
+                f"(capabilities()['flush_endpoint'] is "
+                f"{caps.get('flush_endpoint')!r}): this engine has no "
+                f"cache-reset path, so a cold window needs an engine restart "
+                f"before the window (ADR-0131, S0F-10). Campaign mode refuses "
+                f"to fall through to the legacy POST {api_base.rstrip('/')}"
+                f"/reset_prefix_cache, which would flush whatever engine "
+                f"answers on --api-base and label this window cold (ADR-0102)."
+            )
+    if strict:
+        record["quiescence_probe"] = _await_quiescence(resolved_api_base, backend)
+
+    def _verified() -> bool:
+        probe = record["quiescence_probe"]
+        return bool(probe and probe["readable"] and probe["running_before_flush"] == 0)
+
+    if adapter is not None:
+        try:
             if caps.get("flush_endpoint") and callable(
                 getattr(adapter, "flush_cache", None)
             ):
@@ -4747,22 +4806,10 @@ def _reset_prefix_cache(
                 record["mechanism"] = "adapter"
                 record["verified"] = _verified()
                 return record
-            # No declared flush endpoint -> fall through to the legacy path.
+            # No declared flush endpoint (pilot path only; campaign mode
+            # refused above) -> fall through to the legacy path.
         except Exception as e:
-            # The adapter targets the same endpoint the legacy path would;
-            # retrying raw would fail identically, so warn and return
-            # (or refuse, in campaign mode).
-            if strict:
-                raise CacheResetError(
-                    f"could not reset the {backend} cache before this window "
-                    f"({e}); campaign mode refuses to serve a window under a "
-                    f"cold-start label from an unflushed cache (ADR-0102). For "
-                    f"vLLM, start the server with VLLM_SERVER_DEV_MODE=1 to "
-                    f"enable /reset_prefix_cache."
-                ) from e
-            print(f"[cache] WARNING: could not reset prefix cache ({e}). "
-                  f"For vLLM, start the server with VLLM_SERVER_DEV_MODE=1 to "
-                  f"enable /reset_prefix_cache.")
+            _adapter_failure(e)
             return record
 
     # Legacy fallback (pre-ADR-0007 behavior, kept verbatim): raw POST to the

@@ -175,6 +175,31 @@ stack, whichever shell started it (S0: attempt 3 died at 16:45:10 to attempt 2's
 pd test runs with `UCX_LOG_LEVEL=info` so the selected transports are in the log; the
 launcher records the operator's `UCX_*` values per role and sets none.
 
+Gate (j) parsers (ADR-0130, S0F-9/S0F-14): a budgeted vLLM 0.19.1 start prints no
+`Available KV cache memory` line; the bytes channel is the `gpu_worker.py` line
+`reserved <X> GiB memory for KV Cache as specified by kv_cache_memory_bytes config`
+(the launch echo repeats the bare words and never matches). LMDeploy 0.17.0 prints its
+pool as `[turbomind.cc] Object cache budget: <X> MB from free <Y> MB and ratio <r>`
+(MB = 2^20; the line sits behind tqdm carriage returns and the gate splits on `\r`).
+The gate parses only the tail after a log's LAST engine-start marker and prints a
+`[note]` when one file holds several starts (the cluster manager appends restarts to
+one replica file). Pin the logs with `CAGE_ISO_BYTES_LOGS` on a pod that has run the
+test suite: the suite leaves 0-byte fake `lmdeploy_*.log` files that newest-file
+discovery would pick (S0F-23).
+
+Cold windows (ADR-0131, S0F-10): LMDeploy has no cache-reset route, so an LMDeploy
+prefix-ON window gets its cold start from an engine restart before the window; the
+campaign runner refuses a cache reset on an engine without a flush endpoint instead of
+posting the legacy `/reset_prefix_cache`, which on a dev pod flushed the vLLM on the
+default port and labeled the LMDeploy window cold. The restart step lands with the
+LMDeploy driver registration.
+
+Scoring stack (ADR-0129, S0F-2/S0F-4): `ragas` is not installed; the section 8.6(d)
+judge speaks HTTP through `requests`. The NLI checkpoint loads with TorchScript
+disabled for the load only (`src/evaluation/quality.py`), because CPython 3.13.8
+misreads the decorator layout in `modeling_deberta_v2.py`; do not export
+`PYTORCH_JIT=0` in the shell, it leaks into engine restarts.
+
 Version pins: record the actually-served engine versions into the run manifest; the
 engine×model VERIFY-LIVE matrix is `docs/VLLM_COMPATIBILITY.md` §7. Re-run gate (a)
 after **every** engine relaunch (prefix ON/OFF, policy knobs, and topology are
@@ -199,8 +224,9 @@ Run it once per (model, engine, budget level) BEFORE the level's first cell:
 #    P/D (§6.5): TWO instances, one knob per pool; pd_split is EXPLICIT, never defaulted
 
 # 3. VERIFY — gate (j) against the startup logs; the plan's gate_j.expected_bytes_total
-#    must match realized bytes within CAGE_ISO_BYTES_TOL (default 0.05)
-CAGE_ISO_BYTES_LOGS="vllm=<log>,sglang=<log>" bash scripts/checks/preflight_check.sh <MODEL> <API_BASE>
+#    must match realized bytes within CAGE_ISO_BYTES_TOL (default 0.05); a file with
+#    several engine starts is parsed from its LAST start marker (ADR-0130 tail rule)
+CAGE_ISO_BYTES_LOGS="vllm=<log>,sglang=<log>,lmdeploy=<log>" bash scripts/checks/preflight_check.sh <MODEL> <API_BASE>
 
 # 4. RECORD — append {model, engine, r, plan_bytes, realized_bytes, knob} to
 #    results/<run>/calibration/budget_knob_map.jsonl (operator-recorded; the
@@ -467,7 +493,7 @@ manually, and only then uses `--force` — a user decision, reported as such.
 | `CAGE_RUN_ROOT` / `CAGE_RUN_ID` / `CAGE_PHASE` | run scripts, observability | Minted by `cloud_run.sh`/`run_full_sweep.sh` (`mint_run_id`: `<YYYY-MM-DD_HHMMSS>_<model-slug>_<Q>x<T>_<4hex>_<dataset>`) and exported so every child writes the SAME `results/<phase>/<run-id>/` tree. Export `CAGE_RUN_ID` to resume into an existing tree. |
 | `CAGE_PREFLIGHT_BACKENDS` | `preflight_check.sh` gates (j)/(k) | Comma-separated adapter list to check (default `vllm,sglang,lmdeploy`). Scope down for single-engine pods. |
 | `CAGE_ISO_BYTES_TOL` | gate (j) | Relative tolerance for §6.5 realized-KV iso-bytes parity (default `0.05`; must be a float in (0,1) or the gate FAILS). |
-| `CAGE_ISO_BYTES_LOGS` | gate (j) | Pin exact engine startup logs: `vllm=/path/a.log,sglang=/path/b.log` (e.g. one budget point of a pressure sweep). |
+| `CAGE_ISO_BYTES_LOGS` | gate (j) | Pin exact engine startup logs: `vllm=/path/a.log,sglang=/path/b.log,lmdeploy=/path/c.log` (e.g. one budget point of a pressure sweep). Pin them after the test suite has run on the pod: the suite leaves 0-byte fake `lmdeploy_*.log` files that the unpinned newest-file discovery picks (S0F-23). |
 | `CAGE_QUALITY_STRICT` | `src/evaluation/quality.py`, gate (e) | Unset/`1` = strict fail-closed quality layer (default). An explicit falsy (`0`/`false`/`no`) downgrades instrument failures to `score=None` for the whole run — preflight FAILS on it; forbidden for confirmatory runs. |
 | `CAGE_CLAIM_CHECKER` | `src/evaluation/quality.py` | Claim-check instrument selection. Default `nli` (owner decision #120/F8, 2026-08-19; in-process-safe). `alignscore` is Instrument B and is requested explicitly by `scripts/4_analysis/score_instrument_b.py` — never as the run default. Preflight prints the state either way. |
 | `CAGE_SKIP_QUALITY=1` | run scripts, `run_campaign.py` (cell-step env pin), `run_experiment.py` (campaign-mode gate) | Decoupled-scoring regime (default in `run_full_sweep.sh`; pinned on every campaign cell step by the driver, W1 / ADR-0055): inline model-based quality is skipped and scored after the serving trees. A *declared* regime, not a mock. A campaign cell without it refuses before serving; the regime is recorded per window in `metrics.json["quality_scoring"]`. |
@@ -477,7 +503,7 @@ manually, and only then uses `--force` — a user decision, reported as such.
 | `CAGE_CLUSTER_BASE_PORT` / `CAGE_CLUSTER_ROUTER_PORT` | `run_tests.sh --with-cluster` | S0F-18: forwarded to the cluster manager as `--base-port` / `--router-port` when set (the manager's defaults are 8101 and 9000; 8001 is the image's nginx); the router port also sets `ROUTER_TEST_API_BASE` for the router tests. |
 | `ROUTER_START_TIMEOUT` | `manage_vllm_cluster.py` | S0F-18: default `--router-timeout` in seconds (60). The replica budget reads `VLLM_START_TIMEOUT` (300), the engine launchers' knob. |
 | `CAGE_PD_NIXL_PORT_PREFILL` / `CAGE_PD_NIXL_PORT_DECODE` | `manage_vllm_pd.sh` | ADR-0128 (S0F-13): the NIXL handshake side-channel port of each role (defaults 5600 / 5601), passed to the role as `VLLM_NIXL_SIDE_CHANNEL_PORT` in its child env and recorded in the per-role serving-config capture. Equal values, a value equal to an HTTP port, or a shell `VLLM_NIXL_SIDE_CHANNEL_PORT` refuse the start. |
-| `CAGE_PD_PYTHON` | `manage_vllm_pd.sh` | ADR-0128: the interpreter the nixl import gate probes before the self-cleaning stop (default `python3`, the activated cage-env that runs `vllm serve`). Test seam; never set it on a pod. |
+| `CAGE_PD_PYTHON` | `manage_vllm_pd.sh` | ADR-0128: the interpreter the nixl import gate probes before the self-cleaning stop (default `python3`, the activated cage-env that runs `vllm serve`); the probe first checks that this interpreter can find `vllm`, then `nixl._api` / `nixl._bindings`, then a broken top-level `nixl_ep`. Test seam; never set it on a pod. |
 | `CAGE_HF_LIVE=1` | `tests/test_qasper_revision_s0f5.py` (`setup_runpod.sh` step 4a-live) | ADR-0127 (S0F-5): opt-in for the live qasper check (loads the pinned Hub route with the real `datasets` library and compares the rebuilt 50x3 manifest digest). Unset, the test skips; the bootstrap sets it on every pod. |
 | `CAGE_SGLANG_API_BASE` / `CAGE_LMDEPLOY_API_BASE` | `run_experiment.py` (adapter + cache flush) | Per-engine endpoint override, resolved BEFORE `--api-base`. Pilot convenience only: `run_campaign.py run` refuses while either is set (W2), because it would beat the plan's pin. |
 | `CAGE_SLO_FLOORS_JSON` | `run_campaign.py` (cell-step env pin), `campaign_session.py` | Batch 2 W4 (ADR-0117): the §6.1 single-stream floors of every registered engine as compact JSON, pinned on EVERY cell step from the plan header `calibration` (one cal-v2 artifact per engine, §3.2); the session writes it into `manifest.json["slo_floors"]` at manifest creation and refuses a reopened manifest whose floors differ. `run` refuses while it is exported in the shell. Never set it by hand. |

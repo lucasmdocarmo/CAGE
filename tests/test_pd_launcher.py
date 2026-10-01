@@ -98,9 +98,12 @@ import os  # noqa: E402  (used by the env helpers below)
 
 
 def _clean_env(**extra: str) -> dict:
+    # UCX_ stripped too (review 2026-10-01 LOW 4): the capture records the
+    # operator's UCX_* values, so a developer shell must not leak into the
+    # "nothing set" assertions.
     env = {
         k: v for k, v in os.environ.items()
-        if not k.startswith(("CAGE_", "VLLM_", "SGLANG_", "PD_"))
+        if not k.startswith(("CAGE_", "VLLM_", "SGLANG_", "PD_", "UCX_"))
     }
     env.update(extra)
     return env
@@ -122,12 +125,15 @@ def stub_bin(tmp_path_factory: pytest.TempPathFactory) -> Path:
     # per-role GPU pin must ride CUDA_VISIBLE_DEVICES in the child env and
     # nowhere else; S0F-13: the per-role NIXL side-channel port likewise) when
     # CAGE_TEST_VLLM_JOURNAL names a file.
+    # ucx_tls is journaled so "the launcher exports no UCX_TLS" is a real
+    # assertion (review 2026-10-01 LOW 4), kept before nixl_port so the
+    # endswith(" nixl_port=...") pins hold.
     vllm_stub = (
         "#!/bin/sh\n"
         'if [ -n "${CAGE_TEST_VLLM_JOURNAL:-}" ]; then\n'
-        "  printf 'CUDA_VISIBLE_DEVICES=%s args=%s nixl_port=%s\\n' "
-        '"${CUDA_VISIBLE_DEVICES-unset}" "$*" "${VLLM_NIXL_SIDE_CHANNEL_PORT-unset}" '
-        '>> "$CAGE_TEST_VLLM_JOURNAL"\n'
+        "  printf 'CUDA_VISIBLE_DEVICES=%s args=%s ucx_tls=%s nixl_port=%s\\n' "
+        '"${CUDA_VISIBLE_DEVICES-unset}" "$*" "${UCX_TLS-unset}" '
+        '"${VLLM_NIXL_SIDE_CHANNEL_PORT-unset}" >> "$CAGE_TEST_VLLM_JOURNAL"\n'
         "fi\n"
         "exit 0\n"
     )
@@ -697,9 +703,10 @@ def test_start_gives_each_role_its_own_side_channel_port(stub_bin: Path, tmp_pat
     dcap = json.loads(next(cfg_dir.glob("*_pd-decode.json")).read_text(encoding="utf-8"))
     assert pcap["nixl_side_channel_port"] == 5600
     assert dcap["nixl_side_channel_port"] == 5601
-    # part 5 (record only): no UCX_* set -> an empty record, never an export
+    # part 5 (record only): no UCX_* set -> an empty record, and the child env
+    # carries no UCX_TLS the launcher could have exported (the stub journals it)
     assert pcap["ucx_env"] == {} and dcap["ucx_env"] == {}
-    assert "UCX_TLS" not in prefill[0] and "UCX_TLS" not in decode[0]
+    assert " ucx_tls=unset " in prefill[0] and " ucx_tls=unset " in decode[0]
 
 
 def test_side_channel_port_overrides_and_ucx_record(stub_bin: Path, tmp_path: Path) -> None:
@@ -791,7 +798,7 @@ def test_dead_role_fails_the_start_at_once_with_its_log_tail(stub_bin: Path, tmp
     )
     elapsed = time.monotonic() - t0
     assert proc.returncode != 0
-    assert "exited before serving /health" in proc.stdout
+    assert "exited before both roles were ready" in proc.stdout
     assert "last 20 log lines" in proc.stdout
     assert "not ready within" not in proc.stdout
     assert elapsed < 12, f"liveness check did not short-circuit the wait ({elapsed:.1f}s)"
@@ -811,6 +818,70 @@ def test_both_roles_are_launched_before_one_joint_wait(stub_bin: Path, tmp_path:
     assert out.index("Server args [prefill]") < out.index(wait_line)
     assert out.index("Server args [decode]") < out.index(wait_line)
     assert out.count("Waiting for") == 1  # one joint loop, no per-role serial waits
+
+
+# --- review 2026-10-01 (Fable 5.1, batch 2): LOW 2, LOW 3, LOW 5 -------------
+
+
+@pytest.mark.parametrize("env", [
+    {"CAGE_PD_NIXL_PORT_PREFILL": "70000"},
+    {"CAGE_PD_NIXL_PORT_DECODE": "65536"},
+], ids=["prefill-70000", "decode-65536"])
+def test_start_refuses_side_channel_port_above_65535(stub_bin: Path, env: Dict[str, str]) -> None:
+    # LOW 3: a positive int is not yet a TCP port; without the bound the start
+    # composed both argv lines and ran the self-cleaning stop on a healthy stack.
+    proc = _run_pd(stub_bin, "start", "fake/test-model", **GOOD_BUDGETS, **env)
+    _assert_refused_before_anything(proc)
+    assert "65535" in proc.stderr
+    assert "65535" not in _run_pd(
+        stub_bin, "start", "fake/test-model", CAGE_PD_NIXL_PORT_DECODE="65535", **GOOD_BUDGETS
+    ).stderr  # the bound itself is a legal port
+
+
+def test_import_gate_refuses_an_interpreter_without_vllm(stub_bin: Path) -> None:
+    # LOW 2: the probe runs under CAGE_PD_PYTHON (default python3); an
+    # interpreter that cannot even find vllm is not the serving interpreter,
+    # and the refusal names that cause instead of a misleading nixl message.
+    proc = _run_pd(
+        stub_bin, "start", "fake/test-model",
+        CAGE_TEST_PD_PY_RC="4", CAGE_TEST_PD_PY_MSG="vllm: not findable", **GOOD_BUDGETS,
+    )
+    _assert_refused_before_anything(proc)
+    assert "not the interpreter that runs" in proc.stderr
+    assert "cage-env" in proc.stderr and "CAGE_PD_PYTHON" in proc.stderr
+    assert "nixl==" not in proc.stderr.split("REFUSING", 1)[1].splitlines()[0]
+    text = PD_SH.read_text(encoding="utf-8")
+    assert 'find_spec("vllm")' in text
+
+
+def test_a_role_that_dies_after_reporting_ready_fails_the_start_at_once(
+    stub_bin: Path, tmp_path: Path
+) -> None:
+    # LOW 5: liveness must hold until BOTH roles are ready, not only until a
+    # role first answers /health. Here the prefill answers at once and dies
+    # about 1 s later while the decode is still starting (alive, not ready);
+    # the start must fail naming the prefill well inside the budget.
+    import time
+    local_bin = tmp_path / "bin"
+    local_bin.mkdir()
+    for p in stub_bin.iterdir():
+        (local_bin / p.name).write_text(p.read_text(encoding="utf-8"), encoding="utf-8")
+        (local_bin / p.name).chmod(0o755)
+    (local_bin / "curl").write_text(
+        '#!/bin/sh\ncase "$*" in *:8100/health*) exit 0 ;; *) exit 1 ;; esac\n', encoding="utf-8")
+    (local_bin / "vllm").write_text(
+        '#!/bin/sh\ncase "$*" in *"--port 8100"*) sleep 1 ;; *) sleep 6 ;; esac\nexit 0\n',
+        encoding="utf-8")
+    for name in ("curl", "vllm"):
+        (local_bin / name).chmod(0o755)
+    t0 = time.monotonic()
+    proc = _run_pd(local_bin, "start", "fake/test-model", VLLM_START_TIMEOUT="20", **GOOD_BUDGETS)
+    elapsed = time.monotonic() - t0
+    assert proc.returncode != 0
+    assert "prefill instance ready" in proc.stdout
+    assert "prefill instance exited" in proc.stdout, proc.stdout
+    assert "not ready within" not in proc.stdout
+    assert elapsed < 12, f"the dead ready role was not caught before the budget ({elapsed:.1f}s)"
 
 
 # ---------------------------------------------------------------------------

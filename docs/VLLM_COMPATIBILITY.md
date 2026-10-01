@@ -219,9 +219,10 @@ The transfer stack is pinned as a **triple — (vLLM, NIXL wheel, UCX)** — rec
 together in the manifest; bump any element → re-run this whole section.
 
 Current triple (ADR-0128, 2026-09-30): vLLM 0.19.1; NIXL 0.9.0 (`nixl` + `nixl-cu12`,
-section 7 row); UCX as bundled by that wheel (version read live at the Run-C-prime
-preflight and written to the per-role serving-config capture). The launcher records
-every `UCX_*` variable the operator sets in that capture (`ucx_env`) and exports none
+section 7 row); UCX as bundled by that wheel. The UCX version is read by hand from the
+role log at the Run-C-prime preflight and written into the act manifest; no launcher
+field records it (review 2026-10-01). The launcher records every `UCX_*` variable the
+operator sets in the per-role serving-config capture (`ucx_env`) and exports none
 itself: the intra-node TCP rung runs on UCX's own transport selection, while the RDMA
 rung sets the 8.3 allowlist by hand. The S0 `UCX ... IB` line was a warning printed by
 the decode that reached ready, not a failure.
