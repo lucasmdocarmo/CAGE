@@ -8,7 +8,9 @@ Wave-3 T3.2. The minimal front-end for the intra-node P/D topology: a client
 sends ONE OpenAI-style request to this proxy; the proxy first sends it to the
 PREFILL instance with ``max_tokens=1`` (so prefill computes/stages the KV and
 generates nothing beyond the mandatory first token), then sends the FULL
-request to the DECODE instance and streams the decode response back verbatim.
+request to the DECODE instance and streams the decode response back verbatim,
+forwarding each piece as the decode sends it (``read1``; S0F-28, ADR-0138:
+``read(n)`` held the first token until 8 KB or the end of the stream).
 
 The ticket (S0F-22, ADR-0133, Batch 1; vLLM v0.19.1 source read 2026-10-01):
 the prefill ENGINE writes its KV transfer ticket (``kv_transfer_params`` on
@@ -61,7 +63,13 @@ relays both to the role instances: ``/metrics`` exposes ONE family only,
 so the runner's probe reads the stack's total), and answers 503 when either
 role is unreachable or lacks the gauge; ``/reset_prefix_cache`` is sent to
 BOTH roles and answers 200 only when both flushed, else 502 naming the role
-that did not (never a partial success under a cold-start label). No other
+that did not (never a partial success under a cold-start label). Since
+S0F-27 (ADR-0137) the reset carries ``?reset_running_requests=true``, the
+vLLM mode in which a declined reset is an HTTP 500 instead of a 200, and is
+preceded by one plain one-token completion sent straight to each role: an
+idle NixlConnector role holds the blocks of its last ticketed requests until
+its next engine step, so without the wake its reset is declined at every
+window boundary. A 5xx repeats the cycle once, then the proxy refuses. No other
 metric family is relayed: a sampler pointed at the proxy finds absence,
 never a doubled occupancy (per-role telemetry rides CAGE_TELEMETRY_ENDPOINTS
 against the instances themselves). manage_vllm_pd.sh launches both role
@@ -84,6 +92,7 @@ import json
 import math
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlsplit
@@ -111,13 +120,45 @@ ROLE_LABEL = "pd_role"
 #: path mirrors src/inference/vllm_adapter.py _flush_endpoint).
 METRICS_PATH = "/metrics"
 RESET_PATH = "/reset_prefix_cache"
-#: Upstream timeouts for the two relayed paths, seconds, PER socket operation
+#: S0F-27 (ADR-0137): the query that makes a DECLINED reset visible. Without
+#: it vLLM v0.19.1 answers 200 whatever the block pool did
+#: (serve/cache/api_router.py:21-44); with it the scheduler raises when blocks
+#: are still held (scheduler.py:1895-1902), the engine survives and the
+#: generic handler answers 500. The proxy sends it to both roles on every
+#: reset, whatever the client sent, so its own 200 means both roles flushed.
+RESET_QUERY = "reset_running_requests=true"
+#: S0F-27: the wake request sent straight to each role before the reset. An
+#: idle NixlConnector role releases the blocks of its last ticketed requests
+#: only on an engine step, so one plain one-token completion makes it step.
+#: No kv_transfer_params (a ticket would create a new hold on the prefill),
+#: no model field (CompletionRequest.model is optional, completion/protocol.py:45).
+WAKE_PATH = "/v1/completions"
+WAKE_BODY: Dict[str, Any] = {
+    "prompt": "wake",
+    "max_tokens": 1,
+    "temperature": 0.0,
+    "stream": False,
+}
+#: Upstream timeouts for the relayed paths, seconds, PER socket operation
 #: (http.client semantics: connect, then each read), so one leg is bounded by
 #: about twice the value. The roles are visited concurrently (_call_roles),
-#: so the proxy's worst case is one leg: about 8 s against the runner's 10 s
-#: probe timeout, about 28 s against its 30 s flush timeout.
+#: so the metrics relay's worst case is one leg: about 8 s against the
+#: runner's 10 s probe timeout. A reset is RESET_CYCLES cycles of wake then
+#: reset with _RESET_RETRY_PAUSE_S between them: 2 x (6 s + 6 s) + 1 s = 25 s
+#: against the adapter's 30 s flush timeout (pinned by the proxy tests). The
+#: reset leg was 14 s when the relay was one call; the bound now has to hold
+#: two cycles. Provenance of 3 s: on the S0 single-instance vLLM the reset
+#: request line and the engine's "Successfully reset prefix cache" line share
+#: one second (17:36:42, 2026-09-30); no pd pair has been timed [A, RC-12].
+#: A wake that outlasts its leg is recorded and the reset still decides.
 _METRICS_TIMEOUT = 4.0
-_RESET_TIMEOUT = 14.0
+_WAKE_TIMEOUT = 3.0
+_RESET_TIMEOUT = 3.0
+#: S0F-27: a role that answers 5xx declined the reset (blocks still held: a
+#: notification that had not reached the role when its wake request ran).
+#: The whole cycle runs once more after the pause, then the proxy refuses.
+RESET_CYCLES = 2
+_RESET_RETRY_PAUSE_S = 1.0
 #: GET paths relayed from the decode role (readiness + engine-version capture).
 MODELS_PATH = "/v1/models"
 VERSION_PATH = "/version"
@@ -212,7 +253,8 @@ def sum_gauge(metrics_text: str, gauge: str) -> Optional[int]:
 
 
 def _call_roles(
-    roles: Tuple[Tuple[str, str], ...], method: str, path: str, timeout: float
+    roles: Tuple[Tuple[str, str], ...], method: str, path: str, timeout: float,
+    body: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Tuple[Optional[int], str]]:
     """One upstream call per role, run CONCURRENTLY (one thread per role), so
     the relay's worst case is a single leg rather than the sum of both; each
@@ -220,7 +262,7 @@ def _call_roles(
     out: Dict[str, Tuple[Optional[int], str]] = {}
 
     def _one(role: str, url: str) -> None:
-        out[role] = _upstream_call(url, method, path, timeout)
+        out[role] = _upstream_call(url, method, path, timeout, body)
 
     threads = [
         threading.Thread(target=_one, args=(role, url), daemon=True)
@@ -234,21 +276,31 @@ def _call_roles(
 
 
 def _upstream_call(
-    url: str, method: str, path: str, timeout: float
+    url: str, method: str, path: str, timeout: float,
+    body: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[int], str]:
     """(status, body text) of one upstream call; (None, reason) when the role
     is unreachable or times out (an OSError, never an exception escaping into
-    the handler)."""
+    the handler). ``body`` is sent as JSON when given."""
     host, port = _split_url(url)
     try:
         conn = http.client.HTTPConnection(host, port, timeout=timeout)
         try:
-            conn.request(method, path)
+            if body is None:
+                conn.request(method, path)
+            else:
+                conn.request(
+                    method, path, body=json.dumps(body).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
             resp = conn.getresponse()
             return resp.status, resp.read().decode("utf-8", "replace")
         finally:
             conn.close()
-    except OSError as exc:
+    except (OSError, http.client.HTTPException) as exc:
+        # HTTPException too (review 2026-10-02): a body shorter than its
+        # Content-Length raises IncompleteRead, which is not an OSError and
+        # would otherwise kill the role thread and leave the client unanswered.
         return None, f"unreachable ({exc.__class__.__name__}: {exc})"
 
 
@@ -394,30 +446,57 @@ class PDProxyHandler(BaseHTTPRequestHandler):
         self._reply_text(200, "\n".join(lines) + "\n")
 
     def _relay_reset(self) -> None:
-        """POST /reset_prefix_cache to BOTH roles; 200 only when both answered
-        2xx, else 502 naming the role(s) that did not (a flush that one role
-        declined is not a cold start)."""
+        """Reset BOTH roles; 200 only when both flushed, else 502 naming the
+        role(s) that did not (a flush that one role declined is not a cold
+        start).
+
+        S0F-27 (ADR-0137). One cycle is: wake both roles (WAKE_BODY straight
+        to each role, never through the ticket path), then POST the reset
+        with RESET_QUERY to both. With that query a role answers 5xx when
+        its block pool declined, so 2xx from both means both flushed. A 5xx
+        repeats the whole cycle once after _RESET_RETRY_PAUSE_S (a decode
+        notification can reach the prefill after its first wake step); an
+        unreachable role or a 4xx (no dev-mode route) is refused at once.
+        The wake's own status is recorded and never decides the outcome: the
+        reset status is the authority."""
+        target = f"{RESET_PATH}?{RESET_QUERY}"
+        attempts = []
         statuses: Dict[str, Any] = {}
         failed: Dict[str, str] = {}
-        replies = _call_roles(self._roles(), "POST", RESET_PATH, _RESET_TIMEOUT)
-        for role, _url in self._roles():
-            status, body = replies[role]
-            statuses[role] = status
-            if status is None:
-                failed[role] = body
-            elif not 200 <= status < 300:
-                failed[role] = f"http-{status}: {body[:200]}"
+        cycle = 0
+        while cycle < RESET_CYCLES:
+            cycle += 1
+            wake = _call_roles(self._roles(), "POST", WAKE_PATH, _WAKE_TIMEOUT, WAKE_BODY)
+            replies = _call_roles(self._roles(), "POST", target, _RESET_TIMEOUT)
+            statuses, failed = {}, {}
+            for role, _url in self._roles():
+                status, body = replies[role]
+                statuses[role] = status
+                if status is None:
+                    failed[role] = body
+                elif not 200 <= status < 300:
+                    failed[role] = f"http-{status}: {body[:200]}"
+            attempts.append(
+                {"wake": {role: wake[role][0] for role, _ in self._roles()}, "reset": dict(statuses)}
+            )
+            declined = all(
+                statuses[role] is not None and 500 <= statuses[role] < 600 for role in failed
+            )
+            if not failed or not declined or cycle == RESET_CYCLES:
+                break
+            time.sleep(_RESET_RETRY_PAUSE_S)
+        record = {"query": RESET_QUERY, "roles": statuses, "cycles": cycle, "attempts": attempts}
         if failed:
             self._reply_json(
                 502,
                 {
                     "error": "prefix cache reset failed on a pd role (fail closed)",
-                    "roles": statuses,
                     "failed": failed,
+                    **record,
                 },
             )
             return
-        self._reply_json(200, {"reset": RESET_PATH, "roles": statuses})
+        self._reply_json(200, {"reset": RESET_PATH, **record})
 
     # -- health ------------------------------------------------------------
 
@@ -466,7 +545,10 @@ class PDProxyHandler(BaseHTTPRequestHandler):
     # -- the 1P1D data path -------------------------------------------------
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path == RESET_PATH:
+        # The vLLM adapter posts the reset WITH its query (S0F-27), so the
+        # match is on the path alone; the relay sends RESET_QUERY upstream
+        # whatever the client's query was.
+        if urlsplit(self.path).path == RESET_PATH:
             self._relay_reset()
             return
         if not self.path.startswith("/v1/"):
@@ -556,8 +638,12 @@ class PDProxyHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", ctype)
             self.send_header(TICKET_HEADER, json.dumps(ticket, separators=(",", ":")))
             self.end_headers()
+            # read1, never read (S0F-28, ADR-0138): read(n) blocks until n
+            # bytes or the end of the stream, so a short SSE answer reached
+            # the client whole, at the end, and the client's TTFT equaled its
+            # total time. read1 returns what the upstream has sent so far.
             while True:
-                chunk = resp.read(_CHUNK)
+                chunk = resp.read1(_CHUNK)
                 if not chunk:
                     break
                 self.wfile.write(chunk)

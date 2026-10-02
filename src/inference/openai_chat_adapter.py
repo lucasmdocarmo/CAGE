@@ -63,6 +63,50 @@ from .engine import (
 )
 from .errors import EngineCapabilityUnavailableError
 
+#: S0F-25 (ADR-0135): the finish reasons of a SERVED response. vLLM 0.19.1 has
+#: five (stop, length, abort, error, repetition: v1/engine/__init__.py:29); a
+#: response that ended any other way, or with none, becomes an error row in
+#: ``_finalize``. An allow-list on purpose: a reason a later engine version
+#: adds is refused loudly instead of being recorded as a served answer.
+SERVED_FINISH_REASONS: frozenset = frozenset({"stop", "length"})
+#: Stable prefixes of the error text of an unserved response, so an analysis
+#: can count the kinds without a new column: an in-band engine error object,
+#: a response that ended with no finish_reason, a finish_reason outside the
+#: served set (abort, repetition, anything unknown).
+ERROR_KIND_ENGINE = "engine_error"
+ERROR_KIND_NO_FINISH = "no_finish_reason"
+ERROR_KIND_UNSERVED = "unserved_finish_reason"
+
+
+def _exc_text(exc: BaseException) -> str:
+    """``str(exc)``, never empty: an exception with no message (an aiohttp
+    total timeout raises ``asyncio.TimeoutError()``, whose text is "") is
+    named by its type. An error row with empty text reads as a served row to
+    every consumer that keys on the truthiness of ``error`` (S0F-25)."""
+    return str(exc) or type(exc).__name__
+
+
+def _engine_error_text(obj: Any) -> Optional[str]:
+    """The error text of an in-band engine error object, or None for a normal
+    chunk (S0F-25). Two shapes: ``{"error": {"message", "type", "param",
+    "code"}}`` (vLLM 0.19.1 streaming error events, LMDeploy 0.17.0) and the
+    flat ``{"object": "error", "message", "type", "code"}``. Never empty:
+    vLLM's generate error carries message "", so type and code ride the text.
+    """
+    if not isinstance(obj, dict):
+        return None
+    err = obj.get("error")
+    if not err and obj.get("object") == "error":
+        err = obj
+    if not err:
+        return None
+    if not isinstance(err, dict):
+        return f"{ERROR_KIND_ENGINE}: {err}"
+    head = " ".join(str(err[k]) for k in ("type", "code") if err.get(k) not in (None, ""))
+    message = str(err.get("message") or "").strip()
+    detail = ": ".join(part for part in (head, message) if part)
+    return f"{ERROR_KIND_ENGINE}: {detail}" if detail else ERROR_KIND_ENGINE
+
 
 class OpenAIChatAdapter(InferenceEngine):
     """Base HTTP client for OpenAI-compatible serving engines.
@@ -78,6 +122,10 @@ class OpenAIChatAdapter(InferenceEngine):
     _kv_transfer_telemetry: bool = False
     #: Engine cache-flush endpoint path, or None when the engine has none.
     _flush_endpoint: Optional[str] = None
+    #: Query string the flush POST carries, or None. Kept apart from the path
+    #: so ``_flush_endpoint`` stays the bare route capabilities() declares and
+    #: the pd proxy matches (S0F-27: vLLM's honest reset mode is a query).
+    _flush_query: Optional[str] = None
 
     def __init__(
         self,
@@ -296,7 +344,39 @@ class OpenAIChatAdapter(InferenceEngine):
         (charter D2: None-with-provenance). Plain attributes keep the shared
         InferenceResponse schema untouched. ``num_tokens_source`` is the
         ADR-0118 token-count label; error rows carry None.
+
+        The served rule (S0F-25, ADR-0135) lives here because every return
+        site of the six request paths passes through: a response without an
+        error whose ``finish_reason`` is not in SERVED_FINISH_REASONS (none
+        at all, ``abort``, ``repetition``, anything unknown) is rewritten to
+        the error-row shape the transport failures already use (empty text,
+        zero clocks and counts, no token telemetry). The number of characters
+        received stays in the error text, so a failure before the first token
+        and one after it remain distinguishable.
         """
+        reason = response.finish_reason
+        # isinstance first: a non-string reason (an object) is unhashable, and
+        # a bare membership test would raise instead of refusing the row.
+        served = isinstance(reason, str) and reason in SERVED_FINISH_REASONS
+        if not response.error and not served:
+            response.error = (
+                f"{ERROR_KIND_NO_FINISH}: the response ended without a terminal "
+                f"finish_reason after {len(response.generated_text or '')} character(s) of text"
+                if reason is None
+                else f"{ERROR_KIND_UNSERVED}: {reason!r} (served: {sorted(SERVED_FINISH_REASONS)})"
+            )
+            response.generated_text = ""
+            response.ttft_ms = 0.0
+            response.num_tokens = 0
+            response.finish_reason = "error"
+            response.router_replica = None
+            response.prompt_tokens = None
+            response.cached_prompt_tokens = None
+            response.kv_transfer_params = None
+            if hasattr(response, "mean_token_logprob"):
+                response.mean_token_logprob = None
+                response.sum_token_logprob = None
+            prompt_tokens = cached_prompt_tokens = num_tokens_source = None
         response.engine_id = self.engine_id
         response.usage_telemetry_available = prompt_tokens is not None
         response.cached_token_telemetry_available = cached_prompt_tokens is not None
@@ -348,7 +428,7 @@ class OpenAIChatAdapter(InferenceEngine):
         start_time = time.time()
         first_token_time: Optional[float] = None
         full_text_parts: List[str] = []
-        finish_reason = "length"
+        finish_reason: Optional[str] = None
 
         prompt_tokens: Optional[int] = None
         cached_prompt_tokens: Optional[int] = None
@@ -382,17 +462,25 @@ class OpenAIChatAdapter(InferenceEngine):
                     except Exception:
                         continue
 
+                    # S0F-25: an in-band error object is a failed request,
+                    # never a chunk to skip (the except below records it).
+                    engine_error = _engine_error_text(obj)
+                    if engine_error is not None:
+                        raise ValueError(engine_error)
+
                     # Optional KV transfer metadata (used by vLLM P/D connectors).
                     body_kv = self._body_kv_transfer(obj)
                     if body_kv is not None:
                         kv_transfer_params = body_kv
 
-                    # Final usage chunk (choices may be empty)
+                    # Usage chunk. Its choices are usually empty (the check
+                    # below skips it then); a chunk that carries usage BESIDE
+                    # choices is read in full, text and finish_reason included
+                    # (review 2026-10-02: skipping it dropped both).
                     if isinstance(obj, dict) and "usage" in obj and isinstance(obj["usage"], dict):
                         prompt_tokens, cached_prompt_tokens, completion_tokens = self._extract_usage(
                             obj["usage"]
                         )
-                        continue
 
                     choices = obj.get("choices") if isinstance(obj, dict) else None
                     if not choices:
@@ -405,11 +493,8 @@ class OpenAIChatAdapter(InferenceEngine):
                         if first_token_time is None:
                             first_token_time = time.time()
 
-                    finish_reason = (
-                        choice.get("finish_reason", finish_reason)
-                        if isinstance(choice, dict)
-                        else finish_reason
-                    )
+                    if isinstance(choice, dict):
+                        finish_reason = choice.get("finish_reason") or finish_reason
         except (requests.exceptions.RequestException, ValueError) as e:
             # ValueError covers a malformed/truncated streamed chunk (json parse) so a bad
             # response becomes a recorded error row, not a run-ending crash.
@@ -423,7 +508,7 @@ class OpenAIChatAdapter(InferenceEngine):
                     num_tokens=0,
                     model_name=self.model_name,
                     finish_reason="error",
-                    error=str(e),
+                    error=_exc_text(e),
                 ),
                 prompt_tokens=None,
                 cached_prompt_tokens=None,
@@ -469,7 +554,7 @@ class OpenAIChatAdapter(InferenceEngine):
         start_time = time.time()
         first_token_time: Optional[float] = None
         full_text_parts: List[str] = []
-        finish_reason = "length"
+        finish_reason: Optional[str] = None
         token_logprobs: List[float] = []
 
         prompt_tokens: Optional[int] = None
@@ -504,16 +589,22 @@ class OpenAIChatAdapter(InferenceEngine):
                     except Exception:
                         continue
 
+                    # S0F-25: an in-band error object is a failed request,
+                    # never a chunk to skip (the except below records it).
+                    engine_error = _engine_error_text(obj)
+                    if engine_error is not None:
+                        raise ValueError(engine_error)
+
                     body_kv = self._body_kv_transfer(obj)
                     if body_kv is not None:
                         kv_transfer_params = body_kv
 
-                    # Final usage chunk (choices may be empty)
+                    # Usage chunk: same rule as the raw loop (a chunk with
+                    # usage beside choices is read in full).
                     if isinstance(obj, dict) and "usage" in obj and isinstance(obj["usage"], dict):
                         prompt_tokens, cached_prompt_tokens, completion_tokens = self._extract_usage(
                             obj["usage"]
                         )
-                        continue
 
                     choices = obj.get("choices") if isinstance(obj, dict) else None
                     if not choices:
@@ -547,7 +638,7 @@ class OpenAIChatAdapter(InferenceEngine):
                         num_tokens=0,
                         model_name=self.model_name,
                         finish_reason="error",
-                        error=str(e),
+                        error=_exc_text(e),
                     ),
                     [],
                 ),
@@ -609,7 +700,7 @@ class OpenAIChatAdapter(InferenceEngine):
             choice = result.get("choices", [{}])[0]
             message = choice.get("message") or {}
             generated_text = (message.get("content") or "") if isinstance(message, dict) else ""
-            finish_reason = choice.get("finish_reason") or "length"
+            finish_reason = choice.get("finish_reason")
             token_logprobs = self._extract_chat_logprobs(choice)
 
             usage = result.get("usage") or {}
@@ -661,7 +752,7 @@ class OpenAIChatAdapter(InferenceEngine):
                         num_tokens=0,
                         model_name=self.model_name,
                         finish_reason="error",
-                        error=str(e),
+                        error=_exc_text(e),
                     ),
                     [],
                 ),
@@ -689,7 +780,7 @@ class OpenAIChatAdapter(InferenceEngine):
 
             choice = result.get("choices", [{}])[0]
             generated_text = choice.get("text", "")
-            finish_reason = choice.get("finish_reason", "length")
+            finish_reason = choice.get("finish_reason")
 
             usage = result.get("usage") or {}
             prompt_tokens, cached_prompt_tokens, completion_tokens = self._extract_usage(
@@ -745,7 +836,7 @@ class OpenAIChatAdapter(InferenceEngine):
                     num_tokens=0,
                     model_name=self.model_name,
                     finish_reason="error",
-                    error=str(e),
+                    error=_exc_text(e),
                 ),
                 prompt_tokens=None,
                 cached_prompt_tokens=None,
@@ -832,7 +923,7 @@ class OpenAIChatAdapter(InferenceEngine):
 
                     choice = result.get("choices", [{}])[0]
                     generated_text = choice.get("text", "")
-                    finish_reason = choice.get("finish_reason", "length")
+                    finish_reason = choice.get("finish_reason")
 
                     usage = result.get("usage") or {}
                     prompt_tokens, cached_prompt_tokens, completion_tokens = self._extract_usage(
@@ -872,7 +963,8 @@ class OpenAIChatAdapter(InferenceEngine):
                     # Provenance: this ttft_ms is the full-response PROXY, not
                     # a streamed first-token time. Measured open-loop rows must
                     # come from async_stream_generate instead (D6 §6.3).
-                    response.ttft_methodology = "full-response-proxy"
+                    if response.error is None:
+                        response.ttft_methodology = "full-response-proxy"
                     return response
 
         except Exception as e:
@@ -886,7 +978,7 @@ class OpenAIChatAdapter(InferenceEngine):
                     num_tokens=0,
                     model_name=self.model_name,
                     finish_reason="error",
-                    error=str(e),
+                    error=_exc_text(e),
                 ),
                 prompt_tokens=None,
                 cached_prompt_tokens=None,
@@ -934,7 +1026,7 @@ class OpenAIChatAdapter(InferenceEngine):
         start_time = time.time()
         first_token_time: Optional[float] = None
         full_text_parts: List[str] = []
-        finish_reason = "length"
+        finish_reason: Optional[str] = None
         token_logprobs: List[float] = []
 
         prompt_tokens: Optional[int] = None
@@ -966,11 +1058,17 @@ class OpenAIChatAdapter(InferenceEngine):
                         except Exception:
                             continue
 
+                        # S0F-25: same rule as the sync loops.
+                        engine_error = _engine_error_text(obj)
+                        if engine_error is not None:
+                            raise ValueError(engine_error)
+
                         body_kv = self._body_kv_transfer(obj)
                         if body_kv is not None:
                             kv_transfer_params = body_kv
 
-                        # Final usage chunk (choices may be empty)
+                        # Usage chunk: same rule as the sync loops (a chunk
+                        # with usage beside choices is read in full).
                         if (
                             isinstance(obj, dict)
                             and "usage" in obj
@@ -981,7 +1079,6 @@ class OpenAIChatAdapter(InferenceEngine):
                                 cached_prompt_tokens,
                                 completion_tokens,
                             ) = self._extract_usage(obj["usage"])
-                            continue
 
                         choices = obj.get("choices") if isinstance(obj, dict) else None
                         if not choices:
@@ -1023,7 +1120,7 @@ class OpenAIChatAdapter(InferenceEngine):
                         num_tokens=0,
                         model_name=self.model_name,
                         finish_reason="error",
-                        error=str(e),
+                        error=_exc_text(e),
                     ),
                     [],
                 ),
@@ -1063,7 +1160,8 @@ class OpenAIChatAdapter(InferenceEngine):
             cached_prompt_tokens=cached_prompt_tokens,
             num_tokens_source=num_tokens_source,
         )
-        response.ttft_methodology = "streamed-first-delta"
+        if response.error is None:
+            response.ttft_methodology = "streamed-first-delta"
         return response
 
     async def async_batch_generate(
@@ -1092,6 +1190,8 @@ class OpenAIChatAdapter(InferenceEngine):
                 "engine exposes no documented cache-flush endpoint",
             )
         url = f"{self.api_base}{self._flush_endpoint}"
+        if self._flush_query:
+            url = f"{url}?{self._flush_query}"
         try:
             resp = requests.post(url, timeout=30)
             resp.raise_for_status()

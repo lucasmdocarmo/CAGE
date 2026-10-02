@@ -185,6 +185,7 @@ def _run_cell(
     loader_factory: Optional[Any] = None,
     engine_factory: Optional[Any] = None,
     extra_env: Optional[dict[str, str]] = None,
+    telemetry_required: bool = False,
 ) -> None:
     """Drive the REAL runner main() for one cell with the stub seams patched.
 
@@ -192,8 +193,16 @@ def _run_cell(
     cold-start test hooks; ``extra_env`` (ADR-0106) sets CAGE_* identity env
     AFTER the campaign env reset (defaults keep every pre-existing caller
     untouched).
+
+    ``telemetry_required`` (S0F-26, ADR-0136): the stub engine serves no
+    /metrics, so by default the campaign telemetry requirement (the flag at
+    run start, the live probe before the measured stage) is switched off for
+    the stub cell; True leaves the production rule in force (its own tests
+    below and tests/test_campaign_telemetry_s0f26.py).
     """
     _campaign_env(monkeypatch, root)
+    if not telemetry_required:
+        monkeypatch.setattr(runner, "CAMPAIGN_TELEMETRY_BACKENDS", frozenset())
     for key, value in (extra_env or {}).items():
         monkeypatch.setenv(key, value)
     if engine_factory is None:
@@ -1040,7 +1049,10 @@ def engine_stub(monkeypatch: pytest.MonkeyPatch):
 def test_reset_prefix_cache_strict_waits_for_quiescence_and_records(engine_stub: str) -> None:
     _EngineStub.running = [2]  # two in-flight requests drain over two probes
     record = runner._reset_prefix_cache(engine_stub, backend="vllm", model="m", strict=True)
-    assert _EngineStub.posts == ["/reset_prefix_cache"]
+    # S0F-27 (ADR-0137): the flush POST carries the query under which vLLM
+    # answers 500 to a declined reset; the recorded endpoint stays the route.
+    assert _EngineStub.posts == ["/reset_prefix_cache?reset_running_requests=true"]
+    assert record["engine_confirmed"] is True
     assert record["backend"] == "vllm"
     assert record["endpoint"] == "/reset_prefix_cache"
     assert record["verified"] is True
@@ -1064,7 +1076,7 @@ def test_reset_prefix_cache_pilot_path_does_not_probe(engine_stub: str) -> None:
     _EngineStub.running = [1]
     _EngineStub.drain = False
     record = runner._reset_prefix_cache(engine_stub, backend="vllm", model="m")
-    assert _EngineStub.posts == ["/reset_prefix_cache"]
+    assert _EngineStub.posts == ["/reset_prefix_cache?reset_running_requests=true"]
     assert record["verified"] is False
     assert record["quiescence_probe"] is None
 
@@ -2264,3 +2276,125 @@ def test_campaign_warmup_stage_failure_never_fails_the_cell(
     assert all(meta["consort"][k] == 0 for k in cs.CONSORT_COUNTERS)
     assert meta["warmup_pool"]["num_requests"] == 2
     assert len(_read_jsonl(wdir / "requests.jsonl")) == N_QUERIES
+
+
+# ---------------------------------------------------------------------------
+# S0F-26 (ADR-0136): the campaign telemetry requirement through the REAL
+# runner main(): the flag at run start, the live probe before the measured
+# stage. Every other test of this file runs the stub cell with the
+# requirement switched off (_run_cell telemetry_required=False).
+# ---------------------------------------------------------------------------
+
+
+def test_campaign_cell_without_the_telemetry_flag_refuses_before_serving(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _RecordingEngine.calls = []
+    root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    with pytest.raises(SystemExit) as exc:
+        _run_cell(
+            monkeypatch, root, "no_cache", "squad_v2", ttft_base=200.0, num_trials=1,
+            engine_factory=lambda model: _RecordingEngine(model, "no_cache", 200.0),
+            telemetry_required=True,
+        )
+    assert exc.value.code == 2  # the activation refusals' exit code
+    err = capsys.readouterr().err
+    assert "CAMPAIGN TELEMETRY" in err and "--vllm-telemetry" in err and "ADR-0136" in err
+    assert _RecordingEngine.calls == [], "the refusal must fire BEFORE serving"
+    assert not _window_dirs(root, "no_cache", "squad_v2")
+
+
+def test_campaign_cell_whose_endpoint_returns_no_gauge_refuses_before_the_measured_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The flag is present, the endpoint answers nothing usable (what S0's
+    # windows would have shown had anyone asked before measuring): the cell
+    # refuses after the warm-up and before any measured request is sent.
+    from src.monitoring import vllm_telemetry as vt
+
+    asked: list[tuple[str, str]] = []
+
+    def _dead(url: str, *, metrics_path: str = "/metrics", api_key: Any = None,
+              interval: float = 1.0, dialect: str = "vllm") -> None:
+        asked.append((url, dialect))
+        return None
+
+    monkeypatch.setattr(vt, "capture_snapshot", _dead)
+    _RecordingEngine.calls = []
+    root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    with pytest.raises(SystemExit) as exc:
+        _run_cell(
+            monkeypatch, root, "no_cache", "squad_v2", ttft_base=200.0, num_trials=1,
+            engine_factory=lambda model: _RecordingEngine(model, "no_cache", 200.0),
+            extra_argv=("--vllm-telemetry",), telemetry_required=True,
+        )
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "CAMPAIGN TELEMETRY" in out and "kv_usage" in out and "ADR-0136" in out
+    assert asked == [("http://127.0.0.1:9", "vllm")]
+    assert _RecordingEngine.calls == [], "no measured request may be sent"
+    assert not _window_dirs(root, "no_cache", "squad_v2")
+
+
+def _hermetic_telemetry(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    """A live-looking telemetry endpoint with no server: every snapshot
+    carries a numeric KV usage gauge; the post-stage cage-stats extras are
+    switched off so the run touches no network."""
+    from src.monitoring import vllm_telemetry as vt
+
+    asked: list[tuple[str, str]] = []
+
+    def _snapshot(url: str, *, metrics_path: str = "/metrics", api_key: Any = None,
+                  interval: float = 1.0, dialect: str = "vllm") -> dict[str, Any]:
+        asked.append((url, dialect))
+        return {"kv_usage": 0.125, "running": 0}
+
+    monkeypatch.setattr(vt, "capture_snapshot", _snapshot)
+    monkeypatch.setattr(vt, "available", lambda: False)
+    monkeypatch.setattr(vt, "scrape_spec_decode", lambda *a, **k: None)
+    return asked
+
+
+def test_campaign_cell_with_a_live_gauge_passes_the_probe_and_emits_its_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review 2026-10-02 LOW: the production rule in force, end to end, on its
+    # passing path (every other test of this file switches it off).
+    asked = _hermetic_telemetry(monkeypatch)
+    root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    _run_cell(
+        monkeypatch, root, "no_cache", "squad_v2", ttft_base=200.0, num_trials=1,
+        extra_argv=("--vllm-telemetry",), telemetry_required=True,
+    )
+    (wdir,) = _window_dirs(root, "no_cache", "squad_v2")
+    assert len(_read_jsonl(wdir / "requests.jsonl")) == N_QUERIES
+    # the probe asked the cell's endpoint first, under the cell's dialect
+    assert asked[0] == ("http://127.0.0.1:9", "vllm")
+
+
+def test_campaign_sampler_that_cannot_start_refuses_the_cell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The probe passes, then the sampler cannot start: before S0F-26 this
+    # printed one line and the window ran without telemetry.
+    from src.monitoring import vllm_telemetry as vt
+
+    _hermetic_telemetry(monkeypatch)
+
+    class _DeadSampler:
+        def __init__(self, *a: Any, **k: Any) -> None:
+            raise OSError("cannot spawn the sampler thread")
+
+    monkeypatch.setattr(vt, "VllmTelemetrySampler", _DeadSampler)
+    _RecordingEngine.calls = []
+    root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    with pytest.raises(SystemExit) as exc:
+        _run_cell(
+            monkeypatch, root, "no_cache", "squad_v2", ttft_base=200.0, num_trials=1,
+            engine_factory=lambda model: _RecordingEngine(model, "no_cache", 200.0),
+            extra_argv=("--vllm-telemetry",), telemetry_required=True,
+        )
+    assert exc.value.code == 1
+    assert "cannot spawn the sampler thread" in capsys.readouterr().out
+    assert _RecordingEngine.calls == [], "no measured request may be sent"
+    assert not _window_dirs(root, "no_cache", "squad_v2")

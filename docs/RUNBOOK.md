@@ -202,6 +202,40 @@ with the same rule, refuses a pd window without the record and any non-pd window
 one, and warns when the prefill's expiry counter moved inside the window. The live proof of the rule is checklist rows RC-13 (counter deltas and a
 negative control straight to the decode) and RC-14 (CAGE proxy against vLLM's toy proxy).
 
+Served rows (ADR-0135, S0F-25): a response counts as served only when the engine ended
+it with `finish_reason` `stop` or `length`. Anything else is an error row with a
+non-empty `error`: an in-band engine error event (`engine_error: ...`), a response that
+ended with no `finish_reason` (`no_finish_reason: ...`, the shape of a failed NIXL KV
+load on vLLM 0.19.1), or another reason such as `abort` or `repetition`
+(`unserved_finish_reason: ...`). A client timeout is named by its exception type. The
+rule is one function in the shared adapter, so it holds on vLLM, SGLang and LMDeploy,
+streamed or not. `verify_results` check (l) fails a row without `error` whose
+`finish_reason` is anything else.
+
+Campaign telemetry (ADR-0136, S0F-26): the driver puts `--vllm-telemetry` on every
+vLLM, SGLang and pd cell and never on an hf oracle cell; `load_plan` refuses a plan
+that differs. The runner refuses a campaign cell on vLLM or SGLang without the flag
+(exit 2, before the cache reset), and after the warm-up it asks each telemetry endpoint
+for one snapshot: without a numeric KV usage gauge the cell is refused before the
+measured stage. A hand-run campaign cell needs the flag too, and the shell drivers
+(`run_baselines.sh`, `run_prefix_envelope.sh`, `run_kv_store.sh`) pass it only under
+`VLLM_TELEMETRY=1` (`cloud_run.sh` exports that by default), so in campaign mode without
+it their vLLM and SGLang cells exit 2. The probe dials `--api-base`, the address the
+sampler dials. `verify_results` check (m) warns on every vLLM or SGLang window labeled
+`UNKNOWN_TELEMETRY`; the label counts are in the JSON report
+(`accounting.totals.regime_labels`). The window's latency rows stay valid.
+
+Reset and stream relay on the pd stack (ADR-0137, ADR-0138; S0F-27, S0F-28): the vLLM
+adapter posts `/reset_prefix_cache?reset_running_requests=true`. In that mode vLLM
+answers 500 when its block pool declined the reset, so a 200 means the cache was
+flushed, and the window's `cold_start` record carries `engine_confirmed: true`. On the
+pd stack the proxy first sends one plain one-token completion straight to each role
+(an idle role releases the blocks of its last ticketed requests only on an engine
+step), then the reset to both roles, repeats that cycle once after 1 s on a 5xx, and
+answers 502 naming the role otherwise. The proxy relays the decode stream as it
+arrives (`read1`); before S0F-28 it held the first token until 8 KB or the end of the
+stream, so pd TTFT equaled total time. Live proof: checklist row RC-12.
+
 Gate (j) parsers (ADR-0130, S0F-9/S0F-14): a budgeted vLLM 0.19.1 start prints no
 `Available KV cache memory` line; the bytes channel is the `gpu_worker.py` line
 `reserved <X> GiB memory for KV Cache as specified by kv_cache_memory_bytes config`

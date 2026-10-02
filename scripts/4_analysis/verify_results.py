@@ -54,7 +54,20 @@ the first:
     flag must agree with that re-derivation, and the recorded served-row
     count must equal the rows without ``error``; a pd window with no summary
     or no record FAILs (never the WARN of (i) alone); a window of any other
-    topology carrying the record FAILs (a mislabeled cell).
+    topology carrying the record FAILs (a mislabeled cell);
+(l) served rows ended with stop or length (ADR-0135, S0F-25): a
+    requests.jsonl row without ``error`` must carry ``finish_reason`` ``stop``
+    or ``length``, the adapter's served set; any other value (none, ``abort``,
+    ``repetition``, or the adapter's own ``error`` beside an empty error
+    text) FAILs, because that request failed and the row says it was served;
+    rows that carry no ``finish_reason`` at all are a WARN (the rule cannot
+    be applied to them);
+(m) telemetry that certified nothing is named (ADR-0136, S0F-26): a window
+    of a sampled engine (vLLM, SGLang) whose ``regime.json`` label is
+    ``UNKNOWN_TELEMETRY`` is a WARN carrying the recorded refusal reason, and
+    every window's label rides the accounting. A WARN, not a FAIL: the
+    window's latency rows stay valid for contrasts that need no regime label
+    (S0: all 40 windows read UNKNOWN_TELEMETRY and this gate said nothing).
 
 ``--pilot --results-dir DIR`` preserves the pilot-era metrics-vs-CSV check
 (``verify_dir``) verbatim for pilot trees; that mode keeps writing its report
@@ -132,6 +145,21 @@ _NUM_TOKENS_SOURCE_FALLBACK = "whitespace"
 #: it (src.analysis.cellspec Topology literal), check (k).
 _PD_TRANSFER_KEY = "pd_transfer"
 _PD_TOPOLOGY = "pd"
+
+#: Check (l): the finish reasons of a served row (= src.inference
+#: .openai_chat_adapter.SERVED_FINISH_REASONS; tests pin the two equal, the
+#: adapter is not imported here so the gate needs no HTTP client stack).
+_SERVED_FINISH_REASONS: tuple[str, ...] = ("stop", "length")
+
+#: Check (m): the window's regime artifact (campaign_layout.write_window_regime
+#: writes ``window_dir / "regime.json"``), the label of a window whose
+#: telemetry certified nothing (= regime_inputs.REGIME_UNKNOWN) and the
+#: engines whose campaign windows are sampled (= run_experiment
+#: .CAMPAIGN_TELEMETRY_BACKENDS; the in-process hf oracle has no series by
+#: design). All three pinned equal by tests.
+_REGIME_NAME = "regime.json"
+_REGIME_UNKNOWN = "UNKNOWN_TELEMETRY"
+_TELEMETRY_ENGINES: tuple[str, ...] = ("vllm", "sglang")
 
 VERIFICATION_DIR_SUFFIX = "_verification"
 REPORT_JSON_NAME = "verification_report.json"
@@ -619,6 +647,83 @@ def _check_pd_transfer(
     return not reasons
 
 
+def _check_finish_reasons(
+    rows: list[dict[str, Any]], rel: str, findings: list[Finding]
+) -> int | None:
+    """Check (l), ADR-0135 (S0F-25): every row without an error must have
+    ended with a served finish reason. Returns the number of rows that did
+    not, or None when no judged row carries the field (unknown, never 0).
+    Error rows are outside the rule: the adapter gives them ``error`` as the
+    reason and an open-loop dispatch stub carries none."""
+    judged = [row for row in rows if not row.get("error")]
+    missing = [row for row in judged if "finish_reason" not in row]
+    unserved = [
+        (str(row.get("example_id")), row.get("finish_reason"))
+        for row in judged
+        if "finish_reason" in row and row.get("finish_reason") not in _SERVED_FINISH_REASONS
+    ]
+    if unserved:
+        findings.append(
+            Finding(
+                "FAIL",
+                "finish-reason",
+                rel,
+                f"{len(unserved)} row(s) without an error did not end with a served "
+                f"finish_reason {list(_SERVED_FINISH_REASONS)} (first: "
+                + ", ".join(f"{rid} -> {reason!r}" for rid, reason in unserved[:3])
+                + "): the request failed and the row reads as served (ADR-0135)",
+            )
+        )
+    if missing:
+        findings.append(
+            Finding(
+                "WARN",
+                "finish-reason",
+                rel,
+                f"{len(missing)} row(s) without an error carry no finish_reason: the "
+                "served rule cannot be applied to them (ADR-0135)",
+            )
+        )
+    if judged and len(missing) == len(judged):
+        return None
+    return len(unserved)
+
+
+def _check_regime(
+    window_dir: Path, rel_window: str, engine: str | None, findings: list[Finding]
+) -> str | None:
+    """Check (m), ADR-0136 (S0F-26): the window's regime label, None when the
+    artifact is absent or unreadable. A sampled engine's window labeled
+    UNKNOWN_TELEMETRY is a WARN with the recorded refusal reason."""
+    path = window_dir / _REGIME_NAME
+    if not path.is_file():
+        return None
+    where = f"{rel_window}/{_REGIME_NAME}"
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        findings.append(Finding("FAIL", "schema", where, f"invalid JSON: {exc}"))
+        return None
+    if not isinstance(doc, dict):
+        findings.append(
+            Finding("FAIL", "schema", where, f"root must be an object, got {type(doc).__name__}")
+        )
+        return None
+    label = doc.get("label")
+    if label == _REGIME_UNKNOWN and engine in _TELEMETRY_ENGINES:
+        findings.append(
+            Finding(
+                "WARN",
+                "telemetry",
+                where,
+                f"window is labeled {_REGIME_UNKNOWN}: {doc.get('refusal_reason')!r}; "
+                "its telemetry certified no regime, so no pressure contrast can use "
+                "it (the latency rows stay valid) (ADR-0136)",
+            )
+        )
+    return label if isinstance(label, str) else None
+
+
 def _check_window(
     run_dir: Path,
     window_dir: Path,
@@ -626,9 +731,11 @@ def _check_window(
     findings: list[Finding],
     *,
     topology: str | None = None,
+    engine: str | None = None,
 ) -> dict[str, Any]:
-    """Run checks (a)-(c), (i), (j), (k) + accounting (e) for one window; returns its summary.
-    ``topology`` is the cell's (from its §2 dirname); None skips (k)."""
+    """Run checks (a)-(c), (i)-(m) + accounting (e) for one window; returns its summary.
+    ``topology`` and ``engine`` are the cell's (from its §2 dirname); a None
+    topology skips (k), a None engine keeps (m) to recording the label."""
     rel_window = window_dir.relative_to(run_dir).as_posix()
     per_file_rows: dict[str, list[dict[str, Any]] | None] = {}
     for name in _PER_QUERY_ARTIFACTS:
@@ -722,6 +829,17 @@ def _check_window(
         window_dir, rel_window, topology, requests_rows, findings
     )
 
+    # (l) served rows ended with stop or length (ADR-0135, S0F-25); None when
+    # the rows are unreadable or none carries the field.
+    n_unserved_finish = (
+        _check_finish_reasons(requests_rows, f"{rel_window}/requests.jsonl", findings)
+        if requests_rows is not None
+        else None
+    )
+
+    # (m) the window's regime label (ADR-0136, S0F-26); None = no artifact.
+    regime_label = _check_regime(window_dir, rel_window, engine, findings)
+
     # (e) §9.10 exclusion accounting — absence is NOT zero: rows lacking any
     # validity field are counted as validity-unknown, never as valid.
     accounting: dict[str, Any] = {
@@ -737,6 +855,8 @@ def _check_window(
         "n_valid_known": None,
         "n_no_decode": n_no_decode,
         "pd_transfer_verified": pd_transfer_verified,
+        "n_unserved_finish": n_unserved_finish,
+        "regime_label": regime_label,
     }
     if requests_rows is not None:
         n_error = sum(1 for r in requests_rows if r.get("error"))
@@ -869,12 +989,15 @@ def _walk_cells(
                 Finding("FAIL", "layout", cell_rel, "stray file in cells/ (§1)")
             )
             continue
-        # The §2 dirname IS the cell identity; its topology drives check (k).
-        # An unparseable dirname is a layout FAIL and leaves (k) skipped
-        # (topology None) for that cell's windows.
+        # The §2 dirname IS the cell identity; its topology drives check (k)
+        # and its engine check (m). An unparseable dirname is a layout FAIL
+        # and leaves (k) skipped (topology None) and (m) to recording the
+        # label (engine None) for that cell's windows.
         topology: str | None = None
+        engine: str | None = None
         try:
-            topology = org.parse_row_key_dir(cell_dir.name).topology
+            cell_spec = org.parse_row_key_dir(cell_dir.name)
+            topology, engine = cell_spec.topology, cell_spec.engine
         except org.OrganizeError as exc:
             findings.append(Finding("FAIL", "layout", cell_rel, str(exc)))
 
@@ -954,7 +1077,9 @@ def _walk_cells(
                 continue
             dir_keys[f"{dataset}-{ordinal_str}"] = window_dir.name
             accounting_rows.append(
-                _check_window(run_dir, window_dir, dataset, findings, topology=topology)
+                _check_window(
+                    run_dir, window_dir, dataset, findings, topology=topology, engine=engine
+                )
             )
             n_windows += 1
         _check_windows_table(cell_rel, meta, dir_keys, findings)
@@ -1056,6 +1181,7 @@ def verify_run(run_dir: Path) -> dict[str, Any]:
         "n_validity_unknown",
         "n_valid_known",
         "n_no_decode",
+        "n_unserved_finish",
     ):
         known = [row[key] for row in accounting_rows if row[key] is not None]
         # Absence-is-not-zero: a total over windows with unknown counts is
@@ -1064,6 +1190,14 @@ def verify_run(run_dir: Path) -> dict[str, Any]:
             "sum_over_known_windows": int(sum(known)) if known else None,
             "n_windows_known": len(known),
         }
+
+    # (m): how many windows carry each regime label (windows with no
+    # regime.json are not counted: absence is unknown, never a label).
+    regime_labels: dict[str, int] = {}
+    for row in accounting_rows:
+        if row["regime_label"] is not None:
+            regime_labels[row["regime_label"]] = regime_labels.get(row["regime_label"], 0) + 1
+    totals["regime_labels"] = dict(sorted(regime_labels.items()))
 
     n_fail = sum(1 for f in findings if f.severity == "FAIL")
     n_warn = sum(1 for f in findings if f.severity == "WARN")

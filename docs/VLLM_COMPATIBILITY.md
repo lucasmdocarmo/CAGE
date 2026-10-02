@@ -265,6 +265,26 @@ the decode that reached ready, not a failure.
   exposition spellings: histogram `_sum`/`_count`, counter `_total`; the `_created` and
   `_bucket` siblings are separate series. [VERIFY-LIVE] at RC-13: the `external_kv_transfer`
   attribution and the count-per-TP identity on the provisioned node.
+- The reset (ADR-0137, S0F-27): `POST /reset_prefix_cache` takes two bool query
+  parameters, `reset_running_requests` and `reset_external`, both default false
+  (`entrypoints/serve/cache/api_router.py:21-26`), and answers 200 without reading the
+  engine's result. With `reset_running_requests=true` the scheduler preempts the running
+  requests and raises when blocks are still held (`v1/core/sched/scheduler.py:1895-1902`);
+  the engine survives and the server answers 500. The reset succeeds only when no block
+  besides the null block is in use, the same condition under which
+  `vllm:kv_cache_usage_perc` reads exactly 0.0. A finished prefill request with a ticket
+  holds its blocks outside the running queue until the decode's notification is
+  processed on a prefill engine step, or for `VLLM_NIXL_ABORT_REQUEST_TIMEOUT` (480 s);
+  `vllm:num_requests_running` reads 0 meanwhile. `CompletionRequest.model` is optional
+  (`completion/protocol.py:45`), which the proxy's wake request relies on.
+  [VERIFY-LIVE] at RC-12: the 500 on a held prefill and the release after one wake step.
+- Stream endings (ADR-0135, S0F-25): the finish reasons are `stop`, `length`, `abort`,
+  `error`, `repetition` (`v1/engine/__init__.py:29`; `repetition` only when the request
+  sets `repetition_detection`, which CAGE never sends). `error` is turned into an in-band
+  `data: {"error": {"message", "type", "param", "code"}}` event, except on a request that
+  failed before its first token (a failed KV load): that stream ends with the usage chunk
+  and `[DONE]` and carries no `finish_reason`. The adapter serves `stop` and `length`
+  only.
 
 ### 8.5 Validation instruments (the act-2 measurement toolkit)
 

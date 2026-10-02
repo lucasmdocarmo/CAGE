@@ -87,7 +87,9 @@ def _row(
     if with_record_index:
         row["record_index"] = i
     if with_validity:
-        row.update(ok=True, error=None, empty_generation=False)
+        # finish_reason rides every result row the runner writes
+        # (run_experiment record_result); check (l) keys on it.
+        row.update(ok=True, error=None, empty_generation=False, finish_reason="stop")
     return row
 
 
@@ -918,3 +920,179 @@ def test_check_k_re_derives_with_the_producers_rule() -> None:
 
     assert vr._pd_transfer_reasons is vt.pd_transfer_reasons
     assert vr._PD_TRANSFER_KEY == "pd_transfer"
+
+
+# ---------------------------------------------------------------------------
+# (l) served rows ended with stop or length (S0F-25, ADR-0135)
+# ---------------------------------------------------------------------------
+
+
+def test_green_tree_has_no_finish_reason_finding(tmp_path: Path) -> None:
+    run_dir = _mk_green(tmp_path)
+    report = vr.verify_run(run_dir)
+    assert not _findings(report, "FAIL", "finish-reason")
+    assert not _findings(report, "WARN", "finish-reason")
+    assert all(r["n_unserved_finish"] == 0 for r in report["accounting"]["per_window"])
+    assert report["accounting"]["totals"]["n_unserved_finish"]["sum_over_known_windows"] == 0
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"finish_reason": "abort"},
+        {"finish_reason": "repetition"},
+        {"finish_reason": None},
+        # the pre-S0F-25 async timeout row: finish_reason "error" beside an
+        # EMPTY error text, which every truthiness check read as "no error"
+        {"finish_reason": "error", "error": "", "ok": False, "empty_generation": True,
+         "num_tokens": 0, "tpot_ms": None},
+    ],
+    ids=["abort", "repetition", "null", "empty-error-text"],
+)
+def test_a_row_without_an_error_that_did_not_end_served_fails(tmp_path: Path, fields: Any) -> None:
+    run_dir = _build_tree(tmp_path)
+    wdir = _rewrite_first_window_row(run_dir, **fields)
+    report = vr.verify_run(run_dir)
+    assert report["ok"] is False
+    (finding,) = _findings(report, "FAIL", "finish-reason")
+    assert "e0" in finding["detail"] and "ADR-0135" in finding["detail"]
+    assert repr(fields["finish_reason"]) in finding["detail"]
+    assert _accounting_row(report, run_dir, wdir)["n_unserved_finish"] == 1
+
+
+def test_length_is_a_served_finish_and_error_rows_are_outside_the_rule(tmp_path: Path) -> None:
+    run_dir = _build_tree(tmp_path)
+    wdir = _first_window(run_dir)
+    rows = _read_jsonl(wdir / "requests.jsonl")
+    rows[0]["finish_reason"] = "length"
+    # an error row carries the adapter's own "error" reason: never judged here
+    rows[1].update(ok=False, error="engine_error: InternalServerError 500", finish_reason="error",
+                   num_tokens=0, tpot_ms=None)
+    # an open-loop dispatch stub carries no finish_reason at all
+    rows[2] = {"example_id": "e2", "repeat_index": 0, "record_index": 2, "ok": False,
+               "error": "dropped_by_cap", "empty_generation": False}
+    _write_jsonl(wdir / "requests.jsonl", rows)
+    _seal(run_dir)
+    report = vr.verify_run(run_dir)
+    assert not _findings(report, "FAIL", "finish-reason")
+    assert not _findings(report, "WARN", "finish-reason")
+    assert _accounting_row(report, run_dir, wdir)["n_unserved_finish"] == 0
+
+
+def test_rows_without_the_field_are_a_warn_not_a_fail(tmp_path: Path) -> None:
+    # a tree from a producer that never wrote finish_reason: the rule cannot
+    # be applied, which is unknown, never a pass and never a coerced zero
+    run_dir = _build_tree(tmp_path)
+    wdir = _first_window(run_dir)
+    rows = _read_jsonl(wdir / "requests.jsonl")
+    for row in rows:
+        del row["finish_reason"]
+    _write_jsonl(wdir / "requests.jsonl", rows)
+    _seal(run_dir)
+    report = vr.verify_run(run_dir)
+    assert report["ok"] is True
+    (warn,) = _findings(report, "WARN", "finish-reason")
+    assert f"{N_ROWS} row(s)" in warn["detail"]
+    assert _accounting_row(report, run_dir, wdir)["n_unserved_finish"] is None
+
+
+def test_check_l_served_set_matches_the_adapter() -> None:
+    from src.inference import openai_chat_adapter as oca
+
+    assert frozenset(vr._SERVED_FINISH_REASONS) == oca.SERVED_FINISH_REASONS
+
+
+# ---------------------------------------------------------------------------
+# (m) a window whose telemetry certified nothing is named (S0F-26, ADR-0136)
+# ---------------------------------------------------------------------------
+
+S0_REFUSAL = "window [1.79079e+09, 1.79079e+09) has 0 in-window telemetry sample(s); need >= 2"
+
+
+def _write_regime(wdir: Path, label: Any, reason: Any = None) -> None:
+    """The window's regime.json as campaign_layout.write_window_regime writes it."""
+    (wdir / "regime.json").write_text(json.dumps({
+        "schema_version": 1, "label": label, "inputs": None, "refusal_reason": reason,
+        "attainment": 1.0, "t_start": 0.0, "t_end": 60.0,
+        "telemetry_ok": label != "UNKNOWN_TELEMETRY", "telemetry_source": "cage_stats.jsonl",
+    }), encoding="utf-8")
+
+
+def test_unknown_telemetry_on_a_sampled_engine_is_a_warn_with_its_reason(tmp_path: Path) -> None:
+    # S0: all 40 windows read UNKNOWN_TELEMETRY and this gate passed in silence
+    run_dir = _build_tree(tmp_path)
+    wdir = _first_window(run_dir)
+    _write_regime(wdir, "UNKNOWN_TELEMETRY", S0_REFUSAL)
+    _seal(run_dir)
+    report = vr.verify_run(run_dir)
+    assert report["ok"] is True  # the window's latency rows stay valid
+    (warn,) = _findings(report, "WARN", "telemetry")
+    assert "UNKNOWN_TELEMETRY" in warn["detail"] and "0 in-window telemetry sample" in warn["detail"]
+    assert "ADR-0136" in warn["detail"] and warn["where"].endswith("regime.json")
+    assert _accounting_row(report, run_dir, wdir)["regime_label"] == "UNKNOWN_TELEMETRY"
+    assert report["accounting"]["totals"]["regime_labels"] == {"UNKNOWN_TELEMETRY": 1}
+
+
+def test_a_labeled_window_and_a_window_without_the_artifact_raise_nothing(tmp_path: Path) -> None:
+    run_dir = _build_tree(tmp_path)
+    wdir = _first_window(run_dir)
+    _write_regime(wdir, "UNPRESSURED")
+    _seal(run_dir)
+    report = vr.verify_run(run_dir)
+    assert report["n_warn"] == 0 and report["ok"] is True
+    assert _accounting_row(report, run_dir, wdir)["regime_label"] == "UNPRESSURED"
+    others = [r for r in report["accounting"]["per_window"]
+              if r["window"] != wdir.relative_to(run_dir).as_posix()]
+    assert all(r["regime_label"] is None for r in others)  # no artifact: unknown, not a label
+    assert report["accounting"]["totals"]["regime_labels"] == {"UNPRESSURED": 1}
+
+
+def test_unknown_telemetry_on_the_in_process_oracle_is_not_a_finding(tmp_path: Path) -> None:
+    # the hf oracle has no HTTP server and no sampler: an absent series is its
+    # documented shape, recorded and never warned about
+    run_dir = _build_tree(tmp_path)
+    spec = CellSpec.from_baseline("B3", model=MODEL, engine="hf")  # type: ignore[arg-type]
+    cell_dir = run_dir / "cells" / spec.to_row_key()
+    cell_dir.mkdir(parents=True)
+    key = f"{DATASET}-01"
+    wdir = cell_dir / f"window_{key}"
+    wdir.mkdir()
+    rows = [_row(i, with_validity=True, with_record_index=True) for i in range(N_ROWS)]
+    _write_jsonl(wdir / "requests.jsonl", rows)
+    _write_jsonl(wdir / "qa_evidence.jsonl", [
+        {**r, "question": "q", "generated_answer": "a", "reference_answer": "a", "used_contexts": ["c"]}
+        for r in rows
+    ])
+    (wdir / "engine_metrics.json").write_text(json.dumps({"snapshot": "x"}), encoding="utf-8")
+    _write_jsonl(wdir / "cage_stats.jsonl", [{"ts_s": 0.0}])
+    (wdir / vr._WINDOW_METRICS_NAME).write_text(json.dumps(_window_metrics()), encoding="utf-8")
+    _write_regime(wdir, "UNKNOWN_TELEMETRY", "no telemetry samples")
+    (cell_dir / "cell.json").write_text(json.dumps({
+        "cellspec": spec.to_flat_dict(), "baseline": "B3",
+        "windows": {key: {"dataset": DATASET, "seed": 1, "rep": 1, "t_start": 0.0, "t_end": 60.0}},
+    }), encoding="utf-8")
+    _seal(run_dir)
+    report = vr.verify_run(run_dir)
+    assert report["ok"] is True
+    assert not _findings(report, "WARN", "telemetry")
+    assert _accounting_row(report, run_dir, wdir)["regime_label"] == "UNKNOWN_TELEMETRY"
+
+
+def test_an_unreadable_regime_artifact_fails_the_schema_check(tmp_path: Path) -> None:
+    run_dir = _build_tree(tmp_path)
+    wdir = _first_window(run_dir)
+    (wdir / "regime.json").write_text("{not json", encoding="utf-8")
+    _seal(run_dir)
+    report = vr.verify_run(run_dir)
+    assert report["ok"] is False
+    assert any(f["where"].endswith("regime.json") for f in _findings(report, "FAIL", "schema"))
+    assert _accounting_row(report, run_dir, wdir)["regime_label"] is None
+
+
+def test_check_m_constants_match_their_producers() -> None:
+    from src.analysis import regime_inputs
+
+    assert vr._REGIME_UNKNOWN == regime_inputs.REGIME_UNKNOWN == "UNKNOWN_TELEMETRY"
+    layout = (REPO_ROOT / "src" / "orchestration" / "campaign_layout.py").read_text(encoding="utf-8")
+    assert f'window_dir / "{vr._REGIME_NAME}"' in layout
+    assert vr._TELEMETRY_ENGINES == ("vllm", "sglang")

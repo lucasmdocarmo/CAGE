@@ -188,6 +188,15 @@ from every trial's measured set (results discarded; summary + ids sha256 in
 the window metadata). Both constants surface in the plan header, and
 ``load_plan`` refuses a stale plan whose server-engine cell lacks them.
 
+Telemetry (S0F-26, ADR-0136): every server-engine cell (SERVER_ENGINES,
+blocked cells included) carries ``--vllm-telemetry`` (TELEMETRY_FLAG) exactly
+once, and the in-process hf oracle never does (it serves no /metrics; a
+sampler there would dial the runner's default port). ``load_plan`` refuses a
+stale plan on either count. The runner refuses a campaign cell on vLLM or
+SGLang without the flag, probes the endpoint for the KV usage gauge after the
+warm-up and before the measured stage, and verify_results check (m) names a
+window that still read UNKNOWN_TELEMETRY.
+
 Engine endpoints (Batch 2 finding W2, 2026-09-18, option A): every
 server-engine cell carries ``--api-base http://localhost:<port>`` and every
 relaunch exports the launcher port env (VLLM_PORT / SGLANG_PORT; the pd
@@ -374,6 +383,10 @@ __all__ = [
 # required-key check and _stale_plan_problems (its manifest would carry no
 # slo_floors and its cell.json no budget_plan, so contrast #14 would refuse
 # and rho_own would skip on the whole tree), so the operator re-plans.
+# S0F-26 (2026-10-02, ADR-0136): every server-engine cell argv gained
+# --vllm-telemetry (only pd cells carried it since S0F-22 Batch 1). No schema
+# bump: a v5 plan built before it is refused by _stale_plan_problems (its
+# windows would read UNKNOWN_TELEMETRY), so the operator re-plans.
 PLAN_SCHEMA = "cage-campaign-plan-v5"
 FLOOR_TABLE_SCHEMA = "floor-table-v1"
 
@@ -622,7 +635,19 @@ PD_DECODE_PORT = 8200
 #: transfer proof). Pinned by load_plan per cell; a single-topology cell
 #: carries neither (its sampler, when any, dials --api-base).
 PD_TELEMETRY_ENDPOINTS_ENV = "CAGE_TELEMETRY_ENDPOINTS"
-PD_TELEMETRY_FLAG = "--vllm-telemetry"
+#: S0F-26 (ADR-0136): the runner's telemetry flag rides EVERY server-engine
+#: cell (SERVER_ENGINES, blocked cells included: the ADR-0102 rule) exactly
+#: once, and never an hf cell. Before S0F-26 only pd cells carried it, so
+#: every other campaign window would have read UNKNOWN_TELEMETRY (S0 ran its
+#: cells by hand, with the flag). The in-process oracle serves no /metrics: a
+#: sampler there would dial the runner's --api-base default and record
+#: whatever engine listens on it. Pinned per cell by load_plan. The runner
+#: refuses a campaign cell on vLLM or SGLang without the flag and probes the
+#: endpoint for the KV usage gauge before the measured stage.
+TELEMETRY_FLAG = "--vllm-telemetry"
+PD_TELEMETRY_FLAG = TELEMETRY_FLAG  # the S0F-22 Batch 1 name, one flag
+TELEMETRY_FINDING = "S0F-26"
+TELEMETRY_ADR = "ADR-0136"
 PD_TELEMETRY_ENDPOINTS = (
     f"prefill=http://localhost:{PD_PREFILL_PORT},"
     f"decode=http://localhost:{PD_DECODE_PORT}"
@@ -2857,6 +2882,10 @@ def _stale_plan_problems(
       is budgeted, and neither when it is budget-free (a cell moved under
       another budget boundary of the same engine passes the endpoint and
       prefix clauses and is caught here); hf and blocked cells carry neither.
+    - S0F-26 (ADR-0136): every server-engine cell (blocked ones included)
+      carries TELEMETRY_FLAG exactly once and an hf cell never does; a pd
+      cell additionally carries the role endpoint pair (S0F-22 Batch 1) and
+      no other cell does.
     """
     row = step.get("row_key")
     argv: Sequence[str] = step.get("argv") or []
@@ -3001,17 +3030,30 @@ def _stale_plan_problems(
                     + stale
                 )
 
-    # S0F-22 Batch 1: a pd cell carries the role telemetry pair (flag + env,
-    # the registered value); every other cell carries the env NOT at all (the
-    # runner would sample whatever it named under a single server).
+    # S0F-26 (ADR-0136): the telemetry flag rides every server-engine cell
+    # exactly once and never an hf cell.
+    n_flag = list(argv).count(TELEMETRY_FLAG)
+    if spec.engine in SERVER_ENGINES:
+        if n_flag != 1:
+            problems.append(
+                f"{label}: server-engine cell {row!r} carries {TELEMETRY_FLAG} "
+                f"{n_flag} time(s), must be exactly once ({TELEMETRY_FINDING}, "
+                f"{TELEMETRY_ADR}: without the sampler its windows read "
+                "UNKNOWN_TELEMETRY, and on a pd cell the decode role could not "
+                "be scraped)" + stale
+            )
+    elif n_flag:
+        problems.append(
+            f"{label}: cell {row!r} (engine {spec.engine!r}) carries "
+            f"{TELEMETRY_FLAG} ({TELEMETRY_FINDING}, {TELEMETRY_ADR}: the "
+            "in-process oracle serves no /metrics; a sampler would record "
+            "whatever engine listens on the runner's default port)" + stale
+        )
+    # S0F-22 Batch 1: a pd cell carries the role endpoint pair (the registered
+    # value); every other cell carries the env NOT at all (the runner would
+    # sample whatever it named under a single server).
     got_endpoints = env.get(PD_TELEMETRY_ENDPOINTS_ENV)
     if spec.topology == "pd":
-        if PD_TELEMETRY_FLAG not in argv:
-            problems.append(
-                f"{label}: pd cell {row!r} lacks {PD_TELEMETRY_FLAG} "
-                f"({PD_TELEMETRY_FINDING}: its windows would read UNKNOWN_TELEMETRY "
-                "and the decode role could not be scraped)" + stale
-            )
         if got_endpoints != PD_TELEMETRY_ENDPOINTS:
             problems.append(
                 f"{label}: pd cell {row!r} env {PD_TELEMETRY_ENDPOINTS_ENV} is "
@@ -3219,10 +3261,13 @@ def _cell_step(
     argv += ["--num-queries", str(num_queries)]
     argv += _behavior_argv(spec, grid, pins)
     argv += _cold_start_argv(spec)
-    if spec.topology == "pd":
-        # S0F-22 Batch 1: the pd cell samples BOTH role instances (the
-        # regime pd lane; the Batch 2 transfer proof reads the decode role).
-        argv.append(PD_TELEMETRY_FLAG)
+    if spec.engine in SERVER_ENGINES:
+        # S0F-26 (ADR-0136): every server-engine cell samples its engine (the
+        # single-endpoint sampler dials --api-base); the hf oracle never
+        # does. A pd cell samples BOTH role instances through the endpoint
+        # pair its env carries below (S0F-22: the regime pd lane, and the
+        # Batch 2 transfer proof reads the decode role).
+        argv.append(TELEMETRY_FLAG)
     if query_manifest is not None:
         # The uniform yardstick (build_query_manifest.py): every cell of a
         # dataset with a registered manifest measures the manifest's

@@ -1006,7 +1006,9 @@ class _StubUpstream:
                 self.wfile.write(body)
 
             def do_POST(self) -> None:  # noqa: N802
-                if self.path == "/reset_prefix_cache":
+                # S0F-27: the proxy posts the reset WITH its query; the path
+                # (query included) is what the journal records.
+                if self.path.split("?", 1)[0] == "/reset_prefix_cache":
                     outer.journal.append((outer.role, {"reset": self.path}))
                     body = b"{}"
                     self.send_response(outer.reset_status)
@@ -1350,15 +1352,26 @@ def test_proxy_metrics_fails_closed_when_a_role_is_unreadable(pd_stack) -> None:
     assert "unreachable" in json.loads(body)["roles"]["decode"]
 
 
-def test_proxy_reset_fans_out_to_both_roles_and_requires_both(pd_stack) -> None:
+def test_proxy_reset_fans_out_to_both_roles_and_requires_both(pd_stack, monkeypatch) -> None:
+    # S0F-27 (ADR-0137) changed what one reset is: a plain wake completion
+    # sent straight to each role, then the reset with RESET_QUERY (the vLLM
+    # mode in which a declined reset is a 5xx), and one repeat of that cycle
+    # when a role declines. Before it the relay was one bare POST per role.
+    # The wake order, the retry and the budget are pinned in
+    # tests/test_pd_proxy_s0f27_s0f28.py.
+    monkeypatch.setattr(pd_proxy, "_RESET_RETRY_PAUSE_S", 0.01)
     journal, _, decode, port = pd_stack
+    honest = {"reset": f"{pd_proxy.RESET_PATH}?{pd_proxy.RESET_QUERY}"}
     status, body = _post(port, "/reset_prefix_cache", {})
     assert status == 200
     doc = json.loads(body)
     assert doc["roles"] == {"prefill": 200, "decode": 200}
     # Both roles, concurrently (arrival order in the journal is not defined).
-    assert sorted(r for r, _ in journal) == ["decode", "prefill"], "the reset must reach BOTH roles"
-    assert all(p == {"reset": "/reset_prefix_cache"} for _, p in journal)
+    assert sorted(r for r, p in journal if p == honest) == ["decode", "prefill"], (
+        "the reset must reach BOTH roles"
+    )
+    assert sorted(r for r, p in journal if p == pd_proxy.WAKE_BODY) == ["decode", "prefill"]
+    assert len(journal) == 4
     # one role declines: never a partial success under a cold-start label
     decode.reset_status = 500
     status, body = _post(port, "/reset_prefix_cache", {})
@@ -1371,8 +1384,9 @@ def test_proxy_reset_fans_out_to_both_roles_and_requires_both(pd_stack) -> None:
     status, body = _post(port, "/reset_prefix_cache", {})
     assert status == 502
     assert "unreachable" in json.loads(body)["failed"]["decode"]
-    # the reset never touches the 1P1D data path: no /v1 request was journaled
-    assert all(p == {"reset": "/reset_prefix_cache"} for _, p in journal)
+    # the reset never touches the ticket path: every upstream call is the
+    # honest reset or the plain wake body (no kv_transfer_params anywhere)
+    assert all(p == honest or p == pd_proxy.WAKE_BODY for _, p in journal)
 
 
 # ---------------------------------------------------------------------------
@@ -1583,10 +1597,81 @@ class TestPdPlanEmission:
         # the same value its relaunch carries (one table, never two spellings)
         relaunch = [s for s in _relaunches(plan) if s["topology"] == "pd"][0]
         assert pd[0]["env"]["CAGE_TELEMETRY_ENDPOINTS"] == relaunch["env"]["CAGE_TELEMETRY_ENDPOINTS"]
-        # a single-topology cell carries neither (its sampler, when any, dials
-        # --api-base; the role grammar is the pd stack's)
+        # a single-topology cell never carries the role pair (the role grammar
+        # is the pd stack's; its sampler dials --api-base). Since S0F-26
+        # (ADR-0136) it carries the flag: before, only pd cells did and every
+        # other campaign window would have read UNKNOWN_TELEMETRY.
         assert "CAGE_TELEMETRY_ENDPOINTS" not in single[0]["env"]
-        assert "--vllm-telemetry" not in single[0]["argv"]
+        assert single[0]["argv"].count("--vllm-telemetry") == 1
+        assert pd[0]["argv"].count("--vllm-telemetry") == 1  # once, not twice
+
+    # -- S0F-26 (ADR-0136): the telemetry flag on every server-engine cell ----
+
+    def _mixed_plan(self, tmp_path):
+        # vllm + sglang F1 cells, one hf oracle cell, one executable pd cell
+        # and one BLOCKED pd cell (sglang has no pd launcher)
+        grid = _pd_grid(
+            f1_baselines=("B1",), f1_engines=("vllm", "sglang"),
+            hf_oracle_cells=(("B1", ("squad_v2",)),),
+            dist_cells=(("B3", "vllm", "pd"), ("B3", "sglang", "pd")),
+        )
+        return _plan_for(grid, _floor_table(tmp_path))
+
+    def test_every_server_engine_cell_carries_the_flag_once_and_hf_never(self, tmp_path):
+        plan = self._mixed_plan(tmp_path)
+        cells = _cells(plan)
+        assert {s["cellspec"]["engine"] for s in cells} == {"vllm", "sglang", "hf"}
+        assert any(s["blocked_on"] for s in cells), "the grid must carry a blocked cell"
+        for s in cells:
+            n = s["argv"].count(rc.TELEMETRY_FLAG)
+            if s["cellspec"]["engine"] == "hf":
+                assert n == 0, "the in-process oracle serves no /metrics"
+            else:
+                assert n == 1, (s["row_key"], s["blocked_on"])
+        assert rc.PD_TELEMETRY_FLAG == rc.TELEMETRY_FLAG == "--vllm-telemetry"
+        # the flag exists on the runner CLI the cells invoke
+        assert '"--vllm-telemetry"' in RUN_EXPERIMENT_PY.read_text(encoding="utf-8")
+        # and the mixed plan is what load_plan accepts
+        out = tmp_path / "plan_mixed.json"
+        out.write_text(json.dumps(plan), encoding="utf-8")
+        assert rc.load_plan(out)["counts"]["cells"] == len(cells)
+
+    def test_load_plan_refuses_a_server_cell_without_the_flag(self, tmp_path):
+        plan = self._mixed_plan(tmp_path)
+        out = tmp_path / "plan_stale.json"
+        for engine in ("vllm", "sglang"):
+            stale = json.loads(json.dumps(plan))
+            cell = [
+                s for s in stale["steps"]
+                if s["kind"] == "cell" and s["cellspec"]["engine"] == engine
+                and s["cellspec"]["topology"] == "single"
+            ][0]
+            cell["argv"] = [a for a in cell["argv"] if a != "--vllm-telemetry"]
+            out.write_text(json.dumps(stale), encoding="utf-8")
+            with pytest.raises(rc.RunError, match="vllm-telemetry") as exc:
+                rc.load_plan(out)
+            assert "S0F-26" in str(exc.value) and "UNKNOWN_TELEMETRY" in str(exc.value)
+
+    def test_load_plan_refuses_the_flag_twice_and_on_an_hf_cell(self, tmp_path):
+        plan = self._mixed_plan(tmp_path)
+        out = tmp_path / "plan_stale.json"
+        # twice on a server cell
+        stale = json.loads(json.dumps(plan))
+        cell = [s for s in stale["steps"] if s["kind"] == "cell"
+                and s["cellspec"]["engine"] == "vllm"][0]
+        cell["argv"].append("--vllm-telemetry")
+        out.write_text(json.dumps(stale), encoding="utf-8")
+        with pytest.raises(rc.RunError, match="exactly once"):
+            rc.load_plan(out)
+        # on the hf oracle cell: its sampler would dial the runner's default port
+        stale = json.loads(json.dumps(plan))
+        cell = [s for s in stale["steps"] if s["kind"] == "cell"
+                and s["cellspec"]["engine"] == "hf"][0]
+        cell["argv"].append("--vllm-telemetry")
+        out.write_text(json.dumps(stale), encoding="utf-8")
+        with pytest.raises(rc.RunError, match="hf") as exc:
+            rc.load_plan(out)
+        assert "vllm-telemetry" in str(exc.value) and "S0F-26" in str(exc.value)
 
     def test_load_plan_refuses_a_pd_cell_without_the_telemetry_pair(self, tmp_path):
         plan = _plan_for(_pd_grid(), _floor_table(tmp_path))

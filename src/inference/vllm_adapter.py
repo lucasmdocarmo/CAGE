@@ -37,6 +37,14 @@ class VLLMAdapter(OpenAIChatAdapter):
     # Documented dev-only endpoint; requires the server to run with
     # VLLM_SERVER_DEV_MODE=1 (see scripts/2_serving/manage_vllm_server.sh).
     _flush_endpoint: Optional[str] = "/reset_prefix_cache"
+    # S0F-27 (ADR-0137): without this query vLLM v0.19.1 answers 200 whatever
+    # its block pool did (serve/cache/api_router.py:21-44). With it a declined
+    # reset raises in the scheduler (scheduler.py:1895-1902), the engine
+    # survives and the server answers 500, so a 200 means the cache was
+    # flushed. On a quiesced engine the flag preempts nothing; the campaign
+    # reset probes for zero in-flight requests first (run_experiment
+    # _await_quiescence). The pd proxy sends the same query to both roles.
+    _flush_query: Optional[str] = "reset_running_requests=true"
 
     def __init__(
         self,
@@ -126,6 +134,9 @@ class VLLMAdapter(OpenAIChatAdapter):
             "cached_token_absent_means_zero": True,  # vLLM 0.11.0 quirk (audit M6)
             "kv_usage_gauge": False,  # adapter never scrapes /metrics (ADR-0007 item 5)
             "flush_endpoint": self._flush_endpoint,  # dev-mode gated (VLLM_SERVER_DEV_MODE=1)
+            # S0F-27: the flush POST carries _flush_query, the mode in which a
+            # declined reset is an HTTP 500, so a 2xx is the engine's own word.
+            "flush_confirms_reset": True,
             "kv_transfer_params": True,
             "chat_template_thinking_pin": True,  # verified against vLLM 0.11.0 schema
             "logprobs": True,

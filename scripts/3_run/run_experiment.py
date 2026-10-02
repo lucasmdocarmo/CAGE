@@ -945,9 +945,80 @@ def resolve_telemetry_dialect(backend: str) -> Optional[str]:
             "be ABSENT for this backend (regime labeling refuses such windows)."
         )
         return None
+    if backend in {"hf-oracle", "hf_oracle"}:
+        # S0F-26 (ADR-0136): the reference oracle runs in-process and serves
+        # no HTTP. A sampler would dial --api-base (the runner's default is
+        # the vLLM port) and record whatever engine listens there into the
+        # oracle's window.
+        print(
+            "[telemetry] LOUD SKIP: no telemetry sampler for backend "
+            f"'{backend}': the reference oracle runs in-process and serves no "
+            "/metrics. Telemetry series will be ABSENT for this backend."
+        )
+        return None
     if backend == "sglang":
         return "sglang"
     return "vllm"
+
+
+#: S0F-26 (ADR-0136): the backends whose CAMPAIGN windows must carry a live
+#: telemetry series: the served engines with a cage-stats dialect, which are
+#: the ones the campaign driver registers cells and ports for. The
+#: in-process hf oracle is never sampled and LMDeploy has no dialect.
+#: Mirrored in verify_results._TELEMETRY_ENGINES (pinned equal by tests).
+CAMPAIGN_TELEMETRY_BACKENDS: FrozenSet[str] = frozenset({"vllm", "sglang"})
+
+
+def require_campaign_telemetry(campaign: bool, backend: str, vllm_telemetry: bool) -> None:
+    """Refuse a campaign cell on a sampled backend that lacks --vllm-telemetry.
+
+    Without the sampler every window of the cell is labeled UNKNOWN_TELEMETRY
+    after the fact and no pressure contrast can use it. The campaign driver
+    emits the flag on every server-engine cell; this guards the hand path.
+    Pilot runs and unsampled backends carry no requirement.
+    """
+    if campaign and backend in CAMPAIGN_TELEMETRY_BACKENDS and not vllm_telemetry:
+        raise ValueError(
+            f"CAMPAIGN TELEMETRY: a campaign cell on backend {backend!r} needs "
+            "--vllm-telemetry: without the sampler its windows are labeled "
+            "UNKNOWN_TELEMETRY and no pressure contrast can use them; refusing "
+            "before any serving work (S0F-26, ADR-0136)."
+        )
+
+
+def probe_campaign_telemetry(endpoints: List[Tuple[str, str]], dialect: str) -> None:
+    """One telemetry snapshot per (role, url) endpoint must carry a numeric KV
+    usage gauge; otherwise RuntimeError naming every endpoint that did not.
+
+    The flag alone proves nothing: S0 ran with it and all 40 windows read
+    UNKNOWN_TELEMETRY. This asks the question the regime label depends on
+    (does the sampler's own capture return the gauge from this endpoint,
+    under this dialect) before the measured stage spends GPU time. It proves
+    the gauge at one instant, not two in-window samples; verify_results
+    check (m) reports a window that still certified nothing.
+    """
+    import math
+
+    from src.monitoring import vllm_telemetry as _telemetry
+
+    problems: List[str] = []
+    for role, url in endpoints:
+        try:
+            snapshot = _telemetry.capture_snapshot(url, dialect=dialect)
+        except Exception as exc:
+            problems.append(f"{role}={url}: {type(exc).__name__}: {exc}")
+            continue
+        usage = snapshot.get("kv_usage") if isinstance(snapshot, dict) else None
+        if isinstance(usage, bool) or not isinstance(usage, (int, float)) or not math.isfinite(usage):
+            seen = "no snapshot" if not isinstance(snapshot, dict) else f"kv_usage={usage!r}"
+            problems.append(f"{role}={url}: no numeric kv_usage in the snapshot ({seen})")
+    if problems:
+        raise RuntimeError(
+            "CAMPAIGN TELEMETRY: the telemetry endpoint(s) returned no KV usage gauge "
+            f"under dialect {dialect!r}: " + "; ".join(problems) + ". The window would "
+            "be labeled UNKNOWN_TELEMETRY; refusing before the measured stage "
+            "(S0F-26, ADR-0136)."
+        )
 
 
 def build_multi_instance_snapshot(
@@ -2158,6 +2229,10 @@ def run_experiment(
     # serving work ever starts, never burn a GPU run. None = env unset = the
     # legacy single-sampler wiring further down, untouched.
     telemetry_endpoints = resolve_telemetry_endpoints(vllm_telemetry)
+    # S0F-26 (ADR-0136): a campaign cell on a sampled backend carries the
+    # telemetry flag or refuses here (main() refuses the same before the
+    # first engine contact; this covers direct callers).
+    require_campaign_telemetry(campaign_session is not None, backend, vllm_telemetry)
 
     # S0F-22 Batch 2 (ADR-0134): the decode role's /metrics is the window's
     # transfer proof. Strict mode is the Batch 1 predicate (campaign cell with
@@ -3860,6 +3935,16 @@ def run_experiment(
         # no evidence of vLLM-named families; absent series is the honest
         # outcome and regime labeling will refuse those windows).
         _telemetry_dialect = resolve_telemetry_dialect(backend)
+        # S0F-26 (ADR-0136): each endpoint must answer one snapshot carrying
+        # the KV usage gauge before the measured stage spends GPU time. After
+        # the warm-up on purpose: the engine has stepped, so its gauges are
+        # published. Campaign cells on a sampled backend only.
+        if campaign_session is not None and backend in CAMPAIGN_TELEMETRY_BACKENDS:
+            probe_campaign_telemetry(
+                telemetry_endpoints if telemetry_endpoints is not None
+                else [("single", api_base)],
+                str(_telemetry_dialect),
+            )
         if _telemetry_dialect is not None and telemetry_endpoints is not None:
             # T4.1: ONE sampler per role=url endpoint, all with the SAME
             # resolved dialect (a PD pair runs one engine binary per role, so
@@ -3905,6 +3990,10 @@ def run_experiment(
                     api_base, interval=1.0, dialect=_telemetry_dialect
                 ).start()
             except Exception as e:
+                # S0F-26: a campaign window without its sampler would be
+                # labeled UNKNOWN_TELEMETRY after the fact; refuse it now.
+                if campaign_session is not None:
+                    raise
                 print(f"[telemetry] sampler not started: {e}")
 
     # S0F-22 Batch 2 (ADR-0134): first scrape of the pd pair's transfer
@@ -4861,13 +4950,18 @@ def draw_warmup_pool(
 
 
 #: ADR-0102 (repair 2026-09-16): the Prometheus gauge, per server backend,
-#: that counts in-flight requests. vLLM answers HTTP 200 to
+#: that counts in-flight requests. vLLM answers HTTP 200 to a bare
 #: /reset_prefix_cache even when its block pool DECLINES to reset (blocks
-#: still held by in-flight requests), so the strict campaign reset first
-#: waits for this gauge to read 0 and records the verification in
-#: metrics.json['cold_start']. A backend without a registered gauge (LMDeploy,
-#: the ADR's open VERIFY-LIVE item) is recorded as unverified, loudly, never
-#: assumed verified.
+#: still held), so the strict campaign reset first waits for this gauge to
+#: read 0 and records the verification in metrics.json['cold_start']. A
+#: backend without a registered gauge (LMDeploy, the ADR's open VERIFY-LIVE
+#: item) is recorded as unverified, loudly, never assumed verified.
+#: S0F-27 (ADR-0137): the gauge counts running requests only, so it reads 0
+#: while an idle NixlConnector role still holds the blocks of its last
+#: ticketed requests. The vLLM adapter therefore flushes in the mode where a
+#: declined reset is an HTTP 500 (?reset_running_requests=true), and the
+#: record carries ``engine_confirmed``. The probe stays: with that query a
+#: reset on a busy engine would preempt its running requests.
 COLD_START_RUNNING_GAUGE: Dict[str, str] = {
     "vllm": "vllm:num_requests_running",
     "sglang": "sglang:num_running_reqs",
@@ -4999,7 +5093,12 @@ def _reset_prefix_cache(
     HTTP 200 alone does not prove the engine reset (vLLM answers 200 while
     declining), so the record returned here, persisted by the campaign
     window as metrics.json['cold_start'], carries ``verified`` = the probe
-    read zero in-flight requests right before the flush.
+    read zero in-flight requests right before the flush. ``engine_confirmed``
+    (S0F-27, ADR-0137) is the adapter's ``flush_confirms_reset`` capability
+    after a successful adapter flush: True when a 2xx is the engine's own
+    statement that the cache was flushed (vLLM, whose adapter posts the
+    honest query), None when the engine's flush semantics were not read
+    (SGLang), when the flush failed, or on the legacy path.
     """
     record: Dict[str, Any] = {
         "backend": backend,
@@ -5007,6 +5106,7 @@ def _reset_prefix_cache(
         "mechanism": None,
         "quiescence_probe": None,
         "verified": False,
+        "engine_confirmed": None,
         "adr": "ADR-0102",
     }
     adapter_cls = {
@@ -5110,6 +5210,7 @@ def _reset_prefix_cache(
                 record["endpoint"] = caps["flush_endpoint"]
                 record["mechanism"] = "adapter"
                 record["verified"] = _verified()
+                record["engine_confirmed"] = caps.get("flush_confirms_reset")
                 return record
             # No declared flush endpoint (pilot path only; campaign mode
             # refused above) -> fall through to the legacy path.
@@ -5667,6 +5768,14 @@ def main():
                 "(the campaign v2 mode; --apply is the legacy layout only).",
                 file=sys.stderr,
             )
+            sys.exit(2)
+        # S0F-26 (ADR-0136): same slot, same exit code: a campaign cell on a
+        # sampled backend without the telemetry flag refuses before the
+        # per-window resume skip and before the strict cache flush.
+        try:
+            require_campaign_telemetry(True, args.backend, args.vllm_telemetry)
+        except ValueError as e:
+            print(f"\nError activating campaign mode: {e}", file=sys.stderr)
             sys.exit(2)
 
     def _run_with_top_k(top_k_value: int) -> None:
