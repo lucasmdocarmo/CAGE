@@ -721,3 +721,200 @@ def test_reference_engine_rows_are_exempt_from_the_tpot_clauses(tmp_path: Path) 
     _rewrite_first_window_row(run_dir3, num_tokens=9, tpot_ms=0.0, engine_id="vllm", reference_engine=False)
     (finding,) = _findings(vr.verify_run(run_dir3), "FAIL", "tpot")
     assert "captured-timing defect" in finding["detail"]
+
+
+# ---------------------------------------------------------------------------
+# (k) per-window pd transfer proof (S0F-22 Batch 2, ADR-0134)
+# ---------------------------------------------------------------------------
+
+
+def _pd_transfer_record(**over: Any) -> dict[str, Any]:
+    """A verified decode-side record for a window of N_ROWS served requests,
+    built by the producer's own function so the fixture cannot drift from
+    the record shape run_experiment writes."""
+    from src.monitoring import vllm_telemetry as vt
+
+    start = {"bytes_sum": 4096, "transfer_count": 1, "failed_transfers": 0,
+             "failed_notifications": 0, "external_kv_tokens": 7, "local_compute_tokens": 1,
+             "local_cache_hit_tokens": 0, "recomputed_tokens": 1, "preemptions": 0}
+    end = {"bytes_sum": 4096 + N_ROWS * 1048576, "transfer_count": 1 + N_ROWS,
+           "failed_transfers": 0, "failed_notifications": 0, "external_kv_tokens": 7 + 481,
+           "local_compute_tokens": 1 + N_ROWS, "local_cache_hit_tokens": 32,
+           "recomputed_tokens": 1 + N_ROWS, "preemptions": 0}
+    record = vt.pd_transfer_record(
+        start=start, end=end, prefill_start={"kv_expired_reqs": 0}, prefill_end={"kv_expired_reqs": 0},
+        n_served_rows=N_ROWS, prompt_tokens_sum=513,
+        decode_url="http://localhost:8200", prefill_url="http://localhost:8100",
+        scrape_start_ts=0.0, scrape_end_ts=60.0,
+    )
+    record.update(over)
+    return record
+
+
+def _add_pd_cell(
+    run_dir: Path, *, pd_transfer: dict[str, Any] | None | str = "verified",
+    metrics: bool = True, n_error_rows: int = 0,
+) -> Path:
+    """Add ONE pd cell (B3, family DIST) with one window to an unsealed tree;
+    returns the window dir. ``pd_transfer="verified"`` writes a healthy record,
+    None writes no key, a dict is written verbatim. ``n_error_rows`` turns that
+    many request rows into refused requests (``error`` set), the shape the
+    runner's served-row rule excludes."""
+    spec = CellSpec.from_baseline("B3", model=MODEL, family="DIST", topology="pd")  # type: ignore[arg-type]
+    cell_dir = run_dir / "cells" / spec.to_row_key()
+    cell_dir.mkdir(parents=True)
+    key = f"{DATASET}-01"
+    wdir = cell_dir / f"window_{key}"
+    wdir.mkdir()
+    rows = [_row(i, with_validity=True, with_record_index=True) for i in range(N_ROWS)]
+    for row in rows[:n_error_rows]:
+        row.update(ok=False, error="HTTP 502: prefill returned no usable KV transfer ticket",
+                   num_tokens=0, tpot_ms=None)
+    _write_jsonl(wdir / "requests.jsonl", rows)
+    _write_jsonl(wdir / "qa_evidence.jsonl", [
+        {**r, "question": "q", "generated_answer": "a", "reference_answer": "a", "used_contexts": ["c"]}
+        for r in rows
+    ])
+    (wdir / "engine_metrics.json").write_text(json.dumps({"snapshot": "x"}), encoding="utf-8")
+    _write_jsonl(wdir / "cage_stats.jsonl", [{"ts_s": 0.0, "kv_cache_usage": 0.1}])
+    if metrics:
+        doc = _window_metrics()
+        if pd_transfer == "verified":
+            doc["pd_transfer"] = _pd_transfer_record()
+        elif pd_transfer is not None:
+            doc["pd_transfer"] = pd_transfer
+        (wdir / vr._WINDOW_METRICS_NAME).write_text(json.dumps(doc), encoding="utf-8")
+    (cell_dir / "cell.json").write_text(json.dumps({
+        "cellspec": spec.to_flat_dict(), "baseline": "B3", "gpu_count": 2,
+        "windows": {key: {"dataset": DATASET, "seed": 1, "rep": 1, "t_start": 0.0, "t_end": 60.0}},
+    }), encoding="utf-8")
+    return wdir
+
+
+def test_pd_window_with_a_verified_record_passes_and_rides_the_accounting(tmp_path: Path) -> None:
+    run_dir = _build_tree(tmp_path)
+    wdir = _add_pd_cell(run_dir)
+    _seal(run_dir)
+    report = vr.verify_run(run_dir)
+    assert report["ok"] is True and report["n_warn"] == 0
+    assert _accounting_row(report, run_dir, wdir)["pd_transfer_verified"] is True
+    # single-topology windows carry no proof and no verdict: unknown, not False
+    others = [r for r in report["accounting"]["per_window"] if r["window"] != wdir.relative_to(run_dir).as_posix()]
+    assert len(others) == len(BASELINES) * N_WINDOWS
+    assert all(r["pd_transfer_verified"] is None for r in others)
+    # the markdown table is unchanged: no-decode stays the last column
+    header = next(l for l in vr.render_markdown(report).splitlines() if l.startswith("| window |"))
+    assert header.split("|")[-2].strip() == "no-decode"
+
+
+def test_pd_window_without_the_record_fails(tmp_path: Path) -> None:
+    run_dir = _build_tree(tmp_path)
+    _add_pd_cell(run_dir, pd_transfer=None)
+    _seal(run_dir)
+    report = vr.verify_run(run_dir)
+    assert report["ok"] is False
+    (finding,) = _findings(report, "FAIL", "pd-transfer")
+    assert "pd_transfer" in finding["detail"] and "ADR-0134" in finding["detail"]
+    assert finding["where"].endswith(vr._WINDOW_METRICS_NAME)
+
+
+def test_pd_window_without_metrics_json_fails_not_warns(tmp_path: Path) -> None:
+    # (i) alone gives a WARN for a missing summary; a pd window without its
+    # transfer proof must never verify green on that WARN.
+    run_dir = _build_tree(tmp_path)
+    wdir = _add_pd_cell(run_dir, metrics=False)
+    _seal(run_dir)
+    report = vr.verify_run(run_dir)
+    assert report["ok"] is False
+    (finding,) = _findings(report, "FAIL", "pd-transfer")
+    assert "no runner summary" in finding["detail"]
+    assert _accounting_row(report, run_dir, wdir)["pd_transfer_verified"] is None
+
+
+def test_pd_window_whose_deltas_fail_a_clause_is_refused_offline(tmp_path: Path) -> None:
+    run_dir = _build_tree(tmp_path)
+    record = _pd_transfer_record()
+    record["delta"]["failed_transfers"] = 1
+    record["verified"] = False
+    record["reasons"] = ["failed_transfers == 0 violated: 1 failed pull(s)"]
+    wdir = _add_pd_cell(run_dir, pd_transfer=record)
+    _seal(run_dir)
+    report = vr.verify_run(run_dir)
+    assert report["ok"] is False
+    (finding,) = _findings(report, "FAIL", "pd-transfer")
+    assert "failed_transfers == 0" in finding["detail"]
+    assert _accounting_row(report, run_dir, wdir)["pd_transfer_verified"] is False
+
+
+def test_recorded_verdict_that_disagrees_with_the_deltas_fails(tmp_path: Path) -> None:
+    # the producer's flag is re-derived, never trusted
+    run_dir = _build_tree(tmp_path)
+    record = _pd_transfer_record()
+    record["delta"]["bytes_sum"] = 0  # the flag still says verified
+    _add_pd_cell(run_dir, pd_transfer=record)
+    _seal(run_dir)
+    report = vr.verify_run(run_dir)
+    fails = _findings(report, "FAIL", "pd-transfer")
+    details = "\n".join(f["detail"] for f in fails)
+    assert "bytes_sum > 0" in details and "disagrees" in details
+
+
+def test_recorded_served_count_must_match_the_rows(tmp_path: Path) -> None:
+    # one request refused by the proxy: 2 served rows, the record claims 3
+    run_dir = _build_tree(tmp_path)
+    _add_pd_cell(run_dir, n_error_rows=1)
+    _seal(run_dir)
+    report = vr.verify_run(run_dir)
+    assert report["ok"] is False
+    (finding,) = _findings(report, "FAIL", "pd-transfer")
+    assert "n_served_rows" in finding["detail"] and "3" in finding["detail"] and "2" in finding["detail"]
+
+
+@pytest.mark.parametrize("record", [
+    "not a dict", {"verified": True}, {"delta": "x", "n_served_rows": 3, "verified": True},
+], ids=["string", "no-delta", "delta-not-a-dict"])
+def test_malformed_record_fails(tmp_path: Path, record: Any) -> None:
+    run_dir = _build_tree(tmp_path)
+    _add_pd_cell(run_dir, pd_transfer=record)
+    _seal(run_dir)
+    report = vr.verify_run(run_dir)
+    assert report["ok"] is False
+    assert _findings(report, "FAIL", "pd-transfer")
+
+
+def test_single_topology_window_with_a_record_fails(tmp_path: Path) -> None:
+    # a non-pd cell ran against a decode endpoint: a mislabeled cell
+    run_dir = _build_tree(tmp_path)
+    wdir = _first_window(run_dir)
+    doc = json.loads((wdir / vr._WINDOW_METRICS_NAME).read_text(encoding="utf-8"))
+    doc["pd_transfer"] = _pd_transfer_record()
+    (wdir / vr._WINDOW_METRICS_NAME).write_text(json.dumps(doc), encoding="utf-8")
+    _seal(run_dir)
+    report = vr.verify_run(run_dir)
+    assert report["ok"] is False
+    (finding,) = _findings(report, "FAIL", "pd-transfer")
+    assert "single" in finding["detail"]
+
+
+def test_prefill_expiry_inside_the_window_is_a_warn(tmp_path: Path) -> None:
+    # Review LOW-4: a nonzero prefill expiry delta means a ticket was never
+    # pulled before its 480 s deadline (an earlier window's request, or a
+    # decode that never notified); the gate clauses do not see it, so the
+    # verifier names it without flipping the gate.
+    run_dir = _build_tree(tmp_path)
+    record = _pd_transfer_record()
+    record["prefill_delta"] = {"kv_expired_reqs": 2}
+    wdir = _add_pd_cell(run_dir, pd_transfer=record)
+    _seal(run_dir)
+    report = vr.verify_run(run_dir)
+    assert report["ok"] is True
+    (warn,) = _findings(report, "WARN", "pd-transfer")
+    assert "kv_expired_reqs" in warn["detail"] and "2" in warn["detail"]
+    assert _accounting_row(report, run_dir, wdir)["pd_transfer_verified"] is True
+
+
+def test_check_k_re_derives_with_the_producers_rule() -> None:
+    from src.monitoring import vllm_telemetry as vt
+
+    assert vr._pd_transfer_reasons is vt.pd_transfer_reasons
+    assert vr._PD_TRANSFER_KEY == "pd_transfer"

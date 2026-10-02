@@ -86,8 +86,10 @@
 #   - the whole NIXL data path (transfer, the kv_transfer_params ticket):
 #     S0F-22 Batch 1 (ADR-0133): the proxy asks the prefill for its ticket,
 #     refuses a missing one before the decode, and relays it verbatim; the
-#     runner's pd gate checks the ticket's engine shape on every ok row; the
-#     per-window decode counters (Batch 2, RC-13) prove the pull.
+#     runner's pd gate checks the ticket's engine shape on every served row
+#     (no error); Batch 2 (ADR-0134) scrapes the decode's /metrics before and
+#     after the measured stage and refuses a campaign pd window whose NIXL
+#     counter deltas do not prove the pull (RC-13 is the live proof).
 # These are surfaced in the start banner below, not just in comments.
 # =============================================================================
 

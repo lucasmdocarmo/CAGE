@@ -251,6 +251,20 @@ the decode that reached ready, not a failure.
   the ticket verbatim in the `x-kv-transfer-params` response header; the runner's pd gate
   checks that shape on every served row (rows with `error` set are skipped). `remote_host` is `localhost` unless
   `VLLM_NIXL_SIDE_CHANNEL_HOST` is set on the prefill: the cross-node rung needs it.
+- The pull (ADR-0134): the decode records one `vllm:nixl_bytes_transferred` observation
+  per transfer handle (one per worker per ticketed request, `nixl_connector.py:2398-2402`),
+  so for homogeneous TP `t` the `_count` rises by `t` per served request; the pulled
+  prompt tokens land in `vllm:prompt_tokens_by_source_total{source="external_kv_transfer"}`
+  and the decode samples the first token itself (`local_compute` and
+  `vllm:prompt_tokens_recomputed_total` rise by 1 per request, `scheduler.py:2067-2074`).
+  The decode's local prefix hit is capped at N-1 tokens (`kv_cache_manager.py:195-201`),
+  so a ticketed request always reads at least one block: that is the basis of the
+  runner's `transfer_count >= n_served_rows` clause. `metrics.json["pd_transfer"]`
+  records the two-scrape deltas of these series per window (`start`, `end`, `delta`,
+  `prefill_delta`, `n_served_rows`, `identities`, `verified`, `reasons`). Prometheus
+  exposition spellings: histogram `_sum`/`_count`, counter `_total`; the `_created` and
+  `_bucket` siblings are separate series. [VERIFY-LIVE] at RC-13: the `external_kv_transfer`
+  attribution and the count-per-TP identity on the provisioned node.
 
 ### 8.5 Validation instruments (the act-2 measurement toolkit)
 

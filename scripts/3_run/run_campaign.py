@@ -158,7 +158,9 @@ until their registrations land):
   smoke passes. S0F-22 Batch 1 (ADR-0133): the pd cell also carries the
   role telemetry pair (PD_TELEMETRY_FLAG + CAGE_TELEMETRY_ENDPOINTS), the
   proxy asks the prefill for its KV transfer ticket and relays it, and the
-  runner's pd gate refuses any ok row without an engine-shaped ticket.
+  runner's pd gate refuses any served row (no error) without an engine-shaped
+  ticket; Batch 2 (ADR-0134) adds the per-window decode counter proof, which
+  is why the decode telemetry endpoint is mandatory on a pd cell.
 
 Cell BEHAVIOR realization (repair of the T1.2 verifier blocker): the runner's
 ``--baseline`` token selects only the serving PIPELINE; the arm's remaining

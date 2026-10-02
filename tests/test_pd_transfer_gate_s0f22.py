@@ -1,4 +1,4 @@
-"""Campaign pd windows carry the engine's KV transfer ticket on every ok row (S0F-22, Batch 1).
+"""Campaign pd windows carry the engine's KV transfer ticket on every served row (S0F-22, Batch 1).
 
 Facts the pins rest on (vLLM v0.19.1 source, read 2026-10-01):
 - the prefill's ``NixlConnector.request_finished`` returns a ticket of eight

@@ -44,7 +44,17 @@ the first:
     row is timely on TTFT alone downstream and counted as ``n_no_decode`` in
     the accounting); a whitespace-sourced token count
     (``num_tokens_source == "whitespace"``) is a WARN naming the missing
-    usage chunk.
+    usage chunk;
+(k) per-window pd transfer proof (ADR-0134, S0F-22 Batch 2): a window of a
+    cell with topology ``pd`` must carry ``metrics.json["pd_transfer"]``, the
+    runner's two-scrape record of the decode's NIXL counters; its deltas are
+    re-derived here with the producer's own rule (bytes moved, at least one
+    transfer per served row, zero failed transfers and notifications, prompt
+    tokens attributed to the external KV source), the recorded ``verified``
+    flag must agree with that re-derivation, and the recorded served-row
+    count must equal the rows without ``error``; a pd window with no summary
+    or no record FAILs (never the WARN of (i) alone); a window of any other
+    topology carrying the record FAILs (a mislabeled cell).
 
 ``--pilot --results-dir DIR`` preserves the pilot-era metrics-vs-CSV check
 (``verify_dir``) verbatim for pilot trees; that mode keeps writing its report
@@ -78,6 +88,12 @@ from src.analysis.stats.ledger import (  # noqa: E402
     read_ledger,
     verify_ledger,
 )
+#: Check (k) re-derives the pd transfer verdict with the PRODUCER's rule
+#: (one function, two callers: the runner's refusal and this gate), so the
+#: offline verdict cannot drift from the one the window was emitted under.
+from src.monitoring.vllm_telemetry import (  # noqa: E402
+    pd_transfer_reasons as _pd_transfer_reasons,
+)
 
 #: Fields whose ABSENCE from every row of a per-query file is a WARN (not a
 #: FAIL) until the producer fix lands — H2/#119: without them, serving-error
@@ -110,6 +126,12 @@ _CONSORT_COUNTERS: tuple[str, ...] = (
 #: (= src.inference.engine.NUM_TOKENS_SOURCE_WHITESPACE; tests pin the two
 #: equal): the engine returned no usage.completion_tokens, so the count is words.
 _NUM_TOKENS_SOURCE_FALLBACK = "whitespace"
+
+#: metrics.json key of the per-window pd transfer proof (= run_experiment
+#: .PD_TRANSFER_KEY, pinned equal by tests) and the topology that must carry
+#: it (src.analysis.cellspec Topology literal), check (k).
+_PD_TRANSFER_KEY = "pd_transfer"
+_PD_TOPOLOGY = "pd"
 
 VERIFICATION_DIR_SUFFIX = "_verification"
 REPORT_JSON_NAME = "verification_report.json"
@@ -461,13 +483,152 @@ def _check_tpot_rows(
     return no_decode
 
 
+def _check_pd_transfer(
+    window_dir: Path,
+    rel_window: str,
+    topology: str | None,
+    requests_rows: list[dict[str, Any]] | None,
+    findings: list[Finding],
+) -> bool | None:
+    """Check (k), ADR-0134 (S0F-22 Batch 2): the per-window pd transfer proof.
+    Returns the re-derived verdict for a pd window (True/False), None when
+    there is nothing to judge (not a pd window, topology unknown, or no
+    readable record). The summary is parsed here on purpose: a missing or
+    unparseable file is already (i)'s finding, and the pd-specific FAIL on a
+    MISSING summary is this check's (a pd window must never verify green on
+    (i)'s WARN alone)."""
+    if topology is None:
+        return None  # the cell dirname did not parse: a layout FAIL already stands
+    path = window_dir / _WINDOW_METRICS_NAME
+    where = f"{rel_window}/{_WINDOW_METRICS_NAME}"
+    is_pd = topology == _PD_TOPOLOGY
+    if not path.is_file():
+        if is_pd:
+            findings.append(
+                Finding(
+                    "FAIL",
+                    "pd-transfer",
+                    where,
+                    "no runner summary beside the §1 artifacts: a pd window carries "
+                    f"its KV transfer proof in {_WINDOW_METRICS_NAME}[{_PD_TRANSFER_KEY!r}] "
+                    "and cannot be verified without it (ADR-0134)",
+                )
+            )
+        return None
+    try:
+        metrics = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None  # (i) reported the invalid JSON
+    if not isinstance(metrics, dict):
+        return None  # (i) reported the non-object root
+    record = metrics.get(_PD_TRANSFER_KEY)
+    if not is_pd:
+        if _PD_TRANSFER_KEY in metrics:
+            findings.append(
+                Finding(
+                    "FAIL",
+                    "pd-transfer",
+                    where,
+                    f"a {topology}-topology window carries a {_PD_TRANSFER_KEY!r} record: "
+                    "the cell ran against a decode telemetry endpoint, so its topology "
+                    "label or its launch is wrong (ADR-0134)",
+                )
+            )
+        return None
+    if not isinstance(record, dict):
+        findings.append(
+            Finding(
+                "FAIL",
+                "pd-transfer",
+                where,
+                f"pd window lacks an object {_PD_TRANSFER_KEY!r} (got "
+                f"{type(record).__name__}): the decode's KV pull was never recorded "
+                "for this window (ADR-0134)",
+            )
+        )
+        return False
+    delta = record.get("delta")
+    n_served = record.get("n_served_rows")
+    if not isinstance(delta, dict):
+        findings.append(
+            Finding(
+                "FAIL",
+                "pd-transfer",
+                where,
+                f"{_PD_TRANSFER_KEY}.delta is {type(delta).__name__}, not an object of "
+                "counter deltas (ADR-0134)",
+            )
+        )
+        return False
+    reasons = _pd_transfer_reasons(delta, n_served)
+    if reasons:
+        findings.append(
+            Finding(
+                "FAIL",
+                "pd-transfer",
+                where,
+                "the decode's counter deltas do not prove this window's KV pull: "
+                + "; ".join(reasons)
+                + " (ADR-0134)",
+            )
+        )
+    verified_recorded = record.get("verified")
+    if verified_recorded is not (not reasons):
+        findings.append(
+            Finding(
+                "FAIL",
+                "pd-transfer",
+                where,
+                f"recorded verified={verified_recorded!r} disagrees with the re-derived "
+                f"verdict {not reasons} (the producer's flag is re-derived here, never "
+                "trusted; ADR-0134)",
+            )
+        )
+    if requests_rows is not None:
+        served = sum(1 for r in requests_rows if not r.get("error"))
+        if n_served != served:
+            findings.append(
+                Finding(
+                    "FAIL",
+                    "pd-transfer",
+                    where,
+                    f"recorded n_served_rows={n_served!r} but requests.jsonl has {served} "
+                    "row(s) without error: the proof was computed over a different "
+                    "population than the window carries (ADR-0134)",
+                )
+            )
+    # The prefill's expiry counter is recorded, never gated (it moves about
+    # 480 s after a ticket and only on a prefill step, so it describes an
+    # earlier window's requests): a nonzero delta still names a ticket the
+    # decode never pulled before its deadline (review 2026-10-01 LOW-4).
+    prefill_delta = record.get("prefill_delta")
+    expired = prefill_delta.get("kv_expired_reqs") if isinstance(prefill_delta, dict) else None
+    if isinstance(expired, (int, float)) and not isinstance(expired, bool) and expired > 0:
+        findings.append(
+            Finding(
+                "WARN",
+                "pd-transfer",
+                where,
+                f"prefill_delta.kv_expired_reqs = {expired:g}: the prefill released "
+                "blocks of ticket(s) the decode never pulled within "
+                "VLLM_NIXL_ABORT_REQUEST_TIMEOUT (a request of this or an earlier "
+                "window, or a decode that never notified; RC-13 names the side) "
+                "(ADR-0134)",
+            )
+        )
+    return not reasons
+
+
 def _check_window(
     run_dir: Path,
     window_dir: Path,
     dataset: str,
     findings: list[Finding],
+    *,
+    topology: str | None = None,
 ) -> dict[str, Any]:
-    """Run checks (a)-(c), (i), (j) + accounting (e) for one window; returns its summary."""
+    """Run checks (a)-(c), (i), (j), (k) + accounting (e) for one window; returns its summary.
+    ``topology`` is the cell's (from its §2 dirname); None skips (k)."""
     rel_window = window_dir.relative_to(run_dir).as_posix()
     per_file_rows: dict[str, list[dict[str, Any]] | None] = {}
     for name in _PER_QUERY_ARTIFACTS:
@@ -555,6 +716,12 @@ def _check_window(
         else None
     )
 
+    # (k) per-window pd transfer proof (ADR-0134, S0F-22 Batch 2); the
+    # re-derived verdict rides the accounting (None = not a pd window).
+    pd_transfer_verified = _check_pd_transfer(
+        window_dir, rel_window, topology, requests_rows, findings
+    )
+
     # (e) §9.10 exclusion accounting — absence is NOT zero: rows lacking any
     # validity field are counted as validity-unknown, never as valid.
     accounting: dict[str, Any] = {
@@ -569,6 +736,7 @@ def _check_window(
         "n_validity_unknown": None,
         "n_valid_known": None,
         "n_no_decode": n_no_decode,
+        "pd_transfer_verified": pd_transfer_verified,
     }
     if requests_rows is not None:
         n_error = sum(1 for r in requests_rows if r.get("error"))
@@ -701,8 +869,12 @@ def _walk_cells(
                 Finding("FAIL", "layout", cell_rel, "stray file in cells/ (§1)")
             )
             continue
+        # The §2 dirname IS the cell identity; its topology drives check (k).
+        # An unparseable dirname is a layout FAIL and leaves (k) skipped
+        # (topology None) for that cell's windows.
+        topology: str | None = None
         try:
-            org.parse_row_key_dir(cell_dir.name)
+            topology = org.parse_row_key_dir(cell_dir.name).topology
         except org.OrganizeError as exc:
             findings.append(Finding("FAIL", "layout", cell_rel, str(exc)))
 
@@ -782,7 +954,7 @@ def _walk_cells(
                 continue
             dir_keys[f"{dataset}-{ordinal_str}"] = window_dir.name
             accounting_rows.append(
-                _check_window(run_dir, window_dir, dataset, findings)
+                _check_window(run_dir, window_dir, dataset, findings, topology=topology)
             )
             n_windows += 1
         _check_windows_table(cell_rel, meta, dir_keys, findings)

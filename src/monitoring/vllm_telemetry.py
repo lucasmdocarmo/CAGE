@@ -19,6 +19,7 @@ installing it.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -567,6 +568,218 @@ def scrape_spec_decode(
         "spec_decode_acceptance_rate": (accepted / draft) if (accepted is not None and draft) else None,
         "spec_decode_num_drafts": num_drafts,
         "spec_decode_mean_accept_len": (accepted / num_drafts) if (accepted is not None and num_drafts) else None,
+    }
+
+
+#: S0F-22 Batch 2 (ADR-0134): the decode-side series whose per-window deltas
+#: prove the KV pull of a prefill/decode pair. record key -> (series name,
+#: label filter). Names from vLLM v0.19.1: the NIXL families
+#: (nixl_connector.py:3030-3164; one histogram observation per transfer
+#: handle, bytes = NIXL totalBytes) and the engine counters
+#: (v1/metrics/loggers.py:600-633 by-source and recomputed, :582-588
+#: preemptions). The `_sum`/`_count`/`_total` suffixes are prometheus_client's
+#: exposition spellings. Labels (model_name, engine) are summed: a single
+#: engine per role in CAGE, and the lifetime total is the right quantity
+#: under data parallel too.
+PD_TRANSFER_SERIES: "dict[str, tuple[str, dict[str, str]]]" = {
+    "bytes_sum": ("vllm:nixl_bytes_transferred_sum", {}),
+    "transfer_count": ("vllm:nixl_bytes_transferred_count", {}),
+    "failed_transfers": ("vllm:nixl_num_failed_transfers_total", {}),
+    "failed_notifications": ("vllm:nixl_num_failed_notifications_total", {}),
+    "external_kv_tokens": ("vllm:prompt_tokens_by_source_total", {"source": "external_kv_transfer"}),
+    "local_compute_tokens": ("vllm:prompt_tokens_by_source_total", {"source": "local_compute"}),
+    "local_cache_hit_tokens": ("vllm:prompt_tokens_by_source_total", {"source": "local_cache_hit"}),
+    "recomputed_tokens": ("vllm:prompt_tokens_recomputed_total", {}),
+    "preemptions": ("vllm:num_preemptions_total", {}),
+}
+#: The prefill's only transfer family (nixl_connector.py:3128-3136): tickets
+#: the decode never pulled, counted about VLLM_NIXL_ABORT_REQUEST_TIMEOUT
+#: (480 s) after the ticket and only on a prefill engine step, so a
+#: window-bounded delta describes requests of an earlier window. Recorded,
+#: never gated.
+PD_PREFILL_SERIES: "dict[str, tuple[str, dict[str, str]]]" = {
+    "kv_expired_reqs": ("vllm:nixl_num_kv_expired_reqs_total", {}),
+}
+#: The strict clauses (ADR-0134 decision 4a), evaluated by
+#: ``pd_transfer_reasons`` for the runner's refusal AND verify_results
+#: check (k): one rule, two callers. The identities (decision 4b) are
+#: recorded in the record and never gated: a preemption recompute changes
+#: ``local_compute`` (stats.py:280-297) and pressure windows preempt by design.
+PD_TRANSFER_GATE_CLAUSES: "tuple[str, ...]" = (
+    "failed_transfers == 0",
+    "failed_notifications == 0",
+    "bytes_sum > 0",
+    "transfer_count >= n_served_rows",
+    "external_kv_tokens > 0",
+)
+_PD_GATE_KEYS = ("failed_transfers", "failed_notifications", "bytes_sum", "transfer_count", "external_kv_tokens")
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def read_counter_series(text: str, series: "dict[str, tuple[str, dict[str, str]]]") -> "dict[str, Optional[float]]":
+    """Values of ``series`` in one Prometheus exposition: per key, the sum over
+    samples whose name EQUALS the series name and whose labels contain the
+    filter; None when no sample matched or the sum is not finite (absence
+    stays absence, never 0). Parsed with prometheus_client's own parser, so
+    label values with '}' or ',' and trailing timestamps are handled, and the
+    ``_bucket``/``_created`` siblings never match a ``_sum``/``_count`` name.
+    """
+    from prometheus_client.parser import text_string_to_metric_families
+
+    wanted: "dict[str, list]" = {}
+    for key, (name, labels) in series.items():
+        wanted.setdefault(name, []).append((key, labels))
+    sums: "dict[str, float]" = {}
+    for family in text_string_to_metric_families(text):
+        for sample in family.samples:
+            for key, labels in wanted.get(sample.name, ()):
+                if all(sample.labels.get(k) == v for k, v in labels.items()):
+                    sums[key] = sums.get(key, 0.0) + float(sample.value)
+    return {key: (sums[key] if key in sums and math.isfinite(sums[key]) else None) for key in series}
+
+
+def scrape_counter_series(
+    url: str, series: "dict[str, tuple[str, dict[str, str]]]", *,
+    metrics_path: str = "/metrics", timeout: float = 10.0,
+) -> "dict[str, Optional[float]]":
+    """One GET of ``url`` + ``metrics_path`` read through ``read_counter_series``.
+    Transport and HTTP failures RAISE (urllib's OSError family), and so does
+    a body the Prometheus parser rejects (ValueError): the caller owns the
+    policy (the campaign pd gate refuses, the pilot path records).
+    """
+    import urllib.request
+
+    base = url.rstrip("/")
+    endpoint = base if base.endswith(metrics_path) else base + metrics_path
+    with urllib.request.urlopen(endpoint, timeout=timeout) as resp:
+        text = resp.read().decode("utf-8", "replace")
+    return read_counter_series(text, series)
+
+
+def pd_transfer_reasons(delta: "dict", n_served_rows) -> "list[str]":
+    """Every violated clause of PD_TRANSFER_GATE_CLAUSES for one window's
+    decode deltas, as sentences; empty means verified. ``n_served_rows`` is
+    the Batch 1 served-row count (rows without ``error``): every such row was
+    a 2xx the proxy answered only with a ticket, so the decode pulled at least
+    one block for it (local prefix hits are capped at N-1 tokens,
+    kv_cache_manager.py:195-201; the connector claims N-local >= 1 external
+    tokens, nixl_connector.py:784-790, and reads at least one block,
+    :833-840). A None delta (series absent), a non-finite value or a negative
+    delta (the decode's counters reset between the scrapes) is a reason too.
+    """
+    reasons: "list[str]" = []
+    if isinstance(n_served_rows, bool) or not isinstance(n_served_rows, int) or n_served_rows < 0:
+        reasons.append(f"n_served_rows is {n_served_rows!r}, not a non-negative integer")
+        return reasons
+    # n_served_rows == 0 is NOT a clause (review 2026-10-01, LOW-1): the gate
+    # asks whether the pair transferred. A cliff window where every request
+    # timed out after its pull is attainment data with bytes moved; a window
+    # where nothing moved fails bytes_sum > 0 regardless of the row count.
+    values: "dict[str, float]" = {}
+    for key in _PD_GATE_KEYS:
+        value = delta.get(key) if isinstance(delta, dict) else None
+        if value is None:
+            reasons.append(f"{key}: series absent on the decode")
+        elif not _is_number(value):
+            reasons.append(f"{key}: not a finite number ({value!r})")
+        elif value < 0:
+            reasons.append(f"{key}: negative delta {value} (the decode's counters reset between the scrapes)")
+        else:
+            values[key] = value
+    if "failed_transfers" in values and values["failed_transfers"] != 0:
+        reasons.append(f"failed_transfers == 0 violated: {values['failed_transfers']:g} failed pull(s)")
+    if "failed_notifications" in values and values["failed_notifications"] != 0:
+        reasons.append(
+            f"failed_notifications == 0 violated: {values['failed_notifications']:g} failed notification(s)")
+    if "bytes_sum" in values and values["bytes_sum"] <= 0:
+        reasons.append(f"bytes_sum > 0 violated: {values['bytes_sum']:g} bytes moved")
+    if "transfer_count" in values and values["transfer_count"] < n_served_rows:
+        reasons.append(
+            f"transfer_count >= n_served_rows violated: {values['transfer_count']:g} transfer(s) "
+            f"for {n_served_rows} served row(s)")
+    if "external_kv_tokens" in values and values["external_kv_tokens"] <= 0:
+        reasons.append(
+            f"external_kv_tokens > 0 violated: {values['external_kv_tokens']:g} prompt tokens from external KV")
+    return reasons
+
+
+def _native(value: Optional[float]):
+    """A JSON-native number: int when integer-valued, else float; None stays."""
+    if value is None:
+        return None
+    return int(value) if float(value).is_integer() else float(value)
+
+
+def pd_transfer_record(
+    *, start: "dict", end: "dict", prefill_start: "Optional[dict]", prefill_end: "Optional[dict]",
+    n_served_rows: int, prompt_tokens_sum: Optional[int], decode_url: str, prefill_url: Optional[str],
+    scrape_start_ts: float, scrape_end_ts: float,
+) -> "dict":
+    """The metrics.json ``pd_transfer`` block for one window (ADR-0134).
+
+    ``start``/``end`` are two ``read_counter_series`` results of the decode
+    (before the first measured send, after the last completion); the prefill
+    pair is optional. Deltas are end minus start per key (None when either
+    side is None). ``verified`` is ``not pd_transfer_reasons(delta, n)``. The
+    identities (decision 4b) are recorded with a tri-state verdict each and
+    never decide ``verified``. Every value is JSON-native with string keys
+    and no NaN: the staging writer dumps the dict unchanged.
+    """
+    delta: "dict[str, Optional[float]]" = {}
+    for key in PD_TRANSFER_SERIES:
+        a, b = start.get(key), end.get(key)
+        delta[key] = _native(b - a) if _is_number(a) and _is_number(b) else None
+    prefill_delta = None
+    if prefill_start is not None and prefill_end is not None:
+        prefill_delta = {}
+        for key in PD_PREFILL_SERIES:
+            a, b = prefill_start.get(key), prefill_end.get(key)
+            prefill_delta[key] = _native(b - a) if _is_number(a) and _is_number(b) else None
+    reasons = pd_transfer_reasons(delta, n_served_rows)
+
+    def _eq(x, y) -> Optional[bool]:
+        return (x == y) if _is_number(x) and _is_number(y) else None
+
+    external, cache_hit = delta["external_kv_tokens"], delta["local_cache_hit_tokens"]
+    identities = {
+        "local_compute_equals_served": _eq(delta["local_compute_tokens"], n_served_rows),
+        "recomputed_equals_served": _eq(delta["recomputed_tokens"], n_served_rows),
+        "external_plus_cache_hit_equals_prompt_tokens": (
+            _eq(external + cache_hit, prompt_tokens_sum)
+            if _is_number(external) and _is_number(cache_hit) and _is_number(prompt_tokens_sum) else None
+        ),
+        "no_preemptions": _eq(delta["preemptions"], 0),
+    }
+    identities_hold: Optional[bool] = (
+        None if any(v is None for v in identities.values()) else all(identities.values())
+    )
+    count = delta["transfer_count"]
+    return {
+        "adr": "ADR-0134",
+        "decode_url": decode_url,
+        "prefill_url": prefill_url,
+        "scrape_start_ts": float(scrape_start_ts),
+        "scrape_end_ts": float(scrape_end_ts),
+        "start": {k: _native(v) for k, v in start.items()},
+        "end": {k: _native(v) for k, v in end.items()},
+        "delta": delta,
+        "prefill_start": None if prefill_start is None else {k: _native(v) for k, v in prefill_start.items()},
+        "prefill_end": None if prefill_end is None else {k: _native(v) for k, v in prefill_end.items()},
+        "prefill_delta": prefill_delta,
+        "n_served_rows": int(n_served_rows),
+        "prompt_tokens_sum": None if prompt_tokens_sum is None else int(prompt_tokens_sum),
+        "transfers_per_served_row": (
+            float(count) / n_served_rows if _is_number(count) and isinstance(n_served_rows, int)
+            and not isinstance(n_served_rows, bool) and n_served_rows > 0 else None
+        ),
+        "identities": identities,
+        "identities_hold": identities_hold,
+        "gate_clauses": list(PD_TRANSFER_GATE_CLAUSES),
+        "reasons": reasons,
+        "verified": not reasons,
     }
 
 

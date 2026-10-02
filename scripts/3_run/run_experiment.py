@@ -707,6 +707,143 @@ def enforce_pd_transfer_tickets(results: List[Dict[str, Any]]) -> None:
             )
 
 
+#: S0F-22 Batch 2 (ADR-0134): the metrics.json key of the per-window pd
+#: transfer proof (feature-gated on a `decode` telemetry endpoint, the
+#: cold_start/warmup_pool contract: absent on every run without one).
+PD_TRANSFER_KEY = "pd_transfer"
+
+
+def pd_transfer_endpoints(
+    endpoints: Optional[List[Tuple[str, str]]],
+) -> Optional[Tuple[str, Optional[str]]]:
+    """(decode_url, prefill_url or None) from the CAGE_TELEMETRY_ENDPOINTS
+    pairs, or None when no `decode` role is configured: the decode's /metrics
+    is the only place the pull is counted (nixl_connector.py:2398-2402 at
+    v0.19.1), the prefill carries the expiry counter alone."""
+    if not endpoints:
+        return None
+    roles = dict(endpoints)
+    if "decode" not in roles:
+        return None
+    return roles["decode"], roles.get("prefill")
+
+
+#: Review 2026-10-01 MEDIUM-1: the decode scrape is retried a bounded number
+#: of times before the strict refusal. The counters are monotonic and the
+#: server is quiescent at both boundaries, so a later GET reads the same
+#: values; one late /metrics answer (the frontend busy right after a cliff
+#: window) must not discard a window that cost its full GPU time.
+PD_SCRAPE_ATTEMPTS = 3
+PD_SCRAPE_RETRY_PAUSE_S = 5.0
+
+
+def scrape_pd_transfer(
+    urls: Tuple[str, Optional[str]], *, strict: bool, stage: str, timeout: float = 10.0,
+    attempts: int = PD_SCRAPE_ATTEMPTS, retry_pause_s: float = PD_SCRAPE_RETRY_PAUSE_S,
+) -> Dict[str, Any]:
+    """One scrape of the pd pair's transfer counters at a stage boundary.
+
+    Returns ``{"ts", "decode", "prefill"}`` (``prefill`` None when no prefill
+    endpoint or its scrape failed: the expiry counter is informational). The
+    decode scrape is tried ``attempts`` times, ``retry_pause_s`` apart. A
+    DECODE scrape that fails every attempt is the proof-gate case: in
+    campaign pd mode (``strict``) it RAISES, before the measured stage so no
+    GPU minute is spent on a window that cannot be verified; on the pilot
+    path it is recorded as ``{"ts", "error"}`` and printed, never a
+    fabricated zero.
+    """
+    from src.monitoring.vllm_telemetry import (
+        PD_PREFILL_SERIES, PD_TRANSFER_SERIES, scrape_counter_series,
+    )
+
+    decode_url, prefill_url = urls
+    ts = time.time()
+    attempts = max(1, int(attempts))
+    last_exc: Optional[BaseException] = None
+    decode = None
+    for attempt in range(1, attempts + 1):
+        try:
+            decode = scrape_counter_series(decode_url, PD_TRANSFER_SERIES, timeout=timeout)
+            break
+        except Exception as exc:
+            last_exc = exc
+            if attempt < attempts:
+                print(f"[pd-transfer] decode /metrics scrape {stage} attempt {attempt}/{attempts} "
+                      f"failed ({type(exc).__name__}: {exc}); retrying in {retry_pause_s:g} s")
+                time.sleep(retry_pause_s)
+    if decode is None:
+        msg = (f"decode /metrics scrape {stage} failed on {attempts} attempt(s) ({decode_url}): "
+               f"{type(last_exc).__name__}: {last_exc}")
+        if strict:
+            raise RuntimeError(
+                f"CAMPAIGN PD TRANSFER: {msg}; the window's KV pull cannot be "
+                "proven, refusing (S0F-22, ADR-0134)."
+            ) from last_exc
+        print(f"[pd-transfer] WARNING {msg}; recorded as a failure, not a number")
+        return {"ts": ts, "error": msg}
+    prefill = None
+    if prefill_url:
+        try:
+            prefill = scrape_counter_series(prefill_url, PD_PREFILL_SERIES, timeout=timeout)
+        except Exception as exc:
+            print(f"[pd-transfer] prefill /metrics scrape {stage} failed ({prefill_url}): {exc}; "
+                  "expiry counter recorded as absent")
+    return {"ts": ts, "decode": decode, "prefill": prefill}
+
+
+def build_pd_transfer_record(
+    start: Dict[str, Any], end: Dict[str, Any], results: List[Dict[str, Any]],
+    urls: Tuple[str, Optional[str]],
+) -> Dict[str, Any]:
+    """The window's ``pd_transfer`` block from the two scrapes and the results
+    rows. Served rows are the rows without ``error`` (the Batch 1 rule: every
+    2xx the proxy answered carried a ticket); ``prompt_tokens_sum`` is None
+    unless every served row carries an integer ``prompt_tokens``."""
+    from src.monitoring.vllm_telemetry import pd_transfer_record
+
+    decode_url, prefill_url = urls
+    served = [row for row in results if not row.get("error")]
+    tokens = [row.get("prompt_tokens") for row in served]
+    prompt_tokens_sum = (
+        sum(tokens) if served and all(isinstance(t, int) and not isinstance(t, bool) for t in tokens)
+        else None
+    )
+    failure = start.get("error") or end.get("error")
+    if failure:
+        return {
+            "adr": "ADR-0134",
+            "decode_url": decode_url,
+            "prefill_url": prefill_url,
+            "scrape_start_ts": start.get("ts"),
+            "scrape_end_ts": end.get("ts"),
+            "n_served_rows": len(served),
+            "prompt_tokens_sum": prompt_tokens_sum,
+            "reasons": [failure],
+            "verified": False,
+        }
+    return pd_transfer_record(
+        start=start["decode"], end=end["decode"],
+        prefill_start=start.get("prefill"), prefill_end=end.get("prefill"),
+        n_served_rows=len(served), prompt_tokens_sum=prompt_tokens_sum,
+        decode_url=decode_url, prefill_url=prefill_url,
+        scrape_start_ts=start["ts"], scrape_end_ts=end["ts"],
+    )
+
+
+def enforce_pd_transfer_record(record: Dict[str, Any]) -> None:
+    """Campaign pd gate (ADR-0134): the window's decode counters must prove the
+    pull (every clause of PD_TRANSFER_GATE_CLAUSES, evaluated by
+    vllm_telemetry.pd_transfer_reasons and re-derived offline by verify_results
+    check (k)). Refuses before any window artifact is written."""
+    if record.get("verified") is True:
+        return
+    reasons = record.get("reasons") or ["no reason recorded"]
+    raise RuntimeError(
+        "CAMPAIGN PD TRANSFER: the decode's counters do not prove this window's "
+        "KV pull: " + "; ".join(str(r) for r in reasons) + " (S0F-22, ADR-0134)."
+    )
+
+
 #: T4.1 role-token grammar for CAGE_TELEMETRY_ENDPOINTS. MUST stay identical
 #: to src.monitoring.vllm_telemetry._ROLE_RE — a role accepted here must be
 #: constructible as a sampler role, and vice versa.
@@ -2021,6 +2158,20 @@ def run_experiment(
     # serving work ever starts, never burn a GPU run. None = env unset = the
     # legacy single-sampler wiring further down, untouched.
     telemetry_endpoints = resolve_telemetry_endpoints(vllm_telemetry)
+
+    # S0F-22 Batch 2 (ADR-0134): the decode role's /metrics is the window's
+    # transfer proof. Strict mode is the Batch 1 predicate (campaign cell with
+    # topology pd); a campaign pd cell without a decode endpoint cannot be
+    # verified, so it refuses HERE, before any serving work (the driver pins
+    # the pair on every pd cell; this is the runner's own guard).
+    pd_strict = campaign_session is not None and campaign_session.spec.topology == "pd"
+    pd_transfer_urls = pd_transfer_endpoints(telemetry_endpoints)
+    if pd_strict and pd_transfer_urls is None:
+        raise ValueError(
+            "CAMPAIGN PD TRANSFER: a campaign pd cell needs --vllm-telemetry and a "
+            "decode=<url> entry in CAGE_TELEMETRY_ENDPOINTS (the decode's /metrics "
+            "proves the KV pull); refusing before any serving work (S0F-22, ADR-0134)."
+        )
 
     # hf-oracle corpus-prefix preload is wired for the single/batched workload
     # modes only (the multi-turn prompt layout breaks the literal-prefix
@@ -3756,6 +3907,36 @@ def run_experiment(
             except Exception as e:
                 print(f"[telemetry] sampler not started: {e}")
 
+    # S0F-22 Batch 2 (ADR-0134): first scrape of the pd pair's transfer
+    # counters. The warm-up stages above ran synchronously and the measured
+    # stage has not started, so nothing is in flight: the lifetime counters
+    # here are the window's baseline (warm-up transfers excluded). In campaign
+    # pd mode a failed decode scrape refuses before the stage spends GPU time.
+    pd_transfer_start = (
+        scrape_pd_transfer(pd_transfer_urls, strict=pd_strict, stage="before the measured stage")
+        if pd_transfer_urls is not None else None
+    )
+
+    def _flush_partial_rows() -> None:
+        # A crash escaped the per-query guards (e.g. the server died mid-stage),
+        # or a strict pd transfer refusal after the stage (review 2026-10-01
+        # MEDIUM-1): persist whatever rows were collected so the baseline is
+        # not lost, then the caller re-raises.
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            _pp = os.path.join(output_dir, "results.partial.csv")
+            if results:
+                with open(_pp, "w", newline="") as _pf:
+                    # Union of keys across ALL rows (not row 0): quality.to_dict() drops
+                    # hallucination_detected when None, so a narrow row-0 would otherwise
+                    # make DictWriter raise mid-write and lose the partial flush too.
+                    _w = csv.DictWriter(_pf, fieldnames=list(dict.fromkeys(k for r in results for k in r)))
+                    _w.writeheader()
+                    _w.writerows(results)
+                print(f"[recovery] flushed {len(results)} partial rows -> {_pp}")
+        except Exception as _flush_exc:
+            print(f"[recovery] failed to flush partial results: {_flush_exc}")
+
     # Stage bracket on the SAME clock as the telemetry sampler's per-tick `ts`
     # (epoch seconds, time.time(), see VllmTelemetrySampler._run). Before the
     # ADR-0055 amendment of 2026-09-19 this pair WAS the campaign window; it is
@@ -3771,26 +3952,29 @@ def run_experiment(
         else:
             execute_work_units(work_units, collect_results=True, stage_name="Measured")
     except Exception:
-        # A crash escaped the per-query guards (e.g. the server died mid-stage). Persist
-        # whatever rows were already collected so the baseline is not lost, then re-raise.
-        try:
-            os.makedirs(output_dir, exist_ok=True)
-            _pp = os.path.join(output_dir, "results.partial.csv")
-            if results:
-                with open(_pp, "w", newline="") as _pf:
-                    # Union of keys across ALL rows (not row 0): quality.to_dict() drops
-                    # hallucination_detected when None, so a narrow row-0 would otherwise
-                    # make DictWriter raise mid-write and lose the partial flush too.
-                    _w = csv.DictWriter(_pf, fieldnames=list(dict.fromkeys(k for r in results for k in r)))
-                    _w.writeheader()
-                    _w.writerows(results)
-                print(f"[recovery] stage crashed; flushed {len(results)} partial rows -> {_pp}")
-        except Exception as _flush_exc:
-            print(f"[recovery] failed to flush partial results: {_flush_exc}")
+        _flush_partial_rows()
         raise
     finally:
         performance_evaluator.stop()
     stage_t_end = time.time()
+
+    # S0F-22 Batch 2 (ADR-0134): second scrape, after the last completion. The
+    # decode records a request's transfer in the engine step that precedes its
+    # first output token (nixl_connector.py:2398-2402; scheduler stats are
+    # published per output batch), so every served row's pull is in these
+    # counters. Outside the best-effort telemetry block below on purpose: a
+    # failed scrape in campaign pd mode is a refusal, not a print.
+    pd_transfer_end = None
+    if pd_transfer_urls is not None:
+        try:
+            pd_transfer_end = scrape_pd_transfer(
+                pd_transfer_urls, strict=pd_strict, stage="after the measured stage"
+            )
+        except RuntimeError:
+            # the window cost its full GPU time: keep its rows for forensics
+            # before the strict refusal propagates (review 2026-10-01 MEDIUM-1)
+            _flush_partial_rows()
+            raise
 
     if gpu_monitoring:
         gpu_tracker.stop_monitoring()
@@ -4216,6 +4400,23 @@ def run_experiment(
     # cell instead of silently skipping the gate.
     if campaign_session is not None and campaign_session.spec.topology == "pd":
         enforce_pd_transfer_tickets(results)
+    # S0F-22 Batch 2 (ADR-0134): the window's transfer proof from the two
+    # decode scrapes; in campaign pd mode the deltas must prove the pull
+    # before any artifact is written. The record itself rides metrics.json
+    # whenever a decode endpoint existed (pilot pd runs included).
+    pd_transfer_summary: Optional[Dict[str, Any]] = None
+    if pd_transfer_urls is not None and pd_transfer_start is not None and pd_transfer_end is not None:
+        pd_transfer_summary = build_pd_transfer_record(
+            pd_transfer_start, pd_transfer_end, results, pd_transfer_urls
+        )
+        if pd_strict:
+            enforce_pd_transfer_record(pd_transfer_summary)
+        print(
+            "[pd-transfer] "
+            + ("VERIFIED" if pd_transfer_summary.get("verified") else "NOT VERIFIED")
+            + f": {pd_transfer_summary.get('n_served_rows')} served row(s), delta "
+            + json.dumps(pd_transfer_summary.get("delta"), sort_keys=True)
+        )
 
     git_metadata = capture_git_metadata()
     backend_metadata = capture_backend_metadata(
@@ -4432,6 +4633,12 @@ def run_experiment(
     # quiescence probe, verified flag). Absent when no reset ran.
     if cold_start is not None:
         experiment_summary["cold_start"] = dict(cold_start)
+    # S0F-22 Batch 2 (ADR-0134): the per-window pd transfer proof. Present only
+    # when a decode telemetry endpoint existed (every campaign pd cell), so
+    # every other metrics.json schema stays byte-identical; verify_results
+    # check (k) re-derives its verdict from the recorded deltas.
+    if pd_transfer_summary is not None:
+        experiment_summary["pd_transfer"] = pd_transfer_summary
 
     write_json_atomic(metrics_file, experiment_summary)
     write_json_atomic(stable_metrics_file, experiment_summary)

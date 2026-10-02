@@ -183,8 +183,24 @@ rides the decode request and the `x-kv-transfer-params` response header verbatim
 campaign mode every row the proxy answered (no `error`) must carry it (the runner's pd
 gate keys on the cell topology; refused, timed-out and dropped rows are skipped). A pd cell carries `--vllm-telemetry` and the two role endpoints, the
 proxy relays `GET /v1/models` and `/version` from the decode, and the launcher's
-readiness probes fail on an HTTP error. The per-window transfer proof (the decode's
-`vllm:nixl_bytes_transferred` delta) and checklist rows RC-13/RC-14 are Batch 2.
+readiness probes fail on an HTTP error.
+
+Per-window transfer proof (ADR-0134, S0F-22, Batch 2): on every run with a `decode=`
+telemetry endpoint the runner scrapes the decode's `/metrics` twice, before the first
+measured send and after the last completion, and writes the deltas to
+`metrics.json["pd_transfer"]`: `vllm:nixl_bytes_transferred` `_sum` and `_count`, the two
+NIXL failure counters, the three `vllm:prompt_tokens_by_source_total` sources,
+`vllm:prompt_tokens_recomputed_total`, `vllm:num_preemptions_total`, plus the prefill's
+`vllm:nixl_num_kv_expired_reqs_total`. In campaign mode a pd window is refused unless
+the deltas prove the pull: zero failed transfers and notifications, bytes moved, at
+least one transfer per served row, external KV tokens attributed (a failed decode scrape
+refuses too, before the stage spends GPU time). The record also carries the per-request
+identities (`local_compute == served`, `recomputed == served`, `external + cache_hit ==
+prompt tokens`, no preemptions) as recorded verdicts, never as gate clauses: pressure
+windows preempt by design. `verify_results` check (k) re-derives the verdict offline
+with the same rule, refuses a pd window without the record and any non-pd window with
+one, and warns when the prefill's expiry counter moved inside the window. The live proof of the rule is checklist rows RC-13 (counter deltas and a
+negative control straight to the decode) and RC-14 (CAGE proxy against vLLM's toy proxy).
 
 Gate (j) parsers (ADR-0130, S0F-9/S0F-14): a budgeted vLLM 0.19.1 start prints no
 `Available KV cache memory` line; the bytes channel is the `gpu_worker.py` line
