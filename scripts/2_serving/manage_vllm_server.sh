@@ -422,6 +422,11 @@ PYEOF
     # is the belt-and-suspenders backstop for any un-prefetched model.
     export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-30}"
 
+    # S0F-24 (ADR-0142): a capture record never outlives the start it
+    # described. Removed before this start spawns, so a failed capture leaves
+    # gate (j) on the log fallback, never on an earlier start's record.
+    rm -f "$LOG_DIR/CURRENT.kvpool.json" "$LOG_DIR/CURRENT.pd.kvpool.json"
+
     echo "Starting vLLM server (logging to $log_file)..."
     nohup vllm serve "$model" "${vllm_args[@]}" > "$log_file" 2>&1 &
 
@@ -442,6 +447,9 @@ PYEOF
             if [ "$loaded" = "$model" ]; then
                 echo -e "${GREEN}✓ Server ready with model: $model${NC}"
                 echo "  View logs: tail -f $log_file"
+                # S0F-24 (ADR-0142): record the realized KV pool for gate (j);
+                # the serving-config JSON (CAGE_RUN_ROOT only) gets it too.
+                cage_kv_pool_capture --engine vllm --log "$log_file" --out "$LOG_DIR/CURRENT.kvpool.json" ${cfg_file:+--merge-into "$cfg_file"}
                 return 0
             fi
         fi
@@ -495,6 +503,9 @@ stop_server() {
 
     # The daemon is down: clear its pidfile so a stale PID can never be trusted later.
     rm -f "$PID_FILE"
+    # S0F-24: no running engine, no current KV pool record (the pd pair shares
+    # this log dir and the sweep above kills every vllm serve, so both go).
+    rm -f "$LOG_DIR/CURRENT.kvpool.json" "$LOG_DIR/CURRENT.pd.kvpool.json"
 
     local gpu_mem
     gpu_mem=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null || true)

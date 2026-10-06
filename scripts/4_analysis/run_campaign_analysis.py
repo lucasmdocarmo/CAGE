@@ -70,7 +70,8 @@ Pipeline per run:
    registered margin, the policy/none cell pair, and the S2 ``policy_event``
    mask exist — and listed as labeled skips otherwise.
 6. Emit ``<run>/analysis/<timestamp>/{stats.json, summary.md,
-   forest_<metric>.png, wlt_<metric>.png,
+   forest_<metric>.png (or forest_<metric>__vs_<baseline>__<engine>[__<topology>][__<model>].png
+   per reference when several references render; S0F-29), wlt_<metric>.png,
    wlt_<metric>_pooled_supplementary.png}`` — plus, when the #14 executor
    evaluated goodput windows, the ADDITIVE T6.2 charter-S1 ladder artifact
    ``yield_ladder.{json,md}`` (``yield_ladder.py``: Y with raw throughput,
@@ -1716,6 +1717,54 @@ def _baseline_of_key(index: pd.DataFrame, row_key: str) -> str:
     return str(values[0]) if len(values) else row_key
 
 
+def _forest_file_names(
+    metric: str, labels: Mapping[str, str]
+) -> dict[str, tuple[str, str]]:
+    """reference row key -> (file name, title label) of a multi-reference
+    render (S0F-29, ADR-0141).
+
+    Before 2026-10-06 the name carried the reference's baseline label only
+    (``forest_<metric>__vs_<baseline>.png``), so two references sharing a
+    baseline on two engines overwrote each other: the S0 analysis
+    (results/s0/a/s0-20260930/analysis/20260930-201710/stats.json) recorded
+    two ``forest_ttft_ms__vs_B2.png`` figures, the vLLM and the SGLang B2
+    references of contrast #1, and kept one file. The pair selector matches
+    on engine, model, topology and policy (``_PAIR_MATCH_AXES``; policy is
+    ``none`` on every F1 cell, ``CellSpec``), so those are the axes two
+    references of one baseline can differ on. The engine of the reference row
+    key (``figure_pipeline.parse_row_key``, which fails loud on a key that is
+    not a CellSpec) is part of every multi-reference name; the topology joins
+    it when the references span more than one topology (the review of
+    2026-10-06 found ``single`` and ``pd`` B2 references colliding), and the
+    model when they span more than one model. Two references that still map
+    to one name refuse the render instead of overwriting a file.
+    """
+    axes = {key: fp.parse_row_key(key) for key in labels}
+    topologies = {str(a["topology"]) for a in axes.values()}
+    models = {str(a["model"]) for a in axes.values()}
+    names: dict[str, tuple[str, str]] = {}
+    for key, label in labels.items():
+        parts = [str(axes[key]["engine"])]
+        if len(topologies) > 1:
+            parts.append(str(axes[key]["topology"]))
+        if len(models) > 1:
+            parts.append(str(axes[key]["model"]))
+        names[key] = (
+            f"forest_{metric}__vs_{'__'.join([label, *parts])}.png",
+            f"{label} ({', '.join(parts)})",
+        )
+    seen: dict[str, str] = {}
+    for key, (name, _title) in names.items():
+        if name in seen:
+            raise AnalysisError(
+                f"forest figure name {name!r} would be written for two "
+                f"references ({seen[name]!r} and {key!r}); refusing to "
+                "overwrite a figure (S0F-29)"
+            )
+        seen[name] = key
+    return names
+
+
 def _figure_rows_for_metric(
     contrast_entries: Sequence[Mapping[str, Any]], metric: str
 ) -> list[fp.ContrastStatRow]:
@@ -1810,7 +1859,9 @@ def render_figures(
     stats.json) — never per-query data: wlt_<metric>.png renders the
     per-dataset §8.13 triples as small multiples (the §9.1 co-primary view),
     wlt_<metric>_pooled_supplementary.png is the disclosed pooled extra, and
-    forest_<metric>[__vs_<ref>].png renders one forest per reference. Metrics
+    forest_<metric>.png (one reference) or
+    forest_<metric>__vs_<baseline>__<engine>[__<topology>][__<model>].png
+    (several references; S0F-29) renders one forest per reference. Metrics
     with nothing renderable become COUNTED skip entries in the returned list
     instead of silent omissions (audit I11). Every returned record embeds the
     consumed statistics for the figures-agree-with-stats regression seam.
@@ -1865,17 +1916,30 @@ def render_figures(
         for row in rows:
             by_reference.setdefault(row.reference_row_key, []).append(row)
         multi_reference = len(by_reference) > 1
+        # S0F-29: a multi-reference render names each file by the reference's
+        # baseline AND the pair-match axes it can differ on (engine always;
+        # topology and model when the references span them), and refuses a
+        # name two references share, so a sibling is never overwritten.
+        names = (
+            _forest_file_names(
+                metric,
+                {key: _baseline_of_key(index, key) for key in by_reference},
+            )
+            if multi_reference
+            else {}
+        )
         for reference_key, ref_rows in by_reference.items():
             ref_label = _baseline_of_key(index, reference_key)
             if multi_reference:
-                name = f"forest_{metric}__vs_{ref_label}.png"
+                name, title_ref = names[reference_key]
             else:
                 name = f"forest_{metric}.png"
+                title_ref = ref_label
             forest_path = out_dir / name
             fp.plot_forest_registered(
                 ref_rows,
                 forest_path,
-                title=f"[{stamp}] paired Δ{metric} vs {ref_label} "
+                title=f"[{stamp}] paired Δ{metric} vs {title_ref} "
                 "(registered statistics)",
             )
             figures.append(

@@ -104,6 +104,17 @@ there is a single instance): the Option-A uniform operating point, mirroring
 scripts/lib/_serving_config.sh (VLLM_GPU_MEMORY_UTILIZATION default).
 """
 
+MEM_UTIL_DEFAULTED_ENV = "CAGE_VLLM_MEM_UTIL_DEFAULTED"
+"""S0F-21 (ADR-0141): scripts/lib/_serving_config.sh exports this marker as "1"
+exactly when it set VLLM_GPU_MEMORY_UTILIZATION to its 0.90 default itself.
+The pilot entry points source that library before this manager runs
+(cloud_run.sh, then run_baselines.sh), so without the marker the shared-GPU
+rule read the library's default as an explicit 0.90 and refused the pilot's
+three-replica family on one GPU (found 2026-09-30 by the S0F-19 verifier).
+resolve_gpu_share treats the pair marker "1" plus the value spelled exactly
+as the library spells it ("0.90") as unset; any other value is the operator's.
+"""
+
 
 class GpuShareError(ValueError):
     """Typed refusal for the shared-GPU rule: malformed or overlapping replica
@@ -117,7 +128,9 @@ class GpuShareDecision:
 
     mode:        "shared" (some instance has no distinct pin) or "distinct".
     mem_util:    the --gpu-memory-utilization string handed to EVERY instance.
-    source:      "default" (SHARED_GPU_MEM_UTIL / DISTINCT_GPU_MEM_UTIL) or
+    source:      "default" (SHARED_GPU_MEM_UTIL / DISTINCT_GPU_MEM_UTIL),
+                 "default (...; S0F-21)" when the env carried the serving
+                 library's own marked default, which counts as unset, or
                  "explicit" (VLLM_GPU_MEMORY_UTILIZATION honored).
     replica_gpus: per-replica CUDA_VISIBLE_DEVICES value, None = unpinned.
     """
@@ -218,14 +231,31 @@ def resolve_gpu_share(
     Default: SHARED_GPU_MEM_UTIL when shared, DISTINCT_GPU_MEM_UTIL otherwise.
     Override: VLLM_GPU_MEMORY_UTILIZATION (non-empty) is honored, except that
     a shared value above SHARED_GPU_MEM_UTIL_CEILING is refused with the fix.
+    S0F-21 (ADR-0141): the serving library's own marked default (the marker
+    MEM_UTIL_DEFAULTED_ENV == "1" beside the value "0.90" as the library
+    spells it) counts as unset on both paths, and the source says so.
     """
     shared = replica_count > 1 and any(g is None for g in replica_gpus)
     mode = "shared" if shared else "distinct"
     # Empty is unset (the bash launcher cannot tell the two apart either).
     raw = (env.get("VLLM_GPU_MEMORY_UTILIZATION") or "").strip()
-    if not raw:
+    lib_defaulted = (
+        (env.get(MEM_UTIL_DEFAULTED_ENV) or "").strip() == "1"
+        and raw == f"{DISTINCT_GPU_MEM_UTIL:.2f}"
+    )
+    if not raw or lib_defaulted:
         default = SHARED_GPU_MEM_UTIL if shared else DISTINCT_GPU_MEM_UTIL
-        return GpuShareDecision(mode, f"{default:.2f}", "default", tuple(replica_gpus))
+        # The marker survives the shell: an explicit `export ...=0.90` typed
+        # AFTER the library was sourced in the same shell reads as the
+        # library default too (review 2026-10-06, MEDIUM); the source string
+        # names the way out, and the state file records it.
+        source = (
+            f"default (the serving library's marked {raw} default counts as "
+            f"unset; unset {MEM_UTIL_DEFAULTED_ENV} to force an explicit "
+            f"{raw}; S0F-21)"
+            if lib_defaulted else "default"
+        )
+        return GpuShareDecision(mode, f"{default:.2f}", source, tuple(replica_gpus))
     value = _parse_mem_util(raw)
     if shared and value > SHARED_GPU_MEM_UTIL_CEILING:
         raise GpuShareError(

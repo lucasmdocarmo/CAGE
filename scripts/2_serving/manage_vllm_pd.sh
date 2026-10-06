@@ -541,6 +541,9 @@ capture_role_config() {
     # discipline carried from manage_vllm_server.sh). Skipped silently when
     # CAGE_RUN_ROOT is unset; never fatal to startup.
     local role="$1" model="$2" port="$3" kv_cfg="$4" budget="$5" args_line="$6" prefix="$7" nixl_port="$8"
+    # S0F-24: the file this call wrote (empty when skipped), for the KV pool
+    # capture at ready time to merge into.
+    PD_LAST_CFG_FILE=""
     [ -n "${CAGE_RUN_ROOT:-}" ] || return 0
     local cuda_pin=""
     if [ "$role" = prefill ]; then cuda_pin="$PD_PREFILL_CUDA"; else cuda_pin="$PD_DECODE_CUDA"; fi
@@ -617,6 +620,7 @@ with open(os.environ["SC_FILE"], "w", encoding="utf-8") as fh:
     fh.write("\n")
 PYEOF
     echo "  Serving config captured: $cfg_file"
+    PD_LAST_CFG_FILE="$cfg_file"
 }
 
 launch_role_instance() {
@@ -684,6 +688,7 @@ start_stack() {
     echo "Server args [prefill]: vllm serve $model ${prefill_args[*]}"
     capture_role_config prefill "$model" "$PREFILL_PORT" "$PREFILL_KV_TRANSFER_CONFIG" \
         "$CAGE_KV_BUDGET_BYTES_PREFILL" "vllm serve $model ${prefill_args[*]}" "$want_prefix_cache" "$NIXL_PORT_PREFILL"
+    local prefill_cfg="$PD_LAST_CFG_FILE"
     echo "Starting prefill instance (logging to $prefill_log)..."
     launch_role_instance "$PD_PREFILL_CUDA" "$NIXL_PORT_PREFILL" "$prefill_log" "$PREFILL_PID_FILE" "$model" "${prefill_args[@]}"
     echo "Prefill PID: $(cat "$PREFILL_PID_FILE") (pidfile: $PREFILL_PID_FILE)"
@@ -694,6 +699,7 @@ start_stack() {
     echo "Server args [decode]: vllm serve $model ${decode_args[*]}"
     capture_role_config decode "$model" "$DECODE_PORT" "$DECODE_KV_TRANSFER_CONFIG" \
         "$CAGE_KV_BUDGET_BYTES_DECODE" "vllm serve $model ${decode_args[*]}" "$want_prefix_cache" "$NIXL_PORT_DECODE"
+    local decode_cfg="$PD_LAST_CFG_FILE"
     echo "Starting decode instance (logging to $decode_log)..."
     launch_role_instance "$PD_DECODE_CUDA" "$NIXL_PORT_DECODE" "$decode_log" "$DECODE_PID_FILE" "$model" "${decode_args[@]}"
     echo "Decode PID: $(cat "$DECODE_PID_FILE") (pidfile: $DECODE_PID_FILE)"
@@ -703,6 +709,9 @@ start_stack() {
     # a proxy over a half-up pair must never report ready).
     local max_wait="${VLLM_START_TIMEOUT:-300}"
     wait_for_roles "$max_wait" "$prefill_log" "$decode_log" || return 1
+    # S0F-24 (ADR-0142): one record with both role pools for gate (j); the
+    # per-role serving-config JSON files (CAGE_RUN_ROOT only) get it too.
+    cage_kv_pool_capture_pd "$LOG_DIR" "$prefill_log" "$decode_log" "$prefill_cfg" "$decode_cfg"
 
     echo "Starting pd_proxy on port $PROXY_PORT (logging to $proxy_log)..."
     nohup python3 "$SCRIPT_DIR/pd_proxy.py" \
@@ -759,6 +768,9 @@ stop_stack() {
             *) [ -n "$cmd" ] && echo "  (left non-vLLM GPU process $p alive: ${cmd:0:60})" ;;
         esac
     done
+    # S0F-24: no running engine, no current KV pool record (every vllm serve
+    # on the host was swept above, so the single-instance record goes too).
+    rm -f "$LOG_DIR/CURRENT.kvpool.json" "$LOG_DIR/CURRENT.pd.kvpool.json"
 
     echo -e "${GREEN}✓ P/D stack stopped${NC}"
 }

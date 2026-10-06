@@ -346,6 +346,28 @@ def test_start_refuses_shared_0_90_before_touching_any_process(
     assert not mc.STATE_FILE.exists()
 
 
+def test_start_shared_with_the_lib_defaulted_0_90_serves_0_45(
+    wired: _Launches, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """S0F-21 (ADR-0141): scripts/lib/_serving_config.sh exports 0.90 plus the
+    marker CAGE_VLLM_MEM_UTIL_DEFAULTED=1 when nothing was set; the manager
+    must read that pair as "unset" and serve the shared default, where the
+    pre-fix code refused the launch as an explicit 0.90 above the ceiling."""
+    monkeypatch.setenv("VLLM_GPU_MEMORY_UTILIZATION", "0.90")
+    monkeypatch.setenv(mc.MEM_UTIL_DEFAULTED_ENV, "1")
+    _start(3, None)
+    out = capsys.readouterr().out
+    assert "[cage] gpu-share decision: shared" in out
+    assert "S0F-21" in out
+    replica_cmds = [cmd for cmd, _ in wired.calls if cmd[:2] == ["vllm", "serve"]]
+    assert len(replica_cmds) == 3
+    for cmd in replica_cmds:
+        assert cmd[cmd.index("--gpu-memory-utilization") + 1] == "0.45"
+    state = mc.load_state()
+    assert state["gpu_share"]["mem_util"] == "0.45"
+    assert "S0F-21" in state["gpu_share"]["source"]
+
+
 def test_start_refuses_pin_count_mismatch_before_anything(wired: _Launches) -> None:
     with pytest.raises(mc.GpuShareError):
         _start(3, "0,1")

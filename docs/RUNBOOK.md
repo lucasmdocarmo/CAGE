@@ -248,6 +248,18 @@ one replica file). Unpinned discovery skips 0-byte logs with a `[note]`, and the
 suite writes its fake-engine start logs under a tmp `CAGE_LOG_ROOT` instead of the repo
 (S0F-23, 2026-10-01); pinning with `CAGE_ISO_BYTES_LOGS` stays the exact path.
 
+Launcher capture (ADR-0142, S0F-24): every engine launcher records its realized pool at
+its ready line with `scripts/checks/kv_pool_log.py capture` (the gate's own parser) as
+`CURRENT.kvpool.json` under its log directory (`logs/<engine>/`; the pd pair writes
+`CURRENT.pd.kvpool.json` with both roles) and removes it on `stop`, so a current record
+means a running engine. Gate (j) reads that record before any mtime discovery and prints
+`capture=<file> captured=<utc> log=<log>`; a pin still wins, and the newest-log fallback
+only runs when no record exists. A corrupt record fails the gate naming the file. Under
+`CAGE_RUN_ROOT` the realized pool is also merged into the serving-config JSON
+(`kv_pool_bytes_realized`, `kv_pool_tokens_realized`, `kv_pool_evidence`). A failed
+capture never blocks a start; the launcher prints a warning. The pilot cluster manager
+writes no record (its replica logs stay on the fallback path).
+
 Cold windows (ADR-0131, S0F-10): LMDeploy has no cache-reset route, so an LMDeploy
 prefix-ON window gets its cold start from an engine restart before the window; the
 campaign runner refuses a cache reset on an engine without a flush endpoint instead of
@@ -576,7 +588,8 @@ manually, and only then uses `--force` — a user decision, reported as such.
 | `CAGE_RUN_ROOT` / `CAGE_RUN_ID` / `CAGE_PHASE` | run scripts, observability | Minted by `cloud_run.sh`/`run_full_sweep.sh` (`mint_run_id`: `<YYYY-MM-DD_HHMMSS>_<model-slug>_<Q>x<T>_<4hex>_<dataset>`) and exported so every child writes the SAME `results/<phase>/<run-id>/` tree. Export `CAGE_RUN_ID` to resume into an existing tree. |
 | `CAGE_PREFLIGHT_BACKENDS` | `preflight_check.sh` gates (j)/(k) | Comma-separated adapter list to check (default `vllm,sglang,lmdeploy`). Scope down for single-engine pods. |
 | `CAGE_ISO_BYTES_TOL` | gate (j) | Relative tolerance for §6.5 realized-KV iso-bytes parity (default `0.05`; must be a float in (0,1) or the gate FAILS). |
-| `CAGE_ISO_BYTES_LOGS` | gate (j) | Pin exact engine startup logs: `vllm=/path/a.log,sglang=/path/b.log,lmdeploy=/path/c.log` (e.g. one budget point of a pressure sweep). Unpinned discovery takes the newest NON-EMPTY log per engine and prints a `[note]` for every 0-byte file it stepped over (S0F-23). |
+| `CAGE_ISO_BYTES_LOGS` | gate (j) | Pin exact engine startup logs: `vllm=/path/a.log,sglang=/path/b.log,lmdeploy=/path/c.log` (e.g. one budget point of a pressure sweep). A pin beats the launcher's `CURRENT.kvpool.json` record (ADR-0142); unpinned, the record beats discovery; discovery takes the newest NON-EMPTY log per engine and prints a `[note]` for every 0-byte file it stepped over (S0F-23). |
+| `CAGE_KV_POOL_CAPTURE_RETRIES` / `CAGE_KV_POOL_CAPTURE_INTERVAL` | `scripts/lib/_serving_config.sh` (`cage_kv_pool_capture`) | ADR-0142 (S0F-24): how long a launcher waits at its ready line for a pool line the engine is still writing (defaults 10 retries x 1 s). The S0F-24 launcher tests set 0 per call. A failed capture removes any earlier record, so a stale one never reaches the gate. |
 | `CAGE_LOG_ROOT` | the four `scripts/2_serving/manage_*.sh` launchers; gate (j) discovery | Redirects the launchers' log root (default `<repo>/logs`; the engine subdirectory stays). A test and dev knob (S0F-23): `tests/conftest.py` points it at a tmp dir so the suite's fake-engine starts leave no 0-byte logs in the repo. Leave it UNSET on a pod: `collect_logs.sh` and the backup mirror read `<repo>/logs`. Gate (j) looks there when `CAGE_ISO_BYTES_LOG_ROOT` is unset. |
 | `CAGE_REGIME_KV_METRIC` | gate (o) | Name of the engine's KV occupancy gauge on `/metrics`. Default `vllm:kv_cache_usage_perc`, the vLLM 0.19.1 spelling that cage-stats reads (S0F-8; S0 had to export it by hand); set `vllm:gpu_cache_usage_perc` for a pre-rename engine. |
 | `CAGE_QUALITY_STRICT` | `src/evaluation/quality.py`, gate (e) | Unset/`1` = strict fail-closed quality layer (default). An explicit falsy (`0`/`false`/`no`) downgrades instrument failures to `score=None` for the whole run — preflight FAILS on it; forbidden for confirmatory runs. |

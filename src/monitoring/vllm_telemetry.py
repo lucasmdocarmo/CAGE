@@ -14,6 +14,11 @@ Resolution order (so CAGE never hard-fails if cage-stats isn't present):
   3. graceful skip -> returns None
 Set CAGE_STATS_HOME to the cage-stats repo path to enable the in-process path without
 installing it.
+
+The per-GPU utilization and power record (``gpu`` in every series sample) is read
+by the sampler itself through NVML (S0F-30, ADR-0141): the headless cage-stats API
+returns that field at its dataclass default and only its terminal dashboard samples
+a GPU provider.
 """
 
 from __future__ import annotations
@@ -197,21 +202,20 @@ class VllmTelemetrySampler:
         self._nvml_handles: Optional[list] = None  # index-aligned; None slot = bad handle
         self._nvml_failed = False
 
-    def _read_energy_mj(self) -> "tuple[Optional[float], Optional[list]]":
-        """Cumulative GPU energy (mJ) via NVML: (sum over ALL GPUs, per-GPU list).
+    #: S0F-30 (ADR-0141): the ``source`` of the ``gpu`` sub-record the sampler
+    #: writes itself; the field names are cage-stats' ``GpuSnapshot`` and
+    #: ``GpuSample`` names (cage_stats/metrics/state.py), the shape the panel
+    #: renderer (scripts/4_analysis/render_window_panels.py) reads.
+    GPU_RECORD_SOURCE = "nvml"
 
-        Reads ``pynvml.nvmlDeviceGetTotalEnergyConsumption`` (mJ since driver
-        load) for EVERY ``nvmlDeviceGetCount()`` device once per sampler tick.
-        Under tensor parallelism the model spans N GPUs, so the historical
-        index-0-only read under-counted energy by 1/N: the first element — the
-        value the existing ``energy_mj`` snapshot field now carries — is the
-        SUM across all devices (the TP-correct total), and the second is the
-        per-GPU breakdown, index-aligned with NVML device indices (None for a
-        device whose read failed this tick). One bad handle must not zero the
-        rest: each device is guarded individually and the sum spans whichever
-        devices answered (the list records which). ImportError (pynvml absent)
-        or nvmlInit/count failure permanently disables the probe for this
-        sampler -> (None, None), never a fabricated number.
+    def _nvml(self) -> "tuple[Optional[object], Optional[list]]":
+        """(pynvml module, index-aligned device handles), opened once per
+        sampler, or (None, None) when NVML is unavailable.
+
+        Shared by the energy read and the GPU record (S0F-30): ImportError
+        (pynvml absent) or nvmlInit/count failure permanently disables both
+        probes for this sampler, never a fabricated number; a device whose
+        handle fails is a None slot so one bad handle cannot hide the rest.
         """
         if self._nvml_failed:
             return (None, None)
@@ -234,10 +238,109 @@ class VllmTelemetrySampler:
                 except Exception:
                     handles.append(None)
             self._nvml_handles = handles
-        if not self._nvml_handles:
-            return (None, None)  # zero devices: absence stays absence
+        return (pynvml, self._nvml_handles)
+
+    def _read_gpu_record(self) -> Optional[dict]:
+        """One ``gpu`` sub-record from NVML, or None when no device answered.
+
+        Why the sampler reads it (S0F-30, ADR-0141): the headless cage-stats
+        API (``cage_stats.api.fetch_snapshot``) returns the engine's derived
+        snapshot with the ``gpu`` field at its dataclass default; only the
+        terminal dashboard builds and samples a ``GpuProvider``. Every one of
+        the 481 S0 samples therefore carried ``{"available": false, "source":
+        "none", "gpus": [], "error": null}`` and no window had a per-second
+        GPU utilization or power series. The energy read in the same process
+        proved NVML reachable there, so the record comes from the same
+        handles.
+
+        Per device: ``index``, ``name``, ``util_gpu`` (percent),
+        ``mem_used``/``mem_total`` (bytes), ``temp_c``, ``power_w`` and
+        ``power_limit_w`` (watts; NVML reports milliwatts). Every read is
+        guarded on its own: a field that did not answer is None, never a
+        zero. A device "answered" when its utilization or its memory read
+        succeeded; when no device answered the caller leaves the snapshot's
+        record as received (absence stays absence). The devices are the
+        sampler host's, like the energy read: a sampler polling a remote
+        URL records its own host's GPUs [A, single-host campaign shapes].
+        """
+        pynvml, handles = self._nvml()
+        if pynvml is None or not handles:
+            return None
+        devices: list = []
+        answered = False
+        for index, handle in enumerate(handles):
+            dev: dict = {
+                "index": index, "name": None, "util_gpu": None,
+                "mem_used": None, "mem_total": None, "temp_c": None,
+                "power_w": None, "power_limit_w": None,
+            }
+            if handle is None:
+                devices.append(dev)
+                continue
+            try:
+                name = pynvml.nvmlDeviceGetName(handle)
+                dev["name"] = name.decode() if isinstance(name, bytes) else str(name)
+            except Exception:
+                pass
+            try:
+                dev["util_gpu"] = float(pynvml.nvmlDeviceGetUtilizationRates(handle).gpu)
+                answered = True
+            except Exception:
+                pass
+            try:
+                mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                dev["mem_used"] = int(mem.used)
+                dev["mem_total"] = int(mem.total)
+                answered = True
+            except Exception:
+                pass
+            try:
+                dev["temp_c"] = float(
+                    pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+                )
+            except Exception:
+                pass
+            try:
+                dev["power_w"] = float(pynvml.nvmlDeviceGetPowerUsage(handle)) / 1000.0
+            except Exception:
+                pass
+            try:
+                dev["power_limit_w"] = float(
+                    pynvml.nvmlDeviceGetEnforcedPowerLimit(handle)
+                ) / 1000.0
+            except Exception:
+                pass
+            devices.append(dev)
+        if not answered:
+            return None
+        return {
+            "available": True,
+            "source": self.GPU_RECORD_SOURCE,
+            "gpus": devices,
+            "error": None,
+        }
+
+    def _read_energy_mj(self) -> "tuple[Optional[float], Optional[list]]":
+        """Cumulative GPU energy (mJ) via NVML: (sum over ALL GPUs, per-GPU list).
+
+        Reads ``pynvml.nvmlDeviceGetTotalEnergyConsumption`` (mJ since driver
+        load) for EVERY ``nvmlDeviceGetCount()`` device once per sampler tick.
+        Under tensor parallelism the model spans N GPUs, so the historical
+        index-0-only read under-counted energy by 1/N: the first element, the
+        value the existing ``energy_mj`` snapshot field now carries, is the
+        SUM across all devices (the TP-correct total), and the second is the
+        per-GPU breakdown, index-aligned with NVML device indices (None for a
+        device whose read failed this tick). One bad handle must not zero the
+        rest: each device is guarded individually and the sum spans whichever
+        devices answered (the list records which). ImportError (pynvml absent)
+        or nvmlInit/count failure permanently disables the probe for this
+        sampler -> (None, None), never a fabricated number (``_nvml``).
+        """
+        pynvml, handles = self._nvml()
+        if pynvml is None or not handles:
+            return (None, None)  # NVML unavailable or zero devices: absence stays absence
         per_gpu: list = []
-        for handle in self._nvml_handles:
+        for handle in handles:
             if handle is None:
                 per_gpu.append(None)
                 continue
@@ -274,6 +377,16 @@ class VllmTelemetrySampler:
                     total_mj, per_gpu_mj = self._read_energy_mj()
                     snap["energy_mj"] = total_mj
                     snap["energy_mj_per_gpu"] = per_gpu_mj
+                    # S0F-30: the per-GPU utilization and power record, read
+                    # here because the headless cage-stats API never samples
+                    # one. A record the snapshot already carries as available
+                    # is kept (a future cage-stats that samples its provider
+                    # owns it); an unanswered read leaves the record as is.
+                    received = snap.get("gpu")
+                    if not (isinstance(received, dict) and received.get("available") is True):
+                        gpu_record = self._read_gpu_record()
+                        if gpu_record is not None:
+                            snap["gpu"] = gpu_record
                     self._samples.append(snap)
                     self._sample_ts.append(t0)
             except Exception as e:

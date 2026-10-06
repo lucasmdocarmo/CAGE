@@ -47,7 +47,19 @@
 
 export VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-0}"
 export VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-4096}"
-export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
+# S0F-21 (ADR-0141): a consumer cannot tell this library's 0.90 default from
+# an operator's explicit 0.90, and the multi-replica cluster manager must
+# refuse an explicit 0.90 on a shared GPU (backlog A1). So the library marks
+# the default it sets: CAGE_VLLM_MEM_UTIL_DEFAULTED=1 is exported only on the
+# sourcing that set the value, and a later re-source (cloud_run.sh sources
+# first, run_baselines.sh again) neither clears nor sets it. The marker is
+# read by scripts/2_serving/manage_vllm_cluster.py (resolve_gpu_share), which
+# treats the pair marker=1 plus value 0.90 as unset.
+if [ -z "${VLLM_GPU_MEMORY_UTILIZATION:-}" ]; then
+    VLLM_GPU_MEMORY_UTILIZATION="0.90"
+    export CAGE_VLLM_MEM_UTIL_DEFAULTED="1"
+fi
+export VLLM_GPU_MEMORY_UTILIZATION
 
 printf '[cage] serving config: enforce_eager=%s max_model_len=%s gpu_mem_util=%s (uniform across trees; mem-util is the swept axis)\n' \
   "$VLLM_ENFORCE_EAGER" "$VLLM_MAX_MODEL_LEN" "$VLLM_GPU_MEMORY_UTILIZATION"
@@ -235,4 +247,48 @@ cage_validate_sglang_tp_env() {
         cage_require_positive_int CAGE_SGLANG_TP "${CAGE_SGLANG_TP}" || return 1
     fi
     return 0
+}
+
+# =============================================================================
+# Realized KV pool capture at ready time  (S0F-24, ADR-0142)
+# =============================================================================
+# Each launcher calls cage_kv_pool_capture at its ready line. The module
+# scripts/checks/kv_pool_log.py parses the start log with gate (j)'s own rules
+# (ADR-0130 tail rule included), writes CURRENT.kvpool.json under the engine's
+# log directory (one atomic record: engine, log, bytes, tokens, evidence,
+# starts, captured_utc) and merges the realized pool into the serving-config
+# JSON when the launcher wrote one. Gate (j) reads that record before any
+# mtime discovery, so a stale or multi-start log can no longer be picked by
+# accident. Never fatal to a start: a failed capture prints a warning and the
+# gate falls back to the log as before. `stop` removes the record, so a
+# current record always means a running engine.
+# CAGE_KV_POOL_CAPTURE_RETRIES / CAGE_KV_POOL_CAPTURE_INTERVAL bound the wait
+# for a pool line the engine is still writing (defaults 10 x 1 s).
+cage_kv_pool_capture() {
+    local module rc=0
+    module="$(cd "$(dirname "${BASH_SOURCE[0]}")/../checks" && pwd)/kv_pool_log.py"
+    python3 "$module" capture "$@" \
+        --retries "${CAGE_KV_POOL_CAPTURE_RETRIES:-10}" \
+        --interval "${CAGE_KV_POOL_CAPTURE_INTERVAL:-1}" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "  [warn] KV pool capture failed (exit $rc); gate (j) falls back to the start log (S0F-24)" >&2
+    fi
+    return 0
+}
+
+# The pd pair: one record with both role pools. $1 = the vLLM log dir, $2/$3 =
+# the prefill/decode start logs, $4/$5 = the per-role serving-config JSON
+# files (empty when CAGE_RUN_ROOT is unset).
+cage_kv_pool_capture_pd() {
+    local log_dir="$1" prefill_log="$2" decode_log="$3" prefill_cfg="${4:-}" decode_cfg="${5:-}"
+    local -a extra=()
+    if [ -n "$prefill_cfg" ]; then
+        extra+=( --merge-into "prefill=$prefill_cfg" )
+    fi
+    if [ -n "$decode_cfg" ]; then
+        extra+=( --merge-into "decode=$decode_cfg" )
+    fi
+    cage_kv_pool_capture --engine vllm \
+        --role "prefill=$prefill_log" --role "decode=$decode_log" \
+        --out "$log_dir/CURRENT.pd.kvpool.json" ${extra[@]+"${extra[@]}"}
 }

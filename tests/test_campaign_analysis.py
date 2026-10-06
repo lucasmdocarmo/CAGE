@@ -83,8 +83,8 @@ REG_SHA = "deadbeefcafef00d"
 
 #: Deterministic per-baseline serving/quality offsets: B6 (RAG) pays TTFT vs
 #: B3 (CAG) on every example -> the paired Wilcoxon has an unambiguous sign.
-TTFT_OFFSET = {"B1": 200.0, "B3": 140.0, "B6": 235.0, "B11": 180.0}
-F1_OFFSET = {"B1": 0.80, "B3": 0.62, "B6": 0.71, "B11": 0.66}
+TTFT_OFFSET = {"B1": 200.0, "B2": 160.0, "B3": 140.0, "B6": 235.0, "B11": 180.0}
+F1_OFFSET = {"B1": 0.80, "B2": 0.65, "B3": 0.62, "B6": 0.71, "B11": 0.66}
 
 WINDOW_ARTIFACTS = (
     "requests.jsonl",
@@ -804,9 +804,116 @@ def test_multiple_f1_contrasts_share_reference_grouping(organized_run: Path) -> 
     assert "wlt_ttft_ms.png" in names
     assert "wlt_ttft_ms_pooled_supplementary.png" in names
     forest_names = {n for n in names if n.startswith("forest_")}
-    assert forest_names == {"forest_ttft_ms__vs_B3.png", "forest_ttft_ms__vs_B6.png"}
+    # S0F-29 (ADR-0141): a multi-reference forest name carries the reference's
+    # engine beside its baseline label (the fixture serves vLLM only).
+    assert forest_names == {
+        "forest_ttft_ms__vs_B3__vllm.png",
+        "forest_ttft_ms__vs_B6__vllm.png",
+    }
     for name in names:
         assert (analysis_dir / name).stat().st_size > 0
+
+
+def _two_engine_b2_specs() -> list[CellSpec]:
+    """Contrast #1's pair (B1 vs B2) on vLLM AND SGLang beside the default
+    vLLM cells: two references that share the baseline label B2 and differ
+    only in the engine, the S0 shape (results/s0/a/s0-20260930/analysis/
+    20260930-201710/stats.json recorded two forest_ttft_ms__vs_B2.png
+    figures and kept one file)."""
+    return [
+        CellSpec.from_baseline("B2", model=MODEL),  # type: ignore[arg-type]
+        CellSpec.from_baseline("B1", model=MODEL, engine="sglang"),  # type: ignore[arg-type]
+        CellSpec.from_baseline("B2", model=MODEL, engine="sglang"),  # type: ignore[arg-type]
+    ]
+
+
+def test_forest_names_carry_the_reference_engine_s0f29(tmp_path: Path) -> None:
+    run_dir = _build_run_tree(tmp_path, extra_specs=_two_engine_b2_specs())
+    org.organize_run(run_dir)
+    rc = rca.main([str(run_dir), "--contrasts", "1"])
+    assert rc == 0
+    analysis_dir, stats = _load_stats(run_dir)
+    # Two pairs computed, one per engine, both referencing a B2 cell.
+    refs = {e["reference_row_key"] for e in stats["contrasts"]}
+    assert len(refs) == 2
+    assert {k.split("|")[4] for k in refs} == {"vllm", "sglang"}
+    forests = [e for e in stats["figures"] if e.get("kind") == "forest"]
+    assert len(forests) == 2
+    names = {e["file"] for e in forests}
+    assert names == {
+        "forest_ttft_ms__vs_B2__vllm.png",
+        "forest_ttft_ms__vs_B2__sglang.png",
+    }
+    for entry in forests:
+        consumed_refs = {c["reference_row_key"] for c in entry["consumed"]}
+        assert len(consumed_refs) == 1
+        engine = next(iter(consumed_refs)).split("|")[4]
+        assert entry["file"].endswith(f"__{engine}.png")
+        assert (analysis_dir / entry["file"]).stat().st_size > 0
+    # Both files exist on disk: nothing overwrote its sibling.
+    assert len(list(analysis_dir.glob("forest_ttft_ms__vs_B2__*.png"))) == 2
+
+
+def test_single_reference_forest_name_is_unchanged(organized_run: Path) -> None:
+    # S0F-29 touches multi-reference renders only.
+    assert rca.main([str(organized_run)]) == 0
+    _, stats = _load_stats(organized_run)
+    forests = [e["file"] for e in stats["figures"] if e.get("kind") == "forest"]
+    assert forests == ["forest_ttft_ms.png"]
+
+
+def test_forest_names_carry_the_topology_when_references_span_it(tmp_path: Path) -> None:
+    # Review of SF-A (2026-10-06, HIGH): the pair selector matches on topology
+    # too, so one engine serving B1/B2 on `single` AND `tp` produced two B2
+    # references and one file (`pd` is the DIST-only overlay, CellSpec refuses
+    # it on F1). The topology joins the name whenever the references span
+    # more than one.
+    specs = [
+        CellSpec.from_baseline("B2", model=MODEL),  # type: ignore[arg-type]
+        CellSpec.from_baseline("B1", model=MODEL, topology="tp"),  # type: ignore[arg-type]
+        CellSpec.from_baseline("B2", model=MODEL, topology="tp"),  # type: ignore[arg-type]
+    ]
+    run_dir = _build_run_tree(tmp_path, extra_specs=specs)
+    org.organize_run(run_dir)
+    rc = rca.main([str(run_dir), "--contrasts", "1"])
+    assert rc == 0
+    analysis_dir, stats = _load_stats(run_dir)
+    forests = [e for e in stats["figures"] if e.get("kind") == "forest"]
+    names = [e["file"] for e in forests]
+    assert sorted(names) == [
+        "forest_ttft_ms__vs_B2__vllm__single.png",
+        "forest_ttft_ms__vs_B2__vllm__tp.png",
+    ]
+    assert len(set(names)) == len(names)
+    for name in names:
+        assert (analysis_dir / name).stat().st_size > 0
+
+
+def test_forest_file_names_refuse_a_shared_name() -> None:
+    # The backstop behind the axis rule: two references that still map to one
+    # name refuse the render instead of overwriting a file.
+    key = CellSpec.from_baseline("B2", model=MODEL).to_row_key()  # type: ignore[arg-type]
+    other = CellSpec.from_baseline("B2", model=MODEL, engine="sglang").to_row_key()  # type: ignore[arg-type]
+    names = rca._forest_file_names("ttft_ms", {key: "B2", other: "B2"})
+    assert names[key][0] == "forest_ttft_ms__vs_B2__vllm.png"
+    assert names[other][0] == "forest_ttft_ms__vs_B2__sglang.png"
+    assert names[key][1] == "B2 (vllm)"
+    # Two DISTINCT row keys (F1 and F3 carry B2's gold-reuse arm) with the
+    # same engine, topology and model under one label: nothing in the name
+    # separates them, so the helper refuses rather than overwrite.
+    f3 = CellSpec.from_baseline("B2", model=MODEL, family="F3").to_row_key()  # type: ignore[arg-type]
+    assert f3 != key
+    with pytest.raises(rca.AnalysisError, match="S0F-29"):
+        rca._forest_file_names("ttft_ms", {key: "B2", f3: "B2"})
+
+
+def test_figure_file_names_are_unique_in_stats(organized_run: Path) -> None:
+    # stats.json invariant (review of SF-A): every rendered figure has its own
+    # file name, so no record can describe an overwritten image.
+    assert rca.main([str(organized_run), "--contrasts", "4", "3"]) == 0
+    _, stats = _load_stats(organized_run)
+    files = [e["file"] for e in stats["figures"] if "file" in e]
+    assert len(files) == len(set(files))
 
 
 def test_figures_agree_with_stats_bit_for_bit(organized_run: Path) -> None:

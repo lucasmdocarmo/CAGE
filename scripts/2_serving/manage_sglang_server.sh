@@ -412,6 +412,10 @@ PYEOF
     # the start window (same backstop as the vLLM launcher).
     export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-30}"
 
+    # S0F-24 (ADR-0142): a capture record never outlives the start it
+    # described (removed before the spawn; see manage_vllm_server.sh).
+    rm -f "$LOG_DIR/CURRENT.kvpool.json"
+
     echo "Starting SGLang server (logging to $log_file)..."
     nohup "$SGLANG_PYTHON" -m sglang.launch_server "${sglang_args[@]}" > "$log_file" 2>&1 &
 
@@ -432,6 +436,9 @@ PYEOF
         if [ "$loaded" = "$model" ]; then
             echo -e "${GREEN}✓ Server ready with model: $model${NC}"
             echo "  View logs: tail -f $log_file"
+            # S0F-24 (ADR-0142): record the realized KV pool for gate (j);
+            # the serving-config JSON (CAGE_RUN_ROOT only) gets it too.
+            cage_kv_pool_capture --engine sglang --log "$log_file" --out "$LOG_DIR/CURRENT.kvpool.json" ${cfg_file:+--merge-into "$cfg_file"}
             return 0
         fi
         sleep 2
@@ -472,6 +479,8 @@ stop_server() {
 
     # The daemon is down: clear its pidfile so a stale PID can never be trusted.
     rm -f "$PID_FILE"
+    # S0F-24: no running engine, no current KV pool record.
+    rm -f "$LOG_DIR/CURRENT.kvpool.json"
 
     local gpu_mem
     gpu_mem=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null || true)

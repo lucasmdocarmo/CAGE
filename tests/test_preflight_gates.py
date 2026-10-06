@@ -317,7 +317,12 @@ SGLANG_START_LINE = "[2026-09-30 14:27:37] server_args=ServerArgs(model_path='Qw
 @pytest.fixture(scope="module")
 def iso() -> dict:
     ns: dict = {"__name__": "cage_iso_bytes_gate_under_test"}
-    exec(compile(_snippet("CAGE-ISO-BYTES-GATE"), "CAGE-ISO-BYTES-GATE", "exec"), ns)
+    # The heredoc resolves kv_pool_log.py from argv[2], CAGE_CHECKS_DIR or
+    # cwd/scripts/checks (S0F-24); under pytest only the env form is
+    # independent of the cwd the suite was started from.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("CAGE_CHECKS_DIR", str(REPO_ROOT / "scripts" / "checks"))
+        exec(compile(_snippet("CAGE-ISO-BYTES-GATE"), "CAGE-ISO-BYTES-GATE", "exec"), ns)
     return ns
 
 
