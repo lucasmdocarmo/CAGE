@@ -1125,7 +1125,14 @@ class ShareGPTLoader(DatasetLoader):
         return examples
 
 
-def get_loader(dataset_name: str, split: str = "validation", seed: int = 42) -> DatasetLoader:
+def get_loader(
+    dataset_name: str,
+    split: str = "validation",
+    seed: int = 42,
+    *,
+    token_counter: Optional[Any] = None,
+    token_counter_name: Optional[str] = None,
+) -> DatasetLoader:
     """Factory function to get appropriate dataset loader.
 
     "ruler" (synthetic length instrument) and "scbench" (external-validation
@@ -1134,7 +1141,20 @@ def get_loader(dataset_name: str, split: str = "validation", seed: int = 42) -> 
     classes (e.g. CAGE_RULER_CONTEXT_TOKENS, CAGE_SCBENCH_SUBSET). NOTE:
     microsoft/SCBench publishes a "test" split — pass split="test" (or set
     CAGE_SCBENCH_SPLIT) for scbench; the loader fails closed otherwise.
+
+    ``token_counter`` / ``token_counter_name`` (Batch 1 finding V1): the
+    target model's token counter for the RULER instrument, so the haystack is
+    sized in the served model's tokens (``src.data.ruler.model_token_counter``
+    builds it; the runner passes it from ``--model``). Without one the RULER
+    loader keeps its labeled whitespace proxy. Only the ruler instrument takes
+    a counter; passing one for any other dataset refuses (ValueError) instead
+    of being dropped silently.
     """
+    if token_counter is not None and dataset_name != "ruler":
+        raise ValueError(
+            f"dataset {dataset_name!r} takes no token counter; only the ruler "
+            "instrument is sized under the model tokenizer (Batch 1 V1)"
+        )
     loaders = {
         "hotpotqa": HotpotQALoader,
         "qasper": QasperLoader,
@@ -1151,7 +1171,10 @@ def get_loader(dataset_name: str, split: str = "validation", seed: int = 42) -> 
 
     if dataset_name == "ruler":
         from src.data.ruler import RulerLoader  # lazy: see docstring
-        return RulerLoader(split=split, seed=seed)
+        return RulerLoader(
+            split=split, seed=seed,
+            tokenizer=token_counter, tokenizer_name=token_counter_name,
+        )
     if dataset_name == "scbench":
         from src.data.scbench import SCBenchLoader  # lazy: see docstring
         return SCBenchLoader(split=split, seed=seed)

@@ -228,6 +228,9 @@ phase2_archive/
 /results/
 /archive/
 /evidence/
+# experiments/<S>/<date>/{run,logs,plots,extras}: the Mac-side landing of every pod run
+# (owner 2026-10-03; design MyDocs/RunPod/EXPERIMENT_PROCESS_DESIGN_2026-10-03.md). Data, never tracked.
+/experiments/
 
 # Agent/operator runtime state (scripts/ops): background-task PIDs, logs, state JSON, current zone.
 # Handles and logs, not code -- never tracked.

@@ -191,6 +191,35 @@ def messages_to_fallback_prompt(messages: Sequence[Dict[str, str]]) -> str:
     return "\n\n".join(parts) + "\nAnswer:"
 
 
+def rendered_chat_prompt_tokens(
+    tokenizer: Any,
+    messages: Sequence[Dict[str, str]],
+    *,
+    chat_template_kwargs: Dict[str, Any] | None = None,
+) -> int:
+    """Token count of ``messages`` as the serving engine renders them.
+
+    Purpose (Batch 1 finding V1): the engine applies the model's chat template
+    (system and user role tokens, the generation prompt) around the content,
+    so the request it counts against its context limit is longer than the
+    content. ``tokenizer.apply_chat_template(..., add_generation_prompt=True,
+    tokenize=True)`` renders with the same tokenizer files and template the
+    engine loads [A: that vLLM's server-side rendering counts the same tokens
+    is verified only on a pod, by comparing ``usage.prompt_tokens`` with this
+    count]; ``chat_template_kwargs`` are the engine-specific template kwargs
+    the adapter pins on every request (vLLM: ``{"enable_thinking": False}``,
+    which adds four tokens on Qwen3), so the count mirrors the served
+    request. Pure: no network, no engine.
+    """
+    ids = tokenizer.apply_chat_template(
+        list(messages),
+        add_generation_prompt=True,
+        tokenize=True,
+        **(chat_template_kwargs or {}),
+    )
+    return len(ids)
+
+
 def select_distractor_texts(
     pool_examples: Sequence[Any],
     exclude_texts: Iterable[str],

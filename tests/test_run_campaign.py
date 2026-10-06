@@ -733,7 +733,12 @@ class TestCellSteps:
             argv = s["argv"]
             if s["family"] in ("F2", "F3"):
                 assert "--workload-mode" in argv and "open_loop" in argv
-                assert "--rate" in argv and "--duration-s" in argv
+                # Batch 1 V3 (2026-10-05): the window is W arrivals (one per
+                # prepared request), never a duration; the runner's replay
+                # guard refused every duration-bound window at a real rate.
+                assert "--rate" in argv and "--arrival-count" in argv
+                assert "--duration-s" not in argv
+                assert argv[argv.index("--arrival-count") + 1] == str(s["num_queries"])
                 lam = s["lambda_star_pred_rps"]
                 frac = s["cellspec"]["rate_frac"]
                 assert s["offered_rate_rps"] == pytest.approx(lam * frac)
@@ -1365,10 +1370,11 @@ class TestRun:
         root = _run_root(tmp_path)
         assert rc.run_plan(plan, root) == 0
         calls = stub.calls()
-        # 1 relaunch (vllm plain config) + 2 cells, in plan order.
-        assert len(calls) == 3
-        assert calls[0]["argv"][0] == "restart"  # launcher stub sees its verb
-        for call, step in zip(calls[1:], _cells(plan)):
+        # V2 clean-room stop, 1 relaunch (vllm plain config), 2 cells in plan
+        # order, the V2 end-of-run stop (tests/test_stage1_v2_v3_driver.py
+        # pins the stop rule itself).
+        assert [c["argv"][0] for c in calls] == ["stop", "restart", "--baseline", "--baseline", "stop"]
+        for call, step in zip(calls[2:4], _cells(plan)):
             assert call["argv"] == step["argv"][2:] + ["--campaign-root", str(root)]
             # identity env reached the subprocess (the seam, not just the plan)
             for key, value in step["env"].items():
@@ -1380,7 +1386,7 @@ class TestRun:
         first, second = _cells(plan)
         _complete_cell(root, first)  # 3/3 windows with metrics.json present
         assert rc.run_plan(plan, root) == 0
-        cell_calls = [c for c in stub.calls() if c["argv"][0] != "restart"]
+        cell_calls = [c for c in stub.calls() if c["argv"][0] not in ("restart", "stop")]
         assert len(cell_calls) == 1
         assert "--baseline-label" in cell_calls[0]["argv"]
         label = cell_calls[0]["argv"][cell_calls[0]["argv"].index("--baseline-label") + 1]
@@ -1400,7 +1406,7 @@ class TestRun:
         # window 3: dir exists but NO metrics.json — incomplete, not counted
         (cell_dir / f"window_{first['dataset']}-03").mkdir()
         rc.run_plan(plan, root)
-        cell_calls = [c for c in stub.calls() if c["argv"][0] != "restart"]
+        cell_calls = [c for c in stub.calls() if c["argv"][0] not in ("restart", "stop")]
         assert len(cell_calls) == 2
 
     def test_force_rerun_overrides_resume(self, tmp_path, floor_table, stub):
@@ -1409,7 +1415,7 @@ class TestRun:
         for step in _cells(plan):
             _complete_cell(root, step)
         assert rc.run_plan(plan, root, force_rerun=True) == 0
-        cell_calls = [c for c in stub.calls() if c["argv"][0] != "restart"]
+        cell_calls = [c for c in stub.calls() if c["argv"][0] not in ("restart", "stop")]
         assert len(cell_calls) == 2
 
     def test_failed_cell_continues_and_exits_nonzero(
@@ -1420,7 +1426,7 @@ class TestRun:
         monkeypatch.setenv("STUB_FAIL_MARKER", f"{first['baseline']}_{first['cellspec']['arm']}")
         root = _run_root(tmp_path)
         assert rc.run_plan(plan, root) == 1
-        cell_calls = [c for c in stub.calls() if c["argv"][0] != "restart"]
+        cell_calls = [c for c in stub.calls() if c["argv"][0] not in ("restart", "stop")]
         assert len(cell_calls) == 2, "execution must CONTINUE past a failed cell"
         # dataset-suffixed: F1 row keys are shared by four datasets — a bare
         # per-cell sentinel could not say WHICH dataset's pass failed.
@@ -1470,7 +1476,7 @@ class TestRun:
         monkeypatch.setenv("STUB_FAIL_MARKER", "restart")  # the relaunch fails
         root = _run_root(tmp_path)
         assert rc.run_plan(plan, root) == 1
-        cell_calls = [c for c in stub.calls() if c["argv"][0] != "restart"]
+        cell_calls = [c for c in stub.calls() if c["argv"][0] not in ("restart", "stop")]
         assert cell_calls == [], "cells must not run against a failed serving config"
         for step in _cells(plan):
             assert (
@@ -1560,7 +1566,7 @@ class TestRun:
             wdir.mkdir(parents=True)
             (wdir / "metrics.json").write_text("{}", encoding="utf-8")
         assert rc.run_plan(plan, root) == 0
-        cell_calls = [c for c in stub.calls() if c["argv"][0] != "restart"]
+        cell_calls = [c for c in stub.calls() if c["argv"][0] not in ("restart", "stop")]
         # qasper + task 2 ran; task 1 was skipped-complete on ITS range only
         assert len(cell_calls) == 2
         tasks_run = [
@@ -1611,7 +1617,7 @@ class TestRun:
         plan = _stub_plan(grid, floor_table, stub.cmd)
         root = _run_root(tmp_path)
         assert rc.run_plan(plan, root, skip_blocked=True, seal=True, seal_cmd=stub.cmd) == 0
-        cell_calls = [c for c in stub.calls() if c["argv"][0] != "restart"]
+        cell_calls = [c for c in stub.calls() if c["argv"][0] not in ("restart", "stop")]
         assert len(cell_calls) == 2, "only the 2 executable F1 cells may run"
         labels = {c["argv"][c["argv"].index("--baseline-label") + 1] for c in cell_calls}
         assert labels == {"B1_gold-fresh", "B2_gold-reuse"}
@@ -1745,7 +1751,11 @@ class TestRulerPairing:
         # step (the loader's 4096 default is a pilot convenience).
         ruler = [s for s in _cells(plan_a) if s["dataset"] == "ruler"]
         for s in ruler:
-            assert _argv_value(s, "--ruler-context-tokens") == "32512"
+            # Batch 1 V1 (2026-10-05): the haystack target is the input shape
+            # minus the registered wrapper allowance, and the cap the RENDERED
+            # request must fit is the shape itself (32,512).
+            assert _argv_value(s, "--ruler-context-tokens") == str(rc.RULER_HAYSTACK_TOKENS)
+            assert _argv_value(s, "--ruler-rendered-input-cap") == "32512"
             assert _argv_value(s, "--max-tokens") == "256"
             assert _argv_value(s, "--ruler-task") == s["ruler_task"]
             assert s["ruler_task"] in rc.RULER_F2_TASKS
@@ -3313,8 +3323,8 @@ class TestMaxModelLenA10:
         root = _run_root(tmp_path)
         assert rc.run_plan(plan, root) == 0
         calls = stub.calls()
-        launcher_call = calls[0]
-        assert launcher_call["argv"][0] == "restart"
+        # V2: the clean-room stop precedes the relaunch; pick the relaunch.
+        launcher_call = next(c for c in calls if c["argv"][0] == "restart")
         assert launcher_call["env"]["VLLM_MAX_MODEL_LEN"] == "32768"
 
     def test_counts_unchanged_by_max_model_len(self, plan_a, plan_b):

@@ -230,6 +230,40 @@ an explicit ``relaunch`` step in the plan carrying the launcher argv + launch
 env (budget, KV dtype, connector), so the relaunch count is exactly the
 number of distinct EXECUTABLE serving configs (blocked cells launch nothing).
 
+Engine handoff (Batch 1 finding V2, 2026-10-05): a relaunch step's verb
+(``restart`` on the single-instance launchers, the self-cleaning ``start`` of
+the pd launcher) stops only ITS OWN engine family, so before V2 the plan
+order hf, sglang, vllm left the SGLang server resident on the GPU when the
+first vLLM relaunch ran, and that relaunch failed after its readiness budget
+(the session a dry trace skipped 430 of 870 cells this way); nothing stopped
+the last engine when the run ended. Every relaunch step now records its
+``launcher_key`` (the engine, or PD_LAUNCHER_KEY for the pd stack) and its
+``stop_argv`` (``<launcher> stop``: every launcher of the fleet accepts the
+bare verb and exits 0 with nothing running). ``stop_boundaries`` is the pure
+rule, derived from the relaunch sequence and counted in the plan header
+(``counts.engine_stops``, the number ``plan`` prints): the
+previous family is stopped BEFORE a relaunch of a different launcher and the
+last family is stopped when the run ends; same-launcher relaunches (prefix
+ON then OFF) stop nothing in between. ``run`` additionally stops every
+launcher the plan uses once before its first step (clean room: a resident
+engine from an aborted run). A stop runs under the env of the relaunch it
+closes; a failed stop is printed, counted, makes the exit code nonzero and
+never gates the seal (the data tree is complete); a launcher the plan never
+uses is never touched (the stop argv come from the plan, never from a
+default table, so a stubbed test plan never runs a real launcher).
+
+Window bound (Batch 1 finding V3, 2026-10-05): every window cell (row class
+``window``: F2, F3 and the RULER instrument) is bounded by
+``--arrival-count`` EQUAL to its own ``--num-queries`` (W requests issued,
+one per prepared request), never by ``--duration-s``. Before V3 the driver
+emitted the duration form and the runner's replay guard
+(load_generator.ensure_no_measured_replay) refused every pressure window
+whose rate x duration exceeded the W prepared requests unless
+CAGE_ALLOW_REPLAY=1 labeled the run non-confirmatory. S0 proved the count
+form live (``--arrival-count 50``, 6.5 s spans, 50 of 50 served).
+``window_duration_s`` stays a REQUIRED ``plan`` input and header field as the
+pre-costed duration ESTIMATE (the cost model), bounding nothing.
+
 Failure doctrine: a failed cell writes a ``.STATUS-<dataset>`` sentinel
 (dot-named so the §5 seal scope — which refuses any non-journaled file under
 cells/ — skips it; dataset-suffixed because F1 row keys are shared by four
@@ -315,8 +349,10 @@ __all__ = [
     "load_plan",
     "main",
     "parse_calibration_args",
+    "plan_launchers",
     "row_class",
     "slo_floors_env_value",
+    "stop_boundaries",
 ]
 
 # v2 (2026-09-01): pd steps added required keys gate/topology/pd — a v1 plan
@@ -387,6 +423,17 @@ __all__ = [
 # --vllm-telemetry (only pd cells carried it since S0F-22 Batch 1). No schema
 # bump: a v5 plan built before it is refused by _stale_plan_problems (its
 # windows would read UNKNOWN_TELEMETRY), so the operator re-plans.
+# V2 (2026-10-05, Batch 1 finding V2, engine handoff): relaunch steps gained
+# the REQUIRED keys ``launcher_key`` and ``stop_argv``; the header counts
+# gained ``engine_stops``. No schema bump: a v5 plan built before V2 is
+# refused by the required-key check (its run would leave the previous engine
+# family resident across a launcher change), so the operator re-plans.
+# V3 (2026-10-05, Batch 1 finding V3, window bound): window cell argv carry
+# --arrival-count == --num-queries and no --duration-s; the header
+# behavior_knobs gained ``window_bound``. No schema bump: a v5 plan built
+# before V3 is refused by _stale_plan_problems (its window cells would refuse
+# at the runner's replay guard, or replay under CAGE_ALLOW_REPLAY=1), so the
+# operator re-plans.
 PLAN_SCHEMA = "cage-campaign-plan-v5"
 FLOOR_TABLE_SCHEMA = "floor-table-v1"
 
@@ -453,6 +500,28 @@ assert RULER_CONTEXT_TOKENS == _ruler.MAX_CONTEXT_TOKENS, (
 assert RULER_OUTPUT_TOKENS == _ruler.OUTPUT_TOKENS_HINT, (
     "SHAPE-32K output drifted from src/data/ruler.OUTPUT_TOKENS_HINT"
 )
+#: Batch 1 finding V1 (2026-10-05): the chat wrapper the rendered request adds
+#: around the haystack (the system instruction, "Context 1:", "Question:", the
+#: template's role tokens and the generation prompt), measured on 2026-10-05
+#: with the Qwen/Qwen3-14B tokenizer and the vLLM adapter's pinned template
+#: kwargs. At a 2,048-token haystack, 30 items per task: niah_multikey 85 to
+#: 87, niah_multiquery 99 to 106, variable_tracking 92 to 96, qa 75 to 91. At
+#: the real haystack (32,384), the 200 items of each of the three campaign
+#: seeds (42, 43, 44) per task (independent review 2026-10-05): maxima 88,
+#: 107, 97 and 99 (qa questions 5 to 31 tokens); system plus template alone
+#: 63 with an empty user message, 73 with a minimal one. The allowance
+#: covers the maximum (107) with 21 to spare; the worst rendered request
+#: observed was 32,481 of the 32,512 cap. The runner renders every prompt
+#: (measured and warm-up pool) and refuses the cell when one
+#: exceeds the cap (--ruler-rendered-input-cap), so the allowance is a sizing
+#: input, never a guarantee. The haystack target every RULER cell carries as
+#: --ruler-context-tokens is the registered input shape minus the allowance;
+#: before V1 the haystack target WAS the input shape, counted in words, and
+#: every RULER request exceeded the server cap.
+RULER_WRAPPER_ALLOWANCE: int = 128
+RULER_HAYSTACK_TOKENS: int = RULER_CONTEXT_TOKENS - RULER_WRAPPER_ALLOWANCE
+RULER_SIZING_FINDING: str = "Batch 1 V1"
+assert 0 < RULER_WRAPPER_ALLOWANCE < RULER_CONTEXT_TOKENS
 
 #: Backlog A10 (Tier A): the ONE launcher env that carries the per-session
 #: request-length cap. Every launcher of the frozen fleet reads it from the
@@ -560,9 +629,11 @@ SLO_FLOORS_ADR: str = "ADR-0117"
 #: - N_SECONDARY: secondary-only per-query F1 cells (MDE 0.10 at alpha/12): 800.
 #: - N_IDENTITY: TTFT-only, HF-oracle and T=0 identity cells: 300.
 #: - WINDOW_REQUESTS: loaded/window cells (F2, F3, RULER): W = 200 requests
-#:   per window; the open-loop generator draws from the measured set
-#:   (run_experiment execute_open_loop_measured: schedule index maps modulo
-#:   the prepared measured set), so --num-queries IS the window pool size.
+#:   per window; --num-queries IS the window pool size AND, since V3, the
+#:   window's --arrival-count (one arrival per prepared request: the open-loop
+#:   generator's replay guard refuses a schedule longer than the pool unless
+#:   CAGE_ALLOW_REPLAY=1 labels the run non-confirmatory, so a duration-bound
+#:   window at a real rate never ran).
 N_PRIMARY: int = 2000
 N_SECONDARY: int = 800
 N_IDENTITY: int = 300
@@ -935,6 +1006,24 @@ DEFAULT_LAUNCHER_CMDS: Dict[str, Tuple[str, ...]] = {
 }
 DEFAULT_RUNNER_CMD: Tuple[str, ...] = ("python3", "scripts/3_run/run_experiment.py")
 DEFAULT_SEAL_CMD: Tuple[str, ...] = ("python3", "scripts/3_run/seal_campaign_run.py")
+
+#: Batch 1 finding V2 (2026-10-05): the launcher verb that stops one family's
+#: engine(s). Every launcher of the fleet dispatches it with no model
+#: argument (manage_vllm_server.sh and manage_sglang_server.sh ``stop)`` ->
+#: stop_server; manage_vllm_pd.sh ``stop)`` -> stop_stack) and every kill in
+#: those bodies is guarded, so the verb exits 0 with nothing running. The
+#: relaunch step records ``stop_argv`` = its launcher prefix + this verb; run
+#: executes it at the boundaries stop_boundaries names.
+LAUNCHER_STOP_VERB: str = "stop"
+ENGINE_STOP_FINDING: str = "Batch 1 V2"
+#: run's exit code when every cell passed but an engine stop failed (review
+#: F4): distinct from 1 (a failed cell) so the operator reads "the data is
+#: complete, the pod may still hold an engine" without opening the log.
+EXIT_STOP_FAILED: int = 2
+#: Batch 1 finding V3 (2026-10-05): how a window cell is bounded. The value
+#: the header records; the per-cell rule is --arrival-count == --num-queries.
+WINDOW_BOUND: str = "arrival-count"
+WINDOW_BOUND_FINDING: str = "Batch 1 V3"
 
 _LAMBDA_PENDING_BASIS = "kv-bound-only [pending calibration]"
 _LAMBDA_CALIBRATED_BASIS = "calibrated min(lambda_KV, lambda_compute)"
@@ -2498,6 +2587,9 @@ def _relaunch_step(
         argv = list(launcher) + ["start", HF_ID_OF_SLUG[model]]
         if prefix_off:
             argv.append("--no-prefix-cache")
+        # V2: the stop of THIS stack, run at the boundaries stop_boundaries
+        # names (the pd launcher's stop verb dismantles proxy + both roles).
+        stop_argv = list(launcher) + [LAUNCHER_STOP_VERB]
         # Per-role TP (W4.6): the frozen pd launcher applies ONE
         # CAGE_VLLM_TENSOR_PARALLEL to BOTH role instances (validated equal
         # at registration); degree 1 omits the env — the launcher omits the
@@ -2533,6 +2625,10 @@ def _relaunch_step(
             "topology": topology,
             "tp": role_tp,  # per ROLE instance (both roles, launcher contract)
             "pd": pd_record,
+            # V2: the pd stack is its own launcher family (never the
+            # single-instance vllm script), stopped by its own verb.
+            "launcher_key": PD_LAUNCHER_KEY,
+            "stop_argv": stop_argv,
             "api_base": engine_api_base(engine, topology),  # W2: the proxy
             # Batch 2 W4: the BudgetPlan the role budgets were split from
             # (per POOL, tp=1) plus the pd role record (the per-rank slices
@@ -2550,6 +2646,9 @@ def _relaunch_step(
     argv = list(launcher) + ["restart", HF_ID_OF_SLUG[model]]
     if prefix_off:
         argv.append("--no-prefix-cache")
+    # V2: the stop of this engine family (restart is self-cleaning WITHIN the
+    # family; the stop runs only at a launcher change and at the end).
+    stop_argv = list(launcher) + [LAUNCHER_STOP_VERB]
     env: Dict[str, str] = {}
     budget_bytes: Optional[int] = None
     budget_plan: Optional[Dict[str, Any]] = None
@@ -2642,6 +2741,10 @@ def _relaunch_step(
         "topology": topology,
         "tp": launched_tp,  # the T3.1 degree this serving stack launches with
         "pd": None,  # single/tp relaunch: no §6.5 role split
+        # V2: the launcher this boundary belongs to and how to stop it (the
+        # tp overlay rides the same single-instance launcher as 'single').
+        "launcher_key": engine,
+        "stop_argv": stop_argv,
         "api_base": api_base,  # W2: what the cells under this relaunch dial
         # Batch 2 W4: the BudgetPlan the budget env was derived from (null on
         # a budget-free relaunch); every budgeted cell under it pins it.
@@ -2977,6 +3080,70 @@ def _stale_plan_problems(
             f"{label}: cell {row!r} carries --num-queries {got_n!r} but its "
             f"num_queries record is {step.get('num_queries')!r} (A9)" + stale
         )
+    # V3 (window bound): a window cell (pressure family, or the RULER
+    # instrument) is bounded by --arrival-count == its --num-queries and
+    # never by --duration-s; every other cell carries neither flag.
+    got_arrivals = _argv_flag_value(argv, "--arrival-count")
+    if spec.family in _PRESSURE_FAMILIES or step.get("dataset") == "ruler":
+        if "--duration-s" in argv:
+            problems.append(
+                f"{label}: window cell {row!r} carries --duration-s "
+                f"({WINDOW_BOUND_FINDING}: a duration-bound window refuses at the "
+                "runner's replay guard once rate x duration exceeds the prepared "
+                "pool; the window is W arrivals)" + stale
+            )
+        if got_arrivals is None:
+            problems.append(
+                f"{label}: window cell {row!r} lacks --arrival-count "
+                f"({WINDOW_BOUND_FINDING}: W requests issued per window, one per "
+                "prepared request)" + stale
+            )
+        elif got_arrivals != str(step.get("num_queries")):
+            problems.append(
+                f"{label}: window cell {row!r} carries --arrival-count "
+                f"{got_arrivals!r} but its pool (--num-queries) is "
+                f"{step.get('num_queries')!r} ({WINDOW_BOUND_FINDING}: arrivals "
+                "beyond the pool replay; fewer under-measure the window)" + stale
+            )
+    else:
+        for flag in ("--arrival-count", "--duration-s"):
+            if flag in argv:
+                problems.append(
+                    f"{label}: cell {row!r} (family {spec.family!r}) carries {flag} "
+                    f"({WINDOW_BOUND_FINDING}: the window bound rides window cells "
+                    "only)" + stale
+                )
+    # V1 (RULER sizing): a RULER step carries the registered haystack target
+    # and the rendered input cap; no other cell carries the cap.
+    got_cap = _argv_flag_value(argv, "--ruler-rendered-input-cap")
+    if step.get("dataset") == "ruler":
+        got_haystack = _argv_flag_value(argv, "--ruler-context-tokens")
+        if got_haystack != str(RULER_HAYSTACK_TOKENS):
+            problems.append(
+                f"{label}: RULER cell {row!r} carries --ruler-context-tokens "
+                f"{got_haystack!r}, the registered haystack is {RULER_HAYSTACK_TOKENS} "
+                f"= {RULER_CONTEXT_TOKENS} - {RULER_WRAPPER_ALLOWANCE} "
+                f"({RULER_SIZING_FINDING}: the rendered request must fit the input "
+                "shape)" + stale
+            )
+        if got_cap is None:
+            problems.append(
+                f"{label}: RULER cell {row!r} lacks --ruler-rendered-input-cap "
+                f"({RULER_SIZING_FINDING}: the runner refuses the cell when a rendered "
+                "prompt exceeds it)" + stale
+            )
+        elif got_cap != str(RULER_CONTEXT_TOKENS):
+            problems.append(
+                f"{label}: RULER cell {row!r} carries --ruler-rendered-input-cap "
+                f"{got_cap!r}, the registered input shape is {RULER_CONTEXT_TOKENS} "
+                f"({RULER_SIZING_FINDING})" + stale
+            )
+    elif got_cap is not None:
+        problems.append(
+            f"{label}: cell {row!r} (dataset {step.get('dataset')!r}) carries "
+            f"--ruler-rendered-input-cap ({RULER_SIZING_FINDING}: the cap rides RULER "
+            "cells only)" + stale
+        )
     if per_row_n is not None:
         try:
             expected_cls = classify_row(
@@ -3214,7 +3381,6 @@ def _cell_step(
     floor: FloorTable,
     runner_cmd: Sequence[str],
     seed: int,
-    window_duration_s: float,
     pins: RetrievalPins,
     query_manifest: Optional[str] = None,
     *,
@@ -3281,7 +3447,12 @@ def _cell_step(
         argv += [
             "--ruler-task",
             cell.ruler_task,
+            # V1: the haystack target is the input shape minus the registered
+            # wrapper allowance; the cap is what the RENDERED request must fit
+            # (the runner renders every prompt and refuses the cell otherwise).
             "--ruler-context-tokens",
+            str(RULER_HAYSTACK_TOKENS),
+            "--ruler-rendered-input-cap",
             str(RULER_CONTEXT_TOKENS),
             "--max-tokens",
             str(RULER_OUTPUT_TOKENS),
@@ -3313,13 +3484,18 @@ def _cell_step(
             if row.get("lambda_compute_rps") is None
             else _LAMBDA_CALIBRATED_BASIS
         )
+        # V3: the window is W arrivals, one per prepared request (the
+        # --num-queries above), never a duration: the open-loop generator's
+        # replay guard refuses a schedule longer than the pool, and a
+        # duration-bound window at a real rate always was. The pre-costed
+        # window_duration_s stays in the header as the cost estimate only.
         argv += [
             "--workload-mode",
             "open_loop",
             "--rate",
             f"{offered_rate:.6g}",
-            "--duration-s",
-            f"{window_duration_s:g}",
+            "--arrival-count",
+            str(num_queries),
         ]
     env = _cell_identity_env(spec)
     if spec.retriever != "none":
@@ -3767,7 +3943,6 @@ def build_plan(
                 floor,
                 runner_cmd,
                 seed,
-                window_duration_s,
                 pins,
                 query_manifest=None if manifest_rec is None else manifest_rec["path"],
                 slo_floors_env=slo_floors_env,
@@ -3873,6 +4048,11 @@ def build_plan(
             "quality_scoring": "decoupled",
             "quality_scoring_env": SKIP_QUALITY_ENV,
             "quality_scoring_adr": DECOUPLED_SCORING_ADR,
+            # V3: every window cell is bounded by --arrival-count equal to
+            # its --num-queries (per_row_n.window_requests, or the dataset's
+            # achievable n); window_duration_s above is the cost estimate.
+            "window_bound": WINDOW_BOUND,
+            "window_bound_finding": WINDOW_BOUND_FINDING,
         },
         # W4.2/W4.6: the registered serving shapes — reviewable in the header
         # like the behavior knobs (design registrations, not measurements).
@@ -3928,6 +4108,13 @@ def build_plan(
                 "tasks": list(grid.f2_ruler_tasks),
                 "context_tokens": RULER_CONTEXT_TOKENS,
                 "output_tokens": RULER_OUTPUT_TOKENS,
+                # V1: the registered input shape is the RENDERED request; the
+                # haystack carries the shape minus the wrapper allowance and
+                # the runner refuses a prompt above the cap.
+                "haystack_tokens": RULER_HAYSTACK_TOKENS,
+                "wrapper_allowance_tokens": RULER_WRAPPER_ALLOWANCE,
+                "rendered_input_cap": RULER_CONTEXT_TOKENS,
+                "sizing_finding": RULER_SIZING_FINDING,
             }
         ),
         # A9 / DECISION.md A1: the registered per-row N this plan's
@@ -3953,6 +4140,10 @@ def build_plan(
             "cells": len(cell_steps),
             "windows": sum(s["windows"] for s in cell_steps),
             "relaunches": relaunches,
+            # V2: the family stops 'run' executes (boundaries + the end of
+            # run; the clean-room stops before the first step are not counted
+            # here, they are one per launcher the plan uses).
+            "engine_stops": len(stop_boundaries(steps)),
             "blocked": len(blocked),
             "by_family": by_family,
         },
@@ -4018,6 +4209,10 @@ _RELAUNCH_STEP_KEYS = (
     # from the relaunch identity, never inferred from an optional key).
     "budget_plan",
     "budget_bytes",
+    # V2 (engine handoff): the launcher this boundary belongs to and the argv
+    # that stops its family; both re-checked against the relaunch argv below.
+    "launcher_key",
+    "stop_argv",
 )
 
 
@@ -4080,6 +4275,49 @@ def _stale_relaunch_problems(
                         f"{role_port} ({ENGINE_PORTS_FINDING}: the recorded "
                         "telemetry endpoints name that port)" + stale
                     )
+    # V2 (engine handoff): the stop argv must aim at the SAME launcher the
+    # relaunch argv starts (its prefix before the start/restart verb), and the
+    # launcher key must be the one the topology implies; a drifted record
+    # would stop the wrong family, or none, at a boundary.
+    argv_raw = step.get("argv")
+    if not isinstance(argv_raw, list):
+        # load_plan already recorded the argv type problem (review F5: a
+        # string argv must refuse, never crash the check below).
+        return problems
+    argv: List[Any] = argv_raw
+    verb = "start" if step.get("topology") == "pd" else "restart"
+    want_key = PD_LAUNCHER_KEY if step.get("topology") == "pd" else engine
+    if step.get("launcher_key") != want_key:
+        problems.append(
+            f"{label}: relaunch launcher_key is {step.get('launcher_key')!r}, the "
+            f"{step.get('topology')!r} topology of engine {engine!r} is launched "
+            f"by {want_key!r} ({ENGINE_STOP_FINDING}: the stop at a family boundary "
+            "would target the wrong launcher)" + stale
+        )
+    # The stop argv is the launcher PREFIX plus the stop verb, and the relaunch
+    # argv is that same prefix followed by its start/restart verb (review F6:
+    # positional, never a search for the verb, so a prefix token spelled like
+    # a verb cannot refuse a fresh plan).
+    stop_argv = step.get("stop_argv")
+    if (
+        not isinstance(stop_argv, list)
+        or len(stop_argv) < 2
+        or stop_argv[-1] != LAUNCHER_STOP_VERB
+    ):
+        problems.append(
+            f"{label}: relaunch stop_argv is {stop_argv!r}, must be the launcher "
+            f"prefix plus {LAUNCHER_STOP_VERB!r} ({ENGINE_STOP_FINDING})" + stale
+        )
+    else:
+        prefix = stop_argv[:-1]
+        if argv[: len(prefix)] != prefix or len(argv) <= len(prefix) or argv[len(prefix)] != verb:
+            problems.append(
+                f"{label}: relaunch stop_argv {stop_argv!r} does not stop the launcher "
+                f"the relaunch argv starts ({argv[: len(prefix) + 1]!r} should be the "
+                f"same prefix followed by {verb!r}) ({ENGINE_STOP_FINDING}: a stop "
+                "aimed at another launcher leaves this family resident at the "
+                "boundary)" + stale
+            )
     value = step.get("max_model_len")
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         problems.append(
@@ -4477,6 +4715,55 @@ def _exec(argv: Sequence[str], extra_env: Mapping[str, str]) -> int:
     return proc.returncode
 
 
+def _stop_record(step: Mapping[str, Any], before_index: Optional[int]) -> Dict[str, Any]:
+    return {
+        "before_index": before_index,
+        "launcher_key": step["launcher_key"],
+        "stop_argv": list(step["stop_argv"]),
+        "env": dict(step.get("env") or {}),
+    }
+
+
+def stop_boundaries(steps: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """V2 (engine handoff): WHERE a running engine family must be stopped,
+    derived from the relaunch sequence alone (pure; the plan's own content).
+
+    One record per relaunch step whose ``launcher_key`` differs from the
+    previous relaunch's: ``before_index`` is that relaunch's position in
+    ``steps`` and the stop is the PREVIOUS family's ``stop_argv`` under the
+    env of its last relaunch; plus, when any relaunch exists, one final record
+    with ``before_index`` None: the last family, stopped when the run ends.
+    Relaunches of the same launcher need no stop between them (the launcher's
+    restart, or the pd stack's start, is self-cleaning within its family). A
+    plan without relaunch steps (hf oracle only) stops nothing.
+    """
+    out: List[Dict[str, Any]] = []
+    previous: Optional[Mapping[str, Any]] = None
+    for index, step in enumerate(steps):
+        if step.get("kind") != "relaunch":
+            continue
+        if previous is not None and previous["launcher_key"] != step["launcher_key"]:
+            out.append(_stop_record(previous, index))
+        previous = step
+    if previous is not None:
+        out.append(_stop_record(previous, None))
+    return out
+
+
+def plan_launchers(steps: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """V2: every launcher the plan uses, once each, in order of first
+    appearance, with the stop argv and env of its FIRST relaunch (the clean
+    room 'run' performs before its first step: a resident engine of an
+    aborted run must not meet the first relaunch of this one). A launcher
+    the plan never uses is never named here, so nothing outside the plan is
+    ever executed."""
+    seen: Dict[str, Dict[str, Any]] = {}
+    for step in steps:
+        if step.get("kind") == "relaunch" and step["launcher_key"] not in seen:
+            seen[step["launcher_key"]] = _stop_record(step, None)
+    return list(seen.values())
+
+
 @dataclass
 class _Outcome:
     row_key: str
@@ -4616,55 +4903,105 @@ def run_plan(
 
     outcomes: List[_Outcome] = []
     server_ok = True  # state of the current serving config (non-hf cells)
-    for step in steps:
-        if step["kind"] == "relaunch":
-            rc = _exec(step["argv"], step["env"])
-            server_ok = rc == 0
-            if not server_ok:
-                print(
-                    f"[run_campaign] RELAUNCH FAILED (exit {rc}): engine="
-                    f"{step['engine']} prefix={step['prefix_mode']} "
-                    f"budget_r={step.get('budget_r')} — failing its cells "
-                    "until the next relaunch boundary"
-                )
-            continue
-        row_key, dataset = step["row_key"], step["dataset"]
-        # Per-task RULER steps claim disjoint window-ordinal ranges within a
-        # shared (row_key, dataset) space — resume counting and the failure
-        # sentinel are both scoped to THIS step's range (base 0 = legacy).
-        base = int(step.get("window_ordinal_base") or 0)
-        if step.get("blocked_on"):
-            # Reaches here only under the operator's explicit --skip-blocked:
-            # reported per-cell, executes nothing, gates a plain --seal below.
-            outcomes.append(_Outcome(row_key, dataset, "skipped-blocked"))
-            continue
-        if step.get("serving") is not None and not server_ok:
-            _write_failed_sentinel(
-                campaign_root, row_key, dataset, "relaunch-failed", base
-            )
-            outcomes.append(_Outcome(row_key, dataset, "skipped-launch-failed"))
-            continue
-        done = count_complete_windows(
-            campaign_root,
-            row_key,
-            dataset,
-            ordinal_base=base,
-            expected=int(step["windows"]),
-        )
-        if not force_rerun and done >= int(step["windows"]):
-            _clear_failed_sentinel(campaign_root, row_key, dataset, base)
-            outcomes.append(_Outcome(row_key, dataset, "skipped-complete"))
-            continue
-        argv = list(step["argv"]) + ["--campaign-root", str(campaign_root)]
-        rc = _exec(argv, step["env"])
-        if rc == 0:
-            _clear_failed_sentinel(campaign_root, row_key, dataset, base)
-            outcomes.append(_Outcome(row_key, dataset, "ok"))
+    # V2 (engine handoff): the stops this run performs. Clean room first: every
+    # launcher the plan uses is stopped once before the first step (a resident
+    # engine of an aborted run); then the previous family before a relaunch of
+    # another launcher; then the last family when the run ends. A failed stop
+    # is printed and counted, never hidden; the cells still run (the next
+    # relaunch, if any, is the recorded symptom when the GPU stayed held).
+    stop_failures = 0
+
+    def _stop(record: Mapping[str, Any], why: str) -> None:
+        nonlocal stop_failures
+        rc_stop = _exec(record["stop_argv"], record["env"])
+        if rc_stop == 0:
+            print(f"[run_campaign] engine stop ({why}): launcher={record['launcher_key']} ok")
         else:
-            _write_failed_sentinel(
-                campaign_root, row_key, dataset, f"runner-exit-{rc}", base
+            stop_failures += 1
+            print(
+                f"[run_campaign] STOP FAILED (exit {rc_stop}, {why}): launcher="
+                f"{record['launcher_key']} argv={record['stop_argv']} "
+                f"({ENGINE_STOP_FINDING}: the family may still hold the GPU)"
             )
-            outcomes.append(_Outcome(row_key, dataset, "failed"))
+
+    launchers = plan_launchers(steps)
+    for record in launchers:
+        _stop(record, "clean room before the first step")
+    boundaries = stop_boundaries(steps)
+    stops_before: Dict[int, Dict[str, Any]] = {
+        b["before_index"]: b for b in boundaries if b["before_index"] is not None
+    }
+    # The family running NOW: set at every executed relaunch, stopped once at
+    # the end of the run, on the happy path AND on an abort (review F1 and
+    # F-2 of the V1 review: a Ctrl-C during the SGLang half of a plan must stop
+    # SGLang, the resident family, not the plan's last family).
+    resident: Optional[Dict[str, Any]] = None
+    final_stop_done = False
+
+    def _end_of_run_stops() -> None:
+        nonlocal final_stop_done
+        if final_stop_done or resident is None:
+            return
+        final_stop_done = True
+        _stop(resident, "end of run")
+
+    try:
+        for index, step in enumerate(steps):
+            if step["kind"] == "relaunch":
+                if index in stops_before:
+                    _stop(stops_before[index], "family change before the next relaunch")
+                rc = _exec(step["argv"], step["env"])
+                resident = _stop_record(step, None)
+                server_ok = rc == 0
+                if not server_ok:
+                    print(
+                        f"[run_campaign] RELAUNCH FAILED (exit {rc}): engine="
+                        f"{step['engine']} prefix={step['prefix_mode']} "
+                        f"budget_r={step.get('budget_r')}, failing its cells "
+                        "until the next relaunch boundary"
+                    )
+                continue
+            row_key, dataset = step["row_key"], step["dataset"]
+            # Per-task RULER steps claim disjoint window-ordinal ranges within
+            # a shared (row_key, dataset) space; resume counting and the
+            # failure sentinel are both scoped to THIS step's range (base 0 =
+            # legacy).
+            base = int(step.get("window_ordinal_base") or 0)
+            if step.get("blocked_on"):
+                # Reaches here only under the operator's explicit
+                # --skip-blocked: reported per-cell, executes nothing, gates a
+                # plain --seal below.
+                outcomes.append(_Outcome(row_key, dataset, "skipped-blocked"))
+                continue
+            if step.get("serving") is not None and not server_ok:
+                _write_failed_sentinel(
+                    campaign_root, row_key, dataset, "relaunch-failed", base
+                )
+                outcomes.append(_Outcome(row_key, dataset, "skipped-launch-failed"))
+                continue
+            done = count_complete_windows(
+                campaign_root,
+                row_key,
+                dataset,
+                ordinal_base=base,
+                expected=int(step["windows"]),
+            )
+            if not force_rerun and done >= int(step["windows"]):
+                _clear_failed_sentinel(campaign_root, row_key, dataset, base)
+                outcomes.append(_Outcome(row_key, dataset, "skipped-complete"))
+                continue
+            argv = list(step["argv"]) + ["--campaign-root", str(campaign_root)]
+            rc = _exec(argv, step["env"])
+            if rc == 0:
+                _clear_failed_sentinel(campaign_root, row_key, dataset, base)
+                outcomes.append(_Outcome(row_key, dataset, "ok"))
+            else:
+                _write_failed_sentinel(
+                    campaign_root, row_key, dataset, f"runner-exit-{rc}", base
+                )
+                outcomes.append(_Outcome(row_key, dataset, "failed"))
+    finally:
+        _end_of_run_stops()
 
     # ---- summary matrix (per-cell outcomes; the operator's at-a-glance) ----
     counts: Dict[str, int] = {}
@@ -4673,6 +5010,12 @@ def run_plan(
         counts[o.outcome] = counts.get(o.outcome, 0) + 1
         print(f"  [{o.outcome:>21}] {o.row_key} ({o.dataset})")
     print(f"[run_campaign] totals: {counts}")
+    # Review F8: the two components are printed apart because the header's
+    # counts.engine_stops counts the boundaries only.
+    print(
+        f"[run_campaign] engine stops: clean room {len(launchers)}, boundaries "
+        f"{len(boundaries)}, {stop_failures} failed ({ENGINE_STOP_FINDING})"
+    )
 
     any_failed = any(
         o.outcome in ("failed", "skipped-launch-failed") for o in outcomes
@@ -4692,8 +5035,23 @@ def run_plan(
             if rc != 0:
                 print(f"[run_campaign] seal FAILED (exit {rc})")
                 return 1
-            print("[run_campaign] sealed.")
-    return 1 if any_failed else 0
+            print(
+                "[run_campaign] sealed."
+                + (
+                    f" {stop_failures} engine stop(s) failed; the pod may still hold "
+                    "an engine (the data tree is complete)"
+                    if stop_failures
+                    else ""
+                )
+            )
+    # V2: a failed stop never gates the seal (the data tree is complete) but
+    # the exit code says the run did not leave the pod clean, with its own
+    # value so a re-run operator can tell it from a failed cell (review F4).
+    if any_failed:
+        return 1
+    if stop_failures:
+        return EXIT_STOP_FAILED
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -4758,7 +5116,7 @@ def _cmd_plan(args: argparse.Namespace) -> int:
         print(
             f"[run_campaign] plan written: {args.out} — {c['cells']} cells, "
             f"{c['windows']} windows, {c['relaunches']} relaunches, "
-            f"{c['blocked']} blocked"
+            f"{c['engine_stops']} engine stops, {c['blocked']} blocked"
         )
     else:
         print(text, end="")
@@ -4805,8 +5163,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--window-duration-s",
         required=True,
         type=float,
-        help="fixed pre-costed measurement-window duration for pressure cells "
-        "(§6.1; REQUIRED — never defaulted)",
+        help="pre-costed measurement-window duration ESTIMATE for pressure "
+        "cells, recorded in the plan header for the cost model (§6.1; REQUIRED, "
+        "never defaulted). It bounds nothing: since Batch 1 V3 every window "
+        "cell is bounded by --arrival-count equal to its --num-queries",
     )
     p_plan.add_argument("--seed", type=int, default=42)
     p_plan.add_argument(

@@ -1787,8 +1787,12 @@ class TestAllowPdGating:
         root = _run_root(tmp_path)
         assert rc.run_plan(plan, root, allow_pd=True) == 0
         calls = stub.calls()
-        assert len(calls) == 2  # pd relaunch + the cell
-        relaunch, cell = calls
+        # V2 (2026-10-05): the pd stack is stopped once before the first step
+        # (clean room) and once when the run ends; between them the pd
+        # relaunch and the cell (tests/test_stage1_v2_v3_driver.py pins the
+        # stop rule).
+        assert [c["argv"][0] for c in calls] == ["stop", "start", "--baseline", "stop"]
+        relaunch, cell = calls[1], calls[2]
         # the pd launcher verb is `start` (self-cleaning; no restart verb)
         assert relaunch["argv"][0] == "start"
         assert relaunch["env"]["CAGE_KV_BUDGET_BYTES_PREFILL"] == str(_EXPECT_PREFILL)

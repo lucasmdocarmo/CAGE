@@ -62,7 +62,7 @@ from __future__ import annotations
 
 import os
 import random
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from src.data.loader import CAGExample, DatasetLoader, SquadV2Loader
 
@@ -132,6 +132,34 @@ _QA_POOL_EXAMPLES: int = 2000
 def _whitespace_token_counter(text: str) -> int:
     """Default token proxy: whitespace word count (recorded as such)."""
     return len(text.split())
+
+
+def model_token_counter(model_id: str) -> Tuple[TokenCounter, str, Any]:
+    """The target model's tokenizer as a ``TokenCounter`` (Batch 1 finding V1).
+
+    Purpose: size the haystack in the tokens the served model counts, not in
+    whitespace words (one English word is about 1.3 Qwen3 tokens, so a
+    32,512-word haystack is about 42,000 tokens and every request is refused
+    by the server). Loads ``transformers.AutoTokenizer`` lazily (the module
+    keeps its stdlib-only imports otherwise) from the model id the runner
+    serves; on the pod the snapshot is already staged with the weights.
+
+    Returns ``(counter, name, tokenizer)``: ``counter(text)`` is
+    ``len(tokenizer.encode(text, add_special_tokens=False))`` (the raw text
+    cost; the chat wrapper is counted by the caller when it renders the
+    request), ``name`` is the model id recorded in every item's
+    ``tokenizer_name``, and ``tokenizer`` is the loaded object the caller
+    renders with. Raises whatever the load raises (no network, no snapshot,
+    unknown id): the caller decides whether that refuses the cell.
+    """
+    from transformers import AutoTokenizer  # lazy: see the module docstring
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+    def _count(text: str) -> int:
+        return len(tokenizer.encode(text, add_special_tokens=False))
+
+    return _count, model_id, tokenizer
 
 
 class RulerLoader(DatasetLoader):

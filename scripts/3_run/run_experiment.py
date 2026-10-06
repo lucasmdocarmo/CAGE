@@ -91,6 +91,7 @@ from src.utils.prompting import (
     format_multi_turn_messages,
     messages_to_fallback_prompt,
     prompt_mode,
+    rendered_chat_prompt_tokens,
     select_distractor_texts,
 )
 from prometheus_client import Counter, Histogram, Gauge, CollectorRegistry, start_http_server
@@ -1265,6 +1266,187 @@ def validate_retriever_for_baseline(retriever: str, baseline: str) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Batch 1 finding V1 (2026-10-05, CRITICAL): token-true RULER sizing and the
+# context-length refusal. Three parts: the haystack is counted with the served
+# model's tokenizer (ruler_token_counter -> get_loader); the RENDERED request
+# is counted the way the engine renders it and refused before any engine work
+# when it exceeds the registered input cap (check_ruler_rendered_inputs); an
+# engine context-length error on the campaign path fails the cell
+# (ContextLengthError through the ADR-0116 record guard) instead of landing as
+# an error row with exit 0.
+# ---------------------------------------------------------------------------
+
+#: The chat-template kwargs the vLLM adapter pins on every chat request
+#: (src/inference/vllm_adapter.py, ADR-0007: Qwen3 thinking disabled). The
+#: RULER render check applies the SAME kwargs so it counts the template the
+#: engine renders; pinned equal to the adapter by test.
+RULER_RENDER_TEMPLATE_KWARGS: Dict[str, Any] = {"enable_thinking": False}
+
+#: Error texts that mean "the engine refused the request itself" (as opposed
+#: to a transport failure or a dropped arrival). Two shapes: (1) the HTTP
+#: status line the adapter records on a rejected request, which is ALL it
+#: records today: requests gives "400 Client Error: Bad Request for url: ...",
+#: aiohttp (the open-loop path) "400, message='Bad Request', url='...'"
+#: [V review 2026-10-05: the adapter never reads the response body on an
+#: HTTPError]; a 413 is the payload-too-large variant. On a campaign cell every
+#: request has one shape, so a 400 is a mis-built request (the usual cause on
+#: RULER: the context length), never a served row. (2) the engine's own wording
+#: when a body does reach the text (an in-band error object, or once the
+#: adapter records bodies: BACKLOG V1 follow-up): vLLM's "This model's maximum
+#: context length is N tokens" [A: read in the vLLM serving code], SGLang's
+#: "longer than the model's context length" / "max_total_tokens" [A].
+#: Case-insensitive. A timeout, a dropped arrival or a 5xx never matches.
+CONTEXT_LENGTH_ERROR_RE = re.compile(
+    r"^(?:HTTP )?4(?:00|13)\b"
+    r"|maximum context length|longer than the model'?s? context length"
+    r"|(?:prompt|input) is too long|max_total_tokens",
+    re.IGNORECASE,
+)
+RULER_SIZING_FINDING = "Batch 1 V1"
+
+
+def is_context_length_error(error_text: Any) -> bool:
+    """True when an adapter error row's text is the engine refusing the prompt
+    for its length (CONTEXT_LENGTH_ERROR_RE); False for None, empty or any
+    other failure."""
+    return isinstance(error_text, str) and bool(CONTEXT_LENGTH_ERROR_RE.search(error_text))
+
+
+class ContextLengthError(RuntimeError):
+    """The engine refused a request for its length on the campaign path.
+
+    Before V1 the adapter recorded such a refusal as an error row
+    (``finish_reason == "error"``) and the runner exited 0, so a mis-sized
+    RULER cell produced windows of error rows that the driver marked ok. The
+    cell is mis-sized as a whole (every request of a RULER task has the same
+    shape), so campaign mode fails it; the ADR-0116 record guard wraps this
+    into RecordStageError and the driver writes the failure sentinel.
+    """
+
+    def __init__(self, example_id: str, error_text: str) -> None:
+        self.example_id = example_id
+        self.error_text = error_text
+        super().__init__(
+            f"the engine refused request {example_id!r} ({error_text!r}: an HTTP "
+            "400/413 or a context-length message): the cell's requests are "
+            "mis-built, on RULER usually too long, so campaign mode fails the cell "
+            f"instead of recording an error row and exiting 0 ({RULER_SIZING_FINDING})"
+        )
+
+
+class RulerSizingError(ValueError):
+    """The RULER instrument cannot be sized honestly (Batch 1 V1): the model
+    tokenizer is not loadable on the campaign path, the rendered input cap is
+    missing on a campaign RULER cell, or a rendered prompt exceeds the cap.
+    Raised BEFORE any engine work."""
+
+
+def ruler_token_counter(model: str) -> Tuple[Callable[[str], int], str, Any]:
+    """``(counter, name, tokenizer)`` for the served model (the seam the loader
+    build uses; tests monkeypatch it). Delegates to
+    ``src.data.ruler.model_token_counter``."""
+    from src.data.ruler import model_token_counter
+
+    return model_token_counter(model)
+
+
+def check_ruler_rendered_inputs(
+    examples: Sequence[CAGExample],
+    *,
+    tokenizer: Any,
+    prompt_mode: str,
+    cap: int,
+    max_tokens: int,
+) -> Dict[str, Any]:
+    """Render every RULER example exactly as the engine will and refuse the
+    cell when any rendered prompt exceeds ``cap`` tokens (Batch 1 V1, part 2).
+
+    Chat mode renders ``format_qa_messages`` through the tokenizer's chat
+    template with RULER_RENDER_TEMPLATE_KWARGS (what the vLLM adapter sends);
+    raw mode counts ``format_qa_prompt``. ``cap`` is the registered input
+    shape the driver passes (SHAPE-32K: 32,512); the server cap is
+    ``max_model_len`` >= cap + ``max_tokens`` by the driver's A10 registration,
+    recorded here for the reader. Returns the sizing record persisted as
+    ``metrics.json["ruler_sizing"]``. Pure: no engine, no network.
+    """
+    if not examples:
+        raise RulerSizingError(
+            f"no measured RULER example to size ({RULER_SIZING_FINDING})"
+        )
+    if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
+        raise RulerSizingError(
+            f"--ruler-rendered-input-cap must be an integer >= 1, got {cap!r} "
+            f"({RULER_SIZING_FINDING})"
+        )
+    rendered: List[int] = []
+    haystack: List[int] = []
+    longest: Optional[Tuple[str, int]] = None
+    for ex in examples:
+        contexts = list(ex.context or [])
+        if prompt_mode == "chat":
+            n = rendered_chat_prompt_tokens(
+                tokenizer,
+                format_qa_messages(ex.question, contexts),
+                chat_template_kwargs=RULER_RENDER_TEMPLATE_KWARGS,
+            )
+        else:
+            n = len(tokenizer.encode(format_qa_prompt(ex.question, contexts), add_special_tokens=False))
+        h = len(tokenizer.encode(contexts[0], add_special_tokens=False)) if contexts else 0
+        rendered.append(n)
+        haystack.append(h)
+        if longest is None or n > longest[1]:
+            longest = (ex.id, n)
+    assert longest is not None
+    if longest[1] > cap:
+        over = sum(1 for n in rendered if n > cap)
+        raise RulerSizingError(
+            f"{over} of {len(examples)} RULER prompt(s) exceed the rendered input "
+            f"cap {cap}: the longest is {longest[0]!r} at {longest[1]} tokens "
+            f"(haystack {max(haystack)} + wrapper). The engine would refuse them; "
+            f"lower --ruler-context-tokens or raise the registered wrapper "
+            f"allowance (run_campaign.RULER_WRAPPER_ALLOWANCE) ({RULER_SIZING_FINDING})"
+        )
+    record: Dict[str, Any] = {
+        "cap": cap,
+        "n_items": len(examples),
+        "prompt_mode": prompt_mode,
+        "max_tokens": max_tokens,
+        "rendered_min": min(rendered),
+        "rendered_max": max(rendered),
+        "haystack_min": min(haystack),
+        "haystack_max": max(haystack),
+        "finding": RULER_SIZING_FINDING,
+    }
+    if prompt_mode == "chat":
+        record["template_kwargs"] = dict(RULER_RENDER_TEMPLATE_KWARGS)
+    return record
+
+
+def check_prepared_covers_arrivals(
+    *, n_prepared: int, n_arrivals: Optional[int], dropped_ids: Sequence[str]
+) -> None:
+    """Under ``--arrival-count`` every scheduled arrival needs its own
+    prepared request (the V3 contract: arrivals == the prepared pool). A
+    measured example that failed to prepare (retrieval, rerank, compression)
+    would otherwise reach the replay guard, whose message diagnoses replay
+    and suggests the non-confirmatory label; this names the dropped ids
+    instead and refuses before the first send (review of Batch 1 V3, F3).
+    Duration mode (``n_arrivals`` None) is untouched."""
+    if n_arrivals is None or n_prepared >= n_arrivals:
+        return
+    shown = ", ".join(str(i) for i in list(dropped_ids)[:10])
+    more = f" (+{len(dropped_ids) - 10} more)" if len(dropped_ids) > 10 else ""
+    raise LoadGeneratorError(
+        "prepared_requests",
+        n_prepared,
+        f"only {n_prepared} of the {n_arrivals} scheduled arrivals have a prepared "
+        f"request: {len(dropped_ids)} measured example(s) failed to prepare "
+        f"({shown}{more}); the window would under-measure its pool, so the cell "
+        "refuses before the first send (Batch 1 V3)",
+    )
+
+
 class RerankPoolError(ValueError):
     """``--rerank-pool`` (ADR-0104) cannot be realized as specified.
 
@@ -2193,6 +2375,11 @@ def run_experiment(
     # for this window (campaign mode), persisted as metrics.json['cold_start'].
     # None (the default) leaves every existing caller byte-identical.
     cold_start: Optional[Dict[str, Any]] = None,
+    # Batch 1 V1: the registered input shape every rendered RULER prompt must
+    # fit (the driver passes SHAPE-32K, 32,512, on every RULER cell); None
+    # leaves every non-RULER caller untouched. A campaign RULER cell without
+    # it refuses.
+    ruler_rendered_input_cap: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Run a single baseline experiment.
@@ -2484,7 +2671,43 @@ def run_experiment(
     # warm-cache scenario, where a warm cache helps precisely when the same prompts recur. The
     # warmup count is treated as a flag: when positive, the full measured set is warmed.
     print(f"\nLoading dataset '{dataset}'...")
-    loader = get_loader(dataset, split=default_dataset_split(dataset), seed=seed)
+    # Batch 1 V1 (part 1): the RULER haystack is sized under the SERVED
+    # model's tokenizer, never the whitespace proxy (a 32,512-word haystack is
+    # about 42,000 Qwen3 tokens). The counter comes from --model; a tokenizer
+    # that cannot load refuses a campaign cell before any engine work and
+    # leaves the pilot path on the labeled proxy with a warning.
+    _ruler_tokenizer: Any = None
+    _ruler_counter: Optional[Callable[[str], int]] = None
+    _ruler_counter_name: Optional[str] = None
+    if dataset == "ruler":
+        try:
+            _ruler_counter, _ruler_counter_name, _ruler_tokenizer = ruler_token_counter(model)
+        except Exception as exc:
+            if campaign_session is not None:
+                raise RulerSizingError(
+                    f"cannot load the tokenizer of {model!r} to size the RULER "
+                    f"haystack ({type(exc).__name__}: {exc}); a campaign RULER cell "
+                    f"is sized in the served model's tokens or not at all "
+                    f"({RULER_SIZING_FINDING})"
+                ) from exc
+            print(
+                f"[ruler] WARNING: tokenizer of {model!r} not loadable ({exc}); the "
+                "haystack is sized by the labeled whitespace proxy (pilot path only)"
+            )
+        else:
+            print(f"[ruler] haystack sized under the {_ruler_counter_name} tokenizer ({RULER_SIZING_FINDING})")
+    if _ruler_counter is not None:
+        loader = get_loader(
+            dataset,
+            split=default_dataset_split(dataset),
+            seed=seed,
+            token_counter=_ruler_counter,
+            token_counter_name=_ruler_counter_name,
+        )
+    else:
+        # Every non-RULER dataset (and the pilot RULER fallback) keeps the
+        # exact pre-V1 call shape.
+        loader = get_loader(dataset, split=default_dataset_split(dataset), seed=seed)
     # Uniform-yardstick manifest (2026-07-15): when CAGE_QUERY_MANIFEST is set, the
     # measured query set comes from ONE auditable, pre-drawn artifact shared by every
     # cell/engine/model (scripts/1_setup/build_query_manifest.py), so per-query pairing
@@ -2941,6 +3164,43 @@ def run_experiment(
     print(f"PROMPT MODE: {_prompt_mode} "
           f"({'chat template via /v1/chat/completions' if _prompt_mode == 'chat' else 'legacy raw completions'})")
 
+    # Batch 1 V1 (part 2): before the engine is even set up, render every
+    # measured RULER prompt the way the engine renders it and refuse the cell
+    # when one exceeds the registered input cap. The driver passes the cap on
+    # every RULER cell; a campaign RULER cell without it refuses.
+    ruler_sizing: Optional[Dict[str, Any]] = None
+    if dataset == "ruler":
+        if ruler_rendered_input_cap is None and campaign_session is not None:
+            raise RulerSizingError(
+                "a campaign RULER cell needs --ruler-rendered-input-cap (the "
+                "registered SHAPE-32K input the rendered request must fit; the "
+                f"driver passes 32512) ({RULER_SIZING_FINDING})"
+            )
+        if ruler_rendered_input_cap is not None:
+            if _ruler_tokenizer is None:
+                raise RulerSizingError(
+                    "--ruler-rendered-input-cap needs the served model's tokenizer "
+                    f"to render the prompts and it could not be loaded ({RULER_SIZING_FINDING})"
+                )
+            # The warm-up pool items are sent too (review F-6): same generator,
+            # same size, checked alongside the measured set.
+            ruler_sizing = check_ruler_rendered_inputs(
+                list(base_examples) + list(warmup_pool_examples),
+                tokenizer=_ruler_tokenizer,
+                prompt_mode=_prompt_mode,
+                cap=ruler_rendered_input_cap,
+                max_tokens=max_tokens,
+            )
+            ruler_sizing["n_warmup_items"] = len(warmup_pool_examples)
+            print(
+                f"RULER SIZING ({RULER_SIZING_FINDING}): {ruler_sizing['n_items']} prompts "
+                f"(measured plus warm-up pool) "
+                f"rendered under {_ruler_counter_name}, {ruler_sizing['rendered_min']} to "
+                f"{ruler_sizing['rendered_max']} tokens against the cap "
+                f"{ruler_rendered_input_cap} (haystack {ruler_sizing['haystack_min']} to "
+                f"{ruler_sizing['haystack_max']})"
+            )
+
     # Stop sequences per backend: the HF reference oracle fails closed on stop
     # lists BY DESIGN (run_cag_reference.py never uses them; the adapter refuses
     # to silently ignore a stop request), so hf-oracle requests carry stop=None.
@@ -3262,6 +3522,11 @@ def run_experiment(
         settle_ms: float = 0.0,
         open_loop_record: Optional[RequestRecord] = None,
     ) -> None:
+        # Batch 1 V1 (part 3): an engine "context length" refusal on the
+        # campaign path is a mis-sized cell, never an error row; the ADR-0116
+        # record guard wraps this into RecordStageError and the cell fails.
+        if campaign_session is not None and is_context_length_error(response.error):
+            raise ContextLengthError(example.id, response.error)
 
         question = meta["question"]
         used_contexts = meta["used_contexts"]
@@ -3800,6 +4065,7 @@ def run_experiment(
         nonlocal measured_window_t_start, measured_window_t_end
 
         prepared: List[Tuple[CAGExample, Dict[str, Any], InferenceRequest]] = []
+        dropped_prepare_ids: List[str] = []
         for example in measured_examples:
             # Per-query guard (B4): a failed prepare (retrieval / rerank /
             # compression) skips just this example, not the whole stage.
@@ -3807,6 +4073,7 @@ def run_experiment(
                 meta, request = build_open_loop_request(example)
             except Exception as _ex:
                 consort_counters["n_dropped_prepare"] += 1  # measured stage by definition
+                dropped_prepare_ids.append(example.id)
                 print(f"[open-loop] prepare failed for {example.id}: {_ex}; skipping")
                 continue
             prepared.append((example, meta, request))
@@ -3816,6 +4083,14 @@ def run_experiment(
                 len(measured_examples),
                 "no request prepared successfully for the open-loop measured stage",
             )
+        # Review of Batch 1 V3 (F3): under --arrival-count the pool must cover
+        # every scheduled arrival; name the dropped ids instead of letting the
+        # replay guard diagnose a replay that is really a prepare failure.
+        check_prepared_covers_arrivals(
+            n_prepared=len(prepared),
+            n_arrivals=open_loop_num_arrivals,
+            dropped_ids=dropped_prepare_ids,
+        )
 
         print(
             f"Open-loop dispatch: rate={open_loop_rate_qps} qps, "
@@ -4728,6 +5003,14 @@ def run_experiment(
     # check (k) re-derives its verdict from the recorded deltas.
     if pd_transfer_summary is not None:
         experiment_summary["pd_transfer"] = pd_transfer_summary
+    # Batch 1 V1: the rendered-input sizing of a RULER cell (cap, rendered and
+    # haystack token ranges, tokenizer). Present only when the check ran, so
+    # every other metrics.json schema stays byte-identical.
+    if ruler_sizing is not None:
+        experiment_summary["ruler_sizing"] = {
+            **ruler_sizing,
+            "tokenizer": _ruler_counter_name,
+        }
 
     write_json_atomic(metrics_file, experiment_summary)
     write_json_atomic(stable_metrics_file, experiment_summary)
@@ -5300,6 +5583,17 @@ def main():
              "CAGE_RULER_TASK.",
     )
     parser.add_argument(
+        "--ruler-rendered-input-cap",
+        type=int,
+        default=None,
+        help="Batch 1 V1: the registered input shape (tokens) every RENDERED "
+             "RULER prompt (haystack + chat wrapper) must fit; the runner renders "
+             "every measured prompt with the served model's tokenizer before any "
+             "engine work and refuses the cell when one exceeds it. The campaign "
+             "driver passes 32512 (SHAPE-32K) on every RULER cell, with "
+             "--ruler-context-tokens lowered by the registered wrapper allowance.",
+    )
+    parser.add_argument(
         "--num-queries",
         type=int,
         default=500,
@@ -5832,6 +6126,7 @@ def main():
             vllm_telemetry=args.vllm_telemetry,
             warmup_pool_queries=args.warmup_pool_queries,
             warmup_pool_trial=1,
+            ruler_rendered_input_cap=args.ruler_rendered_input_cap,
         )
 
     def _run_trials(top_k_value: int) -> None:
@@ -5964,6 +6259,7 @@ def main():
                 cold_start=(
                     cold_start_record if campaign_session is not None else None
                 ),
+                ruler_rendered_input_cap=args.ruler_rendered_input_cap,
             )
 
             # Load trial results. A metrics.json that EXISTS but does not parse is

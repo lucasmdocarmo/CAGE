@@ -402,6 +402,28 @@ nohup bash scripts/3_run/cloud_run.sh <MODEL> <N> <T> > run.log 2>&1 &
   resolves them before the pin) and while a shell `VLLM_PORT` / `SGLANG_PORT` / pd
   port value differs from the table (the preflight dials the shell value).
 
+- Engine handoff and the window bound are the driver's (Batch 1 V2 and V3,
+  2026-10-05, ADR-0139): every relaunch step records `launcher_key` and
+  `stop_argv`; `run` stops every launcher the plan uses once before its first
+  step (clean room), stops the previous family before a relaunch of another
+  launcher, and stops the last family when the run ends (`plan` prints the count
+  as `engine stops`; a failed stop is printed and makes the exit code nonzero
+  without gating the seal; a launcher the plan never uses is never touched).
+  Window cells (F2, F3, RULER) carry `--arrival-count` equal to their
+  `--num-queries` and never `--duration-s` (the runner's replay guard refuses a
+  duration-bound window once rate x duration exceeds the prepared pool);
+  `--window-duration-s` is the pre-costed estimate the header records. A hand-run
+  window row must pass `--arrival-count <W>` (S0 did, with 50).
+  RULER cells (Batch 1 V1, ADR-0140) are sized in the served model's tokens:
+  every RULER cell carries `--ruler-context-tokens 32384` (the SHAPE-32K input
+  minus the registered 128-token chat wrapper allowance) and
+  `--ruler-rendered-input-cap 32512`; the runner renders every prompt with the
+  model's chat template before any engine work and refuses the cell when one
+  exceeds the cap (`metrics.json["ruler_sizing"]` records the range), and an
+  engine "maximum context length" error on a campaign cell fails the cell. A
+  hand-run RULER row must pass both flags; the loader's own default stays the
+  labeled whitespace proxy for pilots.
+
 - Floors and budget records are pinned by the campaign driver (Batch 2 W4,
   ADR-0117, §3.2): every cell step carries `CAGE_SLO_FLOORS_JSON` and every
   budgeted cell step `CAGE_BUDGET_PLAN_JSON`; `load_plan` refuses a plan without
