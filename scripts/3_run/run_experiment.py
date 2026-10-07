@@ -336,6 +336,39 @@ def capture_backend_metadata(
                 metadata["loaded_models"] = loaded_models
                 metadata["loaded_model"] = loaded_models[0]
 
+    elif backend == "sglang":
+        # S0F-41 (live H100, 2026-10-07): the campaign seam refuses a window
+        # without engine provenance, and this branch did not exist, so every
+        # SGLang cell was refused after running. SGLang serves from its own
+        # venv (ADR-0120), so its client library is not importable here; the
+        # server answers GET /get_server_info with {"version": sglang.__version__,
+        # ...} [V installed 0.5.10.post1, srt/entrypoints/http_server.py line 617].
+        info_payload = _safe_get_json(f"{api_base}/get_server_info")
+        if isinstance(info_payload, dict):
+            metadata["server_version"] = info_payload.get("version")
+        models_payload = _safe_get_json(f"{api_base}/v1/models")
+        if isinstance(models_payload, dict):
+            loaded_models = [
+                str(item.get("id"))
+                for item in models_payload.get("data", [])
+                if isinstance(item, dict) and item.get("id")
+            ]
+            if loaded_models:
+                metadata["loaded_models"] = loaded_models
+                metadata["loaded_model"] = loaded_models[0]
+
+    elif backend in {"hf-oracle", "hf_oracle"}:
+        # S0F-41: the HF oracle runs the model in-process; transformers is the
+        # engine, so its version is the provenance the seam requires.
+        try:
+            import transformers  # type: ignore
+
+            metadata["client_library_version"] = f"transformers {transformers.__version__}"
+        except Exception:
+            metadata["client_library_version"] = None
+        metadata["loaded_model"] = model_name
+        metadata["loaded_models"] = [model_name]
+
     elif backend == "ollama":
         if shutil.which("ollama"):
             metadata["client_library_version"] = _safe_run(["ollama", "--version"])
