@@ -30,6 +30,11 @@ MASTER = EXPDIR / "cage_experiment.sh"
 STAGES = ["preflight-mac", "provision", "ship", "setup", "validate", "calibrate", "plan", "run",
           "monitor", "seal", "score", "collect", "pull", "analyze", "teardown"]
 DATE = "2026-10-06"
+# The child shells that source the shipped profiles get PATH only. Under the
+# master the whole profile is exported (set -a), so an inherited EXP made the
+# _common.env case print "S0" and failed stage 0 on the S0 day (2026-10-07).
+# The files are the subject of those tests, never the caller's environment.
+PROFILE_ENV = {"PATH": os.environ.get("PATH", "")}
 
 pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="bash not on PATH")
 
@@ -683,7 +688,7 @@ def test_shipped_profiles_cover_their_stage_bounds_and_name_registered_models() 
     for p in sorted((EXPDIR / "profiles").glob("S*.env")):
         proc = subprocess.run(["bash", "-c", f'set -a; source "{EXPDIR}/profiles/_common.env"; source "{p}"; '
                                'printf "%s|%s|%s|%s|%s|%s|%s" "$MODEL_SLUG" "$SEATBELT" "$HOURS" "$SETUP_BOUND_MIN" "$ENGINES" "$CALIBRATE" "${SCORE_BOUND_MIN:-180}"'],
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, env=PROFILE_ENV)
         slug, seatbelt, hours, setup_min, engines, calibrate, score_min = proc.stdout.split("|")
         assert slug in cb.MODEL_KV, f"{p.name}: MODEL_SLUG={slug} is not in cache_budget.MODEL_KV {sorted(cb.MODEL_KV)}"
         n_srv = len([e for e in engines.split() if e != "hf"]); n_cal = len(calibrate.split())
@@ -814,5 +819,5 @@ def test_write_analysis_header_and_profiles_are_plain() -> None:
                 assert re.fullmatch(r"[A-Z_][A-Z0-9_]*=.*", line), f"{p.name}: {line}"
                 assert "$(" not in line and "`" not in line, f"{p.name}: {line}"
         proc = subprocess.run(["bash", "-c", f'set -a; source "{EXPDIR}/profiles/_common.env"; source "{p}"; printf "%s" "$EXP"'],
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, env=PROFILE_ENV)
         assert proc.returncode == 0 and proc.stdout == (p.stem if p.stem != "_common" else ""), p.name
