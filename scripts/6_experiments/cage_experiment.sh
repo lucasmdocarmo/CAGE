@@ -397,8 +397,16 @@ stage_preflight_mac() {
   plan_only || { grep -v '^#' "$STEP_LOG" > "$EXTRAS/ops/pods_before.json"; json_empty "$EXTRAS/ops/pods_before.json" || { printf '  [FAIL] clean room: pods exist before this experiment (see %s)\n' "$EXTRAS/ops/pods_before.json"; return 1; }; }
   run_step 0 "clean room: network-volume list" -- runpodctl network-volume list || return 1
   plan_only || { grep -v '^#' "$STEP_LOG" > "$EXTRAS/ops/volumes_before.json"; json_empty "$EXTRAS/ops/volumes_before.json" || { printf '  [FAIL] clean room: network volumes exist before this experiment (see %s)\n' "$EXTRAS/ops/volumes_before.json"; return 1; }; }
-  run_step 0 "Mac test suite" -- bash "$SCRIPTS/checks/run_tests.sh" -q -p no:cacheprovider || return 1
-  plan_only || cp "$STEP_LOG" "$LAND/logs/setup/suite_mac.log"
+  # The Mac suite is the free gate. MAC_SUITE=0 skips that one step loudly when
+  # the profile vouches for HEAD and says why (SUITE_ON_POD=1 keeps the suite
+  # on the pod); every other stage 0 check stays (owner, 2026-10-07, ADR-0145).
+  if [ "${MAC_SUITE:-1}" = "0" ]; then
+    say "Mac test suite SKIPPED (MAC_SUITE=0 in the profile; SUITE_ON_POD=${SUITE_ON_POD:-0} on the pod is the gate)"
+    plan_only || state note preflight-mac "Mac test suite skipped (MAC_SUITE=0 in the profile)"
+  else
+    run_step 0 "Mac test suite" -- bash "$SCRIPTS/checks/run_tests.sh" -q -p no:cacheprovider || return 1
+    plan_only || cp "$STEP_LOG" "$LAND/logs/setup/suite_mac.log"
+  fi
   run_step 0 "package the repo" -- bash "$SCRIPTS/ops/package_repo.sh" "$tarball" || return 1
   if ! plan_only; then
     step_has "PACKAGED" || { printf '  [FAIL] package_repo.sh printed no PACKAGED line\n'; return 1; }

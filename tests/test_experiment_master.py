@@ -787,6 +787,29 @@ def test_dirty_build_fails_stage_0(world: Dict[str, Path]) -> None:
     assert proc.returncode == 1 and "BUILD_INFO is not dirty=0" in proc.stdout
 
 
+def test_mac_suite_zero_skips_only_the_suite_loudly_and_records_it(world: Dict[str, Path], tmp_path: Path) -> None:
+    # ADR-0145: the default runs the suite gate; MAC_SUITE=0 skips that one step,
+    # says so, notes it in the state, and every other stage 0 check still runs.
+    assert _master(world).returncode == 10
+    assert sum(1 for c in _calls(world) if c.startswith("run_tests")) == 1
+    skip = tmp_path / "S1_nosuite.env"
+    skip.write_text(world["profile"].read_text(encoding="utf-8") + "\nMAC_SUITE=0\n", encoding="utf-8")
+    world["profile"] = skip
+    proc = _master(world, "--plan")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Mac test suite SKIPPED (MAC_SUITE=0" in proc.stdout and "[plan] Mac test suite" not in proc.stdout
+    proc = _master(world, "--from", "preflight-mac", "--redo", "--to", "preflight-mac")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Mac test suite SKIPPED (MAC_SUITE=0" in proc.stdout
+    calls = _calls(world)
+    assert sum(1 for c in calls if c.startswith("run_tests")) == 1          # the suite did not run again
+    assert sum(1 for c in calls if c.startswith("package_repo")) == 2        # the other checks did
+    assert sum(1 for c in calls if c.startswith("runpodctl gpu list")) == 2
+    st = _state(world)
+    assert st["stages"]["preflight-mac"]["status"] == "passed"
+    assert any("MAC_SUITE=0" in n for n in st["stages"]["preflight-mac"]["notes"])
+
+
 def test_rehearsal_n_reaches_the_planner_and_blocked_cells_need_the_profile_consent(world: Dict[str, Path], tmp_path: Path) -> None:
     # ADR-0144: REHEARSAL_N rides the plan argv; a plan with blocked cells
     # refuses stage 7 unless SKIP_BLOCKED=1, which adds --skip-blocked loudly.
