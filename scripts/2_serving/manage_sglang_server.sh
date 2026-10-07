@@ -64,6 +64,14 @@
 # Validated BEFORE any server is stopped or launched
 # (cage_validate_sglang_tp_env in scripts/lib/_serving_config.sh).
 #
+# Piecewise CUDA-graph lever (S0F-35, live H100 2026-10-07): SGLang 0.5.10.post1
+# died in its piecewise CUDA-graph capture of Qwen3-14B ("FusedAddRMSNorm failed
+# ... an illegal memory access"; its own log names the workaround):
+#   CAGE_SGLANG_DISABLE_PIECEWISE_CUDA_GRAPH=1  adds `--disable-piecewise-cuda-graph`
+#                                 (the piecewise capture only; full CUDA graphs
+#                                 stay on, unlike VLLM_ENFORCE_EAGER). A reuse
+#                                 dial and a serving-config field like the rest.
+#
 # Interpreter contract (pre-GO item 10, 2026-09-26): SGLang lives in its OWN
 # venv (setup_runpod.sh step 3c, <repo>/sglang-env; its transformers and torch
 # pins conflict with cage-env), so this launcher never depends on the caller's
@@ -249,6 +257,13 @@ start_server() {
         else
             [[ "$live_cmd" != *"--tp-size"* ]] || dials_match=false
         fi
+        # The piecewise CUDA-graph lever (S0F-35) is a dial too: requested =>
+        # the flag must be live; absent => it must be absent.
+        if [ "${CAGE_SGLANG_DISABLE_PIECEWISE_CUDA_GRAPH:-0}" = "1" ]; then
+            [[ " $live_cmd " == *" --disable-piecewise-cuda-graph "* ]] || dials_match=false
+        else
+            [[ "$live_cmd" != *"--disable-piecewise-cuda-graph"* ]] || dials_match=false
+        fi
         # /metrics exposure (S0-23, ADR-0102) is a reuse requirement too: a
         # server started without --enable-metrics (pre-A14, or by hand) has
         # no running-requests gauge, so every window served from it would
@@ -326,6 +341,12 @@ start_server() {
         echo "Eager mode ON: --disable-cuda-graph"
     fi
 
+    # S0F-35 (live H100, 2026-10-07): the piecewise capture only (see the header).
+    if [ "${CAGE_SGLANG_DISABLE_PIECEWISE_CUDA_GRAPH:-0}" = "1" ]; then
+        sglang_args+=( --disable-piecewise-cuda-graph )
+        echo "Piecewise CUDA graph OFF: --disable-piecewise-cuda-graph (S0F-35)"
+    fi
+
     # Optional server-side KV-cache compression (compressed_cag analogue), e.g.
     #   SGLANG_KV_CACHE_DTYPE=fp8_e5m2 ./scripts/2_serving/manage_sglang_server.sh restart <model>
     if [ -n "${SGLANG_KV_CACHE_DTYPE:-}" ]; then
@@ -363,6 +384,7 @@ start_server() {
         SC_TENSOR_PARALLEL="${CAGE_SGLANG_TP:-}" \
         SC_KV_DTYPE="${SGLANG_KV_CACHE_DTYPE:-auto}" \
         SC_EAGER="${VLLM_ENFORCE_EAGER:-0}" \
+        SC_PIECEWISE_OFF="${CAGE_SGLANG_DISABLE_PIECEWISE_CUDA_GRAPH:-0}" \
         SC_ARGS="$SGLANG_PYTHON -m sglang.launch_server ${sglang_args[*]}" \
         SC_FILE="$cfg_file" \
         python3 - <<'PYEOF' || echo "  (serving-config capture failed; non-fatal)"
@@ -399,6 +421,8 @@ cfg = {
     ),
     "kv_cache_dtype": os.environ.get("SC_KV_DTYPE") or "auto",
     "enforce_eager": os.environ.get("SC_EAGER") == "1",
+    # S0F-35: true when the piecewise CUDA-graph capture was switched off.
+    "disable_piecewise_cuda_graph": os.environ.get("SC_PIECEWISE_OFF") == "1",
     "args": os.environ["SC_ARGS"],
 }
 with open(os.environ["SC_FILE"], "w", encoding="utf-8") as fh:

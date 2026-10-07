@@ -849,6 +849,41 @@ def test_pod_jobs_that_start_engines_put_the_driver_venv_first_on_path(world: Di
     # preflight gate (p) judges exactly the datasets stage 3 staged (the profile's CHARTER_DATASETS)
     assert "CAGE_DATASETS=squad_v2,musique,qasper" in (world["home"] / ".cage_jobs" / "validate_vllm.cmd").read_text(encoding="utf-8")
     assert "cage-env/bin" not in (world["home"] / ".cage_jobs" / "setup.cmd").read_text(encoding="utf-8")
+    # the profile's engine levers are not in the job commands unless set
+    for name in ("validate_vllm", "calibrate_vllm", "run"):
+        assert "CAGE_SGLANG_DISABLE_PIECEWISE_CUDA_GRAPH" not in (world["home"] / ".cage_jobs" / f"{name}.cmd").read_text(encoding="utf-8")
+
+
+def test_the_sglang_piecewise_lever_is_forwarded_to_every_engine_job(world: Dict[str, Path], tmp_path: Path) -> None:
+    # S0F-35: the profile sets the lever; the pod sees it only through the job command.
+    lever = tmp_path / "S1_lever.env"
+    lever.write_text(world["profile"].read_text(encoding="utf-8") + "\nCAGE_SGLANG_DISABLE_PIECEWISE_CUDA_GRAPH=1\n", encoding="utf-8")
+    world["profile"] = lever
+    proc = _master(world, "--yes", "provision", "--to", "run")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    for name in ("validate_vllm", "calibrate_vllm", "run"):
+        cmd = (world["home"] / ".cage_jobs" / f"{name}.cmd").read_text(encoding="utf-8")
+        assert " CAGE_SGLANG_DISABLE_PIECEWISE_CUDA_GRAPH=1 && " in cmd, (name, cmd[:200])
+    assert "CAGE_SGLANG_DISABLE_PIECEWISE_CUDA_GRAPH" not in (world["home"] / ".cage_jobs" / "setup.cmd").read_text(encoding="utf-8")
+
+
+def test_a_stage_0_redo_mid_run_keeps_the_run_id_and_tolerates_its_own_pod_and_volume(world: Dict[str, Path]) -> None:
+    # S0F-36: a code fix mid-run must re-ship through stage 0 and stage 2 while
+    # this landing's own pod and volume exist; a foreign resource still refuses.
+    proc = _master(world, "--yes", "provision", "--to", "ship")
+    assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-800:]
+    rid = _state(world)["run_id"]
+    ours = {"CAGE_TEST_PODS": '[{"id": "pod123"}]', "CAGE_TEST_VOLUMES": '[{"id": "vol123"}]'}
+    proc = _master(world, "--only", "preflight-mac", "--redo", CAGE_TEST_SHA="fedcba9876543210fedcba9876543210fedcba98", **ours)
+    assert proc.returncode == 0, proc.stdout[-2500:] + proc.stderr[-800:]
+    assert "run id kept" in proc.stdout
+    st = _state(world)
+    assert st["run_id"] == rid and st["build"]["sha"].startswith("fedcba")
+    proc = _master(world, "--only", "ship", "--redo", **ours)
+    assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-800:]
+    assert _state(world)["stages"]["ship"]["status"] == "passed"
+    proc = _master(world, "--only", "preflight-mac", "--redo", CAGE_TEST_PODS='[{"id": "pod123"}, {"id": "stranger"}]', CAGE_TEST_VOLUMES='[{"id": "vol123"}]')
+    assert proc.returncode == 1 and "clean room: pods exist" in proc.stdout
 
 
 def test_without_rehearsal_n_and_without_blocked_cells_the_argv_is_unchanged(world: Dict[str, Path]) -> None:

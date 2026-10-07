@@ -119,6 +119,11 @@ POD_TARBALL="${POD_TARBALL:-/root/cage_repo.tar.gz}"
 # 2026-10-07: the validate job's start died with "failed to run command
 # 'vllm'" and the preflight ran under the system python3).
 POD_VENV_BIN="$POD_REPO/${POD_PYTHON%/*}"
+# Engine levers the profile sets reach the pod only through the job command:
+# the ones the launchers read are forwarded (S0F-35: the SGLang piecewise
+# CUDA-graph lever; the string is empty when the profile leaves it unset).
+POD_ENGINE_ENV=""
+[ "${CAGE_SGLANG_DISABLE_PIECEWISE_CUDA_GRAPH:-0}" = "1" ] && POD_ENGINE_ENV=" CAGE_SGLANG_DISABLE_PIECEWISE_CUDA_GRAPH=1"
 FREEZE_FILE="${FREEZE_FILE:-$PROJECT_DIR/MyDocs/registration/freeze_resolutions.json}"
 POD_FREEZE_FILE="MyDocs/registration/freeze_resolutions.json"
 SCORE_BOUND_MIN="${SCORE_BOUND_MIN:-180}"
@@ -347,6 +352,28 @@ sys.exit(0 if empty(doc) else 1)
 PY
 }
 
+json_only_ours() {
+  # json_only_ours <file> [id]...: 0 when every resource the listing holds is
+  # one of the given ids (an empty listing passes; no ids = json_empty).
+  # S0F-36: a stage 0 redo mid-run (a code fix that must re-ship) meets this
+  # landing's own pod and volume; anything else is still a clean-room refusal.
+  "$PY3" - "$@" <<'PY'
+import json, sys
+try:
+    doc = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit(2)
+ours = set(sys.argv[2:])
+items = doc if isinstance(doc, list) else []
+if isinstance(doc, dict):
+    for v in doc.values():
+        if isinstance(v, list):
+            items = items + v
+ids = [str(i.get("id", "")) for i in items if isinstance(i, dict)]
+sys.exit(0 if all(i in ours for i in ids) and len(ids) == len(items) else 1)
+PY
+}
+
 engine_launcher() { case "$1" in vllm) echo manage_vllm_server.sh ;; sglang) echo manage_sglang_server.sh ;; lmdeploy) echo manage_lmdeploy_server.sh ;; *) return 1 ;; esac; }
 engine_api()      { case "$1" in vllm) echo http://localhost:8000 ;; sglang) echo http://localhost:30000 ;; lmdeploy) echo http://localhost:23333 ;; *) return 1 ;; esac; }
 server_engines()  { local e; for e in $ENGINES; do [ "$e" = "hf" ] || echo "$e"; done; }
@@ -400,9 +427,9 @@ stage_preflight_mac() {
   run_step 0 "account balance (before)" -- runpodctl user || return 1
   plan_only || { cp "$STEP_LOG" "$EXTRAS/ops/user_before.txt"; state put cost.balance_before_raw "$(grep -v '^#' "$STEP_LOG" | tr -d '\n' | cut -c1-400)"; }
   run_step 0 "clean room: pod list --all" -- runpodctl pod list --all || return 1
-  plan_only || { grep -v '^#' "$STEP_LOG" > "$EXTRAS/ops/pods_before.json"; json_empty "$EXTRAS/ops/pods_before.json" || { printf '  [FAIL] clean room: pods exist before this experiment (see %s)\n' "$EXTRAS/ops/pods_before.json"; return 1; }; }
+  plan_only || { grep -v '^#' "$STEP_LOG" > "$EXTRAS/ops/pods_before.json"; json_only_ours "$EXTRAS/ops/pods_before.json" $(state get pod.id 2>/dev/null || true) || { printf '  [FAIL] clean room: pods exist before this experiment (see %s)\n' "$EXTRAS/ops/pods_before.json"; return 1; }; }
   run_step 0 "clean room: network-volume list" -- runpodctl network-volume list || return 1
-  plan_only || { grep -v '^#' "$STEP_LOG" > "$EXTRAS/ops/volumes_before.json"; json_empty "$EXTRAS/ops/volumes_before.json" || { printf '  [FAIL] clean room: network volumes exist before this experiment (see %s)\n' "$EXTRAS/ops/volumes_before.json"; return 1; }; }
+  plan_only || { grep -v '^#' "$STEP_LOG" > "$EXTRAS/ops/volumes_before.json"; json_only_ours "$EXTRAS/ops/volumes_before.json" $(state get pod.volume_id 2>/dev/null || true) || { printf '  [FAIL] clean room: network volumes exist before this experiment (see %s)\n' "$EXTRAS/ops/volumes_before.json"; return 1; }; }
   # The Mac suite is the free gate. MAC_SUITE=0 skips that one step loudly when
   # the profile vouches for HEAD and says why (SUITE_ON_POD=1 keeps the suite
   # on the pod); every other stage 0 check stays (owner, 2026-10-07, ADR-0145).
@@ -477,10 +504,17 @@ PY
   run_step 0 "provision plan print" -- bash "$SCRIPTS/runpod/provision_pod.sh" --gpu-id "$GPU_ID" --gpu-count "$GPU_COUNT" --disk-gb "$DISK_GB" --volume-gb "$VOLUME_GB" --terminate-after "$SEATBELT" --hours "$HOURS" --purpose "$EXP $DATE" || return 1
   plan_only || step_has "PLAN ONLY" || { printf '  [FAIL] provision plan print lacks the PLAN ONLY line\n'; return 1; }
   if ! plan_only; then
-    local rid; rid="$(mint_campaign_run_id "$SESSION" "$MODEL_SLUG")"
-    printf '%s' "$rid" | grep -qE '^[a-z0-9][a-z0-9-]{2,40}$' || { printf '  [FAIL] minted run id %s violates the run_id grammar\n' "$rid"; return 1; }
-    state put run_id "$rid"
-    say "run id minted: $rid (campaign root on the pod: $POD_REPO/results/$CAMPAIGN/$SESSION/$rid)"
+    # S0F-36: a stage 0 redo (a code fix re-shipped mid-run) keeps the run id;
+    # the campaign root on the pod never moves under a running landing.
+    local rid; rid="$(state get run_id 2>/dev/null || true)"
+    if [ -n "$rid" ]; then
+      say "run id kept: $rid (a stage 0 redo never re-mints the run)"
+    else
+      rid="$(mint_campaign_run_id "$SESSION" "$MODEL_SLUG")"
+      printf '%s' "$rid" | grep -qE '^[a-z0-9][a-z0-9-]{2,40}$' || { printf '  [FAIL] minted run id %s violates the run_id grammar\n' "$rid"; return 1; }
+      state put run_id "$rid"
+      say "run id minted: $rid (campaign root on the pod: $POD_REPO/results/$CAMPAIGN/$SESSION/$rid)"
+    fi
   fi
   return 0
 }
@@ -639,7 +673,7 @@ stage_validate() {
     launcher="$(engine_launcher "$e")" || { printf '  [FAIL] unknown engine %s\n' "$e"; return 1; }
     api="$(engine_api "$e")"
     # after `stop` the GPU process takes a few seconds to leave the compute-apps list: wait up to 60 s before reading it
-    job_run "validate_$e" 1500 "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT CAGE_DATASETS=$ds && bash scripts/2_serving/$launcher start '$MODEL' && curl -sf $api/v1/models >/dev/null && echo VALIDATE_API_OK; CAGE_PREFLIGHT_BACKENDS=$e bash scripts/checks/preflight_check.sh '$MODEL' $api; rc=\$?; bash scripts/2_serving/$launcher stop; n=1; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do n=\$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . || true); [ \"\$n\" -eq 0 ] && break; sleep 2; done; echo COMPUTE_APPS=\$n; exit \$rc" "$LAND/logs/setup" || return 1
+    job_run "validate_$e" 1500 "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT CAGE_DATASETS=$ds$POD_ENGINE_ENV && bash scripts/2_serving/$launcher start '$MODEL' && curl -sf $api/v1/models >/dev/null && echo VALIDATE_API_OK; CAGE_PREFLIGHT_BACKENDS=$e bash scripts/checks/preflight_check.sh '$MODEL' $api; rc=\$?; bash scripts/2_serving/$launcher stop; n=1; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do n=\$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . || true); [ \"\$n\" -eq 0 ] && break; sleep 2; done; echo COMPUTE_APPS=\$n; exit \$rc" "$LAND/logs/setup" || return 1
     plan_only && continue
     grep -q "VALIDATE_API_OK" "$JOB_LOG" || { printf '  [FAIL] %s: /v1/models never answered\n' "$e"; return 1; }
     grep -q "PREFLIGHT PASS" "$JOB_LOG" || { printf '  [FAIL] %s: preflight did not PASS\n' "$e"; return 1; }
@@ -655,7 +689,7 @@ stage_calibrate() {
     launcher="$(engine_launcher "$e")" || { printf '  [FAIL] unknown engine %s\n' "$e"; return 1; }
     api="$(engine_api "$e")"
     out="results/calibration/${EXP}_${e}.json"
-    job_run "calibrate_$e" 3600 "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT && bash scripts/2_serving/$launcher start '$MODEL' && $POD_PYTHON scripts/3_run/calibrate_cell.py --backend $e --model '$MODEL' --api-base $api --manifest $CALIBRATION_MANIFEST --output $out --budget-fraction $CALIBRATION_BUDGET_FRACTION; rc=\$?; bash scripts/2_serving/$launcher stop; exit \$rc" "$LAND/logs/setup" || return 1
+    job_run "calibrate_$e" 3600 "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT$POD_ENGINE_ENV && bash scripts/2_serving/$launcher start '$MODEL' && $POD_PYTHON scripts/3_run/calibrate_cell.py --backend $e --model '$MODEL' --api-base $api --manifest $CALIBRATION_MANIFEST --output $out --budget-fraction $CALIBRATION_BUDGET_FRACTION; rc=\$?; bash scripts/2_serving/$launcher stop; exit \$rc" "$LAND/logs/setup" || return 1
     run_step 0 "fetch calibration $e" -- pscp_from "$POD_REPO/$out" "$EXTRAS/calibration/${EXP}_${e}.json" || return 1
     plan_only && continue
     run_step 0 "calibration $e: cal-v2 and floor-derived start" -- "$PY3" - "$EXTRAS/calibration/${EXP}_${e}.json" <<'PY' || return 1
@@ -748,7 +782,7 @@ stage_run() {
     fi
   fi
   local name="run"
-  run_step 0 "job $name: submit" -- bash "$PODJOB" submit "$name" "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH && env $RUN_ENV_UNSET CAGE_RUN_ROOT=$POD_RUN_ROOT VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT $POD_PYTHON scripts/3_run/run_campaign.py run --plan results/calibration/plan_$RUN_ID.json --campaign-root $POD_RUN_ROOT --seal$partial" "$bound" || return 1
+  run_step 0 "job $name: submit" -- bash "$PODJOB" submit "$name" "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH$POD_ENGINE_ENV && env $RUN_ENV_UNSET CAGE_RUN_ROOT=$POD_RUN_ROOT VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT $POD_PYTHON scripts/3_run/run_campaign.py run --plan results/calibration/plan_$RUN_ID.json --campaign-root $POD_RUN_ROOT --seal$partial" "$bound" || return 1
   if plan_only; then
     printf '  [plan] %-28s expect DONE(0) or STOP FAILED(2): bash %s wait run %s\n' "job run: wait" "$PODJOB" "$bound"
     return 0
