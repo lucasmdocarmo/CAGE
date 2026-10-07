@@ -304,7 +304,7 @@ def world(tmp_path: Path) -> Dict[str, Path]:
                     "steps": [{"kind": "relaunch", "engine": "vllm", "argv": ["manage_vllm_server.sh", "start"]},
                               {"kind": "cell", "engine": "vllm", "row_key": "k1", "argv": ["run_experiment.py", "--vllm-telemetry"]},
                               {"kind": "cell", "engine": "hf", "row_key": "k2", "argv": ["run_cag_reference.py"]}],
-                    "blocked_row_keys": []}
+                    "blocked_row_keys": ["k9"] if os.environ.get("CAGE_TEST_BLOCKED") else []}
             if os.environ.get("CAGE_TEST_BAD_PLAN"):
                 plan["steps"][1]["argv"] = ["run_experiment.py"]
             out.write_text(json.dumps(plan), encoding="utf-8"); print("plan written"); sys.exit(0)
@@ -319,6 +319,7 @@ def world(tmp_path: Path) -> Dict[str, Path]:
             (root / "observability" / "serving_configs").mkdir(parents=True, exist_ok=True)
             (root / "observability" / "serving_configs" / "x_vllm.json").write_text(json.dumps({"engine": "vllm", "gpu_memory_utilization": 0.9, "kv_pool_bytes_realized": 5713920000}), encoding="utf-8")
             print("env CAGE_RUN_ROOT=", os.environ.get("CAGE_RUN_ROOT"), "VLLM_START_TIMEOUT=", os.environ.get("VLLM_START_TIMEOUT"))
+            print("run argv:", " ".join(a))
             for bad in ("CAGE_SLO_FLOORS_JSON", "CAGE_ALLOW_STALE_INDEX", "VLLM_PORT"):
                 if bad in os.environ:
                     print(f"REFUSED: {bad} is set", file=sys.stderr); sys.exit(2)
@@ -784,6 +785,40 @@ def test_clean_room_violation_fails_stage_0(world: Dict[str, Path]) -> None:
 def test_dirty_build_fails_stage_0(world: Dict[str, Path]) -> None:
     proc = _master(world, CAGE_TEST_DIRTY="1")
     assert proc.returncode == 1 and "BUILD_INFO is not dirty=0" in proc.stdout
+
+
+def test_rehearsal_n_reaches_the_planner_and_blocked_cells_need_the_profile_consent(world: Dict[str, Path], tmp_path: Path) -> None:
+    # ADR-0144: REHEARSAL_N rides the plan argv; a plan with blocked cells
+    # refuses stage 7 unless SKIP_BLOCKED=1, which adds --skip-blocked loudly.
+    reh = tmp_path / "S1_rehearsal.env"
+    reh.write_text(world["profile"].read_text(encoding="utf-8") + "\nREHEARSAL_N=50\n", encoding="utf-8")
+    world["profile"] = reh
+    proc = _master(world, "--yes", "provision", "--to", "run", CAGE_TEST_BLOCKED="1")
+    assert proc.returncode == 1, proc.stdout[-3000:] + proc.stderr[-1000:]
+    plan = json.loads((world["exp_root"] / "S1" / DATE / "extras" / "plan.json").read_text(encoding="utf-8"))
+    assert "--rehearsal-n" in plan["argv"] and plan["argv"][plan["argv"].index("--rehearsal-n") + 1] == "50"
+    assert "the plan carries 1 blocked cell(s)" in proc.stdout and "SKIP_BLOCKED is not 1" in proc.stdout
+    assert not any(".cage_jobs/run.cmd" in c for c in _calls(world))      # nothing was submitted
+    assert _state(world)["stages"]["run"]["status"] == "failed"
+    # with the consent: the run is submitted with --skip-blocked and the note lands in the state
+    consent = tmp_path / "S1_rehearsal_consent.env"
+    consent.write_text(reh.read_text(encoding="utf-8") + "SKIP_BLOCKED=1\n", encoding="utf-8")
+    world["profile"] = consent
+    proc = _master(world, "--from", "run", "--redo", "--to", "run", CAGE_TEST_BLOCKED="1")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert "running the executable subset loudly (SKIP_BLOCKED=1)" in proc.stdout
+    log = (world["exp_root"] / "S1" / DATE / "logs" / "runner" / "run.log").read_text(encoding="utf-8")
+    assert "run argv:" in log and "--skip-blocked" in log and "--seal-partial" not in log
+    assert any("blocked cell(s) skipped loudly" in n for n in _state(world)["stages"]["run"]["notes"])
+
+
+def test_without_rehearsal_n_and_without_blocked_cells_the_argv_is_unchanged(world: Dict[str, Path]) -> None:
+    proc = _master(world, "--yes", "provision", "--to", "run")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    plan = json.loads((world["exp_root"] / "S1" / DATE / "extras" / "plan.json").read_text(encoding="utf-8"))
+    assert "--rehearsal-n" not in plan["argv"]
+    log = (world["exp_root"] / "S1" / DATE / "logs" / "runner" / "run.log").read_text(encoding="utf-8")
+    assert "--skip-blocked" not in log and "blocked cell" not in proc.stdout
 
 
 # ---------------------------------------------------------------------------

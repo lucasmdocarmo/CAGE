@@ -224,6 +224,19 @@ subsets), so the plan REFUSES a manifest whose trials carry fewer than n ids
 for that dataset's cells. The 2,000 to 1,600 to 1,200 step-down is an
 ANALYSIS-time realized-n policy, never a plan knob.
 
+Dress rehearsal (2026-10-07, ADR-0144): ``plan --rehearsal-n N`` derives,
+from the REGISTERED grid of ``--session``, the grid of a full-chain rehearsal
+run: every baseline, engine, HF-oracle cell, RULER task and B12 rung kept;
+the datasets restricted to those with a registered ``--query-manifest``; F2
+collapsed to the lower-median (budget, rate) of its factorial plus the first
+fine-only coordinate when the session registers a fine grid; F3 collapsed to
+its lower medians; one window per cell; every row class at n = N; no
+achievable_n override. ``rehearsal_grid`` is the one rule (never a hand list),
+the plan header records it under ``rehearsal`` (null on a registered plan),
+and the registered grids are never modified. The rehearsal exists so stages
+6 to 14 of the experiment master run once, end to end, before a registered
+session spends its hours; its numbers are DESIGN-INPUT-ONLY by construction.
+
 Ordering minimizes engine relaunches: cells sort on (engine, prefix_mode,
 model, budget_r, kv_dtype, connector, rate); every serving-config change is
 an explicit ``relaunch`` step in the plan carrying the launcher argv + launch
@@ -350,6 +363,7 @@ __all__ = [
     "main",
     "parse_calibration_args",
     "plan_launchers",
+    "rehearsal_grid",
     "row_class",
     "slo_floors_env_value",
     "stop_boundaries",
@@ -1682,6 +1696,112 @@ def get_session_grid(session: str) -> SessionGrid:
             "refusing to fabricate a grid"
         )
     return grid
+
+
+# ---------------------------------------------------------------------------
+# Dress rehearsal of a registered session (2026-10-07, ADR-0144)
+# ---------------------------------------------------------------------------
+
+REHEARSAL_ADR: str = "ADR-0144"
+#: The ONE derivation rule, recorded verbatim in the plan header so the
+#: operator reviews what was collapsed, never a hand-picked cell list.
+REHEARSAL_RULE: str = (
+    "every baseline, engine, HF-oracle cell, RULER task and B12 rung of the "
+    "registered session; datasets restricted to those with a registered query "
+    "manifest; F2 at the lower-median (budget, rate) of its factorial plus the "
+    "first fine-only coordinate when a fine grid is registered; F3 at its lower "
+    "medians; one window per cell; every row class at n; no achievable_n override"
+)
+
+
+def _lower_median(values: Sequence[float]) -> float:
+    """The lower median of a non-empty sequence (sorted ascending, index
+    (len - 1) // 2): deterministic, always a registered member."""
+    ordered = sorted(values)
+    return ordered[(len(ordered) - 1) // 2]
+
+
+def rehearsal_grid(
+    base: SessionGrid, *, n: int, datasets: FrozenSet[str]
+) -> SessionGrid:
+    """Purpose: derive the dress-rehearsal grid of a registered session.
+
+    Args:
+        base: the registered SessionGrid (never modified; a new instance is
+            returned through dataclasses.replace, which re-runs the
+            registration's own validation).
+        n: the per-cell query count every row class is set to; integer >= 1.
+        datasets: the datasets with a registered query manifest; F1 and the
+            HF-oracle cells keep only these, and the F2/F3 datasets must be
+            among them when the session registers F2/F3 cells.
+
+    Returns: a SessionGrid with the same session, group, model, baselines,
+        engines, RULER registration, B12 rungs and behavior knobs, the axes
+        collapsed by REHEARSAL_RULE, replications 1, every N class = n and
+        achievable_n empty.
+
+    Raises: PlanError when n < 1, when no F1 dataset of the session has a
+        manifest, or when the F2 or F3 dataset has none (the plan would
+        refuse the pressure cells' manifest coverage anyway; refusing here
+        names the fix).
+
+    Invariants: every (baseline, engine, family) of ``base`` enumerates at
+        least once in the result (pinned by tests); the registered grids are
+        untouched.
+    """
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise PlanError(f"rehearsal n={n!r} must be an integer >= 1 ({REHEARSAL_ADR})")
+    if not datasets:
+        raise PlanError(
+            f"a rehearsal needs at least one registered --query-manifest: it keeps "
+            f"only datasets with one ({REHEARSAL_ADR})"
+        )
+    f1_datasets = tuple(d for d in base.f1_datasets if d in datasets)
+    if not f1_datasets:
+        raise PlanError(
+            f"rehearsal of session {base.session!r}: none of its F1 datasets "
+            f"{list(base.f1_datasets)} has a registered query manifest "
+            f"(registered: {sorted(datasets)}) ({REHEARSAL_ADR})"
+        )
+    for family, baselines, dataset in (
+        ("F2", base.f2_baselines, base.f2_dataset),
+        ("F3", base.f3_baselines, base.f3_dataset),
+    ):
+        if baselines and dataset not in datasets:
+            raise PlanError(
+                f"rehearsal of session {base.session!r}: the {family} dataset "
+                f"{dataset!r} has no registered query manifest (registered: "
+                f"{sorted(datasets)}); plan with --query-manifest {dataset}=<path> "
+                f"({REHEARSAL_ADR})"
+            )
+    hf_cells = tuple(
+        (bid, kept)
+        for bid, kept in (
+            (bid, tuple(d for d in ds if d in datasets)) for bid, ds in base.hf_oracle_cells
+        )
+        if kept
+    )
+    fine_budgets = tuple(
+        r for r in base.f2_fine_budgets if r not in base.f2_budgets
+    )[:1]
+    fine_rates = base.f2_fine_rates[:1] if fine_budgets else ()
+    return replace(
+        base,
+        f1_datasets=f1_datasets,
+        hf_oracle_cells=hf_cells,
+        f2_budgets=(_lower_median(base.f2_budgets),) if base.f2_budgets else (),
+        f2_rates=(_lower_median(base.f2_rates),) if base.f2_rates else (),
+        f2_fine_budgets=fine_budgets,
+        f2_fine_rates=fine_rates,
+        f3_budgets=(_lower_median(base.f3_budgets),) if base.f3_budgets else (),
+        f3_rates=(_lower_median(base.f3_rates),) if base.f3_rates else (),
+        replications=1,
+        n_primary=n,
+        n_secondary=n,
+        n_identity=n,
+        window_requests=n,
+        achievable_n={},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3842,6 +3962,7 @@ def build_plan(
     freeze_file: Optional[Path] = None,
     calibrations: Optional[Mapping[str, Path]] = None,
     calibration_budget_fraction: float = FLOOR_BUDGET_FRACTION,
+    rehearsal_n: Optional[int] = None,
 ) -> Dict[str, Any]:
     """PURE plan builder: registered grid -> ordered step list + counts.
 
@@ -3867,6 +3988,26 @@ def build_plan(
     is the floor rung every artifact must carry (the charter's r = 1.5).
     """
     grid = get_session_grid(session)
+    rehearsal: Optional[Dict[str, Any]] = None
+    if rehearsal_n is not None:
+        # ADR-0144: the rehearsal is derived from the registered grid by the
+        # one rule and recorded in the header; the registry is untouched.
+        grid = rehearsal_grid(
+            grid, n=rehearsal_n, datasets=frozenset(query_manifests or {})
+        )
+        rehearsal = {
+            "of": session,
+            "n": rehearsal_n,
+            "windows": grid.replications,
+            "datasets": sorted(query_manifests or {}),
+            "f2_coordinates": [[r, f] for r in grid.f2_budgets for f in grid.f2_rates],
+            "f2_fine_coordinates": [
+                [r, f] for r in grid.f2_fine_budgets for f in grid.f2_fine_rates
+            ],
+            "f3_coordinates": [[r, f] for r in grid.f3_budgets for f in grid.f3_rates],
+            "rule": REHEARSAL_RULE,
+            "adr": REHEARSAL_ADR,
+        }
     pins = resolve_retrieval_pins(freeze_file)
     manifests = _register_query_manifests(grid, query_manifests)
     if floor.model != grid.model:
@@ -3983,6 +4124,10 @@ def build_plan(
         "group": grid.group,
         "model": grid.model,
         "model_hf_id": HF_ID_OF_SLUG[grid.model],
+        # ADR-0144: null on a registered plan; the derivation record of a
+        # dress rehearsal otherwise (the per_row_n and counts below are the
+        # rehearsal's own).
+        "rehearsal": rehearsal,
         "seed": seed,
         "window_duration_s": float(window_duration_s),
         "replications": grid.replications,
@@ -5108,6 +5253,7 @@ def _cmd_plan(args: argparse.Namespace) -> int:
         freeze_file=Path(args.freeze_file) if args.freeze_file else None,
         calibrations=parse_calibration_args(args.calibration),
         calibration_budget_fraction=args.calibration_budget_fraction,
+        rehearsal_n=args.rehearsal_n,
     )
     text = json.dumps(plan, indent=2, sort_keys=False) + "\n"
     if args.out:
@@ -5219,6 +5365,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"measured at (charter §6.1: r = {FLOOR_BUDGET_FRACTION:g}, concurrency 1); "
         "pass another value ONLY to register a shakedown rung explicitly (recorded "
         "in the header beside the registered value)",
+    )
+    p_plan.add_argument(
+        "--rehearsal-n",
+        type=int,
+        default=None,
+        metavar="N",
+        help="derive the DRESS REHEARSAL of --session (ADR-0144): every "
+        "baseline, engine, HF-oracle cell, RULER task and B12 rung of the "
+        "registered grid, datasets restricted to the registered manifests, F2 "
+        "and F3 collapsed to one coordinate each (plus one fine-only F2 "
+        "coordinate on the anchor), one window per cell, every row class at "
+        "n = N; recorded in the header 'rehearsal'. Never for a registered run",
     )
     p_plan.add_argument("--out", default=None, help="write the plan JSON here (else stdout)")
     p_plan.set_defaults(func=_cmd_plan)

@@ -665,7 +665,11 @@ stage_plan() {
   local qm cal e item
   qm=""; for item in $QUERY_MANIFESTS; do qm="$qm --query-manifest $item"; done
   cal=""; for e in $CALIBRATE; do cal="$cal --calibration $e=results/calibration/${EXP}_${e}.json"; done
-  job_run plan 900 "cd $POD_REPO && $POD_PYTHON scripts/3_run/run_campaign.py plan --session $SESSION --floor-table results/calibration/floor_table.json --window-duration-s $WINDOW_DURATION_S --seed $SEED$qm$cal --calibration-budget-fraction $CALIBRATION_BUDGET_FRACTION --freeze-file $POD_FREEZE_FILE --out results/calibration/plan_$RUN_ID.json" "$LAND/logs/setup" || return 1
+  # ADR-0144: a dress rehearsal derives its grid from the registered session
+  # (every arm, engine, hf cell, RULER task and rung; the axes collapsed; one
+  # window per cell; every row class at REHEARSAL_N); empty = the registered plan.
+  local reh=""; [ -z "${REHEARSAL_N:-}" ] || reh=" --rehearsal-n $REHEARSAL_N"
+  job_run plan 900 "cd $POD_REPO && $POD_PYTHON scripts/3_run/run_campaign.py plan --session $SESSION --floor-table results/calibration/floor_table.json --window-duration-s $WINDOW_DURATION_S --seed $SEED$qm$cal$reh --calibration-budget-fraction $CALIBRATION_BUDGET_FRACTION --freeze-file $POD_FREEZE_FILE --out results/calibration/plan_$RUN_ID.json" "$LAND/logs/setup" || return 1
   run_step 0 "fetch plan.json" -- pscp_from "$POD_REPO/results/calibration/plan_$RUN_ID.json" "$EXTRAS/plan.json" || return 1
   plan_only && return 0
   run_step 0 "plan argv audit (S0F-26)" -- "$PY3" - "$EXTRAS/plan.json" <<'PY' || return 1
@@ -705,8 +709,27 @@ stage_run() {
   fi
   run_step 0 "backup daemon start" -- pssh "cd $POD_REPO && CAGE_BACKUP_TARGET=$BACKUP_TARGET CAGE_BACKUP_INTERVAL=$BACKUP_INTERVAL_S bash scripts/5_observability/gcs_backup_daemon.sh start $BACKUP_RUN_REL && bash scripts/5_observability/gcs_backup_daemon.sh status $BACKUP_RUN_REL" || return 1
   plan_only || step_has "[gcs-backup] RUNNING (" || { printf '  [FAIL] backup daemon not RUNNING\n'; return 1; }
+  # Blocked cells (a registered arm an engine's frozen launcher cannot serve,
+  # e.g. retr-store on sglang) make run_campaign.py run REFUSE the whole plan
+  # unless --skip-blocked is passed; the consent is the profile's SKIP_BLOCKED=1,
+  # applied only when the fetched plan carries blocked_row_keys and said loudly
+  # (2026-10-07, ADR-0144). The seal at stage 9 is unchanged.
+  local blocked=0 partial=""
+  plan_only || blocked="$("$PY3" -c 'import json,sys; print(len(json.load(open(sys.argv[1], encoding="utf-8")).get("blocked_row_keys", [])))' "$EXTRAS/plan.json" 2>/dev/null || echo 0)"
+  if plan_only; then
+    [ "${SKIP_BLOCKED:-0}" = "1" ] && printf '  [plan] NOTE: SKIP_BLOCKED=1: blocked cells in the plan, if any, are skipped loudly (--skip-blocked)\n'
+  elif [ "$blocked" -gt 0 ]; then
+    if [ "${SKIP_BLOCKED:-0}" = "1" ]; then
+      partial=" --skip-blocked"
+      say "the plan carries $blocked blocked cell(s) (see blocked_row_keys in $EXTRAS/plan.json): running the executable subset loudly (SKIP_BLOCKED=1)"
+      state note run "$blocked blocked cell(s) skipped loudly (SKIP_BLOCKED=1, --skip-blocked)"
+    else
+      printf '  [FAIL] the plan carries %s blocked cell(s) (blocked_row_keys in %s) and SKIP_BLOCKED is not 1: run_campaign.py run refuses a plan with blocked cells unless --skip-blocked is passed; set SKIP_BLOCKED=1 in the profile to run the executable subset loudly, or deregister the blocked cells\n' "$blocked" "$EXTRAS/plan.json"
+      return 1
+    fi
+  fi
   local name="run"
-  run_step 0 "job $name: submit" -- bash "$PODJOB" submit "$name" "cd $POD_REPO && env $RUN_ENV_UNSET CAGE_RUN_ROOT=$POD_RUN_ROOT VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT $POD_PYTHON scripts/3_run/run_campaign.py run --plan results/calibration/plan_$RUN_ID.json --campaign-root $POD_RUN_ROOT --seal" "$bound" || return 1
+  run_step 0 "job $name: submit" -- bash "$PODJOB" submit "$name" "cd $POD_REPO && env $RUN_ENV_UNSET CAGE_RUN_ROOT=$POD_RUN_ROOT VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT $POD_PYTHON scripts/3_run/run_campaign.py run --plan results/calibration/plan_$RUN_ID.json --campaign-root $POD_RUN_ROOT --seal$partial" "$bound" || return 1
   if plan_only; then
     printf '  [plan] %-28s expect DONE(0) or STOP FAILED(2): bash %s wait run %s\n' "job run: wait" "$PODJOB" "$bound"
     return 0
