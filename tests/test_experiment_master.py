@@ -400,9 +400,15 @@ def world(tmp_path: Path) -> Dict[str, Path]:
             "profile": profile}
 
 
+# The master exports whole profiles (set -a), so a caller that sourced S0.env
+# (the master running stage 0's suite, or a dev shell) carries every profile
+# key; the fake world keeps only the process basics (2026-10-07: an inherited
+# POD_RESULTS_DIR=/root/... failed the unpack step under the exported profile).
+_ENV_KEEP = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "USER", "LOGNAME", "SHELL", "CAGE_LOG_ROOT")
+
+
 def _env(w: Dict[str, Path], **extra: str) -> Dict[str, str]:
-    env = {k: v for k, v in os.environ.items()
-           if not k.startswith("CAGE_") and k not in ("VLLM_PORT", "SGLANG_PORT")}
+    env = {k: v for k, v in os.environ.items() if k in _ENV_KEEP}
     env["PATH"] = f"{w['bin']}:{env.get('PATH', '')}"
     env.update({
         "CAGE_TEST_LOG": str(w["log"]), "CAGE_TEST_HOME": str(w["home"]),
@@ -914,6 +920,38 @@ def test_validate_refuses_an_engine_without_a_registered_probe_set(world: Dict[s
     assert proc.returncode == 1
     assert "lmdeploy: no validation probe set is registered" in proc.stdout
     assert not (world["home"] / ".cage_jobs" / "validate_lmdeploy.cmd").exists()
+
+
+def test_the_run_job_states_provider_and_hardware_for_the_campaign_seam(world: Dict[str, Path]) -> None:
+    # S0F-40: campaign mode refuses without CAGE_PROVIDER and CAGE_HARDWARE.
+    proc = _master(world, "--yes", "provision", "--to", "run")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    cmd = (world["home"] / ".cage_jobs" / "run.cmd").read_text(encoding="utf-8")
+    assert "CAGE_PROVIDER=runpod CAGE_HARDWARE='NVIDIA H100 80GB HBM3 x 1' " in cmd, cmd[:400]
+
+
+def test_pod_results_dir_relinks_the_results_root_and_the_cells_land_there(world: Dict[str, Path], tmp_path: Path) -> None:
+    # S0F-39: with POD_RESULTS_DIR set, stage 2 moves <repo>/results onto that
+    # directory and leaves a symlink, so the run's cells land there unchanged.
+    real = tmp_path / "cage-results"
+    prof = tmp_path / "S1_results.env"
+    prof.write_text(world["profile"].read_text(encoding="utf-8") + f"\nPOD_RESULTS_DIR={real}\n", encoding="utf-8")
+    world["profile"] = prof
+    (world["pod_repo"] / "results" / "calibration" / "seed.txt").write_text("seed", encoding="utf-8")
+    proc = _master(world, "--yes", "provision", "--to", "run")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert f"results root on the pod: {real}" in proc.stdout
+    link = world["pod_repo"] / "results"
+    assert link.is_symlink() and link.resolve() == real.resolve()
+    assert (real / "calibration" / "seed.txt").read_text(encoding="utf-8") == "seed"      # moved, not lost
+    rid = _state(world)["run_id"]
+    assert (real / "camp1" / "a" / rid / "cells" / "k1" / "window_squad_v2-01" / "regime.json").is_file()
+    # a second ship (a mid-run re-ship) keeps the link and the data
+    proc = _master(world, "--only", "ship", "--redo", CAGE_TEST_PODS='[{"id": "pod123"}]', CAGE_TEST_VOLUMES='[{"id": "vol123"}]')
+    assert proc.returncode == 0, proc.stdout[-2000:]
+    assert link.is_symlink() and (real / "camp1" / "a" / rid / "cells" / "k1" / "window_squad_v2-01" / "regime.json").is_file()
+    # the default leaves the repo's own results directory alone
+    world["profile"] = tmp_path / "S1.env"
 
 
 def test_without_rehearsal_n_and_without_blocked_cells_the_argv_is_unchanged(world: Dict[str, Path]) -> None:

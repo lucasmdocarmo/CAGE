@@ -211,6 +211,19 @@ def test_lost_when_the_pid_is_alive_but_not_our_job(pod: Dict[str, Path]) -> Non
     assert proc.returncode == 1 and proc.stdout.strip().endswith("LOST")
 
 
+def test_a_landed_status_wins_over_the_pid_heuristics(pod: Dict[str, Path]) -> None:
+    # S0F-32: the probe's checks are not atomic; a job that ended between them
+    # has its exit code on disk, and that code is the verdict, never LOST or
+    # CRASHED. Both pid states are covered: alive-and-not-ours, and dead.
+    pod["jobs"].mkdir()
+    (pod["home"] / ".cage_jobs").mkdir(parents=True, exist_ok=True)
+    for name, pid in (("late", os.getpid()), ("gone", 999999)):
+        (pod["jobs"] / f"{name}.json").write_text(json.dumps({"id": name, "handle": f"pid:{pid}"}), encoding="utf-8")
+        (pod["home"] / ".cage_jobs" / f"{name}.status").write_text("0\n", encoding="utf-8")
+        proc = _run(pod, "status", name)
+        assert proc.stdout.strip() == "DONE(0)" and proc.returncode == 0, (name, proc.stdout)
+
+
 def test_resubmit_starts_a_fresh_remote_log(pod: Dict[str, Path]) -> None:
     # Review 2026-10-06, MEDIUM 8: a marker from attempt 1 must not survive into attempt 2's log.
     assert _run(pod, "submit", "again", "echo ATTEMPT_ONE_MARKER").returncode == 0

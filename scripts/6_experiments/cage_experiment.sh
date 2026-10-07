@@ -112,6 +112,15 @@ printf '%s' "$CAMPAIGN" | grep -qE '^[a-z0-9][a-z0-9-]{0,40}$' \
   || die "CAMPAIGN='$CAMPAIGN' violates the campaign slug grammar ^[a-z0-9][a-z0-9-]{0,40}$ (docs/RESULTS_LAYOUT.md)"
 POD_REPO="${POD_REPO:-/workspace/CAGE}"
 POD_BACKUP_DIR="${POD_BACKUP_DIR:-/workspace/backup}"
+# S0F-39 (live CA-MTL-1, 2026-10-07): the network volume (NFS4, vast backend)
+# refuses "|" in names, and every cell directory is named by its row key, so
+# the results root can live on the container disk instead: when the profile
+# sets POD_RESULTS_DIR, stage 2 moves <repo>/results there and leaves a
+# symlink at <repo>/results, so every relative path stays valid. Empty = the
+# repo's own results directory. The backup target must then move too
+# (profile keys BACKUP_TARGET and POD_BACKUP_DIR); that data lives on the
+# container disk until stage 12 pulls it.
+POD_RESULTS_DIR="${POD_RESULTS_DIR:-}"
 POD_TARBALL="${POD_TARBALL:-/root/cage_repo.tar.gz}"
 # The vLLM launcher runs a bare `vllm serve` from PATH (manage_vllm_server.sh)
 # and the driver calls that launcher, so every pod job that starts an engine
@@ -624,7 +633,15 @@ stage_ship() {
   pod_env
   local tarball; tarball="$(state get build.tarball 2>/dev/null || true)"; tarball="${tarball:-$EXTRAS/ops/repo.tar.gz}"
   run_step 0 "scp tarball" -- pscp_to "$tarball" "$POD_TARBALL" || return 1
-  run_step 0 "unpack on the pod" -- pssh "mkdir -p $POD_REPO && ln -sfn $POD_REPO ~/CAGE && tar xzf $POD_TARBALL --no-same-owner -C $POD_REPO && cat $POD_REPO/BUILD_INFO && mkdir -p $POD_BACKUP_DIR $POD_REPO/MyDocs/registration $POD_REPO/results/calibration" || return 1
+  local relink=""
+  if [ -n "$POD_RESULTS_DIR" ]; then
+    relink=" && mkdir -p $POD_RESULTS_DIR && { [ -L $POD_REPO/results ] || { mkdir -p $POD_REPO/results && cp -R $POD_REPO/results/. $POD_RESULTS_DIR/ && rm -rf $POD_REPO/results && ln -s $POD_RESULTS_DIR $POD_REPO/results; }; } && echo results_root=\$(readlink -f $POD_REPO/results)"
+    say "results root on the pod: $POD_RESULTS_DIR, reached as $POD_REPO/results (S0F-39)"
+  fi
+  run_step 0 "unpack on the pod" -- pssh "mkdir -p $POD_REPO && ln -sfn $POD_REPO ~/CAGE && tar xzf $POD_TARBALL --no-same-owner -C $POD_REPO && cat $POD_REPO/BUILD_INFO$relink && mkdir -p $POD_BACKUP_DIR $POD_REPO/MyDocs/registration $POD_REPO/results/calibration" || return 1
+  if ! plan_only && [ -n "$POD_RESULTS_DIR" ]; then
+    step_has "results_root=$POD_RESULTS_DIR" || { printf '  [FAIL] %s/results does not resolve to %s\n' "$POD_REPO" "$POD_RESULTS_DIR"; return 1; }
+  fi
   if ! plan_only; then
     local sha; sha="$(state get build.sha)"
     step_has "sha=$sha" || { printf '  [FAIL] BUILD_INFO on the pod does not carry the Mac HEAD %s\n' "$sha"; return 1; }
@@ -810,7 +827,7 @@ stage_run() {
     fi
   fi
   local name="run"
-  run_step 0 "job $name: submit" -- bash "$PODJOB" submit "$name" "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH$POD_ENGINE_ENV && env $RUN_ENV_UNSET CAGE_RUN_ROOT=$POD_RUN_ROOT VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT $POD_PYTHON scripts/3_run/run_campaign.py run --plan results/calibration/plan_$RUN_ID.json --campaign-root $POD_RUN_ROOT --seal$partial" "$bound" || return 1
+  run_step 0 "job $name: submit" -- bash "$PODJOB" submit "$name" "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH$POD_ENGINE_ENV && env $RUN_ENV_UNSET CAGE_RUN_ROOT=$POD_RUN_ROOT VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT CAGE_PROVIDER=runpod CAGE_HARDWARE='$GPU_ID x $GPU_COUNT' $POD_PYTHON scripts/3_run/run_campaign.py run --plan results/calibration/plan_$RUN_ID.json --campaign-root $POD_RUN_ROOT --seal$partial" "$bound" || return 1
   if plan_only; then
     printf '  [plan] %-28s expect DONE(0) or STOP FAILED(2): bash %s wait run %s\n' "job run: wait" "$PODJOB" "$bound"
     return 0

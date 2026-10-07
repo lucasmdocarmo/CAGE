@@ -152,7 +152,10 @@ cmd_status() {
   check_name "$name"
   pid="$(_rpid "$name")"
   [ -n "$pid" ] || { echo "UNKNOWN"; return 1; }
-  out="$(rssh "if [ -f $RDIR/$name.status ]; then cat $RDIR/$name.status; elif kill -0 $pid 2>/dev/null; then if ps -o args= -p $pid 2>/dev/null | grep -q '$name.cmd'; then echo RUNNING; else echo LOST; fi; else echo CRASHED; fi" | tr -d '\r\n ')"
+  # The checks are not atomic: a job that ends between the status read and
+  # the ps read must report its exit code, never LOST (S0F-32: the suite's
+  # fake jobs, 2026-10-07), so the status file is re-read after any miss.
+  out="$(rssh "if [ -f $RDIR/$name.status ]; then cat $RDIR/$name.status; elif kill -0 $pid 2>/dev/null && ps -o args= -p $pid 2>/dev/null | grep -q '$name.cmd'; then echo RUNNING; elif [ -f $RDIR/$name.status ]; then cat $RDIR/$name.status; elif kill -0 $pid 2>/dev/null; then echo LOST; else echo CRASHED; fi" | tr -d '\r\n ')"
   case "$out" in
     RUNNING) echo "RUNNING"; return 0 ;;
     LOST)    echo "LOST";    return 1 ;;   # a live pid that is not our job (pid reuse)
