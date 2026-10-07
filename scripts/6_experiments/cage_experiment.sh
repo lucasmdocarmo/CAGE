@@ -647,6 +647,12 @@ stage_ship() {
     step_has "sha=$sha" || { printf '  [FAIL] BUILD_INFO on the pod does not carry the Mac HEAD %s\n' "$sha"; return 1; }
     step_has "dirty=0" || { printf '  [FAIL] BUILD_INFO on the pod is not dirty=0\n'; return 1; }
   fi
+  # S0F-39: cell directories are row keys with "|"; a results root that refuses
+  # the character (the CA-MTL-1 volume, NFS4 on a vast backend) fails here, at
+  # stage 2, not at the first cell of stage 7. The probe runs on the EFFECTIVE
+  # results root (the container disk when POD_RESULTS_DIR is set).
+  run_step 0 "results root accepts | in names" -- pssh "d=$POD_REPO/results/.cage_name_probe_\$\$; mkdir -p \"\$d\" && if mkdir \"\$d/a|b\" 2>/dev/null; then rm -rf \"\$d\"; echo NAME_PROBE_OK; else rm -rf \"\$d\"; echo NAME_PROBE_REFUSED; fi" || return 1
+  plan_only || step_has "NAME_PROBE_OK" || { printf '  [FAIL] the results root refuses the character | in file names (cell directories are row keys, S0F-39): set POD_RESULTS_DIR to a container-disk path in the profile, or choose a datacenter whose volume accepts it\n'; return 1; }
   run_step 0 "scp freeze file" -- pscp_to "$FREEZE_FILE" "$POD_REPO/$POD_FREEZE_FILE" || return 1
   return 0
 }
@@ -678,7 +684,17 @@ stage_validate() {
   [ "${PD_PROBES:-0}" = "1" ] && { printf '  [FAIL] PD_PROBES=1: the S0 pd probes are not built into this stage yet; set 0 or build them\n'; return 1; }
   [ "$TOPOLOGY" = "single" ] || { printf '  [FAIL] TOPOLOGY=%s: only single-instance validation is built; tp/pd launch flags are a separate Spec\n' "$TOPOLOGY"; return 1; }
   if [ "${SUITE_ON_POD:-0}" = "1" ]; then
-    job_run suite_pod 1800 "cd $POD_REPO && env $RUN_ENV_UNSET $POD_PYTHON -m pytest -q -p no:cacheprovider" "$LAND/logs/setup" || return 1
+    # A stage 4 retry on the same shipped code does not rerun the pod suite
+    # (2026-10-07: six retries reran the 7-minute suite every time); the sha it
+    # passed on is recorded, and a re-ship (a new build.sha) runs it again.
+    local suite_sha build_sha
+    suite_sha="$(state get suite_pod.sha 2>/dev/null || true)"; build_sha="$(state get build.sha 2>/dev/null || true)"
+    if ! plan_only && [ -n "$build_sha" ] && [ "$suite_sha" = "$build_sha" ]; then
+      say "pod suite already passed on sha $build_sha: skipped on this retry"
+    else
+      job_run suite_pod 1800 "cd $POD_REPO && env $RUN_ENV_UNSET $POD_PYTHON -m pytest -q -p no:cacheprovider" "$LAND/logs/setup" || return 1
+      plan_only || state put suite_pod.sha "$build_sha"
+    fi
   fi
   # Preflight gate (p) judges the datasets named by CAGE_DATASETS (comma list)
   # and the FULL charter roster when it is unset (live 2026-10-07: it refused

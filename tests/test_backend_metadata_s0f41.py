@@ -56,3 +56,18 @@ def test_an_unknown_backend_still_reports_nothing(monkeypatch) -> None:
     monkeypatch.setattr(rx, "_safe_get_json", lambda url, *, timeout=5: None)
     md = rx.capture_backend_metadata(api_base="http://x", backend="lmdeploy", model_name="m", use_offline=False)
     assert md["server_version"] is None and md["client_library_version"] is None
+
+
+def test_every_engine_of_session_a_has_engine_provenance(monkeypatch) -> None:
+    # The seam refuses a window without a version; session a runs vllm, sglang
+    # and the hf oracle, so each must report one from a stubbed server.
+    rx = _load()
+    def fake_get(url, *, timeout=5):
+        if url.endswith("/version"): return {"version": "0.19.1"}
+        if url.endswith("/get_server_info"): return {"version": "0.5.10.post1"}
+        if url.endswith("/v1/models"): return {"data": [{"id": "m"}]}
+        return None
+    monkeypatch.setattr(rx, "_safe_get_json", fake_get)
+    for backend in ("vllm", "sglang", "hf-oracle"):
+        md = rx.capture_backend_metadata(api_base="http://x", backend=backend, model_name="m", use_offline=False)
+        assert md["server_version"] or md["client_library_version"], backend

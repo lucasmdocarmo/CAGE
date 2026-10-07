@@ -86,6 +86,7 @@ BUNDLE="cd $POD_REPO 2>/dev/null || true
 w=\$(bash scripts/5_observability/watch_campaign.sh '$ROOT' 2>&1); wrc=\$?
 echo \"WATCH_RC=\$wrc\"; echo \"WATCH_VERDICT=\$(printf '%s\n' \"\$w\" | tail -n 1 | cut -c1-200)\"
 echo \"SENTINELS=\$(find '$ROOT/cells' -name '.STATUS-*' 2>/dev/null | wc -l | tr -d ' ')\"
+echo \"RUN_DIR=\$([ -d '$ROOT/cells' ] && echo 1 || echo 0)\"
 echo \"SENTINEL_LIST=\$(find '$ROOT/cells' -name '.STATUS-*' 2>/dev/null | head -5 | tr '\n' ' ')\"
 j=\$(stat -c %Y '$ROOT/write_time_hashes.jsonl' 2>/dev/null || echo 0); n=\$(date +%s)
 if [ \"\$j\" -gt 0 ]; then echo \"JOURNAL_AGE_S=\$((n - j))\"; else echo JOURNAL_AGE_S=-1; fi
@@ -199,6 +200,17 @@ if prev_base is None:
     prev_base = (prev.get("run") or {}).get("sentinels", 0) or 0
 ssh_ok = ssh_rc == "0" and sentinels >= 0
 baseline = sentinels if ssh_ok else prev_base
+# The balance is read every 10th tick; the other ticks carry the last read
+# forward with its instant instead of printing None (S0F-38, 2026-10-07).
+balance_utc = now_s if balance is not None else None
+if balance is None and (prev.get("pod") or {}).get("balance") is not None:
+    balance = prev["pod"]["balance"]; balance_utc = prev["pod"].get("balance_utc")
+# Before the first cell writes, the run root has no cells/ directory and
+# watch_campaign reports an error; say what it is instead.
+run_dir = kv(ssh, "RUN_DIR", "1") == "1"
+verdict = kv(ssh, "WATCH_VERDICT")
+if ssh_ok and not run_dir:
+    verdict = "no cell written yet (the run root has no cells/ directory)"
 
 alerts = []
 if ssh_rc not in ("0",): alerts.append(("HARD", f"ssh bundle failed (rc={ssh_rc}); the pod did not answer"))
@@ -239,8 +251,8 @@ status = {
     "schema": "cage-monitor-status-v1", "tick": tick, "tick_utc": now_s,
     "pod": {"id": os.environ["MON_POD"], "runtime_status": runtime, "desired_status": desired or None,
             "watchdog": watchdog, "watchdog_alive": wd_alive, "seatbelt_min_left": seatbelt_min_left,
-            "hours": hours, "cost_usd": cost, "balance": balance},
-    "run": {"watch_rc": watch_rc, "watch_verdict": kv(ssh, "WATCH_VERDICT"), "sentinels": sentinels,
+            "hours": hours, "cost_usd": cost, "balance": balance, "balance_utc": balance_utc},
+    "run": {"watch_rc": watch_rc, "watch_verdict": verdict, "run_dir": run_dir, "sentinels": sentinels,
             "sentinels_baseline": baseline, "ssh_ok": ssh_ok,
             "journal_age_s": journal_age, "windows": windows, "regime": kv(ssh, "REGIME")[:300],
             "gpu": gpu_raw, "gpu_util": gpu_util, "compute_apps": toint(kv(ssh, "COMPUTE_APPS"), -1),
@@ -251,7 +263,7 @@ status = {
 tmp = os.path.join(out, "status.json.tmp")
 json.dump(status, open(tmp, "w", encoding="utf-8"), indent=2); os.replace(tmp, os.path.join(out, "status.json"))
 line = (f"{now_s} tick={tick} pod={runtime} wd={'ALIVE' if wd_alive else 'NOT-ALIVE'} seatbelt_min={seatbelt_min_left} "
-        f"cost=${cost} job={job_status} verdict={kv(ssh, 'WATCH_VERDICT')[:60]!r} sentinels={sentinels} "
+        f"cost=${cost} job={job_status} verdict={verdict[:60]!r} sentinels={sentinels} "
         f"journal_age={journal_age}s windows={windows} gpu={gpu_raw!r} new_err={len(new_err)} alerts={len(alerts)}")
 open(os.path.join(out, "monitor.log"), "a", encoding="utf-8").write(line + "\n")
 print(line)

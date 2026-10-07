@@ -272,6 +272,8 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         esac
         exec {sys.executable} "$@"
         ''')
+    # the pod suite job runs `python -m pytest` inside the fake repo: one passing test (SUITE_ON_POD=1 worlds)
+    _w(pr / "tests" / "test_pod_suite_ok.py", "def test_ok():\n    assert True\n", exe=False)
     _w(pr / "scripts" / "runpod" / "setup_runpod.sh", r'''
         #!/bin/bash
         echo "setup_runpod CHARTER_DATASETS=$CHARTER_DATASETS PREFETCH_MODELS=$PREFETCH_MODELS" >> "$CAGE_TEST_LOG"
@@ -952,6 +954,35 @@ def test_pod_results_dir_relinks_the_results_root_and_the_cells_land_there(world
     assert link.is_symlink() and (real / "camp1" / "a" / rid / "cells" / "k1" / "window_squad_v2-01" / "regime.json").is_file()
     # the default leaves the repo's own results directory alone
     world["profile"] = tmp_path / "S1.env"
+
+
+def test_the_pod_suite_runs_once_per_shipped_sha_and_again_after_a_reship(world: Dict[str, Path], tmp_path: Path) -> None:
+    # 2026-10-07: six stage 4 retries reran the 7-minute pod suite every time.
+    prof = tmp_path / "S1_suite.env"
+    prof.write_text(world["profile"].read_text(encoding="utf-8") + "\nSUITE_ON_POD=1\n", encoding="utf-8")
+    world["profile"] = prof
+    proc = _master(world, "--yes", "provision", "--to", "validate")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    # one submit = one decode line writing the remote .cmd (status probes name the file too)
+    submits = lambda: sum(1 for c in _calls(world) if c.rstrip().endswith("base64 -d > ~/.cage_jobs/suite_pod.cmd"))
+    assert submits() == 1 and _state(world)["suite_pod"]["sha"] == _state(world)["build"]["sha"]
+    proc = _master(world, "--only", "validate", "--redo")
+    assert proc.returncode == 0, proc.stdout[-2000:]
+    assert "pod suite already passed on sha" in proc.stdout and submits() == 1
+    ours = {"CAGE_TEST_PODS": '[{"id": "pod123"}]', "CAGE_TEST_VOLUMES": '[{"id": "vol123"}]'}
+    assert _master(world, "--only", "preflight-mac", "--redo", CAGE_TEST_SHA="abcdefabcdefabcdefabcdefabcdefabcdefabcd", **ours).returncode == 0
+    assert _master(world, "--only", "ship", "--redo", **ours).returncode == 0
+    proc = _master(world, "--only", "validate", "--redo")
+    assert proc.returncode == 0, proc.stdout[-2000:]
+    assert "already passed" not in proc.stdout and submits() == 2
+
+
+def test_stage_2_probes_that_the_results_root_accepts_the_pipe_character(world: Dict[str, Path]) -> None:
+    proc = _master(world, "--yes", "provision", "--to", "ship")
+    assert proc.returncode == 0, proc.stdout[-2000:]
+    logs = list((world["exp_root"] / "S1" / DATE / "extras" / "steps").glob("ship_*results_root_accepts*.log"))
+    assert len(logs) == 1 and "NAME_PROBE_OK" in logs[0].read_text(encoding="utf-8")
+    assert not list((world["pod_repo"] / "results").glob(".cage_name_probe_*"))     # the probe cleans up
 
 
 def test_without_rehearsal_n_and_without_blocked_cells_the_argv_is_unchanged(world: Dict[str, Path]) -> None:

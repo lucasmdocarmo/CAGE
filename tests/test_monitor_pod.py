@@ -58,7 +58,7 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         #!/bin/bash
         case "$1" in
           pod) echo "{\"id\": \"pod123\", \"runtimeStatus\": \"${CAGE_TEST_RUNTIME:-running}\", \"desiredStatus\": \"RUNNING\"}" ;;
-          user) echo "{\"balance\": ${CAGE_TEST_BALANCE:-300.0}}" ;;
+          user) [ -n "${CAGE_TEST_NO_USER:-}" ] || echo "{\"balance\": ${CAGE_TEST_BALANCE:-300.0}}" ;;
         esac
         ''')
     _w(b / "nvidia-smi", r'''
@@ -234,6 +234,30 @@ def test_ssh_failure_is_hard_and_the_tick_still_lands(world: Dict[str, Path]) ->
     st = _status(world)
     assert any("ssh bundle failed" in a["text"] and a["level"] == "HARD" for a in st["alerts"])
     assert st["run"]["job_status"] == "NONE"
+
+
+def test_the_balance_carries_forward_between_user_reads(world: Dict[str, Path]) -> None:
+    # S0F-38: the balance is read every 10th tick; the ticks between carried None.
+    _tick(world)
+    st = _status(world)
+    assert st["pod"]["balance"] == 300.0 and st["pod"]["balance_utc"].endswith("Z")
+    first_utc = st["pod"]["balance_utc"]
+    _tick(world, CAGE_TEST_NO_USER="1")
+    st = _status(world)
+    assert st["pod"]["balance"] == 300.0 and st["pod"]["balance_utc"] == first_utc
+    _tick(world, CAGE_TEST_BALANCE="12.5")                      # a fresh read replaces the carried value
+    st = _status(world)
+    assert st["pod"]["balance"] == 12.5 and any("balance 12.5 under the floor" in a["text"] for a in st["alerts"])
+
+
+def test_a_run_root_without_cells_reads_no_cell_written_yet(world: Dict[str, Path]) -> None:
+    shutil.rmtree(world["root"] / "cells")
+    proc = _tick(world, CAGE_TEST_WATCH_RC="1", CAGE_TEST_VERDICT="[watch_campaign] ERROR: run dir not found")
+    assert proc.returncode == 0
+    st = _status(world)
+    assert st["run"]["run_dir"] is False and st["run"]["watch_verdict"].startswith("no cell written yet")
+    assert st["run"]["windows"] == 0 and st["alerts"] == []
+    assert "no cell written yet" in (world["out"] / "monitor.log").read_text(encoding="utf-8")
 
 
 def test_usage_errors(world: Dict[str, Path]) -> None:
