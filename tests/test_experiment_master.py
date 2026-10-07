@@ -835,6 +835,22 @@ def test_rehearsal_n_reaches_the_planner_and_blocked_cells_need_the_profile_cons
     assert any("blocked cell(s) skipped loudly" in n for n in _state(world)["stages"]["run"]["notes"])
 
 
+def test_pod_jobs_that_start_engines_put_the_driver_venv_first_on_path(world: Dict[str, Path]) -> None:
+    # Live 2026-10-07: the validate job's `vllm serve` died with "failed to run
+    # command 'vllm'" because nothing put cage-env/bin on the pod job's PATH.
+    proc = _master(world, "--yes", "provision", "--to", "run")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    prefix = f"export PATH={world['pod_repo']}/cage-env/bin:$PATH"
+    for name in ("validate_vllm", "calibrate_vllm", "run"):
+        cmd = (world["home"] / ".cage_jobs" / f"{name}.cmd").read_text(encoding="utf-8")
+        assert cmd.startswith(f"cd {world['pod_repo']} && {prefix}"), (name, cmd[:160])
+    for name in ("validate_vllm", "calibrate_vllm"):
+        assert "VLLM_START_TIMEOUT=600" in (world["home"] / ".cage_jobs" / f"{name}.cmd").read_text(encoding="utf-8")
+    # preflight gate (p) judges exactly the datasets stage 3 staged (the profile's CHARTER_DATASETS)
+    assert "CAGE_DATASETS=squad_v2,musique,qasper" in (world["home"] / ".cage_jobs" / "validate_vllm.cmd").read_text(encoding="utf-8")
+    assert "cage-env/bin" not in (world["home"] / ".cage_jobs" / "setup.cmd").read_text(encoding="utf-8")
+
+
 def test_without_rehearsal_n_and_without_blocked_cells_the_argv_is_unchanged(world: Dict[str, Path]) -> None:
     proc = _master(world, "--yes", "provision", "--to", "run")
     assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]

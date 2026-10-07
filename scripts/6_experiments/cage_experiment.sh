@@ -113,6 +113,12 @@ printf '%s' "$CAMPAIGN" | grep -qE '^[a-z0-9][a-z0-9-]{0,40}$' \
 POD_REPO="${POD_REPO:-/workspace/CAGE}"
 POD_BACKUP_DIR="${POD_BACKUP_DIR:-/workspace/backup}"
 POD_TARBALL="${POD_TARBALL:-/root/cage_repo.tar.gz}"
+# The vLLM launcher runs a bare `vllm serve` from PATH (manage_vllm_server.sh)
+# and the driver calls that launcher, so every pod job that starts an engine
+# puts the driver venv's bin first and carries the start timeout (live
+# 2026-10-07: the validate job's start died with "failed to run command
+# 'vllm'" and the preflight ran under the system python3).
+POD_VENV_BIN="$POD_REPO/${POD_PYTHON%/*}"
 FREEZE_FILE="${FREEZE_FILE:-$PROJECT_DIR/MyDocs/registration/freeze_resolutions.json}"
 POD_FREEZE_FILE="MyDocs/registration/freeze_resolutions.json"
 SCORE_BOUND_MIN="${SCORE_BOUND_MIN:-180}"
@@ -623,12 +629,17 @@ stage_validate() {
   if [ "${SUITE_ON_POD:-0}" = "1" ]; then
     job_run suite_pod 1800 "cd $POD_REPO && env $RUN_ENV_UNSET $POD_PYTHON -m pytest -q -p no:cacheprovider" "$LAND/logs/setup" || return 1
   fi
+  # Preflight gate (p) judges the datasets named by CAGE_DATASETS (comma list)
+  # and the FULL charter roster when it is unset (live 2026-10-07: it refused
+  # hotpotqa, scbench and sharegpt, which this profile never stages); the
+  # experiment's own CHARTER_DATASETS, the set stage 3 staged, is the request.
+  local ds; ds="$(printf '%s' "$CHARTER_DATASETS" | tr ' ' ',')"
   local e launcher api
   for e in $(server_engines); do
     launcher="$(engine_launcher "$e")" || { printf '  [FAIL] unknown engine %s\n' "$e"; return 1; }
     api="$(engine_api "$e")"
     # after `stop` the GPU process takes a few seconds to leave the compute-apps list: wait up to 60 s before reading it
-    job_run "validate_$e" 1500 "cd $POD_REPO && bash scripts/2_serving/$launcher start '$MODEL' && curl -sf $api/v1/models >/dev/null && echo VALIDATE_API_OK; CAGE_PREFLIGHT_BACKENDS=$e bash scripts/checks/preflight_check.sh '$MODEL' $api; rc=\$?; bash scripts/2_serving/$launcher stop; n=1; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do n=\$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . || true); [ \"\$n\" -eq 0 ] && break; sleep 2; done; echo COMPUTE_APPS=\$n; exit \$rc" "$LAND/logs/setup" || return 1
+    job_run "validate_$e" 1500 "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT CAGE_DATASETS=$ds && bash scripts/2_serving/$launcher start '$MODEL' && curl -sf $api/v1/models >/dev/null && echo VALIDATE_API_OK; CAGE_PREFLIGHT_BACKENDS=$e bash scripts/checks/preflight_check.sh '$MODEL' $api; rc=\$?; bash scripts/2_serving/$launcher stop; n=1; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do n=\$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . || true); [ \"\$n\" -eq 0 ] && break; sleep 2; done; echo COMPUTE_APPS=\$n; exit \$rc" "$LAND/logs/setup" || return 1
     plan_only && continue
     grep -q "VALIDATE_API_OK" "$JOB_LOG" || { printf '  [FAIL] %s: /v1/models never answered\n' "$e"; return 1; }
     grep -q "PREFLIGHT PASS" "$JOB_LOG" || { printf '  [FAIL] %s: preflight did not PASS\n' "$e"; return 1; }
@@ -644,7 +655,7 @@ stage_calibrate() {
     launcher="$(engine_launcher "$e")" || { printf '  [FAIL] unknown engine %s\n' "$e"; return 1; }
     api="$(engine_api "$e")"
     out="results/calibration/${EXP}_${e}.json"
-    job_run "calibrate_$e" 3600 "cd $POD_REPO && bash scripts/2_serving/$launcher start '$MODEL' && $POD_PYTHON scripts/3_run/calibrate_cell.py --backend $e --model '$MODEL' --api-base $api --manifest $CALIBRATION_MANIFEST --output $out --budget-fraction $CALIBRATION_BUDGET_FRACTION; rc=\$?; bash scripts/2_serving/$launcher stop; exit \$rc" "$LAND/logs/setup" || return 1
+    job_run "calibrate_$e" 3600 "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT && bash scripts/2_serving/$launcher start '$MODEL' && $POD_PYTHON scripts/3_run/calibrate_cell.py --backend $e --model '$MODEL' --api-base $api --manifest $CALIBRATION_MANIFEST --output $out --budget-fraction $CALIBRATION_BUDGET_FRACTION; rc=\$?; bash scripts/2_serving/$launcher stop; exit \$rc" "$LAND/logs/setup" || return 1
     run_step 0 "fetch calibration $e" -- pscp_from "$POD_REPO/$out" "$EXTRAS/calibration/${EXP}_${e}.json" || return 1
     plan_only && continue
     run_step 0 "calibration $e: cal-v2 and floor-derived start" -- "$PY3" - "$EXTRAS/calibration/${EXP}_${e}.json" <<'PY' || return 1
@@ -737,7 +748,7 @@ stage_run() {
     fi
   fi
   local name="run"
-  run_step 0 "job $name: submit" -- bash "$PODJOB" submit "$name" "cd $POD_REPO && env $RUN_ENV_UNSET CAGE_RUN_ROOT=$POD_RUN_ROOT VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT $POD_PYTHON scripts/3_run/run_campaign.py run --plan results/calibration/plan_$RUN_ID.json --campaign-root $POD_RUN_ROOT --seal$partial" "$bound" || return 1
+  run_step 0 "job $name: submit" -- bash "$PODJOB" submit "$name" "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH && env $RUN_ENV_UNSET CAGE_RUN_ROOT=$POD_RUN_ROOT VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT $POD_PYTHON scripts/3_run/run_campaign.py run --plan results/calibration/plan_$RUN_ID.json --campaign-root $POD_RUN_ROOT --seal$partial" "$bound" || return 1
   if plan_only; then
     printf '  [plan] %-28s expect DONE(0) or STOP FAILED(2): bash %s wait run %s\n' "job run: wait" "$PODJOB" "$bound"
     return 0
