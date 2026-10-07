@@ -133,7 +133,8 @@ def world(tmp_path: Path) -> Dict[str, Path]:
     _w(b / "scp", FAKE_SCP)
     _w(b / "runpodctl", FAKE_RUNPODCTL)
     _w(b / "setsid", "#!/bin/sh\nexec \"$@\"\n")
-    _w(b / "curl", "#!/bin/sh\nexit 0\n")
+    # /metrics answers with the live names of 2026-10-07 (S0F-37); everything else is a silent 200
+    _w(b / "curl", "#!/bin/bash\ncase \"$*\" in *\"/metrics\"*) printf 'sglang:token_usage 0.1\\nsglang:num_retracted_reqs 0\\nsglang:num_running_reqs 0\\nvllm:kv_cache_usage_perc 0.1\\n' ;; esac\nexit 0\n")
     _w(b / "nvidia-smi", r'''
         #!/bin/bash
         case "$*" in
@@ -285,7 +286,8 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         echo "[cage]  NOTE: harness trees carry no ledger.json until the campaign driver seals them"
         ''')
     for eng in ("vllm", "sglang", "lmdeploy"):
-        _w(pr / "scripts" / "2_serving" / f"manage_{eng}_server.sh", f"#!/bin/bash\necho \"launcher {eng} $*\" >> \"$CAGE_TEST_LOG\"; echo \"{eng} $1 ok\"; exit 0\n")
+        # a start writes the realized-pool record the validate probes read (ADR-0142)
+        _w(pr / "scripts" / "2_serving" / f"manage_{eng}_server.sh", f"#!/bin/bash\necho \"launcher {eng} $*\" >> \"$CAGE_TEST_LOG\"; [ \"$1\" = start ] && {{ mkdir -p logs/{eng}; echo '{{}}' > logs/{eng}/CURRENT.kvpool.json; }}; echo \"{eng} $1 ok\"; exit 0\n")
     _w(pr / "scripts" / "checks" / "preflight_check.sh", "#!/bin/bash\necho \"preflight $* BACKENDS=$CAGE_PREFLIGHT_BACKENDS\" >> \"$CAGE_TEST_LOG\"; echo 'PREFLIGHT PASS -- all Gate-2 components green.'; exit \"${CAGE_TEST_PREFLIGHT_RC:-0}\"\n")
     _w(pr / "scripts" / "3_run" / "calibrate_cell.py", r'''
         import json, sys
@@ -884,6 +886,34 @@ def test_a_stage_0_redo_mid_run_keeps_the_run_id_and_tolerates_its_own_pod_and_v
     assert _state(world)["stages"]["ship"]["status"] == "passed"
     proc = _master(world, "--only", "preflight-mac", "--redo", CAGE_TEST_PODS='[{"id": "pod123"}, {"id": "stranger"}]', CAGE_TEST_VOLUMES='[{"id": "vol123"}]')
     assert proc.returncode == 1 and "clean room: pods exist" in proc.stdout
+
+
+def test_validate_runs_the_preflight_on_vllm_only_and_engine_probes_on_sglang(world: Dict[str, Path], tmp_path: Path) -> None:
+    # S0F-37: preflight_check.sh is vLLM's gate set; SGLang gets its own probes.
+    two = tmp_path / "S1_two.env"
+    two.write_text(world["profile"].read_text(encoding="utf-8").replace('ENGINES="vllm hf"', 'ENGINES="vllm sglang hf"'), encoding="utf-8")
+    world["profile"] = two
+    proc = _master(world, "--yes", "provision", "--to", "validate")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    vllm_cmd = (world["home"] / ".cage_jobs" / "validate_vllm.cmd").read_text(encoding="utf-8")
+    sgl_cmd = (world["home"] / ".cage_jobs" / "validate_sglang.cmd").read_text(encoding="utf-8")
+    assert "preflight_check.sh" in vllm_cmd and "/flush_cache" not in vllm_cmd
+    assert "preflight_check.sh" not in sgl_cmd and "POST http://localhost:30000/flush_cache" in sgl_cmd
+    log = (world["exp_root"] / "S1" / DATE / "logs" / "setup" / "validate_sglang.log").read_text(encoding="utf-8")
+    for marker in ("VALIDATE_API_OK", "RUNNING_REQS=0", "ENGINE_FLUSH_OK", "METRIC_OK sglang:token_usage", "METRIC_OK sglang:num_retracted_reqs",
+                   "METRIC_OK sglang:num_running_reqs", "POOL_RECORD_OK", "COMPUTE_APPS=0"):
+        assert marker in log, marker
+    assert _state(world)["stages"]["validate"]["status"] == "passed"
+
+
+def test_validate_refuses_an_engine_without_a_registered_probe_set(world: Dict[str, Path], tmp_path: Path) -> None:
+    lm = tmp_path / "S1_lm.env"
+    lm.write_text(world["profile"].read_text(encoding="utf-8").replace('ENGINES="vllm hf"', 'ENGINES="vllm lmdeploy hf"'), encoding="utf-8")
+    world["profile"] = lm
+    proc = _master(world, "--yes", "provision", "--to", "validate")
+    assert proc.returncode == 1
+    assert "lmdeploy: no validation probe set is registered" in proc.stdout
+    assert not (world["home"] / ".cage_jobs" / "validate_lmdeploy.cmd").exists()
 
 
 def test_without_rehearsal_n_and_without_blocked_cells_the_argv_is_unchanged(world: Dict[str, Path]) -> None:

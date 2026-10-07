@@ -672,11 +672,39 @@ stage_validate() {
   for e in $(server_engines); do
     launcher="$(engine_launcher "$e")" || { printf '  [FAIL] unknown engine %s\n' "$e"; return 1; }
     api="$(engine_api "$e")"
+    # S0F-37 (live 2026-10-07): preflight_check.sh is vLLM's gate set (gate (a)
+    # probes /health and /reset_prefix_cache, gate (o) vLLM's metric names), so
+    # it runs against vLLM only; its engine-independent gates then stand for the
+    # pod. Every other engine gets the engine-specific probes the campaign relies
+    # on: the cold-start endpoint run_experiment.py calls (SGLang POST
+    # /flush_cache), the live /metrics names the regime bridge and the cold-start
+    # check read (the live scrape of 2026-10-07: sglang:token_usage,
+    # sglang:num_retracted_reqs, sglang:num_running_reqs), and the launcher's
+    # realized-pool record (ADR-0142). An engine with no registered set refuses.
+    local probe="" names="" gauge="" n_names=0
+    case "$e" in
+      vllm) probe="CAGE_PREFLIGHT_BACKENDS=$e bash scripts/checks/preflight_check.sh '$MODEL' $api; rc=\$?" ;;
+      sglang) names="sglang:token_usage sglang:num_retracted_reqs sglang:num_running_reqs"; gauge="sglang:num_running_reqs" ;;
+      *) printf '  [FAIL] %s: no validation probe set is registered for this engine (S0F-37)\n' "$e"; return 1 ;;
+    esac
+    if [ -z "$probe" ]; then
+      n_names="$(printf '%s\n' $names | grep -c .)"
+      # The flush refuses while a request runs (the startup warm-up still did at
+      # the fifth attempt: 400 "pending requests ... #running-req: 1"); the
+      # driver reads the running-requests gauge before every flush, so does this.
+      probe="rc=0; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do r=\$(curl -fsS $api/metrics 2>/dev/null | grep '^$gauge' | awk '{print \$NF}' | head -1); r=\${r%.*}; [ \"\${r:-1}\" = 0 ] && break; sleep 2; done; echo \"RUNNING_REQS=\${r:-unread}\"; curl -fsS -X POST $api/flush_cache >/dev/null && echo ENGINE_FLUSH_OK || { echo ENGINE_FLUSH_FAILED; rc=1; }; m=\$(curl -fsS $api/metrics 2>/dev/null); for n in $names; do printf '%s\\n' \"\$m\" | grep -q \"^\$n\" && echo \"METRIC_OK \$n\" || { echo \"METRIC_MISSING \$n\"; rc=1; }; done; [ -s logs/$e/CURRENT.kvpool.json ] && echo POOL_RECORD_OK || { echo POOL_RECORD_MISSING; rc=1; }"
+    fi
     # after `stop` the GPU process takes a few seconds to leave the compute-apps list: wait up to 60 s before reading it
-    job_run "validate_$e" 1500 "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT CAGE_DATASETS=$ds$POD_ENGINE_ENV && bash scripts/2_serving/$launcher start '$MODEL' && curl -sf $api/v1/models >/dev/null && echo VALIDATE_API_OK; CAGE_PREFLIGHT_BACKENDS=$e bash scripts/checks/preflight_check.sh '$MODEL' $api; rc=\$?; bash scripts/2_serving/$launcher stop; n=1; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do n=\$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . || true); [ \"\$n\" -eq 0 ] && break; sleep 2; done; echo COMPUTE_APPS=\$n; exit \$rc" "$LAND/logs/setup" || return 1
+    job_run "validate_$e" 1500 "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT CAGE_DATASETS=$ds$POD_ENGINE_ENV && bash scripts/2_serving/$launcher start '$MODEL' && curl -sf $api/v1/models >/dev/null && echo VALIDATE_API_OK; $probe; bash scripts/2_serving/$launcher stop; n=1; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do n=\$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . || true); [ \"\$n\" -eq 0 ] && break; sleep 2; done; echo COMPUTE_APPS=\$n; exit \$rc" "$LAND/logs/setup" || return 1
     plan_only && continue
     grep -q "VALIDATE_API_OK" "$JOB_LOG" || { printf '  [FAIL] %s: /v1/models never answered\n' "$e"; return 1; }
-    grep -q "PREFLIGHT PASS" "$JOB_LOG" || { printf '  [FAIL] %s: preflight did not PASS\n' "$e"; return 1; }
+    if [ "$e" = "vllm" ]; then
+      grep -q "PREFLIGHT PASS" "$JOB_LOG" || { printf '  [FAIL] %s: preflight did not PASS\n' "$e"; return 1; }
+    else
+      grep -q "ENGINE_FLUSH_OK" "$JOB_LOG" || { printf '  [FAIL] %s: the cold-start endpoint POST /flush_cache did not answer\n' "$e"; return 1; }
+      [ "$(grep -c '^METRIC_OK ' "$JOB_LOG")" -eq "$n_names" ] || { printf '  [FAIL] %s: live /metrics lacks a name the regime bridge or the cold-start check reads:\n' "$e"; grep 'METRIC_MISSING' "$JOB_LOG" | sed 's/^/    /'; return 1; }
+      grep -q "POOL_RECORD_OK" "$JOB_LOG" || { printf '  [FAIL] %s: the launcher wrote no CURRENT.kvpool.json (ADR-0142 realized pool)\n' "$e"; return 1; }
+    fi
     grep -q "COMPUTE_APPS=0" "$JOB_LOG" || { printf '  [FAIL] %s: compute apps remain after stop\n' "$e"; return 1; }
   done
   return 0
