@@ -183,5 +183,8 @@ pytest-asyncio>=0.21.0
 # without token counters, the api derives the two polls at their wall-clock instants
 # (rates over the measured gap, ts = the second poll's epoch time), and the SGLang
 # dialect maps num_requests_total to the request family ([A] semantics, VERIFY-LIVE).
-cage-stats @ git+https://github.com/lucasmdocarmo/cage-stats.git@afa82328c40d19c74f57851de8bd82dc89aa6d91
+# 2026-10-08 (ADR-0148 Batch C review fixes LOW 3 and LOW 4): bumped afa82328 -> 51bb9ac4:
+# the api refuses a backward clock step between its two polls; the session request
+# count starts at the first tick that carries the counter.
+cage-stats @ git+https://github.com/lucasmdocarmo/cage-stats.git@51bb9ac471ad52fcd5c555ee4f6d76a25ba79a50
 # Local dev alternative (no install): set CAGE_STATS_HOME=/Users/lucasmariano/cage-stats
