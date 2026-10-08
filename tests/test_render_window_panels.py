@@ -145,8 +145,14 @@ def test_resource_columns_are_hand_arithmetic(run_root: Path, tmp_path: Path) ->
     assert float(w1["prompt_tps"]) == pytest.approx(2.50)
     assert float(w1["gen_tps_per_gpu"]) == pytest.approx(0.15)
     assert float(w1["prompt_tps_per_gpu"]) == pytest.approx(1.25)
-    assert float(w1["energy_j"]) == pytest.approx(50.0)            # runner delta wins: 50,000 mJ
-    assert float(w1["joules_per_completed"]) == pytest.approx(25.0)
+    # ADR-0148 Batch D (2026-10-08): energy_j is the WINDOW-bounded delta from
+    # the ticks nearest t_start and t_end. Window 01's ticks end 97 s before
+    # t_end, so the window value is empty with a note; the runner's lifetime
+    # delta (50,000 mJ, the sampler's whole life) keeps its own column and is
+    # never written into energy_j.
+    assert w1["energy_j"] == "" and w1["joules_per_completed"] == ""
+    assert float(w1["energy_sampler_lifetime_j"]) == pytest.approx(50.0)
+    assert "energy_j empty: energy ticks do not cover the window" in w1["notes"]
     assert float(w1["usd_window"]) == pytest.approx(3.49 * 100 / 3600)
     assert float(w1["usd_per_completed"]) == pytest.approx(3.49 * 100 / 3600 / 2)
     assert float(w1["avg_gpu_util_pct"]) == 85.5 and float(w1["avg_power_w"]) == 290.0
@@ -155,6 +161,7 @@ def test_resource_columns_are_hand_arithmetic(run_root: Path, tmp_path: Path) ->
     assert w2["clock_mode"] == "index"
     assert w2["gpu_series"] == "not recorded"
     assert w2["energy_j"] == "" and w2["joules_per_completed"] == ""
+    assert w2["energy_sampler_lifetime_j"] == "" and w2["energy_tick_offsets_s"] == ""
     assert w2["regime_label"] == "UNKNOWN_TELEMETRY" and w2["telemetry_ok"] == "False"
     assert "clock" in w2["notes"] and "not recorded" in w2["notes"]
 
@@ -346,4 +353,75 @@ def test_duration_precedence_and_null_telemetry_block() -> None:
                       metrics={"measured_window": {"t_start": T0, "t_end": T0 + 8}, "vllm_telemetry": None},
                       regime={"label": "PRESSURED", "telemetry_ok": True, "t_start": T0, "t_end": T0 + 100})
     assert wd.duration_s() == 8.0                        # metrics.json wins over regime.json
-    assert wd.energy_j() == pytest.approx(4.0)           # series fallback: (1,004,000 - 1,000,000) mJ
+    # ADR-0148 Batch D: the series ticks end at T0+2 while the window ends at
+    # T0+8, six cadences away, so the last-minus-first series fallback (4.0 J,
+    # the pre-Batch-D pin) no longer stands in for the window's energy.
+    energy, offsets, reason = wd.energy_window()
+    assert energy is None and wd.energy_j() is None
+    assert offsets == (0.0, -6.0) and reason.startswith("energy ticks do not cover the window")
+
+
+# ---------------------------------------------------------------------------
+# ADR-0148 Batch D (2026-10-08): window-bounded energy
+# ---------------------------------------------------------------------------
+
+def _energy_samples(n: int = 13, *, cadence: float = 1.0, first_offset: float = -1.0,
+                    per_gpu: bool = True, reset_at: int | None = None) -> list[dict]:
+    """Ticks at T0 + first_offset + i * cadence with cumulative energy
+    1,000,000 + 1,000 i mJ split 500 i / 500 i over two devices."""
+    out = []
+    for i in range(n):
+        e = 1_000_000.0 + 1_000.0 * i
+        if reset_at is not None and i >= reset_at:
+            e = 100.0 * i                                # the counter restarted
+        s = _sample(T0 + first_offset + i * cadence, kv=0.3, running=1, gpu_ok=True, energy_mj=e)
+        if per_gpu:
+            s["energy_mj_per_gpu"] = [500.0 * i, 1_000_000.0 + 500.0 * i]
+        out.append(s)
+    return out
+
+
+def test_energy_j_is_the_window_bounded_delta_from_the_nearest_ticks() -> None:
+    wd = _window_data(_energy_samples(), requests=[_request(True, 4, 40), _request(True, 6, 60)])
+    energy, offsets, reason = wd.energy_window()
+    # ticks T0-1 .. T0+11; span T0 .. T0+10 -> ticks i=1 and i=11, both exactly on the bounds
+    assert reason is None and offsets == (0.0, 0.0)
+    assert energy == pytest.approx(10.0)                 # (5,000 + 5,000) mJ over the two devices
+    row = rwp._index_row(wd, "run", None, "")
+    assert row["energy_j"] == pytest.approx(10.0)
+    assert row["joules_per_completed"] == pytest.approx(5.0)
+    assert row["energy_tick_offsets_s"] == "0;0"
+    assert row["energy_sampler_lifetime_j"] is None        # no runner delta in this metrics.json
+
+
+def test_energy_j_none_when_a_device_reads_on_one_end_only() -> None:
+    samples = _energy_samples()
+    samples[11]["energy_mj_per_gpu"][1] = None            # device 1 unread at the end tick
+    energy, offsets, reason = _window_data(samples).energy_window()
+    assert energy is None and offsets == (0.0, 0.0)
+    assert "device 1 read on one end of the window only" in reason
+
+
+def test_energy_j_none_on_a_counter_reset() -> None:
+    energy, _, reason = _window_data(_energy_samples(per_gpu=False, reset_at=6)).energy_window()
+    assert energy is None and "reset" in reason
+
+
+def test_energy_ticks_within_one_cadence_of_the_bounds_are_accepted() -> None:
+    # cadence 2 s, ticks at T0-1, T0+1, ..., T0+11: the nearest ticks sit 1 s off
+    # each bound (ties take the earlier tick), inside one cadence
+    wd = _window_data(_energy_samples(n=7, cadence=2.0, first_offset=-1.0, per_gpu=False))
+    energy, offsets, reason = wd.energy_window()
+    assert reason is None and offsets == (-1.0, -1.0)
+    assert energy == pytest.approx(5.0)                  # ticks i=0 and i=5: 5,000 mJ
+    assert rwp._index_row(wd, "run", None, "")["energy_tick_offsets_s"] == "-1;-1"
+
+
+def test_lifetime_column_keeps_the_runner_delta_apart_from_the_window_value() -> None:
+    samples = _energy_samples(n=3)                        # ticks end at T0+1, far from t_end
+    wd = _window_data(samples, metrics={"measured_window": {"t_start": T0, "t_end": T0 + 10},
+                                        "vllm_telemetry": {"energy_delta_mj": 50_000.0}})
+    assert wd.energy_j() is None
+    assert wd.energy_sampler_lifetime_j() == pytest.approx(50.0)
+    row = rwp._index_row(wd, "run", None, "")
+    assert row["energy_j"] is None and row["energy_sampler_lifetime_j"] == pytest.approx(50.0)

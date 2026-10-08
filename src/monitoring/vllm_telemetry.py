@@ -497,7 +497,12 @@ class VllmTelemetrySampler:
         # T4.4 the per-tick energy_mj is the SUM across ALL GPUs, so this delta is
         # the TP-correct multi-GPU total (field name preserved; single-GPU hosts
         # are numerically unchanged). Absent (pynvml missing / unsupported GPU)
-        # -> no key, never a fabricated zero.
+        # -> no key, never a fabricated zero. SPAN (ADR-0148, Batch D): this
+        # delta covers the sampler's whole life, which the runner starts before
+        # the measured stage and stops after it, so it includes idle seconds
+        # outside the window; render_window_panels.py derives the window-bounded
+        # energy from the two ticks nearest the window bounds and reports this
+        # value under energy_sampler_lifetime_j.
         energies = [s.get("energy_mj") for s in samples
                     if isinstance(s.get("energy_mj"), (int, float))]
         if len(energies) >= 2:

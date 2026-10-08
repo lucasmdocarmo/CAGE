@@ -27,6 +27,15 @@ referee could not certify shows the same gap here. A prefill/decode window
 carries both roles' samples in one file, told apart by ``instance``; each
 role is drawn as its own trace and the clock is judged per role.
 
+Energy (ADR-0148, Batch D, 2026-10-08): ``energy_j`` is the window-bounded
+delta of the cumulative NVML counter between the tick nearest ``t_start``
+and the tick nearest ``t_end``, each within one sampler cadence of its
+bound, per device when the per-GPU lists exist (None when a device reads on
+one end only or a delta is negative). The runner's ``energy_delta_mj`` spans
+the sampler's whole life (started before the measured stage, stopped after
+it) and is reported under its own column, ``energy_sampler_lifetime_j``,
+never inside ``energy_j``.
+
 Known data shapes (read 2026-10-05 on results/s0/a/s0-20260930): the S0
 tree carries ``ts_s`` = 1.0 on every sample (S0F-15, fixed since) and an
 empty GPU sub-record (``gpu.available`` false, S0F-30). Both are handled,
@@ -76,7 +85,8 @@ INDEX_COLUMNS = (
     "regime_label", "telemetry_ok", "roles", "n_samples", "n_malformed_lines", "clock_mode", "duration_s",
     "n_requests", "n_completed", "n_error", "gen_tokens", "prompt_tokens", "gpu_count",
     "gen_tps", "prompt_tps", "gen_tps_per_gpu", "prompt_tps_per_gpu",
-    "energy_j", "joules_per_completed", "avg_gpu_util_pct", "avg_power_w", "gpu_series",
+    "energy_j", "joules_per_completed", "energy_sampler_lifetime_j", "energy_tick_offsets_s",
+    "avg_gpu_util_pct", "avg_power_w", "gpu_series",
     "usd_per_hour", "usd_window", "usd_per_completed", "panel", "notes",
 )
 
@@ -278,22 +288,72 @@ class WindowData:
         prompt = sum(int(_num(r.get("prompt_tokens")) or 0) for r in completed)
         return n, len(completed), n - len(completed), gen, prompt
 
-    def energy_j(self) -> Optional[float]:
-        """The runner's window delta first; else last minus first of ONE role's
-        cumulative ``energy_mj`` (every role's sampler reads the same NVML
-        counters, so the roles are never summed)."""
+    def energy_sampler_lifetime_j(self) -> Optional[float]:
+        """The runner's ``energy_delta_mj`` in joules, under its own name: the
+        sampler starts before the measured stage and stops after it, so this
+        spans more than the window (ADR-0148, Batch D). None when absent."""
         tele = self.metrics.get("vllm_telemetry")
         delta = _num(tele.get("energy_delta_mj")) if isinstance(tele, dict) else None
-        if delta is not None:
-            return delta / 1000.0
+        return delta / 1000.0 if delta is not None else None
+
+    def energy_window(self) -> tuple[Optional[float], Optional[tuple[float, float]], Optional[str]]:
+        """``(energy_j, (start_offset_s, end_offset_s), reason)`` for the window.
+
+        The first role's ticks carrying a numeric ``energy_mj`` (every role's
+        sampler reads the same NVML counters, so the roles are never summed).
+        The tick nearest ``t_start`` and the tick nearest ``t_end`` (ties take
+        the earlier tick) must each lie within one cadence of its bound, the
+        cadence being the median gap between that role's consecutive ticks.
+        With per-GPU lists on both ticks the delta is summed per device, and a
+        device that reads on one end only refuses the whole value. A negative
+        delta (counter reset) refuses too. ``reason`` names the refusal; the
+        offsets are the ticks' signed distance from the bounds in seconds."""
+        a, b = self.span()
+        if a is None or b is None:
+            return None, None, "no window span"
         roles = self.roles()
         if not roles:
-            return None
-        first = roles[sorted(roles)[0]]
-        vals = [v for v in self.series(first, "energy_mj") if v is not None]
-        if len(vals) >= 2 and vals[-1] >= vals[0]:
-            return (vals[-1] - vals[0]) / 1000.0
-        return None
+            return None, None, "no telemetry samples"
+        group = roles[sorted(roles)[0]]
+        ticks = [(t, s) for s in group for t in (_sample_ts(s),)
+                 if t is not None and _num(s.get("energy_mj")) is not None]
+        if len(ticks) < 2:
+            return None, None, "fewer than two energy ticks"
+        ts = [t for t, _ in ticks]
+        gaps = sorted(y - x for x, y in zip(ts, ts[1:]) if y > x)
+        if not gaps:
+            return None, None, "energy ticks without a forward clock"
+        cadence = gaps[len(gaps) // 2]
+        start = min(ticks, key=lambda p: (abs(p[0] - a), p[0]))
+        end = min(ticks, key=lambda p: (abs(p[0] - b), p[0]))
+        offsets = (start[0] - a, end[0] - b)
+        if abs(offsets[0]) > cadence or abs(offsets[1]) > cadence:
+            return None, offsets, (
+                f"energy ticks do not cover the window (nearest tick {offsets[0]:+.1f} s from "
+                f"t_start, {offsets[1]:+.1f} s from t_end, cadence {cadence:.1f} s)")
+        if start[0] >= end[0]:
+            return None, offsets, "energy ticks do not bracket the window"
+        per0, per1 = start[1].get("energy_mj_per_gpu"), end[1].get("energy_mj_per_gpu")
+        if isinstance(per0, list) and isinstance(per1, list) and per0 and len(per0) == len(per1):
+            deltas: list[float] = []
+            for k, (x, y) in enumerate(zip(per0, per1)):
+                x, y = _num(x), _num(y)
+                if (x is None) != (y is None):
+                    return None, offsets, f"energy device {k} read on one end of the window only"
+                if x is not None and y is not None:
+                    deltas.append(y - x)
+            if not deltas:
+                return None, offsets, "no device reading at the window ticks"
+            total = sum(deltas)
+        else:
+            total = _num(end[1].get("energy_mj")) - _num(start[1].get("energy_mj"))  # type: ignore[operator]
+        if total < 0:
+            return None, offsets, "energy counter reset inside the window (negative delta)"
+        return total / 1000.0, offsets, None
+
+    def energy_j(self) -> Optional[float]:
+        """The window-bounded energy in joules, or None (``energy_window``)."""
+        return self.energy_window()[0]
 
 
 def _load_window(wdir: Path, cell: dict) -> WindowData:
@@ -330,6 +390,10 @@ def _load_window(wdir: Path, cell: dict) -> WindowData:
                 break
         wd.notes.append("zero-length span" if a is not None and b is not None and b <= a
                         else "duration unknown (no measured_window, regime or cell.json span)")
+    if samples and wd.duration_s() is not None:
+        _, _, reason = wd.energy_window()
+        if reason is not None:
+            wd.notes.append(f"energy_j empty: {reason}")
     return wd
 
 
@@ -494,7 +558,7 @@ def _index_row(wd: WindowData, run_id: str, price: Optional[float], panel: str) 
     gpu_count = gpu_count if isinstance(gpu_count, int) and not isinstance(gpu_count, bool) and gpu_count >= 1 else None
     gen_tps = gen / duration if gen is not None and duration else None
     prompt_tps = prompt / duration if prompt is not None and duration else None
-    energy = wd.energy_j()
+    energy, offsets, _ = wd.energy_window()
     gpu_avg = wd.metrics.get("gpu") if isinstance(wd.metrics.get("gpu"), dict) else {}
     usd_window = price * duration / 3600.0 if price is not None and duration else None
     label = wd.regime.get("label")
@@ -513,6 +577,8 @@ def _index_row(wd: WindowData, run_id: str, price: Optional[float], panel: str) 
         "gen_tps_per_gpu": gen_tps / gpu_count if gen_tps is not None and gpu_count else None,
         "prompt_tps_per_gpu": prompt_tps / gpu_count if prompt_tps is not None and gpu_count else None,
         "energy_j": energy, "joules_per_completed": energy / n_ok if energy is not None and n_ok else None,
+        "energy_sampler_lifetime_j": wd.energy_sampler_lifetime_j(),
+        "energy_tick_offsets_s": (f"{offsets[0]:.6g};{offsets[1]:.6g}" if energy is not None and offsets else None),
         "avg_gpu_util_pct": _num(gpu_avg.get("avg_gpu_utilization")), "avg_power_w": _num(gpu_avg.get("avg_power_watts")),
         "gpu_series": ("recorded" if wd.gpu_recorded() else "not recorded") if wd.samples else None,
         "usd_per_hour": price, "usd_window": usd_window,
