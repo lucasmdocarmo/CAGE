@@ -62,21 +62,6 @@ def compression_ratio(original_tokens: int, compressed_tokens: int) -> Optional[
     return float(compressed_tokens) / float(original_tokens)
 
 
-def transfer_bytes_for(
-    kv_bytes: float, *, num_nodes: int, fraction_remote: Optional[float] = None
-) -> float:
-    """Bytes that must move cross-node for a sharded KV of size `kv_bytes`.
-
-    Default fraction_remote = (num_nodes-1)/num_nodes (each node holds 1/N locally).
-    NOTE: this is the analytical model; the *measured* transfer bytes come from the real
-    vLLM KV connector (LMCache/NIXL) once wired — see DEV_BACKLOG #6.
-    """
-    if num_nodes <= 1:
-        return 0.0
-    fr = fraction_remote if fraction_remote is not None else (num_nodes - 1) / num_nodes
-    return float(kv_bytes) * float(fr)
-
-
 def analytical_kv_footprint(
     model_name: str,
     num_tokens: int,

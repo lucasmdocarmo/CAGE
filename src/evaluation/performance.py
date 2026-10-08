@@ -6,54 +6,91 @@ Metrics:
 - Latency (TTFT, TPOT, end-to-end)
 - Resource utilization (CPU, memory, GPU)
 - GPU utilization and memory (via pynvml)
+
+Absence rule (ADR-0148, 2026-10-07): a count of our own events (requests,
+tokens, errors, samples) is 0 on an empty set; every quantity derived from
+readings (mean, max, percentile, ratio, rate, sum of device readings) is None
+when there is no reading. Each result carries the sample count that explains
+its None, so a reader can tell a measured zero from a value never measured.
+Before this rule the trackers wrote 0.0 where nothing was sampled, and a
+window with no successful request or no NVML tick read as a measured idle
+system.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Sequence
 import time
+import numpy as np
 import psutil
 from collections import defaultdict
 
 
+def _mean_or_none(values: Sequence[float]) -> Optional[float]:
+    """Arithmetic mean of the readings; None when there is none (ADR-0148)."""
+    return float(np.mean(values)) if values else None
+
+
+def _max_or_none(values: Sequence[float]) -> Optional[float]:
+    """Maximum of the readings; None when there is none (ADR-0148)."""
+    return float(np.max(values)) if values else None
+
+
+def _percentile_or_none(values: Sequence[float], q: float) -> Optional[float]:
+    """The q-th percentile of the readings (numpy's linear interpolation);
+    None when there is none (ADR-0148)."""
+    return float(np.percentile(values, q)) if values else None
+
+
 @dataclass
 class PerformanceMetrics:
-    """Performance evaluation results."""
-    
-    # Throughput
-    queries_per_second: float
-    tokens_per_second: float
-    
-    # Latency
-    avg_ttft_ms: float  # Average time to first token
-    p50_ttft_ms: float  # Median TTFT
-    p95_ttft_ms: float  # 95th percentile TTFT
-    p99_ttft_ms: float  # 99th percentile TTFT
-    
-    # TPOT - Time Per Output Token (sustained generation speed)
-    avg_tpot_ms: float  # Average time per output token
-    p50_tpot_ms: float  # Median TPOT
-    p95_tpot_ms: float  # 95th percentile TPOT
-    p99_tpot_ms: float  # 99th percentile TPOT
-    
-    avg_latency_ms: float  # Average end-to-end latency
-    p50_latency_ms: float
-    p95_latency_ms: float
-    p99_latency_ms: float
-    
-    # Resource utilization
-    avg_cpu_percent: float
-    avg_memory_mb: float
-    peak_memory_mb: float
-    
+    """Performance evaluation results.
+
+    Absence rule (ADR-0148): the latency, throughput, TPOT and resource fields
+    are None when no reading exists (no successful request, no request with a
+    positive generation interval, no resource sample); ``total_requests``,
+    ``total_tokens``, ``error_count`` and the two time spans stay numbers.
+    ``tpot_sample_count`` and ``resource_sample_count`` say how many readings
+    stand behind the TPOT and the CPU/memory fields.
+    """
+
+    # Throughput (None when the summed serving time is 0)
+    queries_per_second: Optional[float]
+    tokens_per_second: Optional[float]
+
+    # Latency (None with no successful request)
+    avg_ttft_ms: Optional[float]  # Average time to first token
+    p50_ttft_ms: Optional[float]  # Median TTFT
+    p95_ttft_ms: Optional[float]  # 95th percentile TTFT
+    p99_ttft_ms: Optional[float]  # 99th percentile TTFT
+
+    # TPOT - Time Per Output Token (sustained generation speed); None when no
+    # request had a positive generation interval (tpot_sample_count == 0)
+    avg_tpot_ms: Optional[float]  # Average time per output token
+    p50_tpot_ms: Optional[float]  # Median TPOT
+    p95_tpot_ms: Optional[float]  # 95th percentile TPOT
+    p99_tpot_ms: Optional[float]  # 99th percentile TPOT
+
+    avg_latency_ms: Optional[float]  # Average end-to-end latency
+    p50_latency_ms: Optional[float]
+    p95_latency_ms: Optional[float]
+    p99_latency_ms: Optional[float]
+
+    # Resource utilization of the runner process (None with no sample)
+    avg_cpu_percent: Optional[float]
+    avg_memory_mb: Optional[float]
+    peak_memory_mb: Optional[float]
+
     # Additional stats
     total_requests: int
     total_tokens: int
     total_time_seconds: float          # wall-clock span of the measured stage (incl. inline CPU scoring)
-    serving_time_seconds: float        # summed per-request serving time; denominator for throughput
+    serving_time_seconds: float        # summed per-request serving time over successful requests; denominator for throughput
     error_count: int = 0
-    
-    def to_dict(self) -> Dict[str, float]:
-        """Convert to dictionary."""
+    tpot_sample_count: int = 0         # requests with a positive generation interval (ADR-0148)
+    resource_sample_count: int = 0     # CPU/memory samples taken (ADR-0148)
+
+    def to_dict(self) -> Dict[str, Optional[float]]:
+        """Convert to dictionary (None stays None: absence is not zero)."""
         return {
             "queries_per_second": self.queries_per_second,
             "tokens_per_second": self.tokens_per_second,
@@ -77,6 +114,8 @@ class PerformanceMetrics:
             "total_time_seconds": self.total_time_seconds,
             "serving_time_seconds": self.serving_time_seconds,
             "error_count": self.error_count,
+            "tpot_sample_count": self.tpot_sample_count,
+            "resource_sample_count": self.resource_sample_count,
         }
 
 
@@ -166,50 +205,29 @@ class PerformanceEvaluator:
             self._sample_resources()
     
     def compute_metrics(self) -> PerformanceMetrics:
-        """Compute aggregate performance metrics."""
+        """Compute aggregate performance metrics.
+
+        ADR-0148: a field derived from readings is None when there is no
+        reading; the counts and the two time spans are always numbers. Before
+        the rule a window with no successful request returned 0.0 everywhere
+        and read as a window served at zero latency.
+        """
         if not self.start_time or not self.end_time:
             raise ValueError("Must call start() and stop() before computing metrics")
-        
+
         total_time = self.end_time - self.start_time
-        
+
         # Filter out errors
         successful_requests = [
             req for req in self.request_metrics if req.error is None
         ]
         error_count = len(self.request_metrics) - len(successful_requests)
-        
-        if not successful_requests:
-            # Return zero metrics if no successful requests
-            return PerformanceMetrics(
-                queries_per_second=0.0,
-                tokens_per_second=0.0,
-                avg_ttft_ms=0.0,
-                p50_ttft_ms=0.0,
-                p95_ttft_ms=0.0,
-                p99_ttft_ms=0.0,
-                avg_tpot_ms=0.0,
-                p50_tpot_ms=0.0,
-                p95_tpot_ms=0.0,
-                p99_tpot_ms=0.0,
-                avg_latency_ms=0.0,
-                p50_latency_ms=0.0,
-                p95_latency_ms=0.0,
-                p99_latency_ms=0.0,
-                avg_cpu_percent=0.0,
-                avg_memory_mb=0.0,
-                peak_memory_mb=0.0,
-                total_requests=len(self.request_metrics),
-                total_tokens=0,
-                total_time_seconds=total_time,
-                serving_time_seconds=0.0,
-                error_count=error_count,
-            )
-        
-        # Extract metrics
+
+        # Extract metrics (every list is empty on an all-error window)
         ttfts = [req.ttft_ms for req in successful_requests]
         latencies = [req.total_time_ms for req in successful_requests]
         tokens = [req.num_tokens for req in successful_requests]
-        
+
         total_tokens = sum(tokens)
         total_requests = len(successful_requests)
 
@@ -219,18 +237,11 @@ class PerformanceEvaluator:
         # sequential requests and understates serving throughput by ~4x. Summing per-request
         # latencies yields the true single-stream (back-to-back) serving rate, matching the
         # parallel computation in run_experiment.py. Pure decode speed is 1000/avg_tpot_ms.
+        # A zero serving time has no rate (None), never a 0.0 QPS.
         serving_time = sum(latencies) / 1000.0
-        qps = total_requests / serving_time if serving_time > 0 else 0.0
-        tps = total_tokens / serving_time if serving_time > 0 else 0.0
-        
-        # Compute latency percentiles
-        import numpy as np
-        
-        avg_ttft = float(np.mean(ttfts))
-        p50_ttft = float(np.percentile(ttfts, 50))
-        p95_ttft = float(np.percentile(ttfts, 95))
-        p99_ttft = float(np.percentile(ttfts, 99))
-        
+        qps = total_requests / serving_time if serving_time > 0 else None
+        tps = total_tokens / serving_time if serving_time > 0 else None
+
         # Compute TPOT (Time Per Output Token) = mean inter-token latency.
         # TTFT already accounts for the FIRST token, so the time after the first token
         # produced (num_tokens - 1) tokens -> divide by (num_tokens - 1), not num_tokens.
@@ -248,48 +259,33 @@ class PerformanceEvaluator:
                 generation_time_ms = req.total_time_ms - req.ttft_ms
                 tpot = generation_time_ms / (req.num_tokens - 1)
                 tpots.append(tpot)
-        
-        if tpots:
-            avg_tpot = float(np.mean(tpots))
-            p50_tpot = float(np.percentile(tpots, 50))
-            p95_tpot = float(np.percentile(tpots, 95))
-            p99_tpot = float(np.percentile(tpots, 99))
-        else:
-            avg_tpot = p50_tpot = p95_tpot = p99_tpot = 0.0
-        
-        avg_latency = float(np.mean(latencies))
-        p50_latency = float(np.percentile(latencies, 50))
-        p95_latency = float(np.percentile(latencies, 95))
-        p99_latency = float(np.percentile(latencies, 99))
-        
-        # Compute resource utilization
-        avg_cpu = float(np.mean(self.cpu_samples)) if self.cpu_samples else 0.0
-        avg_memory = float(np.mean(self.memory_samples)) if self.memory_samples else 0.0
-        peak_memory = float(np.max(self.memory_samples)) if self.memory_samples else 0.0
-        
+
         return PerformanceMetrics(
             queries_per_second=qps,
             tokens_per_second=tps,
-            avg_ttft_ms=avg_ttft,
-            p50_ttft_ms=p50_ttft,
-            p95_ttft_ms=p95_ttft,
-            p99_ttft_ms=p99_ttft,
-            avg_tpot_ms=avg_tpot,
-            p50_tpot_ms=p50_tpot,
-            p95_tpot_ms=p95_tpot,
-            p99_tpot_ms=p99_tpot,
-            avg_latency_ms=avg_latency,
-            p50_latency_ms=p50_latency,
-            p95_latency_ms=p95_latency,
-            p99_latency_ms=p99_latency,
-            avg_cpu_percent=avg_cpu,
-            avg_memory_mb=avg_memory,
-            peak_memory_mb=peak_memory,
+            avg_ttft_ms=_mean_or_none(ttfts),
+            p50_ttft_ms=_percentile_or_none(ttfts, 50),
+            p95_ttft_ms=_percentile_or_none(ttfts, 95),
+            p99_ttft_ms=_percentile_or_none(ttfts, 99),
+            avg_tpot_ms=_mean_or_none(tpots),
+            p50_tpot_ms=_percentile_or_none(tpots, 50),
+            p95_tpot_ms=_percentile_or_none(tpots, 95),
+            p99_tpot_ms=_percentile_or_none(tpots, 99),
+            avg_latency_ms=_mean_or_none(latencies),
+            p50_latency_ms=_percentile_or_none(latencies, 50),
+            p95_latency_ms=_percentile_or_none(latencies, 95),
+            p99_latency_ms=_percentile_or_none(latencies, 99),
+            # Resource utilization of the runner process (None with no sample)
+            avg_cpu_percent=_mean_or_none(self.cpu_samples),
+            avg_memory_mb=_mean_or_none(self.memory_samples),
+            peak_memory_mb=_max_or_none(self.memory_samples),
             total_requests=total_requests + error_count,
             total_tokens=total_tokens,
             total_time_seconds=total_time,
             serving_time_seconds=serving_time,
             error_count=error_count,
+            tpot_sample_count=len(tpots),
+            resource_sample_count=len(self.memory_samples),
         )
     
     def reset(self) -> None:
@@ -398,115 +394,53 @@ class SpeculativeMetricsTracker:
         self.baseline_latency_ms = None
 
 
-class CacheMetricsTracker:
-    """Tracks cache-specific metrics."""
-    
-    def __init__(self):
-        self.local_hits = 0
-        self.remote_hits = 0
-        self.misses = 0
-        self.remote_fetch_latencies: List[float] = []
-        self.transfer_bytes: List[int] = []
-    
-    def record_local_hit(self) -> None:
-        """Record a local cache hit."""
-        self.local_hits += 1
-    
-    def record_remote_hit(self, fetch_latency_ms: float, bytes_transferred: int) -> None:
-        """Record a remote cache hit."""
-        self.remote_hits += 1
-        self.remote_fetch_latencies.append(fetch_latency_ms)
-        self.transfer_bytes.append(bytes_transferred)
-    
-    def record_miss(self) -> None:
-        """Record a cache miss."""
-        self.misses += 1
-    
-    def get_metrics(self) -> Dict[str, float]:
-        """Compute cache metrics."""
-        total_requests = self.local_hits + self.remote_hits + self.misses
-        
-        if total_requests == 0:
-            return {
-                "local_hit_ratio": 0.0,
-                "remote_hit_ratio": 0.0,
-                "miss_ratio": 0.0,
-                "total_hit_ratio": 0.0,
-                "avg_remote_fetch_ms": 0.0,
-                "total_transfer_mb": 0.0,
-            }
-        
-        import numpy as np
-        
-        local_hit_ratio = self.local_hits / total_requests
-        remote_hit_ratio = self.remote_hits / total_requests
-        miss_ratio = self.misses / total_requests
-        total_hit_ratio = (self.local_hits + self.remote_hits) / total_requests
-        
-        avg_remote_fetch = (
-            float(np.mean(self.remote_fetch_latencies))
-            if self.remote_fetch_latencies
-            else 0.0
-        )
-        total_transfer_mb = sum(self.transfer_bytes) / 1024 / 1024
-        
-        return {
-            "local_hit_ratio": local_hit_ratio,
-            "remote_hit_ratio": remote_hit_ratio,
-            "miss_ratio": miss_ratio,
-            "total_hit_ratio": total_hit_ratio,
-            "avg_remote_fetch_ms": avg_remote_fetch,
-            "total_transfer_mb": total_transfer_mb,
-        }
-    
-    def reset(self) -> None:
-        """Reset all metrics."""
-        self.local_hits = 0
-        self.remote_hits = 0
-        self.misses = 0
-        self.remote_fetch_latencies.clear()
-        self.transfer_bytes.clear()
-
-
 @dataclass
 class GPUMetrics:
     """GPU utilization metrics.
-    
+
     Provides nvidia-smi equivalent metrics via pynvml.
     Used for Layer 2 GPU metrics as per paper requirements.
+
+    Absence rule (ADR-0148; BACKLOG S0F-43): every field derived from NVML
+    readings is None when no reading exists (no sampling tick, or every read
+    of that field failed); ``gpu_count`` and ``sample_count`` are counts;
+    ``total_memory_mb`` and ``power_limit_watts`` are the static device facts
+    read at init, None when a device's value could not be read.
     """
-    
+
     # Per-GPU metrics (aggregated across devices)
     gpu_count: int  # Number of GPUs detected
-    
+    sample_count: int  # Sampling ticks recorded (ADR-0148)
+
     # Utilization (0-100%)
-    avg_gpu_utilization: float  # Average GPU compute utilization
-    max_gpu_utilization: float  # Peak GPU utilization
-    avg_memory_utilization: float  # Average GPU memory bandwidth utilization
-    
+    avg_gpu_utilization: Optional[float]  # Average GPU compute utilization
+    max_gpu_utilization: Optional[float]  # Peak GPU utilization
+    avg_memory_utilization: Optional[float]  # Average GPU memory bandwidth utilization
+
     # Memory (MB)
-    total_memory_mb: float  # Total GPU memory across all devices
-    used_memory_mb: float  # Current GPU memory in use
-    peak_memory_mb: float  # Peak GPU memory usage
-    memory_usage_percent: float  # Percentage of GPU memory used
-    
+    total_memory_mb: Optional[float]  # Total GPU memory across all devices
+    used_memory_mb: Optional[float]  # Mean GPU memory in use over the samples
+    peak_memory_mb: Optional[float]  # Peak GPU memory usage
+    memory_usage_percent: Optional[float]  # mean per-device used memory over the box total (1/N of the box fraction with N equal GPUs; multi-GPU arithmetic is BACKLOG S0F-48)
+
     # Power (Watts)
-    avg_power_watts: float  # Average power draw
-    max_power_watts: float  # Peak power draw
-    power_limit_watts: float  # Power limit
-    
+    avg_power_watts: Optional[float]  # Average power draw
+    max_power_watts: Optional[float]  # Peak power draw
+    power_limit_watts: Optional[float]  # Power limit, summed over devices (None when any read failed)
+
     # Temperature (Celsius)
-    avg_temperature_c: float  # Average GPU temperature
-    max_temperature_c: float  # Peak GPU temperature
-    
+    avg_temperature_c: Optional[float]  # Average GPU temperature
+    max_temperature_c: Optional[float]  # Peak GPU temperature
+
     # PCIe (for distributed systems)
-    pcie_tx_mb: float  # PCIe TX throughput (MB)
-    pcie_rx_mb: float  # PCIe RX throughput (MB)
-    
-    def to_dict(self) -> Dict[str, float]:
-        """Convert to dictionary."""
+    pcie_tx_mb: Optional[float]  # PCIe TX throughput (MB)
+    pcie_rx_mb: Optional[float]  # PCIe RX throughput (MB)
+
+    def to_dict(self) -> Dict[str, Optional[float]]:
+        """Convert to dictionary (None stays None: absence is not zero)."""
         return {
             "gpu_count": self.gpu_count,
+            "sample_count": self.sample_count,
             "avg_gpu_utilization": self.avg_gpu_utilization,
             "max_gpu_utilization": self.max_gpu_utilization,
             "avg_memory_utilization": self.avg_memory_utilization,
@@ -569,8 +503,8 @@ class GPUMetricsTracker:
         # Device info (populated on init)
         self._device_count = 0
         self._device_handles: List = []
-        self._total_memory: List[float] = []  # Per-GPU total memory (MB)
-        self._power_limits: List[float] = []  # Per-GPU power limit (W)
+        self._total_memory: List[Optional[float]] = []  # Per-GPU total memory (MB); None = read failed
+        self._power_limits: List[Optional[float]] = []  # Per-GPU power limit (W); None = read failed
         
         # Try to initialize NVML
         self._init_nvml()
@@ -589,16 +523,21 @@ class GPUMetricsTracker:
                 for i in range(self._device_count)
             ]
             
-            # Get static device info
+            # Get static device info. A failed read is None, never 0 and never
+            # a silently shorter list (ADR-0148 review LOW-2: an unguarded read
+            # on device k left k entries and a box total that understated).
             for handle in self._device_handles:
-                mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                self._total_memory.append(mem_info.total / 1024 / 1024)  # MB
-                
+                try:
+                    mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                    self._total_memory.append(mem_info.total / 1024 / 1024)  # MB
+                except pynvml.NVMLError:
+                    self._total_memory.append(None)
+
                 try:
                     power_limit = pynvml.nvmlDeviceGetPowerManagementLimit(handle)
                     self._power_limits.append(power_limit / 1000)  # W
                 except pynvml.NVMLError:
-                    self._power_limits.append(0.0)
+                    self._power_limits.append(None)  # ADR-0148: unread, not 0 W
             
             return True
             
@@ -768,77 +707,63 @@ class GPUMetricsTracker:
     
     def compute_metrics(self) -> GPUMetrics:
         """Compute aggregate GPU metrics from collected samples.
-        
+
+        ADR-0148 (BACKLOG S0F-43): with no sampling tick, or when every read
+        of one field failed, that field is None; before the rule it read 0.0
+        and a window without NVML data looked like a measured idle GPU. The
+        static device facts (count, total memory, power limit) do not depend
+        on sampling.
+
         Returns:
             GPUMetrics with aggregated statistics
         """
-        import numpy as np
-        
-        # Return zero metrics if no data
-        if not self.gpu_util_samples:
-            return GPUMetrics(
-                gpu_count=self._device_count,
-                avg_gpu_utilization=0.0,
-                max_gpu_utilization=0.0,
-                avg_memory_utilization=0.0,
-                total_memory_mb=sum(self._total_memory) if self._total_memory else 0.0,
-                used_memory_mb=0.0,
-                peak_memory_mb=0.0,
-                memory_usage_percent=0.0,
-                avg_power_watts=0.0,
-                max_power_watts=0.0,
-                power_limit_watts=sum(self._power_limits) if self._power_limits else 0.0,
-                avg_temperature_c=0.0,
-                max_temperature_c=0.0,
-                pcie_tx_mb=0.0,
-                pcie_rx_mb=0.0,
-            )
-        
         # Flatten samples, dropping None (a failed per-call NVML read, not a real zero).
         all_gpu_utils = [u for sample in self.gpu_util_samples for u in sample if u is not None]
         all_mem_utils = [u for sample in self.memory_util_samples for u in sample if u is not None]
         all_mem_used = [m for sample in self.memory_used_samples for m in sample if m is not None]
         all_powers = [p for sample in self.power_samples for p in sample if p is not None]
         all_temps = [t for sample in self.temp_samples for t in sample if t is not None]
+        all_pcie_tx = [tx for sample in self.pcie_tx_samples for tx in sample if tx is not None]
+        all_pcie_rx = [rx for sample in self.pcie_rx_samples for rx in sample if rx is not None]
 
-        # PCIe throughput (cumulative)
-        total_pcie_tx = sum(tx for sample in self.pcie_tx_samples for tx in sample if tx is not None)
-        total_pcie_rx = sum(rx for sample in self.pcie_rx_samples for rx in sample if rx is not None)
-        
-        # Compute statistics
-        avg_gpu_util = float(np.mean(all_gpu_utils)) if all_gpu_utils else 0.0
-        max_gpu_util = float(np.max(all_gpu_utils)) if all_gpu_utils else 0.0
-        avg_mem_util = float(np.mean(all_mem_utils)) if all_mem_utils else 0.0
-        
-        total_memory = sum(self._total_memory) if self._total_memory else 0.0
-        used_memory = float(np.mean(all_mem_used)) if all_mem_used else 0.0
-        peak_memory = float(np.max(all_mem_used)) if all_mem_used else 0.0
-        memory_percent = (used_memory / total_memory * 100) if total_memory > 0 else 0.0
-        
-        avg_power = float(np.mean(all_powers)) if all_powers else 0.0
-        max_power = float(np.max(all_powers)) if all_powers else 0.0
-        power_limit = sum(self._power_limits) if self._power_limits else 0.0
-        
-        avg_temp = float(np.mean(all_temps)) if all_temps else 0.0
-        max_temp = float(np.max(all_temps)) if all_temps else 0.0
-        
-        pcie_tx_mb = total_pcie_tx / 1024 / 1024  # Convert KB to MB
-        pcie_rx_mb = total_pcie_rx / 1024 / 1024
-        
+        # Static device facts, read at init (None when a device's read failed:
+        # a partial box total would understate the divisor of memory_usage_percent).
+        total_memory = (
+            sum(self._total_memory)
+            if self._total_memory and all(m is not None for m in self._total_memory)
+            else None
+        )
+        power_limit = (
+            sum(self._power_limits)
+            if self._power_limits and all(p is not None for p in self._power_limits)
+            else None
+        )
+
+        used_memory = _mean_or_none(all_mem_used)
+        memory_percent = (
+            used_memory / total_memory * 100
+            if used_memory is not None and total_memory else None
+        )
+
+        # PCIe throughput (cumulative over the samples)
+        pcie_tx_mb = sum(all_pcie_tx) / 1024 / 1024 if all_pcie_tx else None  # Convert KB to MB
+        pcie_rx_mb = sum(all_pcie_rx) / 1024 / 1024 if all_pcie_rx else None
+
         return GPUMetrics(
             gpu_count=self._device_count,
-            avg_gpu_utilization=avg_gpu_util,
-            max_gpu_utilization=max_gpu_util,
-            avg_memory_utilization=avg_mem_util,
+            sample_count=len(self.gpu_util_samples),
+            avg_gpu_utilization=_mean_or_none(all_gpu_utils),
+            max_gpu_utilization=_max_or_none(all_gpu_utils),
+            avg_memory_utilization=_mean_or_none(all_mem_utils),
             total_memory_mb=total_memory,
             used_memory_mb=used_memory,
-            peak_memory_mb=peak_memory,
+            peak_memory_mb=_max_or_none(all_mem_used),
             memory_usage_percent=memory_percent,
-            avg_power_watts=avg_power,
-            max_power_watts=max_power,
+            avg_power_watts=_mean_or_none(all_powers),
+            max_power_watts=_max_or_none(all_powers),
             power_limit_watts=power_limit,
-            avg_temperature_c=avg_temp,
-            max_temperature_c=max_temp,
+            avg_temperature_c=_mean_or_none(all_temps),
+            max_temperature_c=_max_or_none(all_temps),
             pcie_tx_mb=pcie_tx_mb,
             pcie_rx_mb=pcie_rx_mb,
         )

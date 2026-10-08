@@ -15,7 +15,7 @@ from src.orchestration.baselines import BaselineType, get_baseline_config  # noq
 
 
 ALL_NAMES = [
-    "no_cache", "prefix_cache", "redis", "rag", "distributed",
+    "no_cache", "prefix_cache", "redis", "rag",
     "hybrid", "speculative", "compressed_rag", "compressed_cag", "staleness",
 ]
 
@@ -33,6 +33,14 @@ def test_get_baseline_config_for_each_family():
 def test_unknown_baseline_raises():
     with pytest.raises(ValueError):
         get_baseline_config("does_not_exist")
+
+
+def test_distributed_pilot_entry_is_gone_and_fails_closed():
+    # The router-mediated pilot family left src on 2026-10-07 (ADR-0147). The
+    # enum member stays for cellspec.from_legacy; the config lookup refuses.
+    assert BaselineType.DISTRIBUTED_CACHE.value == "distributed"
+    with pytest.raises(ValueError, match="distributed"):
+        get_baseline_config("distributed")
 
 
 def test_staleness_config_version_mode_and_wired():

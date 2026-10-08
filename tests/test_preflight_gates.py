@@ -73,6 +73,7 @@ _GATE_ENV_VARS = (
     "CAGE_ALLOW_REPLAY", "CAGE_ALLOW_NO_BACKUP",
     "LMDEPLOY_CACHE_MAX_ENTRY_COUNT", "LMDEPLOY_QUANT_POLICY",
     "CAGE_QUALITY_STRICT", "CAGE_LMDEPLOY_BACKEND_CHECK", "CAGE_CLAIM_CHECKER",
+    "CAGE_ALLOW_NO_RERANK", "CAGE_TRANSPORT_DRYRUN",
     # Gates (r)/(s) (tasks T8.1/T8.3): artifact path + run root, fp8-delegate
     # opt-in/override, endpoint ports, and the scope var itself.
     "CAGE_BLINDNESS_OUT", "CAGE_RUN_ROOT",
@@ -127,9 +128,10 @@ def test_preflight_declares_every_new_lettered_gate() -> None:
         "CAGE-CALIBRATION-ARTIFACT-GATE", "CAGE-REGIME-BRIDGE-GATE",
         "CAGE-DATASET-STALENESS-GATE", "CAGE-STATS-PIN-PARITY-GATE",
         "CAGE-BLINDNESS-MATRIX-GATE", "CAGE-ENGINE-MODEL-GATE-MATRIX",
+        "CAGE-CACHED-TOKENS-PROBE",
     ):
         assert marker in text, f"preflight lost the {marker} gate marker"
-    for letter in ("(j)", "(k)", "(l)", "(m)", "(n)", "(o)", "(p)", "(q)",
+    for letter in ("(a2)", "(j)", "(k)", "(l)", "(m)", "(n)", "(o)", "(p)", "(q)",
                    "(r)", "(s)"):
         assert f'echo "{letter}' in text, f"gate {letter} echo line missing"
     # Skip-with-reason plumbing: exit code 3 must not count as a failure.
@@ -155,6 +157,9 @@ def test_poison_env_list_contains_every_j11_addition() -> None:
         "LMDEPLOY_CACHE_MAX_ENTRY_COUNT", "LMDEPLOY_QUANT_POLICY",
         "CAGE_QUALITY_STRICT", "CAGE_LMDEPLOY_BACKEND_CHECK",
         "CAGE_CLAIM_CHECKER",
+        # ADR-0147 (2026-10-07): an unranked fallback under a ranked label, and a
+        # dry-run push that writes a true-looking backup marker.
+        "CAGE_ALLOW_NO_RERANK", "CAGE_TRANSPORT_DRYRUN",
     ):
         assert var in block, f"poison-env gate (e) lost {var}"
 
@@ -201,6 +206,8 @@ def test_poison_gate_clean_env_passes_and_flags_claim_checker() -> None:
     ("LMDEPLOY_CACHE_MAX_ENTRY_COUNT", "0.7"),
     ("LMDEPLOY_QUANT_POLICY", "8"),
     ("CAGE_TELEMETRY_MOCK", "1"),
+    ("CAGE_ALLOW_NO_RERANK", "1"),
+    ("CAGE_TRANSPORT_DRYRUN", "1"),
 ])
 def test_poison_gate_fails_on_each_new_poison(var: str, value: str) -> None:
     proc = _run_poison_gate(_clean_env(**{var: value}))
@@ -2025,3 +2032,162 @@ def test_gate_matrix_renders_the_table(tmp_path: Path) -> None:
     assert ("| engine | deterministic_mode | turbomind_selected | "
             "fp8_prefix_coexist | cached_token_telemetry |") in proc.stdout
     assert "| vllm | " in proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# (a2) cached-token channel probe (ADR-0147 item 10): loopback chat stub.
+# The vLLM adapter reads an ABSENT usage.prompt_tokens_details block as
+# cached == 0; the probe proves on the served engine that a warm repeat
+# carries the block with cached_tokens > 0, and records what the cold
+# response carried.
+# ---------------------------------------------------------------------------
+
+
+class _ChatStub(BaseHTTPRequestHandler):
+    """POST /v1/chat/completions answering the scripted usage objects in request
+    order (the last one repeats)."""
+
+    usages: list = [{"prompt_tokens": 120, "completion_tokens": 1}]
+    requests: list = []
+    status_code: int = 200
+    raw_body: bytes = b""  # when set, served verbatim (the non-JSON arm)
+
+    def do_POST(self) -> None:  # noqa: N802 (http.server API)
+        length = int(self.headers.get("Content-Length", "0"))
+        body = json.loads(self.rfile.read(length))
+        cls = type(self)
+        cls.requests.append((self.path, body))
+        usage = cls.usages[min(len(cls.requests) - 1, len(cls.usages) - 1)]
+        payload = cls.raw_body or json.dumps(
+            {"choices": [{"message": {"content": "x"}}], "usage": usage}).encode()
+        self.send_response(cls.status_code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args) -> None:
+        pass
+
+
+@pytest.fixture()
+def chat_server():
+    _ChatStub.requests = []
+    _ChatStub.status_code = 200
+    _ChatStub.raw_body = b""
+    server = HTTPServer(("127.0.0.1", 0), _ChatStub)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_cached_tokens_probe_passes_when_the_warm_repeat_hits(chat_server: str) -> None:
+    _ChatStub.usages = [
+        {"prompt_tokens": 120, "completion_tokens": 1},
+        {"prompt_tokens": 120, "completion_tokens": 1,
+         "prompt_tokens_details": {"cached_tokens": 112}},
+    ]
+    proc = _run_gate("CAGE-CACHED-TOKENS-PROBE", chat_server, "test-model")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "[PASS] cached-token channel live: warm repeat cached_tokens=112 > 0" in proc.stdout
+    assert "omits the block at zero" in proc.stdout
+    assert len(_ChatStub.requests) == 2
+    (path_a, body_a), (path_b, body_b) = _ChatStub.requests
+    assert path_a == path_b == "/v1/chat/completions"
+    assert body_a == body_b and body_a["temperature"] == 0 and body_a["max_tokens"] == 1
+    assert body_a["model"] == "test-model"
+
+
+def test_cached_tokens_probe_notes_a_block_present_at_zero(chat_server: str) -> None:
+    _ChatStub.usages = [
+        {"prompt_tokens": 120, "completion_tokens": 1,
+         "prompt_tokens_details": {"cached_tokens": 0}},
+        {"prompt_tokens": 120, "completion_tokens": 1,
+         "prompt_tokens_details": {"cached_tokens": 112}},
+    ]
+    proc = _run_gate("CAGE-CACHED-TOKENS-PROBE", chat_server, "test-model")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "includes prompt_tokens_details at zero" in proc.stdout
+    assert "absent-means-zero" in proc.stdout
+
+
+def test_cached_tokens_probe_fails_when_the_channel_is_off(chat_server: str) -> None:
+    _ChatStub.usages = [{"prompt_tokens": 120, "completion_tokens": 1}]
+    proc = _run_gate("CAGE-CACHED-TOKENS-PROBE", chat_server, "test-model")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "[FAIL]" in proc.stdout and "channel is off" in proc.stdout
+    assert "fabricated 0" in proc.stdout
+
+
+def test_cached_tokens_probe_fails_on_a_zero_hit(chat_server: str) -> None:
+    _ChatStub.usages = [{"prompt_tokens": 120, "completion_tokens": 1,
+                         "prompt_tokens_details": {"cached_tokens": 0}}]
+    proc = _run_gate("CAGE-CACHED-TOKENS-PROBE", chat_server, "test-model")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "did not hit" in proc.stdout
+
+
+def test_cached_tokens_probe_skips_3_offline() -> None:
+    proc = _run_gate("CAGE-CACHED-TOKENS-PROBE", "http://127.0.0.1:9", "test-model")
+    assert proc.returncode == 3, proc.stdout + proc.stderr
+    assert "[SKIP] live-only probe" in proc.stdout
+
+
+def test_cached_tokens_probe_fails_on_an_http_rejection_never_skips(chat_server: str) -> None:
+    """Review of ADR-0147 (MEDIUM 2): a served alias (404) or a refused request
+    shape (400) is a FAIL with the server's words; only a connection-level
+    error is the offline skip."""
+    _ChatStub.status_code = 404
+    _ChatStub.raw_body = b'{"error": "model test-model not found"}'
+    proc = _run_gate("CAGE-CACHED-TOKENS-PROBE", chat_server, "test-model")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "[FAIL]" in proc.stdout and "HTTP 404" in proc.stdout
+    assert "not found" in proc.stdout and "[SKIP]" not in proc.stdout
+
+
+def test_cached_tokens_probe_fails_on_a_body_it_cannot_read(chat_server: str) -> None:
+    _ChatStub.raw_body = b"<html>gateway</html>"
+    proc = _run_gate("CAGE-CACHED-TOKENS-PROBE", chat_server, "test-model")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "[FAIL]" in proc.stdout and "cannot read" in proc.stdout
+
+
+def test_cached_tokens_probe_skips_on_a_prefix_off_server(chat_server: str, tmp_path: Path) -> None:
+    """Review of ADR-0147 (MEDIUM 1): the header says re-run the preflight after
+    every relaunch, and a no_cache arm relaunches with --no-enable-prefix-caching.
+    The probe reads the served mode the way the launcher does (pid file under
+    the launcher's log directory, then the command line) and skips with the
+    reason instead of failing a correct server. The fake server here is a
+    child this test starts and stops by its recorded pid."""
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)", "--no-enable-prefix-caching"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        log_root = tmp_path / "logroot"
+        (log_root / "vllm").mkdir(parents=True)
+        (log_root / "vllm" / "vllm_server.pid").write_text(f"{child.pid}\n", encoding="utf-8")
+        proc = _run_gate("CAGE-CACHED-TOKENS-PROBE", chat_server, "test-model",
+                         env=_clean_env(CAGE_LOG_ROOT=str(log_root)))
+    finally:
+        child.terminate()
+        child.wait(timeout=10)
+    assert proc.returncode == 3, proc.stdout + proc.stderr
+    assert "[SKIP]" in proc.stdout and "--no-enable-prefix-caching" in proc.stdout
+    assert str(child.pid) in proc.stdout
+    assert _ChatStub.requests == []  # the skip fires before any request
+
+
+def test_cached_tokens_probe_runs_when_the_mode_is_unknown(chat_server: str, tmp_path: Path) -> None:
+    """No pid file (the test venv, a hand-started server): the probe proceeds
+    and judges the responses; an unknown mode never hides a FAIL."""
+    _ChatStub.usages = [{"prompt_tokens": 120, "completion_tokens": 1}]
+    proc = _run_gate("CAGE-CACHED-TOKENS-PROBE", chat_server, "test-model",
+                     env=_clean_env(CAGE_LOG_ROOT=str(tmp_path / "empty")))
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "channel is off" in proc.stdout
+

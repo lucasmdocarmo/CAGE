@@ -189,7 +189,7 @@ def chat_query_suffix(full_prompt: str, corpus_prefix: str) -> str:
 
 def default_dataset_split(dataset_name: str) -> str:
     """Same split convention as scripts/3_run/run_experiment.py."""
-    if dataset_name in {"humaneval", "mbpp", "hpc_code"}:
+    if dataset_name in {"humaneval", "mbpp"}:
         return "test"
     return "validation"
 

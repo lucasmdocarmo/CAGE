@@ -401,16 +401,24 @@ def test_parser_exposes_replica_gpus_on_start_and_restart() -> None:
         assert ns.replica_gpus is None
 
 
-def test_main_reports_gpu_share_refusal_as_error_exit_1(
+def test_main_refuses_start_and_restart_since_the_router_left(
     wired: _Launches, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setenv("VLLM_GPU_MEMORY_UTILIZATION", "0.90")
-    monkeypatch.setattr(sys, "argv", ["manage_vllm_cluster.py", "start", "--model", "m", "--replicas", "2"])
-    rc = mc.main()
-    assert rc == 1
-    err = capsys.readouterr().err
-    assert "Error:" in err and "vLLM startup check" in err
-    assert wired.calls == []
+    """ADR-0147 (2026-10-07): the prefix router left src, so the CLI launch
+    refuses before any process is touched; the GPU-share and KV-pin rules
+    stay tested through start_cluster directly (sections 4 and 6)."""
+    for verb in ("start", "restart"):
+        monkeypatch.setattr(sys, "argv", ["manage_vllm_cluster.py", verb, "--model", "m", "--replicas", "2"])
+        rc = mc.main()
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "Error:" in err and "left src on 2026-10-07" in err and "manage_vllm_pd.sh" in err
+        assert wired.calls == []
+    # stop and status, the cleanup traps' commands, are untouched
+    monkeypatch.setattr(sys, "argv", ["manage_vllm_cluster.py", "stop"])
+    assert mc.main() == 0
+    monkeypatch.setattr(sys, "argv", ["manage_vllm_cluster.py", "status"])
+    assert mc.main() == 1  # "Cluster is not running."
 
 
 # ---------------------------------------------------------------------------
@@ -635,18 +643,6 @@ def test_malformed_timeout_env_exits_2_on_start_only(
     assert "usage:" not in capsys.readouterr().err
 
 
-def test_zero_timeout_env_is_accepted_on_start(wired: _Launches, monkeypatch: pytest.MonkeyPatch) -> None:
-    seen: List[int] = []
-
-    def _start(**kw: Any) -> int:
-        seen.append(kw["replica_timeout"])
-        return 0
-
-    monkeypatch.setenv("VLLM_START_TIMEOUT", "0")
-    monkeypatch.setattr(mc, "start_cluster", _start)
-    monkeypatch.setattr(sys, "argv", ["manage_vllm_cluster.py", "start", "--model", "m"])
-    assert mc.main() == 0
-    assert seen == [0]
 
 
 class _FakeChild:

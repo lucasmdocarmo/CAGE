@@ -57,7 +57,7 @@ from src.evaluation.quality import (
     QualityEvaluator,
     resolve_answerability,
 )
-from src.evaluation.performance import PerformanceEvaluator, CacheMetricsTracker
+from src.evaluation.performance import PerformanceEvaluator
 from src.evaluation.code_evaluator import CodeQualityEvaluator
 from src.orchestration.baselines import get_baseline_config, check_baseline_requirements
 from src.orchestration.campaign_session import CampaignCellSession, CampaignSessionError
@@ -399,15 +399,11 @@ def default_experiment_label(
         return "redis_retrieval_cache_cold"
     if baseline == "hybrid":
         return "hybrid_retrieval_cache_warm" if warmup_queries > 0 else "hybrid_retrieval_cache_cold"
-    if baseline == "distributed":
-        if sharding_policy == "replicated":
-            return "distributed_router_replicated"
-        return "distributed_sharded_sim"
     return baseline
 
 
 def default_dataset_split(dataset_name: str) -> str:
-    if dataset_name in {"humaneval", "mbpp", "hpc_code"}:
+    if dataset_name in {"humaneval", "mbpp"}:
         return "test"
     if dataset_name == "ruler":
         # Synthetic length instrument (src/data/ruler.py): generated, no HF splits.
@@ -420,7 +416,7 @@ def default_dataset_split(dataset_name: str) -> str:
 
 
 def is_code_dataset(dataset_name: str, examples: Optional[List[CAGExample]] = None) -> bool:
-    if dataset_name in {"humaneval", "mbpp", "hpc_code"}:
+    if dataset_name in {"humaneval", "mbpp"}:
         return True
     for example in examples or []:
         metadata = example.metadata or {}
@@ -1017,6 +1013,23 @@ def require_campaign_telemetry(campaign: bool, backend: str, vllm_telemetry: boo
             "--vllm-telemetry: without the sampler its windows are labeled "
             "UNKNOWN_TELEMETRY and no pressure contrast can use them; refusing "
             "before any serving work (S0F-26, ADR-0136)."
+        )
+
+
+def require_served_engine(campaign: bool, use_offline: bool) -> None:
+    """Refuse a campaign cell on the in-process vLLM engine (--offline).
+
+    VLLMOfflineAdapter reports ttft_ms as the full response time, a labeled
+    stand-in (src/inference/vllm_adapter.py); a campaign window needs the
+    served engine's streamed first-token TTFT (charter D2). The driver never
+    emits the flag; this guards the hand path (2026-10-07, ADR-0147).
+    """
+    if campaign and use_offline:
+        raise ValueError(
+            "CAMPAIGN ENGINE: --offline runs the in-process vLLM engine, whose "
+            "ttft_ms is the full response time and not a streamed first-token "
+            "time; campaign windows need the served engine (charter D2). Drop "
+            "--offline (ADR-0147)."
         )
 
 
@@ -1922,6 +1935,10 @@ def adapter_honesty_columns(response: Any) -> Dict[str, Any]:
     ``num_tokens_source`` (ADR-0118, Batch 2 W5) says whether the row's
     num_tokens is the engine's usage count, the whitespace word count of the
     text, or the in-process token ids; the decode-phase rule keys on it.
+    ``corpus_prefill_ms`` (ADR-0148) is the HF oracle's prefill time of the
+    row's own corpus block, stamped on every response served against the
+    resident block (HFOracleAdapter.generate; the per-row convention of
+    run_cag_reference.py); None off the reuse path and on every other adapter.
     """
     return {
         "engine_id": getattr(response, "engine_id", None),
@@ -1932,6 +1949,7 @@ def adapter_honesty_columns(response: Any) -> Dict[str, Any]:
         "retries": getattr(response, "retries", None),
         "reference_engine": getattr(response, "reference_engine", None),
         "num_tokens_source": getattr(response, "num_tokens_source", None),
+        "corpus_prefill_ms": getattr(response, "corpus_prefill_ms", None),
     }
 
 
@@ -2453,6 +2471,9 @@ def run_experiment(
     # telemetry flag or refuses here (main() refuses the same before the
     # first engine contact; this covers direct callers).
     require_campaign_telemetry(campaign_session is not None, backend, vllm_telemetry)
+    # ADR-0147 (2026-10-07): the in-process engine's stand-in TTFT is refused
+    # in campaign mode (main() refuses the same; this covers direct callers).
+    require_served_engine(campaign_session is not None, use_offline)
 
     # S0F-22 Batch 2 (ADR-0134): the decode role's /metrics is the window's
     # transfer proof. Strict mode is the Batch 1 predicate (campaign cell with
@@ -3294,7 +3315,6 @@ def run_experiment(
     else:
         quality_evaluator = QualityEvaluator(device="cpu")
     performance_evaluator = PerformanceEvaluator(monitor_resources=True)
-    cache_tracker = CacheMetricsTracker()
     code_evaluator = CodeQualityEvaluator() if code_dataset else None
     
     # Run experiment
@@ -3596,31 +3616,12 @@ def run_experiment(
         except Exception:
             pass
 
-        # Record cache metrics (distributed telemetry)
-        is_distributed = baseline_config.baseline_type.value == "distributed"
-        is_prefix_cache = baseline_config.enable_prefix_caching
-        
-        # If we went through router and it selected a replica (x-router-replica header)
-        router_replica = response.router_replica
-        cached_tokens = response.cached_prompt_tokens or 0
-        transfer_params = response.kv_transfer_params or {}
-        transfer_required = bool(transfer_params.get("transfer_required"))
-        transfer_latency_ms = float(transfer_params.get("transfer_latency_ms") or 0.0)
-        transfer_bytes = int(transfer_params.get("transfer_bytes") or 0)
-        
-        if cached_tokens > 0:
-            if is_distributed and router_replica:
-                if transfer_required or transfer_latency_ms > 0.0 or transfer_bytes > 0:
-                    cache_tracker.record_remote_hit(
-                        fetch_latency_ms=transfer_latency_ms,
-                        bytes_transferred=transfer_bytes,
-                    )
-                else:
-                    cache_tracker.record_local_hit()
-            elif is_prefix_cache:
-                cache_tracker.record_local_hit()
-        elif response.prompt_tokens and response.prompt_tokens > 0:
-            cache_tracker.record_miss()
+        # ADR-0148 (2026-10-07): the cache_telemetry block left. It coerced an
+        # absent cached-token count to 0 and recorded a MISS for it whenever the
+        # prompt count was known, so an engine that reports prompt tokens but no
+        # cached count read miss_ratio 1.0 as if measured. The
+        # per-row cached_prompt_tokens (None when the engine reports none) and
+        # the prompt_cache summary below are the reuse record.
 
         quality_metrics = quality_evaluator.evaluate(
             question=question,
@@ -4407,7 +4408,6 @@ def run_experiment(
 
     # Compute aggregate metrics
     perf_metrics = performance_evaluator.compute_metrics()
-    cache_metrics = cache_tracker.get_metrics()
     gpu_metrics = gpu_tracker.compute_metrics().to_dict() if gpu_monitoring else None
 
     # Optional vLLM serving telemetry via cage-stats — captures what CAGE's own
@@ -4476,7 +4476,25 @@ def run_experiment(
                 # masquerades as a healthy single instance. Absence (plus the
                 # all-empty warning printed above) is the honest outcome.
                 if vllm_telemetry_snapshot is None and vllm_role_samplers is None:
-                    vllm_telemetry_snapshot, _ = capture(api_base)
+                    if campaign_session is not None:
+                        # ADR-0148: no sampled aggregate exists (the sampler
+                        # captured no tick during the measured stage, or this
+                        # backend has no sampler dialect). A one-shot capture
+                        # now reads the engine at idle (rates near zero, see
+                        # the sampler's docstring) and would land as the
+                        # window's measured aggregate. Absence is the honest
+                        # record; the regime label reads the series, not this
+                        # aggregate. The spec-decode backstop below may still
+                        # record cumulative counters, which are not rates.
+                        print(
+                            "[telemetry] no sampled aggregate for this campaign window "
+                            "(no sampler tick during the measured stage, or no sampler "
+                            "for this backend); no vllm_telemetry aggregate is recorded "
+                            "and the idle one-shot capture is refused: "
+                            "an idle one-shot capture would read as measured (ADR-0148)"
+                        )
+                    else:
+                        vllm_telemetry_snapshot, _ = capture(api_base)
                 _dash = dashboard_text(api_base)
                 if _dash:
                     print("\n" + "=" * 70)
@@ -4544,23 +4562,24 @@ def run_experiment(
     print("\n" + "=" * 70)
     print("PERFORMANCE METRICS")
     print("=" * 70)
-    print(f"Throughput: {perf_metrics.queries_per_second:.2f} QPS, {perf_metrics.tokens_per_second:.2f} tokens/sec")
-    print(f"Latency (avg): {perf_metrics.avg_latency_ms:.2f} ms")
-    print(f"Latency (p95): {perf_metrics.p95_latency_ms:.2f} ms")
-    print(f"TTFT (avg): {perf_metrics.avg_ttft_ms:.2f} ms")
-    print(f"TTFT (p95): {perf_metrics.p95_ttft_ms:.2f} ms")
-    print(f"CPU (avg): {perf_metrics.avg_cpu_percent:.1f}%")
-    print(f"Memory (peak): {perf_metrics.peak_memory_mb:.1f} MB")
-    
-    print("\n" + "=" * 70)
-    print("CACHE TELEMETRY")
-    print("=" * 70)
-    print(f"Local Hit Ratio: {cache_metrics['local_hit_ratio']:.3f}")
-    print(f"Remote Hit Ratio: {cache_metrics['remote_hit_ratio']:.3f}")
-    print(f"Miss Ratio: {cache_metrics['miss_ratio']:.3f}")
-    print(f"Avg Remote Fetch: {cache_metrics['avg_remote_fetch_ms']:.2f} ms")
-    print(f"Total Transfer: {cache_metrics['total_transfer_mb']:.2f} MB")
-    
+    # ADR-0148: a field is None when nothing was measured (an all-error window,
+    # no TPOT sample, no resource sample); format_metric prints it as n/a.
+    print(
+        f"Throughput: {format_metric(perf_metrics.queries_per_second)} QPS, "
+        f"{format_metric(perf_metrics.tokens_per_second)} tokens/sec"
+    )
+    print(f"Latency (avg): {format_metric(perf_metrics.avg_latency_ms)} ms")
+    print(f"Latency (p95): {format_metric(perf_metrics.p95_latency_ms)} ms")
+    print(f"TTFT (avg): {format_metric(perf_metrics.avg_ttft_ms)} ms")
+    print(f"TTFT (p95): {format_metric(perf_metrics.p95_ttft_ms)} ms")
+    print(f"CPU (avg): {format_metric(perf_metrics.avg_cpu_percent)} %")
+    print(f"Memory (peak): {format_metric(perf_metrics.peak_memory_mb)} MB")
+    print(
+        f"Requests: {perf_metrics.total_requests} ({perf_metrics.error_count} errors), "
+        f"TPOT samples: {perf_metrics.tpot_sample_count}, "
+        f"resource samples: {perf_metrics.resource_sample_count}"
+    )
+
     # Only clear completeness_bertscore globally when the BERTScore MODEL was unavailable,
     # signalled by a None on a row that HAD a non-empty reference (an answerable item the
     # model should have scored). Do NOT clear merely because unanswerable rows (empty
@@ -4952,7 +4971,6 @@ def run_experiment(
         "performance": perf_metrics.to_dict(),
         "gpu": gpu_metrics,
         "vllm_telemetry": vllm_telemetry_snapshot,
-        "cache_telemetry": cache_metrics,
         "distributed": distributed_summary,
         "quality": avg_quality,
         "staleness": (staleness_metrics(results)
@@ -5575,7 +5593,7 @@ def main():
     parser.add_argument(
         "--baseline",
         required=True,
-        choices=["no_cache", "prefix_cache", "redis", "rag", "distributed", "hybrid", "speculative", "compressed_rag", "compressed_cag", "staleness"],
+        choices=["no_cache", "prefix_cache", "redis", "rag", "hybrid", "speculative", "compressed_rag", "compressed_cag", "staleness"],
         help="Baseline to evaluate (staleness is a scaffold; pilot-era design doc removed -- MyDocs/PUBLICATION.md governs)",
     )
     parser.add_argument(
@@ -5588,7 +5606,7 @@ def main():
     parser.add_argument(
         "--dataset",
         default="squad_v2",
-        choices=["hotpotqa", "qasper", "squad_v2", "trivia_qa", "natural_questions", "musique", "crag", "sharegpt", "humaneval", "mbpp", "hpc_code", "ruler", "scbench"],
+        choices=["hotpotqa", "qasper", "squad_v2", "trivia_qa", "natural_questions", "musique", "crag", "sharegpt", "humaneval", "mbpp", "ruler", "scbench"],
         help="Dataset to use (ruler = synthetic RULER-style length instrument, "
              "src/data/ruler.py; scbench = SCBench two-subset slice, "
              "src/data/scbench.py -- subset via CAGE_SCBENCH_SUBSET)",
@@ -5968,14 +5986,14 @@ def main():
         "--routing-switch-at",
         type=int,
         default=None,
-        help="If set, instruct router to reshuffle replicas after N requests (baseline=distributed)",
+        help="Inert since 2026-10-07 (ADR-0147): the router-mediated distributed baseline left src; kept so recorded pilot argv still parses",
     )
 
     parser.add_argument(
         "--sharding-policy",
         default="replicated",
         choices=["replicated", "sharded_context"],
-        help="Policy for the distributed baseline (replicated=real router-managed replicas, sharded_context=simulated context-parallel transfer)",
+        help="Inert since 2026-10-07 (ADR-0147): the router-mediated distributed baseline left src; kept so recorded pilot argv still parses",
     )
 
     # Speculative decoding options
@@ -6101,6 +6119,13 @@ def main():
         # per-window resume skip and before the strict cache flush.
         try:
             require_campaign_telemetry(True, args.backend, args.vllm_telemetry)
+        except ValueError as e:
+            print(f"\nError activating campaign mode: {e}", file=sys.stderr)
+            sys.exit(2)
+        # ADR-0147 (2026-10-07): same slot, same exit code: the in-process
+        # engine's stand-in TTFT never enters a campaign window.
+        try:
+            require_served_engine(True, args.offline)
         except ValueError as e:
             print(f"\nError activating campaign mode: {e}", file=sys.stderr)
             sys.exit(2)
@@ -6372,7 +6397,6 @@ def main():
             "num_trials": num_trials,
             "performance": {},
             "quality": {},
-            "cache_telemetry": {},
             "retrieval": {},
             "prompt_cache": {},
         }
@@ -6381,7 +6405,14 @@ def main():
         for key in perf_keys:
             values = []
             for result in trial_results:
-                if "performance" in result and key in result["performance"]:
+                # ADR-0148: None marks an unmeasured field (an all-error
+                # window, no TPOT sample); averaged over the trials that
+                # measured it, like the quality loop below.
+                if (
+                    "performance" in result
+                    and key in result["performance"]
+                    and result["performance"][key] is not None
+                ):
                     values.append(result["performance"][key])
             
             if values:
@@ -6423,7 +6454,9 @@ def main():
             aggregated["repeat_passes"] = trial_results[0].get("repeat_passes", {})
             aggregated["vllm_telemetry"] = trial_results[0].get("vllm_telemetry")
 
-        aggregated["cache_telemetry"] = aggregate_numeric_section("cache_telemetry")
+        # ADR-0148: the gpu block rides the None-tolerant section aggregator
+        # (a None value passes through, never averaged as 0).
+        aggregated["gpu"] = aggregate_numeric_section("gpu")
         aggregated["retrieval"] = aggregate_numeric_section("retrieval")
         aggregated["prompt_cache"] = aggregate_numeric_section("prompt_cache")
         

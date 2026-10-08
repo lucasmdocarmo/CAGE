@@ -57,7 +57,12 @@ def world(tmp_path: Path) -> Dict[str, Path]:
     _w(b / "runpodctl", r'''
         #!/bin/bash
         case "$1" in
-          pod) echo "{\"id\": \"pod123\", \"runtimeStatus\": \"${CAGE_TEST_RUNTIME:-running}\", \"desiredStatus\": \"RUNNING\"}" ;;
+          pod)
+            [ -z "${CAGE_TEST_POD_GET_EMPTY:-}" ] || exit 1
+            extra=""
+            [ -n "${CAGE_TEST_POD_MINIMAL:-}" ] || extra=", \"gpuCount\": ${CAGE_TEST_GPU_COUNT:-1}"
+            [ -n "${CAGE_TEST_POD_MINIMAL:-}" ] || [ -n "${CAGE_TEST_NO_COST_PER_HR:-}" ] || extra="$extra, \"costPerHr\": ${CAGE_TEST_COST_PER_HR:-3.49}"
+            echo "{\"id\": \"pod123\", \"runtimeStatus\": \"${CAGE_TEST_RUNTIME:-running}\", \"desiredStatus\": \"RUNNING\"$extra}" ;;
           user) [ -n "${CAGE_TEST_NO_USER:-}" ] || echo "{\"balance\": ${CAGE_TEST_BALANCE:-300.0}}" ;;
         esac
         ''')
@@ -116,6 +121,10 @@ def test_healthy_tick_writes_status_and_log_and_no_alert(world: Dict[str, Path])
     assert st["pod"]["runtime_status"] == "running" and st["pod"]["watchdog_alive"] is True
     assert st["pod"]["seatbelt_min_left"] > 1000 and st["pod"]["balance"] == 300.0
     assert st["pod"]["cost_usd"] > 0 and st["pod"]["hours"] > 0
+    # ADR-0148 item 10: the pod's own rate (all GPUs) times the hours, named as such
+    assert st["pod"]["gpu_count"] == 1 and st["pod"]["cost_basis"] == "pod costPerHr"
+    assert st["pod"]["cost_per_hour_usd"] == 3.49
+    assert st["pod"]["cost_usd"] == round(st["pod"]["hours"] * 3.49, 2)
     assert st["run"]["watch_rc"] == 0 and st["run"]["watch_verdict"] == "RUNNING-HEALTHY"
     assert st["run"]["sentinels"] == 0 and st["run"]["windows"] == 1
     assert st["run"]["journal_age_s"] >= 0 and st["run"]["gpu_util"] == 87.0
@@ -258,6 +267,43 @@ def test_a_run_root_without_cells_reads_no_cell_written_yet(world: Dict[str, Pat
     assert st["run"]["run_dir"] is False and st["run"]["watch_verdict"].startswith("no cell written yet")
     assert st["run"]["windows"] == 0 and st["alerts"] == []
     assert "no cell written yet" in (world["out"] / "monitor.log").read_text(encoding="utf-8")
+
+
+def test_cost_clock_uses_the_pods_rate_then_list_price_times_gpu_count(world: Dict[str, Path]) -> None:
+    # ADR-0148 item 10: the monitor multiplied hours by the per-GPU list price
+    # alone; the provisioner and the two cost scripts multiply by the GPU count,
+    # so a 2-GPU pod read 1/2 of its spend here. The pod JSON carries both the
+    # pod's own hourly rate and its GPU count.
+    _tick(world, CAGE_TEST_GPU_COUNT="2", CAGE_TEST_COST_PER_HR="6.98")
+    st = _status(world)["pod"]
+    assert st["gpu_count"] == 2 and st["cost_basis"] == "pod costPerHr" and st["cost_per_hour_usd"] == 6.98
+    assert st["cost_usd"] == round(st["hours"] * 6.98, 2)
+    # without the pod's rate: the list price (3.49) times the pod's 2 GPUs
+    _tick(world, CAGE_TEST_GPU_COUNT="2", CAGE_TEST_NO_COST_PER_HR="1")
+    st = _status(world)["pod"]
+    assert st["cost_basis"] == "list price x gpu_count" and st["cost_per_hour_usd"] == pytest.approx(6.98)
+    assert st["cost_usd"] == round(st["hours"] * 6.98, 2)
+
+
+def test_cost_clock_carries_the_count_and_rate_forward_on_a_failed_pod_read(world: Dict[str, Path]) -> None:
+    _tick(world, CAGE_TEST_GPU_COUNT="2", CAGE_TEST_COST_PER_HR="6.98")
+    proc = _tick(world, CAGE_TEST_POD_GET_EMPTY="1")
+    assert proc.returncode == 0
+    st = _status(world)
+    assert st["pod"]["runtime_status"] == "unknown"          # the HARD alert still fires
+    assert any("runtimeStatus=unknown" in a["text"] for a in st["alerts"])
+    assert st["pod"]["gpu_count"] == 2 and st["pod"]["cost_per_hour_usd"] == 6.98
+    assert st["pod"]["cost_basis"] == "pod costPerHr" and st["pod"]["cost_usd"] is not None
+
+
+def test_cost_clock_is_none_when_no_rate_is_known(world: Dict[str, Path]) -> None:
+    # a pod JSON without gpuCount or costPerHr and no earlier tick: nothing is
+    # assumed (never "1 GPU"), the hours still run
+    _tick(world, CAGE_TEST_POD_MINIMAL="1")
+    st = _status(world)["pod"]
+    assert st["hours"] > 0
+    assert st["gpu_count"] is None and st["cost_per_hour_usd"] is None
+    assert st["cost_basis"] is None and st["cost_usd"] is None
 
 
 def test_usage_errors(world: Dict[str, Path]) -> None:

@@ -167,13 +167,26 @@ seatbelt_min_left = None
 if m and re.match(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", m.group(1)):
     dl = datetime.datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
     seatbelt_min_left = round((dl - now).total_seconds() / 60, 1)
-cost = None; hours = None
-if os.environ.get("MON_PRICE") and os.environ.get("MON_CREATED"):
+# Cost clock (ADR-0148 item 10): the pod's own hourly rate (costPerHr, all
+# GPUs) when the pod JSON carries it, else the per-GPU list price times the
+# pod's gpuCount; the provisioner's estimate and the two cost scripts use that
+# product, and hours times the list price alone read a multi-GPU pod at 1/N.
+# No rate known -> cost None, never an assumed single GPU.
+hours = None
+if os.environ.get("MON_CREATED"):
     try:
         c = datetime.datetime.strptime(os.environ["MON_CREATED"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
-        hours = round((now - c).total_seconds() / 3600, 3); cost = round(hours * float(os.environ["MON_PRICE"]), 2)
+        hours = round((now - c).total_seconds() / 3600, 3)
     except Exception:
         pass
+gpu_count = find_key(pod, {"gpuCount"})
+gpu_count = gpu_count if isinstance(gpu_count, int) and not isinstance(gpu_count, bool) and gpu_count >= 1 else None
+pod_rate = find_key(pod, {"costPerHr"})
+pod_rate = float(pod_rate) if isinstance(pod_rate, (int, float)) and not isinstance(pod_rate, bool) and pod_rate > 0 else None
+try:
+    list_price = float(os.environ["MON_PRICE"]) if os.environ.get("MON_PRICE") else None
+except ValueError:
+    list_price = None
 ssh = block("SSH"); ssh_rc = kv(raw, "SSH_RC", "?")
 def toint(s, d=-1):
     try: return int(s)
@@ -205,6 +218,22 @@ baseline = sentinels if ssh_ok else prev_base
 balance_utc = now_s if balance is not None else None
 if balance is None and (prev.get("pod") or {}).get("balance") is not None:
     balance = prev["pod"]["balance"]; balance_utc = prev["pod"].get("balance_utc")
+# The GPU count and the pod's own rate carry forward the same way, and only
+# on a tick whose pod read FAILED (an answered pod JSON without the field is
+# the pod's own statement; the list-price fallback applies then).
+prev_pod = prev.get("pod") or {}
+if not pod:
+    if gpu_count is None and isinstance(prev_pod.get("gpu_count"), int) and not isinstance(prev_pod.get("gpu_count"), bool):
+        gpu_count = prev_pod["gpu_count"]
+    if pod_rate is None and prev_pod.get("cost_basis") == "pod costPerHr" and isinstance(prev_pod.get("cost_per_hour_usd"), (int, float)):
+        pod_rate = float(prev_pod["cost_per_hour_usd"])
+if pod_rate is not None:
+    rate, cost_basis = pod_rate, "pod costPerHr"
+elif list_price is not None and gpu_count is not None:
+    rate, cost_basis = list_price * gpu_count, "list price x gpu_count"
+else:
+    rate, cost_basis = None, None
+cost = round(hours * rate, 2) if hours is not None and rate is not None else None
 # Before the first cell writes, the run root has no cells/ directory and
 # watch_campaign reports an error; say what it is instead.
 run_dir = kv(ssh, "RUN_DIR", "1") == "1"
@@ -251,7 +280,8 @@ status = {
     "schema": "cage-monitor-status-v1", "tick": tick, "tick_utc": now_s,
     "pod": {"id": os.environ["MON_POD"], "runtime_status": runtime, "desired_status": desired or None,
             "watchdog": watchdog, "watchdog_alive": wd_alive, "seatbelt_min_left": seatbelt_min_left,
-            "hours": hours, "cost_usd": cost, "balance": balance, "balance_utc": balance_utc},
+            "hours": hours, "cost_usd": cost, "gpu_count": gpu_count, "cost_per_hour_usd": rate,
+            "cost_basis": cost_basis, "balance": balance, "balance_utc": balance_utc},
     "run": {"watch_rc": watch_rc, "watch_verdict": verdict, "run_dir": run_dir, "sentinels": sentinels,
             "sentinels_baseline": baseline, "ssh_ok": ssh_ok,
             "journal_age_s": journal_age, "windows": windows, "regime": kv(ssh, "REGIME")[:300],

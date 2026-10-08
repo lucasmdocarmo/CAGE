@@ -1,18 +1,16 @@
-"""Wave-1 pins: simulated-transfer provenance, telemetry dialect, multi-GPU energy.
+"""Wave-1 pins: transfer-provenance gate, telemetry dialect, multi-GPU energy.
 
 WHAT is pinned and WHY:
 
-1. T3.3 — kv_transfer_params provenance. The ONLY producer of
-   kv_transfer_params today is SimulatedKVCacheManager (router-attached,
-   asyncio.sleep-faked latency), and run_experiment's distributed gate merely
-   checks the metadata EXISTS — it would green-light simulation as
-   measurement. Pinned: (a) the simulator and the router payload stamp every
-   dict source=="simulated"; (b) in campaign mode enforce_campaign_
-   transfer_provenance HARD-FAILS on source=="simulated", on a MISSING source
-   (unknown provenance is not evidence — fail-closed), and on unparseable
-   payloads, while accepting a real-connector stamp (source=="nixl"); (c) the
-   gate is wired behind `campaign_session is not None` so pilot behavior is
-   unchanged.
+1. T3.3, kv_transfer_params provenance. In campaign mode
+   enforce_campaign_transfer_provenance HARD-FAILS on source=="simulated", on
+   a MISSING source (unknown provenance is not evidence, so it fails closed)
+   and on unparseable payloads, while accepting a real-connector stamp
+   (source=="nixl"); the gate is wired behind `campaign_session is not None`
+   so pilot behavior is unchanged. The simulated producer this gate was built
+   against (the prefix router and its SimulatedKVCacheManager) left src on
+   2026-10-07 (ADR-0147). The gate stays: a real connector must still prove
+   its provenance.
 
 2. T4.3 — per-backend telemetry dialect. VllmTelemetrySampler must forward
    its dialect to capture_snapshot every tick (an SGLang server sampled with
@@ -33,7 +31,6 @@ WHAT is pinned and WHY:
 
 from __future__ import annotations
 
-import asyncio
 import importlib.util
 import inspect
 import json
@@ -43,71 +40,10 @@ from pathlib import Path
 
 import pytest
 
+from src.monitoring import vllm_telemetry as vt
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNNER_PATH = REPO_ROOT / "scripts" / "3_run" / "run_experiment.py"
-
-
-def _missing(name: str) -> bool:
-    return name not in sys.modules and importlib.util.find_spec(name) is None
-
-
-def _install_router_import_stubs() -> None:
-    """Stub fastapi/pydantic so router.py imports in the lean venv.
-
-    Import-surface only (decorators pass through, nothing is served) — the
-    sys.modules-stub pattern of tests/test_cov_router_logic.py. A venv that
-    really has the packages keeps them (find_spec wins).
-    """
-    if _missing("fastapi"):
-        fastapi = types.ModuleType("fastapi")
-
-        class HTTPException(Exception):
-            def __init__(self, status_code: int, detail: str = ""):
-                super().__init__(f"{status_code}: {detail}")
-                self.status_code = status_code
-                self.detail = detail
-
-        class FastAPI:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            def _passthrough(self, *args, **kwargs):
-                def decorator(fn):
-                    return fn
-                return decorator
-
-            get = post = on_event = _passthrough
-
-        fastapi.FastAPI = FastAPI
-        fastapi.HTTPException = HTTPException
-        responses = types.ModuleType("fastapi.responses")
-
-        class _Response:
-            def __init__(self, *args, **kwargs):
-                pass
-
-        responses.PlainTextResponse = _Response
-        responses.StreamingResponse = _Response
-        responses.JSONResponse = _Response
-        fastapi.responses = responses
-        sys.modules["fastapi"] = fastapi
-        sys.modules["fastapi.responses"] = responses
-    if _missing("pydantic"):
-        pydantic = types.ModuleType("pydantic")
-
-        class BaseModel:
-            pass
-
-        pydantic.BaseModel = BaseModel
-        pydantic.ConfigDict = dict
-        sys.modules["pydantic"] = pydantic
-
-
-_install_router_import_stubs()
-
-from src.monitoring import vllm_telemetry as vt  # noqa: E402
-from src.orchestration.cache_manager import CacheNode, SimulatedKVCacheManager  # noqa: E402
-from src.orchestration.router import PrefixAwareRouter, ReplicaConfig  # noqa: E402
 
 
 def _load_runner():
@@ -121,69 +57,6 @@ def _load_runner():
 
 
 runner = _load_runner()
-
-
-def _nodes(n: int = 3) -> list:
-    return [
-        CacheNode(
-            node_id=f"replica-{i}",
-            host=f"http://localhost:{8000 + i}",
-            port=0,
-            vram_total=0,
-            vram_used=0,
-            cache_blocks_capacity=0,
-            cache_blocks_used=0,
-        )
-        for i in range(1, n + 1)
-    ]
-
-
-def _offline_router(policy: str = "replicated") -> PrefixAwareRouter:
-    router = PrefixAwareRouter(
-        [
-            ReplicaConfig(replica_id="replica-1", api_base="http://localhost:8001"),
-            ReplicaConfig(replica_id="replica-2", api_base="http://localhost:8002"),
-        ]
-    )
-    # Pre-seed tokenization so route_request_with_simulation never touches the
-    # network (initialize_tokenizer would try the replicas' /v1/models).
-    router.tokenization_mode = "utf8_fallback"
-    router.tokenizer_name = "offline-utf8"
-    if policy != "replicated":
-        router.cache_manager.policy = policy
-    return router
-
-
-# --------------------------------------------------------------------------
-# T3.3 (a): simulator + router payloads are stamped source=="simulated"
-# --------------------------------------------------------------------------
-
-
-def test_simulated_cache_manager_stamps_source_replicated():
-    mgr = SimulatedKVCacheManager(_nodes(), policy="replicated")
-    params = mgr.resolve_prefix([1, 2, 3, 4])
-    assert params["source"] == "simulated"
-
-
-def test_simulated_cache_manager_stamps_source_sharded_context():
-    mgr = SimulatedKVCacheManager(_nodes(), policy="sharded_context")
-    params = mgr.resolve_prefix(list(range(64)))
-    assert params["source"] == "simulated"
-    # The sharded path is the one that fakes a positive transfer cost — the
-    # exact payload the campaign gate exists to refuse.
-    assert params["transfer_bytes"] > 0
-
-
-def test_router_payload_stamps_source_replicated():
-    router = _offline_router("replicated")
-    _, params = asyncio.run(router.route_request_with_simulation("ctx\n\nQ: hi"))
-    assert params["source"] == "simulated"
-
-
-def test_router_payload_stamps_source_sharded_context():
-    router = _offline_router("sharded_context")
-    _, params = asyncio.run(router.route_request_with_simulation("ctx\n\nQ: hi"))
-    assert params["source"] == "simulated"
 
 
 # --------------------------------------------------------------------------

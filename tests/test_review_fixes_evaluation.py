@@ -181,11 +181,15 @@ def test_tpot_excludes_nonstreaming_zero_generation_interval() -> None:
     assert metrics.avg_tpot_ms == pytest.approx(10.0)
 
 
-def test_tpot_all_nonstreaming_falls_back_to_zero_not_negative_or_nan() -> None:
+def test_tpot_all_nonstreaming_is_none_not_zero_negative_or_nan() -> None:
     ev = PerformanceEvaluator(monitor_resources=False)
     ev.start()
     ev.record_request(request_id="r1", ttft_ms=500.0, total_time_ms=500.0, num_tokens=50)
     ev.stop()
     metrics = ev.compute_metrics()
-    # No measurable TPOT rows at all -> the existing empty-list fallback (0.0), not NaN.
-    assert metrics.avg_tpot_ms == 0.0
+    # No measurable TPOT row at all. Until ADR-0148 (2026-10-07) the empty list
+    # fell back to 0.0 ms per token, a value no request produced; the rule now
+    # records None with a zero sample count (absence is not zero), never NaN.
+    assert metrics.avg_tpot_ms is None
+    assert metrics.tpot_sample_count == 0
+    assert metrics.avg_latency_ms == pytest.approx(500.0)  # the row itself stays measured

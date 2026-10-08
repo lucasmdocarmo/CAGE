@@ -29,7 +29,7 @@ import requests
 
 import src.inference.openai_chat_adapter as base_mod
 import src.inference.hf_oracle_adapter as hf_mod
-from src.inference.engine import DummyEngine, InferenceRequest, InferenceResponse
+from src.inference.engine import InferenceEngine, InferenceRequest, InferenceResponse
 from src.inference.errors import (
     EngineCapabilityUnavailableError,
     EngineDependencyUnavailableError,
@@ -664,11 +664,29 @@ def test_capabilities_declarations():
     assert lmd["kv_transfer_params"] is False
 
 
+class _BareEngine(InferenceEngine):
+    """The smallest concrete engine: the base class's capability defaults only."""
+
+    def generate(self, request: InferenceRequest, *, stream: bool = False) -> InferenceResponse:
+        raise NotImplementedError
+
+    def batch_generate(self, requests: List[InferenceRequest]) -> List[InferenceResponse]:
+        raise NotImplementedError
+
+    def is_ready(self) -> bool:
+        return True
+
+    def shutdown(self) -> None:
+        return None
+
+
 def test_capabilities_conservative_default_on_base_engine():
-    caps = DummyEngine().capabilities()
+    caps = _BareEngine(model_name="bare").capabilities()
+    assert caps["engine"] == "_bareengine"
     assert caps["streamed_ttft"] is False
     assert caps["cached_token_telemetry"] is False
     assert caps["flush_endpoint"] is None
+    assert caps["kv_transfer_params"] is False
 
 
 # ------------------------------------------------------------------------- #

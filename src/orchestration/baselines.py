@@ -19,7 +19,7 @@ truth for THIS legacy list; keep the list in sync with it):
 2.  prefix_cache    - vLLM native prefix caching (server launched with --enable-prefix-caching)
 3.  redis           - Redis-backed RETRIEVAL-ARTIFACT cache (query->doc-ids), NOT a KV cache
 4.  rag             - FAISS + SentenceTransformers dense retrieval
-5.  distributed     - router-mediated multi-replica routing (replicated = real; sharded_context = simulated transfer)
+5.  distributed     - pilot router family, REMOVED 2026-10-07 (ADR-0147): no config entry; the enum member stays so cellspec.from_legacy reads old trees
 6.  hybrid          - retrieval-artifact cache + native prefix caching (cold/warm are runtime labels)
 7.  speculative     - measures a server LAUNCHED with speculative decoding; runner records TTFT/TPOT + /metrics acceptance
 8.  compressed_rag  - RAG with LLMLingua-2 text compression of retrieved docs
@@ -145,7 +145,7 @@ def get_baseline_config(baseline_name: str, **overrides) -> BaselineConfig:
     Get predefined baseline configuration.
     
     Args:
-        baseline_name: Name of baseline (no_cache, prefix_cache, redis, rag, distributed, hybrid, speculative)
+        baseline_name: Name of baseline (no_cache, prefix_cache, redis, rag, hybrid, speculative, compressed_rag, compressed_cag, staleness)
         **overrides: Override specific config fields
     
     Returns:
@@ -180,17 +180,6 @@ def get_baseline_config(baseline_name: str, **overrides) -> BaselineConfig:
             enable_prefix_caching=False,
             use_faiss=True,
             top_k_retrieval=3,
-        ),
-        
-        "distributed": BaselineConfig(
-            baseline_type=BaselineType.DISTRIBUTED_CACHE,
-            description="Router-mediated multi-replica prefix-routed baseline (replicated routing is real; simulated transfer policies are experimental only)",
-            enable_prefix_caching=True,
-            metadata={
-                "supports_real_replicated_cluster": True,
-                "supports_sharded_context_simulation": True,
-                "prefers_gpu": True,
-            },
         ),
         
         "hybrid": BaselineConfig(

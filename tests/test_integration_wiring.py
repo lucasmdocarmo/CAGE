@@ -1003,6 +1003,7 @@ def test_adapter_honesty_columns_from_a_stamped_response():
         "retries": 2,
         "reference_engine": None,
         "num_tokens_source": None,  # ADR-0118: unstamped stays None, never a guess
+        "corpus_prefill_ms": None,  # ADR-0148: the oracle's own-block prefill, None off the reuse path
     }
 
 
@@ -1016,6 +1017,7 @@ def test_adapter_honesty_columns_never_fabricated_when_unstamped():
         "retries",
         "reference_engine",
         "num_tokens_source",
+        "corpus_prefill_ms",  # ADR-0148
     ]
 
 

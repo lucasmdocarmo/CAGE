@@ -8,6 +8,8 @@
 # Codifies the user-mandated component check so a broken dependency fails LOUDLY in
 # ~1 minute instead of hours into a paid sweep. Checks:
 #   (a) vLLM /health 200 + the target model listed at /v1/models
+#   (a2) cached-token channel: a warm repeat carries usage.prompt_tokens_details
+#       (ADR-0147 item 10; the adapter's absent-means-zero rule proven live)
 #   (b) the quality layer loads and scores a REAL pair (LettuceDetect grounding + NLI),
 #       grounding_score is a real number (not None -> model-load failure)
 #   (c) cage-stats importable (rich telemetry, not spec-decode-only)
@@ -84,6 +86,145 @@ if curl -fsS -X POST "$API_BASE/reset_prefix_cache" >/dev/null 2>&1; then
 else
     fail "POST /reset_prefix_cache failed -> serve with VLLM_SERVER_DEV_MODE=1, else cold-start-per-trial silently no-ops"
 fi
+# (a2) cached-token channel probe (2026-10-07, ADR-0147 item 10). The vLLM
+# adapter records an ABSENT usage.prompt_tokens_details block as cached == 0
+# (a vLLM 0.11.0 semantic, src/inference/vllm_adapter.py). Against the pinned
+# engine the rule is proven here on the served instance, right after the cache
+# reset above: one prompt sent twice; the warm repeat must carry the block with
+# cached_tokens > 0, or every campaign row would read a fabricated zero. The
+# launcher serves with --enable-prefix-caching and --enable-prompt-tokens-details
+# by default (scripts/2_serving/manage_vllm_server.sh), so a FAIL here is real.
+# The cold response's block is recorded for the reader and decides nothing.
+echo "(a2) cached-token channel: usage.prompt_tokens_details on a warm repeat"
+python3 - "$API_BASE" "$MODEL" <<'PY'
+# CAGE-CACHED-TOKENS-PROBE (ADR-0147 item 10; extracted and executed by
+# tests/test_preflight_gates.py against a loopback chat-completions stub).
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+api = (sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000").rstrip("/")
+model = sys.argv[2] if len(sys.argv) > 2 else "Qwen/Qwen3-8B"
+# Longer than one vLLM KV block (16 tokens) by a wide margin, so the warm
+# repeat has full blocks to hit.
+PROMPT = ("Cached-token channel probe. " * 24).strip()
+
+
+def served_prefix_cache_mode():
+    """"enabled", "disabled" or "unknown", read the way the launcher reads it
+    (scripts/2_serving/manage_vllm_server.sh get_server_prefix_cache_mode): the
+    pid file under the launcher's log directory, then the server's command line.
+    The header says "re-run after every engine relaunch", and a no_cache arm
+    relaunches with --no-enable-prefix-caching; on that instance the warm repeat
+    cannot hit and the probe skips with the reason instead of failing a correct
+    server (review of ADR-0147, MEDIUM 1)."""
+    root = os.environ.get("CAGE_LOG_ROOT") or "logs"
+    pid_file = Path(root) / "vllm" / "vllm_server.pid"
+    try:
+        pid = pid_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return "unknown", None
+    if not pid.isdigit():
+        return "unknown", None
+    try:
+        cmd = subprocess.run(["ps", "-p", pid, "-o", "command="],
+                             capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return "unknown", pid
+    if "--no-enable-prefix-caching" in cmd:
+        return "disabled", pid
+    if "--enable-prefix-caching" in cmd:
+        return "enabled", pid
+    return "unknown", pid
+
+
+def ask():
+    body = json.dumps({"model": model, "max_tokens": 1, "temperature": 0,
+                       "messages": [{"role": "user", "content": PROMPT}]}).encode()
+    req = urllib.request.Request(f"{api}/v1/chat/completions", body,
+                                 {"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return json.load(resp)
+
+
+def cached_tokens(payload):
+    """(usage present, details block present, cached_tokens or None)."""
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    if not isinstance(usage, dict):
+        return False, False, None
+    details = usage.get("prompt_tokens_details")
+    if not isinstance(details, dict):
+        return True, False, None
+    value = details.get("cached_tokens")
+    ok = isinstance(value, int) and not isinstance(value, bool)
+    return True, True, (value if ok else None)
+
+
+mode, served_pid = served_prefix_cache_mode()
+if mode == "disabled":
+    print(f"  [SKIP] the served vLLM (pid {served_pid}) runs with --no-enable-prefix-caching: "
+          "a warm repeat cannot hit, so the cached-token channel cannot be proven on this "
+          "instance; re-run the preflight after a prefix-caching start")
+    sys.exit(3)
+
+try:
+    cold, warm = ask(), ask()
+except urllib.error.HTTPError as exc:
+    # The server answered and refused: a FAIL with its words, never a skip
+    # (review of ADR-0147, MEDIUM 2: a 404 on a served alias or a 400 on the
+    # request shape would otherwise read as "offline").
+    body = exc.read().decode("utf-8", "replace")[:300] if exc.fp else ""
+    print(f"  [FAIL] {api}/v1/chat/completions answered HTTP {exc.code} to the probe "
+          f"request (model={model!r}, max_tokens 1, temperature 0): {body!r}; the "
+          "cached-token channel was not proven")
+    sys.exit(1)
+except (ValueError, KeyError, TypeError) as exc:
+    print(f"  [FAIL] {api}/v1/chat/completions answered a body the probe cannot read "
+          f"({type(exc).__name__}: {exc}); the cached-token channel was not proven")
+    sys.exit(1)
+except Exception as exc:
+    print(f"  [SKIP] live-only probe: no chat completion at {api} "
+          f"({type(exc).__name__}: {exc})")
+    sys.exit(3)
+
+c_usage, c_block, c_val = cached_tokens(cold)
+w_usage, w_block, w_val = cached_tokens(warm)
+print(f"  [probe] cold: usage={'present' if c_usage else 'absent'} "
+      f"prompt_tokens_details={'present' if c_block else 'absent'} cached_tokens={c_val!r}; "
+      f"warm: usage={'present' if w_usage else 'absent'} "
+      f"prompt_tokens_details={'present' if w_block else 'absent'} cached_tokens={w_val!r}")
+if not w_usage:
+    print("  [FAIL] the warm repeat carries no usage object: the adapter would record "
+          "prompt and cached tokens as None on every row (no telemetry)")
+    sys.exit(1)
+if not w_block or w_val is None:
+    print("  [FAIL] the warm repeat carries usage but no prompt_tokens_details.cached_tokens: "
+          "the per-request cached-token channel is off (serve with "
+          "--enable-prompt-tokens-details and --enable-prefix-caching); the adapter's "
+          "absent-means-zero rule would record a fabricated 0 on every row")
+    sys.exit(1)
+if w_val <= 0:
+    print(f"  [FAIL] the warm repeat reports cached_tokens={w_val}: prefix caching did "
+          "not hit on an identical prompt (prefix caching off, or the cache was reset "
+          "between the two requests)")
+    sys.exit(1)
+if c_block:
+    print(f"  [note] the cold response carries the block at cached_tokens={c_val!r}: this "
+          "engine includes prompt_tokens_details at zero, so an ABSENT block means the "
+          "channel is off, not zero (revisit the adapter's absent-means-zero rule, "
+          "src/inference/vllm_adapter.py)")
+else:
+    print("  [note] the cold response omits prompt_tokens_details: this engine omits the "
+          "block at zero, the semantic the adapter's absent-means-zero rule encodes")
+print(f"  [PASS] cached-token channel live: warm repeat cached_tokens={w_val} > 0")
+sys.exit(0)
+PY
+gate_rc $?
+
 
 # (g) vllm serve ENTRYPOINT importable (2026-07-16 live finding): the sweep RESTARTS the
 # server per tree, so gate (a) -- which probes the ALREADY-RUNNING server -- passes even
@@ -107,7 +248,8 @@ fi
 echo "(e) no mock / no disable escape hatches / no unrecorded-deviation levers"
 for _v in CAGE_TELEMETRY_MOCK CAGE_DISABLE_LETTUCEDETECT CAGE_DISABLE_COMPRESSION \
           CAGE_ALLOW_NO_COMPRESSION CAGE_ALLOW_REPLAY CAGE_ALLOW_NO_BACKUP \
-          LMDEPLOY_CACHE_MAX_ENTRY_COUNT LMDEPLOY_QUANT_POLICY; do
+          LMDEPLOY_CACHE_MAX_ENTRY_COUNT LMDEPLOY_QUANT_POLICY \
+          CAGE_ALLOW_NO_RERANK CAGE_TRANSPORT_DRYRUN; do
     _val="$(printf '%s' "${!_v:-}")"
     if [ -n "$_val" ] && [ "$_val" != "0" ]; then
         fail "$_v is set ($_v=$_val) -- would mock/disable/bypass a real component or hand an engine an unrecorded launch lever"

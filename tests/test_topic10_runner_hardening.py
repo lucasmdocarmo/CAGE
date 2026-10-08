@@ -456,18 +456,15 @@ def test_j12_run_tests_default_path_is_local_pytest_no_cluster() -> None:
     )
 
 
-def test_j12_simulate_network_retired_to_deprecated() -> None:
-    old = SCRIPTS / "checks" / "simulate_network.sh"
-    new = SCRIPTS / "deprecated" / "simulate_network.sh"
-    assert not old.exists(), "simulate_network.sh must not live in scripts/checks/ anymore"
-    assert new.is_file(), "simulate_network.sh must be preserved under scripts/deprecated/"
-    text = _text(new)
-    assert "DEPRECATED" in text, "the deprecation stamp is missing"
-    assert "scripts/deprecated/README.md" in text
-    assert "simulate_network.sh" in _text(SCRIPTS / "deprecated" / "README.md"), (
-        "scripts/deprecated/README.md must list the retirement"
+def test_j12_simulate_network_is_gone_from_both_paths() -> None:
+    # 2026-08-18 (J12, task #136): retired from scripts/checks/ to scripts/deprecated/.
+    # 2026-10-07 (ADR-0147): removed outright. It added a real netem delay that
+    # later timings would record with no label, and nothing called it.
+    assert not (SCRIPTS / "checks" / "simulate_network.sh").exists()
+    assert not (SCRIPTS / "deprecated" / "simulate_network.sh").exists(), (
+        "simulate_network.sh is back; it was removed on 2026-10-07 (ADR-0147)"
     )
-    tracked = _tracked_files()
-    assert "scripts/deprecated/simulate_network.sh" in tracked, (
-        "the retired script must stay TRACKED at its new path (git mv, not plain mv)"
+    readme = _text(SCRIPTS / "deprecated" / "README.md")
+    assert "simulate_network.sh" in readme and "REMOVED 2026-10-07" in readme, (
+        "scripts/deprecated/README.md must record the removal"
     )

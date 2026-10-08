@@ -59,7 +59,10 @@ if [ "$WITH_CLUSTER" = "1" ]; then
   fi
   if [ -n "${CAGE_CLUSTER_ROUTER_PORT:-}" ]; then
     CLUSTER_ARGS+=( --router-port "$CAGE_CLUSTER_ROUTER_PORT" )
-    # tests/test_router_integration.py dials ROUTER_TEST_API_BASE (default :9000)
+    # ROUTER_TEST_API_BASE names the router port for live tests (the router and
+    # its integration test left the repo on 2026-10-07, ADR-0147; the cluster
+    # launcher now refuses start, so this mode is a refusal until the owner
+    # decides the launcher's fate)
     export ROUTER_TEST_API_BASE="${ROUTER_TEST_API_BASE:-http://localhost:${CAGE_CLUSTER_ROUTER_PORT}}"
   fi
   "$PYTHON" scripts/2_serving/manage_vllm_cluster.py start --model "$VLLM_TEST_MODEL" --replicas 1 ${CLUSTER_ARGS[@]+"${CLUSTER_ARGS[@]}"}

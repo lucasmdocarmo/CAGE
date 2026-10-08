@@ -16,6 +16,13 @@ marker — the start/validate/stop lifecycle, replica health-gating, and the
 state-file contract execute nowhere in the offline suite. S0 checklist row
 S0-9 (MyDocs/S0_CHECKLIST.md) forces the live proof (start -> status ->
 routed traffic -> stop with no orphan replica) before any DIST-topology cell.
+
+REMOVED (2026-10-07, ADR-0147): the CAGE prefix router (src/orchestration/router.py)
+reported a KV transfer it simulated and left src. A multi-replica cluster has no
+serving path without it, so `start` and `restart` refuse (ROUTER_REMOVED_MSG);
+`stop` and `status` keep working for cleanup. The rule functions below (GPU
+share, KV pin, port probe, readiness) stay as tested library code until the
+owner decides the launcher's fate.
 """
 
 from __future__ import annotations
@@ -36,6 +43,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import requests
+
+ROUTER_REMOVED_MSG = (
+    "REFUSING cluster launch: the CAGE prefix router (src/orchestration/router.py) "
+    "left src on 2026-10-07 (ADR-0147): it reported a KV transfer it simulated. "
+    "A multi-replica cluster has no serving path without it; use "
+    "scripts/2_serving/manage_vllm_server.sh (single instance) or "
+    "scripts/2_serving/manage_vllm_pd.sh (prefill/decode pair). "
+    "stop and status still work for cleanup."
+)
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
@@ -1092,6 +1108,11 @@ def main() -> int:
             replica_timeout, router_timeout = resolve_timeouts(args, os.environ)
         except ValueError as exc:
             parser.error(str(exc))
+        # ADR-0147 (2026-10-07): the router this cluster fronted left src; the
+        # launch refuses before any process is stopped or started. stop and
+        # status (the cleanup traps' commands) keep working.
+        print(f"Error: {ROUTER_REMOVED_MSG}", file=sys.stderr)
+        return 1
 
     try:
         if args.command == "start":
