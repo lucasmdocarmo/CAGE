@@ -1340,7 +1340,10 @@ def test_datasets_gate_honors_runner_dataset_fallback(
 # end-to-end runs against the LIVE venv and synthetic requirements files.
 # ---------------------------------------------------------------------------
 
-_PIN_SHA = "fcc74f261e9a6be034d63ba4373907ec4f72b1db"
+# Any full SHA serves the parse fixtures below; kept equal to the live pin
+# (requirements.txt, bumped 2026-10-08 for ADR-0148 Batch C) so a reader is
+# not misled by a retired commit.
+_PIN_SHA = "afa82328c40d19c74f57851de8bd82dc89aa6d91"
 
 
 def test_preflight_declares_pin_parity_gate() -> None:

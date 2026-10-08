@@ -177,5 +177,11 @@ pytest-asyncio>=0.21.0
 # RAW prefix_cache_queries/hits_total (None-on-absence; contrast #19's raw
 # material) + multi-label-set occupancy refuses-over-averaging
 # (kv_usage=None + kv_usage_multi_engine flag).
-cage-stats @ git+https://github.com/lucasmdocarmo/cage-stats.git@fcc74f261e9a6be034d63ba4373907ec4f72b1db
+# 2026-10-08 (ADR-0148 Batch C, BACKLOG S0F-52): bumped fcc74f26 -> afa82328: the
+# engine reports None (never 0.0) for the running and waiting gauges and the four
+# rates when their family is absent from the scrape, the session accounting pauses
+# without token counters, the api derives the two polls at their wall-clock instants
+# (rates over the measured gap, ts = the second poll's epoch time), and the SGLang
+# dialect maps num_requests_total to the request family ([A] semantics, VERIFY-LIVE).
+cage-stats @ git+https://github.com/lucasmdocarmo/cage-stats.git@afa82328c40d19c74f57851de8bd82dc89aa6d91
 # Local dev alternative (no install): set CAGE_STATS_HOME=/Users/lucasmariano/cage-stats

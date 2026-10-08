@@ -407,6 +407,26 @@ def test_energy_j_none_on_a_counter_reset() -> None:
     assert energy is None and "reset" in reason
 
 
+def test_energy_j_none_when_one_device_counter_reset_hides_in_a_positive_sum() -> None:
+    # Review 2026-10-08 LOW 2: device 0 went backward while device 1 grew more,
+    # so the per-device sum stayed positive; the reset is refused per device.
+    samples = _energy_samples()
+    # start tick i=1 reads [500, 1,000,500]; device 0 ends below its start
+    samples[11]["energy_mj_per_gpu"] = [0.0, 1_000_000.0 + 500.0 * 11 + 3_000.0]
+    energy, _, reason = _window_data(samples).energy_window()
+    assert energy is None and "energy device 0 counter reset" in reason
+
+
+def test_lifetime_column_reads_the_first_role_on_a_prefill_decode_window() -> None:
+    # Review 2026-10-08 NOTE 7: a pd window's vllm_telemetry is the
+    # {multi_instance, instances} dict; the lifetime delta sits per role.
+    wd = _window_data(_energy_samples(n=3), metrics={
+        "measured_window": {"t_start": T0, "t_end": T0 + 10},
+        "vllm_telemetry": {"multi_instance": True, "instances": {
+            "prefill": {"energy_delta_mj": 70_000.0}, "decode": {"energy_delta_mj": 30_000.0}}}})
+    assert wd.energy_sampler_lifetime_j() == pytest.approx(30.0)      # decode sorts first
+
+
 def test_energy_ticks_within_one_cadence_of_the_bounds_are_accepted() -> None:
     # cadence 2 s, ticks at T0-1, T0+1, ..., T0+11: the nearest ticks sit 1 s off
     # each bound (ties take the earlier tick), inside one cadence

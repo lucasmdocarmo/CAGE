@@ -220,9 +220,12 @@ if balance is None and (prev.get("pod") or {}).get("balance") is not None:
     balance = prev["pod"]["balance"]; balance_utc = prev["pod"].get("balance_utc")
 # The GPU count and the pod's own rate carry forward the same way, and only
 # on a tick whose pod read FAILED (an answered pod JSON without the field is
-# the pod's own statement; the list-price fallback applies then).
+# the pod's own statement; the list-price fallback applies then). A failed
+# read is the absence of the pod's identity: runpodctl prints its error as a
+# JSON object on stderr, which the block merges, so an empty dict is not the
+# test (review 2026-10-08, MEDIUM 1).
 prev_pod = prev.get("pod") or {}
-if not pod:
+if find_key(pod, {"id"}) is None:
     if gpu_count is None and isinstance(prev_pod.get("gpu_count"), int) and not isinstance(prev_pod.get("gpu_count"), bool):
         gpu_count = prev_pod["gpu_count"]
     if pod_rate is None and prev_pod.get("cost_basis") == "pod costPerHr" and isinstance(prev_pod.get("cost_per_hour_usd"), (int, float)):

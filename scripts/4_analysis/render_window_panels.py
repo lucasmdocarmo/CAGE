@@ -293,6 +293,12 @@ class WindowData:
         sampler starts before the measured stage and stops after it, so this
         spans more than the window (ADR-0148, Batch D). None when absent."""
         tele = self.metrics.get("vllm_telemetry")
+        if isinstance(tele, dict) and tele.get("multi_instance") is True:
+            # a prefill/decode window: one aggregate per role, the first role
+            # by name as everywhere in this module (review 2026-10-08, NOTE 7)
+            instances = tele.get("instances") if isinstance(tele.get("instances"), dict) else {}
+            roles = sorted(k for k, v in instances.items() if isinstance(v, dict))
+            tele = instances[roles[0]] if roles else None
         delta = _num(tele.get("energy_delta_mj")) if isinstance(tele, dict) else None
         return delta / 1000.0 if delta is not None else None
 
@@ -341,6 +347,8 @@ class WindowData:
                 if (x is None) != (y is None):
                     return None, offsets, f"energy device {k} read on one end of the window only"
                 if x is not None and y is not None:
+                    if y < x:  # review 2026-10-08 LOW 2: a reset on one device hides in a positive sum
+                        return None, offsets, f"energy device {k} counter reset inside the window"
                     deltas.append(y - x)
             if not deltas:
                 return None, offsets, "no device reading at the window ticks"

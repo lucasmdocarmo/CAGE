@@ -58,7 +58,9 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         #!/bin/bash
         case "$1" in
           pod)
-            [ -z "${CAGE_TEST_POD_GET_EMPTY:-}" ] || exit 1
+            # runpodctl reports a failed read as one JSON error object on stderr
+            # (the official runpodctl reference, output-and-errors) and exits 1
+            [ -z "${CAGE_TEST_POD_GET_EMPTY:-}" ] || { echo '{"error":"api request failed: dial tcp: lookup rest.runpod.io: no such host","code":"network_error"}' >&2; exit 1; }
             extra=""
             [ -n "${CAGE_TEST_POD_MINIMAL:-}" ] || extra=", \"gpuCount\": ${CAGE_TEST_GPU_COUNT:-1}"
             [ -n "${CAGE_TEST_POD_MINIMAL:-}" ] || [ -n "${CAGE_TEST_NO_COST_PER_HR:-}" ] || extra="$extra, \"costPerHr\": ${CAGE_TEST_COST_PER_HR:-3.49}"
@@ -286,6 +288,9 @@ def test_cost_clock_uses_the_pods_rate_then_list_price_times_gpu_count(world: Di
 
 
 def test_cost_clock_carries_the_count_and_rate_forward_on_a_failed_pod_read(world: Dict[str, Path]) -> None:
+    # Review 2026-10-08 MEDIUM 1: the failed read is the CLI's JSON error object
+    # on stderr (merged into the block), not an empty output; the carry-forward
+    # keys on the absence of a pod identity, never on an empty dict.
     _tick(world, CAGE_TEST_GPU_COUNT="2", CAGE_TEST_COST_PER_HR="6.98")
     proc = _tick(world, CAGE_TEST_POD_GET_EMPTY="1")
     assert proc.returncode == 0
