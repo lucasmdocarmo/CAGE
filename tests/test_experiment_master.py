@@ -906,7 +906,8 @@ def test_validate_runs_the_preflight_on_vllm_only_and_engine_probes_on_sglang(wo
     vllm_cmd = (world["home"] / ".cage_jobs" / "validate_vllm.cmd").read_text(encoding="utf-8")
     sgl_cmd = (world["home"] / ".cage_jobs" / "validate_sglang.cmd").read_text(encoding="utf-8")
     assert "preflight_check.sh" in vllm_cmd and "/flush_cache" not in vllm_cmd
-    assert "preflight_check.sh" not in sgl_cmd and "POST http://localhost:30000/flush_cache" in sgl_cmd
+    # S0F-54 (ADR-0149): the deferred flush, quoted so the remote shell never globs the "?"
+    assert "preflight_check.sh" not in sgl_cmd and 'POST "http://localhost:30000/flush_cache?timeout=20"' in sgl_cmd
     log = (world["exp_root"] / "S1" / DATE / "logs" / "setup" / "validate_sglang.log").read_text(encoding="utf-8")
     for marker in ("VALIDATE_API_OK", "RUNNING_REQS=0", "ENGINE_FLUSH_OK", "METRIC_OK sglang:token_usage", "METRIC_OK sglang:num_retracted_reqs",
                    "METRIC_OK sglang:num_running_reqs", "POOL_RECORD_OK", "COMPUTE_APPS=0"):

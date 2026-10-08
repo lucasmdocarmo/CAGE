@@ -72,6 +72,13 @@
 #                                 stay on, unlike VLLM_ENFORCE_EAGER). A reuse
 #                                 dial and a serving-config field like the rest.
 #
+# Readiness (S0F-54, live H100 2026-10-08): /v1/models answers two seconds
+# after uvicorn comes up, while SGLang's startup warm-up generation is still
+# running; the cold-start flush posted in that window was refused (400
+# "pending requests ... #queue-req: 0, #running-req: 0"). "Server ready"
+# therefore also waits for SGLang's own ready line in the start log
+# (SGLANG_READY_LINE below), the line it logs after the warm-up.
+#
 # Interpreter contract (pre-GO item 10, 2026-09-26): SGLang lives in its OWN
 # venv (setup_runpod.sh step 3c, <repo>/sglang-env; its transformers and torch
 # pins conflict with cage-env), so this launcher never depends on the caller's
@@ -142,6 +149,11 @@ case "${1:-}" in
 esac
 
 PORT="${SGLANG_PORT:-30000}"   # SGLangAdapter's default api_base port
+# SGLang's own ready line, logged after its startup warm-up generation
+# (0.5.10.post1, sglang/srt/entrypoints/http_server.py); the start waits for
+# it besides /v1/models (S0F-54). A version that drops the line times out
+# loudly at SGLANG_START_TIMEOUT, never ready early.
+SGLANG_READY_LINE="The server is fired up and ready to roll!"
 LOG_DIR="${CAGE_LOG_ROOT:-$PROJECT_DIR/logs}/sglang"
 # Daemon discipline: the launched server's PID is recorded here at start and
 # cleared at stop, so status/stop have an authoritative handle.
@@ -447,17 +459,22 @@ PYEOF
     printf '%s\n' "$server_pid" > "$PID_FILE"
     echo "Server PID: $server_pid (pidfile: $PID_FILE)"
 
-    # Wait for readiness by polling the OpenAI surface the adapter actually
-    # uses (/v1/models): it answers correctly only once the model is served,
-    # which makes it a stricter probe than /health. CUDA-graph capture can
-    # take minutes on smaller GPUs; override with SGLANG_START_TIMEOUT.
+    # Wait for readiness: /v1/models must name the model (the surface the
+    # adapter uses; it answers only once the model is served) AND the start
+    # log must carry SGLang's own ready line. Live 2026-10-08 (S0F-54):
+    # /v1/models answered two seconds after uvicorn came up while the startup
+    # warm-up generation was still running, and the flush posted in that
+    # window was refused ("pending requests ... #running-req: 0": the
+    # in-flight forward sits in the scheduler's overlap result queue, which
+    # no gauge shows). CUDA-graph capture can take minutes on smaller GPUs;
+    # override with SGLANG_START_TIMEOUT.
     echo "Waiting for server to start..."
     local max_wait="${SGLANG_START_TIMEOUT:-300}"
     local waited=0
-    local loaded
+    local loaded=""
     while [ "$waited" -lt "$max_wait" ]; do
         loaded=$(get_loaded_model)
-        if [ "$loaded" = "$model" ]; then
+        if [ "$loaded" = "$model" ] && grep -qF -- "$SGLANG_READY_LINE" "$log_file" 2>/dev/null; then
             echo -e "${GREEN}✓ Server ready with model: $model${NC}"
             echo "  View logs: tail -f $log_file"
             # S0F-24 (ADR-0142): record the realized KV pool for gate (j);
@@ -471,7 +488,14 @@ PYEOF
     done
 
     echo -e "\n${RED}✗ Server failed to start within ${max_wait}s${NC}"
+    if [ "$loaded" = "$model" ]; then
+        echo "  /v1/models named the model, but the start log never showed SGLang's ready line: $SGLANG_READY_LINE (S0F-54)"
+    fi
     echo "Check logs: $log_file"
+    # Fail closed (review 2026-10-08, LOW 1): a start that timed out must not
+    # leave a half-ready server behind, or a later `start` would reuse it on
+    # /v1/models and the dials alone, without the ready-line gate above.
+    stop_server
     return 1
 }
 

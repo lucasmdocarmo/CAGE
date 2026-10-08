@@ -97,6 +97,10 @@ SGLANG_LOG = (
     "[2026-08-18 10:00:00] KV Cache is allocated. #tokens: 430913, K size: 13.15 GB, V size: 13.15 GB\n"
     "[2026-08-18 10:00:01] max_total_num_tokens=430913, chunked_prefill_size=8192\n"
 )
+# SGLang logs this line after its startup warm-up generation (0.5.10.post1,
+# sglang/srt/entrypoints/http_server.py); the launcher's "Server ready" waits
+# for it besides /v1/models (S0F-54, live 2026-10-08).
+SGLANG_READY_LINE = "[2026-08-18 10:00:02] The server is fired up and ready to roll!\n"
 LMDEPLOY_017_LOG = (
     "2026-09-30 14:36:57,224 - lmdeploy - INFO - async_engine.py:130 - input backend=turbomind, "
     "backend_config=TurbomindEngineConfig(dtype='auto', session_len=32768, cache_max_entry_count=0.8763)\n"
@@ -770,9 +774,10 @@ def test_sglang_launcher_captures_at_ready_and_removes_on_stop(stub_bin: Path, t
     proc = _run_launcher(
         "manage_sglang_server.sh", stub_bin, log_root, "start", "fake/test-model",
         SGLANG_START_TIMEOUT="10", CAGE_SGLANG_PYTHON=str(python_stub),
-        CAGE_TEST_POOL_LINES=SGLANG_LOG, CAGE_TEST_READY_WHEN_LOGGED="KV Cache is allocated",
+        CAGE_TEST_POOL_LINES=SGLANG_LOG + SGLANG_READY_LINE, CAGE_TEST_READY_WHEN_LOGGED="KV Cache is allocated",
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Server ready with model: fake/test-model" in proc.stdout
     assert "KV pool captured" in proc.stdout
     record = log_root / "sglang" / kp.CURRENT_NAME
     rec = json.loads(record.read_text(encoding="utf-8"))
@@ -780,6 +785,29 @@ def test_sglang_launcher_captures_at_ready_and_removes_on_stop(stub_bin: Path, t
     proc = _run_launcher("manage_sglang_server.sh", stub_bin, log_root, "stop")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert not record.exists()
+
+
+def test_sglang_launcher_is_not_ready_before_sglangs_own_ready_line(stub_bin: Path, tmp_path: Path) -> None:
+    # S0F-54 (live 2026-10-08): /v1/models answered two seconds after uvicorn
+    # came up while SGLang's startup warm-up generation still ran, and the
+    # flush posted in that window was refused. "Server ready" needs SGLang's
+    # own ready line in the start log too; a log without it times out loudly,
+    # names the missing line, captures nothing, and stops the server it spawned
+    # (review LOW 1: a later start would otherwise reuse it unchecked).
+    log_root = tmp_path / "logroot"
+    python_stub = _engine_stub(stub_bin, "sglang-python")
+    proc = _run_launcher(
+        "manage_sglang_server.sh", stub_bin, log_root, "start", "fake/test-model",
+        SGLANG_START_TIMEOUT="6", CAGE_SGLANG_PYTHON=str(python_stub),
+        CAGE_TEST_POOL_LINES=SGLANG_LOG, CAGE_TEST_READY_WHEN_LOGGED="KV Cache is allocated",
+    )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "Server ready" not in proc.stdout
+    assert "failed to start within 6s" in proc.stdout
+    assert "The server is fired up and ready to roll!" in proc.stdout
+    assert not (log_root / "sglang" / kp.CURRENT_NAME).exists()
+    assert "Server stopped" in proc.stdout
+    assert not (log_root / "sglang" / "sglang_server.pid").exists()
 
 
 def test_lmdeploy_launcher_captures_at_ready_and_removes_on_stop(stub_bin: Path, tmp_path: Path) -> None:

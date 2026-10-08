@@ -725,7 +725,14 @@ stage_validate() {
       # The flush refuses while a request runs (the startup warm-up still did at
       # the fifth attempt: 400 "pending requests ... #running-req: 1"); the
       # driver reads the running-requests gauge before every flush, so does this.
-      probe="rc=0; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do r=\$(curl -fsS $api/metrics 2>/dev/null | grep '^$gauge' | awk '{print \$NF}' | head -1); r=\${r%.*}; [ \"\${r:-1}\" = 0 ] && break; sleep 2; done; echo \"RUNNING_REQS=\${r:-unread}\"; curl -fsS -X POST $api/flush_cache >/dev/null && echo ENGINE_FLUSH_OK || { echo ENGINE_FLUSH_FAILED; rc=1; }; m=\$(curl -fsS $api/metrics 2>/dev/null); for n in $names; do printf '%s\\n' \"\$m\" | grep -q \"^\$n\" && echo \"METRIC_OK \$n\" || { echo \"METRIC_MISSING \$n\"; rc=1; }; done; [ -s logs/$e/CURRENT.kvpool.json ] && echo POOL_RECORD_OK || { echo POOL_RECORD_MISSING; rc=1; }"
+      # Live 2026-10-08 (S0F-54): the gauge read 0 while the warm-up's prefill
+      # was still in flight (the refusal's own counts were 0/0: the forward sits
+      # in the overlap result queue), so the POST is the deferred form SGLang
+      # 0.5.10.post1 offers, ?timeout=20: performed once the scheduler is fully
+      # idle, 400 past the deadline (fail-closed stays), the same query the
+      # adapter sends; the launcher's start now also waits for SGLang's own
+      # ready line. Quoted so the remote shell never globs the "?".
+      probe="rc=0; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do r=\$(curl -fsS $api/metrics 2>/dev/null | grep '^$gauge' | awk '{print \$NF}' | head -1); r=\${r%.*}; [ \"\${r:-1}\" = 0 ] && break; sleep 2; done; echo \"RUNNING_REQS=\${r:-unread}\"; curl -fsS -X POST \"$api/flush_cache?timeout=20\" >/dev/null && echo ENGINE_FLUSH_OK || { echo ENGINE_FLUSH_FAILED; rc=1; }; m=\$(curl -fsS $api/metrics 2>/dev/null); for n in $names; do printf '%s\\n' \"\$m\" | grep -q \"^\$n\" && echo \"METRIC_OK \$n\" || { echo \"METRIC_MISSING \$n\"; rc=1; }; done; [ -s logs/$e/CURRENT.kvpool.json ] && echo POOL_RECORD_OK || { echo POOL_RECORD_MISSING; rc=1; }"
     fi
     # after `stop` the GPU process takes a few seconds to leave the compute-apps list: wait up to 60 s before reading it
     job_run "validate_$e" 1500 "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT CAGE_DATASETS=$ds$POD_ENGINE_ENV && bash scripts/2_serving/$launcher start '$MODEL' && curl -sf $api/v1/models >/dev/null && echo VALIDATE_API_OK; $probe; bash scripts/2_serving/$launcher stop; n=1; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do n=\$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . || true); [ \"\$n\" -eq 0 ] && break; sleep 2; done; echo COMPUTE_APPS=\$n; exit \$rc" "$LAND/logs/setup" || return 1
@@ -734,7 +741,7 @@ stage_validate() {
     if [ "$e" = "vllm" ]; then
       grep -q "PREFLIGHT PASS" "$JOB_LOG" || { printf '  [FAIL] %s: preflight did not PASS\n' "$e"; return 1; }
     else
-      grep -q "ENGINE_FLUSH_OK" "$JOB_LOG" || { printf '  [FAIL] %s: the cold-start endpoint POST /flush_cache did not answer\n' "$e"; return 1; }
+      grep -q "ENGINE_FLUSH_OK" "$JOB_LOG" || { printf '  [FAIL] %s: the cold-start endpoint POST /flush_cache?timeout=20 did not answer 200 (the scheduler never went fully idle within 20 s, or the endpoint is gone)\n' "$e"; return 1; }
       [ "$(grep -c '^METRIC_OK ' "$JOB_LOG")" -eq "$n_names" ] || { printf '  [FAIL] %s: live /metrics lacks a name the regime bridge or the cold-start check reads:\n' "$e"; grep 'METRIC_MISSING' "$JOB_LOG" | sed 's/^/    /'; return 1; }
       grep -q "POOL_RECORD_OK" "$JOB_LOG" || { printf '  [FAIL] %s: the launcher wrote no CURRENT.kvpool.json (ADR-0142 realized pool)\n' "$e"; return 1; }
     fi

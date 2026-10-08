@@ -501,11 +501,13 @@ def test_sglang_ignores_nixl_kv_transfer_params(monkeypatch):
     assert resp.kv_transfer_params is None  # vLLM/NIXL-shaped; not parsed (ADR-0007)
 
 
-def test_sglang_flush_cache_posts_native_endpoint(monkeypatch):
+def test_sglang_flush_cache_posts_native_endpoint_in_the_deferred_form(monkeypatch):
+    # S0F-54 (ADR-0149): ?timeout=20 makes SGLang 0.5.10.post1 perform the flush
+    # once its scheduler is fully idle, and answer 400 past the deadline (fail-closed).
     calls = install_post(monkeypatch, lambda _c: FakeJSONResponse({}))
 
     SGLangAdapter(model_name="m", api_base="http://sgl:1234").flush_cache()
-    assert calls[0]["url"] == "http://sgl:1234/flush_cache"
+    assert calls[0]["url"] == "http://sgl:1234/flush_cache?timeout=20"
 
 
 def test_sglang_flush_cache_failure_raises_typed_error(monkeypatch):

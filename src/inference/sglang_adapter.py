@@ -20,7 +20,10 @@ misreport cached-token rates, corrupting the D2 telemetry-parity gate).
 
 Cache flush: SGLang natively exposes ``POST /flush_cache`` (flushes the radix
 cache), used for cold-start-per-trial (the vLLM analogue is the dev-gated
-``/reset_prefix_cache``).
+``/reset_prefix_cache``). The POST carries ``?timeout=20`` (S0F-54,
+ADR-0149): SGLang 0.5.10.post1 then performs the flush once its scheduler
+is fully idle and answers 400 past the deadline, so a refused flush is
+still a typed error, never a silent warm window.
 
 kv_transfer_params stays unparsed: the field is vLLM/NIXL-shaped; SGLang's
 disaggregation metadata format (if any) is unconfirmed (ADR-0007 item 6).
@@ -40,8 +43,16 @@ class SGLangAdapter(OpenAIChatAdapter):
     engine_id: str = "sglang"
     # NIXL-shaped kv_transfer_params are vLLM telemetry; not parsed here.
     _kv_transfer_telemetry: bool = False
-    # SGLang's native radix-cache flush endpoint.
+    # SGLang's native radix-cache flush endpoint, posted in the deferred form:
+    # with ?timeout=<s> SGLang 0.5.10.post1 performs the flush once its
+    # scheduler is fully idle (a forward still in the overlap result queue
+    # counts as busy and no gauge shows it; live 2026-10-08 the plain POST
+    # was refused with "#queue-req: 0, #running-req: 0") and answers 400
+    # "Timed out waiting for idle state." past the deadline, so fail-closed
+    # stays (S0F-54, ADR-0149; read from sglang/srt/managers/scheduler.py on
+    # the pod). 20 s stays under the 30 s POST timeout of flush_cache().
     _flush_endpoint: Optional[str] = "/flush_cache"
+    _flush_query: Optional[str] = "timeout=20"
 
     def __init__(
         self,

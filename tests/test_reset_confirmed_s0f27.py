@@ -46,6 +46,9 @@ runner = _load("run_experiment_s0f27", REPO_ROOT / "scripts" / "3_run" / "run_ex
 pd_proxy = _load("pd_proxy_s0f27_runner", REPO_ROOT / "scripts" / "2_serving" / "pd_proxy.py")
 
 HONEST = "/reset_prefix_cache?reset_running_requests=true"
+# S0F-54 (ADR-0149): SGLang's flush is the deferred form (performed once the
+# scheduler is fully idle, 400 past the deadline).
+SGLANG_FLUSH = "/flush_cache?timeout=20"
 
 
 class _Engine:
@@ -117,9 +120,9 @@ def test_the_vllm_adapter_posts_the_honest_query(vllm_engine) -> None:
     assert vllm_engine.posts == [HONEST]
 
 
-def test_the_sglang_adapter_posts_its_native_endpoint_without_a_query(sglang_engine) -> None:
+def test_the_sglang_adapter_posts_its_native_endpoint_with_the_deferred_query(sglang_engine) -> None:
     SGLangAdapter(model_name="m", api_base=sglang_engine.url).flush_cache()
-    assert sglang_engine.posts == ["/flush_cache"]
+    assert sglang_engine.posts == [SGLANG_FLUSH]
 
 
 def test_a_declined_reset_is_a_typed_error_naming_the_status(vllm_engine) -> None:
@@ -132,7 +135,8 @@ def test_a_declined_reset_is_a_typed_error_naming_the_status(vllm_engine) -> Non
 
 def test_capabilities_say_which_engine_confirms_its_flush() -> None:
     assert VLLMAdapter(model_name="m").capabilities()["flush_confirms_reset"] is True
-    # SGLang's /flush_cache semantics were not read: unknown stays unknown
+    # SGLang's 200 means flushed by the source read on 2026-10-08 (ADR-0149);
+    # the capability stays absent (None) until a live window records it (S0F-55)
     assert SGLangAdapter(model_name="m").capabilities().get("flush_confirms_reset") is None
     assert LMDeployAdapter(model_name="m").capabilities().get("flush_confirms_reset") is None
 
@@ -141,7 +145,10 @@ def test_the_flush_path_stays_the_bare_endpoint_and_the_query_is_the_proxys() ->
     # the proxy matches the bare path and sends the same query to both roles
     assert VLLMAdapter._flush_endpoint == pd_proxy.RESET_PATH == "/reset_prefix_cache"
     assert VLLMAdapter._flush_query == pd_proxy.RESET_QUERY == "reset_running_requests=true"
-    assert SGLangAdapter._flush_query is None
+    # ADR-0149 (2026-10-08): the original pin recorded that SGLang documented no
+    # flush query; the installed 0.5.10.post1 accepts ?timeout=<s> (the flush is
+    # deferred until the scheduler is fully idle), read from its source on the pod.
+    assert SGLangAdapter._flush_query == "timeout=20"
 
 
 # --- the runner's reset record --------------------------------------------
@@ -165,7 +172,7 @@ def test_strict_reset_refuses_a_reset_the_engine_declined(vllm_engine) -> None:
 
 def test_sglang_reset_is_recorded_as_not_confirmed_by_the_engine(sglang_engine) -> None:
     record = runner._reset_prefix_cache(sglang_engine.url, backend="sglang", model="m", strict=True)
-    assert sglang_engine.posts == ["/flush_cache"]
+    assert sglang_engine.posts == [SGLANG_FLUSH]
     assert record["verified"] is True
     assert record["engine_confirmed"] is None
 
