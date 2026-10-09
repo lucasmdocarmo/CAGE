@@ -2347,7 +2347,8 @@ def _hermetic_telemetry(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]
     def _snapshot(url: str, *, metrics_path: str = "/metrics", api_key: Any = None,
                   interval: float = 1.0, dialect: str = "vllm") -> dict[str, Any]:
         asked.append((url, dialect))
-        return {"kv_usage": 0.125, "running": 0}
+        # ADR-0157 (W16): the probe requires the queue gauge beside kv_usage
+        return {"kv_usage": 0.125, "running": 0, "waiting": 0}
 
     monkeypatch.setattr(vt, "capture_snapshot", _snapshot)
     monkeypatch.setattr(vt, "available", lambda: False)

@@ -42,6 +42,18 @@ MARKER = "CAGE-ENV-REGISTRATION-GATE"
 S0_LINE = "vllm 0.19.1 has requirement numba==0.61.2, but you have numba 0.67.0."
 DRIFT_LINE = "vllm 0.19.1 has requirement numba==0.61.2, but you have numba 0.68.0."
 OTHER_LINE = "lettucedetect 0.1.7 has requirement openai==1.66.3, but you have openai 2.3.0."
+#: ADR-0159 (S0F-57): the four lines lmcache 0.4.4's upper bounds print when the
+#: wheel is installed --no-deps beside the Tier-1 pins (wording reproduced with a
+#: real `pip check` against the pod's versions on 2026-10-09; pip prints the
+#: installed name as prometheus-client, with a hyphen).
+LMCACHE_VERSION = "0.4.4"
+LMCACHE_LINES = (
+    f"lmcache {LMCACHE_VERSION} has requirement numpy<=2.2.6, but you have numpy 2.5.1.",
+    f"lmcache {LMCACHE_VERSION} has requirement opentelemetry-api<=1.40.0,>=1.20.0, but you have opentelemetry-api 1.45.1.",
+    f"lmcache {LMCACHE_VERSION} has requirement opentelemetry-exporter-prometheus<=0.61b0,>=0.50b0, but you have opentelemetry-exporter-prometheus 0.66b1.",
+    f"lmcache {LMCACHE_VERSION} has requirement prometheus_client<=0.24.1,>=0.18.0, but you have prometheus-client 0.26.0.",
+)
+SETUP_RUNPOD = REPO_ROOT / "scripts" / "runpod" / "setup_runpod.sh"
 
 _FAKE_PIP = """\
 import os
@@ -180,15 +192,39 @@ def _entries():
     return rows
 
 
-def test_allowlist_exists_with_exactly_the_s0_entry() -> None:
+def test_allowlist_holds_exactly_the_registered_entries() -> None:
     assert ALLOWLIST.is_file(), "scripts/checks/pip_check_allowlist.txt is tracked"
     rows = _entries()
-    assert len(rows) == 1, rows
-    line, reason, adr = rows[0]
-    assert line == S0_LINE
-    assert len(reason) >= 20, "every accepted line carries a reason"
-    assert re.fullmatch(r"ADR-\d{4}", adr), adr
-    assert adr == "ADR-0126"
+    assert [r[0] for r in rows] == [S0_LINE, *LMCACHE_LINES], rows
+    for line, reason, adr in rows:
+        assert len(reason) >= 20, f"every accepted line carries a reason: {line}"
+        assert " ## " not in reason
+        assert re.fullmatch(r"ADR-\d{4}", adr), adr
+    assert rows[0][2] == "ADR-0126"
+    assert all(r[2] == "ADR-0159" for r in rows[1:])
+
+
+def test_lmcache_lines_pass_together_with_the_s0_line(tmp_path: Path) -> None:
+    # ADR-0159: the pod's pip check after the --no-deps lmcache install prints
+    # exactly these five lines; all are accepted, nothing else is reported.
+    stdout = "\n".join([S0_LINE, *LMCACHE_LINES]) + "\n"
+    proc = _run_gate(tmp_path, stdout=stdout, rc=1, allowlist=REAL_ALLOWLIST)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.count("[accepted]") == 1 + len(LMCACHE_LINES)
+    assert "ADR-0159" in proc.stdout and "[FAIL]" not in proc.stdout
+    assert f"pip check: {1 + len(LMCACHE_LINES)} accepted deviation(s)" in proc.stdout
+
+
+def test_lmcache_lines_match_the_bootstrap_pin_and_the_numpy_pin() -> None:
+    # The accepted lines name the lmcache version setup_runpod.sh installs and the
+    # numpy version requirements.txt pins; a bump of either changes the lines.
+    script = SETUP_RUNPOD.read_text(encoding="utf-8")
+    m = re.search(r'^LMCACHE_VERSION="\$\{LMCACHE_VERSION:-([^}]+)\}"$', script, re.M)
+    assert m and m.group(1) == LMCACHE_VERSION, "setup_runpod.sh step 3d must pin the allowlisted lmcache version"
+    assert 'pip install --no-cache-dir --no-deps "lmcache==${LMCACHE_VERSION}"' in script
+    numpy_pin = re.findall(r"^numpy==(\S+)$", REQUIREMENTS.read_text(encoding="utf-8"), re.M)
+    assert numpy_pin == ["2.5.1"], numpy_pin
+    assert LMCACHE_LINES[0].endswith(f"but you have numpy {numpy_pin[0]}.")
 
 
 def test_requirements_pin_numba_at_the_allowlisted_version() -> None:

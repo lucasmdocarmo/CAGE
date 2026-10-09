@@ -1393,7 +1393,15 @@ def test_proxy_reset_fans_out_to_both_roles_and_requires_both(pd_stack, monkeypa
 # 4. run_campaign.py — pd emission + --allow-pd gating (stub runner)
 # ---------------------------------------------------------------------------
 
-_ANCHOR_DEMAND = 10_000_000_000
+#: ADR-0155: the floor table is sized on the registered anchor shape and the
+#: planner scales D per demand class; the one pd cell here is B3 (corpus-reuse).
+#: ADR-0157 pool rule: each role pool must hold one request of the class cap
+#: (8,192 tokens for the corpus class, ADR-0158), so the demand is the anchor
+#: demand at the registered floor concurrency (c = 50: the prefill pool holds
+#: 50 x 2336 / 4 = 29,200 tokens), never a round stub number.
+_ANCHOR_TOKENS = rc.DEMAND_SEQ_TOKENS_2026_10_08[rc.DEMAND_ANCHOR_ARM]
+_B3_TOKENS = rc.DEMAND_SEQ_TOKENS_2026_10_08["corpus-reuse"]
+_ANCHOR_DEMAND = rc.demand_bytes("qwen3-14b", concurrency=50, avg_seq_tokens=_ANCHOR_TOKENS)
 
 
 def _floor_table(tmp_path: Path) -> Path:
@@ -1414,6 +1422,8 @@ def _floor_table(tmp_path: Path) -> Path:
         "generated_inputs": {
             "model": "qwen3-14b", "engine": "vllm",
             "kv_dtype": "bf16", "grid": "full",
+            # ADR-0155: the shape D was sized on; the plan refuses a table without it
+            "avg_seq_tokens": _ANCHOR_TOKENS, "concurrency_target": 50,
         },
         "rows": rows,
     }
@@ -1490,11 +1500,12 @@ def _relaunches(plan):
     return [s for s in plan["steps"] if s["kind"] == "relaunch"]
 
 
-#: independent §6.5 arithmetic: budget = floor(r × D); prefill = floor(split
-#: × budget); decode = the exact remainder. Restated here, never re-calling
-#: the planner it checks.
-_EXPECT_TOTAL = _ANCHOR_DEMAND  # r = 1.0
-_EXPECT_PREFILL = 2_500_000_000  # floor(0.25 × 1e10), exact binary fraction
+#: independent §6.5 arithmetic: D_class = floor(D_anchor x s_class / s_anchor)
+#: (ADR-0155); budget = floor(r × D_class); prefill = floor(split × budget);
+#: decode = the exact remainder. Restated here, never re-calling the planner
+#: it checks (the registered class tokens are inputs, not planner output).
+_EXPECT_TOTAL = _ANCHOR_DEMAND * _B3_TOKENS // _ANCHOR_TOKENS  # r = 1.0
+_EXPECT_PREFILL = _EXPECT_TOTAL // 4  # floor(0.25 × total), exact binary fraction
 _EXPECT_DECODE = _EXPECT_TOTAL - _EXPECT_PREFILL
 
 

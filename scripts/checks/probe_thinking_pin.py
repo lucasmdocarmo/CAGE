@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Order:     stage 4 (validate), after the engine's own probes and before the launcher stop
 Objective: Prove live that a chat request served by this engine carries no thinking scaffolding (S0F-59, ADR-0151)
-Cloud:     pod, against the running engine
+Cloud:     both
 
 One chat request, built the way the campaign runner builds every request
 (``run_experiment.setup_inference_engine`` for the adapter, the Decision 1B

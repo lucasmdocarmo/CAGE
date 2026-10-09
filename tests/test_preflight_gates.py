@@ -65,7 +65,7 @@ _GATE_ENV_VARS = (
     "CAGE_ISO_POOL_SUM_BYTES",
     "CAGE_CALIBRATION_MANIFESTS", "CAGE_DATASETS", "DATASET",
     "CAGE_REGIME_GATE_SAMPLES", "CAGE_REGIME_GATE_INTERVAL",
-    "CAGE_REGIME_KV_METRIC", "CAGE_REGIME_PREEMPT_METRIC",
+    "CAGE_REGIME_KV_METRIC", "CAGE_REGIME_PREEMPT_METRIC", "CAGE_REGIME_WAIT_METRIC",
     "HF_DATASETS_CACHE", "HF_HOME",
     "CAGE_SCBENCH_HF_PATH", "CAGE_SHAREGPT_HF_PATH",
     "CAGE_TELEMETRY_MOCK", "CAGE_DISABLE_LETTUCEDETECT",
@@ -1047,6 +1047,8 @@ class _MetricsStub(BaseHTTPRequestHandler):
     KV_LINE_OLD = "vllm:gpu_cache_usage_perc{model_name=\"m\"} 0.42\n"
     kv_line = KV_LINE_019
     preempt = True
+    # ADR-0157 (W16): the queue gauge is required beside occupancy and preemptions
+    waiting = True
     hits = 0
 
     def do_GET(self) -> None:  # noqa: N802 (http.server API)
@@ -1054,6 +1056,8 @@ class _MetricsStub(BaseHTTPRequestHandler):
         body = "# HELP test stub\n" + self.kv_line
         if self.preempt:
             body += f"vllm:num_preemptions_total{{model_name=\"m\"}} {float(type(self).hits)}\n"
+        if self.waiting:
+            body += "vllm:num_requests_waiting{model_name=\"m\"} 0\n"
         payload = body.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
@@ -1069,6 +1073,7 @@ class _MetricsStub(BaseHTTPRequestHandler):
 def metrics_server():
     _MetricsStub.hits = 0
     _MetricsStub.preempt = True
+    _MetricsStub.waiting = True
     _MetricsStub.kv_line = _MetricsStub.KV_LINE_019
     server = HTTPServer(("127.0.0.1", 0), _MetricsStub)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1106,6 +1111,17 @@ def test_regime_gate_missing_metric_fails_loud(metrics_server: str) -> None:
                      env=_regime_env())
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert "exposes no 'vllm:num_preemptions_total'" in proc.stdout
+
+
+def test_regime_gate_missing_waiting_gauge_fails_loud(metrics_server: str) -> None:
+    # ADR-0157 (W16, S0F-26): a /metrics page without the queue gauge cannot
+    # certify the regime's queue term; the pod suite of 2026-10-09 caught the
+    # stub serving occupancy and preemptions only.
+    _MetricsStub.waiting = False
+    proc = _run_gate("CAGE-REGIME-BRIDGE-GATE", metrics_server, env=_regime_env())
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "exposes no 'vllm:num_requests_waiting'" in proc.stdout
+    assert "CAGE_REGIME_WAIT_METRIC" in proc.stdout  # the message names the override
 
 
 def test_regime_gate_default_kv_gauge_is_the_vllm_0_19_spelling() -> None:

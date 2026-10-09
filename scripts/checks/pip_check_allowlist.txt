@@ -7,3 +7,14 @@
 # or an ADR id. Versions are part of the match on purpose: when the installed
 # numba or the vLLM pin moves, the line changes and this entry stops matching.
 vllm 0.19.1 has requirement numba==0.61.2, but you have numba 0.67.0. ## vLLM 0.19.1 pins numba 0.61.2 (numpy<2.3), which cannot coexist with the Tier-1 numpy==2.5.1; vLLM imports numba only in the ngram speculative proposer, retired by the charter (27 S0 engine inits ran speculative_config=None); requirements.txt pins the S0-tested numba 0.67.0 so the line stays exact ## ADR-0126
+# ADR-0159 (S0F-57, S0 attempt 2026-10-09): lmcache 0.4.4 (the B8 connector, installed
+# --no-deps by setup_runpod.sh step 3d on INSTALL_LMCACHE=1) declares upper bounds below
+# the Tier-1 numpy pin and below the opentelemetry and prometheus_client versions vLLM
+# 0.19.1 resolves; the bounds are metadata: lmcache 0.4.4 imports beside vllm 0.19.1 with
+# these versions on the 2026-10-09 pod, and the B8 cells of S0 are the live test. The
+# three unpinned versions (1.45.1, 0.66b1, 0.26.0) are what pip resolved on 2026-10-09;
+# when they drift, the line changes and gate (i) names it.
+lmcache 0.4.4 has requirement numpy<=2.2.6, but you have numpy 2.5.1. ## lmcache 0.4.4 is installed --no-deps so the Tier-1 numpy==2.5.1 stays; the bound is metadata only (import proven on the 2026-10-09 pod) and the B8 cells are the live test ## ADR-0159
+lmcache 0.4.4 has requirement opentelemetry-api<=1.40.0,>=1.20.0, but you have opentelemetry-api 1.45.1. ## lmcache 0.4.4 would downgrade the opentelemetry stack vLLM 0.19.1 resolved (1.45.1 on 2026-10-09) and break opentelemetry-exporter-otlp-common and google-api-core; the bound is metadata only ## ADR-0159
+lmcache 0.4.4 has requirement opentelemetry-exporter-prometheus<=0.61b0,>=0.50b0, but you have opentelemetry-exporter-prometheus 0.66b1. ## lmcache 0.4.4 would downgrade the prometheus exporter vLLM 0.19.1 resolved (0.66b1 on 2026-10-09); the bound is metadata only ## ADR-0159
+lmcache 0.4.4 has requirement prometheus_client<=0.24.1,>=0.18.0, but you have prometheus-client 0.26.0. ## lmcache 0.4.4 would downgrade prometheus_client (0.26.0 resolved on 2026-10-09), the client cage-stats and the regime sampler read; the bound is metadata only ## ADR-0159

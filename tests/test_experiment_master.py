@@ -292,6 +292,9 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         #!/bin/bash
         case "$*" in
           *"import torch, vllm"*) echo "torch 2.10.0 cuda 12.8 vllm 0.19.1"; exit "${{CAGE_TEST_SHAPE_RC:-0}}" ;;
+          # S0F-57: the stage 4 lmcache probe; the fake venv has none unless a
+          # test says so (the pod suite of 2026-10-09 ran where lmcache imports)
+          *"import lmcache"*) exit "${{CAGE_TEST_LMCACHE_IMPORT_RC:-1}}" ;;
         esac
         exec {sys.executable} "$@"
         ''')

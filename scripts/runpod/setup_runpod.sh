@@ -48,7 +48,8 @@
 #   SKIP_ENGINE_INSTALL=1 bypass the SGLang/LMDeploy venvs (a vLLM-only pod)
 #   INSTALL_LMCACHE=1     install the LMCache KV-connector package into cage-env for the
 #                         retr-store arm (B8; S0F-57, ADR-0158): opt-in per profile, FATAL
-#                         when it fails; LMCACHE_VERSION pins it (default: the newest wheel)
+#                         when it fails; LMCACHE_VERSION pins the wheel (default 0.4.4,
+#                         ADR-0159: installed --no-deps so the Tier-1 pins stay in place)
 #   CAGE_VENV_ROOT        where the three venvs REALLY live (default /root/cage-venvs, the
 #                         container disk; ADR-0125, S0F-6). The repo-root names cage-env,
 #                         sglang-env and lmdeploy-env are symlinks to them, so every consumer
@@ -251,13 +252,58 @@ pip install -U "openai>=2.0"
 #     and the stage 4 probe are the gates, and the S0 rehearsal is the live test. The
 #     2026-10-08 landing lost its B8 relaunch to ModuleNotFoundError after hours of
 #     billing, so a failed install here is FATAL when opted in (never a warning).
+#     ADR-0159 (S0 attempt of 2026-10-09, 20:49 UTC, pod 70ot6nkur3jnyu): a plain
+#     `pip install lmcache` resolves 0.4.4 (every newer wheel pins transformers 5.x or
+#     the CUDA 13 cupy) and REWRITES the Tier-1 environment to lmcache's upper bounds
+#     (numpy 2.5.1 -> 2.2.6, opentelemetry 1.45.1 -> 1.40.0, prometheus_client 0.26.0
+#     -> 0.24.1); the pod suite's pin test failed on numpy and gate (i) would have
+#     failed on the pip check lines. The wheel is therefore installed --no-deps at the
+#     pinned version, the packages it needs that cage-env lacks are installed under the
+#     Tier-1 exact pins as constraints (they may add, never move, a pinned version),
+#     and the proof below checks the numpy pin and imports vllm and lmcache together
+#     (lmcache 0.4.4 imports beside vllm 0.19.1 and numpy 2.5.1 [V pod 2026-10-09]).
+#     The four `pip check` lines lmcache's bounds then print are the accepted
+#     deviations of scripts/checks/pip_check_allowlist.txt (ADR-0159).
+LMCACHE_VERSION="${LMCACHE_VERSION:-0.4.4}"
+# lmcache 0.4.4's requirements that cage-env does not carry after steps 2 and 3
+# (the install log of 2026-10-09: aiofile, aiofiles, awscrt, cufile-python,
+# cupy-cuda12x, nvtx, setuptools_scm, sortedcontainers; caio and vcs-versioning
+# arrive with them). Another LMCACHE_VERSION may need a different list: the import
+# proof below fails loudly then.
+LMCACHE_EXTRA_DEPS="aiofile aiofiles awscrt cufile-python cupy-cuda12x nvtx setuptools_scm sortedcontainers"
 if [ "${INSTALL_LMCACHE:-0}" = "1" ]; then
-  echo "[cage] [3d] installing lmcache into cage-env (opt-in, INSTALL_LMCACHE=1${LMCACHE_VERSION:+, pin ${LMCACHE_VERSION}})..."
-  if pip install --no-cache-dir "lmcache${LMCACHE_VERSION:+==${LMCACHE_VERSION}}" "transformers>=4.36,<5" \
-     && python -c 'import vllm, lmcache; print("[cage]   lmcache:", getattr(lmcache, "__version__", "?"), "installed beside vllm", vllm.__version__)'; then
-    :
+  echo "[cage] [3d] installing lmcache ${LMCACHE_VERSION} into cage-env (opt-in, INSTALL_LMCACHE=1; --no-deps, the Tier-1 pins stay)..."
+  _tier1_constraints="$(mktemp)"
+  sed -E 's/[[:space:]]*#.*$//' requirements.txt | grep -E '^[A-Za-z0-9][A-Za-z0-9._-]*==' > "$_tier1_constraints" || true
+  if pip install --no-cache-dir --no-deps "lmcache==${LMCACHE_VERSION}" \
+     && pip install --no-cache-dir -c "$_tier1_constraints" ${LMCACHE_EXTRA_DEPS} \
+     && python - <<'PY'
+import importlib.metadata as md
+import re
+import sys
+
+pins = dict(re.findall(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s#]+)",
+                       open("requirements.txt", encoding="utf-8").read(), re.M))
+moved = []
+for name, want in pins.items():
+    try:
+        have = md.version(name)
+    except md.PackageNotFoundError:
+        have = "absent"
+    if have != want:
+        moved.append(f"{name} {have} != pinned {want}")
+if moved:
+    print("[cage] FATAL: the lmcache step moved Tier-1 exact pins (ADR-0159): " + "; ".join(moved))
+    sys.exit(1)
+import vllm, lmcache  # noqa: E402
+print("[cage]   lmcache:", getattr(lmcache, "__version__", "?"), "installed beside vllm", vllm.__version__,
+      f"with the {len(pins)} Tier-1 exact pins intact (numpy {md.version('numpy')})")
+PY
+  then
+    rm -f "$_tier1_constraints"
   else
-    die "lmcache install or import FAILED (S0F-57, ADR-0158): the retr-store (B8) relaunches cannot start; fix the install (LMCACHE_VERSION) or deregister B8 for this session"
+    rm -f "$_tier1_constraints"
+    die "lmcache install or import FAILED (S0F-57, ADR-0158, ADR-0159): the retr-store (B8) relaunches cannot start; fix the install (LMCACHE_VERSION, LMCACHE_EXTRA_DEPS) or deregister B8 for this session"
   fi
 else
   echo "[cage] [3d] lmcache SKIPPED (INSTALL_LMCACHE=${INSTALL_LMCACHE:-0}; the plan's vLLM B8 cells need it)"
