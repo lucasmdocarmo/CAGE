@@ -714,7 +714,7 @@ stage_validate() {
     # check read (the live scrape of 2026-10-07: sglang:token_usage,
     # sglang:num_retracted_reqs, sglang:num_running_reqs), and the launcher's
     # realized-pool record (ADR-0142). An engine with no registered set refuses.
-    local probe="" names="" gauge="" n_names=0
+    local probe="" names="" gauge="" n_names=0 thinking=""
     case "$e" in
       vllm) probe="CAGE_PREFLIGHT_BACKENDS=$e bash scripts/checks/preflight_check.sh '$MODEL' $api; rc=\$?" ;;
       sglang) names="sglang:token_usage sglang:num_retracted_reqs sglang:num_running_reqs"; gauge="sglang:num_running_reqs" ;;
@@ -734,8 +734,14 @@ stage_validate() {
       # ready line. Quoted so the remote shell never globs the "?".
       probe="rc=0; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do r=\$(curl -fsS $api/metrics 2>/dev/null | grep '^$gauge' | awk '{print \$NF}' | head -1); r=\${r%.*}; [ \"\${r:-1}\" = 0 ] && break; sleep 2; done; echo \"RUNNING_REQS=\${r:-unread}\"; curl -fsS -X POST \"$api/flush_cache?timeout=20\" >/dev/null && echo ENGINE_FLUSH_OK || { echo ENGINE_FLUSH_FAILED; rc=1; }; m=\$(curl -fsS $api/metrics 2>/dev/null); for n in $names; do printf '%s\\n' \"\$m\" | grep -q \"^\$n\" && echo \"METRIC_OK \$n\" || { echo \"METRIC_MISSING \$n\"; rc=1; }; done; [ -s logs/$e/CURRENT.kvpool.json ] && echo POOL_RECORD_OK || { echo POOL_RECORD_MISSING; rc=1; }"
     fi
+    # S0F-59 (ADR-0151): one chat request built the way the campaign runner
+    # builds every request (its own adapter construction, the chat messages,
+    # stop "\n", T=0); fails when the served text carries the thinking marker
+    # or the request fails. The 2026-10-08 landing served 2,450 of 2,450
+    # SGLang rows as "<think>" in 2 tokens and no gate said a word.
+    thinking="$POD_PYTHON scripts/checks/probe_thinking_pin.py --backend $e --api-base $api --model '$MODEL' --out logs/$e/CURRENT.thinking_probe.json || rc=1"
     # after `stop` the GPU process takes a few seconds to leave the compute-apps list: wait up to 60 s before reading it
-    job_run "validate_$e" 1500 "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT CAGE_DATASETS=$ds$POD_ENGINE_ENV && bash scripts/2_serving/$launcher start '$MODEL' && curl -sf $api/v1/models >/dev/null && echo VALIDATE_API_OK; $probe; bash scripts/2_serving/$launcher stop; n=1; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do n=\$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . || true); [ \"\$n\" -eq 0 ] && break; sleep 2; done; echo COMPUTE_APPS=\$n; exit \$rc" "$LAND/logs/setup" || return 1
+    job_run "validate_$e" 1500 "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT CAGE_DATASETS=$ds$POD_ENGINE_ENV && bash scripts/2_serving/$launcher start '$MODEL' && curl -sf $api/v1/models >/dev/null && echo VALIDATE_API_OK; $probe; $thinking; bash scripts/2_serving/$launcher stop; n=1; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do n=\$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . || true); [ \"\$n\" -eq 0 ] && break; sleep 2; done; echo COMPUTE_APPS=\$n; exit \$rc" "$LAND/logs/setup" || return 1
     plan_only && continue
     grep -q "VALIDATE_API_OK" "$JOB_LOG" || { printf '  [FAIL] %s: /v1/models never answered\n' "$e"; return 1; }
     if [ "$e" = "vllm" ]; then
@@ -745,6 +751,7 @@ stage_validate() {
       [ "$(grep -c '^METRIC_OK ' "$JOB_LOG")" -eq "$n_names" ] || { printf '  [FAIL] %s: live /metrics lacks a name the regime bridge or the cold-start check reads:\n' "$e"; grep 'METRIC_MISSING' "$JOB_LOG" | sed 's/^/    /'; return 1; }
       grep -q "POOL_RECORD_OK" "$JOB_LOG" || { printf '  [FAIL] %s: the launcher wrote no CURRENT.kvpool.json (ADR-0142 realized pool)\n' "$e"; return 1; }
     fi
+    grep -q "THINKING_PIN_OK" "$JOB_LOG" || { printf '  [FAIL] %s: the thinking pin probe did not pass (S0F-59, ADR-0151): the served text carried the thinking marker or the probe request failed\n' "$e"; grep 'THINKING_PIN_FAILED' "$JOB_LOG" | sed 's/^/    /'; return 1; }
     grep -q "COMPUTE_APPS=0" "$JOB_LOG" || { printf '  [FAIL] %s: compute apps remain after stop\n' "$e"; return 1; }
   done
   return 0

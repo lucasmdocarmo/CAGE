@@ -2,8 +2,8 @@
 
 WHAT is pinned and WHY:
 
-- **Session-'a' enumeration integers** (870 cells / 2610 windows / 36
-  relaunches / 13 blocked; per-family 104+10 / 340+272 / 144 cells): the grid is
+- **Session-'a' enumeration integers** (868 cells / 2604 windows / 36
+  relaunches / 65 blocked; per-family 104+8 / 340+272 / 144 cells): the grid is
   the charter's registered design (§6.1 full 5×6 factorial, §6.8 reduced 3×3,
   §7.6.1 family × group matrix, 3 replications per grid point per D6 §6.3,
   and the ADR-0106 B12 ladder: one corpus-trunc cell PER RUNG (1400, 700)
@@ -412,18 +412,18 @@ class TestPlanCountsSessionA:
         # F1: 12 baselines × 2 engines × 4 datasets              =  96
         #   + ADR-0106 B12 ladder: B12 is 2 rungs (1400, 700), so
         #     its 2 engines × 4 datasets = 8 cells become 16      =  +8
-        # F1 HF oracle: B3×4 + {B1,B2,B6}×2                      =  10
+        # F1 HF oracle: B3×4 + {B1,B6}×2 (ADR-0152: no B2 cell)     =   8
         # F2 qasper: 5 FRESH × 2 engines × 34 coordinates        = 340
         #   (old pin 300 = 5 × 2 × 30, pre-§6.4-overlay)
         # F2 ruler (D5#5, W4.4): 1 (B1) × 2 engines × 34 × 4 tasks = 272
         # F3: 7 REUSE × 2 engines × 3 budgets × 3 rates          = 126
         #   + B12 ladder: 2 engines × 3 × 3 = 18 cells become 36 = +18
-        # ⇒ 104 + 10 + 340 + 272 + 144 = 870
-        #   (old pin 844, pre-ADR-0106; older 532)
-        assert plan_a["counts"]["cells"] == 870
-        # 3 windows per grid point (D6 §6.3) ⇒ 870 × 3 = 2610
-        #   (old 2532 = 844 × 3; older 1596)
-        assert plan_a["counts"]["windows"] == 2610
+        # ⇒ 104 + 8 + 340 + 272 + 144 = 868
+        #   (old pin 870, pre-ADR-0152; 844, pre-ADR-0106; older 532)
+        assert plan_a["counts"]["cells"] == 868
+        # 3 windows per grid point (D6 §6.3) ⇒ 868 × 3 = 2604
+        #   (old 2610 = 870 × 3; 2532 = 844 × 3; older 1596)
+        assert plan_a["counts"]["windows"] == 2604
         # Relaunch boundaries = distinct EXECUTABLE serving configs
         # (engine, prefix, budget, kv_dtype, connector); hf is in-process (0):
         #   vllm:   F1 {plain, fp8·B10, lmcache·B8}                   =  3
@@ -442,6 +442,10 @@ class TestPlanCountsSessionA:
         #           is IDENTICAL to the F2 plain-OFF configs at those r
         #           (F3 budgets ⊂ F2 budgets; family is not a serving
         #           dimension), so they share F2's boundaries       = +0
+        #   ADR-0150 (every charter reuse-off arm served prefix OFF):
+        #           F1 B1/B5/B6/B9/B11 join B4's budget-free prefix-OFF
+        #           plain config on each engine; none of them is carried
+        #           in F3; session a has no DIST overlay              = +0
         # ⇒ (19 + 1) + (15 + 1) = 36  (old pin 34 = 19 + 15, pre-ADR-0103;
         #    older 30 = 17 + 13, pre-fine-grid)
         assert plan_a["counts"]["relaunches"] == 36
@@ -490,22 +494,27 @@ class TestPlanCountsSessionA:
         # (1 × 2 eng × 34 coords × 4 tasks) = 612.
         # ADR-0106 B12 ladder (2 rungs): F1 96 + 8 = 104 (B12's 2 eng × 4
         # datasets doubled), F3 126 + 18 = 144 (B12's 2 eng × 3 × 3 doubled);
-        # the hf oracle slice and F2 carry no B12 (old pins F1 96, F3 126).
-        assert by == {"F1": 104, "F1-hf": 10, "F2": 612, "F3": 144}
+        # the hf oracle slice and F2 carry no B12 (old pins F1 96, F3 126);
+        # the oracle slice is 8 cells since ADR-0152 (old 10: a B2 oracle
+        # cell was B1 under another name, the oracle has no engine reuse).
+        assert by == {"F1": 104, "F1-hf": 8, "F2": 612, "F3": 144}
         windows = {k: 3 * v for k, v in by.items()}
         # Old window pins: F2 900 (= 300 cells × 3, pre-§6.4/pre-RULER),
         # F3 378 (= 126 × 3), F1 288 (= 96 × 3). New F2 = 612 × 3
         # = (340 qasper + 272 ruler) × 3 = 1020 + 816 = 1836; F1 = 104 × 3
         # = 312; F3 = 144 × 3 = 432 (ADR-0106 ladder).
-        assert windows == {"F1": 312, "F1-hf": 30, "F2": 1836, "F3": 432}
+        assert windows == {"F1": 312, "F1-hf": 24, "F2": 1836, "F3": 432}
 
     def test_hf_oracle_exact_reduced_set(self, plan_a):
         hf = [s for s in _cells(plan_a) if s["cellspec"]["engine"] == "hf"]
         got = {(s["baseline"], s["dataset"]) for s in hf}
         want = {("B3", d) for d in ("squad_v2", "hotpotqa", "musique", "qasper")}
-        want |= {(b, d) for b in ("B1", "B2", "B6") for d in ("squad_v2", "qasper")}
+        want |= {(b, d) for b in ("B1", "B6") for d in ("squad_v2", "qasper")}
         assert got == want
-        assert len(hf) == 10
+        assert len(hf) == 8
+        # ADR-0152: no B2 oracle cell (the in-process oracle has no engine
+        # reuse, so a B2 cell would be B1 under another name).
+        assert all(s["baseline"] != "B2" for s in hf)
 
     def test_hf_never_under_pressure(self, plan_a):
         # Structural (§7.3): the oracle is F1-only; a pressure hf cell would
@@ -546,7 +555,8 @@ class TestPlanCountsSessionA:
         assert {s["baseline"] for s in f3} == {"B2", "B3", "B4", "B7", "B8", "B10", "B12"}
         # F3 serves prefix ON, except corpus-fresh (B4), which ADR-0103
         # serves prefix OFF by relaunch in EVERY family (its REUSE-bit family
-        # carriage beside B3 is unchanged).
+        # carriage beside B3 is unchanged). ADR-0150 adds no F3 arm: the
+        # other reuse-off arms (B1, B5/B6, B9, B11) are F1/F2 only.
         for s in f3:
             want = "OFF" if s["baseline"] == "B4" else "ON"
             assert s["serving"]["prefix_mode"] == want, s["row_key"]
@@ -803,7 +813,9 @@ class TestCorpusFreshPrefixOff:
     engine, in every family. Its family carriage (REUSE bit, rides F3 beside
     B3) is unchanged. Before ADR-0103 the runner's ``no_cache`` token only
     labeled telemetry, so B4 and B3 were served by the SAME prefix-ON server:
-    the mislabeled-duplicate failure class."""
+    the mislabeled-duplicate failure class. ADR-0150 (owner decision
+    2026-10-09) extends the rule to every charter reuse-off arm; see
+    TestReuseOffArmsPrefixOff."""
 
     @staticmethod
     def _b3_b4(plan, family, engine):
@@ -865,16 +877,137 @@ class TestCorpusFreshPrefixOff:
         # Doctrine: the knob is a named module constant citing its ADR, and
         # _prefix_off is the ONE rule the sort key, the serving-config
         # identity, the relaunch step and the cell step all consult.
-        assert rc.PREFIX_OFF_ARMS == frozenset({"corpus-fresh"})
+        assert rc.PREFIX_OFF_ARMS == frozenset(
+            {"gold-fresh", "corpus-fresh", "retr-fresh", "retr-comp", "retr-trunc"}
+        )
+        assert rc.PREFIX_OFF_ADRS == "ADR-0103, ADR-0150"
         assert "ADR-0103" in rc._prefix_off.__doc__
+        assert "ADR-0150" in rc._prefix_off.__doc__
 
     def test_rule_surfaces_in_the_plan_header(self, plan_a, plan_b):
         # Like the ADR-0102 constants: the operator reviews the registered
         # prefix-OFF arms in the header, not only inside the cell list.
         for plan in (plan_a, plan_b):
             knobs = plan["behavior_knobs"]
-            assert knobs["prefix_off_arms"] == ["corpus-fresh"]
-            assert knobs["prefix_off_adr"] == "ADR-0103"
+            assert knobs["prefix_off_arms"] == [
+                "corpus-fresh", "gold-fresh", "retr-comp", "retr-fresh", "retr-trunc",
+            ]
+            assert knobs["prefix_off_adr"] == "ADR-0103, ADR-0150"
+
+
+class TestReuseOffArmsPrefixOff:
+    """ADR-0150 (owner decision 2026-10-09, S0F-58): every arm the charter's
+    7.1 table marks reuse "off" (gold-fresh B1, corpus-fresh B4, retr-fresh
+    B5/B6, retr-comp B9, retr-trunc B11) is served with the engine prefix
+    cache OFF through a per-arm relaunch, in every family and on every
+    topology. The 2026-10-08 landing showed the exposure ADR-0103 had closed
+    for B4 alone: gold-fresh and gold-reuse ran on one prefix-ON server and
+    recorded identical per-request cached-token sequences (qasper mean 0.19
+    on both, squad_v2 0.67 on both), so the control arm of the design was
+    its own treatment under another name."""
+
+    OFF_ARMS = frozenset({"gold-fresh", "corpus-fresh", "retr-fresh", "retr-comp", "retr-trunc"})
+    OFF_BASELINES = frozenset({"B1", "B4", "B5", "B6", "B9", "B11"})
+
+    def test_the_set_is_the_charter_reuse_off_column(self):
+        # Restated independently of the planner constant through the
+        # cellspec's own FRESH set plus B4 (reuse-bit REUSE by family
+        # carriage, reuse "off" in the charter's 7.1 column).
+        from src.analysis.cellspec import BASELINES, FRESH_SET
+
+        want = {BASELINES[b].arm for b in FRESH_SET} | {"corpus-fresh"}
+        assert rc.PREFIX_OFF_ARMS == want == self.OFF_ARMS
+        assert {BASELINES[b].arm for b in self.OFF_BASELINES} == self.OFF_ARMS
+        # retr-store (B8) keeps the cache ON: its reuse is the external store.
+        assert "retr-store" not in rc.PREFIX_OFF_ARMS
+
+    def test_every_server_cell_serves_off_iff_its_arm_is_reuse_off(self, plan_a, plan_b):
+        for plan in (plan_a, plan_b):
+            seen = set()
+            for s in _cells(plan):
+                if s["serving"] is None:
+                    continue
+                off = s["family"] == "F2" or s["cellspec"]["arm"] in self.OFF_ARMS
+                assert s["serving"]["prefix_mode"] == ("OFF" if off else "ON"), s["row_key"]
+                seen.add((s["family"], s["baseline"], s["serving"]["prefix_mode"]))
+            # the pairs the landing found byte-identical now differ in serving
+            assert ("F1", "B1", "OFF") in seen and ("F1", "B2", "ON") in seen
+            assert ("F1", "B6", "OFF") in seen and ("F1", "B7", "ON") in seen
+            assert ("F1", "B5", "OFF") in seen and ("F1", "B9", "OFF") in seen
+            assert ("F1", "B11", "OFF") in seen and ("F1", "B8", "ON") in seen
+
+    @pytest.mark.parametrize("engine", ["vllm", "sglang"])
+    def test_f1_twins_differ_only_by_prefix_mode(self, plan_a, engine):
+        cells = _by_baseline(plan_a, "F1", engine)
+
+        def rest(step):
+            return tuple(sorted((k, v) for k, v in step["serving"].items() if k != "prefix_mode"))
+
+        for fresh, reuse in (("B1", "B2"), ("B6", "B7")):
+            assert cells[fresh] and cells[reuse]
+            assert all(s["serving"]["prefix_mode"] == "OFF" for s in cells[fresh])
+            assert all(s["serving"]["prefix_mode"] == "ON" for s in cells[reuse])
+            # same engine, (absent) budget, levers and topology: the prefix
+            # mode is the ONLY serving delta between the twins
+            assert {rest(s) for s in cells[fresh]} == {rest(s) for s in cells[reuse]}
+
+    def test_every_off_cell_runs_under_a_no_prefix_cache_relaunch(self, plan_a, plan_b):
+        for plan in (plan_a, plan_b):
+            current = None
+            checked = 0
+            for s in plan["steps"]:
+                if s["kind"] == "relaunch":
+                    current = s
+                    continue
+                if s["serving"] is None or s["blocked_on"]:
+                    continue
+                off = s["family"] == "F2" or s["cellspec"]["arm"] in self.OFF_ARMS
+                assert current["prefix_mode"] == ("OFF" if off else "ON"), s["row_key"]
+                assert ("--no-prefix-cache" in current["argv"]) is off, s["row_key"]
+                checked += 1
+            assert checked > 0
+
+    def test_f1_off_arms_share_one_budget_free_config_per_engine(self, plan_a):
+        # No new relaunch on session a: the OFF arms join B4's budget-free
+        # prefix-OFF plain config (the 36 pin in TestPlanCountsSessionA).
+        configs = {}
+        for s in _cells(plan_a):
+            if s["family"] == "F1" and s["serving"] is not None and s["serving"]["prefix_mode"] == "OFF":
+                configs.setdefault(s["cellspec"]["engine"], set()).add(
+                    TestOrdering._config_of(s["serving"])
+                )
+        assert configs == {
+            "vllm": {("vllm", "OFF", None, None, None)},
+            "sglang": {("sglang", "OFF", None, None, None)},
+        }
+
+    def test_dist_b1_legs_serve_off_beside_b3_on(self, plan_b):
+        # Session b's DIST overlay carries the transfer pair {B1, B3}: B1's
+        # tp and pd legs each get their own prefix-OFF boundary (+2
+        # relaunches, the 32 pin in TestSessionB); the pd launcher takes
+        # --no-prefix-cache (manage_vllm_pd.sh usage line 16).
+        dist = {
+            (s["baseline"], s["cellspec"]["topology"]): s
+            for s in _cells(plan_b) if s["family"] == "DIST"
+        }
+        assert dist[("B1", "tp")]["serving"]["prefix_mode"] == "OFF"
+        assert dist[("B1", "pd")]["serving"]["prefix_mode"] == "OFF"
+        assert dist[("B3", "tp")]["serving"]["prefix_mode"] == "ON"
+        assert dist[("B3", "pd")]["serving"]["prefix_mode"] == "ON"
+        legs = [s for s in _relaunches(plan_b) if s["topology"] in ("tp", "pd")]
+        assert sorted((s["topology"], s["prefix_mode"]) for s in legs) == [
+            ("pd", "OFF"), ("pd", "ON"), ("tp", "OFF"), ("tp", "ON"),
+        ]
+        for s in legs:
+            assert ("--no-prefix-cache" in s["argv"]) is (s["prefix_mode"] == "OFF"), s["argv"]
+        # the budgets, degree and levers are the same on both legs of a
+        # topology: the prefix mode is the ONLY serving delta
+        by_topology = {}
+        for s in legs:
+            by_topology.setdefault(s["topology"], set()).add(
+                (s["budget_bytes"], s["tp"], s["kv_dtype"], s["connector"])
+            )
+        assert all(len(v) == 1 for v in by_topology.values()), by_topology
 
 
 class TestBehaviorRealization:
@@ -1201,7 +1334,7 @@ class TestPlanSchema:
         after = {p for p in tmp_path.rglob("*")}
         assert after - before == {out}, "plan must write NOTHING except --out"
         plan = rc.load_plan(out)
-        assert plan["counts"]["cells"] == 870  # see TestPlanCountsSessionA (ADR-0106; old 844)
+        assert plan["counts"]["cells"] == 868  # see TestPlanCountsSessionA (ADR-0152; old 870, 844)
         # every row key re-mints from its embedded cellspec (never hand-built)
         for s in _cells(plan)[::50]:
             assert CellSpec.from_flat_dict(s["cellspec"]).to_row_key() == s["row_key"]
@@ -1370,11 +1503,16 @@ class TestRun:
         root = _run_root(tmp_path)
         assert rc.run_plan(plan, root) == 0
         calls = stub.calls()
-        # V2 clean-room stop, 1 relaunch (vllm plain config), 2 cells in plan
-        # order, the V2 end-of-run stop (tests/test_stage1_v2_v3_driver.py
-        # pins the stop rule itself).
-        assert [c["argv"][0] for c in calls] == ["stop", "restart", "--baseline", "--baseline", "stop"]
-        for call, step in zip(calls[2:4], _cells(plan)):
+        # V2 clean-room stop; the vllm plain prefix-ON relaunch and B2
+        # (gold-reuse); the prefix-OFF relaunch and B1 (gold-fresh, ADR-0150:
+        # the OFF group sorts after the ON group; same launcher, so no stop
+        # between them); the V2 end-of-run stop
+        # (tests/test_stage1_v2_v3_driver.py pins the stop rule itself).
+        assert [c["argv"][0] for c in calls] == [
+            "stop", "restart", "--baseline", "restart", "--baseline", "stop",
+        ]
+        assert [s["baseline"] for s in _cells(plan)] == ["B2", "B1"]
+        for call, step in zip([calls[2], calls[4]], _cells(plan)):
             assert call["argv"] == step["argv"][2:] + ["--campaign-root", str(root)]
             # identity env reached the subprocess (the seam, not just the plan)
             for key, value in step["env"].items():
@@ -1899,15 +2037,15 @@ class TestSessionB:
     def test_total_counts(self, plan_b):
         # F1: 12 baselines × 2 engines × 4 QA datasets           =  96
         #   + ADR-0106 B12 ladder (2 rungs): 2 eng × 4 ds doubled = +8
-        # F1 HF oracle: B3×4 + {B1,B2,B6}×2 (anchor slice reuse) =  10
+        # F1 HF oracle: B3×4 + {B1,B6}×2 (anchor slice, ADR-0152) =   8
         # F2: 5 FRESH × 2 engines × 3 budgets × 3 rates (§6.8)   =  90
         # F3: 7 REUSE × 2 engines × 3 budgets × 3 rates          = 126
         #   + B12 ladder: 2 eng × 3 × 3 = 18 doubled             = +18
         # DIST: {B1, B3} × vllm × {tp, pd}                       =   4
-        # ⇒ 104 + 10 + 90 + 144 + 4 = 352; windows 352 × 3 = 1056
-        #   (old pins 326 / 978, pre-ADR-0106)
-        assert plan_b["counts"]["cells"] == 352
-        assert plan_b["counts"]["windows"] == 1056
+        # ⇒ 104 + 8 + 90 + 144 + 4 = 350; windows 350 × 3 = 1050
+        #   (old pins 352 / 1056, pre-ADR-0152; 326 / 978, pre-ADR-0106)
+        assert plan_b["counts"]["cells"] == 350
+        assert plan_b["counts"]["windows"] == 1050
         # Blocked: sglang retr-store (B8), F1 4 + F3 3×3 = 13; the DIST
         # legs are all EXECUTABLE (tp registered, pd launcher exists).
         #   + ADR-0106 B12 rung cells with no query manifest registered
@@ -1924,8 +2062,13 @@ class TestSessionB:
         #           F3 B4 = prefix-OFF plain at r ∈ {1.0, 0.5, 0.25} =
         #           the F2 plain-OFF configs (same budgets)       = +0
         #           DIST carries {B1, B3} only (no B4 leg)         = +0
-        # ⇒ (17 + 1) + (11 + 1) = 30  (old pin 28, pre-ADR-0103)
-        assert plan_b["counts"]["relaunches"] == 30
+        #   ADR-0150 (every charter reuse-off arm served prefix OFF):
+        #           F1 B1/B5/B6/B9/B11 join B4's budget-free OFF config = +0
+        #           DIST B1 (gold-fresh): its tp leg and its pd leg each
+        #           get a prefix-OFF boundary beside B3's ON legs    = +2
+        # ⇒ (17 + 1 + 2) + (11 + 1) = 32  (old pin 30, pre-ADR-0150; 28,
+        #    pre-ADR-0103)
+        assert plan_b["counts"]["relaunches"] == 32
 
     def test_no_fine_grid_and_no_ruler_on_group_b(self, plan_b):
         # §6.8: the fine r-grid runs on Group A ONLY; the D5#5 RULER pairing
@@ -1986,14 +2129,17 @@ class TestSessionB:
         # The tp leg rides the SINGLE-instance launcher at dist_tp_size=8,
         # serving floor(dist_budget_r × D) = 10^10 bytes total — per-rank
         # slice (GQA shards) = 10^10 // 8 = 1_250_000_000.
-        (tp_leg,) = [s for s in _relaunches(plan_b) if s["topology"] == "tp"]
-        assert tp_leg["tp"] == 8
-        assert tp_leg["env"]["CAGE_VLLM_TENSOR_PARALLEL"] == "8"
-        assert tp_leg["env"]["CAGE_KV_BUDGET_BYTES"] == str(
-            (1 * _ANCHOR_DEMAND) // 8
-        )
-        assert tp_leg["budget_bytes"] == 1 * _ANCHOR_DEMAND
-        assert tp_leg["budget_r"] is None  # DIST overlay: not a pressure coord
+        # ADR-0150: two tp legs (B3 prefix ON, B1 prefix OFF), same budget.
+        tp_legs = [s for s in _relaunches(plan_b) if s["topology"] == "tp"]
+        assert sorted(s["prefix_mode"] for s in tp_legs) == ["OFF", "ON"]
+        for tp_leg in tp_legs:
+            assert tp_leg["tp"] == 8
+            assert tp_leg["env"]["CAGE_VLLM_TENSOR_PARALLEL"] == "8"
+            assert tp_leg["env"]["CAGE_KV_BUDGET_BYTES"] == str(
+                (1 * _ANCHOR_DEMAND) // 8
+            )
+            assert tp_leg["budget_bytes"] == 1 * _ANCHOR_DEMAND
+            assert tp_leg["budget_r"] is None  # DIST overlay: not a pressure coord
 
     def test_pd_leg_splits_the_same_total_and_carries_role_tp(self, plan_b):
         # Iso-aggregate-bytes (§6.6a): the pd leg splits the SAME
@@ -2005,7 +2151,16 @@ class TestSessionB:
         # SAME one the tp leg's env uses), so each role env carries
         # pool // 4 — handing the role TOTAL to 4 ranks would realize 4×
         # the §6.5 pools (2026-09-02 verifier major).
-        (pd_leg,) = [s for s in _relaunches(plan_b) if s["topology"] == "pd"]
+        # ADR-0150: two pd legs (B3 prefix ON, B1 prefix OFF), same budgets;
+        # the arithmetic below holds on each, against the tp leg of the same
+        # prefix mode.
+        pd_legs = [s for s in _relaunches(plan_b) if s["topology"] == "pd"]
+        assert sorted(s["prefix_mode"] for s in pd_legs) == ["OFF", "ON"]
+        for pd_leg in pd_legs:
+            self._check_pd_leg(pd_leg, plan_b)
+
+    @staticmethod
+    def _check_pd_leg(pd_leg, plan_b):
         assert pd_leg["tp"] == 4
         assert pd_leg["env"]["CAGE_VLLM_TENSOR_PARALLEL"] == "4"
         prefill_rank = int(pd_leg["env"]["CAGE_KV_BUDGET_BYTES_PREFILL"])
@@ -2027,7 +2182,10 @@ class TestSessionB:
         # realized = (total // 8) × 8 — the #18 pair stays iso-aggregate.
         realized_pd = (prefill_rank + decode_rank) * 4
         assert pd_leg["pd"]["expected_bytes_total"] == realized_pd
-        (tp_leg,) = [s for s in _relaunches(plan_b) if s["topology"] == "tp"]
+        tp_leg = next(
+            s for s in _relaunches(plan_b)
+            if s["topology"] == "tp" and s["prefix_mode"] == pd_leg["prefix_mode"]
+        )
         realized_tp = int(tp_leg["env"]["CAGE_KV_BUDGET_BYTES"]) * 8
         assert realized_pd == realized_tp == 1 * _ANCHOR_DEMAND
 
@@ -2060,7 +2218,7 @@ class TestSessionB:
     def test_plan_b_roundtrips_through_load_plan(self, tmp_path, plan_b):
         out = tmp_path / "plan_b.json"
         out.write_text(json.dumps(plan_b), encoding="utf-8")
-        assert rc.load_plan(out)["counts"]["cells"] == 352  # TestSessionB pin (ADR-0106; old 326)
+        assert rc.load_plan(out)["counts"]["cells"] == 350  # TestSessionB pin (ADR-0152; old 352, 326)
 
 
 # ---------------------------------------------------------------------------
@@ -2159,7 +2317,7 @@ class TestColdStartPerWindow:
 
     def test_hf_cells_exist_and_are_excluded(self, plan_a):
         hf = [s for s in _cells(plan_a) if s["cellspec"]["engine"] == "hf"]
-        assert len(hf) == 10  # the reduced oracle set is the exclusion witness
+        assert len(hf) == 8  # the reduced oracle set (ADR-0152) is the exclusion witness
         for s in hf:
             assert "--reset-cache-between-trials" not in s["argv"]
             assert "--warmup-pool-queries" not in s["argv"]
@@ -2173,10 +2331,10 @@ class TestColdStartPerWindow:
 
     def test_counts_unchanged_by_cold_start(self, plan_a, plan_b):
         # The window protocol adds argv, never cells or windows (the pins at
-        # TestPlanCountsSessionA / TestSessionB stay: 870/2610 and 352/1056,
-        # the ADR-0106 ladder pins; pre-ADR-0106 844/2532 and 326/978).
-        assert (plan_a["counts"]["cells"], plan_a["counts"]["windows"]) == (870, 2610)
-        assert (plan_b["counts"]["cells"], plan_b["counts"]["windows"]) == (352, 1056)
+        # TestPlanCountsSessionA / TestSessionB stay: 868/2604 and 350/1050,
+        # the ADR-0152 pins; pre-ADR-0152 870/2610 and 352/1056).
+        assert (plan_a["counts"]["cells"], plan_a["counts"]["windows"]) == (868, 2604)
+        assert (plan_b["counts"]["cells"], plan_b["counts"]["windows"]) == (350, 1050)
 
     def test_load_plan_refuses_server_cell_without_cold_start(self, tmp_path, plan_a):
         # A stale plan (pre-ADR-0102) whose server-engine cell lacks the
@@ -2209,7 +2367,7 @@ class TestColdStartPerWindow:
     def test_load_plan_accepts_a_fresh_plan(self, tmp_path, plan_a):
         path = tmp_path / "fresh.json"
         path.write_text(json.dumps(plan_a), encoding="utf-8")
-        assert rc.load_plan(path)["counts"]["cells"] == 870  # ADR-0106 pin (old 844)
+        assert rc.load_plan(path)["counts"]["cells"] == 868  # ADR-0152 pin (old 870, 844)
 
 
 # ---------------------------------------------------------------------------
@@ -2323,10 +2481,10 @@ class TestQueryManifestRegistration:
 
     def test_counts_unchanged_by_manifest_registration(self, plan_a, plan_a_manifests):
         # Registration changes executability, never the enumeration: the
-        # TestPlanCountsSessionA pins (870 / 2610 / 36) hold on both plans.
+        # TestPlanCountsSessionA pins (868 / 2604 / 36) hold on both plans.
         for key in ("cells", "windows", "relaunches"):
             assert plan_a_manifests["counts"][key] == plan_a["counts"][key] == {
-                "cells": 870, "windows": 2610, "relaunches": 36
+                "cells": 868, "windows": 2604, "relaunches": 36
             }[key]
 
     def test_partial_registration_blocks_only_the_unmanifested_datasets(
@@ -2469,7 +2627,7 @@ def _preceding_relaunch(plan: Dict[str, Any], cell: Dict[str, Any]) -> Dict[str,
 class TestStalePlanRefusals:
     def test_fresh_plan_with_manifests_loads(self, tmp_path, plan_a_manifests):
         path = _dump(tmp_path, plan_a_manifests, "fresh.json")
-        assert rc.load_plan(path)["counts"]["cells"] == 870  # ADR-0106 pin
+        assert rc.load_plan(path)["counts"]["cells"] == 868  # ADR-0152 pin
 
     def test_warmup_pool_value_drift_refuses(self, tmp_path, plan_a):
         plan = json.loads(json.dumps(plan_a))
@@ -2500,6 +2658,19 @@ class TestStalePlanRefusals:
         relaunch["argv"] = [a for a in relaunch["argv"] if a != "--no-prefix-cache"]
         with pytest.raises(rc.RunError, match="no-prefix-cache"):
             rc.load_plan(_dump(tmp_path, plan, "b4_relaunch_on.json"))
+
+        # ADR-0150: the same clause covers every reuse-off arm; a gold-fresh
+        # (B1) cell hand-edited to prefix ON is the exact shape the
+        # 2026-10-08 landing ran.
+        plan = json.loads(json.dumps(plan_a))
+        cell = next(
+            s for s in _cells(plan)
+            if s["cellspec"]["arm"] == "gold-fresh" and s["cellspec"]["engine"] == "sglang"
+            and s["family"] == "F1"
+        )
+        cell["serving"]["prefix_mode"] = "ON"
+        with pytest.raises(rc.RunError, match="ADR-0150"):
+            rc.load_plan(_dump(tmp_path, plan, "b1_on.json"))
 
     def test_rerank_pool_drift_refuses_both_ways(self, tmp_path, plan_a):
         # ADR-0104: a ranked cell without the pool would run the legacy
@@ -2613,15 +2784,15 @@ class TestPerRowN:
         # the class the A1 table assigns, and the per-class cell counts are
         # pinned by independent arithmetic:
         #   a: primary = B3,B6 x vllm x 4 datasets = 8; secondary = the other
-        #      F1 server cells 104 - 8 = 96; identity = 10 hf; window =
-        #      F2 612 + F3 144 = 756  (sum 870 = the cells pin)
-        #   b: primary 8; secondary 96; identity = 10 hf + 4 DIST = 14;
-        #      window = F2 90 + F3 144 = 234  (sum 352)
+        #      F1 server cells 104 - 8 = 96; identity = 8 hf (ADR-0152);
+        #      window = F2 612 + F3 144 = 756  (sum 868 = the cells pin)
+        #   b: primary 8; secondary 96; identity = 8 hf + 4 DIST = 12;
+        #      window = F2 90 + F3 144 = 234  (sum 350)
         for plan, grid, want in (
             (plan_a, rc.SESSION_GRIDS["a"],
-             {"primary": 8, "secondary": 96, "identity": 10, "window": 756}),
+             {"primary": 8, "secondary": 96, "identity": 8, "window": 756}),
             (plan_b, rc.SESSION_GRIDS["b"],
-             {"primary": 8, "secondary": 96, "identity": 14, "window": 234}),
+             {"primary": 8, "secondary": 96, "identity": 12, "window": 234}),
         ):
             got: Dict[str, int] = {}
             for s in _cells(plan):
@@ -2678,11 +2849,11 @@ class TestPerRowN:
         assert (
             plan_a["counts"]["cells"], plan_a["counts"]["windows"],
             plan_a["counts"]["relaunches"], plan_a["counts"]["blocked"],
-        ) == (870, 2610, 36, 65)
+        ) == (868, 2604, 36, 65)
         assert (
             plan_b["counts"]["cells"], plan_b["counts"]["windows"],
             plan_b["counts"]["relaunches"], plan_b["counts"]["blocked"],
-        ) == (352, 1056, 30, 65)
+        ) == (350, 1050, 32, 65)
 
     @pytest.mark.parametrize(
         "overrides, match",
@@ -2779,7 +2950,7 @@ class TestPerRowN:
         with pytest.raises(rc.PlanError, match=r"qasper.*trial 1.*900.*n=2000"):
             rc.build_plan("a", floor, window_duration_s=300.0, query_manifests={"qasper": m900})
         # Counts are untouched by the override.
-        assert plan["counts"]["cells"] == 870
+        assert plan["counts"]["cells"] == 868
 
     def test_load_plan_refuses_cells_without_or_with_drifted_num_queries(self, tmp_path, plan_a):
         def _strip(engine: str, name: str) -> Path:
@@ -2820,7 +2991,7 @@ class TestPerRowN:
         with pytest.raises(rc.RunError, match="per_row_n"):
             rc.load_plan(_dump(tmp_path, plan, "no_header.json"))
         # and the untouched plan loads.
-        assert rc.load_plan(_dump(tmp_path, plan_a, "fresh_n.json"))["counts"]["cells"] == 870
+        assert rc.load_plan(_dump(tmp_path, plan_a, "fresh_n.json"))["counts"]["cells"] == 868
 
     def test_run_passes_num_queries_to_the_runner(self, tmp_path, floor_table, stub):
         plan = _stub_plan(_tiny_grid(f1_baselines=("B1", "B3")), floor_table, stub.cmd)
@@ -2937,7 +3108,7 @@ class TestRetrievalPinsA5:
         assert rc.build_plan(
             "a", floor, window_duration_s=300.0, freeze_file=good,
             calibrations=calibrations_a,
-        )["counts"]["cells"] == 870
+        )["counts"]["cells"] == 868
 
     def test_every_retrieval_cell_pins_top_k_model_and_index_root(self, plan_a, plan_b):
         for plan in (plan_a, plan_b):
@@ -3008,9 +3179,9 @@ class TestRetrievalPinsA5:
     def test_counts_unchanged_by_the_pins(self, plan_a, plan_b):
         # Argv/env pins never mint cells: the enumeration pins hold.
         c = plan_a["counts"]
-        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (870, 2610, 36, 65)
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (868, 2604, 36, 65)
         c = plan_b["counts"]
-        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (352, 1056, 30, 65)
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (350, 1050, 32, 65)
 
     def test_load_plan_refuses_stale_retrieval_pins(self, tmp_path, plan_a):
         def _cell(plan: Dict[str, Any]) -> Dict[str, Any]:
@@ -3089,7 +3260,7 @@ class TestRetrievalPinsA5:
         with pytest.raises(rc.RunError, match="ir_index_root"):
             rc.load_plan(_dump(tmp_path, plan, "no_header_root.json"))
         # And the untouched plan loads.
-        assert rc.load_plan(_dump(tmp_path, plan_a, "fresh_a5.json"))["counts"]["cells"] == 870
+        assert rc.load_plan(_dump(tmp_path, plan_a, "fresh_a5.json"))["counts"]["cells"] == 868
 
     def test_cli_plan_carries_freeze_file(self, tmp_path, floor_table, calibrations_a):
         good = _write_freeze(tmp_path / "cli_freeze.json", _freeze_doc())
@@ -3277,9 +3448,11 @@ class TestMaxModelLenA10:
 
     def test_registered_value_rides_the_relaunch(self, floor_table, stub):
         plan = _stub_plan(_tiny_grid(max_model_len=8192), floor_table, stub.cmd)
-        (relaunch,) = _relaunches(plan)
-        assert relaunch["max_model_len"] == 8192
-        assert relaunch["env"]["VLLM_MAX_MODEL_LEN"] == "8192"
+        relaunches = _relaunches(plan)
+        assert len(relaunches) == 2  # B2 prefix ON, B1 prefix OFF (ADR-0150)
+        for relaunch in relaunches:
+            assert relaunch["max_model_len"] == 8192
+            assert relaunch["env"]["VLLM_MAX_MODEL_LEN"] == "8192"
         assert plan["serving_shapes"]["max_model_len"] == 8192
 
     def test_load_plan_refuses_a_relaunch_without_it(self, tmp_path, plan_a):
@@ -3316,7 +3489,7 @@ class TestMaxModelLenA10:
         with pytest.raises(rc.RunError, match="max_model_len"):
             rc.load_plan(_dump(tmp_path, plan, "no_header.json"))
         # a fresh plan still loads (the refusals above are the only change)
-        assert rc.load_plan(_dump(tmp_path, plan_a, "fresh_a10.json"))["counts"]["cells"] == 870
+        assert rc.load_plan(_dump(tmp_path, plan_a, "fresh_a10.json"))["counts"]["cells"] == 868
 
     def test_run_passes_it_to_the_launcher(self, tmp_path, floor_table, stub):
         plan = _stub_plan(_tiny_grid(), floor_table, stub.cmd)
@@ -3331,9 +3504,9 @@ class TestMaxModelLenA10:
         # A server dial on an existing boundary adds no cell, window,
         # relaunch or block (pins: TestPlanCountsSessionA / TestSessionB).
         c = plan_a["counts"]
-        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (870, 2610, 36, 65)
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (868, 2604, 36, 65)
         c = plan_b["counts"]
-        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (352, 1056, 30, 65)
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (350, 1050, 32, 65)
 
 
 # ---------------------------------------------------------------------------
@@ -3413,7 +3586,7 @@ class TestDecoupledScoringW1:
         with pytest.raises(rc.RunError, match="CAGE_SKIP_QUALITY"):
             rc.load_plan(_dump(tmp_path, plan, "hf_no_pin.json"))
         # And the untouched plan loads.
-        assert rc.load_plan(_dump(tmp_path, plan_a, "fresh_w1.json"))["counts"]["cells"] == 870
+        assert rc.load_plan(_dump(tmp_path, plan_a, "fresh_w1.json"))["counts"]["cells"] == 868
 
     def test_run_pin_wins_over_the_operator_shell(self, tmp_path, floor_table, stub, monkeypatch):
         # _exec copies the shell env and applies the step env on top: an
@@ -3429,9 +3602,9 @@ class TestDecoupledScoringW1:
 
     def test_counts_unchanged_by_the_pin(self, plan_a, plan_b):
         c = plan_a["counts"]
-        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (870, 2610, 36, 65)
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (868, 2604, 36, 65)
         c = plan_b["counts"]
-        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (352, 1056, 30, 65)
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (350, 1050, 32, 65)
 
 
 # ---------------------------------------------------------------------------
@@ -3576,9 +3749,9 @@ class TestEngineEndpointsW2:
         # Argv on existing cells: the enumeration pins hold, and the identity
         # seam never reads argv (test_identity_env_roundtrips_through_derive_cell_spec).
         c = plan_a["counts"]
-        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (870, 2610, 36, 65)
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (868, 2604, 36, 65)
         c = plan_b["counts"]
-        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (352, 1056, 30, 65)
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (350, 1050, 32, 65)
 
     def test_load_plan_refuses_stale_endpoints(self, tmp_path, plan_a, plan_b):
         def _sglang(plan):
@@ -3650,8 +3823,8 @@ class TestEngineEndpointsW2:
         with pytest.raises(rc.RunError, match="relaunch serving"):
             rc.load_plan(_dump(tmp_path, plan, "moved_cell.json"))
         # And the untouched plans load.
-        assert rc.load_plan(_dump(tmp_path, plan_a, "fresh_w2_a.json"))["counts"]["cells"] == 870
-        assert rc.load_plan(_dump(tmp_path, plan_b, "fresh_w2_b.json"))["counts"]["cells"] == 352
+        assert rc.load_plan(_dump(tmp_path, plan_a, "fresh_w2_a.json"))["counts"]["cells"] == 868
+        assert rc.load_plan(_dump(tmp_path, plan_b, "fresh_w2_b.json"))["counts"]["cells"] == 350
 
     def test_blocked_cell_without_a_registered_endpoint_carries_none(
         self, tmp_path, floor_table, stub
@@ -3696,8 +3869,9 @@ class TestEngineEndpointsW2:
         calls = stub.calls()
         launchers = [c for c in calls if c["argv"][0] == "restart"]
         cells = [c for c in calls if "--baseline" in c["argv"]]
-        assert len(launchers) == 2 and len(cells) == 4
-        # One relaunch per engine, each carrying ITS port env and not the other's.
+        # Two relaunches per engine (B2 prefix ON, B1 prefix OFF; ADR-0150),
+        # each carrying ITS engine's port env and not the other's.
+        assert len(launchers) == 4 and len(cells) == 4
         assert {
             (c["env"].get("VLLM_PORT"), c["env"].get("SGLANG_PORT")) for c in launchers
         } == {(None, "30000"), ("8000", None)}
@@ -3730,8 +3904,10 @@ class TestEngineEndpointsW2:
         monkeypatch.setenv("SGLANG_PORT", "30000")
         plan = _stub_plan(_tiny_grid(), floor_table, stub.cmd)
         assert rc.run_plan(plan, _run_root(tmp_path)) == 0
-        (launcher,) = [c for c in stub.calls() if c["argv"][0] == "restart"]
-        assert launcher["env"]["VLLM_PORT"] == "8000"
+        launchers = [c for c in stub.calls() if c["argv"][0] == "restart"]
+        assert len(launchers) == 2  # B2 prefix ON, B1 prefix OFF (ADR-0150)
+        for launcher in launchers:
+            assert launcher["env"]["VLLM_PORT"] == "8000"
 
 
 # ---------------------------------------------------------------------------
@@ -4073,7 +4249,7 @@ class TestSloFloorsProducerW4:
         with pytest.raises(rc.RunError, match="CAGE_SLO_FLOORS_JSON"):
             rc.load_plan(_dump(tmp_path, plan, "drifted_header.json"))
         # and the untouched plan loads
-        assert rc.load_plan(_dump(tmp_path, plan_a, "fresh_w4.json"))["counts"]["cells"] == 870
+        assert rc.load_plan(_dump(tmp_path, plan_a, "fresh_w4.json"))["counts"]["cells"] == 868
 
     @pytest.mark.parametrize("name", ["CAGE_SLO_FLOORS_JSON", "CAGE_BUDGET_PLAN_JSON"])
     def test_run_refuses_while_a_pin_env_is_exported(
@@ -4108,17 +4284,17 @@ class TestSloFloorsProducerW4:
 
     def test_counts_unchanged_by_the_pins(self, plan_a, plan_b):
         c = plan_a["counts"]
-        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (870, 2610, 36, 65)
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (868, 2604, 36, 65)
         c = plan_b["counts"]
-        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (352, 1056, 30, 65)
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (350, 1050, 32, 65)
 
 
 class TestBudgetPlanProducerW4:
     def test_budgeted_cells_carry_their_relaunch_record(self, plan_a, plan_b):
         # a: F2 612 + executable F3 (144 - 45 blocked: B8 sglang 9, B12 36)
-        #    = 711 budgeted; F1 104 + hf 10 + 45 blocked F3 = 159 free.
-        # b: F2 90 + executable F3 99 + DIST 4 = 193 budgeted; 159 free.
-        for plan, want in ((plan_a, (711, 159)), (plan_b, (193, 159))):
+        #    = 711 budgeted; F1 104 + hf 8 (ADR-0152) + 45 blocked F3 = 157 free.
+        # b: F2 90 + executable F3 99 + DIST 4 = 193 budgeted; 157 free.
+        for plan, want in ((plan_a, (711, 157)), (plan_b, (193, 157))):
             current = None
             n_budgeted = n_free = 0
             for s in plan["steps"]:
@@ -4303,8 +4479,8 @@ class TestBudgetPlanProducerW4:
         with pytest.raises(rc.RunError, match="budget_plan"):
             rc.load_plan(_dump(tmp_path, plan, "moved_budget.json"))
         # and the untouched plans load
-        assert rc.load_plan(_dump(tmp_path, plan_a, "fresh_bp_a.json"))["counts"]["cells"] == 870
-        assert rc.load_plan(_dump(tmp_path, plan_b, "fresh_bp_b.json"))["counts"]["cells"] == 352
+        assert rc.load_plan(_dump(tmp_path, plan_a, "fresh_bp_a.json"))["counts"]["cells"] == 868
+        assert rc.load_plan(_dump(tmp_path, plan_b, "fresh_bp_b.json"))["counts"]["cells"] == 350
 
 
 class TestW4ReviewFixes:

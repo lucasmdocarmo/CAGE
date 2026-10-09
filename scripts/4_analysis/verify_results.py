@@ -67,7 +67,15 @@ the first:
     ``UNKNOWN_TELEMETRY`` is a WARN carrying the recorded refusal reason, and
     every window's label rides the accounting. A WARN, not a FAIL: the
     window's latency rows stay valid for contrasts that need no regime label
-    (S0: all 40 windows read UNKNOWN_TELEMETRY and this gate said nothing).
+    (S0: all 40 windows read UNKNOWN_TELEMETRY and this gate said nothing);
+(n) served text that is thinking scaffolding is named (ADR-0151, S0F-59): a
+    requests.jsonl row without ``error`` whose ``generated_answer`` carries
+    the chat template's thinking-open marker ``<think>`` answered with
+    reasoning scaffolding under the stop sequence, never with an answer
+    (the 2026-10-08 landing: 2,450 of 2,450 SGLang rows, 2 tokens each); a
+    window where half or more of the served rows carry it FAILs, fewer is a
+    WARN, and the median ``num_tokens`` over served rows rides the accounting
+    (the landing's signature was a median of 2 against 4 to 29 on vLLM).
 
 ``--pilot --results-dir DIR`` preserves the pilot-era metrics-vs-CSV check
 (``verify_dir``) verbatim for pilot trees; that mode keeps writing its report
@@ -160,6 +168,13 @@ _SERVED_FINISH_REASONS: tuple[str, ...] = ("stop", "length")
 _REGIME_NAME = "regime.json"
 _REGIME_UNKNOWN = "UNKNOWN_TELEMETRY"
 _TELEMETRY_ENGINES: tuple[str, ...] = ("vllm", "sglang")
+
+#: Check (n): the chat template's thinking-open marker (Qwen3; the vLLM and
+#: SGLang adapters pin enable_thinking=false, ADR-0151; = scripts/checks/
+#: probe_thinking_pin.THINKING_MARKER, pinned equal by tests) and the share of
+#: served rows carrying it at which a window FAILs rather than WARNs.
+_THINKING_MARKER = "<think>"
+_DEGENERATE_SHARE_FAIL = 0.5
 
 VERIFICATION_DIR_SUFFIX = "_verification"
 REPORT_JSON_NAME = "verification_report.json"
@@ -689,6 +704,45 @@ def _check_finish_reasons(
     return len(unserved)
 
 
+def _check_degenerate_output(
+    rows: list[dict[str, Any]], rel: str, findings: list[Finding]
+) -> tuple[int | None, float | None]:
+    """Check (n), ADR-0151 (S0F-59): served rows whose text is thinking
+    scaffolding. Returns (rows carrying the marker, median num_tokens over
+    the served rows), both None when no served row exists; the median is
+    None when no served row carries an integer num_tokens."""
+    served = [row for row in rows if not row.get("error")]
+    if not served:
+        return None, None
+    marked = [
+        row for row in served
+        if _THINKING_MARKER in str(row.get("generated_answer") or "")
+    ]
+    tokens = sorted(
+        row["num_tokens"] for row in served
+        if isinstance(row.get("num_tokens"), int) and not isinstance(row.get("num_tokens"), bool)
+    )
+    median: float | None = None
+    if tokens:
+        mid = len(tokens) // 2
+        median = float(tokens[mid]) if len(tokens) % 2 else (tokens[mid - 1] + tokens[mid]) / 2.0
+    if marked:
+        share = len(marked) / len(served)
+        findings.append(
+            Finding(
+                "FAIL" if share >= _DEGENERATE_SHARE_FAIL else "WARN",
+                "degenerate-output",
+                rel,
+                f"{len(marked)} of {len(served)} served row(s) carry the thinking marker "
+                f"{_THINKING_MARKER!r} in generated_answer (first: "
+                f"{marked[0].get('example_id')!r}; median num_tokens {median}): the chat "
+                "template opened a thinking block and the stop sequence ended the request "
+                "before any answer, and the row reads as served (ADR-0151, S0F-59)",
+            )
+        )
+    return len(marked), median
+
+
 def _check_regime(
     window_dir: Path, rel_window: str, engine: str | None, findings: list[Finding]
 ) -> str | None:
@@ -733,7 +787,7 @@ def _check_window(
     topology: str | None = None,
     engine: str | None = None,
 ) -> dict[str, Any]:
-    """Run checks (a)-(c), (i)-(m) + accounting (e) for one window; returns its summary.
+    """Run checks (a)-(c), (i)-(n) + accounting (e) for one window; returns its summary.
     ``topology`` and ``engine`` are the cell's (from its §2 dirname); a None
     topology skips (k), a None engine keeps (m) to recording the label."""
     rel_window = window_dir.relative_to(run_dir).as_posix()
@@ -840,6 +894,14 @@ def _check_window(
     # (m) the window's regime label (ADR-0136, S0F-26); None = no artifact.
     regime_label = _check_regime(window_dir, rel_window, engine, findings)
 
+    # (n) served text that is thinking scaffolding (ADR-0151, S0F-59); both
+    # None when the rows are unreadable or no row was served.
+    n_thinking_marker, median_num_tokens = (
+        _check_degenerate_output(requests_rows, f"{rel_window}/requests.jsonl", findings)
+        if requests_rows is not None
+        else (None, None)
+    )
+
     # (e) §9.10 exclusion accounting — absence is NOT zero: rows lacking any
     # validity field are counted as validity-unknown, never as valid.
     accounting: dict[str, Any] = {
@@ -857,6 +919,8 @@ def _check_window(
         "pd_transfer_verified": pd_transfer_verified,
         "n_unserved_finish": n_unserved_finish,
         "regime_label": regime_label,
+        "n_thinking_marker": n_thinking_marker,
+        "median_num_tokens": median_num_tokens,
     }
     if requests_rows is not None:
         n_error = sum(1 for r in requests_rows if r.get("error"))
@@ -1182,6 +1246,7 @@ def verify_run(run_dir: Path) -> dict[str, Any]:
         "n_valid_known",
         "n_no_decode",
         "n_unserved_finish",
+        "n_thinking_marker",
     ):
         known = [row[key] for row in accounting_rows if row[key] is not None]
         # Absence-is-not-zero: a total over windows with unknown counts is

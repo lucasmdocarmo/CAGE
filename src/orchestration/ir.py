@@ -603,8 +603,39 @@ class BM25IRIndex:
         return inst
 
 
+def _reranker_input_cap(model: Any, tokenizer: Any) -> Optional[int]:
+    """The cross-encoder's input cap in tokens, or None when unknown.
+
+    sentence_transformers 5.x exposes ``max_seq_length`` (``max_length`` is a
+    deprecated alias that warns on read); older releases expose
+    ``max_length`` alone; both fall back to the tokenizer's
+    ``model_max_length`` when that is a real cap (some tokenizers report a
+    sentinel above 10**6).
+    """
+    for name in ("max_seq_length", "max_length"):
+        try:
+            value = getattr(model, name, None) if hasattr(type(model), name) else None
+        except Exception:  # noqa: BLE001 -- a property that raises is an unknown cap
+            value = None
+        if isinstance(value, int) and not isinstance(value, bool) and 0 < value < 10**6:
+            return value
+    value = getattr(tokenizer, "model_max_length", None)
+    if isinstance(value, int) and not isinstance(value, bool) and 0 < value < 10**6:
+        return value
+    return None
+
+
 class CrossEncoderReranker:
-    """Optional cross-encoder reranker for retrieved hits."""
+    """Optional cross-encoder reranker for retrieved hits.
+
+    S0F-69: the cross-encoder scores each (query, passage) pair through a
+    tokenizer capped at the model's sequence cap (512 on the registered
+    BAAI/bge-reranker-large; the 2026-10-08 run log warned "519 > 512" and
+    "1311 > 512"), and sentence_transformers truncates a longer pair
+    silently, so a long passage is ranked on its head alone. ``scored_pairs``
+    and ``truncated_pairs`` count both per run (the runner writes them into
+    the retrieval summary); the ranking itself is unchanged.
+    """
 
     def __init__(self, model_name: str, *, device: str = "cpu") -> None:
         from sentence_transformers import CrossEncoder
@@ -612,6 +643,26 @@ class CrossEncoderReranker:
         self.model_name = model_name
         self.device = device
         self._model = CrossEncoder(model_name, device=device)
+        self._tokenizer = getattr(self._model, "tokenizer", None)
+        self.max_length: Optional[int] = _reranker_input_cap(self._model, self._tokenizer)
+        self.scored_pairs: int = 0
+        # None when the cap or the tokenizer is unknown: absence is not zero
+        # (the model still truncates at a cap this code cannot see).
+        self.truncated_pairs: Optional[int] = (
+            0 if (self._tokenizer is not None and self.max_length) else None
+        )
+
+    def _count_truncated(self, pairs: Sequence[Tuple[str, str]]) -> None:
+        """Count the pairs longer than the model's input cap (one untruncated
+        tokenizer call per pair, no scoring; ``verbose=False`` keeps the
+        tokenizer's long-sequence warning out of the run log)."""
+        self.scored_pairs += len(pairs)
+        if self.truncated_pairs is None:
+            return
+        for query, text in pairs:
+            n = len(self._tokenizer(query, text, truncation=False, verbose=False)["input_ids"])
+            if n > self.max_length:
+                self.truncated_pairs += 1
 
     def rerank(
         self,
@@ -627,6 +678,7 @@ class CrossEncoderReranker:
             return list(hits)
 
         pairs = [(query, d.text) for d in docs]
+        self._count_truncated(pairs)
         scores = self._model.predict(pairs)
 
         scored = []

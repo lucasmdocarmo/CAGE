@@ -13,7 +13,10 @@ scripts/3_run/run_cag_reference.py verbatim:
 - ``preload_corpus_prefix(text)``: prefill ONE fixed corpus block's KV with a
   single forward pass into a ``DynamicCache`` (recording corpus_prefill_ms);
 - ``generate(request)``: the request prompt must literally extend the cached
-  prefix; only the suffix is tokenized (``add_special_tokens=False``) and
+  prefix; only the suffix is tokenized (``add_special_tokens=False``), the
+  cached corpus ids and the suffix ids are concatenated into the FULL input
+  (transformers 4.57 slices the cached part off itself and refused
+  suffix-only ids with an IndexError on the 2026-10-08 landing, S0F-60) and
   decoded greedily against the cache with an attention mask covering
   cached-corpus + query tokens;
 - after EVERY query the cache is cropped back to the corpus length
@@ -32,8 +35,17 @@ Fail-closed doctrine (mirrors InstrumentUnavailableError in
 src/evaluation/quality.py): torch/transformers import lazily and a missing
 stack raises the typed EngineDependencyUnavailableError -- never a silent
 degradation to another backend. Protocol violations (sampling temperature on
-the greedy oracle, stop sequences, a prompt that does not extend the loaded
-corpus prefix) raise loudly instead of producing rows under wrong semantics.
+the greedy oracle, a prompt that does not extend the loaded corpus prefix)
+raise loudly instead of producing rows under wrong semantics.
+
+Stop sequences (S0F-60): the request's stop list is honored through a
+transformers ``StoppingCriteria`` that decodes the generated suffix after
+every step and ends generation once a stop string appears; the returned
+text is cut before the first stop string and ``finish_reason`` is "stop",
+the campaign's ``stop=["\n"]`` convention served exactly as on the serving
+engines. Before S0F-60 the oracle refused stop lists and the runner sent
+none, so every oracle row ran to ``max_tokens`` (256 tokens of text past
+the answer on the 2026-10-08 landing).
 
 Cached-token telemetry is self-instrumented (charter D2.1: "N/A -- we
 instrument it ourselves (it's our code path)"): in corpus-reuse mode
@@ -44,7 +56,7 @@ loaded prefix it is exactly 0. Both are facts, not engine claims.
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .engine import (
     InferenceEngine,
@@ -69,6 +81,25 @@ def _import_ml_stack() -> Tuple[Any, Any, Any, Any]:
     from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
     return torch, AutoModelForCausalLM, AutoTokenizer, DynamicCache
+
+
+def _import_stopping_criteria() -> Tuple[Any, Any]:
+    """Lazily import (StoppingCriteria, StoppingCriteriaList) (S0F-60).
+
+    A second module-level seam beside ``_import_ml_stack`` so the unit tests
+    install fakes without touching the four-tuple that seam returns.
+    """
+    from transformers import StoppingCriteria, StoppingCriteriaList
+
+    return StoppingCriteria, StoppingCriteriaList
+
+
+def _cut_at_stop(text: str, stops: Sequence[str]) -> Tuple[str, bool]:
+    """The text before the earliest stop string, and whether one was found."""
+    cuts = [i for i in (text.find(s) for s in stops if s) if i >= 0]
+    if not cuts:
+        return text, False
+    return text[: min(cuts)], True
 
 
 class HFOracleAdapter(InferenceEngine):
@@ -143,6 +174,7 @@ class HFOracleAdapter(InferenceEngine):
 
         # Corpus-prefix reuse state (the manual CAG recipe, chan2024cag).
         self._corpus_cache: Optional[Any] = None
+        self._corpus_input_ids: Optional[Any] = None  # the prefilled ids (S0F-60)
         self._corpus_prefix_text: Optional[str] = None
         self._corpus_base_len: int = 0
         self._corpus_prefill_ms: Optional[float] = None
@@ -162,21 +194,15 @@ class HFOracleAdapter(InferenceEngine):
         return pad if pad is not None else self.tokenizer.eos_token_id
 
     def _validate_request(self, request: InferenceRequest) -> None:
-        """Fail closed on requests the T=0 greedy oracle cannot honor."""
+        """Fail closed on requests the T=0 greedy oracle cannot honor
+        (sampling temperature, truncate_prompt_tokens); stop lists are
+        honored since S0F-60 (see ``_stop_criteria``)."""
         if self.enforce_greedy and (request.temperature or 0.0) != 0.0:
             raise ValueError(
                 f"HFOracleAdapter is the T=0 greedy reference engine (charter "
                 f"D2.1); request '{request.request_id}' asked for temperature="
                 f"{request.temperature}. Construct oracle requests with "
                 f"temperature=0.0 (or pass enforce_greedy=False deliberately)."
-            )
-        if request.stop:
-            raise EngineCapabilityUnavailableError(
-                ENGINE_ID,
-                "stop_sequences",
-                "stop-string support is not implemented on the reference path "
-                "(run_cag_reference.py never uses it); refusing to silently "
-                "ignore the request's stop list",
             )
         if request.truncate_prompt_tokens is not None:
             raise EngineCapabilityUnavailableError(
@@ -222,6 +248,7 @@ class HFOracleAdapter(InferenceEngine):
         prefill_ms = (time.perf_counter() - t0) * 1000.0
 
         self._corpus_cache = cache
+        self._corpus_input_ids = enc.input_ids
         self._corpus_prefix_text = prefix_text
         self._corpus_base_len = int(cache.get_seq_length())
         self._corpus_prefill_ms = prefill_ms
@@ -234,9 +261,51 @@ class HFOracleAdapter(InferenceEngine):
             self._corpus_cache = None
             if self.device == "cuda":
                 self._torch.cuda.empty_cache()
+        self._corpus_input_ids = None
         self._corpus_prefix_text = None
         self._corpus_base_len = 0
         self._corpus_prefill_ms = None
+
+    def _stop_classes(self) -> Tuple[Any, Any]:
+        """(StoppingCriteria, StoppingCriteriaList), or the typed fail-closed
+        raise; called BEFORE the timed block so a missing import never becomes
+        an error row (Fable review 2026-10-09, L1)."""
+        try:
+            return _import_stopping_criteria()
+        except ImportError as exc:
+            raise EngineDependencyUnavailableError(
+                ENGINE_ID, "transformers.StoppingCriteria", str(exc)
+            ) from exc
+
+    def _stop_criteria(
+        self, stops: Sequence[str], prompt_len: int, classes: Tuple[Any, Any]
+    ) -> Tuple[Any, Any]:
+        """A StoppingCriteriaList ending generation once the decoded generated
+        text (the ids past ``prompt_len``) carries one of ``stops`` (S0F-60).
+
+        Returns the list and the criterion (its ``matched`` flag records
+        whether a stop string ended the generation). Decoding the generated
+        suffix at every step is O(n) per step over at most max_tokens ids,
+        far below one forward pass of the model.
+        """
+        StoppingCriteria, StoppingCriteriaList = classes
+        tokenizer = self.tokenizer
+        torch = self._torch
+
+        class _StopOnStrings(StoppingCriteria):  # type: ignore[misc,valid-type]
+            def __init__(self) -> None:
+                super().__init__()
+                self.matched = False
+
+            def __call__(self, input_ids: Any, scores: Any, **kwargs: Any) -> Any:
+                text = tokenizer.decode(input_ids[0, prompt_len:], skip_special_tokens=True)
+                self.matched = any(s in text for s in stops)
+                return torch.full(
+                    (input_ids.shape[0],), self.matched, dtype=torch.bool, device=input_ids.device
+                )
+
+        criterion = _StopOnStrings()
+        return StoppingCriteriaList([criterion]), criterion
 
     # ------------------------------------------------------------------ #
     # InferenceEngine interface
@@ -253,16 +322,17 @@ class HFOracleAdapter(InferenceEngine):
 
         With a corpus prefix loaded (``preload_corpus_prefix``), the request
         prompt MUST literally extend the cached prefix text; only the suffix
-        is tokenized (``add_special_tokens=False``) and served against the
-        resident cache, which is cropped back to the corpus length after the
-        query -- NON-OPTIONAL per Chan et al. 2024 (else the next query
-        attends to this one's question and answer).
+        is tokenized (``add_special_tokens=False``), the full ids (cached
+        corpus + suffix) are handed to ``generate`` with the resident cache
+        (S0F-60), and the cache is cropped back to the corpus length after
+        the query -- NON-OPTIONAL per Chan et al. 2024 (else the next query
+        attends to this one's question and answer). A stop list ends the
+        generation at the first stop string and the text is cut before it.
 
         Raises (fail-closed protocol violations, never error rows):
             ValueError: sampling temperature on the greedy oracle, or a prompt
                 that does not extend the loaded corpus prefix.
-            EngineCapabilityUnavailableError: stop sequences /
-                truncate_prompt_tokens requested.
+            EngineCapabilityUnavailableError: truncate_prompt_tokens requested.
         """
         self._validate_request(request)
         torch = self._torch
@@ -279,11 +349,19 @@ class HFOracleAdapter(InferenceEngine):
         answer = ""
         num_generated = 0
         prompt_tokens = 0
+        stop_matched = False
+        stops: List[str] = [s for s in (request.stop or []) if s]
+        stop_classes = self._stop_classes() if stops else None  # fail closed, before the clock
         error: Optional[str] = None
 
         self._sync()
         t0 = time.perf_counter()
         try:
+            gen_kwargs: Dict[str, Any] = dict(
+                max_new_tokens=request.max_tokens,
+                do_sample=False,
+                pad_token_id=self._pad_token_id(),
+            )
             if reuse:
                 assert self._corpus_prefix_text is not None
                 suffix_text = request.prompt[len(self._corpus_prefix_text):]
@@ -292,37 +370,35 @@ class HFOracleAdapter(InferenceEngine):
                 ).to(self.device)
                 q_len = int(q_enc.input_ids.shape[1])
                 prompt_tokens = q_len
-                # Attention mask must cover cached corpus + new query tokens.
-                attention_mask = torch.ones(
-                    (1, self._corpus_base_len + q_len),
-                    dtype=torch.long,
-                    device=self.model.device,
+                prompt_len = self._corpus_base_len + q_len
+                # S0F-60: generate() takes the FULL ids beside the prefilled
+                # cache (it slices the cached part off itself); the suffix
+                # alone raised IndexError in transformers 4.57 on the landing.
+                gen_kwargs["input_ids"] = torch.cat(
+                    [self._corpus_input_ids, q_enc.input_ids], dim=1
                 )
-                with torch.no_grad():
-                    out = self.model.generate(
-                        input_ids=q_enc.input_ids,
-                        attention_mask=attention_mask,
-                        past_key_values=self._corpus_cache,
-                        max_new_tokens=request.max_tokens,
-                        do_sample=False,
-                        pad_token_id=self._pad_token_id(),
-                    )
-                answer = self.tokenizer.decode(out[0, q_len:], skip_special_tokens=True)
-                num_generated = int(out.shape[1]) - q_len
+                # Attention mask must cover cached corpus + new query tokens.
+                gen_kwargs["attention_mask"] = torch.ones(
+                    (1, prompt_len), dtype=torch.long, device=self.model.device
+                )
+                gen_kwargs["past_key_values"] = self._corpus_cache
             else:
                 enc = self.tokenizer(request.prompt, return_tensors="pt").to(self.device)
-                p_len = int(enc.input_ids.shape[1])
-                prompt_tokens = p_len
-                with torch.no_grad():
-                    out = self.model.generate(
-                        input_ids=enc.input_ids,
-                        attention_mask=enc.attention_mask,
-                        max_new_tokens=request.max_tokens,
-                        do_sample=False,
-                        pad_token_id=self._pad_token_id(),
-                    )
-                answer = self.tokenizer.decode(out[0, p_len:], skip_special_tokens=True)
-                num_generated = int(out.shape[1]) - p_len
+                prompt_len = int(enc.input_ids.shape[1])
+                prompt_tokens = prompt_len
+                gen_kwargs["input_ids"] = enc.input_ids
+                gen_kwargs["attention_mask"] = enc.attention_mask
+            criterion = None
+            if stop_classes is not None:
+                gen_kwargs["stopping_criteria"], criterion = self._stop_criteria(
+                    stops, prompt_len, stop_classes
+                )
+            with torch.no_grad():
+                out = self.model.generate(**gen_kwargs)
+            answer = self.tokenizer.decode(out[0, prompt_len:], skip_special_tokens=True)
+            num_generated = int(out.shape[1]) - prompt_len
+            answer, cut = _cut_at_stop(answer, stops)
+            stop_matched = cut or bool(criterion is not None and criterion.matched)
         except Exception as exc:  # noqa: BLE001 -- record, crop, continue (run_cag_reference.py)
             error = f"{type(exc).__name__}: {exc}"
         finally:
@@ -356,7 +432,11 @@ class HFOracleAdapter(InferenceEngine):
                 total_time_ms=total_time_ms,
                 num_tokens=num_generated,
                 model_name=self.model_name,
-                finish_reason=("length" if num_generated >= request.max_tokens else "stop"),
+                finish_reason=(
+                    "stop"
+                    if stop_matched or num_generated < request.max_tokens
+                    else "length"
+                ),
                 prompt_tokens=prompt_tokens,
                 # Self-instrumented cache telemetry (charter D2.1: "we
                 # instrument it ourselves"): exact resident corpus KV length

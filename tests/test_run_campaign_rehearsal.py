@@ -51,7 +51,7 @@ def test_rehearsal_keeps_every_arm_engine_family_hf_cell_ruler_task_and_rung() -
     assert g.primary_engine == a.primary_engine and g.primary_baselines == a.primary_baselines
     # the collapses, by the rule
     assert g.f1_datasets == ("squad_v2", "qasper")                      # QA_DATASETS order, manifests only
-    assert g.hf_oracle_cells == (("B1", ("squad_v2", "qasper")), ("B2", ("squad_v2", "qasper")),
+    assert g.hf_oracle_cells == (("B1", ("squad_v2", "qasper")),            # no B2: ADR-0152
                                  ("B3", ("squad_v2", "qasper")), ("B6", ("squad_v2", "qasper")))
     assert g.f2_budgets == (0.75,) and g.f2_rates == (0.85,)             # lower medians of the §6.1 factorial
     assert g.f2_fine_budgets == (1.25,) and g.f2_fine_rates == (0.85,)   # the first fine-only coordinate
@@ -62,7 +62,7 @@ def test_rehearsal_keeps_every_arm_engine_family_hf_cell_ruler_task_and_rung() -
     # coverage: every (baseline, engine, family) of session a appears in the rehearsal
     assert _coverage(a) <= _coverage(g)
     cells = rc.enumerate_cells(g)
-    assert len(cells) == 112
+    assert len(cells) == 110  # 6 hf (ADR-0152; old 8 with B2) + 52 sglang + 52 vllm
     assert sorted({c.ruler_task for c in cells if c.ruler_task}) == sorted(rc.RULER_F2_TASKS)
     rungs = {c.spec.corpus_budget_tokens for c in cells if c.baseline_id == "B12"}
     assert rungs == set(a.corpus_trunc_budgets)
@@ -89,7 +89,7 @@ def test_rehearsal_plan_builds_against_the_real_manifests_through_the_cli(tmp_pa
     assert reh["f2_coordinates"] == [[0.75, 0.85]] and reh["f2_fine_coordinates"] == [[1.25, 0.85]]
     assert reh["f3_coordinates"] == [[0.5, 0.95]] and "lower-median" in reh["rule"]
     assert plan["session"] == "a" and plan["replications"] == 1
-    assert plan["counts"]["cells"] == 112 and plan["counts"]["windows"] == 112
+    assert plan["counts"]["cells"] == 110 and plan["counts"]["windows"] == 110  # ADR-0152 (old 112)
     assert plan["counts"]["relaunches"] == 18 and plan["counts"]["blocked"] == 3
     assert plan["per_row_n"]["n_primary"] == 50 and plan["per_row_n"]["window_requests"] == 50
     cells = [s for s in plan["steps"] if s["kind"] == "cell"]

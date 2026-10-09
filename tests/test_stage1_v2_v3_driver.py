@@ -392,9 +392,10 @@ class TestRunPlanStops:
         ]
 
     def test_same_launcher_relaunches_are_not_separated_by_a_stop(self, tmp_path, stub) -> None:
-        # B1 (prefix ON) and B4 corpus-fresh (prefix OFF, ADR-0103): two vLLM
-        # relaunches, one family.
-        plan = _plan_for(_grid(f1_baselines=("B1", "B4")), _floor_table(tmp_path), stub.cmd)
+        # B2 gold-reuse (prefix ON) and B4 corpus-fresh (prefix OFF, ADR-0103):
+        # two vLLM relaunches, one family. (B1 gold-fresh serves prefix OFF
+        # too since ADR-0150, so it would share B4's boundary.)
+        plan = _plan_for(_grid(f1_baselines=("B2", "B4")), _floor_table(tmp_path), stub.cmd)
         assert len(_relaunches(plan)) == 2
         assert rc.run_plan(plan, _run_root(tmp_path)) == 0
         assert _verbs(stub.calls()) == [
@@ -441,7 +442,10 @@ class TestRunPlanStops:
 
     def test_a_failed_relaunch_still_stops_its_family_at_the_end(self, tmp_path, stub, monkeypatch) -> None:
         plan = _plan_for(_grid(), _floor_table(tmp_path), stub.cmd)
-        monkeypatch.setenv("STUB_FAIL_EXACT", f"restart {rc.HF_ID_OF_SLUG['qwen3-14b']}")
+        # the default grid's B1 (gold-fresh) relaunches prefix OFF (ADR-0150)
+        monkeypatch.setenv(
+            "STUB_FAIL_EXACT", f"restart {rc.HF_ID_OF_SLUG['qwen3-14b']} --no-prefix-cache"
+        )
         assert rc.run_plan(plan, _run_root(tmp_path)) == 1
         assert _verbs(stub.calls()) == ["stop:vllm", "restart:vllm", "stop:vllm"]
 

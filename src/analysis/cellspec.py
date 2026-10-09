@@ -17,12 +17,14 @@ Charter bindings enforced here:
 - §7.6.1 family × arm legality; hf = sub-pressure F1 oracle only; LMDeploy
   restricted to 14B/70B (P7).
 
-Serving-config note (ADR-0103, owner decision 2026-09-16): corpus-fresh (B4)
-is served with the engine prefix cache OFF by a per-arm relaunch in every
-family, on every engine (scripts/3_run/run_campaign.PREFIX_OFF_ARMS via
-``_prefix_off``). That is a SERVING fact, not an identity axis: B4's carriage
-here is unchanged (REUSE bit, family F3 beside B3, ``_ARMS_BY_FAMILY``), and
-no CellSpec axis or row key encodes the prefix mode.
+Serving-config note (ADR-0103, owner decision 2026-09-16, extended by
+ADR-0150, owner decision 2026-10-09): every arm the charter's 7.1 table marks
+reuse "off" (gold-fresh, corpus-fresh, retr-fresh, retr-comp, retr-trunc) is
+served with the engine prefix cache OFF by a per-arm relaunch in every family,
+on every engine (scripts/3_run/run_campaign.PREFIX_OFF_ARMS via
+``_prefix_off``). That is a SERVING fact, not an identity axis: the family
+carriage here is unchanged (B4 keeps its REUSE bit, family F3 beside B3,
+``_ARMS_BY_FAMILY``), and no CellSpec axis or row key encodes the prefix mode.
 
 Corpus-truncation ladder (ADR-0106, owner decision 2026-09-16, charter
 §7.7(d)): B12 (corpus-trunc) is enumerated as ONE CELL PER RUNG of a

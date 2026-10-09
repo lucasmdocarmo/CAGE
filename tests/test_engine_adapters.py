@@ -29,6 +29,7 @@ import requests
 
 import src.inference.openai_chat_adapter as base_mod
 import src.inference.hf_oracle_adapter as hf_mod
+import src.inference.sglang_adapter as sgl_mod
 from src.inference.engine import InferenceEngine, InferenceRequest, InferenceResponse
 from src.inference.errors import (
     EngineCapabilityUnavailableError,
@@ -447,16 +448,37 @@ def test_sglang_stream_chat_happy_path(monkeypatch):
     assert calls[0]["url"] == "http://sgl:1234/v1/chat/completions"
 
 
-def test_sglang_payload_sends_nothing_unverified_by_default(monkeypatch):
+def test_sglang_payload_pins_enable_thinking_false_by_default(monkeypatch):
+    # S0F-59 (ADR-0151): the default pin is the one vLLM sends (the
+    # 2026-10-08 landing served every SGLang row as "<think>" in 2 tokens
+    # without it); logprobs stay opt-in (unverified live on SGLang).
     lines = chat_stream_lines(["x"], usage=USAGE_NO_DETAILS)
     calls = install_post(monkeypatch, lambda _c: FakeStreamResponse(lines))
 
-    SGLangAdapter(model_name="m").generate(chat_request(), stream=True)
+    adapter = SGLangAdapter(model_name="m")
+    assert adapter.chat_template_kwargs == {"enable_thinking": False}
+    assert sgl_mod.SGLANG_CHAT_TEMPLATE_KWARGS == {"enable_thinking": False}
+    adapter.generate(chat_request(), stream=True)
+
+    payload = calls[0]["json"]
+    assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "logprobs" not in payload
+    assert "top_logprobs" not in payload
+    # the adapter holds a copy: mutating it never rewrites the module constant
+    adapter.chat_template_kwargs["enable_thinking"] = True
+    assert sgl_mod.SGLANG_CHAT_TEMPLATE_KWARGS == {"enable_thinking": False}
+
+
+def test_sglang_explicit_empty_chat_template_kwargs_sends_nothing(monkeypatch):
+    # an explicit {} is the pre-ADR-0151 behavior: nothing sent
+    lines = chat_stream_lines(["x"], usage=USAGE_NO_DETAILS)
+    calls = install_post(monkeypatch, lambda _c: FakeStreamResponse(lines))
+
+    SGLangAdapter(model_name="m", chat_template_kwargs={}).generate(chat_request(), stream=True)
 
     payload = calls[0]["json"]
     assert "chat_template_kwargs" not in payload
     assert "logprobs" not in payload
-    assert "top_logprobs" not in payload
 
 
 def test_sglang_explicit_chat_template_kwargs_sent(monkeypatch):
@@ -658,6 +680,7 @@ def test_capabilities_declarations():
     assert sgl["flush_endpoint"] == "/flush_cache"
     assert sgl["kv_transfer_params"] is False
     assert sgl["truncate_prompt_tokens"] is False
+    assert sgl["chat_template_thinking_pin"] is True  # sent by default (ADR-0151)
 
     lmd = LMDeployAdapter(model_name="m").capabilities()
     assert lmd["engine"] == "lmdeploy-turbomind"
@@ -699,6 +722,7 @@ def test_capabilities_conservative_default_on_base_engine():
 class _FakeTensor:
     def __init__(self, ids: List[int]):
         self.ids = list(ids)
+        self.device = "cpu"
 
     @property
     def shape(self):
@@ -788,7 +812,8 @@ class _FakeModel:
             past_key_values._len = len(input_ids.ids)
 
     def generate(self, input_ids=None, attention_mask=None, past_key_values=None,
-                 max_new_tokens=None, do_sample=None, pad_token_id=None):
+                 max_new_tokens=None, do_sample=None, pad_token_id=None,
+                 stopping_criteria=None):
         self.generate_calls.append({
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -796,11 +821,16 @@ class _FakeModel:
             "max_new_tokens": max_new_tokens,
             "do_sample": do_sample,
             "pad_token_id": pad_token_id,
+            "stopping_criteria": stopping_criteria,
         })
         if self.raise_on_generate is not None:
             raise self.raise_on_generate
         assert do_sample is False, "oracle must decode greedily"
         return _FakeTensor(input_ids.ids + self.generated_ids)
+
+
+class _FakeStoppingCriteria:
+    """Stands in for transformers.StoppingCriteria (a plain base class)."""
 
 
 def _fake_torch():
@@ -809,8 +839,13 @@ def _fake_torch():
         float16="fp16",
         float32="fp32",
         long="long",
+        bool="bool",
         no_grad=lambda: contextlib.nullcontext(),
         ones=lambda shape, dtype=None, device=None: _FakeTensor([1] * int(shape[1])),
+        # S0F-60: the oracle concatenates the cached corpus ids and the suffix
+        # ids, and the stop criterion answers a bool tensor per sequence
+        cat=lambda tensors, dim=1: _FakeTensor([i for t in tensors for i in t.ids]),
+        full=lambda shape, value, dtype=None, device=None: _FakeTensor([int(bool(value))] * int(shape[0])),
         cuda=types.SimpleNamespace(
             is_available=lambda: False,
             synchronize=lambda: None,
@@ -829,6 +864,7 @@ def _install_fake_stack(monkeypatch: pytest.MonkeyPatch, model: _FakeModel, tok:
         )
 
     monkeypatch.setattr(hf_mod, "_import_ml_stack", _stack)
+    monkeypatch.setattr(hf_mod, "_import_stopping_criteria", lambda: (_FakeStoppingCriteria, list))
 
 
 def _oracle(monkeypatch: pytest.MonkeyPatch, generated_text: str = "Paris"):
@@ -909,6 +945,12 @@ def test_hf_oracle_corpus_prefix_reuse_and_crop(monkeypatch):
     assert isinstance(cache, _FakeCache)
     # ...and cropped back to the corpus length after the query (NON-OPTIONAL).
     assert cache.crop_calls == [n_prefix]
+    # S0F-60: generate() receives the FULL ids (cached corpus + suffix) and a
+    # mask over both; the suffix alone raised IndexError on the landing.
+    call = model.generate_calls[0]
+    assert call["input_ids"].ids == tok.encode_words(prefix) + tok.encode_words(suffix)
+    assert call["attention_mask"].shape == (1, n_prefix + len(suffix.split()))
+    assert call["stopping_criteria"] is None  # no stop list on this request
 
 
 def test_hf_oracle_crop_happens_even_on_generation_error(monkeypatch):
@@ -948,14 +990,66 @@ def test_hf_oracle_rejects_sampling_temperature(monkeypatch):
         adapter.generate(req)
 
 
-def test_hf_oracle_rejects_stop_sequences(monkeypatch):
-    adapter, _model, _tok = _oracle(monkeypatch)
+def test_hf_oracle_honors_stop_strings_and_cuts_the_text(monkeypatch):
+    # S0F-60: the campaign's stop list is served, never refused; the text is
+    # cut before the first stop string and finish_reason reads "stop".
+    adapter, model, tok = _oracle(monkeypatch, generated_text="42 STOP more words")
+    prefix = "the corpus block"
+    adapter.preload_corpus_prefix(prefix)
+    suffix = " Question : what ? Answer :"
     req = InferenceRequest(
-        prompt="hello", temperature=0.0, stop=["\n"], request_id="q1"
+        prompt=prefix + suffix, temperature=0.0, max_tokens=8, stop=["STOP"], request_id="q1"
     )
-    with pytest.raises(EngineCapabilityUnavailableError) as exc:
-        adapter.generate(req)
-    assert exc.value.capability == "stop_sequences"
+    resp = adapter.generate(req)
+
+    assert resp.error is None
+    # the text before the stop string is kept verbatim, the fake tokenizer's
+    # trailing space included (vLLM semantics; the row's sanitized_answer
+    # strips it downstream)
+    assert resp.generated_text == "42 "
+    assert resp.finish_reason == "stop"
+    assert resp.num_tokens == 4  # the generated id count, stop word included (ADR-0118)
+    call = model.generate_calls[0]
+    criteria = call["stopping_criteria"]
+    assert isinstance(criteria, list) and len(criteria) == 1
+    (criterion,) = criteria
+    prompt_ids = tok.encode_words(prefix + suffix)
+    assert call["input_ids"].ids == prompt_ids
+    # the criterion reads the generated suffix only: nothing yet, then the stop word
+    assert criterion(_FakeTensor(prompt_ids + tok.encode_words("42")), None).ids == [0]
+    assert criterion.matched is False
+    assert criterion(_FakeTensor(prompt_ids + tok.encode_words("42 STOP")), None).ids == [1]
+    assert criterion.matched is True
+    # the cache is still cropped back to the corpus length after the query
+    assert call["past_key_values"].crop_calls == [len(prefix.split())]
+
+
+def test_hf_oracle_missing_stopping_criteria_fails_closed_before_the_clock(monkeypatch):
+    # Fable review 2026-10-09 L1: a transformers build without StoppingCriteria
+    # raises the typed dependency error on a stop-list request (never an
+    # error row), and a request without a stop list still serves.
+    adapter, model, _tok = _oracle(monkeypatch, generated_text="ok")
+
+    def _raise():
+        raise ImportError("cannot import name 'StoppingCriteria'")
+
+    monkeypatch.setattr(hf_mod, "_import_stopping_criteria", _raise)
+    with pytest.raises(EngineDependencyUnavailableError) as exc:
+        adapter.generate(InferenceRequest(prompt="hello", temperature=0.0, stop=["\n"], request_id="q1"))
+    assert exc.value.dependency == "transformers.StoppingCriteria"
+    assert model.generate_calls == []  # nothing was generated, nothing timed
+    resp = adapter.generate(InferenceRequest(prompt="hello", temperature=0.0, request_id="q2"))
+    assert resp.error is None and resp.generated_text == "ok"
+
+
+def test_hf_oracle_stop_list_without_a_match_runs_to_length(monkeypatch):
+    adapter, model, _tok = _oracle(monkeypatch, generated_text="a b c d")
+    req = InferenceRequest(prompt="hello there", temperature=0.0, max_tokens=4, stop=["\n"], request_id="q1")
+    resp = adapter.generate(req)
+    assert resp.error is None
+    assert resp.generated_text == "a b c d"
+    assert resp.finish_reason == "length" and resp.num_tokens == 4
+    assert model.generate_calls[0]["stopping_criteria"] is not None
 
 
 def test_hf_oracle_batch_generate_is_sequential_batch_1(monkeypatch):

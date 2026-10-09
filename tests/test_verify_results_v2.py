@@ -1096,3 +1096,77 @@ def test_check_m_constants_match_their_producers() -> None:
     layout = (REPO_ROOT / "src" / "orchestration" / "campaign_layout.py").read_text(encoding="utf-8")
     assert f'window_dir / "{vr._REGIME_NAME}"' in layout
     assert vr._TELEMETRY_ENGINES == ("vllm", "sglang")
+
+
+# ---------------------------------------------------------------------------
+# (n) served text that is thinking scaffolding (S0F-59, ADR-0151)
+# ---------------------------------------------------------------------------
+
+
+def test_green_tree_has_no_degenerate_output_finding_and_reports_the_median(tmp_path: Path) -> None:
+    run_dir = _mk_green(tmp_path)
+    report = vr.verify_run(run_dir)
+    assert not _findings(report, "FAIL", "degenerate-output")
+    assert not _findings(report, "WARN", "degenerate-output")
+    for row in report["accounting"]["per_window"]:
+        assert row["n_thinking_marker"] == 0
+        assert row["median_num_tokens"] == 8.0  # the fixture rows: 8 output tokens each
+    assert report["accounting"]["totals"]["n_thinking_marker"]["sum_over_known_windows"] == 0
+
+
+def test_a_window_whose_served_rows_are_thinking_scaffolding_fails(tmp_path: Path) -> None:
+    # the 2026-10-08 landing: every SGLang row "<think>" in 2 tokens, served
+    run_dir = _build_tree(tmp_path)
+    wdir = _first_window(run_dir)
+    rows = _read_jsonl(wdir / "requests.jsonl")
+    for row in rows:
+        row.update(generated_answer="<think>", num_tokens=2, tpot_ms=12.0)
+    _write_jsonl(wdir / "requests.jsonl", rows)
+    _seal(run_dir)
+    report = vr.verify_run(run_dir)
+    assert report["ok"] is False
+    (finding,) = _findings(report, "FAIL", "degenerate-output")
+    assert f"{N_ROWS} of {N_ROWS} served row(s)" in finding["detail"]
+    assert "ADR-0151" in finding["detail"] and "'e0'" in finding["detail"]
+    acc = _accounting_row(report, run_dir, wdir)
+    assert acc["n_thinking_marker"] == N_ROWS and acc["median_num_tokens"] == 2.0
+
+
+def test_one_scaffolding_row_among_served_rows_is_a_warn(tmp_path: Path) -> None:
+    run_dir = _build_tree(tmp_path)
+    wdir = _rewrite_first_window_row(run_dir, generated_answer="<think>", num_tokens=2)
+    report = vr.verify_run(run_dir)
+    assert report["ok"] is True
+    (warn,) = _findings(report, "WARN", "degenerate-output")
+    assert f"1 of {N_ROWS} served row(s)" in warn["detail"]
+    acc = _accounting_row(report, run_dir, wdir)
+    assert acc["n_thinking_marker"] == 1 and acc["median_num_tokens"] == 8.0
+
+
+def test_error_rows_are_outside_check_n_and_rows_without_text_are_not_marked(tmp_path: Path) -> None:
+    run_dir = _build_tree(tmp_path)
+    wdir = _first_window(run_dir)
+    rows = _read_jsonl(wdir / "requests.jsonl")
+    # an error row whose text is the marker is already a failed request
+    rows[0].update(ok=False, error="engine_error: 500", generated_answer="<think>",
+                   finish_reason="error", num_tokens=0, tpot_ms=None)
+    # a served row with no generated_answer field at all is not marked
+    rows[1].pop("generated_answer", None)
+    _write_jsonl(wdir / "requests.jsonl", rows)
+    _seal(run_dir)
+    report = vr.verify_run(run_dir)
+    assert not _findings(report, "FAIL", "degenerate-output")
+    assert not _findings(report, "WARN", "degenerate-output")
+    acc = _accounting_row(report, run_dir, wdir)
+    assert acc["n_thinking_marker"] == 0 and acc["median_num_tokens"] == 8.0
+
+
+def test_check_n_marker_matches_the_stage_4_probe() -> None:
+    import importlib.util
+
+    path = REPO_ROOT / "scripts" / "checks" / "probe_thinking_pin.py"
+    spec = importlib.util.spec_from_file_location("probe_thinking_pin", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.THINKING_MARKER == vr._THINKING_MARKER == "<think>"
+    assert vr._DEGENERATE_SHARE_FAIL == 0.5

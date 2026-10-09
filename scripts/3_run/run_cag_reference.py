@@ -457,16 +457,20 @@ def run_trial(
             t0 = time.perf_counter()
             try:
                 with torch.no_grad():
+                    # S0F-60: generate() takes the FULL ids (the prefilled
+                    # corpus ids + the suffix) beside the cache and slices
+                    # the cached part off itself; the suffix alone raised
+                    # IndexError in transformers 4.57 on the 2026-10-08 landing.
                     out = model.generate(
-                        input_ids=q_enc.input_ids,
+                        input_ids=torch.cat([enc.input_ids, q_enc.input_ids], dim=1),
                         attention_mask=attention_mask,
                         past_key_values=cache,
                         max_new_tokens=max_new_tokens,
                         do_sample=False,
                         pad_token_id=pad_token_id,
                     )
-                answer = tok.decode(out[0, q_len:], skip_special_tokens=True)
-                num_generated = int(out.shape[1]) - q_len
+                answer = tok.decode(out[0, base_len + q_len:], skip_special_tokens=True)
+                num_generated = int(out.shape[1]) - (base_len + q_len)
             except Exception as exc:  # noqa: BLE001 -- record, crop, continue
                 error = f"{type(exc).__name__}: {exc}"
             finally:

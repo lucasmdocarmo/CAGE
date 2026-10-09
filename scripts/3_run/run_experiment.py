@@ -3255,13 +3255,12 @@ def run_experiment(
                 f"{ruler_sizing['haystack_max']})"
             )
 
-    # Stop sequences per backend: the HF reference oracle fails closed on stop
-    # lists BY DESIGN (run_cag_reference.py never uses them; the adapter refuses
-    # to silently ignore a stop request), so hf-oracle requests carry stop=None.
-    # Every other backend keeps the historical stop=["\n"] unchanged.
-    _request_stop: Optional[List[str]] = (
-        None if backend in {"hf-oracle", "hf_oracle"} else ["\n"]
-    )
+    # Stop sequences: every backend carries the historical stop=["\n"], the HF
+    # reference oracle included since S0F-60 (the adapter honors a stop list
+    # through a StoppingCriteria; before, it refused stop lists and the runner
+    # sent none, so every oracle row ran to max_tokens on the 2026-10-08
+    # landing, 256 tokens of text past the answer).
+    _request_stop: Optional[List[str]] = ["\n"]
     # Streamed-TTFT backends: the two new serving-grade adapters stream like
     # vLLM (charter D2 telemetry parity -- adapter capabilities streamed_ttft).
     _stream_backends = {"vllm", "ollama", "sglang", "lmdeploy", "lmdeploy-turbomind"}
@@ -4734,6 +4733,13 @@ def run_experiment(
             "embedding_model": baseline_config.embedding_model,
             "embedding_revision": embedding_revision,
             "reranker_model": baseline_config.reranker_model,
+            # S0F-69: the cross-encoder's input cap and how many (query,
+            # passage) pairs exceeded it (sentence_transformers truncates them
+            # silently; 512 tokens on BAAI/bge-reranker-large, the 2026-10-08
+            # run log warned "519 > 512"); None without a reranker.
+            "rerank_max_length": getattr(reranker, "max_length", None),
+            "rerank_scored_pairs": getattr(reranker, "scored_pairs", None),
+            "rerank_truncated_pairs": getattr(reranker, "truncated_pairs", None),
         }
 
         print("\n" + "=" * 70)

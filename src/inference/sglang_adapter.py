@@ -27,6 +27,15 @@ still a typed error, never a silent warm window.
 
 kv_transfer_params stays unparsed: the field is vLLM/NIXL-shaped; SGLang's
 disaggregation metadata format (if any) is unconfirmed (ADR-0007 item 6).
+
+Thinking pin (S0F-59, ADR-0151): every chat request carries
+``chat_template_kwargs = {"enable_thinking": false}`` by default, the pin
+vLLM sends. On the 2026-10-08 landing SGLang served 2,450 of 2,450 rows as
+"<think>" in 2 tokens: Qwen3's template opened a thinking block, the
+harness stop sequence ended the request, and no answer was ever written.
+Whether SGLang honors the kwarg is proven live by
+scripts/checks/probe_thinking_pin.py at the master's stage 4, which fails
+the run when the served text still carries the marker.
 """
 
 from __future__ import annotations
@@ -35,6 +44,13 @@ from typing import Any, Dict, Optional, Tuple
 
 from .engine import InferenceRequest  # noqa: F401  (re-exported for type context)
 from .openai_chat_adapter import OpenAIChatAdapter
+
+#: S0F-59 (ADR-0151): the chat-template pin sent by default, the one vLLM
+#: sends (vllm_adapter._apply_engine_chat_extras). ``chat_template_kwargs=None``
+#: at construction means this pin; an explicit ``{}`` sends nothing (the
+#: pre-ADR-0151 behavior); the runner's CAGE_SGLANG_CHAT_TEMPLATE_KWARGS
+#: override replaces it.
+SGLANG_CHAT_TEMPLATE_KWARGS: Dict[str, Any] = {"enable_thinking": False}
 
 
 class SGLangAdapter(OpenAIChatAdapter):
@@ -74,10 +90,11 @@ class SGLangAdapter(OpenAIChatAdapter):
             include_usage_in_stream: If True, request a final streaming usage
                 chunk (``stream_options.include_usage`` -- OpenAI schema).
             chat_template_kwargs: Extra kwargs for the server-side chat
-                template renderer (e.g. ``{"enable_thinking": False}``). NOT
-                sent by default: whether SGLang honors the same kwarg name and
-                Jinja semantics as vLLM is [VERIFY-LIVE] (ADR-0007); pass it
-                explicitly once verified at preflight.
+                template renderer. None (the default) sends
+                SGLANG_CHAT_TEMPLATE_KWARGS, ``{"enable_thinking": False}``
+                (S0F-59, ADR-0151); an explicit ``{}`` sends nothing. Whether
+                SGLang honors the kwarg is proven live by the stage 4 probe
+                (scripts/checks/probe_thinking_pin.py), never assumed here.
             request_logprobs: If True, request per-token logprobs
                 (``logprobs=true, top_logprobs=0``, OpenAI chat schema).
                 Default False until verified live against the pinned SGLang.
@@ -90,11 +107,16 @@ class SGLangAdapter(OpenAIChatAdapter):
             include_usage_in_stream=include_usage_in_stream,
             **kwargs,
         )
-        self.chat_template_kwargs = dict(chat_template_kwargs) if chat_template_kwargs else None
+        self.chat_template_kwargs: Optional[Dict[str, Any]] = (
+            dict(chat_template_kwargs)
+            if chat_template_kwargs is not None
+            else dict(SGLANG_CHAT_TEMPLATE_KWARGS)
+        )
         self.request_logprobs = request_logprobs
 
     def _apply_engine_chat_extras(self, payload: Dict[str, Any]) -> None:
-        """SGLang chat extras -- opt-in only, nothing unverified sent silently."""
+        """SGLang chat extras: the thinking pin by default (ADR-0151), an
+        empty pin sends nothing; logprobs stay opt-in (unverified live)."""
         if self.chat_template_kwargs:
             payload["chat_template_kwargs"] = dict(self.chat_template_kwargs)
         if self.request_logprobs:
@@ -132,7 +154,9 @@ class SGLangAdapter(OpenAIChatAdapter):
             "kv_usage_gauge": False,  # adapter never scrapes /metrics (ADR-0007 item 5)
             "flush_endpoint": self._flush_endpoint,
             "kv_transfer_params": False,  # NIXL-shaped; no SGLang parser (ADR-0007 item 6)
-            "chat_template_thinking_pin": "verify-live",
+            # sent on every chat request by default (ADR-0151); that the
+            # engine honors it is proven live by the stage 4 probe
+            "chat_template_thinking_pin": True,
             "logprobs": "verify-live",
             "truncate_prompt_tokens": False,  # vLLM extension; fails closed here
         }

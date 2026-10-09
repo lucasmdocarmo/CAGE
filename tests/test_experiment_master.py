@@ -291,6 +291,20 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         # a start writes the realized-pool record the validate probes read (ADR-0142)
         _w(pr / "scripts" / "2_serving" / f"manage_{eng}_server.sh", f"#!/bin/bash\necho \"launcher {eng} $*\" >> \"$CAGE_TEST_LOG\"; [ \"$1\" = start ] && {{ mkdir -p logs/{eng}; echo '{{}}' > logs/{eng}/CURRENT.kvpool.json; }}; echo \"{eng} $1 ok\"; exit 0\n")
     _w(pr / "scripts" / "checks" / "preflight_check.sh", "#!/bin/bash\necho \"preflight $* BACKENDS=$CAGE_PREFLIGHT_BACKENDS\" >> \"$CAGE_TEST_LOG\"; echo 'PREFLIGHT PASS -- all Gate-2 components green.'; exit \"${CAGE_TEST_PREFLIGHT_RC:-0}\"\n")
+    # S0F-59 (ADR-0151): the thinking pin probe, one per server engine at stage 4
+    _w(pr / "scripts" / "checks" / "probe_thinking_pin.py", r'''
+        import json, os, sys
+        from pathlib import Path
+        a = sys.argv[1:]
+        backend = a[a.index("--backend") + 1]
+        out = Path(a[a.index("--out") + 1]); out.parent.mkdir(parents=True, exist_ok=True)
+        ok = os.environ.get("CAGE_TEST_THINKING_RC", "0") != "1"
+        out.write_text(json.dumps({"backend": backend, "ok": ok}), encoding="utf-8")
+        with open(os.environ["CAGE_TEST_LOG"], "a", encoding="utf-8") as fh:
+            fh.write(f"thinking_probe {backend} {a[a.index('--api-base') + 1]}\n")
+        print(f"THINKING_PIN_OK backend={backend} num_tokens=3" if ok else f"THINKING_PIN_FAILED backend={backend} reason=test")
+        sys.exit(0 if ok else 1)
+        ''', exe=False)
     _w(pr / "scripts" / "3_run" / "calibrate_cell.py", r'''
         import json, sys
         from pathlib import Path
@@ -908,11 +922,36 @@ def test_validate_runs_the_preflight_on_vllm_only_and_engine_probes_on_sglang(wo
     assert "preflight_check.sh" in vllm_cmd and "/flush_cache" not in vllm_cmd
     # S0F-54 (ADR-0149): the deferred flush, quoted so the remote shell never globs the "?"
     assert "preflight_check.sh" not in sgl_cmd and 'POST "http://localhost:30000/flush_cache?timeout=20"' in sgl_cmd
+    # S0F-59 (ADR-0151): the thinking pin probe runs on BOTH engines, before the stop
+    assert "probe_thinking_pin.py --backend vllm --api-base http://localhost:8000" in vllm_cmd
+    assert "probe_thinking_pin.py --backend sglang --api-base http://localhost:30000" in sgl_cmd
+    assert vllm_cmd.index("probe_thinking_pin.py") < vllm_cmd.index("manage_vllm_server.sh stop")
     log = (world["exp_root"] / "S1" / DATE / "logs" / "setup" / "validate_sglang.log").read_text(encoding="utf-8")
     for marker in ("VALIDATE_API_OK", "RUNNING_REQS=0", "ENGINE_FLUSH_OK", "METRIC_OK sglang:token_usage", "METRIC_OK sglang:num_retracted_reqs",
-                   "METRIC_OK sglang:num_running_reqs", "POOL_RECORD_OK", "COMPUTE_APPS=0"):
+                   "METRIC_OK sglang:num_running_reqs", "POOL_RECORD_OK", "THINKING_PIN_OK backend=sglang", "COMPUTE_APPS=0"):
         assert marker in log, marker
+    vllm_log = (world["exp_root"] / "S1" / DATE / "logs" / "setup" / "validate_vllm.log").read_text(encoding="utf-8")
+    assert "THINKING_PIN_OK backend=vllm" in vllm_log
+    assert "thinking_probe vllm http://localhost:8000" in _calls(world)
+    assert "thinking_probe sglang http://localhost:30000" in _calls(world)
     assert _state(world)["stages"]["validate"]["status"] == "passed"
+
+
+def test_validate_fails_when_the_thinking_pin_probe_fails(world: Dict[str, Path]) -> None:
+    # S0F-59 (ADR-0151): the served text still carries the thinking marker (the
+    # 2026-10-08 landing's SGLang shape): stage 4 fails and names the probe.
+    proc = _master(world, "--yes", "provision", "--to", "validate", CAGE_TEST_THINKING_RC="1")
+    assert proc.returncode == 1, proc.stdout[-3000:] + proc.stderr[-1000:]
+    # the probe's exit code fails the job (rc=1) and the job step fails the
+    # stage; the job log tail the master prints names the probe's verdict
+    assert "[FAIL] job validate_vllm: wait: rc=1" in proc.stdout
+    assert "THINKING_PIN_FAILED backend=vllm reason=test" in proc.stdout
+    assert "stage validate FAILED" in proc.stdout
+    assert "thinking_probe vllm http://localhost:8000" in _calls(world)
+    # the engine was still stopped after the failed probe (the stop follows the probe)
+    calls = _calls(world)
+    assert calls.index("thinking_probe vllm http://localhost:8000") < calls.index("launcher vllm stop")
+    assert not (world["home"] / ".cage_jobs" / "calibrate_vllm.cmd").exists(), "stage 5 must not run"
 
 
 def test_validate_refuses_an_engine_without_a_registered_probe_set(world: Dict[str, Path], tmp_path: Path) -> None:

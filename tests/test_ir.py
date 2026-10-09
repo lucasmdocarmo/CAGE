@@ -424,3 +424,103 @@ def test_ensure_ir_index_rebuilds_on_revision_drift_and_reuses_on_match(
     assert (index_dir / "faiss.index").read_bytes() != b"untouched"
     meta = json.loads((index_dir / "meta.json").read_text(encoding="utf-8"))
     assert meta["embedding_revision"] == _REV_B
+
+
+# ---------------------------------------------------------------------------
+# S0F-69: the cross-encoder reranker counts the pairs its tokenizer truncates
+# ---------------------------------------------------------------------------
+
+
+class _FakeCrossEncoder:
+    """sentence_transformers 5.x CrossEncoder stand-in: a 6-token input cap
+    under ``max_seq_length`` (``max_length`` is the deprecated alias that
+    warns on read, so the counter must not touch it) and a whitespace
+    tokenizer that adds three special tokens per pair."""
+
+    max_seq_length = 6
+
+    def __init__(self, model_name: str, device: str = "cpu") -> None:
+        self.model_name = model_name
+        self.device = device
+        self.calls: list = []
+
+        def _tokenize(q, t, truncation=False, verbose=True):
+            self.calls.append((truncation, verbose))
+            return {"input_ids": list(range(len(q.split()) + len(t.split()) + 3))}
+
+        self.tokenizer = _tokenize
+
+    @property
+    def max_length(self):
+        raise AssertionError("the deprecated alias must not be read when max_seq_length exists")
+
+    def predict(self, pairs):
+        return [float(len(text)) for _query, text in pairs]
+
+
+def test_cross_encoder_reranker_counts_truncated_pairs(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.orchestration.ir import CrossEncoderReranker, IRHit
+
+    st_mod = types.ModuleType("sentence_transformers")
+    st_mod.CrossEncoder = _FakeCrossEncoder
+    monkeypatch.setitem(sys.modules, "sentence_transformers", st_mod)
+    reranker = CrossEncoderReranker("fake/cross-encoder")
+    assert reranker.max_length == 6
+    assert (reranker.scored_pairs, reranker.truncated_pairs) == (0, 0)
+
+    docs = [
+        types.SimpleNamespace(doc_id="short", text="one two"),            # 1 + 2 + 3 = 6: fits
+        types.SimpleNamespace(doc_id="long", text="one two three four"),  # 1 + 4 + 3 = 8: truncated
+    ]
+    index = types.SimpleNamespace(resolve_hits=lambda hits: docs)
+    out = reranker.rerank("q", [IRHit(doc_id="short", score=0.9), IRHit(doc_id="long", score=0.1)], index)
+    # the ranking is the model's score, unchanged by the count
+    assert [h.doc_id for h in out] == ["long", "short"]
+    assert (reranker.scored_pairs, reranker.truncated_pairs) == (2, 1)
+    # the count tokenizes untruncated and silences the long-sequence warning
+    assert reranker._model.calls == [(False, False), (False, False)]
+    reranker.rerank("q", [IRHit(doc_id="short", score=0.9)], index)
+    assert (reranker.scored_pairs, reranker.truncated_pairs) == (4, 2)  # cumulative over calls
+
+
+def test_reranker_input_cap_resolution_order() -> None:
+    from src.orchestration.ir import _reranker_input_cap
+
+    class New:  # sentence_transformers 5.x
+        max_seq_length = 512
+
+    class Old:  # releases that expose max_length alone
+        max_length = 384
+
+    class Sentinel:  # no cap on the model; the tokenizer reports a sentinel
+        pass
+
+    tok_real = types.SimpleNamespace(model_max_length=512)
+    tok_sentinel = types.SimpleNamespace(model_max_length=10**30)
+    assert _reranker_input_cap(New(), tok_sentinel) == 512
+    assert _reranker_input_cap(Old(), tok_sentinel) == 384
+    assert _reranker_input_cap(Sentinel(), tok_real) == 512
+    assert _reranker_input_cap(Sentinel(), tok_sentinel) is None
+    assert _reranker_input_cap(Sentinel(), None) is None
+
+
+def test_cross_encoder_reranker_without_a_tokenizer_counts_scored_pairs_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.orchestration.ir import CrossEncoderReranker, IRHit
+
+    class _Bare:
+        def __init__(self, model_name: str, device: str = "cpu") -> None:
+            pass
+
+        def predict(self, pairs):
+            return [1.0 for _ in pairs]
+
+    st_mod = types.ModuleType("sentence_transformers")
+    st_mod.CrossEncoder = _Bare
+    monkeypatch.setitem(sys.modules, "sentence_transformers", st_mod)
+    reranker = CrossEncoderReranker("fake/bare")
+    assert reranker.max_length is None
+    index = types.SimpleNamespace(resolve_hits=lambda hits: [types.SimpleNamespace(doc_id="a", text="x")])
+    reranker.rerank("q", [IRHit(doc_id="a", score=0.5)], index)
+    # the cap is unknown, so the count is unknown too: None, never 0 (the
+    # model still truncates at a cap this code cannot see; Fable review L2)
+    assert (reranker.scored_pairs, reranker.truncated_pairs) == (1, None)

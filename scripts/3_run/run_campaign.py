@@ -44,8 +44,10 @@ until their registrations land):
 
 - F1  locality (prefix ON, sub-pressure): B1-B12 × {vllm, sglang} × the four
   QA datasets — no budget/rate grid (one config per cell).
-- F1 HF oracle: EXACTLY the reduced 10-cell set {B3 × all 4 datasets;
-  B1, B2, B6 × squad_v2 + qasper} on the in-process hf engine.
+- F1 HF oracle: EXACTLY the reduced 8-cell set {B3 × all 4 datasets;
+  B1, B6 × squad_v2 + qasper} on the in-process hf engine (ADR-0152,
+  S0F-60: the oracle has no engine reuse, so a B2 oracle cell was B1 under
+  another name on the 2026-10-08 landing; dropped from the registration).
 - F2  pressure (prefix OFF): FRESH set × {vllm, sglang} × the session's
   registered factorial — session a: the FULL §6.1 5×6 factorial PLUS the
   §6.4 anchor fine r-grid (ANCHOR_FINE_BUDGET_LEVELS at the two chassis
@@ -66,14 +68,19 @@ until their registrations land):
 - F3  interaction (prefix ON × pressure): REUSE set × {vllm, sglang} × the
   §6.8 reduced 3×3 grid r ∈ {1.0, 0.5, 0.25} × {0.85, 0.95, 1.05}·λ*.
 - Replications: 3 measurement windows per grid point (D6 §6.3).
-- corpus-fresh prefix OFF (ADR-0103, owner decision 2026-09-16): B4 is
-  served with the engine prefix cache OFF through a PER-ARM RELAUNCH,
-  uniformly on every engine, in EVERY family (F1 and F3; PREFIX_OFF_ARMS,
-  consulted only via ``_prefix_off``). Its family carriage is unchanged
-  (REUSE bit, rides F3 beside B3). The runner's ``no_cache`` token only
-  labels telemetry, so before ADR-0103 B4 and B3 were served by one
-  prefix-ON server: the mislabeled-duplicate failure class. Cost: one extra
-  budget-free prefix-OFF relaunch per engine for F1; the F3 B4 cells share
+- prefix OFF arms (ADR-0103, owner decision 2026-09-16; extended by
+  ADR-0150, owner decision 2026-10-09, S0F-58): every arm the charter's
+  7.1 table marks reuse "off" (gold-fresh B1, corpus-fresh B4, retr-fresh
+  B5/B6, retr-comp B9, retr-trunc B11) is served with the engine prefix
+  cache OFF through a PER-ARM RELAUNCH, uniformly on every engine, in EVERY
+  family (PREFIX_OFF_ARMS, consulted only via ``_prefix_off``). Family
+  carriage is unchanged (B4's REUSE bit still rides F3 beside B3). The
+  runner's ``no_cache`` / ``rag`` tokens only label telemetry, so before
+  ADR-0103 B4 and B3, and before ADR-0150 B1 and B2 as well as B6 and B7,
+  were served by one prefix-ON server and were byte-identical serving twins
+  under different names (proven on the 2026-10-08 landing: identical
+  per-request cached-token sequences). Cost: one budget-free prefix-OFF
+  relaunch per engine for F1, shared by every OFF arm; the F3 B4 cells share
   the F2 plain prefix-OFF boundaries at the same r (F3 budgets are a subset
   of F2 budgets and family is not a serving dimension).
 - rerank pool (ADR-0104, owner decision 2026-09-16): B6 and every arm
@@ -666,17 +673,23 @@ PER_ROW_N_DECISION: str = (
     "step-down is an analysis-time realized-n policy, not a plan knob"
 )
 
-#: ADR-0103 (owner decision 2026-09-16): the arms served with the engine
-#: prefix cache OFF in EVERY family, through a per-arm RELAUNCH, uniformly on
-#: every engine. corpus-fresh (B4) recomputes the corpus block on every
-#: request: its runner token ``no_cache`` only LABELS telemetry
-#: (src/orchestration/baselines.py), so absent this rule B4 and B3 would be
+#: ADR-0103 (owner decision 2026-09-16) extended by ADR-0150 (owner decision
+#: 2026-10-09, S0F-58): the arms served with the engine prefix cache OFF in
+#: EVERY family, through a per-arm RELAUNCH, uniformly on every engine: every
+#: arm the charter's 7.1 table marks reuse "off". The runner tokens
+#: ``no_cache`` and ``rag`` only LABEL telemetry (src/orchestration/
+#: baselines.py), so absent this rule B1 and B2, B4 and B3, B6 and B7 would be
 #: served by the same prefix-ON server and differ by label alone (the
-#: mislabeled-duplicate failure class). Family carriage is unchanged: B4's
-#: REUSE bit still rides F3 beside B3 (cellspec._ARMS_BY_FAMILY). The rule
-#: is consulted ONLY through _prefix_off (sort key, serving-config identity,
-#: relaunch argv, cell serving record), never re-derived by a step builder.
-PREFIX_OFF_ARMS: FrozenSet[str] = frozenset({"corpus-fresh"})
+#: mislabeled-duplicate failure class; the 2026-10-08 landing showed gold-fresh
+#: and gold-reuse with identical per-request cached-token sequences). Family
+#: carriage is unchanged (cellspec._ARMS_BY_FAMILY). The rule is consulted ONLY
+#: through _prefix_off (sort key, serving-config identity, relaunch argv, cell
+#: serving record), never re-derived by a step builder. retr-store (B8) keeps
+#: the cache ON: its reuse is the external store, the charter's own column.
+PREFIX_OFF_ARMS: FrozenSet[str] = frozenset(
+    {"gold-fresh", "corpus-fresh", "retr-fresh", "retr-comp", "retr-trunc"}
+)
+PREFIX_OFF_ADRS: str = "ADR-0103, ADR-0150"
 
 #: The task text the operator sees on an enumerated-but-unrunnable DIST
 #: tp-overlay cell: the T3.1 TP env exists, but THIS session registered no
@@ -1570,7 +1583,6 @@ SESSION_GRIDS: Dict[str, SessionGrid] = {
         f1_datasets=QA_DATASETS,
         hf_oracle_cells=(
             ("B1", ("squad_v2", "qasper")),
-            ("B2", ("squad_v2", "qasper")),
             ("B3", QA_DATASETS),
             ("B6", ("squad_v2", "qasper")),
         ),
@@ -1630,7 +1642,7 @@ SESSION_GRIDS: Dict[str, SessionGrid] = {
     #   RULER tasks got, and registering it as ONE undifferentiated dataset
     #   would leave the subset an unregistered degree of freedom — named
     #   deferral, additive later.
-    # - HF oracle: the same reduced 10-cell slice as session a (batch-1
+    # - HF oracle: the same reduced 8-cell slice as session a (batch-1
     #   device_map rides the same 4-GPU box, §7.7(e); the charter pins no
     #   Group-B-specific oracle density — conservative reuse of the anchor
     #   slice).
@@ -1648,7 +1660,6 @@ SESSION_GRIDS: Dict[str, SessionGrid] = {
         f1_datasets=QA_DATASETS,
         hf_oracle_cells=(
             ("B1", ("squad_v2", "qasper")),
-            ("B2", ("squad_v2", "qasper")),
             ("B3", QA_DATASETS),
             ("B6", ("squad_v2", "qasper")),
         ),
@@ -2320,16 +2331,17 @@ def enumerate_cells(grid: SessionGrid) -> List[PlannedCell]:
 def _prefix_off(spec: CellSpec) -> bool:
     """The ONE prefix-cache rule: a cell serves with the engine prefix cache
     OFF when its family is F2 (the prefix-OFF pressure family) OR its arm is
-    in PREFIX_OFF_ARMS (ADR-0103: corpus-fresh, B4, in every family); every
-    other cell serves ON.
+    in PREFIX_OFF_ARMS (ADR-0103 and ADR-0150: the charter's reuse-off arms,
+    in every family); every other cell serves ON.
 
-    ADR-0103 closes a mislabeled-duplicate exposure (the failure class the
-    module docstring names): the B4 runner token ``no_cache`` only labels
-    telemetry, so without this clause B4 and B3 shared one prefix-ON server
-    and were byte-identical serving twins under different names. Making the
-    prefix mode part of the arm's serving config gives B4 its own relaunch
-    group (the grouping key already carries prefix_off) while its family
-    carriage is untouched.
+    ADR-0103 closed the mislabeled-duplicate exposure for B4 and ADR-0150
+    closes it for B1, B5/B6, B9 and B11 (the failure class the module
+    docstring names): the runner tokens only label telemetry, so without
+    this clause each fresh arm shared one prefix-ON server with its reuse
+    twin and the pair were byte-identical serving twins under different
+    names. Making the prefix mode part of the arm's serving config gives the
+    OFF arms their own relaunch group (the grouping key already carries
+    prefix_off) while their family carriage is untouched.
     """
     return spec.family == "F2" or spec.arm in PREFIX_OFF_ARMS
 
@@ -3064,9 +3076,9 @@ def _stale_plan_problems(
     - ADR-0102: a server-engine cell carries --reset-cache-between-trials
       and --warmup-pool-queries == WARMUP_POOL_QUERIES (the VALUE, not just
       the flag).
-    - ADR-0103: the cell's serving record and the relaunch it runs under
-      agree with ``_prefix_off`` (the one prefix rule): prefix_mode and
-      the launcher's --no-prefix-cache.
+    - ADR-0103 and ADR-0150: the cell's serving record and the relaunch it
+      runs under agree with ``_prefix_off`` (the one prefix rule): prefix_mode
+      and the launcher's --no-prefix-cache.
     - ADR-0104: a 'rerank' cell carries --rerank-pool RERANK_POOL; every
       other retriever carries no pool.
     - ADR-0106: a corpus-trunc cell carries --corpus-rung and
@@ -3361,13 +3373,13 @@ def _stale_plan_problems(
             problems.append(
                 f"{label}: cell {row!r} serving.prefix_mode is "
                 f"{serving.get('prefix_mode')!r} but the one prefix rule "
-                f"(_prefix_off, ADR-0103) says {expected_mode}" + stale
+                f"(_prefix_off, ADR-0103 and ADR-0150) says {expected_mode}" + stale
             )
         if step.get("blocked_on") is None:
             if preceding_relaunch is None:
                 problems.append(
                     f"{label}: executable server cell {row!r} has no relaunch "
-                    "step before it (ADR-0103: the serving config is a relaunch "
+                    "step before it (ADR-0103 and ADR-0150: the serving config is a relaunch "
                     "boundary)" + stale
                 )
             else:
@@ -3384,7 +3396,7 @@ def _stale_plan_problems(
                         f"{label}: cell {row!r} needs prefix {expected_mode} but "
                         "its relaunch argv "
                         + ("carries" if "--no-prefix-cache" in r_argv else "lacks")
-                        + " --no-prefix-cache (ADR-0103)" + stale
+                        + " --no-prefix-cache (ADR-0103 and ADR-0150)" + stale
                     )
                 # Batch 2 W2 (review F1): the endpoint the cell dials is the
                 # one the relaunch it runs under serves on.
@@ -4184,10 +4196,11 @@ def build_plan(
             "reset_cache_per_window": RESET_CACHE_PER_WINDOW,
             "warmup_pool_queries": WARMUP_POOL_QUERIES,
             "cold_start_adr": "ADR-0102",
-            # ADR-0103: the arms served prefix OFF by relaunch in every
-            # family (corpus-fresh); F2 stays the prefix-OFF family.
+            # ADR-0103 and ADR-0150: the arms served prefix OFF by relaunch
+            # in every family (the charter's reuse-off arms); F2 stays the
+            # prefix-OFF family.
             "prefix_off_arms": sorted(PREFIX_OFF_ARMS),
-            "prefix_off_adr": "ADR-0103",
+            "prefix_off_adr": PREFIX_OFF_ADRS,
             # ADR-0055 (Batch 2 W1): every cell env pins decoupled scoring;
             # re-checked per cell by load_plan.
             "quality_scoring": "decoupled",
