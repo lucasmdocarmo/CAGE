@@ -407,9 +407,9 @@ def test_merged_series_empty_run_writes_nothing(tmp_path: Path):
 # differential baseline: legacy input must keep producing EXACTLY these
 # loader columns/values and regime numbers.
 _LEGACY_RECORDS = [
-    {"ts": 2.0, "kv_usage": 0.5, "preemptions_total": 5},
-    {"ts": 6.0, "kv_usage": 1.0, "preemptions_total": 5},
-    {"ts": 8.0, "kv_usage": 0.8, "preemptions_total": 9},
+    {"ts": 2.0, "kv_usage": 0.5, "preemptions_total": 5, "waiting": 0},
+    {"ts": 6.0, "kv_usage": 1.0, "preemptions_total": 5, "waiting": 3},
+    {"ts": 8.0, "kv_usage": 0.8, "preemptions_total": 9, "waiting": 2},
 ]
 
 
@@ -428,18 +428,22 @@ def test_loader_legacy_file_keeps_exact_pre_t41_columns(tmp_path: Path):
     frame = cl.load_telemetry_series(
         _write_series(tmp_path / "s.jsonl", _LEGACY_RECORDS)
     )
-    # Differential pin: column set AND values identical to pre-T4.1 output.
-    assert list(frame.columns) == ["ts_s", "kv_cache_usage", "preemptions_total"]
+    # Differential pin: column set AND values identical to pre-T4.1 output,
+    # plus the ADR-0153 queue gauge column (deliberate pin update 2026-10-09:
+    # the §6.1 clause (b) reads ``waiting``; an untagged file still never
+    # carries an ``instance`` column).
+    assert list(frame.columns) == ["ts_s", "kv_cache_usage", "preemptions_total", "waiting"]
     assert frame["ts_s"].tolist() == [2.0, 6.0, 8.0]
     assert frame["kv_cache_usage"].tolist() == [0.5, 1.0, 0.8]
     assert frame["preemptions_total"].tolist() == [5, 5, 9]
+    assert frame["waiting"].tolist() == [0, 3, 2]
 
 
 def test_loader_surfaces_instance_column_when_any_record_tagged(tmp_path: Path):
     records = _tagged(_LEGACY_RECORDS[:2], "prefill") + [_LEGACY_RECORDS[2]]
     frame = cl.load_telemetry_series(_write_series(tmp_path / "s.jsonl", records))
     assert list(frame.columns) == [
-        "ts_s", "kv_cache_usage", "preemptions_total", "instance"
+        "ts_s", "kv_cache_usage", "preemptions_total", "waiting", "instance"
     ]
     assert frame["instance"].tolist()[:2] == ["prefill", "prefill"]
     # The untagged record is surfaced as a hole, not hidden or coerced.
@@ -526,9 +530,9 @@ def test_regime_bridge_accepts_one_distinct_role(tmp_path: Path):
 def test_single_sampler_end_to_end_unchanged(tmp_path: Path):
     sampler = _sampler_with(
         [
-            {"kv_usage": 0.5, "preemptions_total": 5},
-            {"kv_usage": 1.0, "preemptions_total": 5},
-            {"kv_usage": 0.8, "preemptions_total": 9},
+            {"kv_usage": 0.5, "preemptions_total": 5, "waiting": 0},
+            {"kv_usage": 1.0, "preemptions_total": 5, "waiting": 3},
+            {"kv_usage": 0.8, "preemptions_total": 9, "waiting": 2},
         ],
         [2.0, 6.0, 8.0],
     )  # default role="single" — today's one-sampler wiring, forward-written

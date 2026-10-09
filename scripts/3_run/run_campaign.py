@@ -311,7 +311,7 @@ import sys
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -338,7 +338,20 @@ from src.orchestration.cache_budget import (  # noqa: E402
 from src.orchestration.calibration import (  # noqa: E402
     FLOOR_N_REQUESTS,
     FLOOR_STATISTIC,
+    PROBE_ATTAINMENT_MIN,
+    PROBE_BISECT_STEPS,
+    PROBE_LADDER_FACTOR,
+    PROBE_MAX_STEPS,
+    PROBE_WARMUP_S,
+    PROBE_WINDOW_S,
     PROCEDURE_VERSION,
+    START_QPS_RULE,
+    CalibrationError,
+    FloorMeasurement,
+    ProbeStep,
+    decide_lambda_star,
+    floor_start_qps,
+    geometric_rate_ladder,
 )
 from src.orchestration.campaign_session import ENGINE_OF_BACKEND  # noqa: E402
 from src.orchestration.load_generator import (  # noqa: E402
@@ -357,16 +370,21 @@ __all__ = [
     "SESSION_GRIDS",
     "PlannedCell",
     "CalibrationFloor",
+    "RungCalibration",
+    "budgeted_rungs",
     "build_plan",
     "budget_plan_record",
+    "calibrate_rungs",
     "cell_num_queries",
     "class_n",
     "classify_row",
+    "demand_seq_tokens",
     "engine_api_base",
     "enumerate_cells",
     "load_calibration",
     "load_floor_table",
     "load_plan",
+    "load_rung_calibration",
     "main",
     "parse_calibration_args",
     "plan_launchers",
@@ -455,7 +473,18 @@ __all__ = [
 # before V3 is refused by _stale_plan_problems (its window cells would refuse
 # at the runner's replay guard, or replay under CAGE_ALLOW_REPLAY=1), so the
 # operator re-plans.
-PLAN_SCHEMA = "cage-campaign-plan-v5"
+# v6 (2026-10-09, Batch B, ADR-0153/0154/0155, per the v2 precedent): cell
+# steps gained the REQUIRED keys ``demand_class`` (the per-arm demand class
+# the serving budget was sized on, S0F-63), ``lambda_star_rps``,
+# ``lambda_star_source`` and ``lambda_kv_pred_rps`` (the offered-rate basis is
+# the rung calibration measured on the cell's own workload, S0F-62; the floor
+# table's KV-bound rate is recorded as the P6 prediction, never offered);
+# relaunch steps gained ``demand_class``; the plan gained the step kind
+# ``dry_window`` (one per engine and demand class, S0F-61) and the header
+# ``rung_calibration`` and ``demand_classes``. A v5 plan carries the pending
+# KV-bound rates the 2026-10-08 landing ran 3 to 6 times below capacity on,
+# so 'run' refuses it and the operator re-plans with the rung artifacts.
+PLAN_SCHEMA = "cage-campaign-plan-v6"
 FLOOR_TABLE_SCHEMA = "floor-table-v1"
 
 #: §6.1 pre-registered budget ratios r = B/D (Group-A anchor factorial; r=1.5
@@ -1052,8 +1081,115 @@ EXIT_STOP_FAILED: int = 2
 WINDOW_BOUND: str = "arrival-count"
 WINDOW_BOUND_FINDING: str = "Batch 1 V3"
 
+#: The floor table's own basis label for its KV-bound rate (build_floor_table
+#: LAMBDA_STAR_BASIS). Since ADR-0154 that rate is RECORDED on every pressure
+#: cell as the P6 prediction (``lambda_kv_pred_rps``) and never offered: the
+#: 2026-10-08 landing offered it (3 to 6 times below the measured capacity on
+#: a 4.0 s assumed service time) and no window reached the regime.
 _LAMBDA_PENDING_BASIS = "kv-bound-only [pending calibration]"
-_LAMBDA_CALIBRATED_BASIS = "calibrated min(lambda_KV, lambda_compute)"
+#: ADR-0154 (owner GO 2026-10-09, S0F-62): the offered rate of a pressure cell
+#: is rate_frac x lambda*(engine, r) MEASURED by ``calibrate-rungs`` on the
+#: gold-fresh F2 workload of the session, under the relaunch the plan itself
+#: emits for that rung (prefix OFF, the gold demand class's byte budget), with
+#: the registered cal-v2 ladder rule. The two basis labels every pressure cell
+#: carries: the gold class offers the measured value; every other demand
+#: class derives its lambda* from the gold rung by the served-token ratio
+#: s_gold / s_class (prefill work per sequence scales with tokens; [D], checked
+#: live by the class's dry window, ADR-0153).
+LAMBDA_BASIS_RUNG = "cal-v2 rung ESTIMATED (gold-fresh F2 workload, this engine, this r)"
+LAMBDA_BASIS_DERIVED = (
+    "derived: gold-fresh rung lambda* x served-token ratio s_gold/s_class [D]; "
+    "checked live by the dry window (ADR-0153)"
+)
+RUNG_CALIBRATION_SCHEMA = "cage-rung-calibration-v1"
+RUNG_CALIBRATION_ADR = "ADR-0154"
+RUNG_CALIBRATION_FINDING = "S0F-62"
+#: The ladder's first rung on the loosest budget: the floor's single-stream
+#: service rate (START_QPS_RULE) at this decode length. The campaign's QA
+#: answers stop at the newline (17 to 29 output tokens on the landing's vLLM
+#: rows; 256 is the runner's cap, not the served length), so the registered
+#: rule at 256 tokens would start a 25 minute climb from 0.35 qps. 32 tokens
+#: is the sizing input of the FIRST rung only; the climb finds lambda*.
+LADDER_START_DECODE_TOKENS: int = 32
+#: Tighter rungs start the climb below the looser rung's lambda* (lambda*
+#: cannot rise as the budget shrinks): two ladder steps below it.
+LADDER_CHAIN_DIVISOR: float = PROBE_LADDER_FACTOR ** 2
+#: Calibration windows replay the measured pool past W arrivals when the
+#: ladder rate x PROBE_WINDOW_S exceeds the pool; calibration data never
+#: enters confirmatory analysis (calibration.py doctrine), so the runner's
+#: labeled non-confirmatory switch rides every ladder step.
+LADDER_REPLAY_ENV = "CAGE_ALLOW_REPLAY"
+
+#: ADR-0155 (owner GO 2026-10-09, S0F-63): per-arm DEMAND CLASSES. Charter
+#: §6.1 sizes D at the target concurrency "per §7.6.1 cell family"; the floor
+#: table carries ONE shape (the gold passages), so at the same byte budget a
+#: retrieval arm (about a quarter of the tokens) held four times the sequences
+#: and never filled its pool (fig04 of the landing: KV usage under 0.25 on
+#: three of F2's four arms). Each arm's demand is the floor table's demand
+#: scaled by its served sequence tokens: D_class = floor(D_floor x s_class /
+#: s_floor), the same arithmetic as cache_budget.demand_bytes (D is linear in
+#: the sequence length), so the gold class stays byte-identical to the floor
+#: table and every class holds the same number of sequences at a given r.
+#: The values are MEASURED means of prompt plus output tokens over the Qasper
+#: windows of the 2026-10-08 landing (experiments/S0/2026-10-08_1322, Qwen3-14B
+#: tokenizer, vLLM output counts; the SGLang rows served 2 tokens of thinking
+#: scaffolding, S0F-59). retr-store (B8) launched on no engine of that landing
+#: and takes retr-fresh's shape (the same ranked retrieval, B8 = B6 plus the
+#: store). corpus-trunc is per rung (the rung IS the served block).
+DEMAND_CLASS_ADR = "ADR-0155"
+DEMAND_CLASS_FINDING = "S0F-63"
+DEMAND_SEQ_TOKENS_SOURCE = (
+    "mean served sequence tokens (prompt + output) over the Qasper windows of "
+    "experiments/S0/2026-10-08_1322 (Qwen/Qwen3-14B tokenizer, vLLM output "
+    "counts); retr-store takes retr-fresh's shape [D]"
+)
+DEMAND_SEQ_TOKENS_2026_10_08: Dict[str, int] = {
+    "gold-fresh": 4779,
+    "gold-reuse": 4779,
+    "corpus-fresh": 2336,
+    "corpus-reuse": 2336,
+    "corpus-comp": 2336,
+    "retr-fresh": 1127,
+    "retr-reuse": 1126,
+    "retr-store": 1127,
+    "retr-comp": 702,
+    "retr-trunc": 348,
+}
+CORPUS_TRUNC_DEMAND_SEQ_TOKENS_2026_10_08: Dict[int, int] = {1400: 1205, 700: 480}
+#: The anchor arm of the floor table: its registered shape must equal the
+#: floor table's ``avg_seq_tokens`` (the P6 artifact and the registration
+#: describe the same sequence) or the plan refuses.
+DEMAND_ANCHOR_ARM = "gold-fresh"
+
+#: ADR-0153 (owner GO 2026-10-09, S0F-61): the DRY WINDOW. One per budgeted
+#: serving configuration minus r (engine, prefix mode, demand class, kv dtype,
+#: connector, topology) with pressure cells, planned at the head of its first
+#: budgeted relaunch (the tightest r the class is carried at, since budgets
+#: sort ascending): the class's first pressure cell at that r, offered at
+#: DRY_WINDOW_RATE_FRAC x lambda*, one window, written to the sibling run root
+#: ``<run_id>-dry`` (the campaign tree never sees it). Its regime.json must
+#: read IN_REGIME; any other label fails every pressure cell of that (engine,
+#: class) with a named sentinel, the budget-free cells still run, and the exit
+#: code is EXIT_DRY_WINDOW_FAILED. Owner-delegated decision 2026-10-09: the
+#: class fails and the run continues (F1 data does not depend on lambda*).
+DRY_WINDOW_RATE_FRAC: float = 0.95
+assert DRY_WINDOW_RATE_FRAC in D6_RATE_FRACTIONS and DRY_WINDOW_RATE_FRAC in D6_REDUCED_RATE_FRACTIONS, (
+    "the dry window rate must be a registered dispatcher fraction on every grid"
+)
+DRY_WINDOW_EXPECTED_LABEL = "IN_REGIME"
+DRY_WINDOW_ROOT_SUFFIX = "-dry"
+#: ADR-0153 (review MEDIUM 6, 2026-10-09): the dry window runs in DURATION
+#: mode for the registered probe window length with the pool replayed
+#: (non-confirmatory, like the ladder), so its regime reading rests on 60 or
+#: more sampler ticks whatever the class's derived rate; a W-arrival window
+#: at the small classes' rates would span a few seconds (S0F-68).
+DRY_WINDOW_DURATION_S: float = PROBE_WINDOW_S
+DRY_WINDOW_ADR = "ADR-0153"
+DRY_WINDOW_FINDING = "S0F-61"
+DRY_WINDOW_GATE = "dry window: the first window of this engine and demand class must read IN_REGIME"
+#: run's exit code when every executed cell passed but a dry window failed
+#: its class (distinct from 1, a failed cell, and 2, a failed engine stop).
+EXIT_DRY_WINDOW_FAILED: int = 3
 
 _PRESSURE_FAMILIES = frozenset({"F2", "F3"})
 
@@ -1322,9 +1458,63 @@ class SessionGrid:
     primary_engine: str = PRIMARY_ENGINE
     primary_baselines: Tuple[str, ...] = PRIMARY_BASELINES
     achievable_n: Mapping[str, int] = field(default_factory=dict)
+    # ADR-0155 demand classes: arm -> mean served sequence tokens (prompt +
+    # output) the arm's byte budget is sized on, and the per-rung shapes of
+    # the corpus-trunc ladder. Registered per session; the defaults are the
+    # 2026-10-08 landing's measurements with the Qwen3-14B tokenizer. On
+    # session b (Llama-3.3-70B) the same counts are registered [A: the Llama
+    # tokenizer counts the same passages within about 10 percent; re-measure
+    # at the session b rehearsal], visible in the plan header.
+    demand_seq_tokens: Mapping[str, int] = field(
+        default_factory=lambda: dict(DEMAND_SEQ_TOKENS_2026_10_08)
+    )
+    corpus_trunc_demand_seq_tokens: Mapping[int, int] = field(
+        default_factory=lambda: dict(CORPUS_TRUNC_DEMAND_SEQ_TOKENS_2026_10_08)
+    )
 
     def __post_init__(self) -> None:
         problems: List[str] = []
+        # ADR-0155: every entry an integer >= 1; the anchor arm present; one
+        # shape per registered corpus-trunc rung.
+        if not isinstance(self.demand_seq_tokens, Mapping) or not self.demand_seq_tokens:
+            problems.append(
+                f"demand_seq_tokens={self.demand_seq_tokens!r} must be a non-empty "
+                f"mapping arm -> served sequence tokens ({DEMAND_CLASS_ADR})"
+            )
+        else:
+            for arm, value in self.demand_seq_tokens.items():
+                if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                    problems.append(
+                        f"demand_seq_tokens[{arm!r}]={value!r} must be an integer >= 1"
+                    )
+            if DEMAND_ANCHOR_ARM not in self.demand_seq_tokens:
+                problems.append(
+                    f"demand_seq_tokens lacks the anchor arm {DEMAND_ANCHOR_ARM!r} "
+                    f"(the floor table's shape, {DEMAND_CLASS_ADR})"
+                )
+        if not isinstance(self.corpus_trunc_demand_seq_tokens, Mapping):
+            problems.append(
+                f"corpus_trunc_demand_seq_tokens={self.corpus_trunc_demand_seq_tokens!r} "
+                "must be a mapping rung -> served sequence tokens"
+            )
+        else:
+            for rung, value in self.corpus_trunc_demand_seq_tokens.items():
+                if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                    problems.append(
+                        f"corpus_trunc_demand_seq_tokens[{rung!r}]={value!r} must be an "
+                        "integer >= 1"
+                    )
+            if isinstance(self.corpus_trunc_budgets, tuple):
+                missing_rungs = [
+                    r for r in self.corpus_trunc_budgets
+                    if r not in self.corpus_trunc_demand_seq_tokens
+                ]
+                if missing_rungs:
+                    problems.append(
+                        f"corpus_trunc_demand_seq_tokens lacks the registered rung(s) "
+                        f"{missing_rungs} ({DEMAND_CLASS_ADR}: the rung is the served "
+                        "block, so each rung is its own demand class)"
+                    )
         # A9 per-row N registration (fail closed on shapes; the classifier
         # and the manifest-coverage check refuse per cell at plan time).
         for name in ("n_primary", "n_secondary", "n_identity", "window_requests"):
@@ -1822,7 +2012,14 @@ def rehearsal_grid(
 
 @dataclass(frozen=True)
 class FloorTable:
-    """Validated floor-table-v1 content: demand + λ* rows keyed by r."""
+    """Validated floor-table-v1 content: demand + λ* rows keyed by r.
+
+    ``avg_seq_tokens`` and ``concurrency_target`` are the shape the demand D
+    was sized on (``generated_inputs``; None when the artifact predates the
+    fields). ADR-0155: the plan refuses a budgeted cell unless
+    ``avg_seq_tokens`` equals the registered anchor arm's served tokens, and
+    scales D per demand class from it.
+    """
 
     path: Path
     sha256: str
@@ -1831,6 +2028,8 @@ class FloorTable:
     kv_dtype: str
     grid: str
     rows: Dict[float, Dict[str, Any]]
+    avg_seq_tokens: Optional[int] = None
+    concurrency_target: Optional[int] = None
 
     def row(self, r: float) -> Dict[str, Any]:
         for key, row in self.rows.items():
@@ -1888,6 +2087,15 @@ def load_floor_table(path: Path) -> FloorTable:
                 bad = True
         if not bad:
             rows[float(row["r"])] = row
+    shape: Dict[str, Optional[int]] = {}
+    for key in ("avg_seq_tokens", "concurrency_target"):
+        value = inputs.get(key)
+        if value is None:
+            shape[key] = None
+        elif isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            problems.append(f"generated_inputs.{key}={value!r} must be an integer >= 1")
+        else:
+            shape[key] = value
     if problems:
         raise PlanError(f"floor table {path}: " + "; ".join(problems))
     return FloorTable(
@@ -1898,6 +2106,8 @@ def load_floor_table(path: Path) -> FloorTable:
         kv_dtype=str(inputs.get("kv_dtype")),
         grid=str(inputs.get("grid")),
         rows=rows,
+        avg_seq_tokens=shape.get("avg_seq_tokens"),
+        concurrency_target=shape.get("concurrency_target"),
     )
 
 
@@ -2057,17 +2267,23 @@ def budget_plan_record(
     plan: BudgetPlan,
     floor: FloorTable,
     pd_roles: Optional[Mapping[str, Any]] = None,
+    seq_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     """The cell.json ``budget_plan`` record: the full BudgetPlan (asdict) plus
-    the floor table's sha256 (the demand source) and, on the pd stack, the
-    relaunch's role record (``pd_roles``: the §6.5 pools, the per-rank
-    slices the launcher was given and the expected realized total, review
-    F6; the BudgetPlan itself is per POOL, tp=1), JSON-normalized ONCE so the
-    relaunch step, the cell step and the env pin are the same object. The
-    consumer reads ``budget_bytes_total`` and ``kv_dtype``; the launched
-    knobs are ``engine_args`` (single/tp) or ``pd_roles`` (pd)."""
+    the floor table's sha256 (the demand source), the demand class's served
+    tokens (``avg_seq_tokens``, ADR-0155: the shape the record's
+    ``demand_bytes`` was scaled to) and, on the pd stack, the relaunch's role
+    record (``pd_roles``: the §6.5 pools, the per-rank slices the launcher was
+    given and the expected realized total, review F6; the BudgetPlan itself is
+    per POOL, tp=1), JSON-normalized ONCE so the relaunch step, the cell step
+    and the env pin are the same object. The consumer reads
+    ``budget_bytes_total`` and ``kv_dtype``; the launched knobs are
+    ``engine_args`` (single/tp) or ``pd_roles`` (pd)."""
     record = asdict(plan)
     record["floor_table_sha256"] = floor.sha256
+    if seq_tokens is not None:
+        record["avg_seq_tokens"] = int(seq_tokens)
+        record["demand_class_adr"] = DEMAND_CLASS_ADR
     if pd_roles is not None:
         record["pd_roles"] = dict(pd_roles)
     return json.loads(json.dumps(record))
@@ -2347,9 +2563,76 @@ def _prefix_off(spec: CellSpec) -> bool:
 
 
 def _coord_key(value: Optional[float]) -> Tuple[int, float]:
-    # None (sub-pressure) sorts BEFORE any budget so each engine's F1 block
-    # runs first on the plain (budget-free) server config.
-    return (0, 0.0) if value is None else (1, float(value))
+    # ADR-0153 pressure-first order: budgets sort ASCENDING (the tightest r
+    # first, where each demand class's dry window runs) and None (sub-pressure,
+    # the budget-free server config) sorts LAST, so an engine's pressure groups
+    # and their dry windows run before its F1 block. Before Batch B the F1
+    # block ran first and the first pressure window came hours in.
+    return (1, 0.0) if value is None else (0, float(value))
+
+
+def _is_budgeted(spec: CellSpec) -> bool:
+    """A cell whose serving stack launches under a byte budget: a pressure
+    coordinate (F2/F3) or the DIST overlay at the registered dist_budget_r."""
+    return spec.budget_r is not None or spec.topology in ("tp", "pd")
+
+
+def demand_seq_tokens(grid: SessionGrid, spec: CellSpec) -> int:
+    """ADR-0155: the served sequence tokens of a cell's DEMAND CLASS, from the
+    session's registration: the arm's entry, or the rung's entry for a
+    corpus-trunc cell (the rung is the served block). An arm with no entry
+    refuses: a budget sized on another arm's shape is the S0F-63 defect.
+    RULER cells are gold-fresh cells (the instrument rides the twin's class)."""
+    if spec.arm == CORPUS_TRUNC_ARM:
+        rung = spec.corpus_budget_tokens
+        value = (
+            grid.corpus_trunc_demand_seq_tokens.get(rung) if rung is not None else None
+        )
+        if value is None:
+            raise PlanError(
+                f"corpus-trunc rung {rung!r} has no registered demand class "
+                f"(SessionGrid.corpus_trunc_demand_seq_tokens, {DEMAND_CLASS_ADR})"
+            )
+        return int(value)
+    value = grid.demand_seq_tokens.get(spec.arm)
+    if value is None:
+        raise PlanError(
+            f"arm {spec.arm!r} has no registered demand class "
+            f"(SessionGrid.demand_seq_tokens, {DEMAND_CLASS_ADR}, {DEMAND_CLASS_FINDING}): "
+            "a budget sized on another arm's shape is the mislabeled-pressure "
+            "defect of the 2026-10-08 landing"
+        )
+    return int(value)
+
+
+def _class_demand_bytes(demand_floor: int, seq_tokens: int, anchor_tokens: int) -> int:
+    """D_class = floor(D_floor x s_class / s_anchor): the floor table's demand
+    scaled by the served-token ratio (D is linear in the sequence length,
+    cache_budget.demand_bytes). Exact for the anchor class (ratio 1)."""
+    return (int(demand_floor) * int(seq_tokens)) // int(anchor_tokens)
+
+
+def _check_floor_shape(grid: SessionGrid, floor: FloorTable) -> int:
+    """ADR-0155: the P6 artifact and the registration must describe the same
+    anchor sequence; returns the anchor's served tokens."""
+    anchor = int(grid.demand_seq_tokens[DEMAND_ANCHOR_ARM])
+    if floor.avg_seq_tokens is None:
+        raise PlanError(
+            f"floor table {floor.path} carries no generated_inputs.avg_seq_tokens: "
+            f"the demand classes ({DEMAND_CLASS_ADR}) scale D from the shape the "
+            "table was sized on; rebuild it with build_floor_table.py "
+            f"--avg-seq-tokens {anchor}"
+        )
+    if floor.avg_seq_tokens != anchor:
+        raise PlanError(
+            f"floor table {floor.path} was sized on avg_seq_tokens="
+            f"{floor.avg_seq_tokens} but session {grid.session!r} registers "
+            f"{anchor} served tokens for the anchor arm {DEMAND_ANCHOR_ARM!r} "
+            f"({DEMAND_CLASS_ADR}: {DEMAND_SEQ_TOKENS_SOURCE}); rebuild the table "
+            f"with --avg-seq-tokens {anchor} (profile FLOOR_AVG_SEQ_TOKENS) or "
+            "re-register the shape"
+        )
+    return anchor
 
 
 def _lever_key(value: Optional[str]) -> str:
@@ -2358,16 +2641,27 @@ def _lever_key(value: Optional[str]) -> str:
     return "" if value is None else value
 
 
-def _sort_key(cell: PlannedCell) -> Tuple[Any, ...]:
+def _demand_class_key(grid: SessionGrid, spec: CellSpec) -> Tuple[int, int]:
+    # A budget-free config has no demand class; budgeted configs group by
+    # their class's served tokens (ADR-0155: the class is a serving-config
+    # dimension because the byte budget differs per class at one r), the
+    # LARGEST class first: the anchor (gold) leads each budget and the B12
+    # corpus-trunc rungs keep their ADR-0106 descending ladder order.
+    return (1, -demand_seq_tokens(grid, spec)) if _is_budgeted(spec) else (0, 0)
+
+
+def _sort_key(cell: PlannedCell, grid: SessionGrid) -> Tuple[Any, ...]:
     """Relaunch-minimizing order:
-    (engine, prefix_mode, model, budget_r, kv_dtype, connector, rate).
+    (engine, topology, prefix_mode, model, budget_r, demand class, kv_dtype,
+    connector, rate).
 
     The launch levers (kv_dtype, connector) sort BEFORE rate: they are part
     of the serving config while rate is client-side, so lever-bearing cells
     must group contiguously across rate levels or every rate change would
-    straddle a lever boundary and force extra relaunches. Trailing components
-    (family, baseline number, dataset) only make the order
-    total/deterministic — they never split a serving config.
+    straddle a lever boundary and force extra relaunches. The demand class
+    (ADR-0155) sits beside the budget: at one r each class launches its own
+    byte budget. Trailing components (family, baseline number, dataset) only
+    make the order total/deterministic — they never split a serving config.
     """
     spec = cell.spec
     return (
@@ -2379,6 +2673,7 @@ def _sort_key(cell: PlannedCell) -> Tuple[Any, ...]:
         1 if _prefix_off(spec) else 0,
         spec.model,
         _coord_key(spec.budget_r),
+        _demand_class_key(grid, spec),
         _lever_key(ARM_KV_DTYPE.get(spec.arm)),
         _lever_key(ARM_CONNECTOR.get(spec.arm)),
         _coord_key(spec.rate_frac),
@@ -2397,13 +2692,14 @@ def _sort_key(cell: PlannedCell) -> Tuple[Any, ...]:
     )
 
 
-#: (engine, prefix_off, model, budget_r, kv_dtype, connector, topology)
+#: (engine, prefix_off, model, budget_r, demand-class seq_tokens, kv_dtype,
+#: connector, topology)
 _ServingConfig = Tuple[
-    str, bool, str, Optional[float], Optional[str], Optional[str], str
+    str, bool, str, Optional[float], Optional[int], Optional[str], Optional[str], str
 ]
 
 
-def _serving_config(cell: PlannedCell) -> Optional[_ServingConfig]:
+def _serving_config(cell: PlannedCell, grid: SessionGrid) -> Optional[_ServingConfig]:
     """The relaunch-boundary identity; None for the in-process hf oracle.
 
     Rate is CLIENT-side load (never a server dial), so it is deliberately
@@ -2412,7 +2708,10 @@ def _serving_config(cell: PlannedCell) -> Optional[_ServingConfig]:
     (run_compression.sh / run_kv_store.sh apply them at launch), so they are
     relaunch-boundary dimensions — and so is topology (T3.2: a pd stack is a
     different process set than a single server; sharing a boundary would run
-    one topology's cells against the other's serving stack).
+    one topology's cells against the other's serving stack). ADR-0155: the
+    demand class (served sequence tokens) is one too on budgeted configs: the
+    byte budget at one r differs per class, so two classes cannot share a
+    server; a budget-free config carries None.
     """
     spec = cell.spec
     if spec.engine == "hf":
@@ -2422,6 +2721,7 @@ def _serving_config(cell: PlannedCell) -> Optional[_ServingConfig]:
         _prefix_off(spec),
         spec.model,
         spec.budget_r,
+        demand_seq_tokens(grid, spec) if _is_budgeted(spec) else None,
         ARM_KV_DTYPE.get(spec.arm),
         ARM_CONNECTOR.get(spec.arm),
         spec.topology,
@@ -2554,24 +2854,31 @@ def _budget_env(
     floor: FloorTable,
     served_kv_dtype: Optional[str] = None,
     tp: int = 1,
+    *,
+    seq_tokens: int,
+    anchor_tokens: int,
 ) -> Tuple[Dict[str, str], int]:
     """Launcher budget env for one serving config, via cache_budget.plan_budget.
 
     Demand comes from the floor table row at this r (T2.4 is the ONE demand
-    source); the primary knob of the resulting BudgetPlan maps onto the
-    launcher env (frozen contract). The BYTE budget stays anchored to
-    floor(r × D) for every config at the same r (the iso-bytes comparison
-    anchor that makes B10's double-saving measurable), but token-denominated
+    source), scaled to the relaunch's DEMAND CLASS (ADR-0155: D_class =
+    floor(D_floor x seq_tokens / anchor_tokens); the anchor class is
+    byte-identical to the table); the primary knob of the resulting
+    BudgetPlan maps onto the launcher env (frozen contract). The BYTE budget
+    stays anchored to floor(r × D_class) for every config of one class at the
+    same r (the iso-bytes comparison anchor that makes B10's double-saving
+    measurable: B10 and B3 share the corpus class), but token-denominated
     dials (SGLang --max-total-tokens) must convert bytes at the SERVED KV
     dtype — an fp8 server planned with bf16 arithmetic would realize only
     HALF the byte budget (§6.5 violation). ``tp`` > 1 plans the TP-sharded
     launch (plan_budget topology='tp': GQA shards → the primary knob carries
     the PER-RANK slice; MLA replicates, #20) — the TOTAL byte budget is
-    still floor(r × D). Returns (env, plan): the BudgetPlan the env was
+    still floor(r × D_class). Returns (env, plan): the BudgetPlan the env was
     derived from rides the relaunch step and every budgeted cell under it
     (Batch 2 W4, cell.json["budget_plan"]).
     """
     row = floor.row(r)
+    demand_class = _class_demand_bytes(int(row["demand_bytes"]), seq_tokens, anchor_tokens)
     if served_kv_dtype is None and floor.kv_dtype != "bf16":
         # A floor table built with --kv-dtype fp8 halves bytes/token, so
         # deriving a PLAIN (non-fp8-lever) launch's token dial from it would
@@ -2589,13 +2896,16 @@ def _budget_env(
             model=model,
             engine=engine,
             r=r,
-            demand=int(row["demand_bytes"]),
+            demand=demand_class,
             kv_dtype=served_kv_dtype or floor.kv_dtype,
             tp=tp,
             topology="single" if tp == 1 else "tp",
         )
     except CacheBudgetError as exc:
-        raise PlanError(f"budget planning refused for engine={engine} r={r:g}: {exc}") from exc
+        raise PlanError(
+            f"budget planning refused for engine={engine} r={r:g} "
+            f"demand class {seq_tokens} tokens: {exc}"
+        ) from exc
     env: Dict[str, str] = {}
     for arg in plan.engine_args:
         if arg.kind != "primary":
@@ -2616,7 +2926,14 @@ def _budget_env(
 
 
 def _pd_budget_env(
-    grid: SessionGrid, engine: str, model: str, floor: FloorTable, role_tp: int
+    grid: SessionGrid,
+    engine: str,
+    model: str,
+    floor: FloorTable,
+    role_tp: int,
+    *,
+    seq_tokens: int,
+    anchor_tokens: int,
 ) -> Tuple[Dict[str, str], Dict[str, Any], BudgetPlan]:
     """PD launcher env: the §6.5 split of floor(dist_budget_r × D) into the
     two REQUIRED per-role byte budgets, plus the role-tagged telemetry
@@ -2642,7 +2959,9 @@ def _pd_budget_env(
             model=model,
             engine=engine,
             r=grid.dist_budget_r,
-            demand=int(row["demand_bytes"]),
+            # ADR-0155: the DIST leg's demand is its arm's class (B1 gold, B3
+            # corpus), the same scaling as the single-instance relaunches.
+            demand=_class_demand_bytes(int(row["demand_bytes"]), seq_tokens, anchor_tokens),
             kv_dtype=floor.kv_dtype,
             tp=1,
             topology="pd",
@@ -2705,7 +3024,9 @@ def _relaunch_step(
     floor: FloorTable,
     launcher_cmds: Mapping[str, Sequence[str]],
 ) -> Dict[str, Any]:
-    engine, prefix_off, model, budget_r, kv_dtype, connector, topology = config
+    engine, prefix_off, model, budget_r, seq_tokens, kv_dtype, connector, topology = config
+    anchor_tokens = int(grid.demand_seq_tokens[DEMAND_ANCHOR_ARM])
+    demand_class: Optional[Dict[str, Any]] = None
     if topology == "pd":
         # T3.2: the pd stack has its OWN launcher (two role instances +
         # proxy); its `start` verb is self-cleaning, so a relaunch boundary
@@ -2729,7 +3050,17 @@ def _relaunch_step(
         # degree also shapes the budget env (per-rank slices — see
         # _pd_budget_env), so it is derived BEFORE the env is built.
         role_tp = grid.dist_pd_role_gpus[0]
-        env, pd_record, plan = _pd_budget_env(grid, engine, model, floor, role_tp)
+        assert seq_tokens is not None  # a pd config is budgeted by identity
+        env, pd_record, plan = _pd_budget_env(
+            grid, engine, model, floor, role_tp,
+            seq_tokens=seq_tokens, anchor_tokens=anchor_tokens,
+        )
+        demand_class = {
+            "seq_tokens": seq_tokens,
+            "anchor_seq_tokens": anchor_tokens,
+            "demand_bytes": plan.demand_bytes,
+            "adr": DEMAND_CLASS_ADR,
+        }
         if role_tp >= 2:
             env["CAGE_VLLM_TENSOR_PARALLEL"] = str(role_tp)
         # Backlog A10: the uniform request-length cap, applied by the pd
@@ -2757,6 +3088,8 @@ def _relaunch_step(
             "topology": topology,
             "tp": role_tp,  # per ROLE instance (both roles, launcher contract)
             "pd": pd_record,
+            # ADR-0155: the demand class this stack's budget was sized on.
+            "demand_class": demand_class,
             # V2: the pd stack is its own launcher family (never the
             # single-instance vllm script), stopped by its own verb.
             "launcher_key": PD_LAUNCHER_KEY,
@@ -2765,7 +3098,9 @@ def _relaunch_step(
             # Batch 2 W4: the BudgetPlan the role budgets were split from
             # (per POOL, tp=1) plus the pd role record (the per-rank slices
             # the launcher was actually given, review F6).
-            "budget_plan": budget_plan_record(plan, floor, pd_roles=pd_record),
+            "budget_plan": budget_plan_record(
+                plan, floor, pd_roles=pd_record, seq_tokens=seq_tokens
+            ),
             "argv": argv,
             "env": env,
         }
@@ -2798,21 +3133,37 @@ def _relaunch_step(
                 "— enumeration should have BLOCKED these cells (driver "
                 "invariant violated)"
             )
+        assert seq_tokens is not None  # a tp config is budgeted by identity
         env, plan = _budget_env(
             engine, model, grid.dist_budget_r, floor,
             served_kv_dtype=kv_dtype, tp=tp_size,
+            seq_tokens=seq_tokens, anchor_tokens=anchor_tokens,
         )
         budget_bytes = plan.budget_bytes_total
-        budget_plan = budget_plan_record(plan, floor)
+        budget_plan = budget_plan_record(plan, floor, seq_tokens=seq_tokens)
+        demand_class = {
+            "seq_tokens": seq_tokens,
+            "anchor_seq_tokens": anchor_tokens,
+            "demand_bytes": plan.demand_bytes,
+            "adr": DEMAND_CLASS_ADR,
+        }
         launched_tp = tp_size
     else:
         if budget_r is not None:
+            assert seq_tokens is not None  # a budgeted config carries its class
             env, plan = _budget_env(
                 engine, model, budget_r, floor,
                 served_kv_dtype=kv_dtype, tp=grid.serving_tp,
+                seq_tokens=seq_tokens, anchor_tokens=anchor_tokens,
             )
             budget_bytes = plan.budget_bytes_total
-            budget_plan = budget_plan_record(plan, floor)
+            budget_plan = budget_plan_record(plan, floor, seq_tokens=seq_tokens)
+            demand_class = {
+                "seq_tokens": seq_tokens,
+                "anchor_seq_tokens": anchor_tokens,
+                "demand_bytes": plan.demand_bytes,
+                "adr": DEMAND_CLASS_ADR,
+            }
         launched_tp = grid.serving_tp
     # T3.1 TP env (single-instance launchers): emitted for degrees >= 2 only
     # — degree 1 means the launcher omits the flag, so single-GPU relaunch
@@ -2873,6 +3224,9 @@ def _relaunch_step(
         "topology": topology,
         "tp": launched_tp,  # the T3.1 degree this serving stack launches with
         "pd": None,  # single/tp relaunch: no §6.5 role split
+        # ADR-0155: the demand class this budget was sized on (None on a
+        # budget-free relaunch: absence stays absence).
+        "demand_class": demand_class,
         # V2: the launcher this boundary belongs to and how to stop it (the
         # tp overlay rides the same single-instance launcher as 'single').
         "launcher_key": engine,
@@ -3212,6 +3566,80 @@ def _stale_plan_problems(
             f"{label}: cell {row!r} carries --num-queries {got_n!r} but its "
             f"num_queries record is {step.get('num_queries')!r} (A9)" + stale
         )
+    # ADR-0154/0155: a pressure cell's offered rate is rate_frac x a lambda*
+    # measured on the rung (gold class) or derived from it by the served-token
+    # ratio (every other class); a blocked cell carries the labeled P6
+    # prediction it never runs at. The floor table's pending basis on an
+    # executable cell is the 2026-10-08 landing's shape and refuses.
+    lambda_star = step.get("lambda_star_rps")
+    rate_basis = step.get("rate_basis")
+    demand_class = step.get("demand_class")
+    if spec.family in _PRESSURE_FAMILIES:
+        if step.get("blocked_on") is None:
+            if rate_basis not in (LAMBDA_BASIS_RUNG, LAMBDA_BASIS_DERIVED):
+                problems.append(
+                    f"{label}: pressure cell {row!r} rate_basis is {rate_basis!r}; an "
+                    "executable cell offers a rung-calibrated lambda* "
+                    f"({RUNG_CALIBRATION_ADR}: the KV-bound prediction ran 3 to 6 times "
+                    "below capacity on the landing)" + stale
+                )
+            if not isinstance(step.get("lambda_star_source"), dict):
+                problems.append(
+                    f"{label}: pressure cell {row!r} carries no lambda_star_source "
+                    f"({RUNG_CALIBRATION_ADR}: the rung artifact the rate rests on)" + stale
+                )
+        if (
+            isinstance(lambda_star, bool)
+            or not isinstance(lambda_star, (int, float))
+            or not math.isfinite(lambda_star)
+            or lambda_star <= 0
+        ):
+            problems.append(
+                f"{label}: pressure cell {row!r} lambda_star_rps={lambda_star!r} must be a "
+                f"finite number > 0 ({RUNG_CALIBRATION_ADR})" + stale
+            )
+        else:
+            want_offered = float(spec.rate_frac or 0.0) * float(lambda_star)
+            offered = step.get("offered_rate_rps")
+            got_rate = _argv_flag_value(argv, "--rate")
+            if not isinstance(offered, (int, float)) or isinstance(offered, bool) or not math.isclose(float(offered), want_offered, rel_tol=1e-9, abs_tol=1e-12):
+                problems.append(
+                    f"{label}: pressure cell {row!r} offered_rate_rps={offered!r} != "
+                    f"rate_frac x lambda_star_rps = {want_offered:.6g} ({RUNG_CALIBRATION_ADR})" + stale
+                )
+            try:
+                rate_ok = got_rate is not None and math.isclose(float(got_rate), want_offered, rel_tol=1e-5)
+            except ValueError:
+                rate_ok = False
+            if not rate_ok:
+                problems.append(
+                    f"{label}: pressure cell {row!r} carries --rate {got_rate!r}, the offered "
+                    f"rate is {want_offered:.6g} ({RUNG_CALIBRATION_ADR})" + stale
+                )
+        seq = demand_class.get("seq_tokens") if isinstance(demand_class, dict) else None
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
+            problems.append(
+                f"{label}: pressure cell {row!r} carries demand_class={demand_class!r}, must "
+                f"name its served-token class ({DEMAND_CLASS_ADR})" + stale
+            )
+    else:
+        if lambda_star is not None or rate_basis is not None or step.get("lambda_star_source") is not None:
+            problems.append(
+                f"{label}: cell {row!r} (family {spec.family!r}) carries a rate basis "
+                f"(lambda_star_rps={lambda_star!r}, rate_basis={rate_basis!r}); only "
+                "pressure cells offer a rate" + stale
+            )
+        budgeted_cell = spec.budget_r is not None or spec.topology in ("tp", "pd")
+        if budgeted_cell and not isinstance(demand_class, dict):
+            problems.append(
+                f"{label}: budgeted cell {row!r} carries no demand_class ({DEMAND_CLASS_ADR})" + stale
+            )
+        if not budgeted_cell and demand_class is not None:
+            problems.append(
+                f"{label}: budget-free cell {row!r} carries demand_class={demand_class!r} "
+                f"({DEMAND_CLASS_ADR}: absence stays absence)" + stale
+            )
+
     # V3 (window bound): a window cell (pressure family, or the RULER
     # instrument) is bounded by --arrival-count == its --num-queries and
     # never by --duration-s; every other cell carries neither flag.
@@ -3518,7 +3946,14 @@ def _cell_step(
     *,
     slo_floors_env: Optional[str],
     budget_plan: Optional[Dict[str, Any]] = None,
+    rungs: Optional[Mapping[str, "RungCalibration"]] = None,
+    ladder: bool = False,
 ) -> Dict[str, Any]:
+    """One cell step. ``rungs`` maps engine -> its RungCalibration (ADR-0154):
+    an executable pressure cell offers rate_frac x lambda*(engine, r) from it,
+    scaled to its demand class (ADR-0155); ``ladder=True`` builds the
+    calibrate-rungs ladder cell instead (rate and arrivals are placeholders
+    the ladder sets per step, so no lambda* is needed)."""
     spec = cell.spec
     argv = list(runner_cmd) + [
         "--baseline",
@@ -3602,33 +4037,110 @@ def _cell_step(
         )
     offered_rate: Optional[float] = None
     lambda_star: Optional[float] = None
+    lambda_source: Optional[Dict[str, Any]] = None
     rate_basis: Optional[str] = None
+    lambda_kv_pred: Optional[float] = None
+    lambda_kv_pred_basis: Optional[str] = None
+    # ADR-0155: the demand class the cell's serving budget was sized on, the
+    # SAME record its relaunch carries (None on budget-free cells: absence
+    # stays absence). A blocked cell on a rung the floor table lacks (it
+    # never runs) records the class with no byte figure.
+    demand_class: Optional[Dict[str, Any]] = None
+    if _is_budgeted(spec):
+        class_tokens = demand_seq_tokens(grid, spec)
+        class_anchor = int(grid.demand_seq_tokens[DEMAND_ANCHOR_ARM])
+        class_r = spec.budget_r if spec.budget_r is not None else grid.dist_budget_r
+        try:
+            class_demand: Optional[int] = _class_demand_bytes(
+                int(floor.row(class_r)["demand_bytes"]), class_tokens, class_anchor
+            )
+        except PlanError:
+            if cell.blocked_on is None:
+                raise
+            class_demand = None
+        demand_class = {
+            "seq_tokens": class_tokens,
+            "anchor_seq_tokens": class_anchor,
+            "demand_bytes": class_demand,
+            "adr": DEMAND_CLASS_ADR,
+        }
     if spec.family in _PRESSURE_FAMILIES:
         assert spec.budget_r is not None and spec.rate_frac is not None
+        assert demand_class is not None
         row = floor.row(spec.budget_r)
-        lambda_star = float(row["lambda_star_pred_rps"])
-        offered_rate = spec.rate_frac * lambda_star
-        # lambda_compute null => the λ* here is the KV bound alone — the plan
-        # carries that label loudly (§6.1: λ* = min(λ_KV, λ_compute)); it is
-        # NEVER hidden behind a bare number.
-        rate_basis = (
-            _LAMBDA_PENDING_BASIS
-            if row.get("lambda_compute_rps") is None
-            else _LAMBDA_CALIBRATED_BASIS
-        )
-        # V3: the window is W arrivals, one per prepared request (the
-        # --num-queries above), never a duration: the open-loop generator's
-        # replay guard refuses a schedule longer than the pool, and a
-        # duration-bound window at a real rate always was. The pre-costed
-        # window_duration_s stays in the header as the cost estimate only.
-        argv += [
-            "--workload-mode",
-            "open_loop",
-            "--rate",
-            f"{offered_rate:.6g}",
-            "--arrival-count",
-            str(num_queries),
-        ]
+        # The floor table's KV-bound rate is the P6 PREDICTION, recorded
+        # beside the offered rate for the ±15 percent falsification test and
+        # never offered (ADR-0154: the landing offered it, 3 to 6 times below
+        # the measured capacity).
+        lambda_kv_pred = float(row["lambda_star_pred_rps"])
+        lambda_kv_pred_basis = str(row.get("lambda_star_basis") or _LAMBDA_PENDING_BASIS)
+        seq_tokens = int(demand_class["seq_tokens"])
+        anchor_tokens = int(grid.demand_seq_tokens[DEMAND_ANCHOR_ARM])
+        if ladder:
+            # ADR-0154: calibrate-rungs sets --rate per ladder step. The window
+            # is the registered PROBE_WINDOW_S in DURATION mode with the
+            # runner's Jain trim at PROBE_WARMUP_S, the cal-v2 probe's own
+            # shape: the V3 pool guard refuses an arrival count above the
+            # prepared pool, and a 75 s window at the rates a rung reaches
+            # needs more arrivals than the pool holds, so the ladder replays
+            # the pool (LADDER_REPLAY_ENV; non-confirmatory by registration,
+            # exactly as calibrate_cell.probe_rate wraps its prepared set).
+            rate_basis = "ladder step (calibrate-rungs sets the rate)"
+            # One window per ladder step (the probe is one rate, one window).
+            # No --open-loop-warmup-s: the runner REFUSES it in campaign mode
+            # (ADR-0055 amendment 2026-09-19, run_experiment.py); the Jain
+            # trim at PROBE_WARMUP_S is applied by _read_ladder_window on the
+            # intended arrival instead (review CRITICAL 1, 2026-10-09).
+            argv[argv.index("--num-trials") + 1] = "1"
+            argv += [
+                "--workload-mode", "open_loop", "--rate", "0",
+                "--duration-s", f"{PROBE_WINDOW_S:g}",
+            ]
+        else:
+            cal = (rungs or {}).get(spec.engine)
+            gold = cal.lambda_at(spec.budget_r) if cal is not None else None
+            if gold is None:
+                if cell.blocked_on is None:
+                    raise PlanError(
+                        f"cell {spec.to_row_key()} is executable but no rung "
+                        f"calibration covers ({spec.engine}, r={spec.budget_r:g}) "
+                        "(_register_rung_calibrations should have refused; driver "
+                        "invariant violated)"
+                    )
+                # A BLOCKED cell never runs: its rate is the P6 prediction,
+                # labeled as such, so the plan stays reviewable (debt visible).
+                lambda_star = lambda_kv_pred
+                rate_basis = f"blocked cell, never run: {lambda_kv_pred_basis}"
+            else:
+                ratio = anchor_tokens / seq_tokens
+                lambda_star = gold * ratio
+                rate_basis = (
+                    LAMBDA_BASIS_RUNG if spec.arm == DEMAND_ANCHOR_ARM else LAMBDA_BASIS_DERIVED
+                )
+                lambda_source = {
+                    "engine": spec.engine,
+                    "r": spec.budget_r,
+                    "gold_lambda_star_qps": gold,
+                    "artifact_sha256": cal.sha256,
+                    "seq_tokens_gold": anchor_tokens,
+                    "seq_tokens_class": seq_tokens,
+                    "ratio": ratio,
+                    "adr": RUNG_CALIBRATION_ADR,
+                }
+            offered_rate = spec.rate_frac * lambda_star
+            # V3: the window is W arrivals, one per prepared request (the
+            # --num-queries above), never a duration: the open-loop generator's
+            # replay guard refuses a schedule longer than the pool, and a
+            # duration-bound window at a real rate always was. The pre-costed
+            # window_duration_s stays in the header as the cost estimate only.
+            argv += [
+                "--workload-mode",
+                "open_loop",
+                "--rate",
+                f"{offered_rate:.6g}",
+                "--arrival-count",
+                str(num_queries),
+            ]
     env = _cell_identity_env(spec)
     if spec.retriever != "none":
         # Backlog A5: the Decision 3B distractor pool size, BEHAVIOR (not
@@ -3702,8 +4214,16 @@ def _cell_step(
             }
         ),
         "offered_rate_rps": offered_rate,
-        "lambda_star_pred_rps": lambda_star,
+        # ADR-0154: the lambda* the offered rate is a fraction of (measured on
+        # the gold rung, scaled to the class), its provenance, and the floor
+        # table's P6 prediction recorded beside it (never offered).
+        "lambda_star_rps": lambda_star,
+        "lambda_star_source": lambda_source,
+        "lambda_kv_pred_rps": lambda_kv_pred,
+        "lambda_kv_pred_basis": lambda_kv_pred_basis,
         "rate_basis": rate_basis,
+        # ADR-0155: the demand class (served sequence tokens) of a budgeted cell.
+        "demand_class": demand_class,
         # Batch 2 W4: the record of the relaunch this cell runs under (the
         # same object; null on hf, blocked and budget-free cells).
         "budget_plan": budget_plan,
@@ -3962,6 +4482,300 @@ def _register_calibrations(
     }
 
 
+# ---------------------------------------------------------------------------
+# Rung calibration artifacts (ADR-0154): lambda* per budget rung, measured by
+# ``calibrate-rungs`` on the gold-fresh F2 workload under the plan's own
+# relaunch for that rung
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RungCalibration:
+    """Validated ``cage-rung-calibration-v1`` artifact of ONE engine: the
+    measured lambda* per budget rung (ESTIMATED rungs carry a value; every
+    rung's label is kept so a refusal can name LADDER_EXHAUSTED or
+    NONE_SUSTAINABLE) plus the provenance the plan header records."""
+
+    path: Path
+    sha256: str
+    engine: str
+    model: str
+    session: str
+    lambdas: Dict[float, float]
+    labels: Dict[float, str]
+
+    def lambda_at(self, r: float) -> Optional[float]:
+        for key, value in self.lambdas.items():
+            if math.isclose(key, r, rel_tol=0.0, abs_tol=1e-9):
+                return value
+        return None
+
+    def label_at(self, r: float) -> Optional[str]:
+        for key, value in self.labels.items():
+            if math.isclose(key, r, rel_tol=0.0, abs_tol=1e-9):
+                return value
+        return None
+
+
+def load_rung_calibration(path: Path) -> RungCalibration:
+    """Load + validate ONE rung-calibration artifact (fail closed): the
+    schema, the cal-v2 procedure version, ``confirmatory: false``, a runner
+    engine id (normalized through ENGINE_OF_BACKEND, the oracle refused), the
+    model and session, and a non-empty ``rungs`` mapping whose keys parse as
+    the rung r and whose ESTIMATED entries carry a finite lambda_star_qps > 0.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise PlanError(
+            f"rung calibration artifact not found: {path} (run scripts/3_run/"
+            "run_campaign.py calibrate-rungs --session <s> --engine <e> ... per "
+            f"engine; {RUNG_CALIBRATION_FINDING}, {RUNG_CALIBRATION_ADR})"
+        )
+    raw = path.read_bytes()
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise PlanError(f"rung calibration artifact {path} is not valid JSON: {exc}") from exc
+    if not isinstance(doc, dict) or doc.get("schema") != RUNG_CALIBRATION_SCHEMA:
+        raise PlanError(
+            f"rung calibration artifact {path} schema is "
+            f"{doc.get('schema') if isinstance(doc, dict) else type(doc).__name__!r}, "
+            f"expected {RUNG_CALIBRATION_SCHEMA!r}"
+        )
+    problems: List[str] = []
+    if doc.get("procedure_version") != PROCEDURE_VERSION:
+        problems.append(
+            f"procedure_version is {doc.get('procedure_version')!r}, the registered "
+            f"procedure is {PROCEDURE_VERSION!r}"
+        )
+    if doc.get("confirmatory") is not False:
+        problems.append("confirmatory must be the literal false")
+    raw_engine = doc.get("engine")
+    engine = ENGINE_OF_BACKEND.get(raw_engine) if isinstance(raw_engine, str) else None
+    if engine is None:
+        problems.append(f"engine {raw_engine!r} is not a runner backend ({sorted(ENGINE_OF_BACKEND)})")
+    elif engine == "hf":
+        problems.append("engine is the in-process oracle, which serves no pressure rung")
+    model = doc.get("model")
+    if not isinstance(model, str) or not model.strip():
+        problems.append(f"model {model!r} must be a non-empty string")
+    session = doc.get("session")
+    if not isinstance(session, str) or session not in SESSIONS:
+        problems.append(f"session {session!r} is not a §1 session ({sorted(SESSIONS)})")
+    rungs = doc.get("rungs")
+    lambdas: Dict[float, float] = {}
+    labels: Dict[float, str] = {}
+    if not isinstance(rungs, dict) or not rungs:
+        problems.append("rungs must be a non-empty mapping r -> rung record")
+    else:
+        for key, rec in rungs.items():
+            try:
+                r = float(key)
+            except (TypeError, ValueError):
+                problems.append(f"rungs key {key!r} does not parse as a budget ratio")
+                continue
+            if not isinstance(rec, dict):
+                problems.append(f"rungs[{key!r}] is not an object")
+                continue
+            if not isinstance(rec.get("r"), (int, float)) or isinstance(rec.get("r"), bool) or not math.isclose(float(rec["r"]), r, rel_tol=0.0, abs_tol=1e-9):
+                problems.append(f"rungs[{key!r}].r={rec.get('r')!r} disagrees with its key")
+            label = rec.get("label")
+            if not isinstance(label, str) or not label:
+                problems.append(f"rungs[{key!r}].label={label!r} must be a non-empty string")
+                continue
+            labels[r] = label
+            value = rec.get("lambda_star_qps")
+            if label == "ESTIMATED":
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                    problems.append(
+                        f"rungs[{key!r}] is ESTIMATED but lambda_star_qps={value!r} is not a finite number > 0"
+                    )
+                else:
+                    lambdas[r] = float(value)
+            elif value is not None:
+                problems.append(
+                    f"rungs[{key!r}] has label {label!r} but carries lambda_star_qps={value!r} "
+                    "(labels are honest: only ESTIMATED carries a value)"
+                )
+    if problems:
+        raise PlanError(f"rung calibration artifact {path}: " + "; ".join(problems))
+    assert engine is not None and isinstance(model, str) and isinstance(session, str)
+    return RungCalibration(
+        path=path,
+        sha256=hashlib.sha256(raw).hexdigest(),
+        engine=engine,
+        model=model,
+        session=session,
+        lambdas=lambdas,
+        labels=labels,
+    )
+
+
+def _register_rung_calibrations(
+    grid: SessionGrid,
+    cells: Sequence[PlannedCell],
+    rung_calibrations: Optional[Mapping[str, Path]],
+    anchor_tokens: int,
+) -> Tuple[Dict[str, Any], Dict[str, RungCalibration]]:
+    """ADR-0154: every EXECUTABLE pressure cell's (engine, r) needs a measured
+    lambda* (an ESTIMATED rung in that engine's artifact) before the plan is
+    built; a plan whose rates rest on the floor table's assumed service time
+    is the 2026-10-08 landing. Returns (header record, engine -> artifact)."""
+    required: Dict[str, set] = {}
+    for cell in cells:
+        spec = cell.spec
+        if cell.blocked_on is None and spec.engine != "hf" and spec.family in _PRESSURE_FAMILIES:
+            assert spec.budget_r is not None
+            required.setdefault(spec.engine, set()).add(float(spec.budget_r))
+    registered = {str(k): Path(v) for k, v in (rung_calibrations or {}).items()}
+    fix = (
+        f"run scripts/3_run/run_campaign.py calibrate-rungs --session {grid.session} "
+        "--engine <engine> --floor-table <table> --calibration <engine cal-v2 floor> "
+        "--out <path> on the pod (every engine with executable pressure cells), then "
+        f"plan --rung-calibration <engine>=<path> ({RUNG_CALIBRATION_FINDING}, "
+        f"{RUNG_CALIBRATION_ADR})"
+    )
+    unknown = sorted(set(registered) - _session_engines(grid))
+    if unknown:
+        raise PlanError(
+            f"--rung-calibration {unknown}: not a server engine of session "
+            f"{grid.session!r} (registered engines: {sorted(_session_engines(grid))})"
+        )
+    missing_engines = sorted(set(required) - set(registered))
+    if missing_engines:
+        raise PlanError(
+            f"rung calibration missing for engine(s) {missing_engines}: the offered "
+            "rates of their pressure cells need lambda* measured per budget rung on "
+            "the gold-fresh workload (the floor table's KV-bound rate is a prediction, "
+            f"never an offered rate since {RUNG_CALIBRATION_ADR}); {fix}"
+        )
+    accepted_models = (grid.model, HF_ID_OF_SLUG[grid.model])
+    artifacts: Dict[str, RungCalibration] = {}
+    header_artifacts: Dict[str, Dict[str, Any]] = {}
+    for engine in sorted(registered):
+        cal = load_rung_calibration(registered[engine])
+        if cal.engine != engine:
+            raise PlanError(
+                f"--rung-calibration {engine}={cal.path}: the artifact describes engine "
+                f"{cal.engine!r}; refusing a swapped rung table"
+            )
+        if cal.model not in accepted_models:
+            raise PlanError(
+                f"--rung-calibration {engine}={cal.path}: the artifact is for model "
+                f"{cal.model!r} but session {grid.session!r} runs {grid.model!r}"
+            )
+        if cal.session != grid.session:
+            raise PlanError(
+                f"--rung-calibration {engine}={cal.path}: the artifact was measured for "
+                f"session {cal.session!r}, not {grid.session!r} (another grid, another "
+                "workload)"
+            )
+        missing_rungs = [
+            r for r in sorted(required.get(engine, ()), reverse=True) if cal.lambda_at(r) is None
+        ]
+        if missing_rungs:
+            named = ", ".join(
+                f"r={r:g} ({cal.label_at(r) or 'absent'})" for r in missing_rungs
+            )
+            raise PlanError(
+                f"--rung-calibration {engine}={cal.path}: no ESTIMATED lambda* for "
+                f"{named}; every executable pressure rung needs one (LADDER_EXHAUSTED: "
+                "extend the ladder; NONE_SUSTAINABLE: lower the start rate; absent: "
+                f"calibrate the rung); {fix}"
+            )
+        artifacts[engine] = cal
+        header_artifacts[engine] = {
+            "path": str(cal.path.resolve()),
+            "sha256": cal.sha256,
+            "model": cal.model,
+            "session": cal.session,
+            "rungs": {f"{r:g}": lam for r, lam in sorted(cal.lambdas.items(), reverse=True)},
+            "labels": {f"{r:g}": label for r, label in sorted(cal.labels.items(), reverse=True)},
+        }
+    header = {
+        "schema": RUNG_CALIBRATION_SCHEMA,
+        "procedure_version": PROCEDURE_VERSION,
+        "adr": RUNG_CALIBRATION_ADR,
+        "finding": RUNG_CALIBRATION_FINDING,
+        "basis_gold": LAMBDA_BASIS_RUNG,
+        "basis_derived": LAMBDA_BASIS_DERIVED,
+        "anchor_arm": DEMAND_ANCHOR_ARM,
+        "anchor_seq_tokens": anchor_tokens,
+        "required_rungs": {e: sorted(rs, reverse=True) for e, rs in sorted(required.items())},
+        "artifacts": header_artifacts,
+    }
+    return header, artifacts
+
+
+def dry_window_key(serving: Mapping[str, Any], demand_class: Mapping[str, Any]) -> Tuple[Any, ...]:
+    """ADR-0153: the pair a dry window gates is the budgeted SERVING
+    CONFIGURATION minus r: (engine, prefix mode, demand class tokens, kv dtype,
+    connector, topology). A prefix-ON arm and a prefix-OFF arm at the same
+    class run on different servers, so each gets its own dry window."""
+    return (
+        str(serving["engine"]),
+        str(serving["prefix_mode"]),
+        int(demand_class["seq_tokens"]),
+        serving.get("kv_dtype"),
+        serving.get("connector"),
+        str(serving.get("topology")),
+    )
+
+
+def _dry_window_step(cell_step: Mapping[str, Any], spec: CellSpec) -> Dict[str, Any]:
+    """ADR-0153: the dry window of one budgeted serving configuration (see
+    dry_window_key): its first pressure cell at the tightest r it is carried at, re-minted at
+    DRY_WINDOW_RATE_FRAC x lambda* (its own row key, so the dry root's cell
+    directory names the rate it ran at), one window. The driver writes it to
+    the sibling run root ``<run_id>-dry`` and reads its regime.json."""
+    lam = cell_step["lambda_star_rps"]
+    assert isinstance(lam, (int, float)) and lam > 0, "a dry window needs a measured lambda*"
+    dry_spec = replace(spec, rate_frac=DRY_WINDOW_RATE_FRAC)
+    offered = DRY_WINDOW_RATE_FRAC * float(lam)
+    argv = list(cell_step["argv"])
+
+    def _set(flag: str, value: str) -> None:
+        at = argv.index(flag)
+        argv[at + 1] = value
+
+    _set("--rate", f"{offered:.6g}")
+    _set("--num-trials", "1")
+    # Duration mode with replay (DRY_WINDOW_DURATION_S): the V3 arrival-count
+    # bound is a WINDOW CELL contract; the dry window is a gate, never data.
+    at = argv.index("--arrival-count")
+    del argv[at:at + 2]
+    argv += ["--duration-s", f"{DRY_WINDOW_DURATION_S:g}"]
+    env = dict(cell_step["env"])
+    env.update(_cell_identity_env(dry_spec))
+    env.pop("CAGE_WINDOW_ORDINAL_BASE", None)
+    env[LADDER_REPLAY_ENV] = "1"
+    return {
+        "kind": "dry_window",
+        "engine": spec.engine,
+        "demand_class": cell_step["demand_class"],
+        "budget_r": spec.budget_r,
+        "row_key": dry_spec.to_row_key(),
+        "cellspec": dry_spec.to_flat_dict(),
+        "dataset": cell_step["dataset"],
+        "windows": 1,
+        "num_queries": cell_step["num_queries"],
+        "rate_frac": DRY_WINDOW_RATE_FRAC,
+        "offered_rate_rps": offered,
+        "duration_s": DRY_WINDOW_DURATION_S,
+        "replay": True,
+        "lambda_star_rps": float(lam),
+        "lambda_star_source": cell_step["lambda_star_source"],
+        "rate_basis": cell_step["rate_basis"],
+        "expected_label": DRY_WINDOW_EXPECTED_LABEL,
+        "gate": DRY_WINDOW_GATE,
+        "adr": DRY_WINDOW_ADR,
+        "serving": cell_step["serving"],
+        "budget_plan": cell_step["budget_plan"],
+        "argv": argv,
+        "env": env,
+    }
+
+
 def build_plan(
     session: str,
     floor: FloorTable,
@@ -3975,6 +4789,7 @@ def build_plan(
     calibrations: Optional[Mapping[str, Path]] = None,
     calibration_budget_fraction: float = FLOOR_BUDGET_FRACTION,
     rehearsal_n: Optional[int] = None,
+    rung_calibrations: Optional[Mapping[str, Path]] = None,
 ) -> Dict[str, Any]:
     """PURE plan builder: registered grid -> ordered step list + counts.
 
@@ -3998,6 +4813,12 @@ def build_plan(
     engine, validated and recorded in the header ``calibration``; every cell
     step pins the floors as CAGE_SLO_FLOORS_JSON. ``calibration_budget_fraction``
     is the floor rung every artifact must carry (the charter's r = 1.5).
+
+    ``rung_calibrations`` maps engine -> rung-calibration artifact path
+    (``plan --rung-calibration ENGINE=PATH``, ADR-0154): one per engine with
+    executable pressure cells, every (engine, r) of those cells ESTIMATED, or
+    the plan refuses. ADR-0155 sizes every budgeted relaunch on its arm's
+    demand class and ADR-0153 plans one dry window per (engine, class).
     """
     grid = get_session_grid(session)
     rehearsal: Optional[Dict[str, Any]] = None
@@ -4035,7 +4856,7 @@ def build_plan(
         )
     launcher_cmds = dict(launcher_cmds or DEFAULT_LAUNCHER_CMDS)
 
-    cells = sorted(enumerate_cells(grid), key=_sort_key)
+    cells = sorted(enumerate_cells(grid), key=lambda c: _sort_key(c, grid))
     # ADR-0106 repair: a rung cell with no manifest for its dataset is
     # blocked (never a silent fallback); an already-blocked cell keeps its
     # first (launch-side) reason.
@@ -4064,13 +4885,25 @@ def build_plan(
     slo_floors_env: Optional[str] = (
         slo_floors_env_value(calibration["floors"]) if calibration["floors"] else None
     )
+    # ADR-0155: the P6 artifact and the registration describe one anchor
+    # sequence; every budgeted relaunch scales D from it to its class.
+    anchor_tokens = (
+        _check_floor_shape(grid, floor)
+        if any(_is_budgeted(c.spec) and c.blocked_on is None and c.spec.engine != "hf" for c in cells)
+        else int(grid.demand_seq_tokens[DEMAND_ANCHOR_ARM])
+    )
+    # ADR-0154: lambda* per (engine, rung) for every executable pressure cell.
+    rung_header, rung_table = _register_rung_calibrations(
+        grid, cells, rung_calibrations, anchor_tokens
+    )
 
     steps: List[Dict[str, Any]] = []
     current: Optional[_ServingConfig] = None
     current_budget_plan: Optional[Dict[str, Any]] = None
     relaunches = 0
+    dried: set = set()
     for cell in cells:
-        config = _serving_config(cell)
+        config = _serving_config(cell, grid)
         # Blocked cells launch NOTHING: they never run, so their (possibly
         # unrealizable) serving config must not emit a relaunch step nor
         # disturb the boundary the surrounding executable cells run under.
@@ -4089,23 +4922,36 @@ def build_plan(
             if cell.blocked_on is None and config is not None
             else None
         )
-        steps.append(
-            _cell_step(
-                cell,
-                grid,
-                floor,
-                runner_cmd,
-                seed,
-                pins,
-                query_manifest=None if manifest_rec is None else manifest_rec["path"],
-                slo_floors_env=slo_floors_env,
-                budget_plan=budget_plan,
-            )
+        cell_step = _cell_step(
+            cell,
+            grid,
+            floor,
+            runner_cmd,
+            seed,
+            pins,
+            query_manifest=None if manifest_rec is None else manifest_rec["path"],
+            slo_floors_env=slo_floors_env,
+            budget_plan=budget_plan,
+            rungs=rung_table,
         )
+        # ADR-0153: the first executable pressure cell of each (engine,
+        # demand class) is preceded by that pair's dry window. Budgets sort
+        # ascending, so this is the tightest r the class is carried at.
+        if (
+            cell.blocked_on is None
+            and cell.spec.family in _PRESSURE_FAMILIES
+            and cell_step["demand_class"] is not None
+        ):
+            key = dry_window_key(cell_step["serving"], cell_step["demand_class"])
+            if key not in dried:
+                dried.add(key)
+                steps.append(_dry_window_step(cell_step, cell.spec))
+        steps.append(cell_step)
     for i, step in enumerate(steps):
         step["index"] = i
 
     cell_steps = [s for s in steps if s["kind"] == "cell"]
+    dry_steps = [s for s in steps if s["kind"] == "dry_window"]
     # F5a invariant: distinct row keys mint distinct namespaces (a short-sha
     # collision would silently share cache entries between two cells).
     namespace_owner: Dict[str, str] = {}
@@ -4247,6 +5093,40 @@ def build_plan(
         # by load_plan; written into manifest.json["slo_floors"] by the
         # campaign session at manifest creation.
         "calibration": calibration,
+        # ADR-0154: the per-(engine, rung) lambda* artifacts the offered rates
+        # rest on (path + sha256 + the values), re-checked per cell by load_plan.
+        "rung_calibration": rung_header,
+        # ADR-0155: the demand classes every budgeted relaunch was sized on.
+        "demand_classes": {
+            "adr": DEMAND_CLASS_ADR,
+            "finding": DEMAND_CLASS_FINDING,
+            "source": DEMAND_SEQ_TOKENS_SOURCE,
+            "anchor_arm": DEMAND_ANCHOR_ARM,
+            "anchor_seq_tokens": anchor_tokens,
+            "floor_avg_seq_tokens": floor.avg_seq_tokens,
+            "floor_concurrency_target": floor.concurrency_target,
+            "seq_tokens": dict(sorted(grid.demand_seq_tokens.items())),
+            "corpus_trunc_seq_tokens": {
+                str(k): v for k, v in sorted(grid.corpus_trunc_demand_seq_tokens.items())
+            },
+            "rule": "D_class = floor(D_floor x s_class / s_anchor); the budget at r is floor(r x D_class)",
+        },
+        # ADR-0153: one dry window per (engine, demand class) with pressure
+        # cells, at the tightest r, offered at rate_frac x lambda*; the run
+        # fails the class unless its regime.json reads the expected label.
+        "dry_window": {
+            "adr": DRY_WINDOW_ADR,
+            "finding": DRY_WINDOW_FINDING,
+            "rate_frac": DRY_WINDOW_RATE_FRAC,
+            "expected_label": DRY_WINDOW_EXPECTED_LABEL,
+            "root_suffix": DRY_WINDOW_ROOT_SUFFIX,
+            "exit_code": EXIT_DRY_WINDOW_FAILED,
+            "count": len(dry_steps),
+            "key": ["engine", "prefix_mode", "seq_tokens", "kv_dtype", "connector", "topology", "budget_r"],
+            "pairs": [
+                [*dry_window_key(s["serving"], s["demand_class"]), s["budget_r"]] for s in dry_steps
+            ],
+        },
         # §6.4 anchor fine grid registration (null on non-anchor sessions).
         "fine_grid": (
             None
@@ -4298,6 +5178,9 @@ def build_plan(
             "cells": len(cell_steps),
             "windows": sum(s["windows"] for s in cell_steps),
             "relaunches": relaunches,
+            # ADR-0153: the dry windows 'run' executes before the pressure
+            # cells of each (engine, demand class); not campaign windows.
+            "dry_windows": len(dry_steps),
             # V2: the family stops 'run' executes (boundaries + the end of
             # run; the clean-room stops before the first step are not counted
             # here, they are one per launcher the plan uses).
@@ -4342,6 +5225,33 @@ _CELL_STEP_KEYS = (
     # too (review F3: a server cell with serving null escaped every clause).
     "budget_plan",
     "serving",
+    # v6 (Batch B): the demand class (ADR-0155) and the offered-rate basis
+    # records (ADR-0154); a v5 plan predates them and is refused.
+    "demand_class",
+    "lambda_star_rps",
+    "lambda_star_source",
+    "lambda_kv_pred_rps",
+    "rate_basis",
+)
+#: ADR-0153: the dry window step (one per engine and demand class).
+_DRY_STEP_KEYS = (
+    "engine",
+    "demand_class",
+    "budget_r",
+    "row_key",
+    "cellspec",
+    "dataset",
+    "windows",
+    "num_queries",
+    "rate_frac",
+    "offered_rate_rps",
+    "lambda_star_rps",
+    "rate_basis",
+    "expected_label",
+    "serving",
+    "budget_plan",
+    "argv",
+    "env",
 )
 _RELAUNCH_STEP_KEYS = (
     "engine",
@@ -4371,6 +5281,8 @@ _RELAUNCH_STEP_KEYS = (
     # that stops its family; both re-checked against the relaunch argv below.
     "launcher_key",
     "stop_argv",
+    # v6 (ADR-0155): the demand class a budgeted relaunch was sized on.
+    "demand_class",
 )
 
 
@@ -4512,6 +5424,27 @@ def _stale_relaunch_problems(
     budget_env_names = sorted(_BUDGET_FLAG_ENV.values()) + [
         "CAGE_KV_BUDGET_BYTES_PREFILL", "CAGE_KV_BUDGET_BYTES_DECODE",
     ]
+    # ADR-0155: a budgeted relaunch names the demand class its budget was
+    # sized on, and the record agrees; a budget-free one carries null.
+    demand_class = step.get("demand_class")
+    if budgeted:
+        seq = demand_class.get("seq_tokens") if isinstance(demand_class, dict) else None
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
+            problems.append(
+                f"{label}: budgeted relaunch carries demand_class={demand_class!r}, "
+                f"must name its served-token class ({DEMAND_CLASS_ADR}: a budget "
+                "sized on no stated shape is the S0F-63 defect)" + stale
+            )
+        elif isinstance(record, dict) and record.get("avg_seq_tokens") != seq:
+            problems.append(
+                f"{label}: budget_plan.avg_seq_tokens {record.get('avg_seq_tokens')!r} "
+                f"!= the relaunch demand class {seq} ({DEMAND_CLASS_ADR})" + stale
+            )
+    elif demand_class is not None:
+        problems.append(
+            f"{label}: budget-free relaunch carries demand_class={demand_class!r} "
+            f"({DEMAND_CLASS_ADR}: absence stays absence)" + stale
+        )
     if not budgeted:
         if budget_bytes is not None or record is not None:
             problems.append(
@@ -4726,14 +5659,35 @@ def load_plan(path: Path) -> Dict[str, Any]:
     slo_floors_env: Optional[str] = (
         slo_floors_env_value(header_floors) if header_floors else None
     )
+    # ADR-0154/0155/0153 headers: a pre-Batch-B plan (v5) is refused by the
+    # schema literal; a hand-edited v6 plan without them is refused here.
+    executable_pressure = any(
+        isinstance(s, dict) and s.get("kind") == "cell" and s.get("blocked_on") is None
+        and s.get("family") in _PRESSURE_FAMILIES
+        for s in steps
+    )
+    if executable_pressure and not isinstance(plan.get("rung_calibration"), dict):
+        raise RunError(
+            f"plan {path} has no rung_calibration header ({RUNG_CALIBRATION_ADR}: the "
+            "measured lambda* every pressure cell's rate rests on) - stale plan, re-plan"
+        )
+    if not isinstance(plan.get("demand_classes"), dict):
+        raise RunError(
+            f"plan {path} has no demand_classes header ({DEMAND_CLASS_ADR}: the "
+            "served-token classes every budgeted relaunch was sized on) - stale plan, "
+            "re-plan"
+        )
     preceding_relaunch: Optional[Dict[str, Any]] = None
+    step_kinds = ("cell", "relaunch", "dry_window")
     for i, step in enumerate(steps):
-        if not isinstance(step, dict) or step.get("kind") not in ("cell", "relaunch"):
-            problems.append(f"steps[{i}]: kind must be 'cell' or 'relaunch'")
+        if not isinstance(step, dict) or step.get("kind") not in step_kinds:
+            problems.append(f"steps[{i}]: kind must be one of {list(step_kinds)}")
             continue
         if step["kind"] == "relaunch":
             preceding_relaunch = step
-        keys = _CELL_STEP_KEYS if step["kind"] == "cell" else _RELAUNCH_STEP_KEYS
+        keys = {
+            "cell": _CELL_STEP_KEYS, "relaunch": _RELAUNCH_STEP_KEYS, "dry_window": _DRY_STEP_KEYS,
+        }[step["kind"]]
         missing = [k for k in keys if k not in step]
         if missing:
             problems.append(f"steps[{i}] ({step['kind']}): missing key(s) {missing}")
@@ -4748,6 +5702,67 @@ def load_plan(path: Path) -> Dict[str, Any]:
             problems.extend(
                 _stale_relaunch_problems(step, f"steps[{i}]", header_max_model_len)
             )
+        if step["kind"] == "dry_window":
+            # ADR-0153: the dry window runs under the budgeted relaunch of its
+            # engine and class at the expected rate; its label is the gate.
+            label = f"steps[{i}]"
+            if preceding_relaunch is None or preceding_relaunch.get("engine") != step.get("engine") or preceding_relaunch.get("budget_r") is None:
+                problems.append(
+                    f"{label}: dry window for {step.get('engine')!r} has no budgeted relaunch of "
+                    f"its engine before it ({DRY_WINDOW_ADR})"
+                )
+            elif (preceding_relaunch.get("demand_class") or {}).get("seq_tokens") != (step.get("demand_class") or {}).get("seq_tokens"):
+                problems.append(
+                    f"{label}: dry window demand class {step.get('demand_class')!r} differs from "
+                    f"its relaunch's {preceding_relaunch.get('demand_class')!r} ({DRY_WINDOW_ADR})"
+                )
+            elif isinstance(step.get("serving"), dict) and any(
+                preceding_relaunch.get(k) != step["serving"].get(k)
+                for k in ("prefix_mode", "kv_dtype", "connector", "topology")
+            ):
+                problems.append(
+                    f"{label}: dry window serving {step.get('serving')!r} is not the serving "
+                    f"configuration of the relaunch before it ({DRY_WINDOW_ADR})"
+                )
+            if step.get("expected_label") != DRY_WINDOW_EXPECTED_LABEL or step.get("rate_frac") != DRY_WINDOW_RATE_FRAC:
+                problems.append(
+                    f"{label}: dry window expects {step.get('expected_label')!r} at rate_frac "
+                    f"{step.get('rate_frac')!r}; the registered gate is {DRY_WINDOW_EXPECTED_LABEL} "
+                    f"at {DRY_WINDOW_RATE_FRAC} ({DRY_WINDOW_ADR})"
+                )
+            lam = step.get("lambda_star_rps")
+            got_rate = _argv_flag_value(step["argv"], "--rate") if isinstance(step["argv"], list) else None
+            try:
+                want = DRY_WINDOW_RATE_FRAC * float(lam)
+                rate_ok = got_rate is not None and math.isclose(float(got_rate), want, rel_tol=1e-5)
+            except (TypeError, ValueError):
+                rate_ok = False
+            if not rate_ok:
+                problems.append(
+                    f"{label}: dry window --rate {got_rate!r} is not {DRY_WINDOW_RATE_FRAC} x "
+                    f"lambda_star_rps {lam!r} ({DRY_WINDOW_ADR})"
+                )
+            if _argv_flag_value(step["argv"], "--num-trials") != "1" if isinstance(step["argv"], list) else True:
+                problems.append(f"{label}: dry window must run exactly one window (--num-trials 1)")
+            if isinstance(step["argv"], list) and (
+                _argv_flag_value(step["argv"], "--duration-s") != f"{DRY_WINDOW_DURATION_S:g}"
+                or "--arrival-count" in step["argv"]
+                or "--open-loop-warmup-s" in step["argv"]
+            ):
+                problems.append(
+                    f"{label}: dry window runs in duration mode for {DRY_WINDOW_DURATION_S:g} s "
+                    f"(no --arrival-count, no warm-up flag) ({DRY_WINDOW_ADR})"
+                )
+            if isinstance(step["env"], dict) and step["env"].get(LADDER_REPLAY_ENV) != "1":
+                problems.append(
+                    f"{label}: dry window carries no {LADDER_REPLAY_ENV}=1 (its duration window "
+                    f"replays the pool; non-confirmatory by registration) ({DRY_WINDOW_ADR})"
+                )
+            try:
+                if CellSpec.from_flat_dict(step["cellspec"]).to_row_key() != step["row_key"]:
+                    problems.append(f"{label}: dry window row_key is not minted from its cellspec")
+            except Exception as exc:  # cellspec is the one legality gate
+                problems.append(f"{label}: dry window cellspec is charter-illegal: {exc}")
         if step["kind"] == "cell":
             try:
                 spec = CellSpec.from_flat_dict(step["cellspec"])
@@ -4926,7 +5941,116 @@ def plan_launchers(steps: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
 class _Outcome:
     row_key: str
     dataset: str
-    outcome: str  # ok | skipped-complete | skipped-blocked | failed | skipped-launch-failed
+    outcome: str  # ok | skipped-complete | skipped-blocked | failed | skipped-launch-failed | skipped-dry-window | dry-window-ok | dry-window-failed
+
+
+def dry_window_root(campaign_root: Path, plan: Optional[Mapping[str, Any]] = None) -> Path:
+    """ADR-0153: the sibling run root the dry windows are written to. The
+    name is the run id's first 30 characters, ``-dry-`` and six hex digits of
+    the plan's rung artifacts (review HIGH 2, 2026-10-09: a re-plan with new
+    lambda* values gets a fresh root, so a stale verdict is never reused
+    across plans), kept inside the §1 run-id grammar for every session (a
+    cd-act run id plus ``-dry`` alone would exceed it). The campaign tree
+    never carries a dry window."""
+    campaign_root = Path(campaign_root)
+    artifacts = ((plan or {}).get("rung_calibration") or {}).get("artifacts") or {}
+    shas = sorted(str((a or {}).get("sha256")) for a in artifacts.values())
+    digest = hashlib.sha256(",".join(shas).encode("utf-8")).hexdigest()[:6]
+    name = f"{campaign_root.name[:30]}{DRY_WINDOW_ROOT_SUFFIX}-{digest}"
+    if not RUN_ID_RE.match(name):
+        raise RunError(f"dry window root {name!r} violates the §1 grammar {RUN_ID_RE.pattern}")
+    return campaign_root.parent / name
+
+
+def _dry_window_dir(dry_root: Path, step: Mapping[str, Any], ordinal: int) -> Path:
+    return Path(dry_root) / "cells" / step["row_key"] / f"window_{step['dataset']}-{ordinal:02d}"
+
+
+def _dry_attempt_ordinals(dry_root: Path, step: Mapping[str, Any]) -> List[int]:
+    """The window ordinals already written for this dry window (one per
+    attempt), ascending; the next attempt runs at the next ordinal through
+    CAGE_WINDOW_ORDINAL_BASE so no verdict is ever overwritten."""
+    cell_dir = Path(dry_root) / "cells" / step["row_key"]
+    prefix = f"window_{step['dataset']}-"
+    out: List[int] = []
+    if cell_dir.is_dir():
+        for entry in cell_dir.iterdir():
+            if entry.is_dir() and entry.name.startswith(prefix) and entry.name[len(prefix):].isdigit():
+                out.append(int(entry.name[len(prefix):]))
+    return sorted(out)
+
+
+def _read_dry_window_regime(
+    dry_root: Path, step: Mapping[str, Any], ordinal: int = 1
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    """The dry window attempt's regime.json (label, document) or (None, {})
+    when the runner wrote none (a refusal before the window, or a crash)."""
+    path = _dry_window_dir(dry_root, step, ordinal) / "regime.json"
+    if not path.is_file():
+        return None, {}
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, {}
+    label = doc.get("label") if isinstance(doc, dict) else None
+    return (label if isinstance(label, str) else None), (doc if isinstance(doc, dict) else {})
+
+
+def _dry_sidecar_path(dry_root: Path, step: Mapping[str, Any], ordinal: int) -> Path:
+    return Path(dry_root) / "dry_attempts" / f"{step['row_key']}.{ordinal:02d}.json"
+
+
+def dry_window_identity(step: Mapping[str, Any]) -> Dict[str, Any]:
+    """What a dry window attempt ran at: a later run reuses an IN_REGIME
+    verdict only when this identity is unchanged (review HIGH 2)."""
+    source = step.get("lambda_star_source") or {}
+    return {
+        "offered_rate_rps": step["offered_rate_rps"],
+        "lambda_star_rps": step["lambda_star_rps"],
+        "rate_frac": step["rate_frac"],
+        "duration_s": step.get("duration_s"),
+        "artifact_sha256": source.get("artifact_sha256") if isinstance(source, dict) else None,
+        "seq_tokens": (step.get("demand_class") or {}).get("seq_tokens"),
+        "serving": step.get("serving"),
+        "budget_plan_total": (step.get("budget_plan") or {}).get("budget_bytes_total"),
+    }
+
+
+def _read_dry_sidecar(dry_root: Path, step: Mapping[str, Any], ordinal: int) -> Dict[str, Any]:
+    path = _dry_sidecar_path(dry_root, step, ordinal)
+    if not path.is_file():
+        return {}
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def _write_dry_sidecar(
+    dry_root: Path, step: Mapping[str, Any], ordinal: int, label: Optional[str], runner_exit: int
+) -> None:
+    path = _dry_sidecar_path(dry_root, step, ordinal)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "cage-dry-window-attempt-v1",
+                "adr": DRY_WINDOW_ADR,
+                "row_key": step["row_key"],
+                "dataset": step["dataset"],
+                "ordinal": ordinal,
+                "identity": dry_window_identity(step),
+                "label": label,
+                "runner_exit": runner_exit,
+                "utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def run_plan(
@@ -5061,6 +6185,11 @@ def run_plan(
 
     outcomes: List[_Outcome] = []
     server_ok = True  # state of the current serving config (non-hf cells)
+    # ADR-0153: (engine, demand-class seq_tokens) -> the dry window's label
+    # when it did not read IN_REGIME; every pressure cell of the pair is then
+    # skipped with a named sentinel and the exit code is EXIT_DRY_WINDOW_FAILED.
+    dry_failed: Dict[Tuple[Any, ...], str] = {}
+    dry_root = dry_window_root(campaign_root, plan)
     # V2 (engine handoff): the stops this run performs. Clean room first: every
     # launcher the plan uses is stopped once before the first step (a resident
     # engine of an aborted run); then the previous family before a relaunch of
@@ -5120,6 +6249,80 @@ def run_plan(
                     )
                 continue
             row_key, dataset = step["row_key"], step["dataset"]
+            if step["kind"] == "dry_window":
+                # ADR-0153: one window per (engine, demand class) at the
+                # tightest r, DRY_WINDOW_RATE_FRAC x lambda*, in the sibling
+                # dry root; its regime label gates the pair's pressure cells.
+                key = dry_window_key(step["serving"], step["demand_class"])
+                pair = f"engine={key[0]} prefix={key[1]} class={key[2]} tokens kv={key[3]} connector={key[4]} topology={key[5]}"
+                if not server_ok:
+                    dry_failed[key] = "relaunch-failed"
+                    print(
+                        f"[run_campaign] DRY WINDOW SKIPPED (relaunch failed): {pair} "
+                        f"r={step['budget_r']}; its pressure cells fail ({DRY_WINDOW_ADR})"
+                    )
+                    outcomes.append(_Outcome(row_key, dataset, "dry-window-failed"))
+                    continue
+                # Reuse rule (review HIGH 2): an earlier attempt is reused only
+                # when its label is IN_REGIME and its sidecar identity (rate,
+                # lambda*, artifact, class, serving, budget) equals this
+                # step's; anything else runs a FRESH attempt at the next
+                # window ordinal, so no verdict is overwritten or inherited.
+                attempts = _dry_attempt_ordinals(dry_root, step)
+                label: Optional[str] = None
+                doc: Dict[str, Any] = {}
+                reused = False
+                if attempts and not force_rerun:
+                    last = attempts[-1]
+                    label, doc = _read_dry_window_regime(dry_root, step, last)
+                    side = _read_dry_sidecar(dry_root, step, last)
+                    if label == DRY_WINDOW_EXPECTED_LABEL and side.get("identity") == dry_window_identity(step):
+                        reused = True
+                        print(
+                            f"[run_campaign] dry window reused: {pair} attempt {last:02d} "
+                            f"(same plan identity, label {label})"
+                        )
+                    else:
+                        print(
+                            f"[run_campaign] dry window attempt {last:02d} not reused "
+                            f"(label={label!r}, identity_match={side.get('identity') == dry_window_identity(step)}): "
+                            "running a fresh attempt"
+                        )
+                if not reused:
+                    base = attempts[-1] if attempts else 0
+                    env = dict(step["env"])
+                    if base:
+                        env["CAGE_WINDOW_ORDINAL_BASE"] = str(base)
+                    argv = list(step["argv"]) + ["--campaign-root", str(dry_root)]
+                    rc = _exec(argv, env)
+                    label, doc = _read_dry_window_regime(dry_root, step, base + 1)
+                    _write_dry_sidecar(dry_root, step, base + 1, label, rc)
+                    if rc != 0:
+                        print(f"[run_campaign] dry window runner exited {rc} ({row_key})")
+                inputs = doc.get("inputs") if isinstance(doc.get("inputs"), dict) else {}
+                summary = (
+                    f"label={label!r} rho_kv_time_avg={inputs.get('rho_kv_time_avg')!r} "
+                    f"queue_waiting_share={inputs.get('queue_waiting_share')!r} "
+                    f"waiting_max={inputs.get('waiting_max')!r} attainment={doc.get('attainment')!r} "
+                    f"refusal={doc.get('refusal_reason')!r}"
+                )
+                if label == DRY_WINDOW_EXPECTED_LABEL:
+                    print(
+                        f"[run_campaign] dry window ok: {pair} r={step['budget_r']} "
+                        f"rate={step['offered_rate_rps']:.4g} rps {summary}"
+                    )
+                    outcomes.append(_Outcome(row_key, dataset, "dry-window-ok"))
+                else:
+                    dry_failed[key] = str(label or "no-regime")
+                    print(
+                        f"[run_campaign] DRY WINDOW FAILED: {pair} r={step['budget_r']} "
+                        f"rate={step['offered_rate_rps']:.4g} rps expected "
+                        f"{DRY_WINDOW_EXPECTED_LABEL}, {summary}; every pressure cell of this "
+                        f"serving configuration is skipped ({DRY_WINDOW_ADR}, {DRY_WINDOW_FINDING}); "
+                        "the budget-free cells still run"
+                    )
+                    outcomes.append(_Outcome(row_key, dataset, "dry-window-failed"))
+                continue
             # Per-task RULER steps claim disjoint window-ordinal ranges within
             # a shared (row_key, dataset) space; resume counting and the
             # failure sentinel are both scoped to THIS step's range (base 0 =
@@ -5137,6 +6340,14 @@ def run_plan(
                 )
                 outcomes.append(_Outcome(row_key, dataset, "skipped-launch-failed"))
                 continue
+            if step.get("family") in _PRESSURE_FAMILIES and isinstance(step.get("demand_class"), dict):
+                key = dry_window_key(step["serving"], step["demand_class"])
+                if key in dry_failed:
+                    _write_failed_sentinel(
+                        campaign_root, row_key, dataset, f"dry-window-{dry_failed[key]}", base
+                    )
+                    outcomes.append(_Outcome(row_key, dataset, "skipped-dry-window"))
+                    continue
             done = count_complete_windows(
                 campaign_root,
                 row_key,
@@ -5179,10 +6390,18 @@ def run_plan(
         o.outcome in ("failed", "skipped-launch-failed") for o in outcomes
     )
     any_blocked_skipped = any(o.outcome == "skipped-blocked" for o in outcomes)
+    any_dry_failed = bool(dry_failed)
+    if any_dry_failed:
+        print(
+            f"[run_campaign] dry windows failed for (engine, prefix, class tokens, kv, connector, "
+            f"topology): {sorted(dry_failed.items(), key=str)} ({DRY_WINDOW_ADR}): their pressure cells were "
+            "skipped with .STATUS sentinels; the plan's lambda* or demand class for those "
+            "pairs does not reach the regime live"
+        )
     if seal:
         # Blocked skips gate the seal exactly like failures: the tree is NOT
         # the full registered session, and a plain seal marks it done.
-        if (any_failed or any_blocked_skipped) and not seal_partial:
+        if (any_failed or any_blocked_skipped or any_dry_failed) and not seal_partial:
             print(
                 "[run_campaign] --seal SKIPPED: run has failures and/or "
                 "blocked-skipped cells and --seal-partial was not given "
@@ -5205,8 +6424,17 @@ def run_plan(
     # V2: a failed stop never gates the seal (the data tree is complete) but
     # the exit code says the run did not leave the pod clean, with its own
     # value so a re-run operator can tell it from a failed cell (review F4).
+    # ADR-0153: a failed dry window has its own value too (3): the executed
+    # cells passed, but a whole (engine, class) of pressure cells never ran.
     if any_failed:
         return 1
+    if any_dry_failed:
+        if stop_failures:
+            print(
+                f"[run_campaign] exit {EXIT_DRY_WINDOW_FAILED} (dry window) also carries "
+                f"{stop_failures} failed engine stop(s) ({ENGINE_STOP_FINDING})"
+            )
+        return EXIT_DRY_WINDOW_FAILED
     if stop_failures:
         return EXIT_STOP_FAILED
     return 0
@@ -5234,19 +6462,46 @@ def parse_query_manifest_args(items: Sequence[str]) -> Dict[str, Path]:
     return out
 
 
-def parse_calibration_args(items: Sequence[str]) -> Dict[str, Path]:
+def parse_calibration_args(
+    items: Sequence[str], flag: str = "--calibration"
+) -> Dict[str, Path]:
     """``ENGINE=PATH`` registrations -> {engine: path}; malformed or
-    duplicate entries refuse (PlanError). Batch 2 W4."""
+    duplicate entries refuse (PlanError). Batch 2 W4; ADR-0154 reuses it for
+    ``--rung-calibration``."""
     out: Dict[str, Path] = {}
     for item in items:
         engine, sep, raw_path = item.partition("=")
         if not sep or not engine.strip() or not raw_path.strip():
-            raise PlanError(f"--calibration {item!r}: expected ENGINE=PATH")
+            raise PlanError(f"{flag} {item!r}: expected ENGINE=PATH")
         engine = engine.strip()
         if engine in out:
-            raise PlanError(f"--calibration {engine}: registered twice")
+            raise PlanError(f"{flag} {engine}: registered twice")
         out[engine] = Path(raw_path.strip())
     return out
+
+
+def parse_rungs_arg(text: Optional[str]) -> Optional[Tuple[float, ...]]:
+    """``--rungs 1.5,1,0.75`` -> (1.5, 1.0, 0.75); None (every budgeted rung)
+    when absent; a non-numeric, non-positive or repeated entry refuses."""
+    if text is None or not text.strip():
+        return None
+    out: List[float] = []
+    for raw in text.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            r = float(raw)
+        except ValueError as exc:
+            raise PlanError(f"--rungs {raw!r} is not a budget ratio") from exc
+        if not math.isfinite(r) or r <= 0:
+            raise PlanError(f"--rungs {raw!r} must be finite and > 0")
+        if any(math.isclose(r, seen, rel_tol=0.0, abs_tol=1e-9) for seen in out):
+            raise PlanError(f"--rungs {raw!r} is listed twice")
+        out.append(r)
+    if not out:
+        raise PlanError(f"--rungs {text!r} names no rung")
+    return tuple(out)
 
 
 def _cmd_plan(args: argparse.Namespace) -> int:
@@ -5267,6 +6522,9 @@ def _cmd_plan(args: argparse.Namespace) -> int:
         calibrations=parse_calibration_args(args.calibration),
         calibration_budget_fraction=args.calibration_budget_fraction,
         rehearsal_n=args.rehearsal_n,
+        rung_calibrations=parse_calibration_args(
+            args.rung_calibration, flag="--rung-calibration"
+        ),
     )
     text = json.dumps(plan, indent=2, sort_keys=False) + "\n"
     if args.out:
@@ -5275,7 +6533,8 @@ def _cmd_plan(args: argparse.Namespace) -> int:
         print(
             f"[run_campaign] plan written: {args.out} — {c['cells']} cells, "
             f"{c['windows']} windows, {c['relaunches']} relaunches, "
-            f"{c['engine_stops']} engine stops, {c['blocked']} blocked"
+            f"{c['engine_stops']} engine stops, {c['dry_windows']} dry windows, "
+            f"{c['blocked']} blocked"
         )
     else:
         print(text, end="")
@@ -5299,13 +6558,512 @@ def _cmd_run(args: argparse.Namespace) -> int:
     )
 
 
+# ---------------------------------------------------------------------------
+# Rung calibration (ADR-0154, S0F-62): lambda* per budget rung, measured by the
+# registered cal-v2 ladder on the gold-fresh F2 workload under the plan's OWN
+# relaunch for that rung (prefix OFF, the gold class budget). The 2026-10-08
+# landing offered rates from the floor table's assumed service time and ran 3
+# to 6 times below the capacity its own telemetry showed; the ladder measures
+# the capacity the cells are then driven at.
+# ---------------------------------------------------------------------------
+
+#: Default run root the ladder windows are written under (one §1 run root
+#: per window: ``<out_root>/<session>/cal-<engine>-r<r>-s<k>``); never a
+#: campaign tree, never read by the analysis (calibration data is
+#: non-confirmatory by registration).
+DEFAULT_RUNG_OUT_ROOT = "results/rung-calibration"
+#: Rung labels the ladder mints beside decide_lambda_star's three: the rung's
+#: relaunch failed, or a probe window left no readable requests.jsonl.
+RUNG_LABEL_RELAUNCH_FAILED = "RELAUNCH_FAILED"
+RUNG_LABEL_PROBE_FAILED = "PROBE_FAILED"
+
+
+def budgeted_rungs(grid: SessionGrid) -> Tuple[float, ...]:
+    """Every budget ratio r a pressure cell of the session is served at (the
+    F2 factorial, the anchor fine overlay, F3), DESCENDING: the order the
+    ladder calibrates them in, so each rung's start rate chains from the
+    looser rung's lambda* (capacity cannot rise as the budget shrinks)."""
+    return tuple(
+        sorted(
+            {float(r) for r in (*grid.f2_budgets, *grid.f2_fine_budgets, *grid.f3_budgets)},
+            reverse=True,
+        )
+    )
+
+
+def _gold_fresh_cell(grid: SessionGrid, engine: str, r: float) -> PlannedCell:
+    """The gold-fresh F2 cell of (engine, r): the ladder's workload. The rate
+    fraction is the first registered one (identity only: the ladder sets the
+    rate per step); a session without the anchor arm on F2, or an engine
+    whose gold cell is blocked, refuses."""
+    bids = [bid for bid in grid.f2_baselines if BASELINES[bid].arm == DEMAND_ANCHOR_ARM]  # type: ignore[index]
+    if not bids:
+        raise PlanError(
+            f"session {grid.session!r} registers no F2 baseline on the {DEMAND_ANCHOR_ARM} "
+            f"arm; the rung ladder measures lambda* on it ({RUNG_CALIBRATION_ADR})"
+        )
+    if not grid.f2_rates:
+        raise PlanError(f"session {grid.session!r} registers no F2 rate fraction")
+    spec = CellSpec.from_baseline(
+        bids[0],
+        engine=engine,  # type: ignore[arg-type]
+        model=grid.model,  # type: ignore[arg-type]
+        family="F2",
+        budget_r=r,
+        rate_frac=grid.f2_rates[0],
+    )
+    cell = PlannedCell(
+        spec=spec,
+        baseline_id=bids[0],
+        dataset=grid.f2_dataset,
+        blocked_on=_launch_blocked_on(spec),
+        grids=(GRID_D6_FACTORIAL,),
+    )
+    if cell.blocked_on is not None:
+        raise PlanError(
+            f"the {DEMAND_ANCHOR_ARM} F2 cell of engine {engine!r} is blocked "
+            f"({cell.blocked_on}); no ladder can run on it"
+        )
+    return cell
+
+
+def ladder_root(out_root: Path, session: str, engine: str, r: float, k: int) -> Path:
+    """The §1 run root of ladder window ``k`` of rung ``r``:
+    ``<out_root>/<session>/cal-<engine>-r<r with '.' as 'p'>-s<k:02d>``
+    (the runner requires a RUN_ID_RE basename under a session directory)."""
+    name = f"cal-{engine}-r{f'{r:g}'.replace('.', 'p')}-s{k:02d}"
+    if not RUN_ID_RE.match(name):
+        raise PlanError(f"ladder root basename {name!r} violates the §1 grammar {RUN_ID_RE.pattern}")
+    return Path(out_root) / session / name
+
+
+def _read_ladder_window(
+    root: Path, row_key: str, dataset: str, rate_qps: float, phase: str
+) -> Tuple[ProbeStep, Optional[str]]:
+    """One probe window's ProbeStep from the runner's requests.jsonl (the
+    rows after the runner's Jain trim; trimmed again at PROBE_WARMUP_S on the
+    intended arrival, idempotent) plus the window's regime label when the
+    runner wrote regime.json (provenance; the decision is attainment's alone).
+    A window with no requests.jsonl, a row without an intended arrival, or no
+    post-warmup arrival raises RunError: the step is refused, never guessed."""
+    window_dir = Path(root) / "cells" / row_key / f"window_{dataset}-01"
+    path = window_dir / "requests.jsonl"
+    if not path.is_file():
+        raise RunError(f"ladder window at {rate_qps:.4g} qps wrote no {path}")
+    rows: List[Dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            rows.append(json.loads(line))
+    for i, row in enumerate(rows):
+        arrival = row.get("arrival_s")
+        if isinstance(arrival, bool) or not isinstance(arrival, (int, float)) or not math.isfinite(arrival):
+            raise RunError(
+                f"{path} row {i} carries arrival_s={arrival!r}; a ladder window is open-loop "
+                "and every row names its intended arrival"
+            )
+    kept = [row for row in rows if float(row["arrival_s"]) >= PROBE_WARMUP_S]
+    if not kept:
+        raise RunError(
+            f"no arrivals in the post-warmup window at {rate_qps:.4g} qps ({path}): the "
+            f"{PROBE_WINDOW_S:g} s window is too short for this rate"
+        )
+    n_completed = sum(1 for row in kept if row.get("ok") is True)
+    step = ProbeStep(
+        rate_qps=float(rate_qps),
+        n_scheduled=len(kept),
+        n_completed=n_completed,
+        throughput_rps=n_completed / (PROBE_WINDOW_S - PROBE_WARMUP_S),
+        phase=phase,
+    )
+    label: Optional[str] = None
+    regime_path = window_dir / "regime.json"
+    if regime_path.is_file():
+        try:
+            doc = json.loads(regime_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            doc = None
+        if isinstance(doc, dict) and isinstance(doc.get("label"), str):
+            label = doc["label"]
+    return step, label
+
+
+def _set_flag(argv: List[str], flag: str, value: str) -> None:
+    at = argv.index(flag)
+    argv[at + 1] = value
+
+
+def calibrate_rungs(
+    session: str,
+    engine: str,
+    floor: FloorTable,
+    *,
+    calibration: Path,
+    out_root: Path,
+    rungs: Optional[Sequence[float]] = None,
+    query_manifests: Optional[Mapping[str, Path]] = None,
+    freeze_file: Optional[Path] = None,
+    rehearsal_n: Optional[int] = None,
+    seed: int = 42,
+    runner_cmd: Sequence[str] = DEFAULT_RUNNER_CMD,
+    launcher_cmds: Optional[Mapping[str, Sequence[str]]] = None,
+    start_qps: Optional[float] = None,
+    exec_fn: Callable[[Sequence[str], Mapping[str, str]], int] = _exec,
+    log: Callable[[str], None] = print,
+) -> Dict[str, Any]:
+    """Measure lambda* per budget rung for ONE engine and return the
+    ``cage-rung-calibration-v1`` artifact document (the caller writes it).
+
+    Per rung, loosest first: the plan's own budgeted relaunch for the gold
+    class at that r (``_relaunch_step`` of the gold-fresh cell's serving
+    config: prefix OFF, the budget sized on the anchor shape), then the
+    registered cal-v2 ladder (``geometric_rate_ladder`` from the start rate,
+    climb until the first unsustainable window or PROBE_MAX_STEPS, then
+    PROBE_BISECT_STEPS arithmetic midpoints), every window one runner
+    invocation of the gold-fresh cell (``_cell_step(ladder=True)``) at that
+    rate into its own §1 run root under ``out_root``; the decision is
+    ``decide_lambda_star`` over the steps sorted by rate. The first rung
+    starts at ``start_qps`` (default: ``floor_start_qps`` of the engine's
+    cal-v2 floor at LADDER_START_DECODE_TOKENS); each later rung starts at
+    the previous ESTIMATED lambda* / LADDER_CHAIN_DIVISOR, else at the floor
+    start again. A failed relaunch or an unreadable window labels the rung
+    (RELAUNCH_FAILED / PROBE_FAILED) and the ladder moves on; the engine is
+    stopped at the end, success or abort. Pure of RunPod: ``exec_fn`` is the
+    one seam (tests stub it with a runner that writes requests.jsonl).
+    """
+    grid = get_session_grid(session)
+    if rehearsal_n is not None:
+        grid = rehearsal_grid(grid, n=rehearsal_n, datasets=frozenset(query_manifests or {}))
+    if engine not in _session_engines(grid):
+        raise PlanError(
+            f"--engine {engine!r} is not a server engine of session {session!r} "
+            f"(registered: {sorted(_session_engines(grid))})"
+        )
+    if floor.model != grid.model:
+        raise PlanError(
+            f"floor table {floor.path} is for model {floor.model!r} but session "
+            f"{session!r} runs {grid.model!r}"
+        )
+    if start_qps is not None and (
+        isinstance(start_qps, bool) or not isinstance(start_qps, (int, float))
+        or not math.isfinite(start_qps) or start_qps <= 0
+    ):
+        raise PlanError(f"--start-qps {start_qps!r} must be finite and > 0")
+    registered = budgeted_rungs(grid)
+    if rungs is None:
+        rung_list: Tuple[float, ...] = registered
+    else:
+        for r in rungs:
+            if not any(math.isclose(r, reg, rel_tol=0.0, abs_tol=1e-9) for reg in registered):
+                raise PlanError(
+                    f"--rungs {r:g} is not a budgeted rung of session {session!r} "
+                    f"(registered: {[f'{x:g}' for x in registered]})"
+                )
+        rung_list = tuple(sorted({float(r) for r in rungs}, reverse=True))
+    for r in rung_list:
+        floor.row(r)
+    pins = resolve_retrieval_pins(freeze_file)
+    manifests = _register_query_manifests(grid, query_manifests)
+    launcher_cmds = dict(launcher_cmds or DEFAULT_LAUNCHER_CMDS)
+    anchor_tokens = _check_floor_shape(grid, floor)
+    cells = [_gold_fresh_cell(grid, engine, r) for r in rung_list]
+    _check_manifest_coverage(grid, manifests, cells)
+    cal_header = _register_calibrations(grid, {engine: Path(calibration)}, cells, FLOOR_BUDGET_FRACTION)
+    floors = cal_header["floors"][engine]
+    slo_floors_env = slo_floors_env_value(cal_header["floors"])
+    floor_meas = FloorMeasurement(
+        ttft_s=float(floors["ttft_s"]),
+        tpot_s=float(floors["tpot_s"]),
+        n_requests=int(floors["n_requests"]),
+        statistic=str(floors["statistic"]),
+    )
+    floor_start = floor_start_qps(floor_meas, max_tokens=LADDER_START_DECODE_TOKENS)
+    first_start = float(start_qps) if start_qps is not None else floor_start
+    manifest_rec = manifests.get(grid.f2_dataset)
+    out_root = Path(out_root)
+
+    rung_records: Dict[str, Dict[str, Any]] = {}
+    resident: Optional[Dict[str, Any]] = None
+    stop_failures = 0
+
+    def _stop(record: Mapping[str, Any], why: str) -> None:
+        nonlocal stop_failures
+        rc_stop = exec_fn(record["stop_argv"], record["env"])
+        if rc_stop == 0:
+            log(f"[calibrate-rungs] engine stop ({why}): launcher={record['launcher_key']} ok")
+        else:
+            stop_failures += 1
+            log(
+                f"[calibrate-rungs] STOP FAILED (exit {rc_stop}, {why}): launcher="
+                f"{record['launcher_key']} argv={record['stop_argv']}"
+            )
+
+    previous_lambda: Optional[float] = None
+    try:
+        for cell in cells:
+            r = float(cell.spec.budget_r)  # type: ignore[arg-type]
+            key = f"{r:g}"
+            config = _serving_config(cell, grid)
+            assert config is not None
+            relaunch = _relaunch_step(config, grid, floor, launcher_cmds)
+            if resident is None:
+                _stop(_stop_record(relaunch, None), "clean room before the first rung")
+            elif resident["launcher_key"] != relaunch["launcher_key"]:
+                _stop(resident, "family change before the next rung")
+            log(
+                f"[calibrate-rungs] rung r={key}: relaunch engine={engine} prefix=OFF "
+                f"budget_bytes={relaunch.get('budget_bytes')} class={anchor_tokens} tokens"
+            )
+            rc = exec_fn(relaunch["argv"], relaunch["env"])
+            resident = _stop_record(relaunch, None)
+            base_record: Dict[str, Any] = {
+                "r": r,
+                "relaunch": {
+                    "argv": list(relaunch["argv"]),
+                    "env": dict(relaunch["env"]),
+                    "budget_bytes": relaunch.get("budget_bytes"),
+                    "budget_plan": relaunch.get("budget_plan"),
+                    "demand_class": relaunch.get("demand_class"),
+                    "exit": rc,
+                },
+            }
+            if rc != 0:
+                log(f"[calibrate-rungs] RELAUNCH FAILED (exit {rc}) at r={key}; rung labeled")
+                rung_records[key] = {
+                    **base_record,
+                    "label": RUNG_LABEL_RELAUNCH_FAILED,
+                    "lambda_star_qps": None,
+                    "sustained_rate_qps": None,
+                    "first_unsustainable_qps": None,
+                    "start_qps": None,
+                    "steps": [],
+                }
+                previous_lambda = None
+                continue
+            cell_step = _cell_step(
+                cell, grid, floor, runner_cmd, seed, pins,
+                query_manifest=None if manifest_rec is None else manifest_rec["path"],
+                slo_floors_env=slo_floors_env,
+                budget_plan=relaunch["budget_plan"],
+                ladder=True,
+            )
+            if previous_lambda is not None:
+                start = previous_lambda / LADDER_CHAIN_DIVISOR
+                start_basis = f"previous rung lambda* {previous_lambda:.4g} / {LADDER_CHAIN_DIVISOR:g}"
+            else:
+                start = first_start
+                start_basis = (
+                    f"--start-qps {first_start:.4g}" if start_qps is not None
+                    else f"{START_QPS_RULE}: floor_start_qps at {LADDER_START_DECODE_TOKENS} decode tokens"
+                )
+            steps: List[ProbeStep] = []
+            step_records: List[Dict[str, Any]] = []
+            k = 0
+
+            def _probe(rate: float, phase: str) -> ProbeStep:
+                nonlocal k
+                root = ladder_root(out_root, session, engine, r, k)
+                k += 1
+                if root.exists():
+                    raise RunError(
+                        f"ladder root {root} already exists; calibration roots are never "
+                        "reused (pick another --out-root)"
+                    )
+                argv = list(cell_step["argv"])
+                _set_flag(argv, "--rate", f"{rate:.6g}")
+                argv += ["--campaign-root", str(root)]
+                env = dict(cell_step["env"])
+                env[LADDER_REPLAY_ENV] = "1"
+                log(f"[calibrate-rungs]   {phase} window: {rate:.4g} qps for {PROBE_WINDOW_S:g} s -> {root}")
+                rc_win = exec_fn(argv, env)
+                step, regime_label = _read_ladder_window(
+                    root, cell_step["row_key"], cell_step["dataset"], rate, phase
+                )
+                log(
+                    f"[calibrate-rungs]   attainment={step.attainment:.3f} "
+                    f"({step.n_completed}/{step.n_scheduled}) throughput={step.throughput_rps:.4g} rps "
+                    f"regime={regime_label} runner_exit={rc_win}"
+                )
+                step_records.append({
+                    **step.to_manifest(),
+                    "regime_label": regime_label,
+                    "runner_exit": rc_win,
+                    "root": str(root),
+                    "trim_warmup_s": PROBE_WARMUP_S,
+                    "replay_env": f"{LADDER_REPLAY_ENV}=1",
+                })
+                return step
+
+            try:
+                for rate in geometric_rate_ladder(start):
+                    step = _probe(rate, "ladder")
+                    steps.append(step)
+                    if step.attainment < PROBE_ATTAINMENT_MIN:
+                        break
+                if len(steps) >= 2 and steps[-1].attainment < PROBE_ATTAINMENT_MIN:
+                    lo, hi = steps[-2].rate_qps, steps[-1].rate_qps
+                    for _ in range(PROBE_BISECT_STEPS):
+                        mid = (lo + hi) / 2.0
+                        step = _probe(mid, "bisect")
+                        steps.append(step)
+                        if step.attainment >= PROBE_ATTAINMENT_MIN:
+                            lo = mid
+                        else:
+                            hi = mid
+                estimate = decide_lambda_star(sorted(steps, key=lambda s: s.rate_qps))
+            except (RunError, CalibrationError) as exc:
+                log(f"[calibrate-rungs] PROBE FAILED at r={key}: {exc}; rung labeled")
+                rung_records[key] = {
+                    **base_record,
+                    "label": RUNG_LABEL_PROBE_FAILED,
+                    "lambda_star_qps": None,
+                    "sustained_rate_qps": None,
+                    "first_unsustainable_qps": None,
+                    "start_qps": start,
+                    "start_basis": start_basis,
+                    "error": str(exc),
+                    "steps": step_records,
+                }
+                previous_lambda = None
+                continue
+            log(
+                f"[calibrate-rungs] rung r={key}: {estimate.label} lambda*="
+                f"{estimate.lambda_star_qps} sustained={estimate.sustained_rate_qps} "
+                f"first_unsustainable={estimate.first_unsustainable_qps} ({len(steps)} windows)"
+            )
+            rung_records[key] = {
+                **base_record,
+                "label": estimate.label,
+                "lambda_star_qps": estimate.lambda_star_qps,
+                "sustained_rate_qps": estimate.sustained_rate_qps,
+                "first_unsustainable_qps": estimate.first_unsustainable_qps,
+                "start_qps": start,
+                "start_basis": start_basis,
+                "steps": step_records,
+                "cell_row_key": cell_step["row_key"],
+                "cell_argv_sha256": hashlib.sha256(
+                    json.dumps(cell_step["argv"], separators=(",", ":")).encode("utf-8")
+                ).hexdigest(),
+            }
+            previous_lambda = estimate.lambda_star_qps
+    finally:
+        if resident is not None:
+            _stop(resident, "end of calibration")
+
+    gold_cell = cells[0]
+    return {
+        "schema": RUNG_CALIBRATION_SCHEMA,
+        "procedure_version": PROCEDURE_VERSION,
+        "confirmatory": False,
+        "adr": RUNG_CALIBRATION_ADR,
+        "finding": RUNG_CALIBRATION_FINDING,
+        "engine": BACKEND_OF_ENGINE[engine],
+        "model": HF_ID_OF_SLUG[grid.model],
+        "session": session,
+        "rehearsal_n": rehearsal_n,
+        "seed": seed,
+        "workload": {
+            "arm": DEMAND_ANCHOR_ARM,
+            "baseline_id": gold_cell.baseline_id,
+            "dataset": gold_cell.dataset,
+            "num_queries": cell_num_queries(grid, gold_cell)[1],
+            "seq_tokens": anchor_tokens,
+            "prefix_mode": "OFF",
+            "query_manifest": None if manifest_rec is None else manifest_rec["path"],
+            "window_mode": "duration",
+            "replay": True,
+            "replay_note": (
+                "the pool is replayed modulo under CAGE_ALLOW_REPLAY=1, the cal-v2 probe's "
+                "own convention (calibrate_cell.probe_rate); the V3 pool guard refuses an "
+                "arrival count above the prepared pool, so calibration windows run in "
+                "duration mode and never enter confirmatory analysis"
+            ),
+        },
+        "ladder": {
+            "window_s": PROBE_WINDOW_S,
+            "warmup_s": PROBE_WARMUP_S,
+            "factor": PROBE_LADDER_FACTOR,
+            "max_steps": PROBE_MAX_STEPS,
+            "bisect_steps": PROBE_BISECT_STEPS,
+            "attainment_min": PROBE_ATTAINMENT_MIN,
+            "start_rule": START_QPS_RULE,
+            "start_decode_tokens": LADDER_START_DECODE_TOKENS,
+            "chain_divisor": LADDER_CHAIN_DIVISOR,
+            "floor_start_qps": floor_start,
+            "first_start_qps": first_start,
+            "floor": dict(floors),
+            "floor_artifact": cal_header["artifacts"][engine],
+        },
+        "stop_failures": stop_failures,
+        "rungs": rung_records,
+    }
+
+
+def _cmd_rungs(args: argparse.Namespace) -> int:
+    grid = get_session_grid(args.session)
+    if args.rehearsal_n is not None:
+        grid = rehearsal_grid(
+            grid, n=args.rehearsal_n,
+            datasets=frozenset(parse_query_manifest_args(args.query_manifest)),
+        )
+    print(" ".join(f"{r:g}" for r in budgeted_rungs(grid)))
+    return 0
+
+
+def _cmd_calibrate_rungs(args: argparse.Namespace) -> int:
+    floor = load_floor_table(Path(args.floor_table))
+    launcher_cmds: Optional[Dict[str, Tuple[str, ...]]] = None
+    if args.launcher_cmd:
+        override = tuple(shlex.split(args.launcher_cmd))
+        launcher_cmds = {engine: override for engine in DEFAULT_LAUNCHER_CMDS}
+    doc = calibrate_rungs(
+        args.session,
+        args.engine,
+        floor,
+        calibration=Path(args.calibration),
+        out_root=Path(args.out_root),
+        rungs=parse_rungs_arg(args.rungs),
+        query_manifests=parse_query_manifest_args(args.query_manifest),
+        freeze_file=Path(args.freeze_file) if args.freeze_file else None,
+        rehearsal_n=args.rehearsal_n,
+        seed=args.seed,
+        runner_cmd=tuple(shlex.split(args.runner_cmd)),
+        launcher_cmds=launcher_cmds,
+        start_qps=args.start_qps,
+    )
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(doc, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+    labels = {key: rec["label"] for key, rec in doc["rungs"].items()}
+    not_estimated = {key: label for key, label in labels.items() if label != "ESTIMATED"}
+    print(
+        f"[calibrate-rungs] artifact written: {out} engine={args.engine} rungs="
+        + ", ".join(
+            f"r={key}: {rec['label']}"
+            + (f" lambda*={rec['lambda_star_qps']:.4g} rps" if rec["lambda_star_qps"] else "")
+            for key, rec in doc["rungs"].items()
+        )
+    )
+    if not_estimated:
+        print(
+            f"[calibrate-rungs] NOT ESTIMATED: {not_estimated}; plan --rung-calibration "
+            f"refuses these rungs (LADDER_EXHAUSTED: raise --start-qps or the rung is "
+            "beyond PROBE_MAX_STEPS windows; NONE_SUSTAINABLE: lower --start-qps; "
+            "RELAUNCH_FAILED / PROBE_FAILED: read the runner and launcher output)",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="run_campaign",
         description=(
             "THE campaign sweep driver: 'plan' enumerates a session's "
             "registered D6 grid into a reviewable execution plan (pure, "
-            "offline); 'run' executes a plan against a campaign root."
+            "offline); 'run' executes a plan against a campaign root; "
+            "'rungs' lists the session's budgeted rungs; 'calibrate-rungs' "
+            "measures lambda* per rung on the pod for one engine (ADR-0154)."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -5391,8 +7149,69 @@ def main(argv: Optional[List[str]] = None) -> int:
         "coordinate on the anchor), one window per cell, every row class at "
         "n = N; recorded in the header 'rehearsal'. Never for a registered run",
     )
+    p_plan.add_argument(
+        "--rung-calibration",
+        action="append",
+        default=[],
+        metavar="ENGINE=PATH",
+        help="register the cage-rung-calibration-v1 artifact (calibrate-rungs "
+        "--out) of one engine; repeatable, REQUIRED for every engine with an "
+        "executable pressure cell: every (engine, r) of those cells must be "
+        "ESTIMATED, else the plan refuses. The offered rate of every pressure "
+        "cell is rate_frac x that lambda* (scaled to the cell's demand class); "
+        f"the floor table's KV-bound rate is recorded, never offered ({RUNG_CALIBRATION_FINDING}, "
+        f"{RUNG_CALIBRATION_ADR})",
+    )
     p_plan.add_argument("--out", default=None, help="write the plan JSON here (else stdout)")
     p_plan.set_defaults(func=_cmd_plan)
+
+    p_rungs = sub.add_parser(
+        "rungs", help="print the session's budgeted rungs, descending (pure)"
+    )
+    p_rungs.add_argument("--session", required=True, help=f"one of {sorted(SESSIONS)}")
+    p_rungs.add_argument("--rehearsal-n", type=int, default=None, metavar="N")
+    p_rungs.add_argument(
+        "--query-manifest", action="append", default=[], metavar="DATASET=PATH",
+        help="the registered manifests (only the rehearsal derivation reads them)",
+    )
+    p_rungs.set_defaults(func=_cmd_rungs)
+
+    p_cal = sub.add_parser(
+        "calibrate-rungs",
+        help="measure lambda* per budget rung for one engine on the pod (ADR-0154)",
+    )
+    p_cal.add_argument("--session", required=True, help=f"one of {sorted(SESSIONS)}")
+    p_cal.add_argument("--engine", required=True, help="the server engine to calibrate")
+    p_cal.add_argument("--floor-table", required=True, help="the T2.4 floor table (demand per r)")
+    p_cal.add_argument(
+        "--calibration", required=True, metavar="PATH",
+        help="this engine's cal-v2 floor artifact (calibrate_cell.py --output): the §6.1 "
+        "floors pinned on every ladder window and the ladder's start rate",
+    )
+    p_cal.add_argument(
+        "--rungs", default=None, metavar="R,R,...",
+        help="the budget rungs to calibrate (default: every budgeted rung of the session, "
+        "see 'rungs'); calibrated loosest first",
+    )
+    p_cal.add_argument("--query-manifest", action="append", default=[], metavar="DATASET=PATH")
+    p_cal.add_argument("--freeze-file", default=None)
+    p_cal.add_argument("--rehearsal-n", type=int, default=None, metavar="N")
+    p_cal.add_argument("--seed", type=int, default=42)
+    p_cal.add_argument(
+        "--start-qps", type=float, default=None,
+        help="override the first rung's start rate (default: floor_start_qps of the "
+        f"cal-v2 floor at {LADDER_START_DECODE_TOKENS} decode tokens); later rungs chain "
+        f"from the previous lambda* / {LADDER_CHAIN_DIVISOR:g}",
+    )
+    p_cal.add_argument("--runner-cmd", default=" ".join(DEFAULT_RUNNER_CMD))
+    p_cal.add_argument("--launcher-cmd", default=None)
+    p_cal.add_argument(
+        "--out-root", default=DEFAULT_RUNG_OUT_ROOT,
+        help="the ladder windows' run roots go under <out-root>/<session>/ (never a "
+        "campaign tree; roots are never reused)",
+    )
+    p_cal.add_argument("--out", required=True, help="write the rung-calibration artifact here")
+    p_cal.set_defaults(func=_cmd_calibrate_rungs)
 
     p_run = sub.add_parser("run", help="execute a plan")
     p_run.add_argument("--plan", required=True, help="plan JSON from 'plan'")

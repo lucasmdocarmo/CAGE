@@ -92,6 +92,21 @@ rc = _load_module()
 # ---------------------------------------------------------------------------
 
 _ANCHOR_DEMAND = 10_000_000_000  # arbitrary but realistic-scale demand bytes
+#: ADR-0155: the registered anchor shape (gold-fresh served tokens, the
+#: 2026-10-08 landing) every fixture floor table is sized on.
+_ANCHOR_SEQ_TOKENS = rc.DEMAND_SEQ_TOKENS_2026_10_08[rc.DEMAND_ANCHOR_ARM]
+#: ADR-0155: served shapes for the synthetic (1000, 500) B12 ladder some grids
+#: here register (test values; the registry carries the landing's 1400/700).
+_TRUNC_SHAPES_1000_500 = {1000: 900, 500: 450}
+#: Executable serving configs of session a (relaunches) under ADR-0155's
+#: demand classes; derived in TestPlanCountsSessionA.test_total_counts.
+_RELAUNCHES_A = 96
+#: Dry windows of session a: one per (engine, demand class) (ADR-0153).
+_DRY_WINDOWS_A = 19
+#: Session b: derived in TestSessionB.test_total_counts.
+_RELAUNCHES_B = 68
+_DRY_WINDOWS_B = 19
+
 
 
 def _floor_table_doc(
@@ -126,6 +141,10 @@ def _floor_table_doc(
             "engine": "vllm",
             "kv_dtype": "bf16",
             "grid": grid,
+            # ADR-0155: the shape D was sized on must equal the registered
+            # anchor arm's served tokens (gold-fresh, the 2026-10-08 landing).
+            "avg_seq_tokens": _ANCHOR_SEQ_TOKENS,
+            "concurrency_target": 32,
         },
         "rows": rows,
     }
@@ -222,6 +241,81 @@ def _calibration_args(calibrations: Dict[str, Path]) -> List[str]:
     return out
 
 
+#: ADR-0154 fixtures: the rung artifacts' lambda* per rung is _RUNG_LAMBDA x r
+#: (deterministic, distinguishable per r, and distinct from the floor table's
+#: 2.0 x r prediction so a test can tell the offered rate's basis apart).
+_RUNG_LAMBDA = 8.0
+
+
+def _rung_calibration_doc(
+    engine: str,
+    session: str,
+    rungs,
+    *,
+    model: str = "Qwen/Qwen3-14B",
+    lam: float = _RUNG_LAMBDA,
+    labels: Optional[Dict[float, str]] = None,
+) -> Dict[str, Any]:
+    """One ``cage-rung-calibration-v1`` artifact as calibrate-rungs writes it;
+    ``labels`` overrides a rung's label (a non-ESTIMATED rung carries no value)."""
+    records: Dict[str, Any] = {}
+    for r in rungs:
+        label = (labels or {}).get(r, "ESTIMATED")
+        records[f"{r:g}"] = {
+            "r": r,
+            "label": label,
+            "lambda_star_qps": lam * r if label == "ESTIMATED" else None,
+            "sustained_rate_qps": lam * r if label != "NONE_SUSTAINABLE" else None,
+            "first_unsustainable_qps": lam * r * 1.3 if label != "LADDER_EXHAUSTED" else None,
+            "steps": [],
+        }
+    return {
+        "schema": rc.RUNG_CALIBRATION_SCHEMA,
+        "procedure_version": rc.PROCEDURE_VERSION,
+        "confirmatory": False,
+        "engine": engine,
+        "model": model,
+        "session": session,
+        "workload": {"arm": rc.DEMAND_ANCHOR_ARM, "dataset": "qasper"},
+        "ladder": {"window_s": 75.0, "warmup_s": 10.0},
+        "rungs": records,
+    }
+
+
+def _write_rung_calibrations(
+    directory: Path, engines, session: str, rungs, **overrides: Any
+) -> Dict[str, Path]:
+    """One rung artifact per engine under ``directory`` -> {engine: path}."""
+    directory.mkdir(parents=True, exist_ok=True)
+    out: Dict[str, Path] = {}
+    for engine in engines:
+        path = directory / f"rungs_{engine}.json"
+        path.write_text(
+            json.dumps(_rung_calibration_doc(engine, session, rungs, **overrides)),
+            encoding="utf-8",
+        )
+        out[engine] = path
+    return out
+
+
+def _rungs_for(calibrations: Dict[str, Path], session: str, **overrides: Any) -> Dict[str, Path]:
+    """Rung artifacts for the engines of ``calibrations`` (written beside
+    them), covering every budgeted rung of the registered ``session``."""
+    grid = rc.get_session_grid(session)
+    rungs = rc.budgeted_rungs(grid)
+    overrides.setdefault("model", rc.HF_ID_OF_SLUG[grid.model])
+    directory = next(iter(calibrations.values())).parent if calibrations else Path(".")
+    return _write_rung_calibrations(directory, list(calibrations), session, rungs, **overrides)
+
+
+def _rung_args(rungs: Dict[str, Path]) -> List[str]:
+    """The repeatable ``--rung-calibration ENGINE=PATH`` CLI registrations."""
+    out: List[str] = []
+    for engine, path in rungs.items():
+        out += ["--rung-calibration", f"{engine}={path}"]
+    return out
+
+
 #: The dense-retriever freeze slot as the registration artifact carries it
 #: (INSTRUMENT_REVISIONS.dense_retriever, ADR-0099). Mirrored into a tmp
 #: artifact so every plan built here is hermetic (no dependency on the
@@ -272,7 +366,7 @@ def test_conftest_freeze_mirror_pins_the_same_literals() -> None:
 def plan_a(floor_table: Path, calibrations_a: Dict[str, Path]) -> Dict[str, Any]:
     floor = rc.load_floor_table(floor_table)
     return rc.build_plan(
-        "a", floor, window_duration_s=300.0, calibrations=calibrations_a
+        "a", floor, window_duration_s=300.0, calibrations=calibrations_a, rung_calibrations=_rungs_for(calibrations_a, "a")
     )
 
 
@@ -320,8 +414,40 @@ with open(os.environ["STUB_CALLS"], "a", encoding="utf-8") as fh:
 marker = os.environ.get("STUB_FAIL_MARKER", "")
 if marker and marker in " ".join(sys.argv[1:]):
     sys.exit(1)
+argv = sys.argv[1:]
+def _flag(name):
+    return argv[argv.index(name) + 1] if name in argv else None
+root = _flag("--campaign-root")
+# The real runner refuses a Jain warm-up trim in campaign mode (ADR-0055
+# amendment 2026-09-19); the stub mirrors the refusal so a plan that carries
+# the flag fails here as it would on the pod (review CRITICAL 1, 2026-10-09).
+if root and _flag("--open-loop-warmup-s") not in (None, "0"):
+    print("REFUSED: campaign mode refuses --open-loop-warmup-s > 0", file=sys.stderr)
+    sys.exit(2)
+# ADR-0153: a DRY WINDOW run (its root carries the -dry- marker) leaves the
+# regime.json the driver gates on; the label is STUB_REGIME_LABEL (default
+# IN_REGIME), 'none' writes nothing (a runner that crashed before the window).
+# The window ordinal honors CAGE_WINDOW_ORDINAL_BASE like the real writer.
+if root and (__DRY_SUFFIX__ + "-") in os.path.basename(root) and os.environ.get("STUB_REGIME_LABEL", "IN_REGIME") != "none":
+    sys.path.insert(0, __REPO_ROOT__)
+    from src.orchestration.campaign_session import derive_cell_spec
+    spec = derive_cell_spec(
+        baseline=_flag("--baseline"), baseline_label=_flag("--baseline-label"),
+        backend=_flag("--backend"), model=_flag("--model"), env=os.environ,
+    )
+    base = int(os.environ.get("CAGE_WINDOW_ORDINAL_BASE", "0") or 0)
+    wdir = os.path.join(root, "cells", spec.to_row_key(), "window_%s-%02d" % (_flag("--dataset"), base + 1))
+    os.makedirs(wdir, exist_ok=True)
+    with open(os.path.join(wdir, "regime.json"), "w", encoding="utf-8") as fh:
+        json.dump({
+            "schema_version": 2,
+            "label": os.environ.get("STUB_REGIME_LABEL", "IN_REGIME"),
+            "attainment": 0.97,
+            "inputs": {"rho_kv_time_avg": 0.93, "queue_waiting_share": 0.8, "waiting_max": 7},
+            "refusal_reason": None,
+        }, fh)
 sys.exit(0)
-"""
+""".replace("__DRY_SUFFIX__", repr(rc.DRY_WINDOW_ROOT_SUFFIX)).replace("__REPO_ROOT__", repr(str(rc.REPO_ROOT)))
 
 
 @pytest.fixture()
@@ -353,6 +479,23 @@ def stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return Stub
 
 
+def _is_dry_call(call: Dict[str, Any]) -> bool:
+    """ADR-0153: a runner invocation into the sibling dry root."""
+    argv = call["argv"]
+    if "--campaign-root" not in argv:
+        return False
+    return (rc.DRY_WINDOW_ROOT_SUFFIX + "-") in Path(argv[argv.index("--campaign-root") + 1]).name
+
+
+def _cell_calls(stub) -> List[Dict[str, Any]]:
+    """The stub's CELL runner invocations (no launcher verbs, no dry windows)."""
+    return [c for c in stub.calls() if "--baseline" in c["argv"] and not _is_dry_call(c)]
+
+
+def _dry_calls(stub) -> List[Dict[str, Any]]:
+    return [c for c in stub.calls() if _is_dry_call(c)]
+
+
 def _stub_plan(grid: Any, floor_path: Path, stub_cmd) -> Dict[str, Any]:
     """Build a plan against a synthetic grid with stubbed runner + launchers
     (Batch 2 W4: one cal-v1 floor artifact per grid engine, beside the floor
@@ -361,6 +504,17 @@ def _stub_plan(grid: Any, floor_path: Path, stub_cmd) -> Dict[str, Any]:
     calibrations = _write_calibrations(
         Path(floor_path).parent / "cal", _grid_engines(grid),
         model=rc.HF_ID_OF_SLUG[grid.model],
+    )
+    # ADR-0154: rung artifacts only for a grid with pressure cells (an artifact
+    # without rungs is refused, and a pressure-free grid needs none).
+    budgeted = rc.budgeted_rungs(grid)
+    rungs = (
+        _write_rung_calibrations(
+            Path(floor_path).parent / "cal", _grid_engines(grid), grid.session,
+            budgeted, model=rc.HF_ID_OF_SLUG[grid.model],
+        )
+        if budgeted
+        else None
     )
     orig = rc.SESSION_GRIDS
     rc.SESSION_GRIDS = {grid.session: grid}
@@ -372,6 +526,7 @@ def _stub_plan(grid: Any, floor_path: Path, stub_cmd) -> Dict[str, Any]:
             runner_cmd=stub_cmd,
             launcher_cmds={"vllm": stub_cmd, "sglang": stub_cmd},
             calibrations=calibrations,
+            rung_calibrations=rungs,
         )
     finally:
         rc.SESSION_GRIDS = orig
@@ -425,30 +580,37 @@ class TestPlanCountsSessionA:
         #   (old 2610 = 870 × 3; 2532 = 844 × 3; older 1596)
         assert plan_a["counts"]["windows"] == 2604
         # Relaunch boundaries = distinct EXECUTABLE serving configs
-        # (engine, prefix, budget, kv_dtype, connector); hf is in-process (0):
-        #   vllm:   F1 {plain, fp8·B10, lmcache·B8}                   =  3
-        #           F3 3 budgets × {plain, fp8, lmcache}              =  9
-        #           F2 7 budgets, all plain (FRESH set has no lever)  =  7
-        #             (5 factorial + the 2 §6.4 fine-only levels; the
-        #              ruler steps REUSE the qasper boundaries — dataset
-        #              is not a serving-config dimension)
-        #   sglang: F1 {plain, fp8}   (B8 BLOCKED: no connector knob) =  2
-        #           F3 3 budgets × {plain, fp8}                       =  6
-        #           F2 7 budgets, plain                               =  7
-        #   ADR-0103 (corpus-fresh B4 served prefix OFF by relaunch):
-        #           F1 B4 = the budget-free prefix-OFF plain config, new
-        #           on EACH engine                                    = +1 ×2
-        #           F3 B4 = prefix-OFF plain at r ∈ {1.0, 0.5, 0.25}, which
-        #           is IDENTICAL to the F2 plain-OFF configs at those r
-        #           (F3 budgets ⊂ F2 budgets; family is not a serving
-        #           dimension), so they share F2's boundaries       = +0
-        #   ADR-0150 (every charter reuse-off arm served prefix OFF):
-        #           F1 B1/B5/B6/B9/B11 join B4's budget-free prefix-OFF
-        #           plain config on each engine; none of them is carried
-        #           in F3; session a has no DIST overlay              = +0
-        # ⇒ (19 + 1) + (15 + 1) = 36  (old pin 34 = 19 + 15, pre-ADR-0103;
-        #    older 30 = 17 + 13, pre-fine-grid)
-        assert plan_a["counts"]["relaunches"] == 36
+        # (engine, prefix, budget, DEMAND CLASS, kv_dtype, connector); hf is
+        # in-process (0). ADR-0155: at one r every served-token class
+        # launches its own byte budget, so the class is a config dimension.
+        # Classes (DEMAND_SEQ_TOKENS_2026_10_08): gold-fresh 4779, gold-reuse
+        # 4779, corpus-{reuse,fresh,comp} 2336, retr-fresh 1127 (B5 and B6
+        # share it), retr-reuse 1126, retr-store 1127, retr-comp 702,
+        # retr-trunc 348; B12 rungs blocked here (no manifest).
+        #   per engine, prefix OFF, budgeted:
+        #           F2 7 budgets × 4 classes {4779, 1127, 702, 348}  = 28
+        #             (the ruler steps REUSE the qasper boundaries;
+        #              dataset is not a serving-config dimension)
+        #           F3 B4 corpus-fresh 2336 × 3 budgets               =  3
+        #   per engine, prefix ON, budgeted (F3, 3 budgets each):
+        #           B2 gold-reuse 4779, B3 corpus-reuse 2336, B7
+        #           retr-reuse 1126, B10 corpus-comp 2336 fp8          = 12
+        #           B8 retr-store 1127 lmcache, vLLM only (sglang:
+        #           BLOCKED, no connector knob)                       = +3 vllm
+        #   per engine, budget-free (F1):
+        #           prefix ON {plain, fp8·B10} (+ lmcache·B8 on vLLM) = 2 / 3
+        #           prefix OFF plain (ADR-0103/0150 reuse-off arms)   =  1
+        # ⇒ vllm 28 + 3 + 15 + 3 + 1 = 50; sglang 28 + 3 + 12 + 2 + 1 = 46
+        #   ⇒ 96 (old pin 36 before ADR-0155, when one r launched one
+        #   budget for every class; 34 pre-ADR-0103; 30 pre-fine-grid)
+        assert plan_a["counts"]["relaunches"] == _RELAUNCHES_A
+        # ADR-0153: one dry window per budgeted serving configuration minus r
+        # (engine, prefix, class, kv dtype, connector, topology), at the
+        # tightest r it is carried at: per engine, prefix OFF {4779, 1127,
+        # 702, 348} + corpus-fresh 2336 = 5; prefix ON {gold-reuse 4779,
+        # corpus-reuse 2336, corpus-comp 2336 fp8, retr-reuse 1126} = 4, plus
+        # retr-store 1127 lmcache on vLLM only: vllm 10 + sglang 9 = 19.
+        assert plan_a["counts"]["dry_windows"] == _DRY_WINDOWS_A
         # Blocked: retr-store (B8) on sglang — the frozen launcher has no
         # KV-store connector knob: F1 4 datasets + F3 3×3 = 13. Serving them
         # connector-free would duplicate plain rag under a B8 label.
@@ -569,11 +731,17 @@ class TestPlanCountsSessionA:
 
 class TestOrdering:
     @staticmethod
-    def _config_of(serving):
+    def _config_of(step):
+        # The relaunch-boundary identity as a cell step or a relaunch step
+        # carries it; ADR-0155 adds the demand class (served tokens) beside
+        # the budget: one r launches one byte budget per class.
+        serving = step["serving"] if step["kind"] == "cell" else step
+        demand = step.get("demand_class")
         return (
             serving["engine"],
             serving["prefix_mode"],
             serving["budget_r"],
+            None if demand is None else demand["seq_tokens"],
             serving["kv_dtype"],
             serving["connector"],
         )
@@ -581,62 +749,54 @@ class TestOrdering:
     def test_relaunches_equal_distinct_serving_configs(self, plan_a):
         # Minimality: with cells grouped by config, relaunch count == the
         # number of distinct EXECUTABLE configs — the theoretical minimum
-        # (blocked cells launch nothing; kv_dtype/connector ARE config dims).
+        # (blocked cells launch nothing; kv_dtype/connector and, since
+        # ADR-0155, the demand class ARE config dims).
         configs = set()
         for s in _cells(plan_a):
             if s["serving"] is not None and not s["blocked_on"]:
-                configs.add(self._config_of(s["serving"]))
-        # 36 = the 30 pre-fine configs + the 2 §6.4 fine-only F2 budget
-        # levels × 2 engines + the ADR-0103 budget-free prefix-OFF plain
-        # config for F1 B4 × 2 engines (F3 B4 rides the F2 plain-OFF
-        # boundaries at the same r; see
-        # TestPlanCountsSessionA.test_total_counts).
-        assert len(_relaunches(plan_a)) == len(configs) == 36
+                configs.add(self._config_of(s))
+        assert len(_relaunches(plan_a)) == len(configs) == _RELAUNCHES_A
 
     def test_every_cell_runs_under_its_preceding_relaunch(self, plan_a):
         current = None
         for s in plan_a["steps"]:
             if s["kind"] == "relaunch":
-                current = (
-                    s["engine"],
-                    s["prefix_mode"],
-                    s["budget_r"],
-                    s["kv_dtype"],
-                    s["connector"],
-                )
+                current = self._config_of(s)
                 continue
+            if s["kind"] == "dry_window":
+                continue  # ADR-0153: checked by TestDryWindowPlan
             if s["serving"] is None:
                 continue  # hf oracle: in-process
             if s["blocked_on"]:
                 continue  # never runs — no serving-boundary claim to check
             assert current == self._config_of(
-                s["serving"]
+                s
             ), f"cell {s['row_key']} would run under serving config {current}"
 
-    def test_corpus_fresh_prefix_off_rides_f2_boundaries(self, plan_a):
-        # ADR-0103 minimality: every B4 F3 cell's serving config is one of
-        # the F2 plain prefix-OFF configs at the same r (F3 budgets are a
-        # subset of F2 budgets), so B4 F3 adds NO relaunch; only the
-        # budget-free F1 B4 config is new (one per engine).
-        f2_configs = {
-            self._config_of(s["serving"])
-            for s in _cells(plan_a)
-            if s["family"] == "F2"
-        }
-        f1_b4_configs = set()
+    def test_corpus_fresh_prefix_off_has_its_own_class_boundaries(self, plan_a):
+        # ADR-0103 served B4 prefix OFF by relaunch; before ADR-0155 its F3
+        # cells shared the F2 plain prefix-OFF boundaries at the same r.
+        # Now the corpus class (2336 served tokens) is not an F2 class, so
+        # B4 F3 launches its own prefix-OFF budget per r (3 per engine), and
+        # the budget-free F1 B4 config stays one per engine.
+        grid = rc.SESSION_GRIDS["a"]
+        corpus = rc.DEMAND_SEQ_TOKENS_2026_10_08["corpus-fresh"]
+        f2_configs = {self._config_of(s) for s in _cells(plan_a) if s["family"] == "F2"}
+        f3_b4_configs, f1_b4_configs = set(), set()
         for s in _cells(plan_a):
             if s["baseline"] != "B4":
                 continue
-            cfg = self._config_of(s["serving"])
-            if s["family"] == "F3":
-                assert cfg in f2_configs, s["row_key"]
-            else:
-                assert s["family"] == "F1"
-                assert cfg not in f2_configs, s["row_key"]
-                f1_b4_configs.add(cfg)
+            cfg = self._config_of(s)
+            assert cfg not in f2_configs, s["row_key"]
+            (f3_b4_configs if s["family"] == "F3" else f1_b4_configs).add(cfg)
+        assert f3_b4_configs == {
+            (engine, "OFF", r, corpus, None, None)
+            for engine in ("vllm", "sglang")
+            for r in grid.f3_budgets
+        }
         assert f1_b4_configs == {
-            ("vllm", "OFF", None, None, None),
-            ("sglang", "OFF", None, None, None),
+            ("vllm", "OFF", None, None, None, None),
+            ("sglang", "OFF", None, None, None, None),
         }
 
     def test_rate_changes_never_relaunch(self, floor_table):
@@ -692,8 +852,15 @@ class TestOrdering:
                 )
             if s["budget_r"] is None:
                 assert env == {}, "budget-free relaunch must carry no budget env"
+                assert s["demand_class"] is None
                 continue
-            budget_bytes = int(s["budget_r"] * _ANCHOR_DEMAND)  # floor(r×D), exact here
+            # ADR-0155: the budget is floor(r x D_class) with D_class the floor
+            # table's D scaled by the class's served tokens over the anchor's.
+            seq = s["demand_class"]["seq_tokens"]
+            assert s["demand_class"]["anchor_seq_tokens"] == _ANCHOR_SEQ_TOKENS
+            demand_class = (_ANCHOR_DEMAND * seq) // _ANCHOR_SEQ_TOKENS
+            assert s["demand_class"]["demand_bytes"] == demand_class
+            budget_bytes = int(s["budget_r"] * demand_class)
             if s["engine"] == "vllm":
                 # the bytes knob is dtype-independent: SAME byte budget for
                 # every config at the same r (iso-bytes anchor, §6.5)
@@ -749,7 +916,7 @@ class TestCellSteps:
                 assert "--rate" in argv and "--arrival-count" in argv
                 assert "--duration-s" not in argv
                 assert argv[argv.index("--arrival-count") + 1] == str(s["num_queries"])
-                lam = s["lambda_star_pred_rps"]
+                lam = s["lambda_star_rps"]
                 frac = s["cellspec"]["rate_frac"]
                 assert s["offered_rate_rps"] == pytest.approx(lam * frac)
                 assert float(argv[argv.index("--rate") + 1]) == pytest.approx(
@@ -760,28 +927,84 @@ class TestCellSteps:
                 assert "--workload-mode" not in argv
                 assert s["offered_rate_rps"] is None
                 assert s["rate_basis"] is None
+                assert s["lambda_star_rps"] is None
+                assert s["lambda_star_source"] is None
                 # absence stays absence: no budget/rate identity env keys
                 assert "CAGE_CELL_BUDGET_R" not in s["env"]
                 assert "CAGE_CELL_RATE_FRAC" not in s["env"]
 
-    def test_lambda_compute_null_labels_rates_pending_calibration(self, plan_a):
-        pressure = [s for s in _cells(plan_a) if s["family"] in ("F2", "F3")]
+    def test_executable_pressure_rates_rest_on_the_rung_lambda(self, plan_a):
+        # ADR-0154: the gold class offers rate_frac x the rung's measured
+        # lambda* (_RUNG_LAMBDA x r in the fixture); every other class offers
+        # it scaled by the served-token ratio gold/class (ADR-0155); the
+        # floor table's KV-bound prediction (2.0 x r) is recorded beside it
+        # and never offered.
+        pressure = [
+            s for s in _cells(plan_a) if s["family"] in ("F2", "F3") and not s["blocked_on"]
+        ]
         assert pressure
-        assert all(
-            s["rate_basis"] == "kv-bound-only [pending calibration]" for s in pressure
-        )
+        gold_seen = derived_seen = False
+        for s in pressure:
+            r = s["cellspec"]["budget_r"]
+            gold = _RUNG_LAMBDA * r
+            seq = s["demand_class"]["seq_tokens"]
+            assert s["lambda_kv_pred_rps"] == pytest.approx(2.0 * r)
+            assert s["lambda_star_source"]["gold_lambda_star_qps"] == pytest.approx(gold)
+            assert s["lambda_star_source"]["seq_tokens_gold"] == _ANCHOR_SEQ_TOKENS
+            assert s["lambda_star_source"]["seq_tokens_class"] == seq
+            if s["cellspec"]["arm"] == rc.DEMAND_ANCHOR_ARM:
+                assert s["rate_basis"] == rc.LAMBDA_BASIS_RUNG
+                assert s["lambda_star_rps"] == pytest.approx(gold)
+                assert seq == _ANCHOR_SEQ_TOKENS
+                gold_seen = True
+            else:
+                assert s["rate_basis"] == rc.LAMBDA_BASIS_DERIVED
+                assert s["lambda_star_rps"] == pytest.approx(gold * _ANCHOR_SEQ_TOKENS / seq)
+                derived_seen = True
+            assert s["lambda_star_rps"] != pytest.approx(s["lambda_kv_pred_rps"])
+        assert gold_seen and derived_seen
 
-    def test_calibrated_lambda_compute_changes_basis(self, tmp_path, calibrations_a):
-        path = tmp_path / "ft_cal.json"
-        path.write_text(
-            json.dumps(_floor_table_doc(lambda_compute=1.0)), encoding="utf-8"
+    def test_blocked_pressure_cells_carry_a_reviewable_rate(self, plan_a, tmp_path, calibrations_a):
+        # A blocked cell never runs. On a calibrated (engine, r) it carries the
+        # same derived lambda* as its executable siblings (reviewable debt);
+        # where no rung covers it, the floor table's P6 prediction, labeled.
+        blocked = [
+            s for s in _cells(plan_a) if s["family"] in ("F2", "F3") and s["blocked_on"]
+        ]
+        assert blocked
+        for s in blocked:
+            assert s["rate_basis"] in (rc.LAMBDA_BASIS_RUNG, rc.LAMBDA_BASIS_DERIVED)
+            assert s["lambda_star_rps"] > 0
+        # On plan a every blocked rung is also an executable rung, so the
+        # no-rung branch needs a grid whose only cells at some rung are
+        # blocked: B8 (retr-store) on sglang, F3 at r=0.25, with an artifact
+        # covering r=1.0 only (the executable gold cell's rung).
+        grid = _tiny_grid(
+            f1_baselines=rc.PRIMARY_BASELINES, f1_engines=("sglang",), primary_engine="sglang",
+            f2_baselines=("B1",), f2_engines=("sglang",), f2_budgets=(1.0,), f2_rates=(0.85,),
+            f3_baselines=("B8",), f3_engines=("sglang",), f3_budgets=(0.25,), f3_rates=(0.85,),
         )
-        plan = rc.build_plan(
-            "a", rc.load_floor_table(path), window_duration_s=300.0,
-            calibrations=calibrations_a,
-        )
-        pressure = [s for s in _cells(plan) if s["family"] in ("F2", "F3")]
-        assert all("pending calibration" not in s["rate_basis"] for s in pressure)
+        path = tmp_path / "ft_blocked.json"
+        path.write_text(json.dumps(_floor_table_doc()), encoding="utf-8")
+        cal = _write_calibrations(tmp_path / "cal_blocked", ("sglang",))
+        rungs = _write_rung_calibrations(tmp_path / "cal_blocked", ("sglang",), "a", (1.0,))
+        orig = rc.SESSION_GRIDS
+        rc.SESSION_GRIDS = {grid.session: grid}
+        try:
+            plan = rc.build_plan(
+                "a", rc.load_floor_table(path), window_duration_s=60.0,
+                calibrations=cal, rung_calibrations=rungs,
+            )
+        finally:
+            rc.SESSION_GRIDS = orig
+        (b8,) = [s for s in _cells(plan) if s["baseline"] == "B8"]
+        assert b8["blocked_on"]
+        assert b8["rate_basis"] == "blocked cell, never run: test"
+        assert b8["lambda_star_rps"] == pytest.approx(2.0 * 0.25)  # the floor table's 2.0 x r
+        assert b8["lambda_star_source"] is None
+        assert b8["offered_rate_rps"] == pytest.approx(0.85 * 2.0 * 0.25)
+        # and the plan loads: the blocked basis is accepted by the validator
+        assert rc.load_plan(_dump(tmp_path, plan, "blocked_basis.json"))["counts"]["blocked"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -859,7 +1082,7 @@ class TestCorpusFreshPrefixOff:
             if s["kind"] == "relaunch":
                 current = s
                 continue
-            if s["baseline"] != "B4":
+            if s["kind"] != "cell" or s["baseline"] != "B4":
                 continue
             assert current is not None
             assert current["prefix_mode"] == "OFF"
@@ -959,7 +1182,7 @@ class TestReuseOffArmsPrefixOff:
                 if s["kind"] == "relaunch":
                     current = s
                     continue
-                if s["serving"] is None or s["blocked_on"]:
+                if s["kind"] != "cell" or s["serving"] is None or s["blocked_on"]:
                     continue
                 off = s["family"] == "F2" or s["cellspec"]["arm"] in self.OFF_ARMS
                 assert current["prefix_mode"] == ("OFF" if off else "ON"), s["row_key"]
@@ -969,16 +1192,16 @@ class TestReuseOffArmsPrefixOff:
 
     def test_f1_off_arms_share_one_budget_free_config_per_engine(self, plan_a):
         # No new relaunch on session a: the OFF arms join B4's budget-free
-        # prefix-OFF plain config (the 36 pin in TestPlanCountsSessionA).
+        # prefix-OFF plain config (the relaunch pin in TestPlanCountsSessionA).
         configs = {}
         for s in _cells(plan_a):
             if s["family"] == "F1" and s["serving"] is not None and s["serving"]["prefix_mode"] == "OFF":
                 configs.setdefault(s["cellspec"]["engine"], set()).add(
-                    TestOrdering._config_of(s["serving"])
+                    TestOrdering._config_of(s)
                 )
         assert configs == {
-            "vllm": {("vllm", "OFF", None, None, None)},
-            "sglang": {("sglang", "OFF", None, None, None)},
+            "vllm": {("vllm", "OFF", None, None, None, None)},
+            "sglang": {("sglang", "OFF", None, None, None, None)},
         }
 
     def test_dist_b1_legs_serve_off_beside_b3_on(self, plan_b):
@@ -1000,12 +1223,20 @@ class TestReuseOffArmsPrefixOff:
         ]
         for s in legs:
             assert ("--no-prefix-cache" in s["argv"]) is (s["prefix_mode"] == "OFF"), s["argv"]
-        # the budgets, degree and levers are the same on both legs of a
-        # topology: the prefix mode is the ONLY serving delta
+        # the degree and levers are the same on both legs of a topology; the
+        # prefix mode and (ADR-0155) the arm's demand class are the serving
+        # deltas: B1 serves its gold budget D, B3 the corpus class's
+        # floor(D x 2336 / 4779), each at dist_budget_r = 1.0
         by_topology = {}
         for s in legs:
             by_topology.setdefault(s["topology"], set()).add(
-                (s["budget_bytes"], s["tp"], s["kv_dtype"], s["connector"])
+                (s["tp"], s["kv_dtype"], s["connector"])
+            )
+            seq = s["demand_class"]["seq_tokens"]
+            assert s["budget_bytes"] == (_ANCHOR_DEMAND * seq) // _ANCHOR_SEQ_TOKENS
+            assert seq == (
+                _ANCHOR_SEQ_TOKENS if s["prefix_mode"] == "OFF"
+                else rc.DEMAND_SEQ_TOKENS_2026_10_08["corpus-reuse"]
             )
         assert all(len(v) == 1 for v in by_topology.values()), by_topology
 
@@ -1296,7 +1527,7 @@ class TestCorpusTruncLadder:
             _tiny_grid(f1_baselines=("B12",), corpus_trunc_budgets=ladder)
 
     def test_tiny_grid_enumerates_one_cell_per_rung(self, floor_table, stub):
-        grid = _tiny_grid(f1_baselines=("B3", "B12"), corpus_trunc_budgets=(1000, 500))
+        grid = _tiny_grid(f1_baselines=("B3", "B12"), corpus_trunc_budgets=(1000, 500), corpus_trunc_demand_seq_tokens=_TRUNC_SHAPES_1000_500)
         plan = _stub_plan(grid, floor_table, stub.cmd)
         cells = _cells(plan)
         assert [s["baseline"] for s in cells] == ["B3", "B12", "B12"]
@@ -1315,6 +1546,7 @@ class TestPlanSchema:
         self, tmp_path, floor_table, calibrations_a
     ):
         out = tmp_path / "plan_a.json"
+        rungs_a = _rungs_for(calibrations_a, "a")  # fixture files, written BEFORE the snapshot
         before = {p for p in tmp_path.rglob("*")}
         code = rc.main(
             [
@@ -1327,7 +1559,7 @@ class TestPlanSchema:
                 "300",
                 "--out",
                 str(out),
-                *_calibration_args(calibrations_a),
+                *_calibration_args(calibrations_a), *_rung_args(rungs_a),
             ]
         )
         assert code == 0
@@ -1704,7 +1936,9 @@ class TestRun:
             wdir.mkdir(parents=True)
             (wdir / "metrics.json").write_text("{}", encoding="utf-8")
         assert rc.run_plan(plan, root) == 0
-        cell_calls = [c for c in stub.calls() if c["argv"][0] not in ("restart", "stop")]
+        # the F2 class's one dry window ran first (ADR-0153), then the cells
+        assert len(_dry_calls(stub)) == 1
+        cell_calls = _cell_calls(stub)
         # qasper + task 2 ran; task 1 was skipped-complete on ITS range only
         assert len(cell_calls) == 2
         tasks_run = [
@@ -2029,7 +2263,7 @@ def calibrations_b(tmp_path: Path) -> Dict[str, Path]:
 def plan_b(floor_table_b: Path, calibrations_b: Dict[str, Path]) -> Dict[str, Any]:
     return rc.build_plan(
         "b", rc.load_floor_table(floor_table_b), window_duration_s=300.0,
-        calibrations=calibrations_b,
+        calibrations=calibrations_b, rung_calibrations=_rungs_for(calibrations_b, "b"),
     )
 
 
@@ -2052,23 +2286,27 @@ class TestSessionB:
         #     (identical F1/F3 carriage to session a): 16 + 36 = 52
         # ⇒ 13 + 52 = 65  (old pin 13, pre-manifest-registration)
         assert plan_b["counts"]["blocked"] == 65
-        # Relaunches = distinct executable configs:
-        #   vllm:   F1 {plain, fp8, lmcache} 3 + F3 3×{plain,fp8,lmcache} 9
-        #           + F2 3 plain + DIST {tp leg, pd leg} 2        = 17
-        #   sglang: F1 {plain, fp8} 2 + F3 3×{plain,fp8} 6 + F2 3 = 11
-        #   ADR-0103 (corpus-fresh B4 served prefix OFF by relaunch):
-        #           F1 B4 = budget-free prefix-OFF plain, new per engine
-        #                                                         = +1 ×2
-        #           F3 B4 = prefix-OFF plain at r ∈ {1.0, 0.5, 0.25} =
-        #           the F2 plain-OFF configs (same budgets)       = +0
-        #           DIST carries {B1, B3} only (no B4 leg)         = +0
-        #   ADR-0150 (every charter reuse-off arm served prefix OFF):
-        #           F1 B1/B5/B6/B9/B11 join B4's budget-free OFF config = +0
-        #           DIST B1 (gold-fresh): its tp leg and its pd leg each
-        #           get a prefix-OFF boundary beside B3's ON legs    = +2
-        # ⇒ (17 + 1 + 2) + (11 + 1) = 32  (old pin 30, pre-ADR-0150; 28,
-        #    pre-ADR-0103)
-        assert plan_b["counts"]["relaunches"] == 32
+        # Relaunches = distinct executable configs, the demand class a config
+        # dimension (ADR-0155; classes as in TestPlanCountsSessionA):
+        #   per engine, prefix OFF budgeted:
+        #           F2 3 budgets × 4 classes {4779, 1127, 702, 348}  = 12
+        #           F3 B4 corpus-fresh 2336 × 3 budgets               =  3
+        #   per engine, prefix ON budgeted (F3, 3 budgets each):
+        #           B2 4779, B3 2336, B7 1126, B10 2336 fp8            = 12
+        #           B8 1126 lmcache on vLLM only                      = +3 vllm
+        #   per engine, budget-free F1: ON {plain, fp8} (+lmcache on
+        #           vLLM) = 2 / 3; OFF plain (ADR-0103/0150)         = +1
+        #   DIST (vLLM only, dist_budget_r 1.0): B1 gold-fresh OFF and
+        #           B3 corpus-reuse ON, each a tp leg and a pd leg;
+        #           their classes differ (4779 vs 2336), so each leg is
+        #           its own boundary as before (ADR-0150)             =  4
+        # ⇒ vllm 12 + 3 + 15 + 3 + 1 + 4 = 38; sglang 12 + 3 + 12 + 2 + 1
+        #   = 30 ⇒ 68 (old pin 32 before ADR-0155; 30 pre-ADR-0150; 28
+        #   pre-ADR-0103)
+        assert plan_b["counts"]["relaunches"] == _RELAUNCHES_B
+        # ADR-0153: the same 19 serving configurations as session a (the DIST
+        # legs are not pressure cells and get no dry window)
+        assert plan_b["counts"]["dry_windows"] == _DRY_WINDOWS_B
 
     def test_no_fine_grid_and_no_ruler_on_group_b(self, plan_b):
         # §6.8: the fine r-grid runs on Group A ONLY; the D5#5 RULER pairing
@@ -2127,18 +2365,20 @@ class TestSessionB:
 
     def test_tp_leg_launches_tp8_at_the_dist_budget(self, plan_b, floor_table_b):
         # The tp leg rides the SINGLE-instance launcher at dist_tp_size=8,
-        # serving floor(dist_budget_r × D) = 10^10 bytes total — per-rank
-        # slice (GQA shards) = 10^10 // 8 = 1_250_000_000.
-        # ADR-0150: two tp legs (B3 prefix ON, B1 prefix OFF), same budget.
+        # serving floor(dist_budget_r × D_class) bytes total — per-rank
+        # slice (GQA shards) = total // 8. ADR-0150: two tp legs (B3 prefix
+        # ON, B1 prefix OFF); ADR-0155: B1's D_class is the gold D = 10^10
+        # (per rank 1_250_000_000), B3's the corpus class floor(D x 2336 /
+        # 4779) = 4_888_051_893 (per rank 611_006_486).
         tp_legs = [s for s in _relaunches(plan_b) if s["topology"] == "tp"]
         assert sorted(s["prefix_mode"] for s in tp_legs) == ["OFF", "ON"]
         for tp_leg in tp_legs:
+            demand_class = (_ANCHOR_DEMAND * tp_leg["demand_class"]["seq_tokens"]) // _ANCHOR_SEQ_TOKENS
+            assert demand_class in (10_000_000_000, 4_888_051_893)
             assert tp_leg["tp"] == 8
             assert tp_leg["env"]["CAGE_VLLM_TENSOR_PARALLEL"] == "8"
-            assert tp_leg["env"]["CAGE_KV_BUDGET_BYTES"] == str(
-                (1 * _ANCHOR_DEMAND) // 8
-            )
-            assert tp_leg["budget_bytes"] == 1 * _ANCHOR_DEMAND
+            assert tp_leg["env"]["CAGE_KV_BUDGET_BYTES"] == str(demand_class // 8)
+            assert tp_leg["budget_bytes"] == 1 * demand_class
             assert tp_leg["budget_r"] is None  # DIST overlay: not a pressure coord
 
     def test_pd_leg_splits_the_same_total_and_carries_role_tp(self, plan_b):
@@ -2163,31 +2403,36 @@ class TestSessionB:
     def _check_pd_leg(pd_leg, plan_b):
         assert pd_leg["tp"] == 4
         assert pd_leg["env"]["CAGE_VLLM_TENSOR_PARALLEL"] == "4"
+        # ADR-0155: the total is the leg's CLASS demand at r = 1.0 (gold 10^10
+        # on B1's OFF leg, the corpus class 4_888_051_893 on B3's ON leg);
+        # the 0.5 split is exact-sum (floor + remainder).
+        total = (_ANCHOR_DEMAND * pd_leg["demand_class"]["seq_tokens"]) // _ANCHOR_SEQ_TOKENS
+        assert total in (10_000_000_000, 4_888_051_893)
+        prefill_pool = total // 2
+        decode_pool = total - prefill_pool
         prefill_rank = int(pd_leg["env"]["CAGE_KV_BUDGET_BYTES_PREFILL"])
         decode_rank = int(pd_leg["env"]["CAGE_KV_BUDGET_BYTES_DECODE"])
-        assert prefill_rank == 5_000_000_000 // 4 == 1_250_000_000
-        assert decode_rank == 1_250_000_000
+        assert prefill_rank == prefill_pool // 4
+        assert decode_rank == decode_pool // 4
         # The plan record keeps the registered §6.5 exact-sum role pools AND
         # the per-rank env basis gate (j) closes against.
-        assert pd_leg["pd"]["prefill_bytes"] == 5_000_000_000
-        assert pd_leg["pd"]["decode_bytes"] == 5_000_000_000
-        assert (
-            pd_leg["pd"]["prefill_bytes"] + pd_leg["pd"]["decode_bytes"]
-            == 1 * _ANCHOR_DEMAND
-        )
+        assert pd_leg["pd"]["prefill_bytes"] == prefill_pool
+        assert pd_leg["pd"]["decode_bytes"] == decode_pool
+        assert pd_leg["pd"]["prefill_bytes"] + pd_leg["pd"]["decode_bytes"] == total
         assert pd_leg["pd"]["prefill_bytes_per_rank"] == prefill_rank
         assert pd_leg["pd"]["decode_bytes_per_rank"] == decode_rank
         # Cross-leg §6.6a closure under the ONE registered convention:
-        # pd realized = (pool // 4) × 4 ranks × 2 roles = 10^10 = tp
-        # realized = (total // 8) × 8 — the #18 pair stays iso-aggregate.
+        # pd realized = (pool // 4) × 4 ranks × 2 roles = tp realized =
+        # (total // 8) × 8 — the #18 pair stays iso-aggregate per class.
         realized_pd = (prefill_rank + decode_rank) * 4
         assert pd_leg["pd"]["expected_bytes_total"] == realized_pd
         tp_leg = next(
             s for s in _relaunches(plan_b)
             if s["topology"] == "tp" and s["prefix_mode"] == pd_leg["prefix_mode"]
         )
+        assert tp_leg["demand_class"] == pd_leg["demand_class"]
         realized_tp = int(tp_leg["env"]["CAGE_KV_BUDGET_BYTES"]) * 8
-        assert realized_pd == realized_tp == 1 * _ANCHOR_DEMAND
+        assert realized_pd == realized_tp == (total // 8) * 8
 
     def test_f2_budget_env_divides_per_rank_at_tp4(self, plan_b):
         # Independent arithmetic for the TP-sharded budget env: GQA shards ⇒
@@ -2199,7 +2444,9 @@ class TestSessionB:
         for s in _relaunches(plan_b):
             if s["topology"] != "single" or s["budget_r"] is None:
                 continue
-            per_rank = int(s["budget_r"] * _ANCHOR_DEMAND) // 4
+            # ADR-0155: D is the class demand floor(D_floor x s_class / s_anchor)
+            demand_class = (_ANCHOR_DEMAND * s["demand_class"]["seq_tokens"]) // _ANCHOR_SEQ_TOKENS
+            per_rank = int(s["budget_r"] * demand_class) // 4
             if s["engine"] == "vllm" and s["kv_dtype"] is None and s["connector"] is None:
                 assert s["env"]["CAGE_KV_BUDGET_BYTES"] == str(per_rank)
             if s["engine"] == "sglang" and s["kv_dtype"] is None:
@@ -2226,13 +2473,18 @@ class TestSessionB:
 # ---------------------------------------------------------------------------
 
 
-class TestPlanSchemaV5:
+class TestPlanSchemaV6:
     def test_schema_literal(self):
-        assert rc.PLAN_SCHEMA == "cage-campaign-plan-v5"
+        assert rc.PLAN_SCHEMA == "cage-campaign-plan-v6"
 
     @pytest.mark.parametrize(
         "old_schema",
-        ["cage-campaign-plan-v2", "cage-campaign-plan-v3", "cage-campaign-plan-v4"],
+        [
+            "cage-campaign-plan-v2", "cage-campaign-plan-v3", "cage-campaign-plan-v4",
+            # v5 predates the ADR-0153/0154/0155 keys (dry windows, rung
+            # lambda*, demand classes) and offered the floor table's rate.
+            "cage-campaign-plan-v5",
+        ],
     )
     def test_older_plan_refuses(self, tmp_path, old_schema):
         # A v2 plan predates gpu_count / grids / ruler_task /
@@ -2437,7 +2689,7 @@ def plan_a_manifests(
     floor = rc.load_floor_table(floor_table)
     return rc.build_plan(
         "a", floor, window_duration_s=300.0, query_manifests=manifests_a,
-        calibrations=calibrations_a,
+        calibrations=calibrations_a, rung_calibrations=_rungs_for(calibrations_a, "a"),
     )
 
 
@@ -2481,11 +2733,18 @@ class TestQueryManifestRegistration:
 
     def test_counts_unchanged_by_manifest_registration(self, plan_a, plan_a_manifests):
         # Registration changes executability, never the enumeration: the
-        # TestPlanCountsSessionA pins (868 / 2604 / 36) hold on both plans.
-        for key in ("cells", "windows", "relaunches"):
+        # TestPlanCountsSessionA cell and window pins (868 / 2604) hold on
+        # both plans. Relaunches DO differ (ADR-0155): the manifests unblock
+        # the B12 rungs, each rung its own demand class (1205 and 480 served
+        # tokens), prefix ON, at 3 F3 budgets on 2 engines = +12 boundaries.
+        for key in ("cells", "windows"):
             assert plan_a_manifests["counts"][key] == plan_a["counts"][key] == {
-                "cells": 868, "windows": 2604, "relaunches": 36
+                "cells": 868, "windows": 2604,
             }[key]
+        assert plan_a["counts"]["relaunches"] == _RELAUNCHES_A
+        assert plan_a_manifests["counts"]["relaunches"] == _RELAUNCHES_A + 12
+        # and the two new rung classes (prefix ON) bring one dry window each per engine
+        assert plan_a_manifests["counts"]["dry_windows"] == _DRY_WINDOWS_A + 4
 
     def test_partial_registration_blocks_only_the_unmanifested_datasets(
         self, floor_table, tmp_path, calibrations_a
@@ -2494,7 +2753,7 @@ class TestQueryManifestRegistration:
         only = {"squad_v2": _write_manifest(tmp_path, "squad_v2")}
         plan = rc.build_plan(
             "a", floor, window_duration_s=300.0, query_manifests=only,
-            calibrations=calibrations_a,
+            calibrations=calibrations_a, rung_calibrations=_rungs_for(calibrations_a, "a"),
         )
         for s in self._b12(plan):
             if s["dataset"] == "squad_v2":
@@ -2572,12 +2831,12 @@ class TestQueryManifestRegistration:
 
         # A9: an 8-id-per-trial artifact cannot serve the registered primary
         # n (B3 on vllm = 2000) -> the plan refuses naming the shortfall ...
-        grid = _tiny_grid(f1_baselines=("B3", "B12"), corpus_trunc_budgets=(1000, 500))
+        grid = _tiny_grid(f1_baselines=("B3", "B12"), corpus_trunc_budgets=(1000, 500), corpus_trunc_demand_seq_tokens=_TRUNC_SHAPES_1000_500)
         with pytest.raises(rc.PlanError, match=r"squad_v2.*trial 1.*2000.*shortfall 1992"):
             _plan(grid)
         # ... unless the grid registers the dataset's achievable n (A5).
         grid = _tiny_grid(
-            f1_baselines=("B3", "B12"), corpus_trunc_budgets=(1000, 500),
+            f1_baselines=("B3", "B12"), corpus_trunc_budgets=(1000, 500), corpus_trunc_demand_seq_tokens=_TRUNC_SHAPES_1000_500,
             achievable_n={"squad_v2": 8},
         )
         plan = _plan(grid)
@@ -2596,7 +2855,7 @@ class TestQueryManifestRegistration:
         squad = _write_manifest(tmp_path, "squad_v2")
         base = ["plan", "--session", "a", "--floor-table", str(floor_table),
                 "--window-duration-s", "300", "--out", str(out),
-                *_calibration_args(calibrations_a)]
+                *_calibration_args(calibrations_a), *_rung_args(_rungs_for(calibrations_a, "a"))]
         assert rc.main(base + ["--query-manifest", f"squad_v2={squad}"]) == 0
         plan = rc.load_plan(out)
         assert set(plan["query_manifests"]) == {"squad_v2"}
@@ -2849,11 +3108,11 @@ class TestPerRowN:
         assert (
             plan_a["counts"]["cells"], plan_a["counts"]["windows"],
             plan_a["counts"]["relaunches"], plan_a["counts"]["blocked"],
-        ) == (868, 2604, 36, 65)
+        ) == (868, 2604, _RELAUNCHES_A, 65)
         assert (
             plan_b["counts"]["cells"], plan_b["counts"]["windows"],
             plan_b["counts"]["relaunches"], plan_b["counts"]["blocked"],
-        ) == (350, 1050, 32, 65)
+        ) == (350, 1050, _RELAUNCHES_B, 65)
 
     @pytest.mark.parametrize(
         "overrides, match",
@@ -2908,7 +3167,7 @@ class TestPerRowN:
         plan = rc.build_plan(
             "a", floor, window_duration_s=300.0,
             query_manifests={"squad_v2": _write_manifest(tmp_path, "squad_v2", name="ok.json")},
-            calibrations=calibrations_a,
+            calibrations=calibrations_a, rung_calibrations=_rungs_for(calibrations_a, "a"),
         )
         assert plan["query_manifests"]["squad_v2"]["trial_sizes"] == {"1": 2000, "2": 2000, "3": 2000}
 
@@ -2921,7 +3180,7 @@ class TestPerRowN:
         rc.SESSION_GRIDS = {"a": grid}
         try:
             plan = rc.build_plan(
-                "a", floor, window_duration_s=300.0, calibrations=calibrations_a
+                "a", floor, window_duration_s=300.0, calibrations=calibrations_a, rung_calibrations=_rungs_for(calibrations_a, "a")
             )
             for s in _cells(plan):
                 base = _n_of_class(s["row_class"])
@@ -2942,7 +3201,7 @@ class TestPerRowN:
             m900 = _write_manifest(tmp_path, "qasper", ids_per_trial=900)
             plan = rc.build_plan(
                 "a", floor, window_duration_s=300.0, query_manifests={"qasper": m900},
-                calibrations=calibrations_a,
+                calibrations=calibrations_a, rung_calibrations=_rungs_for(calibrations_a, "a"),
             )
             assert plan["query_manifests"]["qasper"]["trial_sizes"]["1"] == 900
         finally:
@@ -3107,7 +3366,7 @@ class TestRetrievalPinsA5:
         good = _write_freeze(tmp_path / "explicit.json", _freeze_doc())
         assert rc.build_plan(
             "a", floor, window_duration_s=300.0, freeze_file=good,
-            calibrations=calibrations_a,
+            calibrations=calibrations_a, rung_calibrations=_rungs_for(calibrations_a, "a"),
         )["counts"]["cells"] == 868
 
     def test_every_retrieval_cell_pins_top_k_model_and_index_root(self, plan_a, plan_b):
@@ -3179,9 +3438,9 @@ class TestRetrievalPinsA5:
     def test_counts_unchanged_by_the_pins(self, plan_a, plan_b):
         # Argv/env pins never mint cells: the enumeration pins hold.
         c = plan_a["counts"]
-        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (868, 2604, 36, 65)
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (868, 2604, _RELAUNCHES_A, 65)
         c = plan_b["counts"]
-        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (350, 1050, 32, 65)
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (350, 1050, _RELAUNCHES_B, 65)
 
     def test_load_plan_refuses_stale_retrieval_pins(self, tmp_path, plan_a):
         def _cell(plan: Dict[str, Any]) -> Dict[str, Any]:
@@ -3268,7 +3527,7 @@ class TestRetrievalPinsA5:
         code = rc.main([
             "plan", "--session", "a", "--floor-table", str(floor_table),
             "--window-duration-s", "300", "--freeze-file", str(good), "--out", str(out),
-            *_calibration_args(calibrations_a),
+            *_calibration_args(calibrations_a), *_rung_args(_rungs_for(calibrations_a, "a")),
         ])
         assert code == 0
         plan = rc.load_plan(out)
@@ -3504,9 +3763,9 @@ class TestMaxModelLenA10:
         # A server dial on an existing boundary adds no cell, window,
         # relaunch or block (pins: TestPlanCountsSessionA / TestSessionB).
         c = plan_a["counts"]
-        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (868, 2604, 36, 65)
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (868, 2604, _RELAUNCHES_A, 65)
         c = plan_b["counts"]
-        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (350, 1050, 32, 65)
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (350, 1050, _RELAUNCHES_B, 65)
 
 
 # ---------------------------------------------------------------------------
@@ -3602,9 +3861,9 @@ class TestDecoupledScoringW1:
 
     def test_counts_unchanged_by_the_pin(self, plan_a, plan_b):
         c = plan_a["counts"]
-        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (868, 2604, 36, 65)
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (868, 2604, _RELAUNCHES_A, 65)
         c = plan_b["counts"]
-        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (350, 1050, 32, 65)
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (350, 1050, _RELAUNCHES_B, 65)
 
 
 # ---------------------------------------------------------------------------
@@ -3719,7 +3978,7 @@ class TestEngineEndpointsW2:
                 if s["kind"] == "relaunch":
                     current = s
                     continue
-                if s["serving"] is None or s["blocked_on"]:
+                if s["kind"] != "cell" or s["serving"] is None or s["blocked_on"]:
                     continue
                 assert current is not None
                 api = _argv_value(s, "--api-base")
@@ -3749,9 +4008,9 @@ class TestEngineEndpointsW2:
         # Argv on existing cells: the enumeration pins hold, and the identity
         # seam never reads argv (test_identity_env_roundtrips_through_derive_cell_spec).
         c = plan_a["counts"]
-        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (868, 2604, 36, 65)
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (868, 2604, _RELAUNCHES_A, 65)
         c = plan_b["counts"]
-        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (350, 1050, 32, 65)
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (350, 1050, _RELAUNCHES_B, 65)
 
     def test_load_plan_refuses_stale_endpoints(self, tmp_path, plan_a, plan_b):
         def _sglang(plan):
@@ -4130,7 +4389,7 @@ class TestSloFloorsProducerW4:
             rc.build_plan("a", floor, window_duration_s=300.0, calibrations=half)
         plan = rc.build_plan(
             "a", floor, window_duration_s=300.0, calibrations=half,
-            calibration_budget_fraction=0.5,
+            calibration_budget_fraction=0.5, rung_calibrations=_rungs_for(half, "a"),
         )
         assert plan["calibration"]["budget_fraction"] == 0.5
         assert plan["calibration"]["registered_budget_fraction"] == 1.5
@@ -4142,7 +4401,8 @@ class TestSloFloorsProducerW4:
         # the charter slug is accepted as the model spelling too
         slug = _write_calibrations(tmp_path / "slug", ("vllm", "sglang"), model="qwen3-14b")
         assert rc.build_plan(
-            "a", floor, window_duration_s=300.0, calibrations=slug
+            "a", floor, window_duration_s=300.0, calibrations=slug,
+            rung_calibrations=_rungs_for(slug, "a"),
         )["calibration"]["artifacts"]["vllm"]["model"] == "qwen3-14b"
 
     def test_blocked_only_engine_needs_no_floor(self, floor_table, stub, tmp_path):
@@ -4182,7 +4442,7 @@ class TestSloFloorsProducerW4:
         out = tmp_path / "plan.json"
         base = ["plan", "--session", "a", "--floor-table", str(floor_table),
                 "--window-duration-s", "300", "--out", str(out)]
-        assert rc.main(base + _calibration_args(calibrations_a)) == 0
+        assert rc.main(base + _calibration_args(calibrations_a) + _rung_args(_rungs_for(calibrations_a, "a"))) == 0
         plan = rc.load_plan(out)
         assert set(plan["calibration"]["floors"]) == {"vllm", "sglang"}
         # no --calibration at all: refused (exit 2), nothing written
@@ -4192,23 +4452,23 @@ class TestSloFloorsProducerW4:
         # malformed (no '=') and duplicate registrations refuse
         assert rc.main(base + ["--calibration", str(calibrations_a["vllm"])]) == 2
         assert rc.main(
-            base + _calibration_args(calibrations_a)
+            base + _calibration_args(calibrations_a) + _rung_args(_rungs_for(calibrations_a, "a"))
             + ["--calibration", f"vllm={calibrations_a['vllm']}"]
         ) == 2
         # the 0.5 shakedown rung needs the explicit fraction flag
         half = _write_calibrations(tmp_path / "half", ("vllm", "sglang"), budget_fraction=0.5)
-        assert rc.main(base + _calibration_args(half)) == 2
+        assert rc.main(base + _calibration_args(half) + _rung_args(_rungs_for(half, "a"))) == 2
         assert rc.main(
-            base + _calibration_args(half) + ["--calibration-budget-fraction", "0.5"]
+            base + _calibration_args(half) + _rung_args(_rungs_for(half, "a")) + ["--calibration-budget-fraction", "0.5"]
         ) == 0
         assert rc.load_plan(out)["calibration"]["budget_fraction"] == 0.5
         # the flag against 1.5 artifacts, and malformed flag values (review T9)
         assert rc.main(
-            base + _calibration_args(calibrations_a) + ["--calibration-budget-fraction", "0.5"]
+            base + _calibration_args(calibrations_a) + _rung_args(_rungs_for(calibrations_a, "a")) + ["--calibration-budget-fraction", "0.5"]
         ) == 2
         for bad in ("nan", "0", "-1", "inf"):
             assert rc.main(
-                base + _calibration_args(calibrations_a) + ["--calibration-budget-fraction", bad]
+                base + _calibration_args(calibrations_a) + _rung_args(_rungs_for(calibrations_a, "a")) + ["--calibration-budget-fraction", bad]
             ) == 2, bad
 
     def test_load_plan_refuses_a_stale_or_drifted_floors_pin(self, tmp_path, plan_a):
@@ -4271,9 +4531,12 @@ class TestSloFloorsProducerW4:
         plan = _stub_plan(grid, floor_table, stub.cmd)
         root = _run_root(tmp_path)
         assert rc.run_plan(plan, root) == 0
-        cell_calls = [c for c in stub.calls() if "--baseline" in c["argv"]]
+        cell_calls = _cell_calls(stub)
         assert len(cell_calls) == 2
         want = rc.slo_floors_env_value(plan["calibration"]["floors"])
+        # the dry window rides the same pins as the pressure cell it re-mints
+        (dry,) = _dry_calls(stub)
+        assert dry["env"]["CAGE_SLO_FLOORS_JSON"] == want
         by_family = {c["env"]["CAGE_CELL_FAMILY"]: c for c in cell_calls}
         assert by_family["F1"]["env"]["CAGE_SLO_FLOORS_JSON"] == want
         assert by_family["F2"]["env"]["CAGE_SLO_FLOORS_JSON"] == want
@@ -4284,9 +4547,9 @@ class TestSloFloorsProducerW4:
 
     def test_counts_unchanged_by_the_pins(self, plan_a, plan_b):
         c = plan_a["counts"]
-        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (868, 2604, 36, 65)
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (868, 2604, _RELAUNCHES_A, 65)
         c = plan_b["counts"]
-        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (350, 1050, 32, 65)
+        assert (c["cells"], c["windows"], c["relaunches"], c["blocked"]) == (350, 1050, _RELAUNCHES_B, 65)
 
 
 class TestBudgetPlanProducerW4:
@@ -4300,6 +4563,8 @@ class TestBudgetPlanProducerW4:
             for s in plan["steps"]:
                 if s["kind"] == "relaunch":
                     current = s
+                    continue
+                if s["kind"] != "cell":
                     continue
                 if _budgeted(s):
                     assert current is not None and current["budget_plan"] is not None, s["row_key"]
@@ -4323,8 +4588,12 @@ class TestBudgetPlanProducerW4:
             rec = s["budget_plan"]
             r = s["cellspec"]["budget_r"]
             assert rec["r"] == r
-            assert rec["budget_bytes_total"] == int(r * _ANCHOR_DEMAND)  # floor(r x D)
-            assert rec["demand_bytes"] == _ANCHOR_DEMAND
+            # ADR-0155: D is the class demand floor(D_floor x s_class / s_anchor)
+            seq = s["demand_class"]["seq_tokens"]
+            demand_class = (_ANCHOR_DEMAND * seq) // _ANCHOR_SEQ_TOKENS
+            assert rec["avg_seq_tokens"] == seq
+            assert rec["budget_bytes_total"] == int(r * demand_class)  # floor(r x D_class)
+            assert rec["demand_bytes"] == demand_class
             assert rec["model"] == "qwen3-14b"
             assert rec["engine"] == s["cellspec"]["engine"]
             assert rec["topology"] == "single" and rec["tp"] == 1
@@ -4621,7 +4890,8 @@ class TestW4ReviewFixes:
     def test_pd_record_carries_the_role_slices_the_launcher_was_given(self, plan_b):
         # F6: the per-pool BudgetPlan (tp=1) rides with the relaunch's pd
         # role record, so one cell.json reconciles the launched knobs.
-        pd = next(s for s in _relaunches(plan_b) if s["topology"] == "pd")
+        # B1's pd leg is the prefix-OFF one (ADR-0150); B3's is prefix ON.
+        pd = next(s for s in _relaunches(plan_b) if s["topology"] == "pd" and s["prefix_mode"] == "OFF")
         (cell,) = [s for s in _cells(plan_b) if s["cellspec"]["topology"] == "pd" and s["baseline"] == "B1"]
         rec = cell["budget_plan"]
         assert rec["pd_roles"] == pd["pd"]

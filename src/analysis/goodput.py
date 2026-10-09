@@ -5,8 +5,14 @@ Charter bindings (PUBLICATION.md):
 - §6.1 chassis: relative primary SLO pair — TTFT ≤ 10× and TPOT ≤ 5× the same
   model×engine single-stream baseline; completed-only goodput; knee =
   Chiu-Jain power-metric maximum; cliff = retrograde goodput; the 3-layer
-  in-regime criterion (ρ_KV time-avg ≥ 0.9, scarcity counters > 0,
-  attainment ≥ 90%).
+  in-regime criterion (ρ_KV time-avg ≥ 0.9, the admission queue non-empty on
+  at least QUEUE_SHARE_MIN of the in-window telemetry samples, attainment
+  ≥ 90%). ADR-0153 (owner decision 2026-10-09, S0F-61) replaced the
+  preemption-counter clause (b): both engines gate admission, so under a
+  tight budget the pool fills to its limit and never evicts (0 preemptions on
+  98 served windows of the 2026-10-08 landing while RULER windows queued 46
+  of 50 requests); the queue the engines expose is the scarcity signal, and
+  the preemption delta stays a RECORDED counter beside the label.
 - S1: serving yield Y = timely AND veridical per request, with the
   independence null G·E[v] and the covariance gap Cov(timely, veridical)
   printed beside every Y (clause b), and the truth tax G − Y (§9.2 estimand
@@ -76,6 +82,7 @@ __all__ = [
     "OnsetKind",
     "OnsetLabel",
     "PAST_CLIFF",
+    "QUEUE_SHARE_MIN",
     "RegimeLabel",
     "RHO_KV_MIN",
     "UNPRESSURED",
@@ -105,6 +112,13 @@ TPOT_SLO_MULTIPLIER: float = 5.0
 # §6.1 in-regime thresholds.
 RHO_KV_MIN: float = 0.9
 ATTAINMENT_MIN: float = 0.9
+#: ADR-0153 clause (b): the share of in-window telemetry samples whose
+#: waiting-request gauge reads > 0 (vLLM ``num_requests_waiting``; SGLang
+#: ``num_queue_reqs`` through the cage-stats dialect, one ``waiting`` key on
+#: both engines) must reach this value. A pool that is full (clause a) while
+#: requests wait for admission is scarce; a full pool with an empty queue is
+#: a comfortable fit. Preemptions are recorded, never gated on.
+QUEUE_SHARE_MIN: float = 0.5
 
 # §9.2 multiplicative resolution band ×/÷1.15.
 DEFAULT_RESOLUTION: float = 1.15
@@ -844,36 +858,66 @@ def find_cliff(
     )
 
 
-def classify_regime(
-    *, rho_kv: float, scarcity_events: int, attainment: float
-) -> RegimeLabel:
-    """§6.1 3-layer in-regime criterion for one cell.
-
-    (a) ρ_KV time-avg ≥ 0.9 AND (b) scarcity counters > 0 AND (c) attainment
-    ≥ 0.9 → IN_REGIME; failing (a) or (b) → UNPRESSURED; failing (c) →
-    PAST_CLIFF. Pinned tie-break: (c) wins on joint failure — a completion
-    collapse is diagnostic regardless of occupancy. All three labels remain
-    valid grid points; only IN_REGIME enters in-regime aggregates.
-    """
-    for name, value in (("rho_kv", rho_kv), ("attainment", attainment)):
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise GoodputError(f"{name}={value!r} must be a number")
-        if not math.isfinite(float(value)) or float(value) < 0.0:
-            raise GoodputError(f"{name}={value!r} must be finite and >= 0")
-    if float(attainment) > 1.0:
-        raise GoodputError(f"attainment={attainment!r} must be within [0, 1]")
+def _check_scarcity_events(scarcity_events: object) -> int | None:
+    """The recorded preemption delta (ADR-0153: provenance beside the label,
+    never a gate). None is legal (not recorded); a value must be a
+    non-negative integer count."""
+    if scarcity_events is None:
+        return None
     if (
         isinstance(scarcity_events, bool)
         or not isinstance(scarcity_events, (int, float))
+        or not math.isfinite(float(scarcity_events))
         or not float(scarcity_events).is_integer()
         or scarcity_events < 0
     ):
         raise GoodputError(
             f"scarcity_events={scarcity_events!r} must be a non-negative integer count"
         )
+    return int(scarcity_events)
+
+
+def classify_regime(
+    *,
+    rho_kv: float,
+    attainment: float,
+    queue_waiting_share: float,
+    scarcity_events: int | None = None,
+) -> RegimeLabel:
+    """§6.1 3-layer in-regime criterion for one cell (clause (b) per ADR-0153).
+
+    (a) ρ_KV time-avg ≥ RHO_KV_MIN AND (b) the waiting-request gauge is > 0
+    on at least QUEUE_SHARE_MIN of the in-window telemetry samples
+    (``queue_waiting_share``) AND (c) attainment ≥ ATTAINMENT_MIN →
+    IN_REGIME; failing (a) or (b) → UNPRESSURED; failing (c) → PAST_CLIFF.
+    Pinned tie-break: (c) wins on joint failure — a completion collapse is
+    diagnostic regardless of occupancy. All three labels remain valid grid
+    points; only IN_REGIME enters in-regime aggregates.
+
+    ``scarcity_events`` (the cumulative preemption delta) is accepted for
+    provenance and validated when given; it never decides the label
+    (ADR-0153: both engines gate admission, so a full pool evicts nothing).
+    Thresholds are inclusive.
+    """
+    for name, value in (
+        ("rho_kv", rho_kv),
+        ("attainment", attainment),
+        ("queue_waiting_share", queue_waiting_share),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise GoodputError(f"{name}={value!r} must be a number")
+        if not math.isfinite(float(value)) or float(value) < 0.0:
+            raise GoodputError(f"{name}={value!r} must be finite and >= 0")
+    for name, value in (
+        ("attainment", attainment),
+        ("queue_waiting_share", queue_waiting_share),
+    ):
+        if float(value) > 1.0:
+            raise GoodputError(f"{name}={value!r} must be within [0, 1]")
+    _check_scarcity_events(scarcity_events)
     if float(attainment) < ATTAINMENT_MIN:
         return PAST_CLIFF
-    if float(rho_kv) < RHO_KV_MIN or int(scarcity_events) == 0:
+    if float(rho_kv) < RHO_KV_MIN or float(queue_waiting_share) < QUEUE_SHARE_MIN:
         return UNPRESSURED
     return IN_REGIME
 
@@ -882,31 +926,41 @@ def label_regime(
     cells: pd.DataFrame,
     *,
     rho_col: str = "rho_kv",
-    events_col: str = "scarcity_events",
+    queue_col: str = "queue_waiting_share",
     attainment_col: str = "attainment",
+    events_col: str | None = None,
 ) -> pd.Series:
     """Vectorized ``classify_regime`` over per-cell rows; returns a 'regime'
-    Series aligned to ``cells.index``."""
-    missing = [c for c in (rho_col, events_col, attainment_col) if c not in cells.columns]
+    Series aligned to ``cells.index``. ``events_col`` names the recorded
+    preemption-delta column when the caller wants it validated (non-negative
+    integer counts); it never decides a label (ADR-0153)."""
+    required = [rho_col, queue_col, attainment_col]
+    if events_col is not None:
+        required.append(events_col)
+    missing = [c for c in required if c not in cells.columns]
     if missing:
         raise GoodputError(f"cells frame is missing required columns {missing}")
     rho = _numeric(cells[rho_col], rho_col)
-    events = _numeric(cells[events_col], events_col)
+    queue = _numeric(cells[queue_col], queue_col)
     attainment = _numeric(cells[attainment_col], attainment_col)
     if not np.isfinite(rho).all() or (rho < 0.0).any():
         raise GoodputError(f"column {rho_col!r} must be finite and >= 0")
     if not np.isfinite(attainment).all() or ((attainment < 0.0) | (attainment > 1.0)).any():
         raise GoodputError(f"column {attainment_col!r} must be within [0, 1]")
-    if (
-        not np.isfinite(events).all()
-        or (events < 0.0).any()
-        or (events != np.floor(events)).any()
-    ):
-        raise GoodputError(
-            f"column {events_col!r} must hold non-negative integer counts"
-        )
+    if not np.isfinite(queue).all() or ((queue < 0.0) | (queue > 1.0)).any():
+        raise GoodputError(f"column {queue_col!r} must be within [0, 1]")
+    if events_col is not None:
+        events = _numeric(cells[events_col], events_col)
+        if (
+            not np.isfinite(events).all()
+            or (events < 0.0).any()
+            or (events != np.floor(events)).any()
+        ):
+            raise GoodputError(
+                f"column {events_col!r} must hold non-negative integer counts"
+            )
     labels = np.select(
-        [attainment < ATTAINMENT_MIN, (rho < RHO_KV_MIN) | (events == 0.0)],
+        [attainment < ATTAINMENT_MIN, (rho < RHO_KV_MIN) | (queue < QUEUE_SHARE_MIN)],
         [PAST_CLIFF, UNPRESSURED],
         default=IN_REGIME,
     )

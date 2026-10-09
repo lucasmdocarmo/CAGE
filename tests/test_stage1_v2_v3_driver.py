@@ -92,6 +92,9 @@ def _floor_table(tmp_path: Path) -> Path:
         "schema": "floor-table-v1",
         "generated_inputs": {
             "model": "qwen3-14b", "engine": "vllm", "kv_dtype": "bf16", "grid": "test",
+            # ADR-0155: the shape D was sized on = the registered anchor arm's tokens
+            "avg_seq_tokens": rc.DEMAND_SEQ_TOKENS_2026_10_08[rc.DEMAND_ANCHOR_ARM],
+            "concurrency_target": 32,
         },
         "rows": rows,
     }
@@ -150,9 +153,37 @@ def _grid(**overrides: Any):
     return rc.SessionGrid(**kwargs)
 
 
+def _rungs_for(grid, directory: Path) -> Optional[Dict[str, Path]]:
+    """ADR-0154: one rung-calibration artifact per server engine covering every
+    budgeted rung of ``grid`` (lambda* = 8 x r); None for a pressure-free grid."""
+    rungs = rc.budgeted_rungs(grid)
+    if not rungs:
+        return None
+    engines = set(grid.f1_engines) | set(grid.f2_engines) | set(grid.f3_engines)
+    engines |= {engine for _bid, engine, _topology in grid.dist_cells}
+    directory.mkdir(parents=True, exist_ok=True)
+    out: Dict[str, Path] = {}
+    for engine in sorted(engines - {"hf"}):
+        doc = {
+            "schema": rc.RUNG_CALIBRATION_SCHEMA, "procedure_version": PROCEDURE_VERSION,
+            "confirmatory": False, "engine": engine, "model": rc.HF_ID_OF_SLUG[grid.model],
+            "session": grid.session, "workload": {}, "ladder": {},
+            "rungs": {
+                f"{r:g}": {"r": r, "label": "ESTIMATED", "lambda_star_qps": 8.0 * r,
+                           "sustained_rate_qps": 8.0 * r, "first_unsustainable_qps": 10.4 * r, "steps": []}
+                for r in rungs
+            },
+        }
+        path = directory / f"rungs_{engine}.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        out[engine] = path
+    return out
+
+
 def _plan_for(grid, floor_path: Path, stub_cmd, *, launcher_cmds=None) -> Dict[str, Any]:
     floor = rc.load_floor_table(floor_path)
     calibrations = _calibrations_for(grid, floor_path.parent / "cal")
+    rungs = _rungs_for(grid, floor_path.parent / "cal")
     orig = rc.SESSION_GRIDS
     rc.SESSION_GRIDS = {grid.session: grid}
     try:
@@ -165,6 +196,7 @@ def _plan_for(grid, floor_path: Path, stub_cmd, *, launcher_cmds=None) -> Dict[s
                 "vllm": stub_cmd, "sglang": stub_cmd, rc.PD_LAUNCHER_KEY: stub_cmd,
             },
             calibrations=calibrations,
+            rung_calibrations=rungs,
         )
     finally:
         rc.SESSION_GRIDS = orig

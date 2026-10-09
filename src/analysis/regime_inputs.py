@@ -10,6 +10,14 @@ Charter bindings (PUBLICATION.md):
   ``rho_kv``/``scarcity_events`` — this bridge is that producer. ρ_KV is the
   zero-order-hold time-weighted mean of the KV-occupancy gauge over the
   window; scarcity_events is the delta of the CUMULATIVE preemption counter.
+- ADR-0153 (owner decision 2026-10-09, S0F-61): clause (b) reads the
+  admission QUEUE, not the preemption counter. ``queue_waiting_share`` is the
+  fraction of in-window samples whose waiting-request gauge (``waiting``:
+  vLLM num_requests_waiting, SGLang num_queue_reqs through the cage-stats
+  dialect) is > 0; ``waiting_max``/``waiting_mean`` describe the gauge and
+  ``n_waiting_samples`` counts the queued samples. A missing or non-numeric
+  gauge value refuses the window like the occupancy gauge does (absence is
+  not zero). ``scarcity_events`` stays on the record as provenance.
 - E2b, absence-is-not-zero doctrine: an engine that does not report the
   occupancy gauge (None/NaN samples), a window with too few samples, or a
   sparsely-covered window can NEVER be coerced into a numeric that would
@@ -117,9 +125,14 @@ class WindowRegimeInputs:
 
     ``rho_kv_time_avg`` = zero-order-hold time-weighted mean of the occupancy
     gauge over the covered span; ``scarcity_events`` = cumulative-preemption
-    delta (last − first in-window value); ``coverage`` = covered_time /
-    window duration, where covered time runs from the first in-window sample
-    to ``window_end_s`` (the pre-first-sample gap is never extrapolated).
+    delta (last − first in-window value; recorded, never a gate since
+    ADR-0153); ``coverage`` = covered_time / window duration, where covered
+    time runs from the first in-window sample to ``window_end_s`` (the
+    pre-first-sample gap is never extrapolated). ``queue_waiting_share`` =
+    the share of in-window samples with ``waiting`` > 0 (clause (b) of the
+    §6.1 criterion per ADR-0153); ``waiting_max``/``waiting_mean`` = the
+    gauge's in-window maximum and sample mean; ``n_waiting_samples`` = the
+    number of queued samples.
     """
 
     rho_kv_time_avg: float
@@ -128,6 +141,10 @@ class WindowRegimeInputs:
     coverage: float
     window_start_s: float
     window_end_s: float
+    queue_waiting_share: float
+    waiting_max: float
+    waiting_mean: float
+    n_waiting_samples: int
 
     def to_flat_dict(self) -> dict[str, int | float]:
         """Flat mapping suitable as CSV columns (joins a CellSpec row key)."""
@@ -142,29 +159,37 @@ def compute_window_regime_inputs(
     ts_col: str = "ts_s",
     kv_col: str = "kv_cache_usage",
     preempt_col: str = "preemptions_total",
+    waiting_col: str = "waiting",
     min_samples: int = 2,
     min_coverage: float = 0.8,
 ) -> WindowRegimeInputs:
-    """Certify one window's (ρ_KV time-avg, scarcity_events) from telemetry.
+    """Certify one window's (ρ_KV time-avg, queue share, scarcity_events)
+    from telemetry.
 
     ``samples`` is the cage-stats time series: ``ts_col`` monotonic
     non-decreasing seconds on the SAME clock as the window bounds, ``kv_col``
     the KV-occupancy gauge (fraction in [0, 1]; None when the engine lacks
-    the metric), ``preempt_col`` the CUMULATIVE preemption counter. Samples
-    with ``window_start_s <= ts < window_end_s`` are in-window.
+    the metric), ``preempt_col`` the CUMULATIVE preemption counter,
+    ``waiting_col`` the waiting-request gauge (a non-negative integer count
+    per sample; vLLM ``num_requests_waiting``, SGLang ``num_queue_reqs``
+    through the cage-stats dialect, both under the sampler's ``waiting``
+    key). Samples with ``window_start_s <= ts < window_end_s`` are in-window.
 
     ρ_KV is the zero-order-hold time-weighted mean: each in-window sample's
     value holds until the next sample's timestamp; the last holds until
     ``window_end_s``; the span before the first in-window sample is NOT
     covered (no backward extrapolation). The denominator is the covered time
-    (first in-window ts .. window_end_s).
+    (first in-window ts .. window_end_s). ``queue_waiting_share`` is the
+    plain sample share (queued samples / in-window samples), the form the
+    owner decided on 2026-10-09 (ADR-0153).
 
     Fail-closed (E2b): missing columns, non-monotonic or non-finite
     timestamps, bad bounds, fewer than ``min_samples`` in-window samples,
     coverage below ``min_coverage``, any None/NaN gauge or counter value,
-    a non-integral or decreasing counter — each raises ``RegimeInputError``.
-    Absence is not zero: none of these may fall through to a numeric that
-    could label the window UNPRESSURED.
+    a negative or non-integral waiting value, a non-integral or decreasing
+    counter — each raises ``RegimeInputError``. Absence is not zero: none of
+    these may fall through to a numeric that could label the window
+    UNPRESSURED.
     """
     min_samples = _check_min_samples(min_samples)
     min_coverage = _check_min_coverage(min_coverage)
@@ -175,7 +200,9 @@ def compute_window_regime_inputs(
             f"window_end_s={window_end_s!r} must be > window_start_s="
             f"{window_start_s!r}"
         )
-    missing = [c for c in (ts_col, kv_col, preempt_col) if c not in samples.columns]
+    missing = [
+        c for c in (ts_col, kv_col, preempt_col, waiting_col) if c not in samples.columns
+    ]
     if missing:
         raise RegimeInputError(f"samples frame is missing required columns {missing}")
 
@@ -251,6 +278,28 @@ def compute_window_regime_inputs(
         )
     scarcity_events = int(pre_w[-1] - pre_w[0])
 
+    # ADR-0153 clause (b): the admission queue. A sample without the gauge
+    # cannot certify scarcity, so it refuses exactly like the occupancy gauge.
+    waiting = pd.to_numeric(samples[waiting_col], errors="coerce").to_numpy(dtype=float)
+    waiting_w = waiting[in_window]
+    n_absent_waiting = int(np.isnan(waiting_w).sum())
+    if n_absent_waiting > 0:
+        raise RegimeInputError(
+            f"waiting-request gauge {waiting_col!r} is None/NaN on "
+            f"{n_absent_waiting} in-window sample(s): absence is not zero — the "
+            "queue clause (b) of the §6.1 criterion cannot be certified without "
+            "the gauge (ADR-0153, E2b)"
+        )
+    if not np.isfinite(waiting_w).all() or (waiting_w < 0.0).any():
+        raise RegimeInputError(
+            f"column {waiting_col!r} is a request count and must be finite and >= 0"
+        )
+    if (waiting_w != np.floor(waiting_w)).any():
+        raise RegimeInputError(
+            f"column {waiting_col!r} is a request count and must hold integer values"
+        )
+    n_waiting_samples = int((waiting_w > 0.0).sum())
+
     return WindowRegimeInputs(
         rho_kv_time_avg=rho_kv_time_avg,
         scarcity_events=scarcity_events,
@@ -258,6 +307,10 @@ def compute_window_regime_inputs(
         coverage=float(coverage),
         window_start_s=window_start_s,
         window_end_s=window_end_s,
+        queue_waiting_share=n_waiting_samples / n_samples,
+        waiting_max=float(waiting_w.max()),
+        waiting_mean=float(waiting_w.mean()),
+        n_waiting_samples=n_waiting_samples,
     )
 
 
@@ -281,10 +334,17 @@ class PDWindowRegimeInputs:
       mean IS the occupancy of the summed pool (§6.5: B = TOTAL bytes, pools
       summed, split recorded).
     - ``scarcity_events``: SUM of per-role cumulative-counter deltas — a
-      preemption on either role is scarcity of the one budget B.
+      preemption on either role is scarcity of the one budget B (recorded,
+      never a gate since ADR-0153).
     - ``n_samples``: SUM of per-role in-window sample counts.
     - ``coverage``: MIN of per-role coverages — conservative: the pool is only
       certified where EVERY role is; the weakest telemetry bounds the claim.
+    - ``queue_waiting_share``: MAX of the per-role shares (ADR-0153): a
+      request waiting at either role waits for the one budget B, and the
+      prefill role's queue is the admission queue of the pair [A, recorded
+      per role so the reading can be revisited]; ``waiting_max`` = MAX,
+      ``waiting_mean`` = the sample-count-weighted mean, ``n_waiting_samples``
+      = SUM.
 
     ``per_role`` maps role -> that role's certified ``WindowRegimeInputs``;
     ``budgets_by_role`` records the §6.5 split (bytes) that produced the pool.
@@ -296,6 +356,10 @@ class PDWindowRegimeInputs:
     coverage: float
     window_start_s: float
     window_end_s: float
+    queue_waiting_share: float
+    waiting_max: float
+    waiting_mean: float
+    n_waiting_samples: int
     per_role: Mapping[str, WindowRegimeInputs]
     budgets_by_role: Mapping[str, int]
 
@@ -314,6 +378,10 @@ class PDWindowRegimeInputs:
             "coverage": self.coverage,
             "window_start_s": self.window_start_s,
             "window_end_s": self.window_end_s,
+            "queue_waiting_share": self.queue_waiting_share,
+            "waiting_max": self.waiting_max,
+            "waiting_mean": self.waiting_mean,
+            "n_waiting_samples": self.n_waiting_samples,
         }
 
 
@@ -353,6 +421,7 @@ def compute_pd_window_regime_inputs(
     ts_col: str = "ts_s",
     kv_col: str = "kv_cache_usage",
     preempt_col: str = "preemptions_total",
+    waiting_col: str = "waiting",
     min_samples: int = 2,
     min_coverage: float = 0.8,
 ) -> PDWindowRegimeInputs:
@@ -427,6 +496,7 @@ def compute_pd_window_regime_inputs(
                 ts_col=ts_col,
                 kv_col=kv_col,
                 preempt_col=preempt_col,
+                waiting_col=waiting_col,
                 min_samples=min_samples,
                 min_coverage=min_coverage,
             )
@@ -445,13 +515,22 @@ def compute_pd_window_regime_inputs(
         )
     )
     reference = next(iter(per_role.values()))
+    n_total = sum(w.n_samples for w in per_role.values())
+    # ADR-0153: the queue of the pair is the worst role's queue (MAX share);
+    # a lone role reproduces its own numbers exactly (max/sum of one).
     return PDWindowRegimeInputs(
         rho_kv_time_avg=rho_pooled,
         scarcity_events=sum(w.scarcity_events for w in per_role.values()),
-        n_samples=sum(w.n_samples for w in per_role.values()),
+        n_samples=n_total,
         coverage=min(w.coverage for w in per_role.values()),
         window_start_s=reference.window_start_s,
         window_end_s=reference.window_end_s,
+        queue_waiting_share=max(w.queue_waiting_share for w in per_role.values()),
+        waiting_max=max(w.waiting_max for w in per_role.values()),
+        waiting_mean=float(
+            sum(w.waiting_mean * w.n_samples for w in per_role.values()) / n_total
+        ),
+        n_waiting_samples=sum(w.n_waiting_samples for w in per_role.values()),
         per_role=per_role,
         budgets_by_role={role: int(budgets_by_role[role]) for role in per_role},
     )
@@ -475,12 +554,14 @@ def compute_regime_inputs(
     Columns = the ``WindowRegimeInputs`` fields plus ``telemetry_ok`` (bool)
     and ``refusal_reason`` (str | None). With ``allow_missing=False`` (the
     default) the first ``RegimeInputError`` re-raises — fail-closed. With
-    ``allow_missing=True`` a refused window yields a row with NaN for
-    ``rho_kv_time_avg``/``scarcity_events``/``n_samples``/``coverage``,
-    ``telemetry_ok=False``, and the refusal message in ``refusal_reason``
-    (never a numeric sentinel — absence is not zero); certified rows carry
-    ``telemetry_ok=True`` and ``refusal_reason=None``. Downstream,
-    ``label_regime_with_refusal`` maps refused rows to ``REGIME_UNKNOWN``.
+    ``allow_missing=True`` a refused window yields a row with NaN for every
+    certified field (``rho_kv_time_avg``, ``scarcity_events``, ``n_samples``,
+    ``coverage``, ``queue_waiting_share``, ``waiting_max``, ``waiting_mean``,
+    ``n_waiting_samples``), ``telemetry_ok=False``, and the refusal message
+    in ``refusal_reason`` (never a numeric sentinel — absence is not zero);
+    certified rows carry ``telemetry_ok=True`` and ``refusal_reason=None``.
+    Downstream, ``label_regime_with_refusal`` maps refused rows to
+    ``REGIME_UNKNOWN``.
     """
     if len(windows) == 0:
         raise RegimeInputError("windows is empty: nothing to certify")
@@ -504,6 +585,10 @@ def compute_regime_inputs(
                     "coverage": math.nan,
                     "window_start_s": _bound_or_nan(start),
                     "window_end_s": _bound_or_nan(end),
+                    "queue_waiting_share": math.nan,
+                    "waiting_max": math.nan,
+                    "waiting_mean": math.nan,
+                    "n_waiting_samples": math.nan,
                     "telemetry_ok": False,
                     "refusal_reason": str(exc),
                 }
@@ -523,6 +608,10 @@ def compute_regime_inputs(
         "coverage",
         "window_start_s",
         "window_end_s",
+        "queue_waiting_share",
+        "waiting_max",
+        "waiting_mean",
+        "n_waiting_samples",
         "telemetry_ok",
         "refusal_reason",
     ]
@@ -540,26 +629,30 @@ def label_regime_with_refusal(
     cells: pd.DataFrame,
     *,
     rho_col: str = "rho_kv_time_avg",
-    events_col: str = "scarcity_events",
+    queue_col: str = "queue_waiting_share",
     attainment_col: str = "attainment",
     ok_col: str = "telemetry_ok",
+    events_col: str | None = "scarcity_events",
 ) -> pd.Series:
     """§6.1 regime labels with the operational UNKNOWN refusal lane.
 
     Rows with ``telemetry_ok`` True get their label from
     ``goodput.label_regime`` (the ONE source of the §6.1 thresholds — no
-    duplication here); rows with ``telemetry_ok`` False get
-    ``REGIME_UNKNOWN``, which is outside the 3-label grid vocabulary and
-    never enters in-regime aggregates. When ``ok_col`` is absent every row
-    is treated as certified, delegating entirely to goodput's own
-    validation. Returns a 'regime' Series aligned to ``cells.index``.
+    duplication here; clause (b) reads ``queue_col`` per ADR-0153 and
+    ``events_col`` is validated as the recorded preemption delta, never a
+    gate); rows with ``telemetry_ok`` False get ``REGIME_UNKNOWN``, which is
+    outside the 3-label grid vocabulary and never enters in-regime
+    aggregates. When ``ok_col`` is absent every row is treated as certified,
+    delegating entirely to goodput's own validation. Returns a 'regime'
+    Series aligned to ``cells.index``.
     """
     if ok_col not in cells.columns:
         return _goodput_label_regime(
             cells,
             rho_col=rho_col,
-            events_col=events_col,
+            queue_col=queue_col,
             attainment_col=attainment_col,
+            events_col=events_col,
         )
     ok = _bool_array(cells[ok_col], ok_col)
     labels = pd.Series(REGIME_UNKNOWN, index=cells.index, name="regime", dtype=object)
@@ -567,7 +660,8 @@ def label_regime_with_refusal(
         labels.loc[ok] = _goodput_label_regime(
             cells.loc[ok],
             rho_col=rho_col,
-            events_col=events_col,
+            queue_col=queue_col,
             attainment_col=attainment_col,
+            events_col=events_col,
         )
     return labels

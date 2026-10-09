@@ -953,10 +953,13 @@ def _regime_series(
 ) -> list[dict[str, Any]]:
     """Canonical sampler records inside the [0, 4) test window: constant
     occupancy ``kv``, a cumulative preemption counter that climbs by one per
-    sample (3 scarcity events), full coverage; optionally role-tagged."""
+    sample (3 scarcity events, recorded), one request waiting on every sample
+    (ADR-0153 queue share 1.0), full coverage; optionally role-tagged."""
     rows = []
     for i, t in enumerate(ts):
-        rec: dict[str, Any] = {"ts_s": t, "kv_cache_usage": kv, "preemptions_total": i}
+        rec: dict[str, Any] = {
+            "ts_s": t, "kv_cache_usage": kv, "preemptions_total": i, "waiting": 1,
+        }
         if instance is not None:
             rec["instance"] = instance
         rows.append(rec)

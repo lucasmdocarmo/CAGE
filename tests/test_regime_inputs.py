@@ -1,6 +1,7 @@
 """Tests for src.analysis.regime_inputs — the telemetry → §6.1 regime-input
 bridge (E2/E2b 2026-08-12): ZOH ρ_KV time-average, cumulative-preemption
-deltas, fail-closed refusals, and the UNKNOWN_TELEMETRY lane."""
+deltas, the ADR-0153 queue share (the waiting-request gauge, S0F-61),
+fail-closed refusals, and the UNKNOWN_TELEMETRY lane."""
 
 from __future__ import annotations
 
@@ -27,16 +28,21 @@ from src.analysis.regime_inputs import (
 )
 
 
-def _samples(ts: list, kv: list, pre: list) -> pd.DataFrame:
+def _samples(ts: list, kv: list, pre: list, waiting: list | None = None) -> pd.DataFrame:
+    """The sampler's series schema; ``waiting`` (ADR-0153 queue gauge)
+    defaults to an empty queue on every sample."""
+    if waiting is None:
+        waiting = [0] * len(ts)
     return pd.DataFrame(
-        {"ts_s": ts, "kv_cache_usage": kv, "preemptions_total": pre}
+        {"ts_s": ts, "kv_cache_usage": kv, "preemptions_total": pre, "waiting": waiting}
     )
 
 
 def _canonical() -> pd.DataFrame:
     """Window [0, 10): covered time 8 (first sample at 2), ZOH integral
-    0.5*4 + 1.0*2 + 0.8*2 = 5.6 -> mean 0.7, coverage 0.8; counter 5 -> 9."""
-    return _samples([2.0, 6.0, 8.0], [0.5, 1.0, 0.8], [5, 5, 9])
+    0.5*4 + 1.0*2 + 0.8*2 = 5.6 -> mean 0.7, coverage 0.8; counter 5 -> 9;
+    waiting 0, 3, 2 -> queue share 2/3, max 3, mean 5/3, 2 queued samples."""
+    return _samples([2.0, 6.0, 8.0], [0.5, 1.0, 0.8], [5, 5, 9], [0, 3, 2])
 
 
 class TestComputeWindowRegimeInputs:
@@ -49,6 +55,55 @@ class TestComputeWindowRegimeInputs:
         assert w.coverage == pytest.approx(0.8)
         assert w.window_start_s == 0.0
         assert w.window_end_s == 10.0
+        # ADR-0153: the queue clause inputs, a plain sample share.
+        assert w.queue_waiting_share == pytest.approx(2.0 / 3.0)
+        assert w.waiting_max == 3.0
+        assert w.waiting_mean == pytest.approx(5.0 / 3.0)
+        assert w.n_waiting_samples == 2
+
+    def test_queue_share_counts_samples_not_time(self) -> None:
+        # Two of four samples queued -> exactly 0.5 whatever the spacing; the
+        # share is the owner's "at least 50 percent of in-window samples".
+        frame = _samples(
+            [0.0, 1.0, 2.0, 9.0], [0.9] * 4, [0, 0, 0, 0], [5, 0, 0, 7]
+        )
+        w = compute_window_regime_inputs(frame, 0.0, 10.0)
+        assert w.queue_waiting_share == pytest.approx(0.5)
+        assert w.n_waiting_samples == 2
+        assert w.waiting_max == 7.0 and w.waiting_mean == pytest.approx(3.0)
+
+    def test_integral_float_waiting_accepted(self) -> None:
+        # vLLM and SGLang expose the gauge as a float (46.0 on the landing).
+        frame = _samples([2.0, 6.0, 8.0], [0.5, 1.0, 0.8], [5, 5, 9], [46.0, 0.0, 1.0])
+        w = compute_window_regime_inputs(frame, 0.0, 10.0)
+        assert w.queue_waiting_share == pytest.approx(2.0 / 3.0)
+        assert w.waiting_max == 46.0
+
+    def test_missing_waiting_column_raises(self) -> None:
+        frame = _canonical().drop(columns=["waiting"])
+        with pytest.raises(RegimeInputError, match="waiting"):
+            compute_window_regime_inputs(frame, 0.0, 10.0)
+
+    @pytest.mark.parametrize("hole", [None, math.nan])
+    def test_absent_waiting_gauge_raises_absence_is_not_zero(self, hole: object) -> None:
+        frame = _samples([2.0, 6.0, 8.0], [0.5, 1.0, 0.8], [5, 5, 9], [0, hole, 2])
+        with pytest.raises(RegimeInputError, match="absence is not zero"):
+            compute_window_regime_inputs(frame, 0.0, 10.0)
+
+    @pytest.mark.parametrize("bad, match", [([0, -1, 2], ">= 0"), ([0, 1.5, 2], "integer")])
+    def test_bad_waiting_values_raise(self, bad: list, match: str) -> None:
+        frame = _samples([2.0, 6.0, 8.0], [0.5, 1.0, 0.8], [5, 5, 9], bad)
+        with pytest.raises(RegimeInputError, match=match):
+            compute_window_regime_inputs(frame, 0.0, 10.0)
+
+    def test_out_of_window_waiting_never_counts(self) -> None:
+        frame = _samples(
+            [-1.0, 2.0, 6.0, 8.0, 10.0], [0.0, 0.5, 1.0, 0.8, 0.0],
+            [0, 5, 5, 9, 9], [9, 0, 3, 2, 9],
+        )
+        w = compute_window_regime_inputs(frame, 0.0, 10.0)
+        assert w.queue_waiting_share == pytest.approx(2.0 / 3.0)
+        assert w.waiting_max == 3.0
 
     def test_pre_window_samples_ignored_never_extrapolated(self) -> None:
         # A sample BEFORE window_start must not hold forward into the window:
@@ -178,6 +233,8 @@ class TestComputeRegimeInputs:
         assert frame["refusal_reason"].isna().all()
         assert frame.loc[0, "rho_kv_time_avg"] == pytest.approx(0.7)
         assert frame.loc[0, "scarcity_events"] == 4
+        assert frame.loc[0, "queue_waiting_share"] == pytest.approx(2.0 / 3.0)
+        assert frame.loc[0, "n_waiting_samples"] == 2
         # Window [1, 9): covered 9-2=7, integral 0.5*4 + 1.0*2 + 0.8*1 = 4.8.
         assert frame.loc[1, "rho_kv_time_avg"] == pytest.approx(4.8 / 7.0)
         assert frame.loc[1, "coverage"] == pytest.approx(7.0 / 8.0)
@@ -195,6 +252,8 @@ class TestComputeRegimeInputs:
         assert math.isnan(bad["rho_kv_time_avg"])
         assert math.isnan(bad["scarcity_events"])
         assert math.isnan(bad["coverage"])
+        assert math.isnan(bad["queue_waiting_share"])
+        assert math.isnan(bad["waiting_max"]) and math.isnan(bad["n_waiting_samples"])
         assert bad["window_start_s"] == 100.0
 
     def test_default_reraises_first_error(self) -> None:
@@ -215,7 +274,8 @@ class TestLabelRegimeWithRefusal:
         return pd.DataFrame(
             {
                 "rho_kv_time_avg": [0.95, 0.5, 0.95, math.nan],
-                "scarcity_events": [3.0, 3.0, 3.0, math.nan],
+                "queue_waiting_share": [1.0, 1.0, 1.0, math.nan],
+                "scarcity_events": [0.0, 3.0, 3.0, math.nan],
                 "attainment": [0.95, 0.95, 0.5, 0.95],
                 "telemetry_ok": [True, True, True, False],
             },
@@ -245,10 +305,25 @@ class TestLabelRegimeWithRefusal:
         expected = label_regime(
             cells,
             rho_col="rho_kv_time_avg",
-            events_col="scarcity_events",
+            queue_col="queue_waiting_share",
             attainment_col="attainment",
+            events_col="scarcity_events",
         )
         assert labels.tolist() == expected.tolist()
+
+    def test_empty_queue_is_unpressured_with_preemptions_recorded(self) -> None:
+        # ADR-0153: the recorded counter never decides; a full pool with an
+        # empty queue is UNPRESSURED even beside 30 preemptions.
+        cells = pd.DataFrame(
+            {
+                "rho_kv_time_avg": [0.95],
+                "queue_waiting_share": [0.0],
+                "scarcity_events": [30.0],
+                "attainment": [0.95],
+                "telemetry_ok": [True],
+            }
+        )
+        assert label_regime_with_refusal(cells).tolist() == [UNPRESSURED]
 
     def test_absent_ok_col_delegates_validation_to_goodput(self) -> None:
         cells = self._cells().drop(columns=["telemetry_ok"])  # row 40 has NaN rho
@@ -268,9 +343,10 @@ class TestLabelRegimeWithRefusal:
 
     def test_end_to_end_bridge_to_labels(self) -> None:
         # High-pressure telemetry: integral 0.95*4 + 0.95*2 + 0.92*2 = 7.54,
-        # covered 8 -> rho 0.9425 >= 0.9; scarcity 4 > 0.
+        # covered 8 -> rho 0.9425 >= 0.9; the queue is non-empty on 2 of 3
+        # samples (share 2/3 >= 0.5); the preemption counter is recorded.
         telemetry = _samples(
-            [2.0, 6.0, 8.0], [0.95, 0.95, 0.92], [5, 5, 9]
+            [2.0, 6.0, 8.0], [0.95, 0.95, 0.92], [5, 5, 9], [4, 2, 0]
         )
         frame = compute_regime_inputs(
             telemetry, [(0.0, 10.0), (100.0, 110.0)], allow_missing=True

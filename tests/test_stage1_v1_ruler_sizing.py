@@ -393,7 +393,10 @@ def _floor_table(tmp_path: Path) -> Path:
         for r in (1.5, 1.0, 0.5, 0.25)
     ]
     doc = {"schema": "floor-table-v1",
-           "generated_inputs": {"model": "qwen3-14b", "engine": "vllm", "kv_dtype": "bf16", "grid": "test"},
+           "generated_inputs": {"model": "qwen3-14b", "engine": "vllm", "kv_dtype": "bf16", "grid": "test",
+                                # ADR-0155: the registered anchor arm's served tokens
+                                "avg_seq_tokens": rc.DEMAND_SEQ_TOKENS_2026_10_08[rc.DEMAND_ANCHOR_ARM],
+                                "concurrency_target": 32},
            "rows": rows}
     path = tmp_path / "floor_table.json"
     path.write_text(json.dumps(doc), encoding="utf-8")
@@ -414,6 +417,23 @@ def _calibrations(tmp_path: Path) -> Dict[str, Path]:
     return {"vllm": path}
 
 
+def _rung_calibrations(tmp_path: Path, rungs=(1.0,)) -> Dict[str, Path]:
+    """ADR-0154: the vLLM rung artifact (lambda* = 8 x r) for the ruler grid."""
+    from src.orchestration.calibration import PROCEDURE_VERSION
+
+    directory = tmp_path / "cal"
+    directory.mkdir(exist_ok=True)
+    doc = {"schema": rc.RUNG_CALIBRATION_SCHEMA, "procedure_version": PROCEDURE_VERSION,
+           "confirmatory": False, "engine": "vllm", "model": "Qwen/Qwen3-14B", "session": "a",
+           "workload": {}, "ladder": {},
+           "rungs": {f"{r:g}": {"r": r, "label": "ESTIMATED", "lambda_star_qps": 8.0 * r,
+                                "sustained_rate_qps": 8.0 * r, "first_unsustainable_qps": 10.4 * r,
+                                "steps": []} for r in rungs}}
+    path = directory / "rungs_vllm.json"
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    return {"vllm": path}
+
+
 def _ruler_plan(tmp_path: Path) -> Dict[str, Any]:
     grid = rc.SessionGrid(
         session="a", group="A", model="qwen3-14b",
@@ -429,6 +449,7 @@ def _ruler_plan(tmp_path: Path) -> Dict[str, Any]:
             "a", rc.load_floor_table(_floor_table(tmp_path)), window_duration_s=60.0,
             runner_cmd=("stub",), launcher_cmds={"vllm": ("stub",), "sglang": ("stub",)},
             calibrations=_calibrations(tmp_path),
+            rung_calibrations=_rung_calibrations(tmp_path),
         )
     finally:
         rc.SESSION_GRIDS = orig

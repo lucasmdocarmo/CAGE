@@ -21,6 +21,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_run_campaign import (  # noqa: E402
+    _rungs_for,
     _floor_table_doc,
     _tiny_grid,
     _write_calibrations,
@@ -81,6 +82,10 @@ def test_rehearsal_plan_builds_against_the_real_manifests_through_the_cli(tmp_pa
         argv += ["--query-manifest", f"{ds}={path}"]
     for eng, path in cal.items():
         argv += ["--calibration", f"{eng}={path}"]
+    # ADR-0154: the rehearsal's rungs are a subset of the registered session's,
+    # so the session a rung artifacts cover them.
+    for eng, path in _rungs_for(cal, "a").items():
+        argv += ["--rung-calibration", f"{eng}={path}"]
     assert rc.main(argv) == 0
     plan = json.loads(out.read_text(encoding="utf-8"))
     reh = plan["rehearsal"]
@@ -90,7 +95,18 @@ def test_rehearsal_plan_builds_against_the_real_manifests_through_the_cli(tmp_pa
     assert reh["f3_coordinates"] == [[0.5, 0.95]] and "lower-median" in reh["rule"]
     assert plan["session"] == "a" and plan["replications"] == 1
     assert plan["counts"]["cells"] == 110 and plan["counts"]["windows"] == 110  # ADR-0152 (old 112)
-    assert plan["counts"]["relaunches"] == 18 and plan["counts"]["blocked"] == 3
+    # Relaunches (ADR-0155, one boundary per engine x prefix x budget x
+    # demand class): per engine F2 2 budgets {0.75, 1.25} x 4 classes = 8,
+    # F3 (r = 0.5) B4 corpus-fresh OFF 1, prefix ON B2/B3/B7/B10 4 + the two
+    # B12 rungs (manifests registered) 2, budget-free F1 ON 2 (+1 lmcache on
+    # vLLM) and OFF 1; vLLM adds the B8 lmcache F3 boundary 1
+    # => vllm 8 + 1 + 4 + 2 + 1 + 3 + 1 = 20, sglang 8 + 1 + 4 + 2 + 2 + 1 = 18
+    # => 38 (old pin 18 before ADR-0155). Dry windows (ADR-0153, one per
+    # budgeted serving configuration minus r): per engine prefix OFF {4779,
+    # 1127, 702, 348} + corpus-fresh 2336 = 5, prefix ON {4779, 2336, 2336 fp8,
+    # 1126, 1205, 480} = 6, plus retr-store lmcache on vLLM => 12 + 11 = 23.
+    assert plan["counts"]["relaunches"] == 38 and plan["counts"]["blocked"] == 3
+    assert plan["counts"]["dry_windows"] == 23
     assert plan["per_row_n"]["n_primary"] == 50 and plan["per_row_n"]["window_requests"] == 50
     cells = [s for s in plan["steps"] if s["kind"] == "cell"]
     assert {s["num_queries"] for s in cells} == {50} and {s["windows"] for s in cells} == {1}

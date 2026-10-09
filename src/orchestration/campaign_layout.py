@@ -161,6 +161,11 @@ _BASELINE_OF_CELL: dict[tuple[str, str], str] = {
 _TS_FIELDS: tuple[str, ...] = ("ts_s", "ts")
 _KV_FIELDS: tuple[str, ...] = ("kv_cache_usage", "kv_usage")
 _PREEMPT_FIELD = "preemptions_total"
+#: ADR-0153 (S0F-61): the waiting-request gauge the §6.1 clause (b) reads
+#: (VllmTelemetrySampler._GAUGES "waiting": vLLM num_requests_waiting, SGLang
+#: num_queue_reqs through the cage-stats dialect). Absent on a record -> None
+#: -> the bridge refuses the window (absence is not zero).
+_WAITING_FIELD = "waiting"
 
 #: Series-schema note (T4.1, Wave-3): records MAY carry an OPTIONAL
 #: ``instance`` role string ("single", "prefill", "decode", ...) stamped by
@@ -175,7 +180,11 @@ _PREEMPT_FIELD = "preemptions_total"
 #: byte-weighted.
 _INSTANCE_FIELD = "instance"
 
-_REGIME_SCHEMA_VERSION = 1
+#: regime.json schema: 2 since ADR-0153 (the ``inputs`` block carries the queue
+#: clause fields queue_waiting_share, waiting_max, waiting_mean and
+#: n_waiting_samples beside the version-1 fields; the label vocabulary is
+#: unchanged). A reader that needs the queue fields checks this version.
+_REGIME_SCHEMA_VERSION = 2
 
 
 class CampaignLayoutError(RuntimeError):
@@ -920,10 +929,11 @@ def load_telemetry_series(path: Path) -> pd.DataFrame:
 
     Accepts BOTH field spellings per record — canonical (``ts_s``,
     ``kv_cache_usage``; what save_series now emits) preferred, legacy
-    (``ts``, ``kv_usage``) fallback; ``preemptions_total`` is shared. A record
-    carrying NEITHER timestamp spelling is corrupt (a sample that cannot be
-    placed in time) and fails loud. Absent gauges/counters stay None (-> NaN)
-    so ``compute_window_regime_inputs`` refuses them — absence is not zero.
+    (``ts``, ``kv_usage``) fallback; ``preemptions_total`` and ``waiting``
+    (ADR-0153, the queue gauge) are shared. A record carrying NEITHER
+    timestamp spelling is corrupt (a sample that cannot be placed in time)
+    and fails loud. Absent gauges/counters stay None (-> NaN) so
+    ``compute_window_regime_inputs`` refuses them — absence is not zero.
     Returns a frame with exactly the canonical columns; an empty or
     all-blank-lines file yields an empty frame (0 samples -> refusal lane).
 
@@ -977,16 +987,18 @@ def load_telemetry_series(path: Path) -> pd.DataFrame:
                 "ts_s": ts,
                 "kv_cache_usage": kv,
                 "preemptions_total": rec.get(_PREEMPT_FIELD),
+                _WAITING_FIELD: rec.get(_WAITING_FIELD),
                 _INSTANCE_FIELD: instance,
             }
         )
     if problems:
         raise CampaignLayoutError(problems)
-    # Legacy frames keep EXACTLY the pre-T4.1 columns (differential pin in
-    # tests/test_multi_instance_telemetry.py); the instance column exists only
-    # when some record actually carried the tag. pd.DataFrame(columns=...)
-    # selects, so the always-present dict key is simply dropped for legacy.
-    columns = ["ts_s", "kv_cache_usage", "preemptions_total"]
+    # Untagged frames keep EXACTLY the single-instance columns (differential
+    # pin in tests/test_multi_instance_telemetry.py; ``waiting`` joined them
+    # with ADR-0153); the instance column exists only when some record
+    # actually carried the tag. pd.DataFrame(columns=...) selects, so the
+    # always-present dict key is simply dropped for untagged files.
+    columns = ["ts_s", "kv_cache_usage", "preemptions_total", _WAITING_FIELD]
     if saw_instance:
         columns.append(_INSTANCE_FIELD)
     return pd.DataFrame(rows, columns=columns)
@@ -1015,7 +1027,9 @@ def write_window_regime(
       null, the refusal message in ``refusal_reason`` — absence stays absence,
       never a numeric that could read UNPRESSURED;
     - certified + ``attainment`` provided -> the §6.1 3-layer label from
-      ``goodput.classify_regime`` (the ONE threshold source);
+      ``goodput.classify_regime`` (the ONE threshold source; clause (b) is
+      the queue share per ADR-0153, the preemption delta rides along as a
+      recorded input);
     - certified, no attainment yet -> ``label`` null (§6.1 labeling deferred
       until the caller's attainment exists — never fabricated).
 
@@ -1130,8 +1144,9 @@ def write_window_regime(
             # GoodputError (attainment outside [0,1], ...) propagates: caller bug.
             label = classify_regime(
                 rho_kv=inputs.rho_kv_time_avg,
-                scarcity_events=inputs.scarcity_events,
                 attainment=float(attainment),
+                queue_waiting_share=inputs.queue_waiting_share,
+                scarcity_events=inputs.scarcity_events,
             )
         document.update(
             {
@@ -1267,8 +1282,9 @@ def _write_pd_window_regime(
             # GoodputError (attainment outside [0,1], ...) propagates: caller bug.
             label = classify_regime(
                 rho_kv=inputs.rho_kv_time_avg,
-                scarcity_events=inputs.scarcity_events,
                 attainment=float(attainment),
+                queue_waiting_share=inputs.queue_waiting_share,
+                scarcity_events=inputs.scarcity_events,
             )
         document.update(
             {

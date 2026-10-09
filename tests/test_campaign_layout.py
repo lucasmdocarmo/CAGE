@@ -44,16 +44,17 @@ WINDOWS_PER_DATASET = 2
 
 #: Pinned ZOH case (tests/test_regime_inputs.py::_canonical): window [0, 10),
 #: covered time 8 (first sample at 2), integral 0.5*4 + 1.0*2 + 0.8*2 = 5.6
-#: -> mean 0.7, coverage 0.8; counter 5 -> 9 => 4 scarcity events.
+#: -> mean 0.7, coverage 0.8; counter 5 -> 9 => 4 scarcity events; the
+#: ADR-0153 queue gauge 0, 3, 2 -> queue share 2/3 (2 queued samples).
 _ZOH_LEGACY = [
-    {"ts": 2.0, "kv_usage": 0.5, "preemptions_total": 5},
-    {"ts": 6.0, "kv_usage": 1.0, "preemptions_total": 5},
-    {"ts": 8.0, "kv_usage": 0.8, "preemptions_total": 9},
+    {"ts": 2.0, "kv_usage": 0.5, "preemptions_total": 5, "waiting": 0},
+    {"ts": 6.0, "kv_usage": 1.0, "preemptions_total": 5, "waiting": 3},
+    {"ts": 8.0, "kv_usage": 0.8, "preemptions_total": 9, "waiting": 2},
 ]
 _ZOH_CANONICAL = [
-    {"ts_s": 2.0, "kv_cache_usage": 0.5, "preemptions_total": 5},
-    {"ts_s": 6.0, "kv_cache_usage": 1.0, "preemptions_total": 5},
-    {"ts_s": 8.0, "kv_cache_usage": 0.8, "preemptions_total": 9},
+    {"ts_s": 2.0, "kv_cache_usage": 0.5, "preemptions_total": 5, "waiting": 0},
+    {"ts_s": 6.0, "kv_cache_usage": 1.0, "preemptions_total": 5, "waiting": 3},
+    {"ts_s": 8.0, "kv_cache_usage": 0.8, "preemptions_total": 9, "waiting": 2},
 ]
 
 
@@ -447,6 +448,11 @@ def test_regime_pinned_zoh_case_both_schemas(
     assert doc["inputs"]["scarcity_events"] == 4
     assert doc["inputs"]["n_samples"] == 3
     assert doc["inputs"]["coverage"] == pytest.approx(0.8)
+    # ADR-0153: the queue clause inputs ride the same record, schema 2.
+    assert doc["schema_version"] == 2
+    assert doc["inputs"]["queue_waiting_share"] == pytest.approx(2.0 / 3.0)
+    assert doc["inputs"]["waiting_max"] == 3.0
+    assert doc["inputs"]["n_waiting_samples"] == 2
     # No attainment yet -> §6.1 labeling deferred, never fabricated.
     assert doc["label"] is None and doc["attainment"] is None
 
@@ -462,16 +468,55 @@ def test_regime_label_with_attainment(tmp_path: Path) -> None:
 
 
 def test_regime_in_regime_label(tmp_path: Path) -> None:
+    # ADR-0153: a full pool with a queue on 2 of 3 samples and a preemption
+    # counter that never moves (the 2026-10-08 landing's shape) is IN_REGIME.
     telemetry = [
-        {"ts_s": 2.0, "kv_cache_usage": 0.95, "preemptions_total": 0},
-        {"ts_s": 6.0, "kv_cache_usage": 0.95, "preemptions_total": 1},
-        {"ts_s": 8.0, "kv_cache_usage": 0.95, "preemptions_total": 3},
+        {"ts_s": 2.0, "kv_cache_usage": 0.95, "preemptions_total": 0, "waiting": 4},
+        {"ts_s": 6.0, "kv_cache_usage": 0.95, "preemptions_total": 0, "waiting": 2},
+        {"ts_s": 8.0, "kv_cache_usage": 0.95, "preemptions_total": 0, "waiting": 0},
     ]
     handle = _one_window(tmp_path, telemetry)
     path = cl.write_window_regime(
         handle.window_dir, t_start=0.0, t_end=10.0, attainment=0.95
     )
-    assert json.loads(path.read_text(encoding="utf-8"))["label"] == IN_REGIME
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    assert doc["label"] == IN_REGIME
+    assert doc["inputs"]["scarcity_events"] == 0  # recorded, not a gate
+
+
+def test_regime_full_pool_without_a_queue_is_unpressured(tmp_path: Path) -> None:
+    # Preemptions recorded (3) but no request ever waited: a comfortable fit.
+    telemetry = [
+        {"ts_s": 2.0, "kv_cache_usage": 0.95, "preemptions_total": 0, "waiting": 0},
+        {"ts_s": 6.0, "kv_cache_usage": 0.95, "preemptions_total": 1, "waiting": 0},
+        {"ts_s": 8.0, "kv_cache_usage": 0.95, "preemptions_total": 3, "waiting": 0},
+    ]
+    handle = _one_window(tmp_path, telemetry)
+    path = cl.write_window_regime(
+        handle.window_dir, t_start=0.0, t_end=10.0, attainment=0.95
+    )
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    assert doc["label"] == UNPRESSURED
+    assert doc["inputs"]["queue_waiting_share"] == 0.0
+    assert doc["inputs"]["scarcity_events"] == 3
+
+
+def test_regime_series_without_the_queue_gauge_is_a_refusal(tmp_path: Path) -> None:
+    # A pre-ADR-0153 series (no ``waiting`` field) certifies nothing: the
+    # queue clause cannot be read, so the window reads UNKNOWN_TELEMETRY
+    # naming the gauge, never a label computed on the counter alone.
+    telemetry = [
+        {"ts_s": 2.0, "kv_cache_usage": 0.95, "preemptions_total": 0},
+        {"ts_s": 6.0, "kv_cache_usage": 0.95, "preemptions_total": 1},
+    ]
+    handle = _one_window(tmp_path, telemetry)
+    path = cl.write_window_regime(
+        handle.window_dir, t_start=0.0, t_end=10.0, attainment=0.95
+    )
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    assert doc["telemetry_ok"] is False and doc["label"] == REGIME_UNKNOWN
+    assert "waiting" in doc["refusal_reason"]
+    assert "absence is not zero" in doc["refusal_reason"]
 
 
 def test_regime_refusal_absence_stays_absence(tmp_path: Path) -> None:
@@ -555,9 +600,9 @@ def _sampler_with(samples: list[dict[str, Any]], ts: list[float]) -> VllmTelemet
 def test_save_series_emits_canonical_alongside_legacy(tmp_path: Path) -> None:
     sampler = _sampler_with(
         [
-            {"kv_usage": 0.5, "preemptions_total": 5},
-            {"kv_usage": 1.0, "preemptions_total": 5},
-            {"kv_usage": 0.8, "preemptions_total": 9},
+            {"kv_usage": 0.5, "preemptions_total": 5, "waiting": 0},
+            {"kv_usage": 1.0, "preemptions_total": 5, "waiting": 3},
+            {"kv_usage": 0.8, "preemptions_total": 9, "waiting": 2},
         ],
         [2.0, 6.0, 8.0],
     )
@@ -591,9 +636,9 @@ def test_save_series_roundtrips_into_regime_inputs(tmp_path: Path) -> None:
 
     sampler = _sampler_with(
         [
-            {"kv_usage": 0.5, "preemptions_total": 5},
-            {"kv_usage": 1.0, "preemptions_total": 5},
-            {"kv_usage": 0.8, "preemptions_total": 9},
+            {"kv_usage": 0.5, "preemptions_total": 5, "waiting": 0},
+            {"kv_usage": 1.0, "preemptions_total": 5, "waiting": 3},
+            {"kv_usage": 0.8, "preemptions_total": 9, "waiting": 2},
         ],
         [2.0, 6.0, 8.0],
     )
@@ -603,6 +648,7 @@ def test_save_series_roundtrips_into_regime_inputs(tmp_path: Path) -> None:
     inputs = compute_window_regime_inputs(frame, 0.0, 10.0)
     assert inputs.rho_kv_time_avg == pytest.approx(0.7)
     assert inputs.scarcity_events == 4
+    assert inputs.queue_waiting_share == pytest.approx(2.0 / 3.0)
 
 
 # ---------------------------------------------------------------------------

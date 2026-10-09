@@ -200,12 +200,24 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         echo "SAFE TO TEARDOWN"
         ''')
     _w(fake_scripts / "3_run" / "run_campaign.py", r'''
+        import sys
         class PlanError(Exception):
             pass
+        # ADR-0155: the stage 0 probe reads the anchor arm's registered shape
+        DEMAND_ANCHOR_ARM = "gold-fresh"
+        class _Grid:
+            def __init__(self, session):
+                self.session = session
+                self.demand_seq_tokens = {"gold-fresh": 4779}
         def get_session_grid(session):
             if session not in ("a", "b"):
                 raise PlanError(f"session {session!r} is not a registered grid")
-            return {"session": session}
+            return _Grid(session)
+        if __name__ == "__main__":
+            a = sys.argv[1:]
+            if a and a[0] == "rungs":  # ADR-0154: stage 5 lists the budgeted rungs on the Mac
+                print("1 0.5"); sys.exit(0)
+            print("REFUSED: fake Mac planner knows only 'rungs'", file=sys.stderr); sys.exit(2)
         ''', exe=False)
     _w(fake_scripts / "4_analysis" / "build_floor_table.py", r'''
         import json, sys
@@ -316,9 +328,20 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         import json, os, sys
         from pathlib import Path
         a = sys.argv[1:]
+        if a[0] == "rungs":
+            print("1 0.5"); sys.exit(0)
+        if a[0] == "calibrate-rungs":
+            out = Path(a[a.index("--out") + 1]); out.parent.mkdir(parents=True, exist_ok=True)
+            fail = os.environ.get("CAGE_TEST_RUNGS_FAIL") == "1"
+            label = "LADDER_EXHAUSTED" if fail else "ESTIMATED"
+            doc = {"schema": "cage-rung-calibration-v1", "engine": a[a.index("--engine") + 1], "argv": a,
+                   "rungs": {r: {"r": float(r), "label": label, "lambda_star_qps": None if fail else 3.0 * float(r)}
+                             for r in a[a.index("--rungs") + 1].split(",")}}
+            out.write_text(json.dumps(doc), encoding="utf-8")
+            print("[calibrate-rungs] artifact written:", out); sys.exit(1 if fail else 0)
         if a[0] == "plan":
             out = Path(a[a.index("--out") + 1]); out.parent.mkdir(parents=True, exist_ok=True)
-            plan = {"schema": "cage-campaign-plan-v5", "session": a[a.index("--session") + 1], "argv": a,
+            plan = {"schema": "cage-campaign-plan-v6", "session": a[a.index("--session") + 1], "argv": a,
                     "steps": [{"kind": "relaunch", "engine": "vllm", "argv": ["manage_vllm_server.sh", "start"]},
                               {"kind": "cell", "engine": "vllm", "row_key": "k1", "argv": ["run_experiment.py", "--vllm-telemetry"]},
                               {"kind": "cell", "engine": "hf", "row_key": "k2", "argv": ["run_cag_reference.py"]}],
@@ -341,6 +364,9 @@ def world(tmp_path: Path) -> Dict[str, Path]:
             for bad in ("CAGE_SLO_FLOORS_JSON", "CAGE_ALLOW_STALE_INDEX", "VLLM_PORT"):
                 if bad in os.environ:
                     print(f"REFUSED: {bad} is set", file=sys.stderr); sys.exit(2)
+            if os.environ.get("CAGE_TEST_RUN_DRY_FAILED"):
+                print("[run_campaign] DRY WINDOW FAILED: engine=vllm class=4779 tokens r=0.5 rate=2.85 rps expected IN_REGIME, label='UNPRESSURED'")
+                sys.exit(3)
             if os.environ.get("CAGE_TEST_RUN_STOP_FAILED"):
                 print("[run_campaign] STOP FAILED (exit 1, timeout): launcher=vllm")
                 if "--seal" in a: (root / "ledger.json").write_text("{}", encoding="utf-8")
@@ -398,7 +424,7 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         CALIBRATE="vllm"
         BUDGET_RATIOS="1.0"
         HOURS=1
-        SEATBELT=8h
+        SEATBELT=12h
         SETUP_BOUND_MIN=1
         DC_PREFS="EU-RO-1 US-NE-1"
         PREFETCH_MODELS="Qwen/Qwen3-14B"
@@ -542,7 +568,7 @@ def test_full_sequence_with_both_gos_lands_the_run(world: Dict[str, Path]) -> No
     for n in re.findall(r"\.cage_jobs/([A-Za-z0-9_.-]+)\.cmd", world["log"].read_text(encoding="utf-8")):
         if not names or names[-1] != n:
             names.append(n)
-    assert names == ["setup", "validate_vllm", "calibrate_vllm", "plan", "run", "score", "collect"]
+    assert names == ["setup", "validate_vllm", "calibrate_vllm", "calibrate_rungs_vllm", "plan", "run", "score", "collect"]
     assert any("setup_runpod CHARTER_DATASETS=squad_v2 musique qasper PREFETCH_MODELS=Qwen/Qwen3-14B" in c for c in calls), \
         [c for c in calls if "setup" in c.lower()]
     assert any("preflight Qwen/Qwen3-14B http://localhost:8000 BACKENDS=vllm" in c for c in calls), \
@@ -699,11 +725,12 @@ def test_setup_benign_note_passes_and_the_import_note_fails(world: Dict[str, Pat
 def test_short_seatbelt_fails_stage_0_before_anything_bills(world: Dict[str, Path], tmp_path: Path) -> None:
     # Review 2026-10-06, HIGH 4: the seatbelt must cover every pod-side bound.
     short = tmp_path / "S1_short.env"
-    short.write_text(world["profile"].read_text(encoding="utf-8").replace("SEATBELT=8h", "SEATBELT=2h"), encoding="utf-8")
+    short.write_text(world["profile"].read_text(encoding="utf-8").replace("SEATBELT=12h", "SEATBELT=2h"), encoding="utf-8")
     world["profile"] = short
     proc = _master(world)
     assert proc.returncode == 1
-    assert "SEATBELT=2h (120 min) is shorter than the 431 min the stages need" in proc.stdout
+    # 1 + 25 + 60 + 150 (ADR-0154 rung calibration, 9,000 s) + 15 + 60 + 180 + 30 + 60
+    assert "SEATBELT=2h (120 min) is shorter than the 581 min the stages need" in proc.stdout
     assert not any("provision_pod" in c for c in _calls(world))
 
 
@@ -712,12 +739,15 @@ def test_shipped_profiles_cover_their_stage_bounds_and_name_registered_models() 
     cb = importlib.import_module("src.orchestration.cache_budget")
     for p in sorted((EXPDIR / "profiles").glob("S*.env")):
         proc = subprocess.run(["bash", "-c", f'set -a; source "{EXPDIR}/profiles/_common.env"; source "{p}"; '
-                               'printf "%s|%s|%s|%s|%s|%s|%s" "$MODEL_SLUG" "$SEATBELT" "$HOURS" "$SETUP_BOUND_MIN" "$ENGINES" "$CALIBRATE" "${SCORE_BOUND_MIN:-180}"'],
+                               'printf "%s|%s|%s|%s|%s|%s|%s|%s|%s" "$MODEL_SLUG" "$SEATBELT" "$HOURS" "$SETUP_BOUND_MIN" "$ENGINES" "$CALIBRATE" "${SCORE_BOUND_MIN:-180}" "$CALIBRATE_RUNGS_BOUND_S" "$FLOOR_AVG_SEQ_TOKENS"'],
                               capture_output=True, text=True, env=PROFILE_ENV)
-        slug, seatbelt, hours, setup_min, engines, calibrate, score_min = proc.stdout.split("|")
+        slug, seatbelt, hours, setup_min, engines, calibrate, score_min, rungs_bound_s, floor_tokens = proc.stdout.split("|")
         assert slug in cb.MODEL_KV, f"{p.name}: MODEL_SLUG={slug} is not in cache_budget.MODEL_KV {sorted(cb.MODEL_KV)}"
+        # ADR-0155: every shipped profile sizes the floor table on the anchor shape
+        assert floor_tokens == "4779", f"{p.name}: FLOOR_AVG_SEQ_TOKENS={floor_tokens} is not the registered anchor shape"
         n_srv = len([e for e in engines.split() if e != "hf"]); n_cal = len(calibrate.split())
-        need = int(setup_min) + n_srv * 25 + n_cal * 60 + 15 + int(hours) * 60 + int(score_min) + 30 + 60
+        need = (int(setup_min) + n_srv * 25 + n_cal * 60 + n_cal * int(rungs_bound_s) // 60 + 15 + int(hours) * 60
+                + int(score_min) + 30 + 60)
         unit = seatbelt[-1]; n = int(seatbelt[:-1])
         have = n * 60 if unit == "h" else n if unit == "m" else n * 1440
         assert have >= need, f"{p.name}: SEATBELT={seatbelt} ({have} min) < {need} min needed"
@@ -763,6 +793,61 @@ def test_run_exit_2_with_stop_failed_only_is_accepted_and_noted(world: Dict[str,
     st = _state(world)
     assert st["stages"]["run"]["status"] == "passed"
     assert any("STOP FAILED" in n for n in st["stages"]["run"]["notes"])
+
+
+def test_rung_calibration_job_feeds_the_plan(world: Dict[str, Path]) -> None:
+    # ADR-0154: stage 5 runs calibrate-rungs per engine AFTER the floor table is
+    # on the pod, with the session's rungs, and stage 6 registers the artifact.
+    proc = _master(world, "--yes", "provision", "--to", "plan")
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-2000:]
+    cmd = (world["home"] / ".cage_jobs" / "calibrate_rungs_vllm.cmd").read_text(encoding="utf-8")
+    assert "run_campaign.py calibrate-rungs --session a --engine vllm --floor-table results/calibration/floor_table.json" in cmd
+    assert "--calibration results/calibration/S1_vllm.json --rungs 1,0.5" in cmd
+    assert "--out results/calibration/rungs_S1_vllm.json --out-root results/rung-calibration" in cmd
+    assert "--query-manifest squad_v2=data/manifests/squad_v2_50x3_seed42.json" in cmd
+    assert " start " not in cmd, "the job's relaunches are the plan's own; no engine start before it"
+    plan_cmd = (world["home"] / ".cage_jobs" / "plan.cmd").read_text(encoding="utf-8")
+    assert "--rung-calibration vllm=results/calibration/rungs_S1_vllm.json" in plan_cmd
+    assert "rungs calibration (ADR-0154): rungs 1,0.5" in proc.stdout or "rung calibration (ADR-0154): rungs 1,0.5" in proc.stdout
+    fetched = world["exp_root"] / "S1" / DATE / "extras" / "calibration" / "rungs_S1_vllm.json"
+    assert json.loads(fetched.read_text(encoding="utf-8"))["rungs"]["1"]["label"] == "ESTIMATED"
+    calls = _calls(world)
+    # the scp of the floor table to the pod is the only call naming its pod path in clear (job bodies are base64)
+    i_floor = next(i for i, c in enumerate(calls) if "results/calibration/floor_table.json" in c)
+    i_rungs = next(i for i, c in enumerate(calls) if "calibrate_rungs_vllm.cmd" in c)
+    assert i_floor < i_rungs, "the rung job needs the floor table on the pod first"
+
+
+def test_a_rung_that_is_not_estimated_fails_stage_5_before_the_plan(world: Dict[str, Path]) -> None:
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_RUNGS_FAIL="1")
+    assert proc.returncode == 1
+    assert "stage calibrate FAILED" in proc.stdout
+    assert not (world["home"] / ".cage_jobs" / "plan.cmd").exists(), "stage 6 must not run"
+    st = _state(world)
+    assert st["stages"]["calibrate"]["status"] == "failed" and "plan" not in st["stages"]
+
+
+def test_run_exit_3_dry_window_failed_fails_the_stage_loudly(world: Dict[str, Path]) -> None:
+    # ADR-0153: a dry window off the regime skips a whole (engine, class); the
+    # tree is partial, the master names the pairs and stops for the owner.
+    proc = _master(world, "--yes", "provision", "--yes", "teardown", CAGE_TEST_RUN_DRY_FAILED="1")
+    assert proc.returncode == 1
+    assert "exit 3 = DRY WINDOW FAILED (ADR-0153)" in proc.stdout
+    assert "DRY WINDOW FAILED: engine=vllm class=4779 tokens r=0.5" in proc.stdout
+    st = _state(world)
+    assert st["stages"]["run"]["status"] == "failed"
+    assert any("exit 3: DRY WINDOW FAILED" in n for n in st["stages"]["run"]["notes"])
+
+
+def test_floor_avg_seq_tokens_must_be_the_anchor_shape(world: Dict[str, Path], tmp_path: Path) -> None:
+    # ADR-0155: stage 0 refuses a profile sized on another shape before anything bills
+    wrong = tmp_path / "S1_shape.env"
+    wrong.write_text(world["profile"].read_text(encoding="utf-8") + "\nFLOOR_AVG_SEQ_TOKENS=3100\n", encoding="utf-8")
+    world["profile"] = wrong
+    proc = _master(world)
+    assert proc.returncode == 1
+    assert "FLOOR_AVG_SEQ_TOKENS=3100 but session 'a' registers 4779 served tokens" in proc.stdout
+    assert not any("provision_pod" in c for c in _calls(world))
 
 
 def test_running_stage_in_state_refuses_without_redo(world: Dict[str, Path]) -> None:
@@ -865,16 +950,16 @@ def test_pod_jobs_that_start_engines_put_the_driver_venv_first_on_path(world: Di
     proc = _master(world, "--yes", "provision", "--to", "run")
     assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
     prefix = f"export PATH={world['pod_repo']}/cage-env/bin:$PATH"
-    for name in ("validate_vllm", "calibrate_vllm", "run"):
+    for name in ("validate_vllm", "calibrate_vllm", "calibrate_rungs_vllm", "run"):
         cmd = (world["home"] / ".cage_jobs" / f"{name}.cmd").read_text(encoding="utf-8")
         assert cmd.startswith(f"cd {world['pod_repo']} && {prefix}"), (name, cmd[:160])
-    for name in ("validate_vllm", "calibrate_vllm"):
+    for name in ("validate_vllm", "calibrate_vllm", "calibrate_rungs_vllm"):
         assert "VLLM_START_TIMEOUT=600" in (world["home"] / ".cage_jobs" / f"{name}.cmd").read_text(encoding="utf-8")
     # preflight gate (p) judges exactly the datasets stage 3 staged (the profile's CHARTER_DATASETS)
     assert "CAGE_DATASETS=squad_v2,musique,qasper" in (world["home"] / ".cage_jobs" / "validate_vllm.cmd").read_text(encoding="utf-8")
     assert "cage-env/bin" not in (world["home"] / ".cage_jobs" / "setup.cmd").read_text(encoding="utf-8")
     # the profile's engine levers are not in the job commands unless set
-    for name in ("validate_vllm", "calibrate_vllm", "run"):
+    for name in ("validate_vllm", "calibrate_vllm", "calibrate_rungs_vllm", "run"):
         assert "CAGE_SGLANG_DISABLE_PIECEWISE_CUDA_GRAPH" not in (world["home"] / ".cage_jobs" / f"{name}.cmd").read_text(encoding="utf-8")
 
 
@@ -885,7 +970,7 @@ def test_the_sglang_piecewise_lever_is_forwarded_to_every_engine_job(world: Dict
     world["profile"] = lever
     proc = _master(world, "--yes", "provision", "--to", "run")
     assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
-    for name in ("validate_vllm", "calibrate_vllm", "run"):
+    for name in ("validate_vllm", "calibrate_vllm", "calibrate_rungs_vllm", "run"):
         cmd = (world["home"] / ".cage_jobs" / f"{name}.cmd").read_text(encoding="utf-8")
         assert " CAGE_SGLANG_DISABLE_PIECEWISE_CUDA_GRAPH=1 && " in cmd, (name, cmd[:200])
     assert "CAGE_SGLANG_DISABLE_PIECEWISE_CUDA_GRAPH" not in (world["home"] / ".cage_jobs" / "setup.cmd").read_text(encoding="utf-8")

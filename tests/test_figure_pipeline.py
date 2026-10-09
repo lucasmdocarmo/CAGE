@@ -484,10 +484,11 @@ def test_plot_goodput_grid_accepts_label_regime_output(
     coords = fp.expand_row_keys(df)
     cells = pd.DataFrame(
         {
-            # r=1.5 rows unpressured (no scarcity events); high-rate starved
-            # rows past the cliff (attainment collapse); the rest in-regime.
+            # r=1.5 rows unpressured (an empty admission queue, ADR-0153);
+            # high-rate starved rows past the cliff (attainment collapse);
+            # the rest in-regime.
             "rho_kv": np.where(coords["budget_r"] == 1.5, 0.3, 0.97),
-            "scarcity_events": np.where(coords["budget_r"] == 1.5, 0, 25),
+            "queue_waiting_share": np.where(coords["budget_r"] == 1.5, 0.0, 0.9),
             "attainment": np.where(
                 (coords["rate_frac"] == 1.2) & (coords["budget_r"] <= 0.5),
                 0.5,

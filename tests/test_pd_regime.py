@@ -50,22 +50,25 @@ from src.orchestration import campaign_layout as cl  # noqa: E402
 # ---------------------------------------------------------------------------
 
 
-def _series(ts: list, kv: list, pre: list) -> pd.DataFrame:
+def _series(ts: list, kv: list, pre: list, waiting: list | None = None) -> pd.DataFrame:
+    if waiting is None:
+        waiting = [0] * len(ts)
     return pd.DataFrame(
-        {"ts_s": ts, "kv_cache_usage": kv, "preemptions_total": pre}
+        {"ts_s": ts, "kv_cache_usage": kv, "preemptions_total": pre, "waiting": waiting}
     )
 
 
 def _prefill() -> pd.DataFrame:
     """The pinned single-series ZOH case (tests/test_regime_inputs.py):
     covered 8 (first sample at 2), integral 0.5*4 + 1.0*2 + 0.8*2 = 5.6 ->
-    rho 0.7; counter 5 -> 9 => 4 events; n 3; coverage 0.8."""
-    return _series([2.0, 6.0, 8.0], [0.5, 1.0, 0.8], [5, 5, 9])
+    rho 0.7; counter 5 -> 9 => 4 events; n 3; coverage 0.8; waiting 0, 3, 2
+    -> queue share 2/3 (ADR-0153)."""
+    return _series([2.0, 6.0, 8.0], [0.5, 1.0, 0.8], [5, 5, 9], [0, 3, 2])
 
 
 def _decode() -> pd.DataFrame:
     """Covered 8, integral 0.1*4 + 0.3*4 = 1.6 -> rho 0.2; counter 1 -> 3
-    => 2 events; n 2; coverage 0.8."""
+    => 2 events; n 2; coverage 0.8; no request ever waits (share 0)."""
     return _series([2.0, 6.0], [0.1, 0.3], [1, 3])
 
 
@@ -113,6 +116,12 @@ class TestPooledMath:
         assert pooled.coverage == pytest.approx(0.8)
         assert pooled.window_start_s == 0.0
         assert pooled.window_end_s == 10.0
+        # ADR-0153: the pair's queue is the worst role's queue (MAX share);
+        # waiting_mean weights the roles by sample count: (3 * 5/3 + 2 * 0) / 5.
+        assert pooled.queue_waiting_share == pytest.approx(2.0 / 3.0)
+        assert pooled.waiting_max == 3.0
+        assert pooled.waiting_mean == pytest.approx(1.0)
+        assert pooled.n_waiting_samples == 2
 
     def test_budget_weights_flip_with_the_split(self) -> None:
         # Same gauges, split recorded the other way round: the pool moves —
@@ -179,6 +188,10 @@ class TestSingleRoleDifferential:
         assert pooled.coverage == single.coverage
         assert pooled.window_start_s == single.window_start_s
         assert pooled.window_end_s == single.window_end_s
+        assert pooled.queue_waiting_share == single.queue_waiting_share
+        assert pooled.waiting_max == single.waiting_max
+        assert pooled.waiting_mean == single.waiting_mean
+        assert pooled.n_waiting_samples == single.n_waiting_samples
         assert pooled.to_flat_dict() == single.to_flat_dict()
 
     def test_single_role_budget_magnitude_is_irrelevant(self) -> None:
@@ -303,17 +316,18 @@ class TestRefusalMatrix:
 _PD_RECORDS = [
     # prefill = the pinned ZOH case; decode = the 0.2-rho case; interleaved
     # by timestamp exactly as a merged PD stream arrives (T4.1 save order).
-    {"ts_s": 2.0, "kv_cache_usage": 0.5, "preemptions_total": 5, "instance": "prefill"},
-    {"ts_s": 2.0, "kv_cache_usage": 0.1, "preemptions_total": 1, "instance": "decode"},
-    {"ts_s": 6.0, "kv_cache_usage": 1.0, "preemptions_total": 5, "instance": "prefill"},
-    {"ts_s": 6.0, "kv_cache_usage": 0.3, "preemptions_total": 3, "instance": "decode"},
-    {"ts_s": 8.0, "kv_cache_usage": 0.8, "preemptions_total": 9, "instance": "prefill"},
+    # The ADR-0153 queue gauge rides every record (prefill 0, 3, 2; decode 0).
+    {"ts_s": 2.0, "kv_cache_usage": 0.5, "preemptions_total": 5, "waiting": 0, "instance": "prefill"},
+    {"ts_s": 2.0, "kv_cache_usage": 0.1, "preemptions_total": 1, "waiting": 0, "instance": "decode"},
+    {"ts_s": 6.0, "kv_cache_usage": 1.0, "preemptions_total": 5, "waiting": 3, "instance": "prefill"},
+    {"ts_s": 6.0, "kv_cache_usage": 0.3, "preemptions_total": 3, "waiting": 0, "instance": "decode"},
+    {"ts_s": 8.0, "kv_cache_usage": 0.8, "preemptions_total": 9, "waiting": 2, "instance": "prefill"},
 ]
 
 _LEGACY_RECORDS = [
-    {"ts_s": 2.0, "kv_cache_usage": 0.5, "preemptions_total": 5},
-    {"ts_s": 6.0, "kv_cache_usage": 1.0, "preemptions_total": 5},
-    {"ts_s": 8.0, "kv_cache_usage": 0.8, "preemptions_total": 9},
+    {"ts_s": 2.0, "kv_cache_usage": 0.5, "preemptions_total": 5, "waiting": 0},
+    {"ts_s": 6.0, "kv_cache_usage": 1.0, "preemptions_total": 5, "waiting": 3},
+    {"ts_s": 8.0, "kv_cache_usage": 0.8, "preemptions_total": 9, "waiting": 2},
 ]
 
 
@@ -376,6 +390,10 @@ class TestWriteWindowRegimeRouting:
         assert doc["inputs"]["scarcity_events"] == 6
         assert doc["inputs"]["n_samples"] == 5
         assert doc["inputs"]["coverage"] == pytest.approx(0.8)
+        # ADR-0153: the pooled queue clause (MAX of the role shares).
+        assert doc["inputs"]["queue_waiting_share"] == pytest.approx(2.0 / 3.0)
+        assert doc["inputs"]["n_waiting_samples"] == 2
+        assert doc["pd"]["per_role"]["decode"]["queue_waiting_share"] == 0.0
         # No attainment yet -> §6.1 labeling deferred, never fabricated.
         assert doc["label"] is None
         assert doc["pd"]["budgets_by_role"] == {"prefill": 3, "decode": 1}

@@ -140,6 +140,9 @@ POD_READY_TIMEOUT_S="${CAGE_POD_READY_TIMEOUT_S:-900}"
 POD_READY_POLL_S="${CAGE_POD_READY_POLL_S:-15}"
 # Per-stage job bounds (seconds); the seatbelt must cover their sum plus the run.
 VALIDATE_BOUND_S=1500; CALIBRATE_BOUND_S=3600; PLAN_BOUND_S=900; COLLECT_BOUND_S=1800; PULL_MARGIN_MIN=60
+# ADR-0154: the per-engine rung calibration job bound (profile key, default in
+# _common.env): up to PROBE_MAX_STEPS windows of 75 s plus a relaunch per rung.
+: "${CALIBRATE_RUNGS_BOUND_S:=9000}"
 
 seatbelt_minutes() { # "24h" | "90m" | "2d" -> minutes, or empty when malformed
   case "$1" in
@@ -153,7 +156,7 @@ seatbelt_need_minutes() { # the stage bounds the pod must survive, in minutes
   local n_srv=0 n_cal=0 e
   for e in $ENGINES; do [ "$e" = "hf" ] || n_srv=$((n_srv + 1)); done
   for e in $CALIBRATE; do n_cal=$((n_cal + 1)); done
-  printf '%s' "$(( SETUP_BOUND_MIN + n_srv * VALIDATE_BOUND_S / 60 + n_cal * CALIBRATE_BOUND_S / 60 + PLAN_BOUND_S / 60 + HOURS * 60 + SCORE_BOUND_MIN + COLLECT_BOUND_S / 60 + PULL_MARGIN_MIN ))"
+  printf '%s' "$(( SETUP_BOUND_MIN + n_srv * VALIDATE_BOUND_S / 60 + n_cal * CALIBRATE_BOUND_S / 60 + n_cal * CALIBRATE_RUNGS_BOUND_S / 60 + PLAN_BOUND_S / 60 + HOURS * 60 + SCORE_BOUND_MIN + COLLECT_BOUND_S / 60 + PULL_MARGIN_MIN ))"
 }
 
 DATE="${DATE_ARG:-${CAGE_EXP_DATE:-$(date -u +%Y-%m-%d)}}"
@@ -468,16 +471,21 @@ stage_preflight_mac() {
   for item in $QUERY_MANIFESTS; do mpath="${item#*=}"; [ -f "$PROJECT_DIR/$mpath" ] || missing="$missing $mpath"; done
   [ -f "$PROJECT_DIR/$CALIBRATION_MANIFEST" ] || missing="$missing $CALIBRATION_MANIFEST"
   run_step 0 "query and calibration manifests exist" -- test -z "$missing" || { printf '  [FAIL] manifest(s) named by the profile do not exist in the repo:%s (build them with scripts/1_setup/build_query_manifest.py or drop them from QUERY_MANIFESTS)\n' "$missing"; return 1; }
-  run_step 0 "session '$SESSION' registered in the driver" -- "$PY" - "$SCRIPTS/3_run/run_campaign.py" "$SESSION" <<'PY' || return 1
+  run_step 0 "session '$SESSION' registered; FLOOR_AVG_SEQ_TOKENS is its anchor shape (ADR-0155)" -- "$PY" - "$SCRIPTS/3_run/run_campaign.py" "$SESSION" "$FLOOR_AVG_SEQ_TOKENS" <<'PY' || return 1
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location("cage_run_campaign_probe", sys.argv[1])
 m = importlib.util.module_from_spec(spec); sys.modules[spec.name] = m
 spec.loader.exec_module(m)
 try:
-    m.get_session_grid(sys.argv[2])
+    grid = m.get_session_grid(sys.argv[2])
 except Exception as exc:
     print(f"REFUSED: session {sys.argv[2]!r}: {exc}"); sys.exit(1)
-print(f"session {sys.argv[2]!r} is registered")
+anchor = int(grid.demand_seq_tokens[m.DEMAND_ANCHOR_ARM])
+if sys.argv[3].strip() != str(anchor):
+    print(f"REFUSED: FLOOR_AVG_SEQ_TOKENS={sys.argv[3]} but session {sys.argv[2]!r} registers {anchor} served tokens "
+          f"for the anchor arm {m.DEMAND_ANCHOR_ARM!r} (ADR-0155): the plan refuses a floor table sized on another shape; "
+          f"set FLOOR_AVG_SEQ_TOKENS={anchor} in the profile"); sys.exit(1)
+print(f"session {sys.argv[2]!r} is registered; anchor shape {anchor} served tokens")
 PY
   run_step 0 "stock read (gpu list --include-unavailable)" -- runpodctl gpu list --include-unavailable || return 1
   if ! plan_only; then
@@ -508,7 +516,7 @@ PY
   local seat_min need_min
   seat_min="$(seatbelt_minutes "$SEATBELT")" || { printf '  [FAIL] SEATBELT=%s is not <n>h, <n>m or <n>d\n' "$SEATBELT"; return 1; }
   need_min="$(seatbelt_need_minutes)"
-  say "seatbelt $SEATBELT = $seat_min min; the stage bounds need $need_min min (setup $SETUP_BOUND_MIN, validate, calibrate, plan, run $((HOURS * 60)), score $SCORE_BOUND_MIN, collect, pull margin $PULL_MARGIN_MIN)"
+  say "seatbelt $SEATBELT = $seat_min min; the stage bounds need $need_min min (setup $SETUP_BOUND_MIN, validate, calibrate, calibrate-rungs $((CALIBRATE_RUNGS_BOUND_S / 60)) per engine, plan, run $((HOURS * 60)), score $SCORE_BOUND_MIN, collect, pull margin $PULL_MARGIN_MIN)"
   run_step 0 "seatbelt covers the stage bounds" -- test "$seat_min" -ge "$need_min" || { printf '  [FAIL] SEATBELT=%s (%s min) is shorter than the %s min the stages need; raise SEATBELT in the profile\n' "$SEATBELT" "$seat_min" "$need_min"; return 1; }
   run_step 0 "provision plan print" -- bash "$SCRIPTS/runpod/provision_pod.sh" --gpu-id "$GPU_ID" --gpu-count "$GPU_COUNT" --disk-gb "$DISK_GB" --volume-gb "$VOLUME_GB" --terminate-after "$SEATBELT" --hours "$HOURS" --purpose "$EXP $DATE" || return 1
   plan_only || step_has "PLAN ONLY" || { printf '  [FAIL] provision plan print lacks the PLAN ONLY line\n'; return 1; }
@@ -785,6 +793,50 @@ PY
     run_step 0 "byte plan $e r=$r" -- bash -c "cd '$PROJECT_DIR' && '$PY' -m src.orchestration.cache_budget --model '$MODEL_SLUG' --engine '$e' --r '$r' --concurrency '$FLOOR_CONCURRENCY' --avg-seq-tokens '$FLOOR_AVG_SEQ_TOKENS' > '$EXTRAS/calibration/budget_${e}_r${r}.json'" || return 1
   done; done
   run_step 0 "scp floor table to the pod" -- pscp_to "$EXTRAS/calibration/floor_table_$stamp.json" "$POD_REPO/results/calibration/floor_table.json" || return 1
+  # ADR-0154 (S0F-62): lambda* per budget rung, measured on the gold-fresh F2
+  # workload under the plan's OWN relaunch for that rung (prefix OFF, the gold
+  # class budget), by the registered cal-v2 ladder through the runner. One job
+  # per engine; the rungs are the session's budgeted rungs (the rehearsal's
+  # collapsed ones under REHEARSAL_N) unless the profile names CALIBRATE_RUNGS.
+  # The job starts and stops the engines itself (its relaunches ARE the plan's).
+  local rungs qm2 reh2 item
+  qm2=""; for item in $QUERY_MANIFESTS; do qm2="$qm2 --query-manifest $item"; done
+  reh2=""; [ -z "${REHEARSAL_N:-}" ] || reh2=" --rehearsal-n $REHEARSAL_N"
+  rungs="${CALIBRATE_RUNGS:-}"
+  if [ -z "$rungs" ]; then
+    rungs="$("$PY" "$SCRIPTS/3_run/run_campaign.py" rungs --session "$SESSION"$reh2$qm2 | tr ' ' ',')" || { printf '  [FAIL] run_campaign.py rungs failed for session %s\n' "$SESSION"; return 1; }
+  fi
+  [ -n "$rungs" ] || { printf '  [FAIL] no budgeted rung for session %s (CALIBRATE_RUNGS empty and the driver lists none)\n' "$SESSION"; return 1; }
+  # The ladder roots are never reused (a reused root is a PROBE_FAILED rung),
+  # so each attempt of this stage gets its own out-root under the run id
+  # (review MEDIUM 4); stage 12 pulls the whole rung-calibration tree.
+  local rungs_root="results/rung-calibration/${RUN_ID}-$(date -u +%H%M%S)"
+  plan_only || state put calibration.rungs_out_root "$rungs_root"
+  say "rung calibration (ADR-0154): rungs $rungs per engine, bound ${CALIBRATE_RUNGS_BOUND_S}s each, roots under $rungs_root"
+  for e in $CALIBRATE; do
+    out="results/calibration/rungs_${EXP}_${e}.json"
+    local jrc=0
+    job_run "calibrate_rungs_$e" "$CALIBRATE_RUNGS_BOUND_S" "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT$POD_ENGINE_ENV && $POD_PYTHON scripts/3_run/run_campaign.py calibrate-rungs --session $SESSION --engine $e --floor-table results/calibration/floor_table.json --calibration results/calibration/${EXP}_${e}.json --rungs $rungs$qm2$reh2 --seed $SEED --freeze-file $POD_FREEZE_FILE --out $out --out-root $rungs_root" "$LAND/logs/setup" || jrc=1
+    if [ "$jrc" -ne 0 ]; then
+      # calibrate-rungs exits 1 when a rung is not ESTIMATED and still writes
+      # the artifact: fetch it so the labels are readable on the Mac (review LOW 10).
+      plan_only || pscp_from "$POD_REPO/$out" "$EXTRAS/calibration/rungs_${EXP}_${e}.json" 2>/dev/null || true
+      printf '  [FAIL] rung calibration %s failed; the artifact, if written, is at %s\n' "$e" "$EXTRAS/calibration/rungs_${EXP}_${e}.json"
+      return 1
+    fi
+    run_step 0 "fetch rung calibration $e" -- pscp_from "$POD_REPO/$out" "$EXTRAS/calibration/rungs_${EXP}_${e}.json" || return 1
+    plan_only && continue
+    run_step 0 "rung calibration $e: every rung ESTIMATED" -- "$PY3" - "$EXTRAS/calibration/rungs_${EXP}_${e}.json" <<'PY' || return 1
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+rungs = d.get("rungs") or {}
+print("schema=%s rungs=%s" % (d.get("schema"), {k: (v.get("label"), v.get("lambda_star_qps")) for k, v in rungs.items()}))
+bad = {k: v.get("label") for k, v in rungs.items() if v.get("label") != "ESTIMATED"}
+if d.get("schema") != "cage-rung-calibration-v1" or not rungs or bad:
+    print("  [FAIL] rung(s) not ESTIMATED: %s (ADR-0154: the plan refuses them; LADDER_EXHAUSTED: raise the start rate or the rung is beyond the ladder ceiling; NONE_SUSTAINABLE: lower it; RELAUNCH_FAILED / PROBE_FAILED: read logs/setup/calibrate_rungs_<engine>.log)" % bad)
+    sys.exit(1)
+PY
+  done
   return 0
 }
 
@@ -792,7 +844,7 @@ stage_plan() {
   pod_env
   local qm cal e item
   qm=""; for item in $QUERY_MANIFESTS; do qm="$qm --query-manifest $item"; done
-  cal=""; for e in $CALIBRATE; do cal="$cal --calibration $e=results/calibration/${EXP}_${e}.json"; done
+  cal=""; for e in $CALIBRATE; do cal="$cal --calibration $e=results/calibration/${EXP}_${e}.json --rung-calibration $e=results/calibration/rungs_${EXP}_${e}.json"; done
   # ADR-0144: a dress rehearsal derives its grid from the registered session
   # (every arm, engine, hf cell, RULER task and rung; the axes collapsed; one
   # window per cell; every row class at REHEARSAL_N); empty = the registered plan.
@@ -816,7 +868,9 @@ for s in cells:
         bad.append(f"{eng} cell carries --vllm-telemetry {n} times: {s.get('row_key', '?')}")
     if s.get("topology") == "pd" and not any(k.startswith("CAGE_PD_") for k in (s.get("env") or {})):
         bad.append(f"pd cell without CAGE_PD_* env: {s.get('row_key', '?')}")
-print(f"plan schema={plan.get('schema')} steps={len(steps)} cells={len(cells)} relaunches={len(steps)-len(cells)} blocked={len(plan.get('blocked_row_keys', []))}")
+kinds = {}
+for s in steps: kinds[s.get("kind")] = kinds.get(s.get("kind"), 0) + 1
+print(f"plan schema={plan.get('schema')} steps={len(steps)} by kind={kinds} blocked={len(plan.get('blocked_row_keys', []))}")
 for b in bad: print("  [FAIL] " + b)
 sys.exit(1 if bad else 0)
 PY
@@ -859,7 +913,7 @@ stage_run() {
   local name="run"
   run_step 0 "job $name: submit" -- bash "$PODJOB" submit "$name" "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH$POD_ENGINE_ENV && env $RUN_ENV_UNSET CAGE_RUN_ROOT=$POD_RUN_ROOT VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT CAGE_PROVIDER=runpod CAGE_HARDWARE='$GPU_ID x $GPU_COUNT' $POD_PYTHON scripts/3_run/run_campaign.py run --plan results/calibration/plan_$RUN_ID.json --campaign-root $POD_RUN_ROOT --seal$partial" "$bound" || return 1
   if plan_only; then
-    printf '  [plan] %-28s expect DONE(0) or STOP FAILED(2): bash %s wait run %s\n' "job run: wait" "$PODJOB" "$bound"
+    printf '  [plan] %-28s expect DONE(0) or STOP FAILED(2); DRY WINDOW FAILED(3) fails the stage: bash %s wait run %s\n' "job run: wait" "$PODJOB" "$bound"
     return 0
   fi
   local wrc=0
@@ -872,6 +926,15 @@ stage_run() {
     if grep -q "STOP FAILED" "$JOB_LOG" 2>/dev/null && grep -q "FAILED(2)" "$EXTRAS/steps/run_wait.log"; then
       say "run finished with exit 2 = STOP FAILED only (data tree complete; the pod may still hold an engine)"
       state note run "exit 2: STOP FAILED (ADR-0139); data tree complete"
+    elif grep -q "DRY WINDOW FAILED" "$JOB_LOG" 2>/dev/null && grep -q "FAILED(3)" "$EXTRAS/steps/run_wait.log"; then
+      # ADR-0153: a dry window did not read IN_REGIME, so every pressure cell
+      # of its (engine, demand class) was skipped with a sentinel: the tree is
+      # PARTIAL and the stage fails loudly; the owner decides what runs next.
+      printf '  [FAIL] run ended with exit 3 = DRY WINDOW FAILED (ADR-0153): the pressure cells of these serving configurations never ran; the data tree is partial:\n'
+      grep "DRY WINDOW FAILED" "$JOB_LOG" | head -12
+      grep -q "STOP FAILED" "$JOB_LOG" 2>/dev/null && printf '  [FAIL] the same run also reports STOP FAILED (an engine may still hold the GPU)\n'
+      state note run "exit 3: DRY WINDOW FAILED (ADR-0153); pressure cells skipped, see logs/runner/run.log"
+      return 1
     else
       printf '  [FAIL] run ended %s (see %s)\n' "$(tail -n 1 "$EXTRAS/steps/run_wait.log")" "$JOB_LOG"; return 1
     fi
@@ -952,6 +1015,25 @@ stage_pull() {
   run_step 0 "pull job logs" -- pscp_from ".cage_jobs/." "$LAND/logs/runner/pod_jobs/" || return 1
   run_step 0 "pull vm_logs forensics" -- pscp_from "$POD_BACKUP_DIR/vm_logs/." "$LAND/logs/system/vm_logs/" || return 1
   run_step 0 "pull pod calibration dir" -- pscp_from "$POD_REPO/results/calibration/." "$EXTRAS/calibration/pod/" || return 1
+  # ADR-0154 / ADR-0153 (review MEDIUM 5): the ladder windows behind every
+  # lambda* and the dry roots behind every regime gate are evidence; they
+  # live outside the campaign root, so they are pulled here, best effort
+  # (a run without pressure cells has neither).
+  if plan_only; then
+    printf '  [plan] %-28s pscp_from %s/results/rung-calibration/. and every %s-dry-* sibling\n' "pull rung + dry evidence" "$POD_REPO" "$POD_RUN_ROOT"
+  else
+    mkdir -p "$LAND/run/rung-calibration"
+    if pssh "test -d $POD_REPO/results/rung-calibration" >/dev/null 2>&1; then
+      pscp_from "$POD_REPO/results/rung-calibration/." "$LAND/run/rung-calibration/" || printf '  [WARN] rung-calibration windows not pulled\n'
+    else
+      say "no rung-calibration tree on the pod (no ladder ran)"
+    fi
+    local dry_root
+    for dry_root in $(pssh "ls -d ${POD_RUN_ROOT}-dry-* 2>/dev/null" 2>/dev/null || true); do
+      mkdir -p "$(dirname "$RUN_LOCAL")/$(basename "$dry_root")"
+      pscp_from "$dry_root/." "$(dirname "$RUN_LOCAL")/$(basename "$dry_root")/" || printf '  [WARN] dry root %s not pulled\n' "$dry_root"
+    done
+  fi
   return 0
 }
 

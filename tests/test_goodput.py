@@ -18,6 +18,7 @@ from src.analysis.goodput import (
     GoldStratum,
     GoodputError,
     InstrumentAccuracy,
+    QUEUE_SHARE_MIN,
     RHO_KV_MIN,
     SLOBaseline,
     TPOT_SLO_MULTIPLIER,
@@ -348,6 +349,13 @@ class TestFindCliff:
 
 
 class TestRegimeLabels:
+    """ADR-0153 (owner decision 2026-10-09, S0F-61): clause (b) of the §6.1
+    criterion is the share of in-window samples with a non-empty admission
+    queue; the preemption delta is recorded, never a gate. The 2026-10-08
+    landing read 0 preemptions on every served window while RULER windows
+    queued 46 of 50 requests, so the old clause labeled 0 of 106 windows
+    IN_REGIME."""
+
     def test_exported_constants_are_the_classifier_outputs(self) -> None:
         # 2026-08-02 harmonization: consumers (figure_pipeline) import these
         # names; they must be exactly what the classifier emits.
@@ -357,94 +365,144 @@ class TestRegimeLabels:
         assert UNPRESSURED == "UNPRESSURED"
         assert PAST_CLIFF == "PAST_CLIFF"
         assert (
-            classify_regime(rho_kv=0.95, scarcity_events=3, attainment=0.95)
+            classify_regime(rho_kv=0.95, attainment=0.95, queue_waiting_share=0.8)
             == IN_REGIME
         )
 
-    def test_in_regime(self) -> None:
+    def test_in_regime_with_a_queue_and_zero_preemptions(self) -> None:
+        # The landing's shape: a full pool, a persistent queue, a preemption
+        # counter that never moved. Before ADR-0153 this read UNPRESSURED.
         assert (
-            classify_regime(rho_kv=0.95, scarcity_events=3, attainment=0.95)
+            classify_regime(
+                rho_kv=0.95, attainment=0.95, queue_waiting_share=0.8, scarcity_events=0
+            )
             == "IN_REGIME"
         )
 
     def test_thresholds_are_inclusive(self) -> None:
+        assert QUEUE_SHARE_MIN == 0.5
         assert (
             classify_regime(
-                rho_kv=RHO_KV_MIN, scarcity_events=1, attainment=ATTAINMENT_MIN
+                rho_kv=RHO_KV_MIN,
+                attainment=ATTAINMENT_MIN,
+                queue_waiting_share=QUEUE_SHARE_MIN,
             )
             == "IN_REGIME"
         )
 
     def test_low_occupancy_is_unpressured(self) -> None:
         assert (
-            classify_regime(rho_kv=0.5, scarcity_events=3, attainment=0.95)
+            classify_regime(rho_kv=0.5, attainment=0.95, queue_waiting_share=1.0)
             == "UNPRESSURED"
         )
 
-    def test_zero_scarcity_events_is_unpressured(self) -> None:
+    def test_empty_queue_is_unpressured_whatever_the_preemptions_say(self) -> None:
+        # A full pool with no one waiting is a comfortable fit; 30 preemptions
+        # recorded beside it change nothing (the counter is provenance).
         assert (
-            classify_regime(rho_kv=0.95, scarcity_events=0, attainment=0.95)
+            classify_regime(
+                rho_kv=0.95, attainment=0.95, queue_waiting_share=0.0, scarcity_events=30
+            )
+            == "UNPRESSURED"
+        )
+        assert (
+            classify_regime(rho_kv=0.95, attainment=0.95, queue_waiting_share=0.49)
             == "UNPRESSURED"
         )
 
     def test_low_attainment_is_past_cliff(self) -> None:
         assert (
-            classify_regime(rho_kv=0.95, scarcity_events=3, attainment=0.5)
+            classify_regime(rho_kv=0.95, attainment=0.5, queue_waiting_share=1.0)
             == "PAST_CLIFF"
         )
 
     def test_joint_failure_past_cliff_wins(self) -> None:
         assert (
-            classify_regime(rho_kv=0.1, scarcity_events=0, attainment=0.5)
+            classify_regime(rho_kv=0.1, attainment=0.5, queue_waiting_share=0.0)
             == "PAST_CLIFF"
         )
+
+    @pytest.mark.parametrize("bad", [-1, 2.5, math.nan, True, "3"])
+    def test_scarcity_events_is_validated_when_given(self, bad: object) -> None:
+        with pytest.raises(GoodputError, match="scarcity_events"):
+            classify_regime(
+                rho_kv=0.95, attainment=0.95, queue_waiting_share=1.0,
+                scarcity_events=bad,  # type: ignore[arg-type]
+            )
 
     @pytest.mark.parametrize(
         "kwargs",
         [
-            {"rho_kv": math.nan, "scarcity_events": 1, "attainment": 0.95},
-            {"rho_kv": -0.1, "scarcity_events": 1, "attainment": 0.95},
-            {"rho_kv": 0.95, "scarcity_events": -1, "attainment": 0.95},
-            {"rho_kv": 0.95, "scarcity_events": 2.5, "attainment": 0.95},
-            {"rho_kv": 0.95, "scarcity_events": 1, "attainment": 1.2},
+            {"rho_kv": math.nan, "attainment": 0.95, "queue_waiting_share": 1.0},
+            {"rho_kv": -0.1, "attainment": 0.95, "queue_waiting_share": 1.0},
+            {"rho_kv": 0.95, "attainment": 1.2, "queue_waiting_share": 1.0},
+            {"rho_kv": 0.95, "attainment": 0.95, "queue_waiting_share": -0.1},
+            {"rho_kv": 0.95, "attainment": 0.95, "queue_waiting_share": 1.2},
+            {"rho_kv": 0.95, "attainment": 0.95, "queue_waiting_share": math.nan},
+            {"rho_kv": 0.95, "attainment": 0.95, "queue_waiting_share": "0.5"},
+            {"rho_kv": 0.95, "attainment": 0.95, "queue_waiting_share": True},
         ],
     )
-    def test_domain_guards_raise(self, kwargs: dict[str, float]) -> None:
+    def test_domain_guards_raise(self, kwargs: dict[str, object]) -> None:
         with pytest.raises(GoodputError):
-            classify_regime(**kwargs)
+            classify_regime(**kwargs)  # type: ignore[arg-type]
+
+    def test_queue_share_is_a_required_keyword(self) -> None:
+        # The pre-ADR-0153 call shape must not resolve silently to a label.
+        with pytest.raises(TypeError):
+            classify_regime(rho_kv=0.95, scarcity_events=3, attainment=0.95)  # type: ignore[call-arg]
 
     def test_vectorized_matches_scalar(self) -> None:
         cells = pd.DataFrame(
             {
-                "rho_kv": [0.95, 0.5, 0.95, 0.1],
-                "scarcity_events": [3, 3, 0, 0],
-                "attainment": [0.95, 0.95, 0.95, 0.5],
+                "rho_kv": [0.95, 0.5, 0.95, 0.1, 0.95],
+                "queue_waiting_share": [0.8, 1.0, 0.0, 0.0, 0.5],
+                "scarcity_events": [0, 3, 30, 0, 1],
+                "attainment": [0.95, 0.95, 0.95, 0.5, 0.9],
             },
-            index=[10, 20, 30, 40],
+            index=[10, 20, 30, 40, 50],
         )
-        labels = label_regime(cells)
+        labels = label_regime(cells, events_col="scarcity_events")
         expected = [
             classify_regime(
                 rho_kv=row.rho_kv,
-                scarcity_events=int(row.scarcity_events),
                 attainment=row.attainment,
+                queue_waiting_share=row.queue_waiting_share,
+                scarcity_events=int(row.scarcity_events),
             )
             for row in cells.itertuples()
         ]
         assert labels.tolist() == expected
+        assert labels.tolist() == [
+            "IN_REGIME", "UNPRESSURED", "UNPRESSURED", "PAST_CLIFF", "IN_REGIME",
+        ]
         assert labels.name == "regime"
-        assert list(labels.index) == [10, 20, 30, 40]
+        assert list(labels.index) == [10, 20, 30, 40, 50]
 
-    def test_vectorized_missing_column_raises(self) -> None:
-        with pytest.raises(GoodputError, match="scarcity_events"):
+    def test_vectorized_missing_queue_column_raises(self) -> None:
+        with pytest.raises(GoodputError, match="queue_waiting_share"):
             label_regime(pd.DataFrame({"rho_kv": [0.95], "attainment": [0.95]}))
 
-    def test_vectorized_fractional_events_raise(self) -> None:
+    def test_vectorized_queue_share_outside_unit_interval_raises(self) -> None:
         cells = pd.DataFrame(
-            {"rho_kv": [0.95], "scarcity_events": [2.5], "attainment": [0.95]}
+            {"rho_kv": [0.95], "queue_waiting_share": [1.5], "attainment": [0.95]}
+        )
+        with pytest.raises(GoodputError, match="queue_waiting_share"):
+            label_regime(cells)
+
+    def test_vectorized_fractional_events_raise_only_when_named(self) -> None:
+        cells = pd.DataFrame(
+            {
+                "rho_kv": [0.95],
+                "queue_waiting_share": [1.0],
+                "scarcity_events": [2.5],
+                "attainment": [0.95],
+            }
         )
         with pytest.raises(GoodputError, match="integer"):
-            label_regime(cells)
+            label_regime(cells, events_col="scarcity_events")
+        # Not named: the recorded counter is not read and never decides.
+        assert label_regime(cells).tolist() == ["IN_REGIME"]
 
 
 class TestCorrectedRate:
