@@ -96,14 +96,14 @@ def _capture(result: Any):
 
 
 def test_a_snapshot_with_a_numeric_gauge_passes(monkeypatch) -> None:
-    fake, calls = _capture({"kv_usage": 0.0, "running": 0})
+    fake, calls = _capture({"kv_usage": 0.0, "running": 0, "waiting": 0})
     monkeypatch.setattr(vt, "capture_snapshot", fake)
     runner.probe_campaign_telemetry([("single", "http://h:8000")], "vllm")
     assert calls == [("http://h:8000", "vllm")]
 
 
 def test_every_endpoint_of_a_pd_pair_is_probed(monkeypatch) -> None:
-    fake, calls = _capture({"kv_usage": 0.25})
+    fake, calls = _capture({"kv_usage": 0.25, "waiting": 3})
     monkeypatch.setattr(vt, "capture_snapshot", fake)
     runner.probe_campaign_telemetry(
         [("prefill", "http://h:8100"), ("decode", "http://h:8200")], "vllm"
@@ -116,12 +116,14 @@ def test_every_endpoint_of_a_pd_pair_is_probed(monkeypatch) -> None:
     [
         None,                                   # unreachable, or no cage-stats at all
         {"spec_decode": {"x": 1}},              # the dependency-free fallback: no KV gauge
-        {"kv_usage": None},                     # cage-stats multi-engine refusal / gauge missing
-        {"kv_usage": True},                     # a bool is not a reading
-        {"kv_usage": float("nan")},
-        {"kv_usage": "0.1"},
+        {"kv_usage": None, "waiting": 0},       # cage-stats multi-engine refusal / gauge missing
+        {"kv_usage": True, "waiting": 0},       # a bool is not a reading
+        {"kv_usage": float("nan"), "waiting": 0},
+        {"kv_usage": "0.1", "waiting": 0},
+        {"kv_usage": 0.1},                      # ADR-0153 (b): no queue gauge, no regime label
+        {"kv_usage": 0.1, "waiting": None},
     ],
-    ids=["no-snapshot", "spec-only", "gauge-null", "bool", "nan", "string"],
+    ids=["no-snapshot", "spec-only", "gauge-null", "bool", "nan", "string", "no-waiting", "waiting-null"],
 )
 def test_a_snapshot_without_a_numeric_gauge_refuses(monkeypatch, snapshot: Any) -> None:
     fake, _ = _capture(snapshot)
@@ -129,7 +131,8 @@ def test_a_snapshot_without_a_numeric_gauge_refuses(monkeypatch, snapshot: Any) 
     with pytest.raises(RuntimeError) as exc:
         runner.probe_campaign_telemetry([("single", "http://h:8000")], "vllm")
     msg = str(exc.value)
-    assert "CAMPAIGN TELEMETRY" in msg and "http://h:8000" in msg and "kv_usage" in msg
+    assert "CAMPAIGN TELEMETRY" in msg and "http://h:8000" in msg
+    assert ("kv_usage" in msg) or ("waiting" in msg)
     assert "ADR-0136" in msg
 
 
@@ -142,7 +145,7 @@ def test_a_capture_that_raises_refuses_with_its_cause(monkeypatch) -> None:
 
 
 def test_one_dead_role_is_named_and_the_healthy_one_is_not(monkeypatch) -> None:
-    fake, _ = _capture(lambda url: {"kv_usage": 0.1} if url.endswith("8200") else None)
+    fake, _ = _capture(lambda url: {"kv_usage": 0.1, "waiting": 0} if url.endswith("8200") else None)
     monkeypatch.setattr(vt, "capture_snapshot", fake)
     with pytest.raises(RuntimeError) as exc:
         runner.probe_campaign_telemetry(

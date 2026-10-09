@@ -46,6 +46,9 @@
 #   LMDEPLOY_VERSION      LMDeploy pin override (default: the section 7 pin below; own venv lmdeploy-env)
 #   LMDEPLOY_TORCH_VERSION  torch pinned inside lmdeploy-env (default 2.10.0: vLLM 0.19.1's CUDA 12.8 line)
 #   SKIP_ENGINE_INSTALL=1 bypass the SGLang/LMDeploy venvs (a vLLM-only pod)
+#   INSTALL_LMCACHE=1     install the LMCache KV-connector package into cage-env for the
+#                         retr-store arm (B8; S0F-57, ADR-0158): opt-in per profile, FATAL
+#                         when it fails; LMCACHE_VERSION pins it (default: the newest wheel)
 #   CAGE_VENV_ROOT        where the three venvs REALLY live (default /root/cage-venvs, the
 #                         container disk; ADR-0125, S0F-6). The repo-root names cage-env,
 #                         sglang-env and lmdeploy-env are symlinks to them, so every consumer
@@ -236,6 +239,29 @@ pip install -r requirements.txt
 #     same reconcile as the GCP port (see setup_gpu_cloud.sh [3b] for history).
 echo "[cage] [3b] reconciling openai for vLLM ${VLLM_VERSION}..."
 pip install -U "openai>=2.0"
+
+# 3d. LMCache (S0F-57, ADR-0158): the KV-connector package of the retr-store arm
+#     (B8; the relaunch sets VLLM_KV_TRANSFER_CONFIG LMCacheConnectorV1). Opt-in per
+#     profile: INSTALL_LMCACHE=1 when the plan has executable vLLM B8 cells (the
+#     master's stage 0 reports NEEDS_LMCACHE from the registered plan and its stage 4
+#     proves the import on the pod). The recipe is run_kv_store.sh's: lmcache and the
+#     repo's transformers<5 pin in the SAME pip call (lmcache alone pulls transformers
+#     5.x). The pairing with vLLM 0.19.1 is NOT live-validated [?] (run_kv_store.sh
+#     header; no release note read on 2026-10-09 names 0.19); the import proof below
+#     and the stage 4 probe are the gates, and the S0 rehearsal is the live test. The
+#     2026-10-08 landing lost its B8 relaunch to ModuleNotFoundError after hours of
+#     billing, so a failed install here is FATAL when opted in (never a warning).
+if [ "${INSTALL_LMCACHE:-0}" = "1" ]; then
+  echo "[cage] [3d] installing lmcache into cage-env (opt-in, INSTALL_LMCACHE=1${LMCACHE_VERSION:+, pin ${LMCACHE_VERSION}})..."
+  if pip install --no-cache-dir "lmcache${LMCACHE_VERSION:+==${LMCACHE_VERSION}}" "transformers>=4.36,<5" \
+     && python -c 'import vllm, lmcache; print("[cage]   lmcache:", getattr(lmcache, "__version__", "?"), "installed beside vllm", vllm.__version__)'; then
+    :
+  else
+    die "lmcache install or import FAILED (S0F-57, ADR-0158): the retr-store (B8) relaunches cannot start; fix the install (LMCACHE_VERSION) or deregister B8 for this session"
+  fi
+else
+  echo "[cage] [3d] lmcache SKIPPED (INSTALL_LMCACHE=${INSTALL_LMCACHE:-0}; the plan's vLLM B8 cells need it)"
+fi
 
 # 3c. Charter engines #2 and #3 in their OWN venvs (pre-GO item 10). lmdeploy-env is
 #     created from the canonical interpreter like cage-env; sglang-env from CPython

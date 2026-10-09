@@ -71,7 +71,10 @@ rc = _load("run_campaign_stage1_v2_v3", RUN_CAMPAIGN_PY)
 # helpers: a hermetic plan (floor table, cal-v2 floors, a recording stub)
 # ---------------------------------------------------------------------------
 
-_DEMAND = 10_000_000_000
+# Gap triage 2026-10-09 C1: the plan refuses a budgeted pool below one max_model_len
+# request, so the stub demand is c = 400 x 4,779 tokens x 327,680 bytes/token (the
+# largest fixture kv/token): the smallest class (348) at r = 0.25 still holds one.
+_DEMAND = 400 * 4779 * 327_680
 
 
 def _floor_table(tmp_path: Path) -> Path:

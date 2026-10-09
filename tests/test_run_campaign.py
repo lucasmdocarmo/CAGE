@@ -91,13 +91,26 @@ rc = _load_module()
 # Fixtures
 # ---------------------------------------------------------------------------
 
-_ANCHOR_DEMAND = 10_000_000_000  # arbitrary but realistic-scale demand bytes
+#: The stub floor table's anchor demand. Gap triage 2026-10-09 C1: a budgeted
+#: relaunch's pool must hold one max_model_len request (32,768 tokens), and a
+#: class budget is c x s_class x bytes/token x r, so the fixture's c must be
+#: large enough that the SMALLEST registered class (348 tokens) at the tightest
+#: rung (r = 0.25) still holds one request: 32,768 / (348 x 0.25) = 377 -> 400,
+#: sized on the fixture model with the most bytes per token (llama-3.3-70b,
+#: session b) so the same demand holds on the qwen3-14b fixtures too. (The real
+#: S0 profile runs c = 50 and refuses on exactly this rule; the owner decides
+#: the remedy.)
+_ANCHOR_DEMAND = rc.demand_bytes(
+    "llama-3.3-70b", concurrency=400, avg_seq_tokens=rc.DEMAND_SEQ_TOKENS_2026_10_08[rc.DEMAND_ANCHOR_ARM]
+)
 #: ADR-0155: the registered anchor shape (gold-fresh served tokens, the
 #: 2026-10-08 landing) every fixture floor table is sized on.
 _ANCHOR_SEQ_TOKENS = rc.DEMAND_SEQ_TOKENS_2026_10_08[rc.DEMAND_ANCHOR_ARM]
 #: ADR-0155: served shapes for the synthetic (1000, 500) B12 ladder some grids
 #: here register (test values; the registry carries the landing's 1400/700).
 _TRUNC_SHAPES_1000_500 = {1000: 900, 500: 450}
+#: ADR-0158: the served maxima of those synthetic classes (test values).
+_MAX_SERVED_WITH_1000_500 = {**rc.DEMAND_CLASS_MAX_SERVED_TOKENS_2026_10_08, 900: 1200, 450: 600}
 #: Executable serving configs of session a (relaunches) under ADR-0155's
 #: demand classes; derived in TestPlanCountsSessionA.test_total_counts.
 _RELAUNCHES_A = 96
@@ -245,19 +258,13 @@ def _calibration_args(calibrations: Dict[str, Path]) -> List[str]:
 #: (deterministic, distinguishable per r, and distinct from the floor table's
 #: 2.0 x r prediction so a test can tell the offered rate's basis apart).
 _RUNG_LAMBDA = 8.0
+#: ADR-0156 fixtures: the smallest class's lambda* per rung is _RUNG_SMALL_FACTOR
+#: x the anchor's, so the fixture's log-log slope is alpha = ln(4) / ln(s_g / s_m)
+#: (about 0.53 for 4,779 over 348 tokens), distinguishable from the KV-bound 1.
+_RUNG_SMALL_FACTOR = 4.0
 
 
-def _rung_calibration_doc(
-    engine: str,
-    session: str,
-    rungs,
-    *,
-    model: str = "Qwen/Qwen3-14B",
-    lam: float = _RUNG_LAMBDA,
-    labels: Optional[Dict[float, str]] = None,
-) -> Dict[str, Any]:
-    """One ``cage-rung-calibration-v1`` artifact as calibrate-rungs writes it;
-    ``labels`` overrides a rung's label (a non-ESTIMATED rung carries no value)."""
+def _rung_table(rungs, lam: float, labels: Optional[Dict[float, str]]) -> Dict[str, Any]:
     records: Dict[str, Any] = {}
     for r in rungs:
         label = (labels or {}).get(r, "ESTIMATED")
@@ -269,6 +276,41 @@ def _rung_calibration_doc(
             "first_unsustainable_qps": lam * r * 1.3 if label != "LADDER_EXHAUSTED" else None,
             "steps": [],
         }
+    return records
+
+
+def _rung_calibration_doc(
+    engine: str,
+    session: str,
+    rungs,
+    *,
+    model: str = "Qwen/Qwen3-14B",
+    lam: float = _RUNG_LAMBDA,
+    labels: Optional[Dict[float, str]] = None,
+    small: Optional[Tuple[int, str]] = None,
+    small_factor: float = _RUNG_SMALL_FACTOR,
+    small_labels: Optional[Dict[float, str]] = None,
+    anchor_seq_tokens: int = _ANCHOR_SEQ_TOKENS,
+) -> Dict[str, Any]:
+    """One ``cage-rung-calibration-v2`` artifact as calibrate-rungs writes it;
+    ``labels`` overrides an anchor rung's label (a non-ESTIMATED rung carries no
+    value); ``small`` = (seq_tokens, arm) adds the smallest-class ladder
+    (ADR-0156) at ``small_factor`` x the anchor's lambda* per rung."""
+    records = _rung_table(rungs, lam, labels)
+    classes: Dict[str, Any] = {
+        str(anchor_seq_tokens): {
+            "role": "anchor", "arm": rc.DEMAND_ANCHOR_ARM, "baseline_id": "B1", "family": "F2",
+            "prefix_mode": "OFF", "seq_tokens": anchor_seq_tokens, "dataset": "qasper",
+            "rungs": records,
+        }
+    }
+    if small is not None:
+        seq, arm = small
+        classes[str(seq)] = {
+            "role": "smallest", "arm": arm, "baseline_id": "B11", "family": "F2",
+            "prefix_mode": "OFF", "seq_tokens": seq, "dataset": "qasper",
+            "rungs": _rung_table(rungs, lam * small_factor, small_labels),
+        }
     return {
         "schema": rc.RUNG_CALIBRATION_SCHEMA,
         "procedure_version": rc.PROCEDURE_VERSION,
@@ -276,22 +318,37 @@ def _rung_calibration_doc(
         "engine": engine,
         "model": model,
         "session": session,
+        "anchor_seq_tokens": anchor_seq_tokens,
         "workload": {"arm": rc.DEMAND_ANCHOR_ARM, "dataset": "qasper"},
         "ladder": {"window_s": 75.0, "warmup_s": 10.0},
         "rungs": records,
+        "classes": classes,
     }
 
 
+def _smallest_for(grid: Any, engine: str) -> Optional[Tuple[int, str]]:
+    """ADR-0156: (seq_tokens, arm) of the engine's smallest executable class
+    below the anchor on ``grid`` (B12 rungs count only with a qasper manifest,
+    which these fixtures never register), or None."""
+    cell = rc.smallest_pressure_class(grid, engine, None)
+    return None if cell is None else (rc.demand_seq_tokens(grid, cell.spec), cell.spec.arm)
+
+
 def _write_rung_calibrations(
-    directory: Path, engines, session: str, rungs, **overrides: Any
+    directory: Path, engines, session: str, rungs, *, grid: Any = None, **overrides: Any
 ) -> Dict[str, Path]:
-    """One rung artifact per engine under ``directory`` -> {engine: path}."""
+    """One rung artifact per engine under ``directory`` -> {engine: path}.
+    With ``grid`` given (and no explicit ``small``), each engine's artifact
+    carries the smallest-class ladder that grid needs (ADR-0156)."""
     directory.mkdir(parents=True, exist_ok=True)
     out: Dict[str, Path] = {}
     for engine in engines:
+        per_engine = dict(overrides)
+        if grid is not None and "small" not in per_engine:
+            per_engine["small"] = _smallest_for(grid, engine)
         path = directory / f"rungs_{engine}.json"
         path.write_text(
-            json.dumps(_rung_calibration_doc(engine, session, rungs, **overrides)),
+            json.dumps(_rung_calibration_doc(engine, session, rungs, **per_engine)),
             encoding="utf-8",
         )
         out[engine] = path
@@ -300,12 +357,13 @@ def _write_rung_calibrations(
 
 def _rungs_for(calibrations: Dict[str, Path], session: str, **overrides: Any) -> Dict[str, Path]:
     """Rung artifacts for the engines of ``calibrations`` (written beside
-    them), covering every budgeted rung of the registered ``session``."""
+    them), covering every budgeted rung of the registered ``session`` and its
+    smallest class per engine (ADR-0156)."""
     grid = rc.get_session_grid(session)
     rungs = rc.budgeted_rungs(grid)
     overrides.setdefault("model", rc.HF_ID_OF_SLUG[grid.model])
     directory = next(iter(calibrations.values())).parent if calibrations else Path(".")
-    return _write_rung_calibrations(directory, list(calibrations), session, rungs, **overrides)
+    return _write_rung_calibrations(directory, list(calibrations), session, rungs, grid=grid, **overrides)
 
 
 def _rung_args(rungs: Dict[str, Path]) -> List[str]:
@@ -511,7 +569,7 @@ def _stub_plan(grid: Any, floor_path: Path, stub_cmd) -> Dict[str, Any]:
     rungs = (
         _write_rung_calibrations(
             Path(floor_path).parent / "cal", _grid_engines(grid), grid.session,
-            budgeted, model=rc.HF_ID_OF_SLUG[grid.model],
+            budgeted, grid=grid, model=rc.HF_ID_OF_SLUG[grid.model],
         )
         if budgeted
         else None
@@ -832,7 +890,8 @@ class TestOrdering:
         # the ONE table the cells' --api-base derives from), and nothing else.
         for s in _relaunches(plan_a):
             env = dict(s["env"])
-            assert env.pop("VLLM_MAX_MODEL_LEN") == "32768"
+            # ADR-0158: the class request cap (the session cap on a budget-free relaunch)
+            assert env.pop("VLLM_MAX_MODEL_LEN") == str(s["max_model_len"])
             port_env, port = {
                 "vllm": ("VLLM_PORT", "8000"), "sglang": ("SGLANG_PORT", "30000"),
             }[s["engine"]]
@@ -935,34 +994,52 @@ class TestCellSteps:
 
     def test_executable_pressure_rates_rest_on_the_rung_lambda(self, plan_a):
         # ADR-0154: the gold class offers rate_frac x the rung's measured
-        # lambda* (_RUNG_LAMBDA x r in the fixture); every other class offers
-        # it scaled by the served-token ratio gold/class (ADR-0155); the
-        # floor table's KV-bound prediction (2.0 x r) is recorded beside it
-        # and never offered.
+        # lambda* (_RUNG_LAMBDA x r in the fixture); ADR-0156: the smallest
+        # class (retr-trunc, 348 tokens) offers its OWN measured lambda*
+        # (_RUNG_SMALL_FACTOR x the anchor's in the fixture) and every class in
+        # between the log-log interpolation through the two anchors; the floor
+        # table's KV-bound prediction (2.0 x r) is recorded beside it and never
+        # offered.
+        import math as _math
+
         pressure = [
             s for s in _cells(plan_a) if s["family"] in ("F2", "F3") and not s["blocked_on"]
         ]
         assert pressure
-        gold_seen = derived_seen = False
+        small_seq = 348
+        alpha = _math.log(_RUNG_SMALL_FACTOR) / _math.log(_ANCHOR_SEQ_TOKENS / small_seq)
+        seen = set()
         for s in pressure:
             r = s["cellspec"]["budget_r"]
             gold = _RUNG_LAMBDA * r
             seq = s["demand_class"]["seq_tokens"]
+            src = s["lambda_star_source"]
             assert s["lambda_kv_pred_rps"] == pytest.approx(2.0 * r)
-            assert s["lambda_star_source"]["gold_lambda_star_qps"] == pytest.approx(gold)
-            assert s["lambda_star_source"]["seq_tokens_gold"] == _ANCHOR_SEQ_TOKENS
-            assert s["lambda_star_source"]["seq_tokens_class"] == seq
-            if s["cellspec"]["arm"] == rc.DEMAND_ANCHOR_ARM:
+            assert src["gold_lambda_star_qps"] == pytest.approx(gold)
+            assert src["seq_tokens_gold"] == _ANCHOR_SEQ_TOKENS
+            assert src["seq_tokens_class"] == seq
+            if seq == _ANCHOR_SEQ_TOKENS:
+                assert s["cellspec"]["arm"] in ("gold-fresh", "gold-reuse")
                 assert s["rate_basis"] == rc.LAMBDA_BASIS_RUNG
                 assert s["lambda_star_rps"] == pytest.approx(gold)
-                assert seq == _ANCHOR_SEQ_TOKENS
-                gold_seen = True
+                assert src["alpha"] is None
+                seen.add("anchor")
+            elif seq == small_seq:
+                assert s["cellspec"]["arm"] == "retr-trunc"
+                assert s["rate_basis"] == rc.LAMBDA_BASIS_SMALL
+                assert s["lambda_star_rps"] == pytest.approx(gold * _RUNG_SMALL_FACTOR)
+                assert src["alpha"] == pytest.approx(alpha) and src["seq_tokens_small"] == small_seq
+                seen.add("small")
             else:
-                assert s["rate_basis"] == rc.LAMBDA_BASIS_DERIVED
-                assert s["lambda_star_rps"] == pytest.approx(gold * _ANCHOR_SEQ_TOKENS / seq)
-                derived_seen = True
+                assert small_seq < seq < _ANCHOR_SEQ_TOKENS
+                assert s["rate_basis"] == rc.LAMBDA_BASIS_INTERPOLATED
+                assert s["lambda_star_rps"] == pytest.approx(gold * (_ANCHOR_SEQ_TOKENS / seq) ** alpha)
+                # between the anchors: more than the anchor, less than the small class
+                assert gold < s["lambda_star_rps"] < gold * _RUNG_SMALL_FACTOR
+                assert src["alpha"] == pytest.approx(alpha) and src["kv_bound_alpha"] == 1.0
+                seen.add("interpolated")
             assert s["lambda_star_rps"] != pytest.approx(s["lambda_kv_pred_rps"])
-        assert gold_seen and derived_seen
+        assert seen == {"anchor", "small", "interpolated"}
 
     def test_blocked_pressure_cells_carry_a_reviewable_rate(self, plan_a, tmp_path, calibrations_a):
         # A blocked cell never runs. On a calibrated (engine, r) it carries the
@@ -973,7 +1050,7 @@ class TestCellSteps:
         ]
         assert blocked
         for s in blocked:
-            assert s["rate_basis"] in (rc.LAMBDA_BASIS_RUNG, rc.LAMBDA_BASIS_DERIVED)
+            assert s["rate_basis"] in (rc.LAMBDA_BASIS_RUNG, rc.LAMBDA_BASIS_SMALL, rc.LAMBDA_BASIS_INTERPOLATED)
             assert s["lambda_star_rps"] > 0
         # On plan a every blocked rung is also an executable rung, so the
         # no-rung branch needs a grid whose only cells at some rung are
@@ -1527,7 +1604,7 @@ class TestCorpusTruncLadder:
             _tiny_grid(f1_baselines=("B12",), corpus_trunc_budgets=ladder)
 
     def test_tiny_grid_enumerates_one_cell_per_rung(self, floor_table, stub):
-        grid = _tiny_grid(f1_baselines=("B3", "B12"), corpus_trunc_budgets=(1000, 500), corpus_trunc_demand_seq_tokens=_TRUNC_SHAPES_1000_500)
+        grid = _tiny_grid(f1_baselines=("B3", "B12"), corpus_trunc_budgets=(1000, 500), corpus_trunc_demand_seq_tokens=_TRUNC_SHAPES_1000_500, demand_class_max_served_tokens=_MAX_SERVED_WITH_1000_500)
         plan = _stub_plan(grid, floor_table, stub.cmd)
         cells = _cells(plan)
         assert [s["baseline"] for s in cells] == ["B3", "B12", "B12"]
@@ -2374,7 +2451,7 @@ class TestSessionB:
         assert sorted(s["prefix_mode"] for s in tp_legs) == ["OFF", "ON"]
         for tp_leg in tp_legs:
             demand_class = (_ANCHOR_DEMAND * tp_leg["demand_class"]["seq_tokens"]) // _ANCHOR_SEQ_TOKENS
-            assert demand_class in (10_000_000_000, 4_888_051_893)
+            assert demand_class in (_ANCHOR_DEMAND, (_ANCHOR_DEMAND * rc.DEMAND_SEQ_TOKENS_2026_10_08["corpus-fresh"]) // _ANCHOR_SEQ_TOKENS)  # the gold or the corpus class
             assert tp_leg["tp"] == 8
             assert tp_leg["env"]["CAGE_VLLM_TENSOR_PARALLEL"] == "8"
             assert tp_leg["env"]["CAGE_KV_BUDGET_BYTES"] == str(demand_class // 8)
@@ -2403,11 +2480,11 @@ class TestSessionB:
     def _check_pd_leg(pd_leg, plan_b):
         assert pd_leg["tp"] == 4
         assert pd_leg["env"]["CAGE_VLLM_TENSOR_PARALLEL"] == "4"
-        # ADR-0155: the total is the leg's CLASS demand at r = 1.0 (gold 10^10
-        # on B1's OFF leg, the corpus class 4_888_051_893 on B3's ON leg);
-        # the 0.5 split is exact-sum (floor + remainder).
+        # ADR-0155: the total is the leg's CLASS demand at r = 1.0 (the gold
+        # class on B1's OFF leg, the corpus class on B3's ON leg); the 0.5
+        # split is exact-sum (floor + remainder).
         total = (_ANCHOR_DEMAND * pd_leg["demand_class"]["seq_tokens"]) // _ANCHOR_SEQ_TOKENS
-        assert total in (10_000_000_000, 4_888_051_893)
+        assert total in (_ANCHOR_DEMAND, (_ANCHOR_DEMAND * rc.DEMAND_SEQ_TOKENS_2026_10_08["corpus-fresh"]) // _ANCHOR_SEQ_TOKENS)
         prefill_pool = total // 2
         decode_pool = total - prefill_pool
         prefill_rank = int(pd_leg["env"]["CAGE_KV_BUDGET_BYTES_PREFILL"])
@@ -2831,12 +2908,12 @@ class TestQueryManifestRegistration:
 
         # A9: an 8-id-per-trial artifact cannot serve the registered primary
         # n (B3 on vllm = 2000) -> the plan refuses naming the shortfall ...
-        grid = _tiny_grid(f1_baselines=("B3", "B12"), corpus_trunc_budgets=(1000, 500), corpus_trunc_demand_seq_tokens=_TRUNC_SHAPES_1000_500)
+        grid = _tiny_grid(f1_baselines=("B3", "B12"), corpus_trunc_budgets=(1000, 500), corpus_trunc_demand_seq_tokens=_TRUNC_SHAPES_1000_500, demand_class_max_served_tokens=_MAX_SERVED_WITH_1000_500)
         with pytest.raises(rc.PlanError, match=r"squad_v2.*trial 1.*2000.*shortfall 1992"):
             _plan(grid)
         # ... unless the grid registers the dataset's achievable n (A5).
         grid = _tiny_grid(
-            f1_baselines=("B3", "B12"), corpus_trunc_budgets=(1000, 500), corpus_trunc_demand_seq_tokens=_TRUNC_SHAPES_1000_500,
+            f1_baselines=("B3", "B12"), corpus_trunc_budgets=(1000, 500), corpus_trunc_demand_seq_tokens=_TRUNC_SHAPES_1000_500, demand_class_max_served_tokens=_MAX_SERVED_WITH_1000_500,
             achievable_n={"squad_v2": 8},
         )
         plan = _plan(grid)
@@ -3658,11 +3735,17 @@ class TestMaxModelLenA10:
             relaunches = _relaunches(plan)
             assert relaunches
             assert {s["engine"] for s in relaunches} == {"vllm", "sglang"}
+            grid = rc.get_session_grid(plan["session"])
             for s in relaunches:
-                assert s["max_model_len"] == 32_768, s
-                assert s["env"]["VLLM_MAX_MODEL_LEN"] == "32768", s
-                # the pilot default can never ride a campaign relaunch
-                assert s["env"]["VLLM_MAX_MODEL_LEN"] != "4096"
+                # ADR-0158: a budgeted relaunch carries its CLASS cap, a
+                # budget-free one the session cap (32,768, RULER)
+                seq = (s.get("demand_class") or {}).get("seq_tokens")
+                assert s["max_model_len"] == rc.request_cap_tokens(grid, seq), s
+                assert s["env"]["VLLM_MAX_MODEL_LEN"] == str(s["max_model_len"]), s
+                if seq is None or seq == 4779:
+                    assert s["max_model_len"] == 32_768, s
+                if seq is not None:
+                    assert s["max_model_len"] == plan["serving_shapes"]["request_caps"][str(seq)]
         # Session b: the single, tp AND pd relaunch shapes all carry it
         # (the pd launcher reads the same env for both role instances).
         assert {s["topology"] for s in _relaunches(plan_b)} == {"single", "tp", "pd"}
@@ -3673,6 +3756,8 @@ class TestMaxModelLenA10:
             assert shapes["max_model_len"] == 32_768
             assert shapes["max_model_len_env"] == "VLLM_MAX_MODEL_LEN"
             assert shapes["max_model_len_backlog"] == "A10"
+            assert shapes["request_caps"]["4779"] == 32_768 and shapes["request_caps"]["348"] == 4_096
+            assert shapes["request_cap_adr"] == "ADR-0158"
 
     def test_cell_steps_never_carry_it(self, plan_a):
         # The value is a SERVER dial (relaunch boundary), never cell argv or
@@ -4631,7 +4716,7 @@ class TestBudgetPlanProducerW4:
         assert tp["budget_bytes_total"] == 1 * _ANCHOR_DEMAND
         assert pd["topology"] == "pd" and pd["pd_split"] == 0.5 and pd["r"] == 1.0
         assert pd["budget_bytes_total"] == 1 * _ANCHOR_DEMAND
-        assert pd["pools_bytes"] == [5_000_000_000, 5_000_000_000]
+        assert pd["pools_bytes"] == [_ANCHOR_DEMAND // 2, _ANCHOR_DEMAND - _ANCHOR_DEMAND // 2]
         assert sum(pd["pools_bytes"]) == pd["budget_bytes_total"]
         # DIST cells carry no pressure coordinate; the record carries the
         # registered dist_budget_r the overlay actually served at

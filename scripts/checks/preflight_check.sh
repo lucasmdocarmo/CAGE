@@ -905,6 +905,9 @@ interval = float(os.environ.get("CAGE_REGIME_GATE_INTERVAL", "1.0"))
 # the pre-rename spelling, selectable through the override for an older engine.
 kv_metric = os.environ.get("CAGE_REGIME_KV_METRIC", "vllm:kv_cache_usage_perc")
 pre_metric = os.environ.get("CAGE_REGIME_PREEMPT_METRIC", "vllm:num_preemptions_total")
+# ADR-0153 clause (b) reads the admission queue (vLLM num_requests_waiting);
+# gap triage 2026-10-09 M3: proven live here, like the occupancy gauge.
+wait_metric = os.environ.get("CAGE_REGIME_WAIT_METRIC", "vllm:num_requests_waiting")
 if n < 2 or interval <= 0:
     print(f"  [FAIL] CAGE_REGIME_GATE_SAMPLES={n} / CAGE_REGIME_GATE_INTERVAL="
           f"{interval}: need >= 2 samples at a positive interval")
@@ -947,11 +950,12 @@ try:
             "ts_s": time.monotonic(),
             "kv_cache_usage": metric_sum(text, kv_metric),
             "preemptions_total": metric_sum(text, pre_metric),
+            "waiting": metric_sum(text, wait_metric),
         })
 except KeyError as exc:
     print(f"  [FAIL] live /metrics exposes no {exc.args[0]!r} -- the regime "
-          f"bridge cannot certify rho_KV/scarcity from this engine (override "
-          f"names via CAGE_REGIME_KV_METRIC / CAGE_REGIME_PREEMPT_METRIC)")
+          f"bridge cannot certify rho_KV/queue/scarcity from this engine (override "
+          f"names via CAGE_REGIME_KV_METRIC / CAGE_REGIME_PREEMPT_METRIC / CAGE_REGIME_WAIT_METRIC)")
     sys.exit(1)
 except Exception as exc:
     print(f"  [FAIL] telemetry sampling broke mid-gate: {type(exc).__name__}: {exc}")

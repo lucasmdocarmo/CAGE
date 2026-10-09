@@ -304,6 +304,7 @@ import argparse
 import hashlib
 import json
 import math
+import statistics
 import os
 import shlex
 import subprocess
@@ -330,9 +331,11 @@ from src.orchestration.campaign_layout import (  # noqa: E402
     WINDOW_DIR_RE,
 )
 from src.orchestration.cache_budget import (  # noqa: E402
+    KV_DTYPE_FACTOR,
     MODEL_KV,
     BudgetPlan,
     CacheBudgetError,
+    demand_bytes,
     plan_budget,
 )
 from src.orchestration.calibration import (  # noqa: E402
@@ -386,6 +389,16 @@ __all__ = [
     "load_plan",
     "load_rung_calibration",
     "main",
+    "interpolation_alpha",
+    "rung_lambda_for_class",
+    "smallest_pressure_class",
+    "window_span_summary",
+    "preflight_registration_check",
+    "alpha_tolerance",
+    "resolve_alpha",
+    "pool_shortfalls",
+    "mac_pool_shortfalls",
+    "request_cap_tokens",
     "parse_calibration_args",
     "plan_launchers",
     "rehearsal_grid",
@@ -484,6 +497,12 @@ __all__ = [
 # ``rung_calibration`` and ``demand_classes``. A v5 plan carries the pending
 # KV-bound rates the 2026-10-08 landing ran 3 to 6 times below capacity on,
 # so 'run' refuses it and the operator re-plans with the rung artifacts.
+# ADR-0156 (2026-10-09, Batch C): cell steps gained ``window_span_s_expected``
+# and ``window_span_below_floor`` (S0F-68 audit), the rung artifact became v2
+# (the smallest-class ladder) and the header gained ``window_spans``. No
+# schema bump: a v6 plan built before it is refused by the required-key check
+# and by _stale_plan_problems (its derived rates rest on the KV-bound ratio),
+# so the operator re-plans with v2 artifacts.
 PLAN_SCHEMA = "cage-campaign-plan-v6"
 FLOOR_TABLE_SCHEMA = "floor-table-v1"
 
@@ -1091,19 +1110,28 @@ _LAMBDA_PENDING_BASIS = "kv-bound-only [pending calibration]"
 #: is rate_frac x lambda*(engine, r) MEASURED by ``calibrate-rungs`` on the
 #: gold-fresh F2 workload of the session, under the relaunch the plan itself
 #: emits for that rung (prefix OFF, the gold demand class's byte budget), with
-#: the registered cal-v2 ladder rule. The two basis labels every pressure cell
-#: carries: the gold class offers the measured value; every other demand
-#: class derives its lambda* from the gold rung by the served-token ratio
-#: s_gold / s_class (prefill work per sequence scales with tokens; [D], checked
-#: live by the class's dry window, ADR-0153).
+#: the registered cal-v2 ladder rule. ADR-0156 (owner decision 2026-10-09,
+#: "apply recommended fixes for best solution possible") adds the SECOND
+#: anchor: the engine's smallest executable demand class gets its own ladder
+#: under its own class budget at every rung, and every class between the two
+#: anchors is interpolated on the log-log line through them (the KV-bound
+#: ratio of Batch B was an assumption the landing's scheduler-bound evidence
+#: contradicted at loose r). The three basis labels every pressure cell
+#: carries name which of the three its lambda* is.
 LAMBDA_BASIS_RUNG = "cal-v2 rung ESTIMATED (gold-fresh F2 workload, this engine, this r)"
-LAMBDA_BASIS_DERIVED = (
-    "derived: gold-fresh rung lambda* x served-token ratio s_gold/s_class [D]; "
-    "checked live by the dry window (ADR-0153)"
+LAMBDA_BASIS_SMALL = "cal-v2 rung ESTIMATED (the engine's smallest executable demand class, this r)"
+#: lambda(s) = lambda_g x (s_g / s)^alpha with alpha = ln(lambda_m / lambda_g)
+#: / ln(s_g / s_m) per (engine, r): alpha = 1 is the KV-bound limit (D linear
+#: in tokens, Batch B's assumption), alpha = 0 a pure request cap. Never an
+#: extrapolation: the anchors are the largest and the smallest class.
+LAMBDA_BASIS_INTERPOLATED = (
+    "interpolated: log-log between the gold-fresh and the smallest-class rung lambda* "
+    "(alpha recorded; 1 = KV-bound) [D]; checked live by the dry window (ADR-0153)"
 )
-RUNG_CALIBRATION_SCHEMA = "cage-rung-calibration-v1"
+RUNG_CALIBRATION_SCHEMA = "cage-rung-calibration-v2"
 RUNG_CALIBRATION_ADR = "ADR-0154"
 RUNG_CALIBRATION_FINDING = "S0F-62"
+TWO_ANCHOR_ADR = "ADR-0156"
 #: The ladder's first rung on the loosest budget: the floor's single-stream
 #: service rate (START_QPS_RULE) at this decode length. The campaign's QA
 #: answers stop at the newline (17 to 29 output tokens on the landing's vLLM
@@ -1156,6 +1184,61 @@ DEMAND_SEQ_TOKENS_2026_10_08: Dict[str, int] = {
     "retr-trunc": 348,
 }
 CORPUS_TRUNC_DEMAND_SEQ_TOKENS_2026_10_08: Dict[int, int] = {1400: 1205, 700: 480}
+#: ADR-0158 (S0F-71 remedy (a), owner 2026-10-09 "proceed with recommendations"):
+#: the request-length cap is PER DEMAND CLASS. A budgeted relaunch's KV pool is
+#: floor(r x c x s_class) tokens (ADR-0155), and vLLM refuses to start when
+#: that pool cannot hold ONE request of the cap (S0 2026-10-08 log); a uniform
+#: 32,768 cap (A10) therefore refused every class below gold at the tight
+#: rungs. The anchor class keeps the session cap (RULER SHAPE-32K runs on it);
+#: every other class gets the smallest power of two at or above
+#: REQUEST_CAP_MARGIN x its served MAXIMUM on the 2026-10-08 landing, never
+#: above the session cap. Served maxima (prompt + output tokens, vLLM counts,
+#: ok rows, 318 requests files, computed 2026-10-09 [V]; the anchor's figure
+#: includes the RULER rows; the QA gold maximum was 18,237): the table below,
+#: keyed by the class's served tokens (DEMAND_SEQ_TOKENS_2026_10_08 values).
+#: Limitation [A]: arms of different classes inside one contrast serve under
+#: different caps (B11 at 4,096 vs B6 at 8,192); the cap bounds request length
+#: only, the byte budget is untouched, and every served request sits at or
+#: below half its cap.
+DEMAND_CLASS_MAX_SERVED_TOKENS_2026_10_08: Dict[int, int] = {
+    4779: 32574,  # gold-fresh (RULER rows included) and gold-reuse
+    2336: 3211,   # corpus-fresh, corpus-reuse, corpus-comp
+    1205: 1551,   # corpus-trunc, 1400-token rung
+    1127: 2607,   # retr-fresh; retr-store takes the same shape [D]
+    1126: 2607,   # retr-reuse
+    702: 1607,    # retr-comp
+    480: 1551,    # corpus-trunc, 700-token rung
+    348: 1068,    # retr-trunc
+}
+REQUEST_CAP_MARGIN: float = 2.0
+REQUEST_CAP_ADR = "ADR-0158"
+REQUEST_CAP_RULE = (
+    "per demand class: the anchor class serves the session max_model_len (RULER); every "
+    f"other class the smallest power of two >= {REQUEST_CAP_MARGIN:g} x its served maximum "
+    "on the 2026-10-08 landing, never above the session cap; the cap bounds request "
+    f"length only and the pool must hold one request of it ({REQUEST_CAP_ADR})"
+)
+
+
+def request_cap_tokens(grid: "SessionGrid", seq_tokens: Optional[int]) -> int:
+    """The request-length cap (VLLM_MAX_MODEL_LEN: vLLM --max-model-len, SGLang
+    --context-length) a relaunch of demand class ``seq_tokens`` launches with
+    (ADR-0158). None (a budget-free relaunch) and the anchor class take the
+    session cap; a class absent from the maxima table refuses (PlanError)."""
+    session_cap = int(grid.max_model_len)
+    if seq_tokens is None or int(seq_tokens) == int(grid.demand_seq_tokens[DEMAND_ANCHOR_ARM]):
+        return session_cap
+    served_max = grid.demand_class_max_served_tokens.get(int(seq_tokens))
+    if isinstance(served_max, bool) or not isinstance(served_max, int) or served_max < 1:
+        raise PlanError(
+            f"demand class {seq_tokens} tokens has no served maximum registered on the grid "
+            f"(demand_class_max_served_tokens; {REQUEST_CAP_ADR}): register it from the "
+            "landing's rows before planning this class"
+        )
+    cap = 1
+    while cap < REQUEST_CAP_MARGIN * served_max:
+        cap *= 2
+    return min(session_cap, cap)
 #: The anchor arm of the floor table: its registered shape must equal the
 #: floor table's ``avg_seq_tokens`` (the P6 artifact and the registration
 #: describe the same sequence) or the plan refuses.
@@ -1190,6 +1273,20 @@ DRY_WINDOW_GATE = "dry window: the first window of this engine and demand class 
 #: run's exit code when every executed cell passed but a dry window failed
 #: its class (distinct from 1, a failed cell, and 2, a failed engine stop).
 EXIT_DRY_WINDOW_FAILED: int = 3
+
+#: ADR-0156 (S0F-68): the expected span of a pressure window is W / offered
+#: rate (V3: W arrivals, one per prepared request). The regime inputs read one
+#: telemetry sample per TELEMETRY_SAMPLE_INTERVAL_S (the runner's sampler,
+#: run_experiment.py ``interval=1.0``, mirrored here) and the registered
+#: warm-up transient is PROBE_WARMUP_S: a window shorter than that transient
+#: is all ramp. Every pressure cell records its span and whether it sits
+#: below the floor; the plan header and the master count them. A COUNT, never
+#: a refusal: W is the registered per-row N of the power decision, and
+#: changing it is the owner's one-way door (the dry window, 75 s, is the live
+#: regime proof per serving configuration meanwhile).
+TELEMETRY_SAMPLE_INTERVAL_S: float = 1.0
+WINDOW_SPAN_FLOOR_S: float = PROBE_WARMUP_S
+WINDOW_SPAN_FINDING = "S0F-68"
 
 _PRESSURE_FAMILIES = frozenset({"F2", "F3"})
 
@@ -1471,6 +1568,12 @@ class SessionGrid:
     corpus_trunc_demand_seq_tokens: Mapping[int, int] = field(
         default_factory=lambda: dict(CORPUS_TRUNC_DEMAND_SEQ_TOKENS_2026_10_08)
     )
+    # ADR-0158: the served MAXIMUM per demand class (keyed by the class's served
+    # tokens), the basis of the per-class request cap; a grid registering a
+    # class without one refuses here, at registration.
+    demand_class_max_served_tokens: Mapping[int, int] = field(
+        default_factory=lambda: dict(DEMAND_CLASS_MAX_SERVED_TOKENS_2026_10_08)
+    )
 
     def __post_init__(self) -> None:
         problems: List[str] = []
@@ -1515,6 +1618,20 @@ class SessionGrid:
                         f"{missing_rungs} ({DEMAND_CLASS_ADR}: the rung is the served "
                         "block, so each rung is its own demand class)"
                     )
+        # ADR-0158: every registered class has a served maximum (an int >= 1).
+        if isinstance(self.demand_seq_tokens, Mapping) and isinstance(self.corpus_trunc_demand_seq_tokens, Mapping):
+            classes = set(self.demand_seq_tokens.values()) | set(self.corpus_trunc_demand_seq_tokens.values())
+            table = self.demand_class_max_served_tokens
+            if not isinstance(table, Mapping):
+                problems.append(f"demand_class_max_served_tokens={table!r} must be a mapping class tokens -> served maximum")
+            else:
+                for seq in sorted(classes, reverse=True):
+                    value = table.get(seq)
+                    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                        problems.append(
+                            f"demand_class_max_served_tokens lacks an integer >= 1 for the class of "
+                            f"{seq} served tokens ({REQUEST_CAP_ADR}: the per-class request cap needs it)"
+                        )
         # A9 per-row N registration (fail closed on shapes; the classifier
         # and the manifest-coverage check refuse per cell at plan time).
         for name in ("n_primary", "n_secondary", "n_identity", "window_requests"):
@@ -1900,6 +2017,260 @@ def get_session_grid(session: str) -> SessionGrid:
 
 
 # ---------------------------------------------------------------------------
+# Pool capacity vs the request-length cap (gap triage 2026-10-09, C1)
+# ---------------------------------------------------------------------------
+
+#: vLLM refuses to start when the KV pool cannot hold ONE request of
+#: max_model_len tokens: 0.19.1 on the S0 pod, "To serve at least one request
+#: with the models's max seq len (32768), (4.5 GiB KV cache is needed, which
+#: is larger than the available KV cache memory" (results/s0/vm_logs/
+#: 2f54e73fb2dc/cluster/vllm_Qwen_Qwen3-8B_replica-1_8101.log:81, S0.env
+#: 2026-10-08 note). ADR-0155 sizes a budgeted relaunch at floor(r x D_class)
+#: with D_class = c x s_class x bytes/token, so a SMALL class at a TIGHT r
+#: plans a pool of r x c x s_class tokens: retr-trunc (348 tokens) at c = 50
+#: holds 17,400 x r tokens, below 32,768 at EVERY registered rung; every such
+#: relaunch fails on the pod after the setup, validate and calibrate stages
+#: billed, and the dry window then skips the configuration's cells (the
+#: anchor-only sizing before ADR-0155 never hit this: 238,950 x r tokens).
+#: SGLang's behavior with --max-total-tokens below --context-length was not
+#: read [?]; the design fact is engine-independent (the registered cap is a
+#: one-request guarantee the pool cannot honor), so the plan refuses on both.
+#: The remedy (a per-class request cap, a class budget floor, or a larger c)
+#: is the owner's registration decision; see the 2026-10-09 report.
+MAX_MODEL_LEN_POOL_RULE = (
+    "every budgeted relaunch's KV pool (budget_plan.budget_tokens_total, each P/D pool "
+    "on a pd stack) holds at least one request of the relaunch's request cap (its class "
+    f"cap, {REQUEST_CAP_ADR}); vLLM refuses a smaller pool at engine start (S0 2026-10-08 log)"
+)
+
+
+def _pool_tokens_of(record: Mapping[str, Any]) -> List[Tuple[str, int]]:
+    """(pool label, tokens) per pool of one budget_plan record: the total on a
+    single or tp stack, each role's pool on a pd stack (bytes to tokens at the
+    plan's own kv dtype through MODEL_KV, the planner's arithmetic)."""
+    pools = record.get("pools_bytes")
+    if not pools:
+        return [("pool", int(record["budget_tokens_total"]))]
+    model = str(record["model"])
+    kv_dtype = str(record.get("kv_dtype") or "bf16")
+    eff = math.floor(MODEL_KV[model].kv_bytes_per_token * KV_DTYPE_FACTOR[kv_dtype])
+    return [(role, int(b) // eff) for role, b in zip(("prefill", "decode"), pools)]
+
+
+def pool_shortfalls(
+    relaunch_steps: Sequence[Mapping[str, Any]], max_model_len: int
+) -> List[Dict[str, Any]]:
+    """The budgeted relaunches whose pool cannot hold one max_model_len
+    request (MAX_MODEL_LEN_POOL_RULE), one record each: engine, class tokens,
+    r, kv dtype, topology, pool label, pool tokens, shortfall tokens. Pure."""
+    out: List[Dict[str, Any]] = []
+    for step in relaunch_steps:
+        record = step.get("budget_plan")
+        if not isinstance(record, Mapping):
+            continue
+        # ADR-0158: the relaunch's own cap (its class); the session cap when absent
+        cap = step.get("max_model_len")
+        cap = int(max_model_len) if not isinstance(cap, int) or isinstance(cap, bool) else cap
+        for label, tokens in _pool_tokens_of(record):
+            if tokens < cap:
+                out.append({
+                    "engine": step.get("engine"),
+                    "seq_tokens": (step.get("demand_class") or {}).get("seq_tokens"),
+                    # a pd relaunch carries budget_r None (its r is the registered
+                    # dist_budget_r); the BudgetPlan's own r is the one planned
+                    "budget_r": record.get("r") if step.get("budget_r") is None else step.get("budget_r"),
+                    "kv_dtype": record.get("kv_dtype"),
+                    "topology": step.get("topology"),
+                    "pool": label,
+                    "pool_tokens": tokens,
+                    "max_model_len": cap,
+                    "shortfall_tokens": cap - tokens,
+                })
+    return out
+
+
+def _pool_shortfall_text(shortfalls: Sequence[Mapping[str, Any]], where: str) -> str:
+    rows = sorted(shortfalls, key=lambda s: (str(s["engine"]), int(s["seq_tokens"] or 0), float(s["budget_r"] or 0)))
+    listed = "; ".join(
+        f"{s['engine']} class {s['seq_tokens']} tokens r={float(s['budget_r']):g} {s['topology']}/{s['pool']}: "
+        f"{s['pool_tokens']} tokens vs cap {s['max_model_len']} (short {s['shortfall_tokens']})"
+        for s in rows[:12]
+    )
+    more = "" if len(rows) <= 12 else f"; and {len(rows) - 12} more"
+    return (
+        f"{where}: {len(rows)} budgeted relaunch pool(s) cannot hold one request of their class's "
+        f"request cap ({MAX_MODEL_LEN_POOL_RULE}): {listed}{more}. The pod "
+        "would fail each relaunch at engine start after the setup, validate and calibrate stages "
+        "billed. Remedies (owner, registration): a per-class request cap below the pool, a class "
+        "budget floor of one request, or a concurrency c large enough at the tightest rung; none "
+        "is chosen here"
+    )
+
+
+def mac_pool_shortfalls(
+    grid: SessionGrid, cells: Sequence[PlannedCell], floor_concurrency: int
+) -> List[Dict[str, Any]]:
+    """The Mac-side (stage 0) image of ``pool_shortfalls``: no floor table
+    exists yet, so the demand is cache_budget.demand_bytes at the profile's
+    FLOOR_CONCURRENCY and the registered anchor shape, exactly what
+    build_floor_table.py writes (demand_bytes(model, concurrency,
+    avg_seq_tokens); build_floor_table.py:210), scaled per class
+    (_class_demand_bytes) and planned through plan_budget with each executable
+    config's own r, kv dtype, tp and topology as _relaunch_step does. One
+    record per distinct serving configuration."""
+    anchor = int(grid.demand_seq_tokens[DEMAND_ANCHOR_ARM])
+    seen: set = set()
+    steps: List[Dict[str, Any]] = []
+    for cell in cells:
+        if cell.blocked_on is not None:
+            continue
+        config = _serving_config(cell, grid)
+        if config is None or config[4] is None or config in seen:
+            continue
+        seen.add(config)
+        spec = cell.spec
+        seq_tokens = int(config[4])
+        d_floor = demand_bytes(spec.model, concurrency=int(floor_concurrency), avg_seq_tokens=anchor)
+        d_class = _class_demand_bytes(d_floor, seq_tokens, anchor)
+        kv_dtype = ARM_KV_DTYPE.get(spec.arm) or "bf16"
+        if spec.topology == "tp":
+            r, tp, topology, split = grid.dist_budget_r, int(grid.dist_tp_size or 1), "tp", None
+        elif spec.topology == "pd":
+            r, tp, topology, split = grid.dist_budget_r, 1, "pd", grid.dist_pd_split
+        else:
+            r, tp, topology, split = float(spec.budget_r), int(grid.serving_tp), "single", None
+            if tp != 1:
+                topology = "tp"
+        plan = plan_budget(
+            model=spec.model, engine=spec.engine, r=float(r), demand=d_class,
+            kv_dtype=kv_dtype, tp=tp, topology=topology, pd_split=split,
+        )
+        steps.append({
+            "engine": spec.engine,
+            "budget_r": float(r),
+            "topology": spec.topology,
+            "max_model_len": request_cap_tokens(grid, seq_tokens),
+            "demand_class": {"seq_tokens": seq_tokens},
+            "budget_plan": json.loads(json.dumps(asdict(plan))),
+        })
+    return pool_shortfalls(steps, grid.max_model_len)
+
+
+# ---------------------------------------------------------------------------
+# Stage 0 registration preflight (gap triage 2026-10-09): what the plan
+# would refuse at stage 6, checked on the Mac before anything bills
+# ---------------------------------------------------------------------------
+
+
+def preflight_registration_check(
+    session: str,
+    *,
+    floor_avg_seq_tokens: Any,
+    rehearsal_n: Optional[int] = None,
+    query_manifests: Optional[Mapping[str, Any]] = None,
+    charter_datasets: Sequence[str] = (),
+    floor_concurrency: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Purpose: run, on the Mac at stage 0, every registration check the pod
+    plan (stage 6) would refuse on after the setup, validate and calibrate
+    stages have billed. The gap triage of 2026-10-09 found the registered S1
+    profile refused at stage 6 twice over: its 50-id manifests cannot supply
+    the registered per-row n (shortfall), and its F1 grid carries HotpotQA
+    while CHARTER_DATASETS stages three datasets.
+
+    Args:
+        session: the section 1 session id (``SESSION`` in the profile).
+        floor_avg_seq_tokens: the profile's FLOOR_AVG_SEQ_TOKENS (string or
+            int); must equal the registered anchor shape (ADR-0155).
+        rehearsal_n: REHEARSAL_N when set (ADR-0144); the rehearsal grid is
+            then the one checked, exactly as stage 6 derives it.
+        query_manifests: dataset -> manifest path (QUERY_MANIFESTS), resolved
+            paths; validated and coverage-checked like ``plan`` does.
+        charter_datasets: CHARTER_DATASETS (the datasets stage 3 stages);
+            empty skips the staging check. RULER is generated, never staged.
+        floor_concurrency: FLOOR_CONCURRENCY (the c the floor table is built
+            at); when given, every executable budgeted configuration's pool
+            is checked against max_model_len (MAX_MODEL_LEN_POOL_RULE) and
+            the shortfalls are returned under ``pool_shortfalls``.
+
+    Returns: {"session", "anchor_seq_tokens", "cells", "executable_cells",
+        "needs_lmcache" (an executable vLLM cell carries the LMCache
+        connector, so stage 4 must prove the module imports: S0F-57),
+        "pool_shortfalls": [record] (empty without floor_concurrency),
+        "problems": [str]} where an empty problems list is a pass.
+
+    Raises: nothing on a registration problem (recorded in ``problems``); a
+        programming error propagates.
+    """
+    problems: List[str] = []
+    try:
+        grid = get_session_grid(session)
+    except PlanError as exc:
+        return {
+            "session": session, "anchor_seq_tokens": None, "cells": 0,
+            "executable_cells": 0, "needs_lmcache": False, "problems": [str(exc)],
+        }
+    anchor = int(grid.demand_seq_tokens[DEMAND_ANCHOR_ARM])
+    if str(floor_avg_seq_tokens).strip() != str(anchor):
+        problems.append(
+            f"FLOOR_AVG_SEQ_TOKENS={floor_avg_seq_tokens} but session {session!r} registers "
+            f"{anchor} served tokens for the anchor arm {DEMAND_ANCHOR_ARM!r} ({DEMAND_CLASS_ADR}): "
+            f"the plan refuses a floor table sized on another shape; set FLOOR_AVG_SEQ_TOKENS={anchor}"
+        )
+    paths = {str(k): Path(v) for k, v in (query_manifests or {}).items()}
+    if rehearsal_n is not None:
+        try:
+            grid = rehearsal_grid(grid, n=rehearsal_n, datasets=frozenset(paths))
+        except PlanError as exc:
+            problems.append(str(exc))
+    if charter_datasets:
+        staged = set(charter_datasets) | {"ruler"}
+        unstaged = sorted(_grid_datasets(grid) - staged)
+        if unstaged:
+            problems.append(
+                f"session {session!r} carries dataset(s) {unstaged} that CHARTER_DATASETS "
+                f"{sorted(charter_datasets)} does not stage: stage 3 would never download them "
+                "and every cell of theirs would fail at stage 7"
+            )
+    cells = enumerate_cells(grid)
+    manifests: Dict[str, Dict[str, Any]] = {}
+    try:
+        manifests = _register_query_manifests(grid, paths)
+    except PlanError as exc:
+        problems.append(str(exc))
+    cells = [
+        replace(c, blocked_on=trunc_manifest_blocked_on(c.dataset))
+        if c.spec.arm == CORPUS_TRUNC_ARM and c.dataset not in manifests and c.blocked_on is None
+        else c
+        for c in cells
+    ]
+    try:
+        _check_manifest_coverage(grid, manifests, cells)
+    except PlanError as exc:
+        problems.append(str(exc))
+    executable = [c for c in cells if c.blocked_on is None]
+    needs_lmcache = any(
+        c.spec.engine == "vllm" and ARM_CONNECTOR.get(c.spec.arm) == "lmcache" for c in executable
+    )
+    shortfalls: List[Dict[str, Any]] = []
+    if floor_concurrency is not None:
+        shortfalls = mac_pool_shortfalls(grid, cells, int(floor_concurrency))
+        if shortfalls:
+            problems.append(_pool_shortfall_text(
+                shortfalls, f"session {session!r} at FLOOR_CONCURRENCY={int(floor_concurrency)}"
+            ))
+    return {
+        "session": session,
+        "anchor_seq_tokens": anchor,
+        "cells": len(cells),
+        "executable_cells": len(executable),
+        "needs_lmcache": needs_lmcache,
+        "pool_shortfalls": shortfalls,
+        "problems": problems,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Dress rehearsal of a registered session (2026-10-07, ADR-0144)
 # ---------------------------------------------------------------------------
 
@@ -2086,6 +2457,16 @@ def load_floor_table(path: Path) -> FloorTable:
                 problems.append(f"rows[{i}].{req}={value!r} must be a number")
                 bad = True
         if not bad:
+            pred = float(row["lambda_star_pred_rps"])
+            if not (math.isfinite(pred) and pred > 0):
+                problems.append(
+                    f"rows[{i}].lambda_star_pred_rps={row['lambda_star_pred_rps']!r} must be a "
+                    "positive finite rate (the P6 prediction divides every pressure cell's span)"
+                )
+                continue
+            if isinstance(row["demand_bytes"], float) or int(row["demand_bytes"]) < 1:
+                problems.append(f"rows[{i}].demand_bytes={row['demand_bytes']!r} must be an integer >= 1")
+                continue
             rows[float(row["r"])] = row
     shape: Dict[str, Optional[int]] = {}
     for key in ("avg_seq_tokens", "concurrency_target"):
@@ -2291,6 +2672,46 @@ def budget_plan_record(
 
 def _json_norm(value: Any) -> Any:
     return json.loads(json.dumps(value, sort_keys=True))
+
+
+def window_span_summary(cell_steps: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """ADR-0156 / S0F-68: the distribution of the executable pressure cells'
+    expected window spans (W / offered rate) against WINDOW_SPAN_FLOOR_S,
+    overall and per demand class; the header record the operator and the
+    master read before the GO. Pure: reads the steps' recorded spans."""
+    spans: List[Tuple[float, int]] = []
+    for s in cell_steps:
+        span = s.get("window_span_s_expected")
+        if s.get("family") in _PRESSURE_FAMILIES and s.get("blocked_on") is None and isinstance(span, (int, float)):
+            seq = (s.get("demand_class") or {}).get("seq_tokens")
+            spans.append((float(span), int(seq) if isinstance(seq, int) else 0))
+    values = sorted(v for v, _seq in spans)
+    by_class: Dict[str, Dict[str, Any]] = {}
+    for span, seq in spans:
+        rec = by_class.setdefault(str(seq), {"cells": 0, "below_floor": 0, "min_s": None})
+        rec["cells"] += 1
+        rec["below_floor"] += int(span < WINDOW_SPAN_FLOOR_S)
+        rec["min_s"] = span if rec["min_s"] is None else min(rec["min_s"], span)
+    median = None if not values else float(statistics.median(values))
+    return {
+        "finding": WINDOW_SPAN_FINDING,
+        "adr": TWO_ANCHOR_ADR,
+        "rule": "span_s = num_queries / offered_rate_rps (V3: W arrivals, one per prepared request)",
+        "floor_s": WINDOW_SPAN_FLOOR_S,
+        "floor_basis": "PROBE_WARMUP_S, the registered warm-up transient: a shorter window is all ramp",
+        "sampler_interval_s": TELEMETRY_SAMPLE_INTERVAL_S,
+        "executable_pressure_cells": len(values),
+        "below_floor": sum(1 for v in values if v < WINDOW_SPAN_FLOOR_S),
+        "min_s": values[0] if values else None,
+        "median_s": median,
+        "max_s": values[-1] if values else None,
+        "by_class": dict(sorted(by_class.items(), key=lambda kv: -int(kv[0]))),
+        "note": (
+            "a count, never a refusal: W is the registered per-row N (DECISION.md A1); "
+            "the dry window (75 s) is the live regime proof per serving configuration; "
+            "raising W, or a duration bound with replay, is the owner's decision"
+        ),
+    }
 
 
 #: _stale_plan_problems sentinel: "the caller did not pass the header floors"
@@ -3063,9 +3484,10 @@ def _relaunch_step(
         }
         if role_tp >= 2:
             env["CAGE_VLLM_TENSOR_PARALLEL"] = str(role_tp)
-        # Backlog A10: the uniform request-length cap, applied by the pd
+        # Backlog A10 / ADR-0158: the class request cap, applied by the pd
         # launcher to BOTH role instances (one env, frozen contract).
-        env[MAX_MODEL_LEN_ENV] = str(grid.max_model_len)
+        request_cap = request_cap_tokens(grid, seq_tokens)
+        env[MAX_MODEL_LEN_ENV] = str(request_cap)
         # Batch 2 W2: the proxy port the cells under this relaunch dial, and
         # the role ports the proxy's upstreams and the telemetry endpoints
         # above name (one table, exported, never left to the shell).
@@ -3077,7 +3499,7 @@ def _relaunch_step(
             "engine": engine,
             "model": model,
             "prefix_mode": "OFF" if prefix_off else "ON",
-            "max_model_len": grid.max_model_len,
+            "max_model_len": request_cap,
             # budget_r stays the CELL coordinate (None — DIST is the
             # topology overlay, not a pressure family); the pd byte budgets
             # ride the dedicated record + env.
@@ -3201,11 +3623,13 @@ def _relaunch_step(
                 "have BLOCKED these cells (driver invariant violated)"
             )
         env[mapping[0]] = mapping[1]
-    # Backlog A10: the uniform request-length cap rides EVERY relaunch of
+    # Backlog A10 / ADR-0158: the request-length cap rides EVERY relaunch of
     # BOTH engines (vLLM --max-model-len, SGLang --context-length), budget-
-    # free F1 relaunches included: a server launched without it would fall
-    # back to the pilot shell default 4096 and refuse every RULER request.
-    env[MAX_MODEL_LEN_ENV] = str(grid.max_model_len)
+    # free F1 relaunches included (they take the session cap): a server
+    # launched without it would fall back to the pilot shell default 4096 and
+    # refuse every RULER request. A budgeted relaunch takes its CLASS cap.
+    request_cap = request_cap_tokens(grid, seq_tokens)
+    env[MAX_MODEL_LEN_ENV] = str(request_cap)
     # Batch 2 W2: the launcher port, from the ONE table the cells under this
     # relaunch pin --api-base from (the launcher's shell default never
     # reaches a campaign server; the tp overlay rides the same launcher).
@@ -3216,7 +3640,7 @@ def _relaunch_step(
         "engine": engine,
         "model": model,
         "prefix_mode": "OFF" if prefix_off else "ON",
-        "max_model_len": grid.max_model_len,
+        "max_model_len": request_cap,
         "budget_r": budget_r,
         "budget_bytes": budget_bytes,
         "kv_dtype": kv_dtype,
@@ -3576,12 +4000,13 @@ def _stale_plan_problems(
     demand_class = step.get("demand_class")
     if spec.family in _PRESSURE_FAMILIES:
         if step.get("blocked_on") is None:
-            if rate_basis not in (LAMBDA_BASIS_RUNG, LAMBDA_BASIS_DERIVED):
+            if rate_basis not in (LAMBDA_BASIS_RUNG, LAMBDA_BASIS_SMALL, LAMBDA_BASIS_INTERPOLATED):
                 problems.append(
                     f"{label}: pressure cell {row!r} rate_basis is {rate_basis!r}; an "
-                    "executable cell offers a rung-calibrated lambda* "
-                    f"({RUNG_CALIBRATION_ADR}: the KV-bound prediction ran 3 to 6 times "
-                    "below capacity on the landing)" + stale
+                    "executable cell offers a rung-calibrated lambda* (measured on an "
+                    f"anchor or interpolated between the two, {RUNG_CALIBRATION_ADR}, "
+                    f"{TWO_ANCHOR_ADR}: the KV-bound prediction ran 3 to 6 times below "
+                    "capacity on the landing)" + stale
                 )
             if not isinstance(step.get("lambda_star_source"), dict):
                 problems.append(
@@ -3616,6 +4041,24 @@ def _stale_plan_problems(
                     f"{label}: pressure cell {row!r} carries --rate {got_rate!r}, the offered "
                     f"rate is {want_offered:.6g} ({RUNG_CALIBRATION_ADR})" + stale
                 )
+            # ADR-0156 / S0F-68: every pressure cell records W / offered rate
+            # and its floor verdict (a blocked cell on its labeled rate too),
+            # so both are re-derived here.
+            got_span = step.get("window_span_s_expected")
+            got_n = step.get("num_queries")
+            if isinstance(got_n, int) and not isinstance(got_n, bool) and want_offered > 0:
+                want_span = got_n / want_offered
+                if not isinstance(got_span, (int, float)) or isinstance(got_span, bool) or not math.isclose(float(got_span), want_span, rel_tol=1e-6):
+                    problems.append(
+                        f"{label}: pressure cell {row!r} window_span_s_expected={got_span!r} != "
+                        f"num_queries / offered rate = {want_span:.4g} s ({WINDOW_SPAN_FINDING})" + stale
+                    )
+                if step.get("window_span_below_floor") is not bool(want_span < WINDOW_SPAN_FLOOR_S):
+                    problems.append(
+                        f"{label}: pressure cell {row!r} window_span_below_floor="
+                        f"{step.get('window_span_below_floor')!r} disagrees with the registered "
+                        f"floor {WINDOW_SPAN_FLOOR_S:g} s ({WINDOW_SPAN_FINDING})" + stale
+                    )
         seq = demand_class.get("seq_tokens") if isinstance(demand_class, dict) else None
         if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
             problems.append(
@@ -3628,6 +4071,11 @@ def _stale_plan_problems(
                 f"{label}: cell {row!r} (family {spec.family!r}) carries a rate basis "
                 f"(lambda_star_rps={lambda_star!r}, rate_basis={rate_basis!r}); only "
                 "pressure cells offer a rate" + stale
+            )
+        if step.get("window_span_s_expected") is not None or step.get("window_span_below_floor") is not None:
+            problems.append(
+                f"{label}: cell {row!r} (family {spec.family!r}) carries a window span "
+                f"({WINDOW_SPAN_FINDING}: only pressure cells have one)" + stale
             )
         budgeted_cell = spec.budget_r is not None or spec.topology in ("tp", "pd")
         if budgeted_cell and not isinstance(demand_class, dict):
@@ -4036,6 +4484,7 @@ def _cell_step(
             "violated"
         )
     offered_rate: Optional[float] = None
+    window_span: Optional[float] = None
     lambda_star: Optional[float] = None
     lambda_source: Optional[Dict[str, Any]] = None
     rate_basis: Optional[str] = None
@@ -4098,35 +4547,33 @@ def _cell_step(
             ]
         else:
             cal = (rungs or {}).get(spec.engine)
-            gold = cal.lambda_at(spec.budget_r) if cal is not None else None
-            if gold is None:
+            try:
+                resolved = (
+                    rung_lambda_for_class(cal, spec.budget_r, seq_tokens, anchor_tokens)
+                    if cal is not None
+                    else None
+                )
+            except PlanError:
+                # Fable review 2026-10-09 LOW 3: a class outside the two anchors
+                # refuses an EXECUTABLE cell (never extrapolate); a blocked one
+                # never runs and takes the P6 line below like any blocked cell.
+                if cell.blocked_on is None:
+                    raise
+                resolved = None
+            if resolved is None:
                 if cell.blocked_on is None:
                     raise PlanError(
                         f"cell {spec.to_row_key()} is executable but no rung "
-                        f"calibration covers ({spec.engine}, r={spec.budget_r:g}) "
-                        "(_register_rung_calibrations should have refused; driver "
-                        "invariant violated)"
+                        f"calibration covers ({spec.engine}, r={spec.budget_r:g}, class "
+                        f"{seq_tokens} tokens) (_register_rung_calibrations should have "
+                        "refused; driver invariant violated)"
                     )
                 # A BLOCKED cell never runs: its rate is the P6 prediction,
                 # labeled as such, so the plan stays reviewable (debt visible).
                 lambda_star = lambda_kv_pred
                 rate_basis = f"blocked cell, never run: {lambda_kv_pred_basis}"
             else:
-                ratio = anchor_tokens / seq_tokens
-                lambda_star = gold * ratio
-                rate_basis = (
-                    LAMBDA_BASIS_RUNG if spec.arm == DEMAND_ANCHOR_ARM else LAMBDA_BASIS_DERIVED
-                )
-                lambda_source = {
-                    "engine": spec.engine,
-                    "r": spec.budget_r,
-                    "gold_lambda_star_qps": gold,
-                    "artifact_sha256": cal.sha256,
-                    "seq_tokens_gold": anchor_tokens,
-                    "seq_tokens_class": seq_tokens,
-                    "ratio": ratio,
-                    "adr": RUNG_CALIBRATION_ADR,
-                }
+                lambda_star, rate_basis, lambda_source = resolved
             offered_rate = spec.rate_frac * lambda_star
             # V3: the window is W arrivals, one per prepared request (the
             # --num-queries above), never a duration: the open-loop generator's
@@ -4141,6 +4588,9 @@ def _cell_step(
                 "--arrival-count",
                 str(num_queries),
             ]
+            # ADR-0156 / S0F-68: the span this W-arrival window is expected to
+            # cover at its offered rate, recorded beside the floor verdict.
+            window_span = num_queries / offered_rate
     env = _cell_identity_env(spec)
     if spec.retriever != "none":
         # Backlog A5: the Decision 3B distractor pool size, BEHAVIOR (not
@@ -4222,6 +4672,11 @@ def _cell_step(
         "lambda_kv_pred_rps": lambda_kv_pred,
         "lambda_kv_pred_basis": lambda_kv_pred_basis,
         "rate_basis": rate_basis,
+        # ADR-0156 / S0F-68: W / offered rate on a pressure cell (null
+        # elsewhere, the ladder cell included: its rate is set per step) and
+        # whether it sits below WINDOW_SPAN_FLOOR_S (null when no span).
+        "window_span_s_expected": window_span,
+        "window_span_below_floor": None if window_span is None else bool(window_span < WINDOW_SPAN_FLOOR_S),
         # ADR-0155: the demand class (served sequence tokens) of a budgeted cell.
         "demand_class": demand_class,
         # Batch 2 W4: the record of the relaunch this cell runs under (the
@@ -4491,10 +4946,13 @@ def _register_calibrations(
 
 @dataclass(frozen=True)
 class RungCalibration:
-    """Validated ``cage-rung-calibration-v1`` artifact of ONE engine: the
-    measured lambda* per budget rung (ESTIMATED rungs carry a value; every
+    """Validated ``cage-rung-calibration-v2`` artifact of ONE engine: the
+    measured lambda* per budget rung of the ANCHOR class (gold-fresh; every
     rung's label is kept so a refusal can name LADDER_EXHAUSTED or
-    NONE_SUSTAINABLE) plus the provenance the plan header records."""
+    NONE_SUSTAINABLE) and, when the engine serves a class below the anchor,
+    the same table for its SMALLEST executable class (ADR-0156: the second
+    anchor of the log-log interpolation), plus the provenance the plan header
+    records. ``small_*`` stay empty on a one-class artifact."""
 
     path: Path
     sha256: str
@@ -4503,26 +4961,85 @@ class RungCalibration:
     session: str
     lambdas: Dict[float, float]
     labels: Dict[float, str]
+    anchor_seq_tokens: Optional[int] = None
+    small_seq_tokens: Optional[int] = None
+    small_arm: Optional[str] = None
+    small_prefix_mode: Optional[str] = None
+    small_lambdas: Dict[float, float] = field(default_factory=dict)
+    small_labels: Dict[float, str] = field(default_factory=dict)
+
+    @staticmethod
+    def _at(table: Mapping[float, Any], r: float) -> Optional[Any]:
+        for key, value in table.items():
+            if math.isclose(key, r, rel_tol=0.0, abs_tol=1e-9):
+                return value
+        return None
 
     def lambda_at(self, r: float) -> Optional[float]:
-        for key, value in self.lambdas.items():
-            if math.isclose(key, r, rel_tol=0.0, abs_tol=1e-9):
-                return value
-        return None
+        return self._at(self.lambdas, r)
 
     def label_at(self, r: float) -> Optional[str]:
-        for key, value in self.labels.items():
-            if math.isclose(key, r, rel_tol=0.0, abs_tol=1e-9):
-                return value
-        return None
+        return self._at(self.labels, r)
+
+    def small_lambda_at(self, r: float) -> Optional[float]:
+        return self._at(self.small_lambdas, r)
+
+    def small_label_at(self, r: float) -> Optional[str]:
+        return self._at(self.small_labels, r)
+
+
+def _parse_rung_table(
+    rungs: Any, where: str, problems: List[str]
+) -> Tuple[Dict[float, float], Dict[float, str]]:
+    """One ``rungs`` table (r -> rung record) of the artifact: keys parse as
+    the rung r, ``r`` agrees with its key, every label is a non-empty string
+    and ONLY an ESTIMATED rung carries a finite lambda_star_qps > 0."""
+    lambdas: Dict[float, float] = {}
+    labels: Dict[float, str] = {}
+    if not isinstance(rungs, dict) or not rungs:
+        problems.append(f"{where} must be a non-empty mapping r -> rung record")
+        return lambdas, labels
+    for key, rec in rungs.items():
+        try:
+            r = float(key)
+        except (TypeError, ValueError):
+            problems.append(f"{where} key {key!r} does not parse as a budget ratio")
+            continue
+        if not isinstance(rec, dict):
+            problems.append(f"{where}[{key!r}] is not an object")
+            continue
+        if not isinstance(rec.get("r"), (int, float)) or isinstance(rec.get("r"), bool) or not math.isclose(float(rec["r"]), r, rel_tol=0.0, abs_tol=1e-9):
+            problems.append(f"{where}[{key!r}].r={rec.get('r')!r} disagrees with its key")
+        label = rec.get("label")
+        if not isinstance(label, str) or not label:
+            problems.append(f"{where}[{key!r}].label={label!r} must be a non-empty string")
+            continue
+        labels[r] = label
+        value = rec.get("lambda_star_qps")
+        if label == "ESTIMATED":
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                problems.append(
+                    f"{where}[{key!r}] is ESTIMATED but lambda_star_qps={value!r} is not a finite number > 0"
+                )
+            else:
+                lambdas[r] = float(value)
+        elif value is not None:
+            problems.append(
+                f"{where}[{key!r}] has label {label!r} but carries lambda_star_qps={value!r} "
+                "(labels are honest: only ESTIMATED carries a value)"
+            )
+    return lambdas, labels
 
 
 def load_rung_calibration(path: Path) -> RungCalibration:
     """Load + validate ONE rung-calibration artifact (fail closed): the
-    schema, the cal-v2 procedure version, ``confirmatory: false``, a runner
-    engine id (normalized through ENGINE_OF_BACKEND, the oracle refused), the
-    model and session, and a non-empty ``rungs`` mapping whose keys parse as
-    the rung r and whose ESTIMATED entries carry a finite lambda_star_qps > 0.
+    schema (v2; a v1 artifact predates the second anchor and refuses), the
+    cal-v2 procedure version, ``confirmatory: false``, a runner engine id
+    (normalized through ENGINE_OF_BACKEND, the oracle refused), the model and
+    session, the anchor ``rungs`` table, and the optional ``classes`` block
+    (ADR-0156): one ``anchor`` entry whose table equals ``rungs`` and whose
+    ``seq_tokens`` is the anchor shape, and at most one ``smallest`` entry
+    (arm, prefix mode, a shape below the anchor, its own rungs table).
     """
     path = Path(path)
     if not path.is_file():
@@ -4540,7 +5057,8 @@ def load_rung_calibration(path: Path) -> RungCalibration:
         raise PlanError(
             f"rung calibration artifact {path} schema is "
             f"{doc.get('schema') if isinstance(doc, dict) else type(doc).__name__!r}, "
-            f"expected {RUNG_CALIBRATION_SCHEMA!r}"
+            f"expected {RUNG_CALIBRATION_SCHEMA!r} (a v1 artifact predates the second "
+            f"anchor of {TWO_ANCHOR_ADR}: re-run calibrate-rungs)"
         )
     problems: List[str] = []
     if doc.get("procedure_version") != PROCEDURE_VERSION:
@@ -4562,41 +5080,66 @@ def load_rung_calibration(path: Path) -> RungCalibration:
     session = doc.get("session")
     if not isinstance(session, str) or session not in SESSIONS:
         problems.append(f"session {session!r} is not a §1 session ({sorted(SESSIONS)})")
-    rungs = doc.get("rungs")
-    lambdas: Dict[float, float] = {}
-    labels: Dict[float, str] = {}
-    if not isinstance(rungs, dict) or not rungs:
-        problems.append("rungs must be a non-empty mapping r -> rung record")
-    else:
-        for key, rec in rungs.items():
-            try:
-                r = float(key)
-            except (TypeError, ValueError):
-                problems.append(f"rungs key {key!r} does not parse as a budget ratio")
-                continue
-            if not isinstance(rec, dict):
-                problems.append(f"rungs[{key!r}] is not an object")
-                continue
-            if not isinstance(rec.get("r"), (int, float)) or isinstance(rec.get("r"), bool) or not math.isclose(float(rec["r"]), r, rel_tol=0.0, abs_tol=1e-9):
-                problems.append(f"rungs[{key!r}].r={rec.get('r')!r} disagrees with its key")
-            label = rec.get("label")
-            if not isinstance(label, str) or not label:
-                problems.append(f"rungs[{key!r}].label={label!r} must be a non-empty string")
-                continue
-            labels[r] = label
-            value = rec.get("lambda_star_qps")
-            if label == "ESTIMATED":
-                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
-                    problems.append(
-                        f"rungs[{key!r}] is ESTIMATED but lambda_star_qps={value!r} is not a finite number > 0"
-                    )
+    lambdas, labels = _parse_rung_table(doc.get("rungs"), "rungs", problems)
+    anchor_tokens = doc.get("anchor_seq_tokens")
+    if anchor_tokens is not None and (
+        isinstance(anchor_tokens, bool) or not isinstance(anchor_tokens, int) or anchor_tokens < 1
+    ):
+        problems.append(f"anchor_seq_tokens={anchor_tokens!r} must be an integer >= 1")
+        anchor_tokens = None
+    small_seq: Optional[int] = None
+    small_arm: Optional[str] = None
+    small_prefix: Optional[str] = None
+    small_lambdas: Dict[float, float] = {}
+    small_labels: Dict[float, str] = {}
+    classes = doc.get("classes")
+    if classes is not None:
+        if not isinstance(classes, dict):
+            problems.append("classes must be a mapping seq_tokens -> class record")
+        else:
+            roles: Dict[str, str] = {}
+            for key, rec in classes.items():
+                where = f"classes[{key!r}]"
+                if not isinstance(rec, dict):
+                    problems.append(f"{where} is not an object")
+                    continue
+                role = rec.get("role")
+                if role not in ("anchor", "smallest"):
+                    problems.append(f"{where}.role={role!r} must be 'anchor' or 'smallest'")
+                    continue
+                if role in roles:
+                    problems.append(f"classes carries two {role!r} entries ({roles[role]!r}, {key!r})")
+                    continue
+                roles[role] = str(key)
+                seq = rec.get("seq_tokens")
+                if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1 or str(seq) != str(key):
+                    problems.append(f"{where}.seq_tokens={seq!r} must be the integer >= 1 the key names")
+                    seq = None
+                c_lambdas, c_labels = _parse_rung_table(rec.get("rungs"), f"{where}.rungs", problems)
+                if role == "anchor":
+                    if (c_lambdas, c_labels) != (lambdas, labels):
+                        problems.append(f"{where} (the anchor) differs from the top-level rungs table")
+                    if seq is not None:
+                        if anchor_tokens is None:
+                            anchor_tokens = seq
+                        elif seq != anchor_tokens:
+                            problems.append(
+                                f"{where}.seq_tokens={seq} disagrees with anchor_seq_tokens={anchor_tokens}"
+                            )
                 else:
-                    lambdas[r] = float(value)
-            elif value is not None:
-                problems.append(
-                    f"rungs[{key!r}] has label {label!r} but carries lambda_star_qps={value!r} "
-                    "(labels are honest: only ESTIMATED carries a value)"
-                )
+                    arm = rec.get("arm")
+                    if not isinstance(arm, str) or not arm.strip():
+                        problems.append(f"{where}.arm={arm!r} must name the smallest class's arm")
+                    prefix = rec.get("prefix_mode")
+                    if prefix not in ("ON", "OFF"):
+                        problems.append(f"{where}.prefix_mode={prefix!r} must be 'ON' or 'OFF'")
+                    small_seq, small_arm, small_prefix = seq, (arm if isinstance(arm, str) else None), (prefix if isinstance(prefix, str) else None)
+                    small_lambdas, small_labels = c_lambdas, c_labels
+    if small_seq is not None and anchor_tokens is not None and small_seq >= anchor_tokens:
+        problems.append(
+            f"the smallest class ({small_seq} tokens) is not below the anchor ({anchor_tokens} tokens) "
+            f"({TWO_ANCHOR_ADR}: the anchors are the largest and the smallest class)"
+        )
     if problems:
         raise PlanError(f"rung calibration artifact {path}: " + "; ".join(problems))
     assert engine is not None and isinstance(model, str) and isinstance(session, str)
@@ -4608,7 +5151,113 @@ def load_rung_calibration(path: Path) -> RungCalibration:
         session=session,
         lambdas=lambdas,
         labels=labels,
+        anchor_seq_tokens=anchor_tokens,
+        small_seq_tokens=small_seq,
+        small_arm=small_arm,
+        small_prefix_mode=small_prefix,
+        small_lambdas=small_lambdas,
+        small_labels=small_labels,
     )
+
+
+def interpolation_alpha(lambda_gold: float, s_gold: int, lambda_small: float, s_small: int) -> float:
+    """ADR-0156: the log-log slope through the two anchors,
+    alpha = ln(lambda_m / lambda_g) / ln(s_g / s_m); 1 is the KV-bound limit.
+    Refuses (PlanError) non-positive rates or a small class not below the anchor."""
+    if not (lambda_gold > 0 and lambda_small > 0 and math.isfinite(lambda_gold) and math.isfinite(lambda_small)):
+        raise PlanError(f"interpolation needs two positive finite rates, got {lambda_gold!r} and {lambda_small!r}")
+    if not (0 < s_small < s_gold):
+        raise PlanError(f"interpolation needs 0 < s_small={s_small} < s_gold={s_gold} ({TWO_ANCHOR_ADR})")
+    return math.log(lambda_small / lambda_gold) / math.log(s_gold / s_small)
+
+
+def alpha_tolerance(s_gold: int, s_small: int) -> float:
+    """Fable review 2026-10-09 HIGH 1: the two ladders resolve lambda* to one
+    bisected step, (PROBE_LADDER_FACTOR - 1) / 2**PROBE_BISECT_STEPS of the
+    rate (7.5 percent at 1.3 and 2 steps). Two classes with the SAME capacity
+    (the scheduler-bound regime at loose r, S0F-70) can therefore read a
+    small-class lambda* one step BELOW the anchor's by measurement
+    resolution alone, a slope of ln(1 / (1 + step)) / ln(s_g / s_m). This is
+    the magnitude of that slope: alpha in [-tol, 0) is measurement noise
+    around a flat line and clamps to 0; below -tol one ladder is defective."""
+    step = (PROBE_LADDER_FACTOR - 1.0) / (2 ** PROBE_BISECT_STEPS)
+    return math.log(1.0 + step) / math.log(s_gold / s_small)
+
+
+def resolve_alpha(
+    lambda_gold: float, s_gold: int, lambda_small: float, s_small: int, *, where: str = ""
+) -> Tuple[float, float, bool]:
+    """(alpha used, alpha raw, clamped): the ADR-0156 slope with the
+    resolution rule of ``alpha_tolerance``. Refuses (PlanError) a raw slope
+    below -tol: a smaller sequence cannot sustain LESS under the KV, compute
+    or request-cap bound beyond the ladders' own resolution, so one ladder is
+    defective (the SGLang thinking rows of S0F-59 are one cause)."""
+    raw = interpolation_alpha(lambda_gold, s_gold, lambda_small, s_small)
+    tol = alpha_tolerance(s_gold, s_small)
+    if raw < -tol:
+        raise PlanError(
+            f"{where}the smallest class ({s_small} tokens) sustained {lambda_small:.4g} rps, "
+            f"below the anchor's {lambda_gold:.4g} rps (alpha {raw:.3f} < 0 beyond the ladders' "
+            f"resolution, tolerance {tol:.3f}): a smaller sequence cannot sustain less under the "
+            "KV, compute or request-cap bound, so one ladder is defective (the SGLang thinking "
+            f"rows of S0F-59 are one cause); re-calibrate ({TWO_ANCHOR_ADR})"
+        )
+    if raw < 0.0:
+        return 0.0, raw, True
+    return raw, raw, False
+
+
+def rung_lambda_for_class(
+    cal: RungCalibration, r: float, seq_tokens: int, anchor_tokens: int
+) -> Optional[Tuple[float, str, Dict[str, Any]]]:
+    """The lambda* a pressure cell of ``seq_tokens`` offers a fraction of at
+    rung ``r`` (ADR-0154 and ADR-0156): the anchor's measured value on the
+    anchor class, the smallest class's measured value on that class, and the
+    log-log interpolation between the two anchors for every class in between
+    (never outside: PlanError). Returns (lambda*, basis label, source record)
+    or None when the artifact lacks the rung the class needs (the caller
+    decides: an executable cell refuses, a blocked one records the P6 line)."""
+    gold = cal.lambda_at(r)
+    if gold is None:
+        return None
+    source: Dict[str, Any] = {
+        "engine": cal.engine,
+        "r": r,
+        "gold_lambda_star_qps": gold,
+        "artifact_sha256": cal.sha256,
+        "seq_tokens_gold": anchor_tokens,
+        "seq_tokens_class": seq_tokens,
+        "adr": RUNG_CALIBRATION_ADR,
+    }
+    if seq_tokens == anchor_tokens:
+        source["alpha"] = None
+        return gold, LAMBDA_BASIS_RUNG, source
+    small = cal.small_lambda_at(r)
+    s_small = cal.small_seq_tokens
+    if small is None or s_small is None:
+        return None
+    alpha, alpha_raw, clamped = resolve_alpha(
+        gold, anchor_tokens, small, s_small, where=f"engine {cal.engine!r} at r={r:g}: "
+    )
+    source.update({
+        "small_lambda_star_qps": small,
+        "seq_tokens_small": s_small,
+        "small_arm": cal.small_arm,
+        "alpha": alpha,
+        "alpha_raw": alpha_raw,
+        "alpha_clamped": clamped,
+        "alpha_tolerance": alpha_tolerance(anchor_tokens, s_small),
+        "kv_bound_alpha": 1.0,
+        "two_anchor_adr": TWO_ANCHOR_ADR,
+    })
+    if seq_tokens == s_small:
+        return small, LAMBDA_BASIS_SMALL, source
+    if not (s_small < seq_tokens < anchor_tokens):
+        raise PlanError(
+            f"class {seq_tokens} tokens lies outside the anchors [{s_small}, {anchor_tokens}] of "
+            f"engine {cal.engine!r} at r={r:g}: the interpolation never extrapolates ({TWO_ANCHOR_ADR})"
+        )
+    return gold * (anchor_tokens / seq_tokens) ** alpha, LAMBDA_BASIS_INTERPOLATED, source
 
 
 def _register_rung_calibrations(
@@ -4618,22 +5267,32 @@ def _register_rung_calibrations(
     anchor_tokens: int,
 ) -> Tuple[Dict[str, Any], Dict[str, RungCalibration]]:
     """ADR-0154: every EXECUTABLE pressure cell's (engine, r) needs a measured
-    lambda* (an ESTIMATED rung in that engine's artifact) before the plan is
-    built; a plan whose rates rest on the floor table's assumed service time
-    is the 2026-10-08 landing. Returns (header record, engine -> artifact)."""
+    anchor lambda* (an ESTIMATED rung in that engine's artifact) before the
+    plan is built; a plan whose rates rest on the floor table's assumed service
+    time is the 2026-10-08 landing. ADR-0156: an engine serving a demand class
+    below the anchor also needs the SMALLEST executable class's ladder (the
+    artifact's ``smallest`` entry must be that class), ESTIMATED at every rung
+    a non-anchor class is carried at, and the slope alpha through the two
+    anchors must be >= 0 at each (a smaller sequence sustaining less is a
+    measurement defect, refused). Returns (header record, engine -> artifact)."""
     required: Dict[str, set] = {}
+    below_anchor: Dict[str, Dict[int, set]] = {}
     for cell in cells:
         spec = cell.spec
         if cell.blocked_on is None and spec.engine != "hf" and spec.family in _PRESSURE_FAMILIES:
             assert spec.budget_r is not None
-            required.setdefault(spec.engine, set()).add(float(spec.budget_r))
+            r = float(spec.budget_r)
+            required.setdefault(spec.engine, set()).add(r)
+            seq = demand_seq_tokens(grid, spec)
+            if seq != anchor_tokens:
+                below_anchor.setdefault(spec.engine, {}).setdefault(seq, set()).add(r)
     registered = {str(k): Path(v) for k, v in (rung_calibrations or {}).items()}
     fix = (
         f"run scripts/3_run/run_campaign.py calibrate-rungs --session {grid.session} "
         "--engine <engine> --floor-table <table> --calibration <engine cal-v2 floor> "
         "--out <path> on the pod (every engine with executable pressure cells), then "
         f"plan --rung-calibration <engine>=<path> ({RUNG_CALIBRATION_FINDING}, "
-        f"{RUNG_CALIBRATION_ADR})"
+        f"{RUNG_CALIBRATION_ADR}, {TWO_ANCHOR_ADR})"
     )
     unknown = sorted(set(registered) - _session_engines(grid))
     if unknown:
@@ -4654,54 +5313,126 @@ def _register_rung_calibrations(
     header_artifacts: Dict[str, Dict[str, Any]] = {}
     for engine in sorted(registered):
         cal = load_rung_calibration(registered[engine])
+        where = f"--rung-calibration {engine}={cal.path}"
         if cal.engine != engine:
-            raise PlanError(
-                f"--rung-calibration {engine}={cal.path}: the artifact describes engine "
-                f"{cal.engine!r}; refusing a swapped rung table"
-            )
+            raise PlanError(f"{where}: the artifact describes engine {cal.engine!r}; refusing a swapped rung table")
         if cal.model not in accepted_models:
             raise PlanError(
-                f"--rung-calibration {engine}={cal.path}: the artifact is for model "
-                f"{cal.model!r} but session {grid.session!r} runs {grid.model!r}"
+                f"{where}: the artifact is for model {cal.model!r} but session {grid.session!r} runs {grid.model!r}"
             )
         if cal.session != grid.session:
             raise PlanError(
-                f"--rung-calibration {engine}={cal.path}: the artifact was measured for "
-                f"session {cal.session!r}, not {grid.session!r} (another grid, another "
-                "workload)"
+                f"{where}: the artifact was measured for session {cal.session!r}, not "
+                f"{grid.session!r} (another grid, another workload)"
+            )
+        if cal.anchor_seq_tokens is not None and cal.anchor_seq_tokens != anchor_tokens:
+            raise PlanError(
+                f"{where}: the artifact's anchor class is {cal.anchor_seq_tokens} tokens but the "
+                f"session registers {anchor_tokens} for {DEMAND_ANCHOR_ARM!r} ({DEMAND_CLASS_ADR})"
             )
         missing_rungs = [
             r for r in sorted(required.get(engine, ()), reverse=True) if cal.lambda_at(r) is None
         ]
         if missing_rungs:
-            named = ", ".join(
-                f"r={r:g} ({cal.label_at(r) or 'absent'})" for r in missing_rungs
-            )
+            named = ", ".join(f"r={r:g} ({cal.label_at(r) or 'absent'})" for r in missing_rungs)
             raise PlanError(
-                f"--rung-calibration {engine}={cal.path}: no ESTIMATED lambda* for "
-                f"{named}; every executable pressure rung needs one (LADDER_EXHAUSTED: "
-                "extend the ladder; NONE_SUSTAINABLE: lower the start rate; absent: "
-                f"calibrate the rung); {fix}"
+                f"{where}: no ESTIMATED lambda* for {named}; every executable pressure rung "
+                "needs one (LADDER_EXHAUSTED: extend the ladder; NONE_SUSTAINABLE: lower the "
+                f"start rate; absent: calibrate the rung); {fix}"
             )
+        classes = below_anchor.get(engine, {})
+        alpha: Dict[float, float] = {}
+        alpha_clamped: List[float] = []
+        if classes:
+            s_min = min(classes)
+            if cal.small_seq_tokens is None:
+                raise PlanError(
+                    f"{where}: the artifact carries no smallest-class ladder but engine {engine!r} "
+                    f"serves {len(classes)} demand class(es) below the anchor ({sorted(classes)} tokens); "
+                    f"the second anchor is its smallest executable class, {s_min} tokens "
+                    f"({TWO_ANCHOR_ADR}); {fix}"
+                )
+            if cal.small_seq_tokens != s_min:
+                raise PlanError(
+                    f"{where}: the artifact's smallest class is {cal.small_seq_tokens} tokens "
+                    f"({cal.small_arm}) but the smallest executable class of engine {engine!r} on "
+                    f"this grid is {s_min} tokens ({TWO_ANCHOR_ADR}: re-calibrate on this grid)"
+                )
+            rungs_small = sorted(set().union(*classes.values()), reverse=True)
+            missing_small = [r for r in rungs_small if cal.small_lambda_at(r) is None]
+            if missing_small:
+                named = ", ".join(f"r={r:g} ({cal.small_label_at(r) or 'absent'})" for r in missing_small)
+                raise PlanError(
+                    f"{where}: the smallest class ({s_min} tokens, {cal.small_arm}) has no ESTIMATED "
+                    f"lambda* for {named}; every rung a class below the anchor is carried at needs "
+                    f"both anchors ({TWO_ANCHOR_ADR}); {fix}"
+                )
+            # Fable review 2026-10-09 LOW 6: the slope is checked at EVERY rung
+            # both anchors are ESTIMATED at (a blocked cell interpolates at any
+            # of them), not only where an executable class is carried.
+            rungs_check = sorted(
+                set(rungs_small) | {r for r in cal.small_lambdas if cal.lambda_at(r) is not None},
+                reverse=True,
+            )
+            for r in rungs_check:
+                lam_g = cal.lambda_at(r)
+                lam_m = cal.small_lambda_at(r)
+                assert lam_g is not None and lam_m is not None
+                a, _raw, clamped = resolve_alpha(
+                    lam_g, anchor_tokens, lam_m, s_min, where=f"{where}: at r={r:g} "
+                )
+                alpha[r] = a
+                if clamped:
+                    alpha_clamped.append(r)
         artifacts[engine] = cal
         header_artifacts[engine] = {
             "path": str(cal.path.resolve()),
             "sha256": cal.sha256,
             "model": cal.model,
             "session": cal.session,
+            "anchor_seq_tokens": cal.anchor_seq_tokens,
             "rungs": {f"{r:g}": lam for r, lam in sorted(cal.lambdas.items(), reverse=True)},
             "labels": {f"{r:g}": label for r, label in sorted(cal.labels.items(), reverse=True)},
+            "small_class": (
+                None
+                if cal.small_seq_tokens is None
+                else {
+                    "seq_tokens": cal.small_seq_tokens,
+                    "arm": cal.small_arm,
+                    "prefix_mode": cal.small_prefix_mode,
+                    "rungs": {f"{r:g}": lam for r, lam in sorted(cal.small_lambdas.items(), reverse=True)},
+                    "labels": {f"{r:g}": label for r, label in sorted(cal.small_labels.items(), reverse=True)},
+                }
+            ),
+            "alpha": {f"{r:g}": a for r, a in sorted(alpha.items(), reverse=True)},
+            # rungs whose raw slope sat in [-tolerance, 0) and reads as 0 (flat)
+            "alpha_clamped": [f"{r:g}" for r in sorted(alpha_clamped, reverse=True)],
+            "alpha_tolerance": (
+                None if cal.small_seq_tokens is None
+                else alpha_tolerance(anchor_tokens, cal.small_seq_tokens)
+            ),
         }
     header = {
         "schema": RUNG_CALIBRATION_SCHEMA,
         "procedure_version": PROCEDURE_VERSION,
         "adr": RUNG_CALIBRATION_ADR,
+        "two_anchor_adr": TWO_ANCHOR_ADR,
         "finding": RUNG_CALIBRATION_FINDING,
         "basis_gold": LAMBDA_BASIS_RUNG,
-        "basis_derived": LAMBDA_BASIS_DERIVED,
+        "basis_small": LAMBDA_BASIS_SMALL,
+        "basis_interpolated": LAMBDA_BASIS_INTERPOLATED,
+        "interpolation": (
+            "lambda(s) = lambda_g x (s_g / s)^alpha with alpha = ln(lambda_m / lambda_g) / "
+            "ln(s_g / s_m) per (engine, r); the anchors are the largest (gold-fresh) and the "
+            "smallest executable class, so no class is extrapolated; alpha = 1 is the KV-bound limit"
+        ),
         "anchor_arm": DEMAND_ANCHOR_ARM,
         "anchor_seq_tokens": anchor_tokens,
         "required_rungs": {e: sorted(rs, reverse=True) for e, rs in sorted(required.items())},
+        "classes_below_anchor": {
+            e: {str(seq): sorted(rs, reverse=True) for seq, rs in sorted(by_class.items())}
+            for e, by_class in sorted(below_anchor.items())
+        },
         "artifacts": header_artifacts,
     }
     return header, artifacts
@@ -4952,6 +5683,12 @@ def build_plan(
 
     cell_steps = [s for s in steps if s["kind"] == "cell"]
     dry_steps = [s for s in steps if s["kind"] == "dry_window"]
+    window_spans = window_span_summary(cell_steps)
+    # Gap triage 2026-10-09 C1: a pool below one max_model_len request fails
+    # at engine start on the pod; refused HERE, with every offender listed.
+    shortfalls = pool_shortfalls([s for s in steps if s["kind"] == "relaunch"], grid.max_model_len)
+    if shortfalls:
+        raise PlanError(_pool_shortfall_text(shortfalls, f"plan of session {session!r}"))
     # F5a invariant: distinct row keys mint distinct namespaces (a short-sha
     # collision would silently share cache entries between two cells).
     namespace_owner: Dict[str, str] = {}
@@ -5070,6 +5807,18 @@ def build_plan(
             "max_model_len": grid.max_model_len,
             "max_model_len_env": MAX_MODEL_LEN_ENV,
             "max_model_len_backlog": "A10",
+            # ADR-0158: the per-class request cap every budgeted relaunch of
+            # this session carries (a budget-free one carries max_model_len);
+            # re-checked per relaunch by load_plan.
+            "request_caps": {
+                str(seq): request_cap_tokens(grid, seq)
+                for seq in sorted(set(grid.demand_seq_tokens.values()) | set(grid.corpus_trunc_demand_seq_tokens.values()), reverse=True)
+            },
+            "request_cap_rule": REQUEST_CAP_RULE,
+            "request_cap_adr": REQUEST_CAP_ADR,
+            "request_cap_served_max_tokens": {
+                str(k): v for k, v in sorted(grid.demand_class_max_served_tokens.items(), reverse=True)
+            },
             # Batch 2 W2: the ONE port table every relaunch's launcher env
             # and every server cell's --api-base derive from (mirrors the
             # frozen launchers' defaults); re-checked per relaunch and per
@@ -5127,6 +5876,10 @@ def build_plan(
                 [*dry_window_key(s["serving"], s["demand_class"]), s["budget_r"]] for s in dry_steps
             ],
         },
+        # ADR-0156 / S0F-68: the expected spans of the executable pressure
+        # windows (W / offered rate) against the registered floor; a count the
+        # operator reads before the GO, never a refusal (W is registered).
+        "window_spans": window_spans,
         # §6.4 anchor fine grid registration (null on non-anchor sessions).
         "fine_grid": (
             None
@@ -5232,6 +5985,9 @@ _CELL_STEP_KEYS = (
     "lambda_star_source",
     "lambda_kv_pred_rps",
     "rate_basis",
+    # ADR-0156 / S0F-68: the window span audit on pressure cells (null elsewhere).
+    "window_span_s_expected",
+    "window_span_below_floor",
 )
 #: ADR-0153: the dry window step (one per engine and demand class).
 _DRY_STEP_KEYS = (
@@ -5287,11 +6043,13 @@ _RELAUNCH_STEP_KEYS = (
 
 
 def _stale_relaunch_problems(
-    step: Mapping[str, Any], label: str, header_max_model_len: int
+    step: Mapping[str, Any], label: str, header_max_model_len: int,
+    header_request_caps: Optional[Mapping[str, Any]] = None,
 ) -> List[str]:
-    """load_plan's fail-closed per-relaunch check (backlog A10): the
-    ``max_model_len`` record is a positive integer equal to the header's
-    (ONE value per session, the uniform-regime rule) and the env carries
+    """load_plan's fail-closed per-relaunch check (backlog A10, ADR-0158): the
+    ``max_model_len`` record is a positive integer equal to the header's cap
+    for the relaunch's demand class (``serving_shapes.request_caps``; the
+    session cap on a budget-free relaunch) and the env carries
     MAX_MODEL_LEN_ENV with exactly that value (a relaunch without the env
     would launch at the pilot shell default 4096; a drifted env would make
     the record lie about the server every cell under it ran against).
@@ -5395,12 +6153,21 @@ def _stale_relaunch_problems(
             ">= 1 (backlog A10)" + stale
         )
         return problems
-    if value != header_max_model_len:
+    seq = (step.get("demand_class") or {}).get("seq_tokens")
+    expected: Any = header_max_model_len
+    if seq is not None:
+        expected = (header_request_caps or {}).get(str(seq))
+        if expected is None:
+            problems.append(
+                f"{label}: relaunch of demand class {seq} tokens but the header's "
+                f"serving_shapes.request_caps has no cap for it ({REQUEST_CAP_ADR})" + stale
+            )
+            return problems
+    if value != expected:
         problems.append(
-            f"{label}: relaunch max_model_len {value} differs from the header's "
-            f"{header_max_model_len}: a session serves ONE uniform "
-            "max_model_len (backlog A10, _serving_config.sh uniform-regime "
-            "rule)" + stale
+            f"{label}: relaunch max_model_len {value} differs from the header's cap "
+            f"{expected} for its class ({'budget-free: the session cap' if seq is None else f'{seq} tokens'}; "
+            f"{REQUEST_CAP_ADR}; backlog A10)" + stale
         )
     got = env.get(MAX_MODEL_LEN_ENV)
     if got != str(value):
@@ -5700,7 +6467,10 @@ def load_plan(path: Path) -> Dict[str, Any]:
             problems.append(f"steps[{i}]: env must be an object")
         if step["kind"] == "relaunch":
             problems.extend(
-                _stale_relaunch_problems(step, f"steps[{i}]", header_max_model_len)
+                _stale_relaunch_problems(
+                    step, f"steps[{i}]", header_max_model_len,
+                    shapes.get("request_caps") if isinstance(shapes, dict) else None,
+                )
             )
         if step["kind"] == "dry_window":
             # ADR-0153: the dry window runs under the budgeted relaunch of its
@@ -6536,6 +7306,14 @@ def _cmd_plan(args: argparse.Namespace) -> int:
             f"{c['engine_stops']} engine stops, {c['dry_windows']} dry windows, "
             f"{c['blocked']} blocked"
         )
+        ws = plan["window_spans"]
+        if ws["executable_pressure_cells"]:
+            print(
+                f"[run_campaign] window spans ({WINDOW_SPAN_FINDING}): {ws['executable_pressure_cells']} "
+                f"executable pressure cells, min {ws['min_s']:.3g} s, median {ws['median_s']:.3g} s, "
+                f"max {ws['max_s']:.3g} s; {ws['below_floor']} below the {ws['floor_s']:g} s floor"
+                + (" (WARNING: those windows are shorter than the registered warm-up transient)" if ws["below_floor"] else "")
+            )
     else:
         print(text, end="")
     return 0
@@ -6627,11 +7405,52 @@ def _gold_fresh_cell(grid: SessionGrid, engine: str, r: float) -> PlannedCell:
     return cell
 
 
-def ladder_root(out_root: Path, session: str, engine: str, r: float, k: int) -> Path:
+def smallest_pressure_class(
+    grid: SessionGrid, engine: str, manifests: Optional[Mapping[str, Any]] = None
+) -> Optional[PlannedCell]:
+    """ADR-0156: the engine's smallest executable demand class below the
+    anchor, as ONE template cell (its arm, family, prefix mode and, for a B12
+    rung, the rung); None when the engine serves the anchor class only.
+    Executable = not launch-blocked and, for a corpus-trunc rung, a manifest
+    registered for its dataset (build_plan's own rule). Ties on the token
+    count break toward prefix OFF (a replayed ladder window is clean there)
+    and the lower baseline number; the template's own budget_r is replaced
+    per rung by ``_class_cell_at``."""
+    anchor = int(grid.demand_seq_tokens[DEMAND_ANCHOR_ARM])
+    best: Optional[Tuple[Tuple[int, int, int], PlannedCell]] = None
+    for cell in enumerate_cells(grid):
+        spec = cell.spec
+        if spec.engine != engine or spec.family not in _PRESSURE_FAMILIES or cell.blocked_on is not None:
+            continue
+        if spec.arm == CORPUS_TRUNC_ARM and cell.dataset not in (manifests or {}):
+            continue
+        seq = demand_seq_tokens(grid, spec)
+        if seq >= anchor:
+            continue
+        key = (seq, 0 if _prefix_off(spec) else 1, _baseline_num(cell.baseline_id))
+        if best is None or key < best[0]:
+            best = (key, cell)
+    return None if best is None else best[1]
+
+
+def _class_cell_at(template: PlannedCell, r: float) -> PlannedCell:
+    """The template class cell re-minted at rung ``r`` (its rate fraction is
+    identity only: the ladder sets the rate per step)."""
+    spec = replace(template.spec, budget_r=r)
+    return replace(
+        template, spec=spec, blocked_on=_launch_blocked_on(spec), grids=None,
+        ruler_task=None, window_ordinal_base=0,
+    )
+
+
+def ladder_root(out_root: Path, session: str, engine: str, r: float, k: int, role: str = "anchor") -> Path:
     """The §1 run root of ladder window ``k`` of rung ``r``:
-    ``<out_root>/<session>/cal-<engine>-r<r with '.' as 'p'>-s<k:02d>``
-    (the runner requires a RUN_ID_RE basename under a session directory)."""
-    name = f"cal-{engine}-r{f'{r:g}'.replace('.', 'p')}-s{k:02d}"
+    ``<out_root>/<session>/cal-<engine>-r<r with '.' as 'p'>-s<k:02d>`` for
+    the anchor class and ``cal-<engine>-smallest-r<r>-s<k>`` for the smallest
+    class (ADR-0156; the runner requires a RUN_ID_RE basename under a session
+    directory)."""
+    tag = "" if role == "anchor" else f"-{role}"
+    name = f"cal-{engine}{tag}-r{f'{r:g}'.replace('.', 'p')}-s{k:02d}"
     if not RUN_ID_RE.match(name):
         raise PlanError(f"ladder root basename {name!r} violates the §1 grammar {RUN_ID_RE.pattern}")
     return Path(out_root) / session / name
@@ -6707,28 +7526,35 @@ def calibrate_rungs(
     runner_cmd: Sequence[str] = DEFAULT_RUNNER_CMD,
     launcher_cmds: Optional[Mapping[str, Sequence[str]]] = None,
     start_qps: Optional[float] = None,
+    anchor_only: bool = False,
     exec_fn: Callable[[Sequence[str], Mapping[str, str]], int] = _exec,
     log: Callable[[str], None] = print,
 ) -> Dict[str, Any]:
     """Measure lambda* per budget rung for ONE engine and return the
-    ``cage-rung-calibration-v1`` artifact document (the caller writes it).
+    ``cage-rung-calibration-v2`` artifact document (the caller writes it).
 
-    Per rung, loosest first: the plan's own budgeted relaunch for the gold
-    class at that r (``_relaunch_step`` of the gold-fresh cell's serving
-    config: prefix OFF, the budget sized on the anchor shape), then the
-    registered cal-v2 ladder (``geometric_rate_ladder`` from the start rate,
-    climb until the first unsustainable window or PROBE_MAX_STEPS, then
-    PROBE_BISECT_STEPS arithmetic midpoints), every window one runner
-    invocation of the gold-fresh cell (``_cell_step(ladder=True)``) at that
-    rate into its own §1 run root under ``out_root``; the decision is
-    ``decide_lambda_star`` over the steps sorted by rate. The first rung
-    starts at ``start_qps`` (default: ``floor_start_qps`` of the engine's
-    cal-v2 floor at LADDER_START_DECODE_TOKENS); each later rung starts at
-    the previous ESTIMATED lambda* / LADDER_CHAIN_DIVISOR, else at the floor
-    start again. A failed relaunch or an unreadable window labels the rung
-    (RELAUNCH_FAILED / PROBE_FAILED) and the ladder moves on; the engine is
-    stopped at the end, success or abort. Pure of RunPod: ``exec_fn`` is the
-    one seam (tests stub it with a runner that writes requests.jsonl).
+    Two classes, the ANCHOR first (ADR-0154) and then the engine's SMALLEST
+    executable class below it (ADR-0156; skipped when the engine serves the
+    anchor class only, or under ``anchor_only``). Per class and rung, loosest
+    first: the plan's own budgeted relaunch of that class's serving config
+    (``_relaunch_step``: prefix mode per the arm, the budget sized on the
+    class's shape), then the registered cal-v2 ladder (``geometric_rate_ladder``
+    from the start rate, climb until the first unsustainable window or
+    PROBE_MAX_STEPS, then PROBE_BISECT_STEPS arithmetic midpoints), every
+    window one runner invocation of the class cell (``_cell_step(ladder=True)``)
+    at that rate into its own §1 run root under ``out_root``; the decision is
+    ``decide_lambda_star`` over the steps sorted by rate. The anchor's first
+    rung starts at ``start_qps`` (default: ``floor_start_qps`` of the engine's
+    cal-v2 floor at LADDER_START_DECODE_TOKENS); each later rung starts at the
+    previous ESTIMATED lambda* / LADDER_CHAIN_DIVISOR, else at the floor start
+    again. The smallest class starts each rung at the HIGHER of the anchor's
+    lambda* at that rung (a shorter sequence sustains at least the anchor's
+    rate under the KV, compute and request-cap bounds; a NONE_SUSTAINABLE
+    there is the loud symptom of a defective ladder) and the chained start.
+    A failed relaunch or an unreadable window labels the rung (RELAUNCH_FAILED
+    / PROBE_FAILED) and the ladder moves on; the engine is stopped at the end,
+    success or abort. Pure of RunPod: ``exec_fn`` is the one seam (tests stub
+    it with a runner that writes requests.jsonl).
     """
     grid = get_session_grid(session)
     if rehearsal_n is not None:
@@ -6765,9 +7591,21 @@ def calibrate_rungs(
     manifests = _register_query_manifests(grid, query_manifests)
     launcher_cmds = dict(launcher_cmds or DEFAULT_LAUNCHER_CMDS)
     anchor_tokens = _check_floor_shape(grid, floor)
-    cells = [_gold_fresh_cell(grid, engine, r) for r in rung_list]
-    _check_manifest_coverage(grid, manifests, cells)
-    cal_header = _register_calibrations(grid, {engine: Path(calibration)}, cells, FLOOR_BUDGET_FRACTION)
+    anchor_cells = [_gold_fresh_cell(grid, engine, r) for r in rung_list]
+    small_template = None if anchor_only else smallest_pressure_class(grid, engine, manifests)
+    small_cells = [] if small_template is None else [_class_cell_at(small_template, r) for r in rung_list]
+    all_cells = anchor_cells + small_cells
+    _check_manifest_coverage(grid, manifests, all_cells)
+    # Gap triage 2026-10-09 C1: every ladder relaunch's pool is checked against
+    # max_model_len BEFORE the first rung runs (a failure at the smallest
+    # class's first relaunch would otherwise come after the anchor ladder).
+    shortfalls = pool_shortfalls(
+        [_relaunch_step(_serving_config(c, grid), grid, floor, launcher_cmds) for c in all_cells],  # type: ignore[arg-type]
+        grid.max_model_len,
+    )
+    if shortfalls:
+        raise PlanError(_pool_shortfall_text(shortfalls, f"calibrate-rungs {engine} session {session!r}"))
+    cal_header = _register_calibrations(grid, {engine: Path(calibration)}, all_cells, FLOOR_BUDGET_FRACTION)
     floors = cal_header["floors"][engine]
     slo_floors_env = slo_floors_env_value(cal_header["floors"])
     floor_meas = FloorMeasurement(
@@ -6778,10 +7616,10 @@ def calibrate_rungs(
     )
     floor_start = floor_start_qps(floor_meas, max_tokens=LADDER_START_DECODE_TOKENS)
     first_start = float(start_qps) if start_qps is not None else floor_start
-    manifest_rec = manifests.get(grid.f2_dataset)
     out_root = Path(out_root)
 
-    rung_records: Dict[str, Dict[str, Any]] = {}
+    anchor_records: Dict[str, Dict[str, Any]] = {}
+    small_records: Dict[str, Dict[str, Any]] = {}
     resident: Optional[Dict[str, Any]] = None
     stop_failures = 0
 
@@ -6797,11 +7635,13 @@ def calibrate_rungs(
                 f"{record['launcher_key']} argv={record['stop_argv']}"
             )
 
-    previous_lambda: Optional[float] = None
-    try:
+    def _ladder(role: str, cells: Sequence[PlannedCell], records: Dict[str, Dict[str, Any]]) -> None:
+        nonlocal resident
+        previous_lambda: Optional[float] = None
         for cell in cells:
             r = float(cell.spec.budget_r)  # type: ignore[arg-type]
             key = f"{r:g}"
+            seq_tokens = demand_seq_tokens(grid, cell.spec)
             config = _serving_config(cell, grid)
             assert config is not None
             relaunch = _relaunch_step(config, grid, floor, launcher_cmds)
@@ -6810,13 +7650,23 @@ def calibrate_rungs(
             elif resident["launcher_key"] != relaunch["launcher_key"]:
                 _stop(resident, "family change before the next rung")
             log(
-                f"[calibrate-rungs] rung r={key}: relaunch engine={engine} prefix=OFF "
-                f"budget_bytes={relaunch.get('budget_bytes')} class={anchor_tokens} tokens"
+                f"[calibrate-rungs] {role} class {cell.spec.arm} ({seq_tokens} tokens) rung r={key}: "
+                f"relaunch engine={engine} prefix={relaunch['prefix_mode']} "
+                f"budget_bytes={relaunch.get('budget_bytes')}"
             )
             rc = exec_fn(relaunch["argv"], relaunch["env"])
             resident = _stop_record(relaunch, None)
             base_record: Dict[str, Any] = {
                 "r": r,
+                "class": {
+                    "role": role,
+                    "arm": cell.spec.arm,
+                    "baseline_id": cell.baseline_id,
+                    "family": cell.spec.family,
+                    "prefix_mode": relaunch["prefix_mode"],
+                    "seq_tokens": seq_tokens,
+                    "corpus_budget_tokens": cell.spec.corpus_budget_tokens,
+                },
                 "relaunch": {
                     "argv": list(relaunch["argv"]),
                     "env": dict(relaunch["env"]),
@@ -6827,8 +7677,8 @@ def calibrate_rungs(
                 },
             }
             if rc != 0:
-                log(f"[calibrate-rungs] RELAUNCH FAILED (exit {rc}) at r={key}; rung labeled")
-                rung_records[key] = {
+                log(f"[calibrate-rungs] RELAUNCH FAILED (exit {rc}) at r={key} ({role}); rung labeled")
+                records[key] = {
                     **base_record,
                     "label": RUNG_LABEL_RELAUNCH_FAILED,
                     "lambda_star_qps": None,
@@ -6839,6 +7689,7 @@ def calibrate_rungs(
                 }
                 previous_lambda = None
                 continue
+            manifest_rec = manifests.get(cell.dataset)
             cell_step = _cell_step(
                 cell, grid, floor, runner_cmd, seed, pins,
                 query_manifest=None if manifest_rec is None else manifest_rec["path"],
@@ -6846,9 +7697,30 @@ def calibrate_rungs(
                 budget_plan=relaunch["budget_plan"],
                 ladder=True,
             )
+            candidates: List[Tuple[float, str]] = []
             if previous_lambda is not None:
-                start = previous_lambda / LADDER_CHAIN_DIVISOR
-                start_basis = f"previous rung lambda* {previous_lambda:.4g} / {LADDER_CHAIN_DIVISOR:g}"
+                candidates.append((
+                    previous_lambda / LADDER_CHAIN_DIVISOR,
+                    f"previous rung lambda* {previous_lambda:.4g} / {LADDER_CHAIN_DIVISOR:g}",
+                ))
+            if role != "anchor":
+                # Fable review 2026-10-09 HIGH 1: the anchor's ESTIMATED lambda*
+                # is the LAST sustainable step of ITS ladder (attainment just
+                # above 0.9); a class with the same capacity (scheduler-bound
+                # at loose r, S0F-70) started exactly there reads 0.88 by
+                # Poisson variance and ends NONE_SUSTAINABLE. The small ladder
+                # starts one chain step below, the rule tighter rungs use.
+                anchor_rec = anchor_records.get(key) or {}
+                anchor_lambda = anchor_rec.get("lambda_star_qps")
+                if isinstance(anchor_lambda, (int, float)) and anchor_lambda > 0:
+                    candidates.append((
+                        float(anchor_lambda) / LADDER_CHAIN_DIVISOR,
+                        f"anchor lambda* {anchor_lambda:.4g} at r={key} / {LADDER_CHAIN_DIVISOR:g} "
+                        "(a shorter sequence sustains at least the anchor's rate; one chain "
+                        "step below it so a same-capacity class is not read unsustainable)",
+                    ))
+            if candidates:
+                start, start_basis = max(candidates)
             else:
                 start = first_start
                 start_basis = (
@@ -6861,7 +7733,7 @@ def calibrate_rungs(
 
             def _probe(rate: float, phase: str) -> ProbeStep:
                 nonlocal k
-                root = ladder_root(out_root, session, engine, r, k)
+                root = ladder_root(out_root, session, engine, r, k, role)
                 k += 1
                 if root.exists():
                     raise RunError(
@@ -6911,8 +7783,8 @@ def calibrate_rungs(
                             hi = mid
                 estimate = decide_lambda_star(sorted(steps, key=lambda s: s.rate_qps))
             except (RunError, CalibrationError) as exc:
-                log(f"[calibrate-rungs] PROBE FAILED at r={key}: {exc}; rung labeled")
-                rung_records[key] = {
+                log(f"[calibrate-rungs] PROBE FAILED at r={key} ({role}): {exc}; rung labeled")
+                records[key] = {
                     **base_record,
                     "label": RUNG_LABEL_PROBE_FAILED,
                     "lambda_star_qps": None,
@@ -6926,11 +7798,11 @@ def calibrate_rungs(
                 previous_lambda = None
                 continue
             log(
-                f"[calibrate-rungs] rung r={key}: {estimate.label} lambda*="
+                f"[calibrate-rungs] {role} rung r={key}: {estimate.label} lambda*="
                 f"{estimate.lambda_star_qps} sustained={estimate.sustained_rate_qps} "
                 f"first_unsustainable={estimate.first_unsustainable_qps} ({len(steps)} windows)"
             )
-            rung_records[key] = {
+            records[key] = {
                 **base_record,
                 "label": estimate.label,
                 "lambda_star_qps": estimate.lambda_star_qps,
@@ -6945,22 +7817,60 @@ def calibrate_rungs(
                 ).hexdigest(),
             }
             previous_lambda = estimate.lambda_star_qps
+
+    try:
+        _ladder("anchor", anchor_cells, anchor_records)
+        if small_cells:
+            _ladder("smallest", small_cells, small_records)
     finally:
         if resident is not None:
             _stop(resident, "end of calibration")
 
-    gold_cell = cells[0]
+    gold_cell = anchor_cells[0]
+    classes: Dict[str, Dict[str, Any]] = {
+        str(anchor_tokens): {
+            "role": "anchor",
+            "arm": DEMAND_ANCHOR_ARM,
+            "baseline_id": gold_cell.baseline_id,
+            "family": "F2",
+            "prefix_mode": "OFF",
+            "seq_tokens": anchor_tokens,
+            "dataset": gold_cell.dataset,
+            "rungs": anchor_records,
+        }
+    }
+    if small_cells:
+        small = small_cells[0]
+        small_seq = demand_seq_tokens(grid, small.spec)
+        classes[str(small_seq)] = {
+            "role": "smallest",
+            "arm": small.spec.arm,
+            "baseline_id": small.baseline_id,
+            "family": small.spec.family,
+            "prefix_mode": "OFF" if _prefix_off(small.spec) else "ON",
+            "seq_tokens": small_seq,
+            "dataset": small.dataset,
+            "corpus_budget_tokens": small.spec.corpus_budget_tokens,
+            "rungs": small_records,
+            "note": (
+                None if _prefix_off(small.spec) else
+                "a prefix-ON class replays its pool with the cache warm, so its ladder "
+                "over-reads the sustainable rate [D]"
+            ),
+        }
     return {
         "schema": RUNG_CALIBRATION_SCHEMA,
         "procedure_version": PROCEDURE_VERSION,
         "confirmatory": False,
         "adr": RUNG_CALIBRATION_ADR,
+        "two_anchor_adr": TWO_ANCHOR_ADR,
         "finding": RUNG_CALIBRATION_FINDING,
         "engine": BACKEND_OF_ENGINE[engine],
         "model": HF_ID_OF_SLUG[grid.model],
         "session": session,
         "rehearsal_n": rehearsal_n,
         "seed": seed,
+        "anchor_seq_tokens": anchor_tokens,
         "workload": {
             "arm": DEMAND_ANCHOR_ARM,
             "baseline_id": gold_cell.baseline_id,
@@ -6968,7 +7878,7 @@ def calibrate_rungs(
             "num_queries": cell_num_queries(grid, gold_cell)[1],
             "seq_tokens": anchor_tokens,
             "prefix_mode": "OFF",
-            "query_manifest": None if manifest_rec is None else manifest_rec["path"],
+            "query_manifest": None if manifests.get(gold_cell.dataset) is None else manifests[gold_cell.dataset]["path"],
             "window_mode": "duration",
             "replay": True,
             "replay_note": (
@@ -6993,8 +7903,17 @@ def calibrate_rungs(
             "floor": dict(floors),
             "floor_artifact": cal_header["artifacts"][engine],
         },
+        "interpolation": {
+            "adr": TWO_ANCHOR_ADR,
+            "rule": (
+                "lambda(s) = lambda_g x (s_g / s)^alpha, alpha = ln(lambda_m / lambda_g) / "
+                "ln(s_g / s_m) per rung; the plan computes alpha from the two anchors above"
+            ),
+            "anchor_only": anchor_only,
+        },
         "stop_failures": stop_failures,
-        "rungs": rung_records,
+        "rungs": anchor_records,
+        "classes": classes,
     }
 
 
@@ -7029,20 +7948,25 @@ def _cmd_calibrate_rungs(args: argparse.Namespace) -> int:
         runner_cmd=tuple(shlex.split(args.runner_cmd)),
         launcher_cmds=launcher_cmds,
         start_qps=args.start_qps,
+        anchor_only=args.anchor_only,
     )
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(doc, indent=2, sort_keys=False) + "\n", encoding="utf-8")
-    labels = {key: rec["label"] for key, rec in doc["rungs"].items()}
-    not_estimated = {key: label for key, label in labels.items() if label != "ESTIMATED"}
-    print(
-        f"[calibrate-rungs] artifact written: {out} engine={args.engine} rungs="
-        + ", ".join(
-            f"r={key}: {rec['label']}"
-            + (f" lambda*={rec['lambda_star_qps']:.4g} rps" if rec["lambda_star_qps"] else "")
-            for key, rec in doc["rungs"].items()
+    not_estimated: Dict[str, str] = {}
+    for seq, cls in doc["classes"].items():
+        for key, rec in cls["rungs"].items():
+            if rec["label"] != "ESTIMATED":
+                not_estimated[f"{cls['role']} {seq} tokens r={key}"] = rec["label"]
+        print(
+            f"[calibrate-rungs] artifact written: {out} engine={args.engine} {cls['role']} class "
+            f"{cls['arm']} ({seq} tokens) rungs="
+            + ", ".join(
+                f"r={key}: {rec['label']}"
+                + (f" lambda*={rec['lambda_star_qps']:.4g} rps" if rec["lambda_star_qps"] else "")
+                for key, rec in cls["rungs"].items()
+            )
         )
-    )
     if not_estimated:
         print(
             f"[calibrate-rungs] NOT ESTIMATED: {not_estimated}; plan --rung-calibration "
@@ -7202,6 +8126,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="override the first rung's start rate (default: floor_start_qps of the "
         f"cal-v2 floor at {LADDER_START_DECODE_TOKENS} decode tokens); later rungs chain "
         f"from the previous lambda* / {LADDER_CHAIN_DIVISOR:g}",
+    )
+    p_cal.add_argument(
+        "--anchor-only", action="store_true",
+        help=f"skip the smallest-class ladder ({TWO_ANCHOR_ADR}); a plan whose engine serves a "
+        "class below the anchor then REFUSES the artifact (diagnostics only)",
     )
     p_cal.add_argument("--runner-cmd", default=" ".join(DEFAULT_RUNNER_CMD))
     p_cal.add_argument("--launcher-cmd", default=None)

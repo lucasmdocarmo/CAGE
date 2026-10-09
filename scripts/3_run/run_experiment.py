@@ -1055,16 +1055,20 @@ def probe_campaign_telemetry(endpoints: List[Tuple[str, str]], dialect: str) -> 
         except Exception as exc:
             problems.append(f"{role}={url}: {type(exc).__name__}: {exc}")
             continue
-        usage = snapshot.get("kv_usage") if isinstance(snapshot, dict) else None
-        if isinstance(usage, bool) or not isinstance(usage, (int, float)) or not math.isfinite(usage):
-            seen = "no snapshot" if not isinstance(snapshot, dict) else f"kv_usage={usage!r}"
-            problems.append(f"{role}={url}: no numeric kv_usage in the snapshot ({seen})")
+        # ADR-0153 clause (b) reads the queue gauge too (``waiting``: vLLM
+        # num_requests_waiting, SGLang num_queue_reqs through the dialect); a
+        # window without it is UNKNOWN_TELEMETRY (gap triage 2026-10-09 M3).
+        for gauge in ("kv_usage", "waiting"):
+            value = snapshot.get(gauge) if isinstance(snapshot, dict) else None
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                seen = "no snapshot" if not isinstance(snapshot, dict) else f"{gauge}={value!r}"
+                problems.append(f"{role}={url}: no numeric {gauge} in the snapshot ({seen})")
     if problems:
         raise RuntimeError(
-            "CAMPAIGN TELEMETRY: the telemetry endpoint(s) returned no KV usage gauge "
+            "CAMPAIGN TELEMETRY: the telemetry endpoint(s) returned no KV usage or queue gauge "
             f"under dialect {dialect!r}: " + "; ".join(problems) + ". The window would "
             "be labeled UNKNOWN_TELEMETRY; refusing before the measured stage "
-            "(S0F-26, ADR-0136)."
+            "(S0F-26, ADR-0136, ADR-0153)."
         )
 
 

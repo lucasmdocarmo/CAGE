@@ -1129,7 +1129,7 @@ class TestContrast18OneTokenCompletionsW5:
             lambda _t: [_req(0, tpot_ms=None, num_tokens=1)] + [_req(i) for i in range(1, 4)],
         )
         for row in rows:
-            metrics, gpu_count, reason = _dist_metrics(run_dir, predicate_root, row)
+            metrics, gpu_count, reason, _clock = _dist_metrics(run_dir, predicate_root, row)
             assert reason is None
             assert metrics.n_no_decode == 1
             assert metrics.n_timely == 4  # e0 is timely on TTFT alone
@@ -1151,7 +1151,7 @@ class TestContrast18OneTokenCompletionsW5:
         run_dir, predicate_root, rows = _dist_18_tree(
             tmp_path, lambda _t: [_req(0, tpot_ms=None)] + [_req(i) for i in range(1, 4)]
         )
-        metrics, gpu_count, reason = _dist_metrics(run_dir, predicate_root, rows[0])
+        metrics, gpu_count, reason, _clock = _dist_metrics(run_dir, predicate_root, rows[0])
         assert metrics is None and gpu_count is None
         assert "captured-timing defect" in reason
 
@@ -1165,6 +1165,6 @@ class TestContrast18OneTokenCompletionsW5:
             return rows
 
         run_dir, predicate_root, rows = _dist_18_tree(tmp_path, _legacy)
-        metrics, _gpu, reason = _dist_metrics(run_dir, predicate_root, rows[0])
+        metrics, _gpu, reason, _clock = _dist_metrics(run_dir, predicate_root, rows[0])
         assert metrics is None
         assert "num_tokens" in reason

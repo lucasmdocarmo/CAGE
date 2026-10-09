@@ -31,6 +31,10 @@ from .openai_chat_adapter import OpenAIChatAdapter
 class VLLMAdapter(OpenAIChatAdapter):
     """HTTP client adapter for a vLLM OpenAI-compatible server."""
 
+    #: Class-level default so an instance built without ``__init__`` (the
+    #: runner's render-kwargs pin test) carries the opt-out (ADR-0042).
+    request_logprobs: bool = False
+
     engine_id: str = "vllm"
     # vLLM P/D connectors (NIXL) attach kv_transfer_params to bodies/headers.
     _kv_transfer_telemetry: bool = True
@@ -52,6 +56,7 @@ class VLLMAdapter(OpenAIChatAdapter):
         api_base: str = "http://localhost:8000",
         timeout: int = 300,
         include_usage_in_stream: bool = True,
+        request_logprobs: bool = False,
         **kwargs: Any,
     ) -> None:
         """Create an adapter targeting a vLLM server.
@@ -62,6 +67,15 @@ class VLLMAdapter(OpenAIChatAdapter):
             timeout: Requests timeout (seconds).
             include_usage_in_stream: If True, request a final streaming usage
                 chunk so we can extract prompt/cached token telemetry.
+            request_logprobs: If True, request per-token logprobs
+                (``logprobs=true, top_logprobs=0``, OpenAI chat schema).
+                Default False (ADR-0042; gap triage 2026-10-09, H5): the
+                SGLang and LMDeploy adapters never request them, so a vLLM
+                default of True sent every campaign request with a per-token
+                payload the other engines did not carry, an asymmetric and
+                unmeasured overhead inside the cross-engine contrasts. The
+                campaign runner never opts in; the pilot's abstention
+                risk-coverage curves pass it explicitly.
             **kwargs: Forwarded to OpenAIChatAdapter (e.g. max_retries,
                 retry_backoff_s) then InferenceEngine.
         """
@@ -72,6 +86,7 @@ class VLLMAdapter(OpenAIChatAdapter):
             include_usage_in_stream=include_usage_in_stream,
             **kwargs,
         )
+        self.request_logprobs = request_logprobs
 
     def _apply_engine_chat_extras(self, payload: Dict[str, Any]) -> None:
         """vLLM-specific /v1/chat/completions fields.
@@ -83,13 +98,16 @@ class VLLMAdapter(OpenAIChatAdapter):
           renderer. Will be accessible by the chat template."); Qwen3's chat
           template reads ``enable_thinking``. Other templates simply ignore
           the unused variable (Jinja semantics), so the field is always sent.
-        - logprobs=true, top_logprobs=0: per-generated-token logprobs (OpenAI
-          chat schema) -> mean/sum persisted for abstention risk-coverage
-          curves. top_logprobs=0 returns only the chosen token's logprob.
+        - logprobs=true, top_logprobs=0 ONLY under ``request_logprobs``
+          (opt-in, the SGLang and LMDeploy convention; ADR-0042): per
+          generated-token logprobs -> mean/sum for the pilot's abstention
+          risk-coverage curves. top_logprobs=0 returns only the chosen
+          token's logprob.
         """
         payload["chat_template_kwargs"] = {"enable_thinking": False}
-        payload["logprobs"] = True
-        payload["top_logprobs"] = 0
+        if self.request_logprobs:
+            payload["logprobs"] = True
+            payload["top_logprobs"] = 0
 
     def _apply_truncate_prompt_tokens(
         self, payload: Dict[str, Any], request: InferenceRequest
@@ -139,7 +157,7 @@ class VLLMAdapter(OpenAIChatAdapter):
             "flush_confirms_reset": True,
             "kv_transfer_params": True,
             "chat_template_thinking_pin": True,  # verified against vLLM 0.11.0 schema
-            "logprobs": True,
+            "logprobs": self.request_logprobs,  # opt-in (ADR-0042; the engines agree)
             "truncate_prompt_tokens": True,
         }
 

@@ -412,6 +412,53 @@ _TRUTH_TAX_GROUP_AXES: tuple[str, ...] = (
 _TRUTH_TAX_REQUEST_COLUMNS: tuple[str, ...] = (
     "ok", "ttft_ms", "tpot_ms", "num_tokens",
 )
+#: ADR-0063 (gap triage 2026-10-09, 2/3 item 3): a NON-completion carries no
+#: timing. The adapter stamps ttft_ms 0.0 on an error row (openai_chat_adapter
+#: .py:369, :506) and the runner writes it as-is (run_experiment.py:3708), so a
+#: loader that averaged every numeric field pulled an arm's TTFT co-primary
+#: toward 0 with every failed request. Timing fields of a row whose ``ok`` is
+#: False are dropped (counted in frame.attrs["error_row_timing_dropped"]);
+#: the row itself stays (its ok / error / predicate fields are data).
+ERROR_ROW_TIMING_COLUMNS: tuple[str, ...] = (
+    "ttft_ms", "tpot_ms", "latency_ms", "ttft_from_send_ms", "ttft_from_scheduled_ms",
+    "latency_from_send_ms", "latency_from_scheduled_ms", "scheduler_lag_ms",
+)
+#: ADR-0089 / section 9.5 (gap triage 2026-10-09, 2/3 item 9): the registered
+#: margins artifact is keyed by FAMILY (binary_predicate, quality_continuous,
+#: serving_continuous; charter D9 "predicate 0.05 pp, ttft 25 ms") beside the
+#: window_* keys; a per-query metric named on the CLI resolves to its family
+#: when the artifact carries no key of its own. Serving timings are the
+#: serving family; the continuous quality scores the quality family. A metric
+#: absent here and from the artifact still refuses (G1d).
+METRIC_MARGIN_FAMILY: dict[str, str] = {
+    "ttft_ms": "serving_continuous",
+    "tpot_ms": "serving_continuous",
+    "latency_ms": "serving_continuous",
+    "ttft_from_scheduled_ms": "serving_continuous",
+    "grounding_score": "quality_continuous",
+    "faithfulness_score": "quality_continuous",
+}
+#: W16 (charter section 6.3, ADR-0016 and ADR-0060; applied 2026-10-09 on the
+#: owner's "fix the remaining issues"): on an OPEN-LOOP row the section 6.1
+#: timely gate clocks TTFT from the INTENDED arrival, the dispatcher's
+#: ``ttft_from_scheduled_ms``, never from the actual send (``ttft_ms``): a send
+#: delayed by client-side queueing would hide that delay from the SLO
+#: (coordinated omission). A row with no open-loop workload mode (the pilot's
+#: closed-loop rows) has no intended arrival and keeps ``ttft_ms``. A COMPLETED
+#: open-loop row that carries ``ttft_ms`` but no scheduled value is a defective
+#: record and refuses the window (never graded on the send clock in silence).
+#: Both bases are counted per window, and the send-clock G and Y are recorded
+#: beside the registered ones as the sensitivity column.
+TTFT_SCHEDULED_COLUMN = "ttft_from_scheduled_ms"
+TTFT_BASIS_SCHEDULED = "scheduled"
+TTFT_BASIS_SEND = "send"
+OPEN_LOOP_MODE = "open_loop"
+TTFT_CLOCK_RULE = (
+    "section 6.3 coordinated omission (W16): open-loop rows are graded on "
+    f"{TTFT_SCHEDULED_COLUMN} (TTFT from the intended arrival); rows without an "
+    "open-loop workload mode on ttft_ms (the send clock); the send-clock G and Y "
+    "are recorded per window as a sensitivity, never as the registered value"
+)
 #: §3-extra manifest key carrying the §6.1 single-stream floors per engine:
 #: {"slo_floors": {"<engine>": {"ttft_s": ..., "tpot_s": ...}}} — produced by
 #: the E3 floor calibration (src/orchestration/calibration.summarize_floor).
@@ -966,6 +1013,7 @@ def load_per_query(
         raise AnalysisError(f"no index rows for row keys {sorted(wanted)}")
     rows: list[dict[str, Any]] = []
     bool_coerced: set[str] = set()
+    error_timing_dropped = 0
     label_reasons: dict[str, dict[str, int]] = {}
     for rec in selection.itertuples(index=False):
         window_dir = run_dir / str(rec.window_dir)
@@ -1009,7 +1057,14 @@ def load_per_query(
                     )
                 trial_raw.setdefault(dup_key, {}).update(obj)
                 bucket = merged.setdefault(example_id, {})
+                error_row = obj.get("ok") is False
                 for field_name, value in obj.items():
+                    if error_row and field_name in ERROR_ROW_TIMING_COLUMNS:
+                        # ADR-0063: a non-completion has no timing (the adapter's
+                        # 0.0 stamp is a placeholder, never a measurement)
+                        if value is not None:
+                            error_timing_dropped += 1
+                        continue
                     if isinstance(value, bool):
                         # true/false -> 1.0/0.0, noted — never dropped (G11).
                         bool_coerced.add(field_name)
@@ -1050,6 +1105,7 @@ def load_per_query(
             )
     frame = pd.DataFrame(rows)
     frame.attrs["bool_coerced_fields"] = sorted(bool_coerced)
+    frame.attrs["error_row_timing_dropped"] = error_timing_dropped
     frame.attrs["degradation_reasons"] = {
         column: dict(sorted(counts.items()))
         for column, counts in sorted(label_reasons.items())
@@ -1364,16 +1420,21 @@ def resolve_registered_margin(
             f"registered margins artifact {REGISTERED_MARGINS_PATH} must be "
             "a JSON object mapping metric -> margin"
         )
-    if equivalence_metric not in margins:
+    margin_key = (
+        equivalence_metric if equivalence_metric in margins
+        else METRIC_MARGIN_FAMILY.get(equivalence_metric)
+    )
+    record["margin_key"] = margin_key
+    if margin_key is None or margin_key not in margins:
         if tost_margin is not None:
             raise AnalysisError(
                 f"metric {equivalence_metric!r} has no registered §9.5 "
                 f"margin in {REGISTERED_MARGINS_PATH.name} (registered: "
-                f"{sorted(margins)}) — an unregistered margin cannot run at "
-                "the confirmatory look (G1d)"
+                f"{sorted(margins)}; family of the metric: {margin_key!r}) — an "
+                "unregistered margin cannot run at the confirmatory look (G1d)"
             )
         return None, record
-    raw_margin = margins[equivalence_metric]
+    raw_margin = margins[margin_key]
     # K-COV2 (task #140): the registered value must BE a margin — a typed
     # refusal, never a float() crash (string) or a silent NaN/<=0 consumption.
     if isinstance(raw_margin, bool) or not isinstance(raw_margin, (int, float)):
@@ -3317,12 +3378,73 @@ def _decode_tokens_of(num_tokens: Any) -> float:
     return float(max(num_tokens - 1, 0))
 
 
+def _slo_ttft_ms(req: Mapping[str, Any]) -> tuple[float | None, str]:
+    """(TTFT in ms for the section 6.1 gate, its clock basis) per W16: the
+    scheduled clock on an open-loop row, the send clock otherwise. A completed
+    open-loop row with a send TTFT and no scheduled one refuses
+    (AnalysisError): the coordinated-omission clock is missing, and grading
+    it on the send clock would understate its latency."""
+    scheduled = req.get(TTFT_SCHEDULED_COLUMN)
+    send = req.get("ttft_ms")
+    if (
+        isinstance(scheduled, (int, float))
+        and not isinstance(scheduled, bool)
+        and math.isfinite(float(scheduled))
+    ):
+        return float(scheduled), TTFT_BASIS_SCHEDULED
+    if req.get("workload_mode") == OPEN_LOOP_MODE and req.get("ok") and send is not None:
+        raise AnalysisError(
+            f"open-loop row example_id={req.get('example_id')!r} "
+            f"record_index={req.get('record_index')!r} carries ttft_ms={send!r} "
+            f"but no {TTFT_SCHEDULED_COLUMN}: the section 6.3 coordinated-omission "
+            "clock is missing and the row cannot be graded on the send clock (W16)"
+        )
+    return (None if send is None else float(send)), TTFT_BASIS_SEND
+
+
+def _ttft_clock_record(
+    window_label: str,
+    basis_counts: Mapping[str, int],
+    metrics: WindowMetrics,
+    send_records: Sequence[Mapping[str, Any]],
+    baseline: SLOBaseline,
+    duration_s: float,
+    gpu_count: int = 1,
+) -> dict[str, Any]:
+    """The per-window W16 record: which clock graded how many rows, and the
+    send-clock G and Y beside the registered ones when any row was graded on
+    the scheduled clock (the sensitivity column; absent otherwise)."""
+    record: dict[str, Any] = {
+        "window": window_label,
+        "ttft_basis_counts": dict(basis_counts),
+        "registered_basis": (
+            TTFT_BASIS_SCHEDULED if basis_counts.get(TTFT_BASIS_SCHEDULED) else TTFT_BASIS_SEND
+        ),
+    }
+    if basis_counts.get(TTFT_BASIS_SCHEDULED):
+        try:
+            send_metrics = evaluate_window(
+                pd.DataFrame(send_records), baseline, duration_s=duration_s,
+                gpu_count=gpu_count,
+            )
+        except GoodputError as exc:
+            record["send_clock_sensitivity"] = {"unavailable": str(exc)}
+        else:
+            record["send_clock_sensitivity"] = {
+                "goodput_frac_registered": metrics.goodput_frac,
+                "goodput_frac_send_clock": send_metrics.goodput_frac,
+                "yield_frac_registered": metrics.yield_frac,
+                "yield_frac_send_clock": send_metrics.yield_frac,
+            }
+    return record
+
+
 def _window_truth_tax(
     run_dir: Path,
     rec: Any,
     predicate_root: Path,
     floors: Mapping[str, Any],
-) -> tuple[WindowMetrics | None, str | None]:
+) -> tuple[WindowMetrics | None, str | None, dict[str, Any] | None]:
     """One window's FULL ladder metrics (the §9.2 variable G − Y rides on
     ``truth_tax_frac``), or (None, exclusion reason). Returning the whole
     ``WindowMetrics`` — not just the tax — is what lets the T6.2 yield-ladder
@@ -3360,7 +3482,7 @@ def _window_truth_tax(
     regime = json.loads(regime_path.read_text(encoding="utf-8"))
     label = regime.get("label")
     if label != IN_REGIME:
-        return None, f"regime label {label!r} (population = in-regime cells, §9.2)"
+        return None, f"regime label {label!r} (population = in-regime cells, §9.2)", None
 
     engine = str(rec.engine)
     floor = floors.get(engine)
@@ -3419,6 +3541,8 @@ def _window_truth_tax(
         predicate_by_key[_predicate_join_key(obj)] = obj.get("predicate")
 
     records: list[dict[str, Any]] = []
+    send_records: list[dict[str, Any]] = []
+    basis_counts: dict[str, int] = {TTFT_BASIS_SCHEDULED: 0, TTFT_BASIS_SEND: 0}
     unscored_ok: list[tuple[Any, str, Any]] = []
     for req in requests:
         key = _predicate_join_key(req)
@@ -3431,21 +3555,38 @@ def _window_truth_tax(
         else:
             pred = predicate_by_key[key]
             verid = float("nan") if pred is None else bool(pred)
-        ttft_ms = req.get("ttft_ms")
+        # W16: the section 6.3 clock on open-loop rows; a defective row refuses.
+        try:
+            ttft_ms, basis = _slo_ttft_ms(req)
+        except AnalysisError as exc:
+            raise AnalysisError(f"contrast #14 (truth_tax): {window_label}: {exc}") from exc
+        basis_counts[basis] += 1
+        send_ttft_ms = req.get("ttft_ms")
         tpot_ms = req.get("tpot_ms")
+        base = {
+            "ok": ok,
+            "veridical": verid,
+            "tpot_s": (
+                float("nan") if tpot_ms is None else float(tpot_ms) / 1000.0
+            ),
+            # ADR-0118: the decode-phase length keys the TPOT clause.
+            DECODE_TOKENS_COLUMN: _decode_tokens_of(req.get("num_tokens")),
+        }
         records.append(
             {
-                "ok": ok,
-                "veridical": verid,
+                **base,
                 # F2: THE ms→s conversion seam (evaluate_window is seconds).
                 "ttft_s": (
                     float("nan") if ttft_ms is None else float(ttft_ms) / 1000.0
                 ),
-                "tpot_s": (
-                    float("nan") if tpot_ms is None else float(tpot_ms) / 1000.0
+            }
+        )
+        send_records.append(
+            {
+                **base,
+                "ttft_s": (
+                    float("nan") if send_ttft_ms is None else float(send_ttft_ms) / 1000.0
                 ),
-                # ADR-0118: the decode-phase length keys the TPOT clause.
-                DECODE_TOKENS_COLUMN: _decode_tokens_of(req.get("num_tokens")),
             }
         )
     if unscored_ok:
@@ -3468,7 +3609,10 @@ def _window_truth_tax(
         raise AnalysisError(
             f"contrast #14 (truth_tax): {window_label}: {exc}"
         ) from exc
-    return metrics, None
+    clock = _ttft_clock_record(
+        window_label, basis_counts, metrics, send_records, baseline, duration_s
+    )
+    return metrics, None, clock
 
 
 def compute_truth_tax(
@@ -3559,6 +3703,8 @@ def compute_truth_tax(
             "open pre-freeze owner item"
         ),
         "predicate_table": predicate_root.name,
+        # W16: the clock every evaluated window was graded on, per window.
+        "ttft_clock": {"rule": TTFT_CLOCK_RULE, "windows": []},
         "legs": [],
         "per_dataset_intersection": [],
         "excluded_windows": [],
@@ -3578,7 +3724,7 @@ def compute_truth_tax(
         for rec in grp.itertuples(index=False):
             cache_key = f"{rec.window_dir}"
             if cache_key not in tt_cache:
-                metrics, excluded = _window_truth_tax(
+                metrics, excluded, clock = _window_truth_tax(
                     run_dir, rec, predicate_root, floors
                 )
                 tt_cache[cache_key] = metrics
@@ -3586,6 +3732,8 @@ def compute_truth_tax(
                     section["excluded_windows"].append(
                         {"window": str(rec.window_dir), "reason": excluded}
                     )
+                if clock is not None:
+                    section["ttft_clock"]["windows"].append(clock)
             cached = tt_cache[cache_key]
             if cached is not None:
                 values.append(float(cached.truth_tax_frac))
@@ -4669,7 +4817,7 @@ def _dist_window_metrics(
     rec: Any,
     predicate_root: Path | None,
     floors: Mapping[str, Any] | None,
-) -> tuple[WindowMetrics | None, int | None, str | None]:
+) -> tuple[WindowMetrics | None, int | None, str | None, dict[str, Any] | None]:
     """One DIST window's (WindowMetrics, gpu_count) for #18, or a labeled
     skip reason naming exactly the missing input.
 
@@ -4700,7 +4848,7 @@ def _dist_window_metrics(
             (run_dir / str(rec.cell_json)).read_text(encoding="utf-8")
         )
     except (OSError, json.JSONDecodeError) as exc:
-        return None, None, f"{rec.cell_json}: unreadable cell.json ({exc})"
+        return None, None, f"{rec.cell_json}: unreadable cell.json ({exc})", None
     gpu_count = cell_meta.get(_GPU_COUNT_CELL_KEY)
     if isinstance(gpu_count, bool) or not isinstance(gpu_count, int):
         return None, None, (
@@ -4708,13 +4856,13 @@ def _dist_window_metrics(
             "the §6.6b per-GPU basis is undefined without the window's GPU "
             "count [VERIFY-LIVE at Run-C-prime preflight: the DIST producer "
             "must persist it]"
-        )
+        ), None
 
     if not isinstance(floors, Mapping) or not floors:
         return None, None, (
             f"manifest.json carries no {_SLO_FLOORS_MANIFEST_KEY!r} mapping — "
             "G/Y need the §6.1 single-stream floors (E3 calibration)"
-        )
+        ), None
     engine = str(rec.engine)
     floor = floors.get(engine)
     if not isinstance(floor, Mapping) or not {"ttft_s", "tpot_s"} <= set(floor):
@@ -4722,7 +4870,7 @@ def _dist_window_metrics(
             f"manifest {_SLO_FLOORS_MANIFEST_KEY!r} has no ttft_s/tpot_s "
             f"floor for engine {engine!r} — the §6.1 SLO pair is relative to "
             "the measured single-stream floor"
-        )
+        ), None
 
     window_meta = (cell_meta.get("windows") or {}).get(str(rec.window_key))
     if (
@@ -4733,15 +4881,15 @@ def _dist_window_metrics(
         return None, None, (
             f"cell.json windows[{str(rec.window_key)!r}] carries no "
             f"t_start/t_end for {label} — no pre-costed window duration"
-        )
+        ), None
     duration_s = float(window_meta["t_end"]) - float(window_meta["t_start"])
 
     requests_path = window_dir / "requests.jsonl"
     if not requests_path.is_file():
-        return None, None, f"{requests_path} missing — no per-request basis"
+        return None, None, f"{requests_path} missing — no per-request basis", None
     requests = _read_jsonl(requests_path)
     if not requests:
-        return None, None, f"{requests_path} has no rows — an empty window has no G or Y"
+        return None, None, f"{requests_path} has no rows — an empty window has no G or Y", None
     missing_cols = sorted(
         c for c in _TRUTH_TAX_REQUEST_COLUMNS if not any(c in r for r in requests)
     )
@@ -4750,21 +4898,23 @@ def _dist_window_metrics(
             f"requests.jsonl rows in {label} carry no {missing_cols} "
             "column(s): Y needs the ok stamp, per-request ttft_ms/tpot_ms "
             "and num_tokens (ADR-0118 decode-phase rule)"
-        )
+        ), None
 
     if predicate_root is None:
         return None, None, (
             f"no §8.5 predicate table joined for this run — Y is undefined "
             f"without per-request verdicts; {_PREDICATE_FIX_HINT}"
-        )
+        ), None
     pred_path = predicate_root / str(rec.window_dir) / PREDICATE_ROWS_NAME
     if not pred_path.is_file():
-        return None, None, f"{pred_path} missing — {_PREDICATE_FIX_HINT}"
+        return None, None, f"{pred_path} missing — {_PREDICATE_FIX_HINT}", None
     predicate_by_key: dict[tuple[Any, str, Any], Any] = {}
     for obj in _read_jsonl(pred_path):
         predicate_by_key[_predicate_join_key(obj)] = obj.get("predicate")
 
     records: list[dict[str, Any]] = []
+    send_records: list[dict[str, Any]] = []
+    basis_counts: dict[str, int] = {TTFT_BASIS_SCHEDULED: 0, TTFT_BASIS_SEND: 0}
     unscored_ok = 0
     for req in requests:
         key = _predicate_join_key(req)
@@ -4777,21 +4927,39 @@ def _dist_window_metrics(
         else:
             pred = predicate_by_key[key]
             verid = float("nan") if pred is None else bool(pred)
-        ttft_ms = req.get("ttft_ms")
+        # W16: the section 6.3 clock on open-loop rows; a defective row is a
+        # labeled skip here (the additive DIST pass never crashes the look).
+        try:
+            ttft_ms, basis = _slo_ttft_ms(req)
+        except AnalysisError as exc:
+            return None, None, f"{label}: {exc}", None
+        basis_counts[basis] += 1
+        send_ttft_ms = req.get("ttft_ms")
         tpot_ms = req.get("tpot_ms")
+        base = {
+            "ok": ok,
+            "veridical": verid,
+            "tpot_s": (
+                float("nan") if tpot_ms is None else float(tpot_ms) / 1000.0
+            ),
+            # ADR-0118: the decode-phase length keys the TPOT clause.
+            DECODE_TOKENS_COLUMN: _decode_tokens_of(req.get("num_tokens")),
+        }
         records.append(
             {
-                "ok": ok,
-                "veridical": verid,
+                **base,
                 # The one registered ms→s seam, same as the #14 executor.
                 "ttft_s": (
                     float("nan") if ttft_ms is None else float(ttft_ms) / 1000.0
                 ),
-                "tpot_s": (
-                    float("nan") if tpot_ms is None else float(tpot_ms) / 1000.0
+            }
+        )
+        send_records.append(
+            {
+                **base,
+                "ttft_s": (
+                    float("nan") if send_ttft_ms is None else float(send_ttft_ms) / 1000.0
                 ),
-                # ADR-0118: the decode-phase length keys the TPOT clause.
-                DECODE_TOKENS_COLUMN: _decode_tokens_of(req.get("num_tokens")),
             }
         )
     if unscored_ok:
@@ -4799,7 +4967,7 @@ def _dist_window_metrics(
             f"{unscored_ok} completed (ok) request(s) in {label} have NO "
             "predicate row — the §8.5 predicate must be scored for every "
             "completion (§9.10); rebuild the predicate table against this tree"
-        )
+        ), None
 
     baseline = SLOBaseline(
         ttft_s=float(floor["ttft_s"]), tpot_s=float(floor["tpot_s"])
@@ -4812,8 +4980,12 @@ def _dist_window_metrics(
             gpu_count=gpu_count,
         )
     except GoodputError as exc:
-        return None, None, f"{label}: {exc}"
-    return metrics, gpu_count, None
+        return None, None, f"{label}: {exc}", None
+    clock = _ttft_clock_record(
+        label, basis_counts, metrics, send_records, baseline, duration_s,
+        gpu_count=gpu_count,
+    )
+    return metrics, gpu_count, None, clock
 
 
 def _dist_axes(rec: Any) -> dict[str, Any]:
@@ -4877,6 +5049,8 @@ def run_dist_contrasts_pass(
         "contrast_18": {"not_requested": True},
         "contrast_19": {"not_requested": True},
         "input_skips": input_skips,
+        # W16: the clock every #18 window was graded on, per window.
+        "ttft_clock": {"rule": TTFT_CLOCK_RULE, "windows": []},
     }
 
     manifest_floors: Mapping[str, Any] | None = None
@@ -4905,7 +5079,7 @@ def run_dist_contrasts_pass(
         for rec in dist_rows.itertuples(index=False):
             if str(rec.topology) not in ("tp", "pd"):
                 continue  # the executor labels non-sides; only sides need Y
-            metrics, gpu_count, reason = _dist_window_metrics(
+            metrics, gpu_count, reason, clock = _dist_window_metrics(
                 run_dir, rec, predicate_root, manifest_floors
             )
             if reason is not None:
@@ -4917,6 +5091,8 @@ def run_dist_contrasts_pass(
                     }
                 )
                 continue
+            if clock is not None:
+                document["ttft_clock"]["windows"].append(clock)
             windows_18.append(
                 {
                     **_dist_axes(rec),

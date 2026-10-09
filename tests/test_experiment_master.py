@@ -134,7 +134,7 @@ def world(tmp_path: Path) -> Dict[str, Path]:
     _w(b / "runpodctl", FAKE_RUNPODCTL)
     _w(b / "setsid", "#!/bin/sh\nexec \"$@\"\n")
     # /metrics answers with the live names of 2026-10-07 (S0F-37); everything else is a silent 200
-    _w(b / "curl", "#!/bin/bash\ncase \"$*\" in *\"/metrics\"*) printf 'sglang:token_usage 0.1\\nsglang:num_retracted_reqs 0\\nsglang:num_running_reqs 0\\nvllm:kv_cache_usage_perc 0.1\\n' ;; esac\nexit 0\n")
+    _w(b / "curl", "#!/bin/bash\ncase \"$*\" in *\"/metrics\"*) printf 'sglang:token_usage 0.1\\nsglang:num_retracted_reqs 0\\nsglang:num_running_reqs 0\\nsglang:num_queue_reqs 0\\nvllm:kv_cache_usage_perc 0.1\\n' ;; esac\nexit 0\n")
     _w(b / "nvidia-smi", r'''
         #!/bin/bash
         case "$*" in
@@ -213,6 +213,17 @@ def world(tmp_path: Path) -> Dict[str, Path]:
             if session not in ("a", "b"):
                 raise PlanError(f"session {session!r} is not a registered grid")
             return _Grid(session)
+        def preflight_registration_check(session, *, floor_avg_seq_tokens, rehearsal_n=None, query_manifests=None, charter_datasets=(), floor_concurrency=None):
+            # gap triage 2026-10-09: the stage 0 registration preflight; two test knobs
+            import os
+            get_session_grid(session)
+            problems = []
+            if str(floor_avg_seq_tokens).strip() != "4779":
+                problems.append(f"FLOOR_AVG_SEQ_TOKENS={floor_avg_seq_tokens} but session {session!r} registers 4779 served tokens for the anchor arm 'gold-fresh' (ADR-0155)")
+            if os.environ.get("CAGE_TEST_PREFLIGHT_PROBLEMS"):
+                problems.append(os.environ["CAGE_TEST_PREFLIGHT_PROBLEMS"])
+            return {"session": session, "anchor_seq_tokens": 4779, "cells": 3, "executable_cells": 3,
+                    "needs_lmcache": os.environ.get("CAGE_TEST_NEEDS_LMCACHE") == "1", "problems": problems}
         if __name__ == "__main__":
             a = sys.argv[1:]
             if a and a[0] == "rungs":  # ADR-0154: stage 5 lists the budgeted rungs on the Mac
@@ -291,6 +302,10 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         echo "setup_runpod CHARTER_DATASETS=$CHARTER_DATASETS PREFETCH_MODELS=$PREFETCH_MODELS" >> "$CAGE_TEST_LOG"
         echo "[cage]   cage-env: link"
         echo "[cage]   all charter datasets staged: $CHARTER_DATASETS"
+        if [ "${INSTALL_LMCACHE:-0}" = "1" ]; then
+          if [ -n "${CAGE_TEST_LMCACHE_FAIL:-}" ]; then echo "[cage] FATAL: lmcache install or import FAILED (S0F-57, ADR-0158)"; exit 1; fi
+          echo "[cage]   lmcache: 0.3.x installed beside vllm 0.19.1"
+        fi
         for m in $PREFETCH_MODELS; do echo "[cage]   $m: cached"; done
         echo "[cage]   pynvml OK -> GPU memory-pressure telemetry WILL be captured"
         echo "[cage]   cage_stats.api import OK -> serving telemetry available"
@@ -334,17 +349,26 @@ def world(tmp_path: Path) -> Dict[str, Path]:
             out = Path(a[a.index("--out") + 1]); out.parent.mkdir(parents=True, exist_ok=True)
             fail = os.environ.get("CAGE_TEST_RUNGS_FAIL") == "1"
             label = "LADDER_EXHAUSTED" if fail else "ESTIMATED"
-            doc = {"schema": "cage-rung-calibration-v1", "engine": a[a.index("--engine") + 1], "argv": a,
-                   "rungs": {r: {"r": float(r), "label": label, "lambda_star_qps": None if fail else 3.0 * float(r)}
-                             for r in a[a.index("--rungs") + 1].split(",")}}
+            rungs = {r: {"r": float(r), "label": label, "lambda_star_qps": None if fail else 3.0 * float(r)}
+                     for r in a[a.index("--rungs") + 1].split(",")}
+            small_fail = os.environ.get("CAGE_TEST_SMALL_RUNGS_FAIL") == "1"
+            small = {r: {"r": float(r), "label": "LADDER_EXHAUSTED" if small_fail else "ESTIMATED",
+                         "lambda_star_qps": None if small_fail else 12.0 * float(r)}
+                     for r in a[a.index("--rungs") + 1].split(",")}
+            # ADR-0156: the v2 artifact carries both anchors under classes
+            doc = {"schema": "cage-rung-calibration-v2", "engine": a[a.index("--engine") + 1], "argv": a,
+                   "anchor_seq_tokens": 4779, "rungs": rungs,
+                   "classes": {"4779": {"role": "anchor", "arm": "gold-fresh", "seq_tokens": 4779, "rungs": rungs},
+                               "348": {"role": "smallest", "arm": "retr-trunc", "seq_tokens": 348, "prefix_mode": "OFF", "rungs": small}}}
             out.write_text(json.dumps(doc), encoding="utf-8")
             print("[calibrate-rungs] artifact written:", out); sys.exit(1 if fail else 0)
         if a[0] == "plan":
             out = Path(a[a.index("--out") + 1]); out.parent.mkdir(parents=True, exist_ok=True)
             plan = {"schema": "cage-campaign-plan-v6", "session": a[a.index("--session") + 1], "argv": a,
                     "steps": [{"kind": "relaunch", "engine": "vllm", "argv": ["manage_vllm_server.sh", "start"]},
-                              {"kind": "cell", "engine": "vllm", "row_key": "k1", "argv": ["run_experiment.py", "--vllm-telemetry"]},
-                              {"kind": "cell", "engine": "hf", "row_key": "k2", "argv": ["run_cag_reference.py"]}],
+                              # cell steps carry engine/topology inside cellspec (the real plan shape; gap triage 2026-10-09 L2)
+                              {"kind": "cell", "cellspec": {"engine": "vllm", "topology": "single"}, "row_key": "k1", "argv": ["run_experiment.py", "--vllm-telemetry"]},
+                              {"kind": "cell", "cellspec": {"engine": "hf", "topology": "single"}, "row_key": "k2", "argv": ["run_cag_reference.py"]}],
                     "blocked_row_keys": ["k9"] if os.environ.get("CAGE_TEST_BLOCKED") else []}
             if os.environ.get("CAGE_TEST_BAD_PLAN"):
                 plan["steps"][1]["argv"] = ["run_experiment.py"]
@@ -426,6 +450,7 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         HOURS=1
         SEATBELT=12h
         SETUP_BOUND_MIN=1
+        CALIBRATE_RUNGS_BOUND_S=9000
         DC_PREFS="EU-RO-1 US-NE-1"
         PREFETCH_MODELS="Qwen/Qwen3-14B"
         MAX_NULL_FRACTION=0.2
@@ -808,7 +833,7 @@ def test_rung_calibration_job_feeds_the_plan(world: Dict[str, Path]) -> None:
     assert " start " not in cmd, "the job's relaunches are the plan's own; no engine start before it"
     plan_cmd = (world["home"] / ".cage_jobs" / "plan.cmd").read_text(encoding="utf-8")
     assert "--rung-calibration vllm=results/calibration/rungs_S1_vllm.json" in plan_cmd
-    assert "rungs calibration (ADR-0154): rungs 1,0.5" in proc.stdout or "rung calibration (ADR-0154): rungs 1,0.5" in proc.stdout
+    assert "rung calibration (ADR-0154, ADR-0156): rungs 1,0.5 per engine on the anchor and the smallest class" in proc.stdout
     fetched = world["exp_root"] / "S1" / DATE / "extras" / "calibration" / "rungs_S1_vllm.json"
     assert json.loads(fetched.read_text(encoding="utf-8"))["rungs"]["1"]["label"] == "ESTIMATED"
     calls = _calls(world)
@@ -825,6 +850,63 @@ def test_a_rung_that_is_not_estimated_fails_stage_5_before_the_plan(world: Dict[
     assert not (world["home"] / ".cage_jobs" / "plan.cmd").exists(), "stage 6 must not run"
     st = _state(world)
     assert st["stages"]["calibrate"]["status"] == "failed" and "plan" not in st["stages"]
+
+
+def test_stage_0_refuses_a_registration_problem_before_anything_bills(world: Dict[str, Path]) -> None:
+    # gap triage 2026-10-09: the manifest shortfall and the unstaged dataset the
+    # registered S1 profile hits at stage 6 are refused at stage 0, on the Mac
+    proc = _master(world, "--yes", "provision",
+                   CAGE_TEST_PREFLIGHT_PROBLEMS="--query-manifest qasper: trial 1 carries 50 ids but the primary cells register n=2000: shortfall 1950")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "REFUSED: --query-manifest qasper" in proc.stdout and "stage preflight-mac FAILED" in proc.stdout
+    assert not any("provision_pod" in c for c in _calls(world)), "nothing may bill after a stage 0 refusal"
+
+
+def test_stage_4_proves_the_lmcache_import_when_the_plan_needs_it(world: Dict[str, Path]) -> None:
+    # S0F-57 (gap triage C1): stage 0 found an executable vLLM retr-store cell, so
+    # the validate job imports lmcache in the pod venv; the fake venv has none
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_NEEDS_LMCACHE="1")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "NEEDS_LMCACHE=1" in proc.stdout and "stage validate FAILED" in proc.stdout
+    assert "lmcache module does not import" in proc.stdout
+    assert _state(world)["registration"]["needs_lmcache"] in ("1", 1)
+    cmd = (world["home"] / ".cage_jobs" / "validate_vllm.cmd").read_text(encoding="utf-8")
+    assert "import lmcache" in cmd
+    log = (world["exp_root"] / "S1" / DATE / "logs" / "setup" / "validate_vllm.log").read_text(encoding="utf-8")
+    assert "LMCACHE_IMPORT_MISSING" in log and "PREFLIGHT PASS" in log
+    assert not (world["home"] / ".cage_jobs" / "calibrate_vllm.cmd").exists(), "stage 5 must not run"
+
+
+def test_stage_3_installs_lmcache_when_the_profile_opts_in(world: Dict[str, Path], tmp_path: Path) -> None:
+    # S0F-57 / ADR-0158: INSTALL_LMCACHE=1 (a profile knob; _common.env defaults it to 0)
+    # reaches the bootstrap and its proof line is required
+    prof = tmp_path / "S1_lmcache.env"
+    prof.write_text(world["profile"].read_text(encoding="utf-8") + "\nINSTALL_LMCACHE=1\n", encoding="utf-8")
+    world["profile"] = prof
+    proc = _master(world, "--yes", "provision", "--to", "setup")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    cmd = (world["home"] / ".cage_jobs" / "setup.cmd").read_text(encoding="utf-8")
+    assert "INSTALL_LMCACHE='1'" in cmd
+    assert "installed beside vllm" in (world["exp_root"] / "S1" / DATE / "logs" / "setup" / "setup.log").read_text(encoding="utf-8")
+    proc = _master(world, "--from", "setup", "--redo", "--to", "setup", CAGE_TEST_LMCACHE_FAIL="1")
+    assert proc.returncode == 1 and "stage setup FAILED" in proc.stdout
+
+
+def test_stage_4_skips_the_lmcache_probe_when_no_cell_needs_it(world: Dict[str, Path]) -> None:
+    proc = _master(world, "--yes", "provision", "--to", "validate")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    assert "NEEDS_LMCACHE=0" in proc.stdout
+    assert "import lmcache" not in (world["home"] / ".cage_jobs" / "validate_vllm.cmd").read_text(encoding="utf-8")
+
+
+def test_a_smallest_class_rung_that_is_not_estimated_fails_stage_5_too(world: Dict[str, Path]) -> None:
+    # ADR-0156: the fake job exits 0 with the anchor ESTIMATED but the smallest
+    # class LADDER_EXHAUSTED; the master's own check over the classes block fails
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_SMALL_RUNGS_FAIL="1")
+    assert proc.returncode == 1
+    assert "stage calibrate FAILED" in proc.stdout
+    assert "smallest 348" in proc.stdout and "LADDER_EXHAUSTED" in proc.stdout
+    assert not (world["home"] / ".cage_jobs" / "plan.cmd").exists()
 
 
 def test_run_exit_3_dry_window_failed_fails_the_stage_loudly(world: Dict[str, Path]) -> None:
@@ -1013,7 +1095,7 @@ def test_validate_runs_the_preflight_on_vllm_only_and_engine_probes_on_sglang(wo
     assert vllm_cmd.index("probe_thinking_pin.py") < vllm_cmd.index("manage_vllm_server.sh stop")
     log = (world["exp_root"] / "S1" / DATE / "logs" / "setup" / "validate_sglang.log").read_text(encoding="utf-8")
     for marker in ("VALIDATE_API_OK", "RUNNING_REQS=0", "ENGINE_FLUSH_OK", "METRIC_OK sglang:token_usage", "METRIC_OK sglang:num_retracted_reqs",
-                   "METRIC_OK sglang:num_running_reqs", "POOL_RECORD_OK", "THINKING_PIN_OK backend=sglang", "COMPUTE_APPS=0"):
+                   "METRIC_OK sglang:num_running_reqs", "METRIC_OK sglang:num_queue_reqs", "POOL_RECORD_OK", "THINKING_PIN_OK backend=sglang", "COMPUTE_APPS=0"):
         assert marker in log, marker
     vllm_log = (world["exp_root"] / "S1" / DATE / "logs" / "setup" / "validate_vllm.log").read_text(encoding="utf-8")
     assert "THINKING_PIN_OK backend=vllm" in vllm_log

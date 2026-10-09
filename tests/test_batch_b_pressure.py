@@ -16,6 +16,8 @@ Pure of RunPod: the runner and the launchers are the recording stub of
 from __future__ import annotations
 
 import json
+import math
+import statistics
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -27,6 +29,7 @@ from test_run_campaign import (  # noqa: E402
     _ANCHOR_DEMAND,
     _ANCHOR_SEQ_TOKENS,
     _RUNG_LAMBDA,
+    _RUNG_SMALL_FACTOR,
     _cell_calls,
     _cells,
     _dry_calls,
@@ -170,6 +173,54 @@ class TestRungArtifact:
         with pytest.raises(rc.PlanError, match="not valid JSON"):
             rc.load_rung_calibration(bad)
 
+    def test_classes_block_loads_the_smallest_ladder(self, tmp_path):
+        # ADR-0156: the second anchor rides the artifact's classes block
+        doc = _rung_calibration_doc("vllm", "a", (1.0, 0.5), small=(348, "retr-trunc"))
+        cal = rc.load_rung_calibration(_write_doc(tmp_path, doc))
+        assert cal.anchor_seq_tokens == _ANCHOR_SEQ_TOKENS
+        assert (cal.small_seq_tokens, cal.small_arm, cal.small_prefix_mode) == (348, "retr-trunc", "OFF")
+        assert cal.small_lambdas == {1.0: _RUNG_LAMBDA * _RUNG_SMALL_FACTOR, 0.5: _RUNG_LAMBDA * _RUNG_SMALL_FACTOR * 0.5}
+        assert cal.small_label_at(0.5) == "ESTIMATED" and cal.small_lambda_at(0.25) is None
+        # a one-class artifact loads with the small side empty
+        one = rc.load_rung_calibration(_write_doc(tmp_path, _rung_calibration_doc("vllm", "a", (1.0,)), "one.json"))
+        assert one.small_seq_tokens is None and one.small_lambdas == {} and one.anchor_seq_tokens == _ANCHOR_SEQ_TOKENS
+
+    @pytest.mark.parametrize(
+        "spoil, match",
+        [
+            (lambda d: d.update(schema="cage-rung-calibration-v1"), "predates the second anchor"),
+            (lambda d: d.update(classes=[]), "classes must be a mapping"),
+            (lambda d: d["classes"].update({"349": dict(d["classes"]["348"], seq_tokens=349)}), "two 'smallest' entries"),
+            (lambda d: d["classes"]["348"].update(role="middle"), "must be 'anchor' or 'smallest'"),
+            (lambda d: d["classes"]["348"].update(seq_tokens=347), "the integer >= 1 the key names"),
+            (lambda d: d["classes"]["348"].update(arm=""), "must name the smallest class's arm"),
+            (lambda d: d["classes"]["348"].update(prefix_mode="on"), "must be 'ON' or 'OFF'"),
+            (lambda d: d["classes"][str(_ANCHOR_SEQ_TOKENS)].update(rungs={"1": {"r": 1.0, "label": "ESTIMATED", "lambda_star_qps": 1.0}}), "differs from the top-level rungs table"),
+            (lambda d: d.update(anchor_seq_tokens=4000), "disagrees with anchor_seq_tokens"),
+            (lambda d: d["classes"]["348"]["rungs"]["1"].update(lambda_star_qps=None), r"classes\['348'\].rungs\['1'\] is ESTIMATED but"),
+        ],
+    )
+    def test_classes_refusals(self, tmp_path, spoil, match):
+        doc = _rung_calibration_doc("vllm", "a", (1.0, 0.5), small=(348, "retr-trunc"))
+        spoil(doc)
+        with pytest.raises(rc.PlanError, match=match):
+            rc.load_rung_calibration(_write_doc(tmp_path, doc))
+
+    def test_smallest_class_must_be_below_the_anchor(self, tmp_path):
+        doc = _rung_calibration_doc("vllm", "a", (1.0,), small=(_ANCHOR_SEQ_TOKENS + 1, "x"))
+        with pytest.raises(rc.PlanError, match="is not below the anchor"):
+            rc.load_rung_calibration(_write_doc(tmp_path, doc))
+
+    def test_interpolation_arithmetic(self):
+        alpha = rc.interpolation_alpha(8.0, 4779, 32.0, 348)
+        assert alpha == pytest.approx(math.log(4.0) / math.log(4779 / 348))
+        assert rc.interpolation_alpha(8.0, 4779, 8.0 * 4779 / 348, 348) == pytest.approx(1.0)  # KV-bound limit
+        assert rc.interpolation_alpha(8.0, 4779, 8.0, 348) == 0.0  # pure request cap
+        with pytest.raises(rc.PlanError, match="positive finite rates"):
+            rc.interpolation_alpha(0.0, 4779, 8.0, 348)
+        with pytest.raises(rc.PlanError, match="s_small"):
+            rc.interpolation_alpha(8.0, 348, 8.0, 4779)
+
 
 class TestRungRegistration:
     def _build(self, floor_table: Path, cal: Dict[str, Path], rungs: Optional[Dict[str, Path]]):
@@ -218,18 +269,58 @@ class TestRungRegistration:
 
     def test_header_records_the_registration(self, plan_a):
         header = plan_a["rung_calibration"]
-        assert header["schema"] == rc.RUNG_CALIBRATION_SCHEMA
+        assert header["schema"] == rc.RUNG_CALIBRATION_SCHEMA == "cage-rung-calibration-v2"
         assert header["adr"] == "ADR-0154" and header["finding"] == "S0F-62"
+        assert header["two_anchor_adr"] == "ADR-0156"
         assert header["anchor_arm"] == "gold-fresh" and header["anchor_seq_tokens"] == _ANCHOR_SEQ_TOKENS
         assert header["required_rungs"] == {
             "sglang": [1.5, 1.25, 1.0, 0.75, 0.5, 0.375, 0.25],
             "vllm": [1.5, 1.25, 1.0, 0.75, 0.5, 0.375, 0.25],
         }
+        # the classes below the anchor per engine and the rungs each is carried at
+        below = header["classes_below_anchor"]
+        assert set(below) == {"vllm", "sglang"}
+        assert set(below["vllm"]) == {"2336", "1127", "1126", "702", "348"}
+        assert below["vllm"]["348"] == [1.5, 1.25, 1.0, 0.75, 0.5, 0.375, 0.25]  # retr-trunc, F2
+        assert below["vllm"]["1126"] == [1.0, 0.5, 0.25]  # retr-reuse, F3 only
+        alpha = math.log(_RUNG_SMALL_FACTOR) / math.log(_ANCHOR_SEQ_TOKENS / 348)
         for engine in ("vllm", "sglang"):
             art = header["artifacts"][engine]
             assert len(art["sha256"]) == 64 and art["session"] == "a"
             assert art["rungs"] == {f"{r:g}": _RUNG_LAMBDA * r for r in (1.5, 1.25, 1.0, 0.75, 0.5, 0.375, 0.25)}
             assert set(art["labels"].values()) == {"ESTIMATED"}
+            small = art["small_class"]
+            assert (small["seq_tokens"], small["arm"], small["prefix_mode"]) == (348, "retr-trunc", "OFF")
+            assert small["rungs"]["1"] == pytest.approx(_RUNG_LAMBDA * _RUNG_SMALL_FACTOR)
+            assert set(art["alpha"]) == {"1.5", "1.25", "1", "0.75", "0.5", "0.375", "0.25"}
+            assert all(a == pytest.approx(alpha) for a in art["alpha"].values())
+
+    def test_an_engine_serving_classes_below_the_anchor_needs_the_smallest_ladder(
+        self, floor_table, calibrations_a, tmp_path
+    ):
+        # ADR-0156: session a serves five classes below the anchor on both engines
+        rungs = rc.budgeted_rungs(rc.SESSION_GRIDS["a"])
+        anchor_only = _write_rung_calibrations(tmp_path / "ao", ("vllm", "sglang"), "a", rungs, small=None)
+        with pytest.raises(rc.PlanError, match="carries no smallest-class ladder .* 348 tokens"):
+            self._build(floor_table, calibrations_a, anchor_only)
+        wrong = _write_rung_calibrations(tmp_path / "wrong", ("vllm", "sglang"), "a", rungs, small=(702, "retr-comp"))
+        with pytest.raises(rc.PlanError, match="smallest class is 702 tokens .* is 348 tokens"):
+            self._build(floor_table, calibrations_a, wrong)
+        short = _write_rung_calibrations(
+            tmp_path / "short", ("vllm", "sglang"), "a", rungs,
+            small=(348, "retr-trunc"), small_labels={0.25: "LADDER_EXHAUSTED"},
+        )
+        with pytest.raises(rc.PlanError, match=r"smallest class \(348 tokens, retr-trunc\) has no ESTIMATED lambda\* for r=0\.25 \(LADDER_EXHAUSTED\)"):
+            self._build(floor_table, calibrations_a, short)
+        # a smaller sequence that sustained LESS than the anchor is a defective ladder
+        slower = _write_rung_calibrations(tmp_path / "slow", ("vllm", "sglang"), "a", rungs, small=(348, "retr-trunc"), small_factor=0.5)
+        with pytest.raises(rc.PlanError, match=r"alpha -\d\.\d+ < 0"):
+            self._build(floor_table, calibrations_a, slower)
+        # a pure request cap (equal rates, alpha 0) is legal and interpolates flat
+        flat = _write_rung_calibrations(tmp_path / "flat", ("vllm", "sglang"), "a", rungs, small=(348, "retr-trunc"), small_factor=1.0)
+        plan = self._build(floor_table, calibrations_a, flat)
+        for s in _pressure_cells(plan):
+            assert s["lambda_star_rps"] == pytest.approx(_RUNG_LAMBDA * s["cellspec"]["budget_r"])
 
     def test_cli_registers_and_refuses_malformed(self, tmp_path, floor_table, calibrations_a):
         rungs = _rungs_for(calibrations_a, "a")
@@ -474,6 +565,28 @@ class TestLoadPlanBatchB:
         with pytest.raises(rc.RunError, match=match):
             rc.load_plan(_dump(tmp_path, plan, "cell.json"))
 
+    def test_window_span_clauses(self, plan_a, tmp_path):
+        # ADR-0156 / S0F-68: the recorded span and its floor verdict re-derive
+        plan = self._copy(plan_a)
+        cell = next(s for s in _cells(plan) if s["family"] == "F2" and s["blocked_on"] is None)
+        cell["window_span_s_expected"] = cell["window_span_s_expected"] * 2
+        with pytest.raises(rc.RunError, match="window_span_s_expected=.* != num_queries / offered rate"):
+            rc.load_plan(_dump(tmp_path, plan, "span.json"))
+        plan = self._copy(plan_a)
+        cell = next(s for s in _cells(plan) if s["family"] == "F2" and s["blocked_on"] is None)
+        cell["window_span_below_floor"] = not cell["window_span_below_floor"]
+        with pytest.raises(rc.RunError, match="window_span_below_floor=.* disagrees with the registered floor"):
+            rc.load_plan(_dump(tmp_path, plan, "floor.json"))
+        plan = self._copy(plan_a)
+        cell = next(s for s in _cells(plan) if s["family"] == "F1" and s["serving"] is not None)
+        cell["window_span_s_expected"] = 12.0
+        with pytest.raises(rc.RunError, match="carries a window span"):
+            rc.load_plan(_dump(tmp_path, plan, "f1_span.json"))
+        plan = self._copy(plan_a)
+        del _cells(plan)[0]["window_span_s_expected"]
+        with pytest.raises(rc.RunError, match="missing key"):
+            rc.load_plan(_dump(tmp_path, plan, "span_key.json"))
+
     def test_non_pressure_cell_carries_no_rate_basis(self, plan_a, tmp_path):
         plan = self._copy(plan_a)
         cell = next(s for s in _cells(plan) if s["family"] == "F1" and s["serving"] is not None)
@@ -545,6 +658,68 @@ class TestLoadPlanBatchB:
 
 
 # ---------------------------------------------------------------------------
+# The window span audit (ADR-0156 / S0F-68)
+# ---------------------------------------------------------------------------
+
+
+class TestWindowSpans:
+    def test_every_pressure_cell_records_w_over_rate_and_the_floor_verdict(self, plan_a):
+        executable = _pressure_cells(plan_a)
+        for s in executable:
+            assert s["window_span_s_expected"] == pytest.approx(s["num_queries"] / s["offered_rate_rps"])
+            assert s["window_span_below_floor"] is (s["window_span_s_expected"] < rc.WINDOW_SPAN_FLOOR_S)
+        for s in _pressure_cells(plan_a, executable=False):
+            # a blocked cell records the same arithmetic on its labeled rate
+            assert s["window_span_s_expected"] == pytest.approx(s["num_queries"] / s["offered_rate_rps"])
+        for s in _cells(plan_a):
+            if s["family"] not in PRESSURE:
+                assert s["window_span_s_expected"] is None and s["window_span_below_floor"] is None
+        assert rc.WINDOW_SPAN_FLOOR_S == PROBE_WARMUP_S == 10.0 and rc.TELEMETRY_SAMPLE_INTERVAL_S == 1.0
+
+    def test_header_summarizes_the_executable_spans_per_class(self, plan_a):
+        ws = plan_a["window_spans"]
+        executable = _pressure_cells(plan_a)
+        spans = sorted(s["window_span_s_expected"] for s in executable)
+        assert ws["finding"] == "S0F-68" and ws["adr"] == "ADR-0156" and ws["floor_s"] == 10.0
+        assert ws["executable_pressure_cells"] == len(executable) == len(spans)
+        assert ws["min_s"] == pytest.approx(spans[0]) and ws["max_s"] == pytest.approx(spans[-1])
+        assert ws["median_s"] == pytest.approx(statistics.median(spans))  # Fable LOW 8: the true median
+        assert ws["below_floor"] == sum(1 for v in spans if v < 10.0)
+        # W = 200 at rate_frac x (8 x r): the gold class at r = 1.5, 1.2 x 12 = 14.4 rps
+        # spans 13.9 s; the smallest class (4 x the rate) spans 3.5 s and is below
+        assert set(ws["by_class"]) == {"4779", "2336", "1127", "1126", "702", "348"}
+        assert list(ws["by_class"]) == ["4779", "2336", "1127", "1126", "702", "348"]  # largest first
+        # the small class offers 4 x the anchor's rate, so its windows are the shortest;
+        # per class the count below the floor is exactly the cells whose span is under it
+        for seq, rec in ws["by_class"].items():
+            mine = [s for s in executable if s["demand_class"]["seq_tokens"] == int(seq)]
+            assert rec["cells"] == len(mine)
+            assert rec["below_floor"] == sum(1 for s in mine if s["window_span_s_expected"] < 10.0)
+            assert rec["min_s"] == pytest.approx(min(s["window_span_s_expected"] for s in mine))
+        assert ws["by_class"]["348"]["below_floor"] > 0 and ws["by_class"]["348"]["min_s"] < ws["by_class"]["4779"]["min_s"]
+        assert ws["by_class"]["4779"]["min_s"] == pytest.approx(200 / (1.2 * _RUNG_LAMBDA * 1.5))
+        assert sum(c["cells"] for c in ws["by_class"].values()) == len(executable)
+        assert "never a refusal" in ws["note"]
+
+    def test_summary_of_no_pressure_cells(self):
+        ws = rc.window_span_summary([])
+        assert ws["executable_pressure_cells"] == 0 and ws["below_floor"] == 0
+        assert ws["min_s"] is None and ws["median_s"] is None and ws["max_s"] is None and ws["by_class"] == {}
+
+    def test_plan_cli_prints_the_span_line(self, tmp_path, floor_table, calibrations_a, capsys):
+        out = tmp_path / "plan.json"
+        argv = ["plan", "--session", "a", "--floor-table", str(floor_table), "--window-duration-s", "300", "--out", str(out)]
+        for engine, path in calibrations_a.items():
+            argv += ["--calibration", f"{engine}={path}"]
+        for engine, path in _rungs_for(calibrations_a, "a").items():
+            argv += ["--rung-calibration", f"{engine}={path}"]
+        assert rc.main(argv) == 0
+        text = capsys.readouterr().out
+        assert "window spans (S0F-68):" in text and "below the 10 s floor" in text
+        assert "WARNING: those windows are shorter than the registered warm-up transient" in text
+
+
+# ---------------------------------------------------------------------------
 # run: the dry window gates the class's pressure cells (ADR-0153)
 # ---------------------------------------------------------------------------
 
@@ -552,6 +727,14 @@ class TestLoadPlanBatchB:
 def _pressure_grid():
     return _tiny_grid(
         f1_baselines=("B1",), f2_baselines=("B1",), f2_budgets=(1.0, 0.5), f2_rates=(0.85,),
+    )
+
+
+def _two_class_grid():
+    """ADR-0156: the anchor (B1 gold-fresh, 4,779 tokens) and the smallest
+    class (B11 retr-trunc, 348 tokens) on F2, vLLM only."""
+    return _tiny_grid(
+        f1_baselines=("B1",), f2_baselines=("B1", "B11"), f2_budgets=(1.0, 0.5), f2_rates=(0.85,),
     )
 
 
@@ -705,8 +888,12 @@ class FakeWorld:
     (a server with capacity ``cap`` requests per second), unless
     ``write_rows`` is off (a runner that died before the window)."""
 
-    def __init__(self, cap: float, *, relaunch_rc: int = 0, write_rows: bool = True, regime: str = "IN_REGIME"):
+    def __init__(
+        self, cap: float, *, relaunch_rc: int = 0, write_rows: bool = True, regime: str = "IN_REGIME",
+        cap_by_arm: Optional[Dict[str, float]] = None,
+    ):
         self.cap = cap
+        self.cap_by_arm = dict(cap_by_arm or {})  # ADR-0156: a class's own capacity
         self.relaunch_rc = relaunch_rc
         self.write_rows = write_rows
         self.regime = regime
@@ -735,7 +922,8 @@ class FakeWorld:
         wdir = root / "cells" / spec.to_row_key() / f"window_{argv[argv.index('--dataset') + 1]}-01"
         wdir.mkdir(parents=True)
         n = max(1, round(rate * PROBE_WINDOW_S))
-        ok_share = min(1.0, self.cap / rate)
+        cap = self.cap_by_arm.get(env.get("CAGE_CELL_ARM", ""), self.cap)
+        ok_share = min(1.0, cap / rate)
         # the runner's Jain trim drops the warmup rows; attainment over the
         # KEPT rows is exactly min(1, cap / rate) up to one row
         kept = [i * PROBE_WINDOW_S / n for i in range(n) if i * PROBE_WINDOW_S / n >= PROBE_WARMUP_S]
@@ -947,6 +1135,109 @@ class TestCalibrateRungs:
         assert again["rungs"]["1"]["label"] == rc.RUNG_LABEL_PROBE_FAILED
         assert "already exists" in again["rungs"]["1"]["error"]
 
+    def test_one_class_grid_writes_the_anchor_class_only(self, tmp_path):
+        doc = _calibrate(tmp_path, FakeWorld(cap=6.0), _pressure_grid())
+        assert doc["schema"] == "cage-rung-calibration-v2" and doc["two_anchor_adr"] == "ADR-0156"
+        assert doc["anchor_seq_tokens"] == _ANCHOR_SEQ_TOKENS
+        assert list(doc["classes"]) == [str(_ANCHOR_SEQ_TOKENS)]
+        assert doc["classes"][str(_ANCHOR_SEQ_TOKENS)]["role"] == "anchor"
+        assert doc["classes"][str(_ANCHOR_SEQ_TOKENS)]["rungs"] == doc["rungs"]
+        assert doc["interpolation"]["anchor_only"] is False
+
+    def test_smallest_class_ladder_starts_one_chain_step_below_the_anchor_rate_and_feeds_the_interpolation(self, tmp_path):
+        # ADR-0156: B1 (4,779 tokens) and B11 retr-trunc (348 tokens) on F2; the
+        # fake server sustains 6 rps on the anchor and 24 rps on the small class
+        grid = _two_class_grid()
+        world = FakeWorld(cap=6.0, cap_by_arm={"retr-trunc": 24.0})
+        doc = _calibrate(tmp_path, world, grid)
+        assert set(doc["classes"]) == {str(_ANCHOR_SEQ_TOKENS), "348"}
+        small = doc["classes"]["348"]
+        assert (small["role"], small["arm"], small["baseline_id"], small["family"], small["prefix_mode"]) == (
+            "smallest", "retr-trunc", "B11", "F2", "OFF",
+        )
+        assert small["note"] is None  # prefix OFF: the replayed ladder is clean
+        anchor = doc["rungs"]
+        for key in ("1", "0.5"):
+            a, m = anchor[key], small["rungs"][key]
+            assert a["label"] == m["label"] == "ESTIMATED"
+            assert a["lambda_star_qps"] <= 6.0 / 0.9 * 1.01 and a["first_unsustainable_qps"] >= 6.0 / 0.9 * 0.99
+            assert m["lambda_star_qps"] <= 24.0 / 0.9 * 1.01 and m["first_unsustainable_qps"] >= 24.0 / 0.9 * 0.99
+            assert m["class"]["seq_tokens"] == 348 and a["class"]["seq_tokens"] == _ANCHOR_SEQ_TOKENS
+            # the small class's budget is its own class budget at that r
+            assert m["relaunch"]["demand_class"]["seq_tokens"] == 348
+            assert int(m["relaunch"]["env"]["CAGE_KV_BUDGET_BYTES"]) == int(float(key) * ((_ANCHOR_DEMAND * 348) // _ANCHOR_SEQ_TOKENS))
+            assert "--no-prefix-cache" in m["relaunch"]["argv"]
+            for s in m["steps"]:
+                assert Path(s["root"]).name.startswith(f"cal-vllm-smallest-r{key.replace('.', 'p')}-s")
+        # the first small rung starts one chain step BELOW the anchor's lambda*
+        # (Fable review 2026-10-09 HIGH 1: the anchor's ESTIMATED value is the
+        # last sustainable step of its own ladder; a same-capacity class
+        # started exactly there reads unsustainable by Poisson variance)
+        assert small["rungs"]["1"]["start_qps"] == pytest.approx(anchor["1"]["lambda_star_qps"] / rc.LADDER_CHAIN_DIVISOR)
+        assert "anchor lambda*" in small["rungs"]["1"]["start_basis"] and "one chain step below" in small["rungs"]["1"]["start_basis"]
+        # the second small rung chains from the higher of the two candidates
+        chained = small["rungs"]["1"]["lambda_star_qps"] / PROBE_LADDER_FACTOR ** 2
+        assert small["rungs"]["0.5"]["start_qps"] == pytest.approx(max(chained, anchor["0.5"]["lambda_star_qps"] / rc.LADDER_CHAIN_DIVISOR))
+        # order: the anchor's two rungs, then the small class's two (four relaunches)
+        restarts = [e["CAGE_KV_BUDGET_BYTES"] for a, e in world.calls if "restart" in a]
+        assert len(restarts) == 4
+        small_windows = [(a, e) for a, e in world.runner_calls() if e["CAGE_CELL_ARM"] == "retr-trunc"]
+        assert small_windows and all(e["CAGE_CELL_BUDGET_R"] in ("1", "0.5") for _a, e in small_windows)
+        assert all("--max-context-docs" in a for a, _e in small_windows)  # the arm's own behavior argv
+        # the artifact feeds the plan: B11 offers its own lambda*, B1 the anchor's
+        path = _write_doc(tmp_path, doc, "rungs_vllm.json")
+        cal = rc.load_rung_calibration(path)
+        floor = rc.load_floor_table(tmp_path / "ft.json")
+        orig = rc.SESSION_GRIDS
+        rc.SESSION_GRIDS = {"a": grid}
+        try:
+            plan = rc.build_plan(
+                "a", floor, window_duration_s=60.0,
+                calibrations={"vllm": tmp_path / "cal" / "calibration_vllm.json"},
+                rung_calibrations={"vllm": path},
+            )
+        finally:
+            rc.SESSION_GRIDS = orig
+        for s in _pressure_cells(plan):
+            r = s["cellspec"]["budget_r"]
+            if s["cellspec"]["arm"] == "retr-trunc":
+                assert s["rate_basis"] == rc.LAMBDA_BASIS_SMALL
+                assert s["lambda_star_rps"] == pytest.approx(cal.small_lambda_at(r))
+            else:
+                assert s["rate_basis"] == rc.LAMBDA_BASIS_RUNG
+                assert s["lambda_star_rps"] == pytest.approx(cal.lambda_at(r))
+        alpha = plan["rung_calibration"]["artifacts"]["vllm"]["alpha"]
+        for key in ("1", "0.5"):
+            want = math.log(cal.small_lambda_at(float(key)) / cal.lambda_at(float(key))) / math.log(_ANCHOR_SEQ_TOKENS / 348)
+            assert alpha[key] == pytest.approx(want)
+
+    def test_anchor_only_skips_the_second_ladder_and_the_plan_refuses_it(self, tmp_path):
+        grid = _two_class_grid()
+        world = FakeWorld(cap=6.0, cap_by_arm={"retr-trunc": 24.0})
+        doc = _calibrate(tmp_path, world, grid, anchor_only=True)
+        assert list(doc["classes"]) == [str(_ANCHOR_SEQ_TOKENS)] and doc["interpolation"]["anchor_only"] is True
+        assert all(e.get("CAGE_CELL_ARM") == "gold-fresh" for _a, e in world.runner_calls())
+        path = _write_doc(tmp_path, doc, "rungs_vllm.json")
+        orig = rc.SESSION_GRIDS
+        rc.SESSION_GRIDS = {"a": grid}
+        try:
+            with pytest.raises(rc.PlanError, match="carries no smallest-class ladder"):
+                rc.build_plan(
+                    "a", rc.load_floor_table(tmp_path / "ft.json"), window_duration_s=60.0,
+                    calibrations={"vllm": tmp_path / "cal" / "calibration_vllm.json"},
+                    rung_calibrations={"vllm": path},
+                )
+        finally:
+            rc.SESSION_GRIDS = orig
+
+    def test_a_defective_small_ladder_reads_none_sustainable(self, tmp_path):
+        # the small class starts at the anchor's rate; a server that sustains LESS
+        # on the small class labels its rung NONE_SUSTAINABLE (loud), never a value
+        grid = _two_class_grid()
+        doc = _calibrate(tmp_path, FakeWorld(cap=6.0, cap_by_arm={"retr-trunc": 1.0}), grid, rungs=(1.0,))
+        assert doc["rungs"]["1"]["label"] == "ESTIMATED"
+        assert doc["classes"]["348"]["rungs"]["1"]["label"] == "NONE_SUSTAINABLE"
+
 
 class TestReadLadderWindow:
     def _window(self, tmp_path: Path, rows) -> Path:
@@ -987,7 +1278,9 @@ if "--open-loop-warmup-s" in argv and argv[argv.index("--open-loop-warmup-s") + 
 from src.orchestration.campaign_session import derive_cell_spec
 def flag(name):
     return argv[argv.index(name) + 1]
-rate = float(flag("--rate")); cap = float(os.environ["STUB_CAPACITY_QPS"])
+rate = float(flag("--rate"))
+cap = float(os.environ.get("STUB_CAPACITY_QPS_" + os.environ.get("CAGE_CELL_ARM", "").replace("-", "_").upper(),
+                           os.environ["STUB_CAPACITY_QPS"]))
 spec = derive_cell_spec(baseline=flag("--baseline"), baseline_label=flag("--baseline-label"),
                         backend=flag("--backend"), model=flag("--model"), env=os.environ)
 wdir = os.path.join(flag("--campaign-root"), "cells", spec.to_row_key(), "window_%s-01" % flag("--dataset"))
@@ -1002,7 +1295,7 @@ sys.exit(0)
 """.replace("__REPO_ROOT__", repr(str(rc.REPO_ROOT)))
 
 
-def _cli_calibrate(tmp_path: Path, monkeypatch, capacity: str, extra: List[str]) -> Tuple[int, Path]:
+def _cli_calibrate(tmp_path: Path, monkeypatch, capacity: str, extra: List[str], grid=None) -> Tuple[int, Path]:
     stub_path = tmp_path / "ladder_stub.py"
     stub_path.write_text(_LADDER_STUB_SOURCE, encoding="utf-8")
     monkeypatch.setenv("STUB_CALLS", str(tmp_path / "calls.jsonl"))
@@ -1013,7 +1306,7 @@ def _cli_calibrate(tmp_path: Path, monkeypatch, capacity: str, extra: List[str])
     out = tmp_path / "rungs_vllm.json"
     cmd = f"{sys.executable} {stub_path}"
     orig = rc.SESSION_GRIDS
-    rc.SESSION_GRIDS = {"a": _pressure_grid()}
+    rc.SESSION_GRIDS = {"a": grid or _pressure_grid()}
     try:
         code = rc.main([
             "calibrate-rungs", "--session", "a", "--engine", "vllm", "--floor-table", str(floor),
@@ -1042,3 +1335,26 @@ class TestCalibrateRungsCli:
         assert code == 1
         assert json.loads(out.read_text(encoding="utf-8"))["rungs"]["1"]["label"] == "NONE_SUSTAINABLE"
         assert "NOT ESTIMATED" in capsys.readouterr().err
+
+    def test_two_anchors_end_to_end_with_a_subprocess_runner(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("STUB_CAPACITY_QPS_RETR_TRUNC", "12.0")
+        code, out = _cli_calibrate(tmp_path, monkeypatch, "4.0", ["--rungs", "0.5", "--start-qps", "2"], grid=_two_class_grid())
+        assert code == 0
+        doc = json.loads(out.read_text(encoding="utf-8"))
+        small = doc["classes"]["348"]["rungs"]["0.5"]
+        assert small["label"] == "ESTIMATED" and small["lambda_star_qps"] <= 12.0 / 0.9 * 1.01
+        assert small["first_unsustainable_qps"] >= 12.0 / 0.9 * 0.99
+        assert all(Path(s["root"]).name.startswith("cal-vllm-smallest-r0p5-s") for s in small["steps"])
+        text = capsys.readouterr().out
+        assert "anchor class gold-fresh (4779 tokens)" in text and "smallest class retr-trunc (348 tokens)" in text
+        cal = rc.load_rung_calibration(out)
+        assert cal.small_lambda_at(0.5) == small["lambda_star_qps"]
+
+    def test_exit_1_when_the_small_class_is_not_estimated(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("STUB_CAPACITY_QPS_RETR_TRUNC", "0.01")
+        code, out = _cli_calibrate(tmp_path, monkeypatch, "4.0", ["--rungs", "0.5", "--start-qps", "2"], grid=_two_class_grid())
+        assert code == 1
+        doc = json.loads(out.read_text(encoding="utf-8"))
+        assert doc["rungs"]["0.5"]["label"] == "ESTIMATED"
+        assert doc["classes"]["348"]["rungs"]["0.5"]["label"] == "NONE_SUSTAINABLE"
+        assert "smallest 348 tokens r=0.5" in capsys.readouterr().err

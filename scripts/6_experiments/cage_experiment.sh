@@ -140,9 +140,10 @@ POD_READY_TIMEOUT_S="${CAGE_POD_READY_TIMEOUT_S:-900}"
 POD_READY_POLL_S="${CAGE_POD_READY_POLL_S:-15}"
 # Per-stage job bounds (seconds); the seatbelt must cover their sum plus the run.
 VALIDATE_BOUND_S=1500; CALIBRATE_BOUND_S=3600; PLAN_BOUND_S=900; COLLECT_BOUND_S=1800; PULL_MARGIN_MIN=60
-# ADR-0154: the per-engine rung calibration job bound (profile key, default in
-# _common.env): up to PROBE_MAX_STEPS windows of 75 s plus a relaunch per rung.
-: "${CALIBRATE_RUNGS_BOUND_S:=9000}"
+# ADR-0154 / ADR-0156: the per-engine rung calibration job bound (profile key,
+# default in _common.env): up to PROBE_MAX_STEPS windows of 75 s plus a relaunch
+# per rung, for TWO classes (the anchor and the engine's smallest class).
+: "${CALIBRATE_RUNGS_BOUND_S:=18000}"
 
 seatbelt_minutes() { # "24h" | "90m" | "2d" -> minutes, or empty when malformed
   case "$1" in
@@ -471,22 +472,37 @@ stage_preflight_mac() {
   for item in $QUERY_MANIFESTS; do mpath="${item#*=}"; [ -f "$PROJECT_DIR/$mpath" ] || missing="$missing $mpath"; done
   [ -f "$PROJECT_DIR/$CALIBRATION_MANIFEST" ] || missing="$missing $CALIBRATION_MANIFEST"
   run_step 0 "query and calibration manifests exist" -- test -z "$missing" || { printf '  [FAIL] manifest(s) named by the profile do not exist in the repo:%s (build them with scripts/1_setup/build_query_manifest.py or drop them from QUERY_MANIFESTS)\n' "$missing"; return 1; }
-  run_step 0 "session '$SESSION' registered; FLOOR_AVG_SEQ_TOKENS is its anchor shape (ADR-0155)" -- "$PY" - "$SCRIPTS/3_run/run_campaign.py" "$SESSION" "$FLOOR_AVG_SEQ_TOKENS" <<'PY' || return 1
+  # Gap triage 2026-10-09: every registration check stage 6 would refuse on
+  # (anchor shape ADR-0155, datasets staged, manifest coverage per row class,
+  # the rehearsal derivation) runs HERE, before anything bills; the probe
+  # also says whether an executable vLLM cell needs the LMCache module, which
+  # stage 4 then proves importable on the pod (S0F-57).
+  run_step 0 "session '$SESSION' registration preflight (anchor shape, datasets staged, manifest coverage, pool vs max_model_len)" -- "$PY" - "$SCRIPTS/3_run/run_campaign.py" "$SESSION" "$FLOOR_AVG_SEQ_TOKENS" "${REHEARSAL_N:-}" "$QUERY_MANIFESTS" "$CHARTER_DATASETS" "$PROJECT_DIR" "$FLOOR_CONCURRENCY" <<'PY' || return 1
 import importlib.util, sys
+from pathlib import Path
 spec = importlib.util.spec_from_file_location("cage_run_campaign_probe", sys.argv[1])
 m = importlib.util.module_from_spec(spec); sys.modules[spec.name] = m
 spec.loader.exec_module(m)
+session, floor_tokens, rehearsal, manifests_raw, datasets_raw, project, concurrency = sys.argv[2:9]
+manifests = {}
+for item in manifests_raw.split():
+    ds, _sep, rel = item.partition("=")
+    manifests[ds] = str(Path(project) / rel)
 try:
-    grid = m.get_session_grid(sys.argv[2])
+    report = m.preflight_registration_check(
+        session, floor_avg_seq_tokens=floor_tokens,
+        rehearsal_n=int(rehearsal) if rehearsal.strip() else None,
+        query_manifests=manifests, charter_datasets=tuple(datasets_raw.split()),
+        floor_concurrency=int(concurrency))
 except Exception as exc:
-    print(f"REFUSED: session {sys.argv[2]!r}: {exc}"); sys.exit(1)
-anchor = int(grid.demand_seq_tokens[m.DEMAND_ANCHOR_ARM])
-if sys.argv[3].strip() != str(anchor):
-    print(f"REFUSED: FLOOR_AVG_SEQ_TOKENS={sys.argv[3]} but session {sys.argv[2]!r} registers {anchor} served tokens "
-          f"for the anchor arm {m.DEMAND_ANCHOR_ARM!r} (ADR-0155): the plan refuses a floor table sized on another shape; "
-          f"set FLOOR_AVG_SEQ_TOKENS={anchor} in the profile"); sys.exit(1)
-print(f"session {sys.argv[2]!r} is registered; anchor shape {anchor} served tokens")
+    print(f"REFUSED: session {session!r}: {exc}"); sys.exit(1)
+print(f"session {session!r}: anchor shape {report['anchor_seq_tokens']} served tokens; {report['cells']} cells, "
+      f"{report['executable_cells']} executable; NEEDS_LMCACHE={1 if report['needs_lmcache'] else 0}")
+for p in report["problems"]:
+    print(f"REFUSED: {p}")
+sys.exit(1 if report["problems"] else 0)
 PY
+  plan_only || { if step_has "NEEDS_LMCACHE=1"; then state put registration.needs_lmcache 1; else state put registration.needs_lmcache 0; fi; }
   run_step 0 "stock read (gpu list --include-unavailable)" -- runpodctl gpu list --include-unavailable || return 1
   if ! plan_only; then
     grep -v '^#' "$STEP_LOG" > "$EXTRAS/ops/gpu_list.json"
@@ -668,10 +684,15 @@ stage_ship() {
 stage_setup() {
   pod_env
   local bound=$(( SETUP_BOUND_MIN * 60 ))
-  job_run setup "$bound" "cd $POD_REPO && CHARTER_DATASETS='$CHARTER_DATASETS' PREFETCH_MODELS='$PREFETCH_MODELS' bash scripts/runpod/setup_runpod.sh" "$LAND/logs/setup" || return 1
+  # S0F-57 / ADR-0158: INSTALL_LMCACHE=1 (profile) installs the B8 connector package in
+  # the bootstrap, FATAL there when it fails; the line below proves it landed.
+  job_run setup "$bound" "cd $POD_REPO && CHARTER_DATASETS='$CHARTER_DATASETS' PREFETCH_MODELS='$PREFETCH_MODELS' INSTALL_LMCACHE='${INSTALL_LMCACHE:-0}' LMCACHE_VERSION='${LMCACHE_VERSION:-}' bash scripts/runpod/setup_runpod.sh" "$LAND/logs/setup" || return 1
   plan_only && return 0
   local log="$JOB_LOG" m bad=0
   grep -q "RunPod bootstrap complete" "$log" || { printf '  [FAIL] setup: no "RunPod bootstrap complete" line\n'; bad=1; }
+  if [ "${INSTALL_LMCACHE:-0}" = "1" ]; then
+    grep -q "installed beside vllm" "$log" || { printf '  [FAIL] setup: INSTALL_LMCACHE=1 but the bootstrap printed no "lmcache: ... installed beside vllm" line (S0F-57)\n'; bad=1; }
+  fi
   # WARNING, FATAL and ERROR always; NOTE only for the telemetry import note
   # (setup_runpod.sh:424): the closing "harness trees carry no ledger.json"
   # NOTE (line 450) prints on every bootstrap (review 2026-10-06, HIGH 2).
@@ -722,10 +743,19 @@ stage_validate() {
     # check read (the live scrape of 2026-10-07: sglang:token_usage,
     # sglang:num_retracted_reqs, sglang:num_running_reqs), and the launcher's
     # realized-pool record (ADR-0142). An engine with no registered set refuses.
-    local probe="" names="" gauge="" n_names=0 thinking=""
+    local probe="" names="" gauge="" n_names=0 thinking="" needs_lmcache
+    needs_lmcache="$(state get registration.needs_lmcache 2>/dev/null || echo 0)"
     case "$e" in
-      vllm) probe="CAGE_PREFLIGHT_BACKENDS=$e bash scripts/checks/preflight_check.sh '$MODEL' $api; rc=\$?" ;;
-      sglang) names="sglang:token_usage sglang:num_retracted_reqs sglang:num_running_reqs"; gauge="sglang:num_running_reqs" ;;
+      vllm) probe="CAGE_PREFLIGHT_BACKENDS=$e bash scripts/checks/preflight_check.sh '$MODEL' $api; rc=\$?"
+            # S0F-57 (gap triage 2026-10-09, C1): the plan's vLLM retr-store (B8)
+            # cells relaunch with the LMCache connector; on the 2026-10-08 landing
+            # that relaunch died with ModuleNotFoundError after hours of billing.
+            # When stage 0 found such a cell executable, the import is proven here.
+            # (the marker alone: the check below fails the stage with the fix text)
+            [ "$needs_lmcache" = "1" ] && probe="$probe; $POD_PYTHON -c 'import lmcache' && echo LMCACHE_IMPORT_OK || echo LMCACHE_IMPORT_MISSING" ;;
+      # sglang:num_queue_reqs is the queue gauge the section 6.1 clause (b)
+      # regime label reads (ADR-0153; gap triage 2026-10-09 M3).
+      sglang) names="sglang:token_usage sglang:num_retracted_reqs sglang:num_running_reqs sglang:num_queue_reqs"; gauge="sglang:num_running_reqs" ;;
       *) printf '  [FAIL] %s: no validation probe set is registered for this engine (S0F-37)\n' "$e"; return 1 ;;
     esac
     if [ -z "$probe" ]; then
@@ -754,6 +784,9 @@ stage_validate() {
     grep -q "VALIDATE_API_OK" "$JOB_LOG" || { printf '  [FAIL] %s: /v1/models never answered\n' "$e"; return 1; }
     if [ "$e" = "vllm" ]; then
       grep -q "PREFLIGHT PASS" "$JOB_LOG" || { printf '  [FAIL] %s: preflight did not PASS\n' "$e"; return 1; }
+      if [ "$needs_lmcache" = "1" ]; then
+        grep -q "LMCACHE_IMPORT_OK" "$JOB_LOG" || { printf '  [FAIL] %s: the lmcache module does not import in the pod venv, but the plan has executable vLLM retr-store (B8) cells whose relaunch sets the LMCache connector (S0F-57): install lmcache on the pod (setup_runpod.sh) or deregister B8 for this session, before the calibration stages bill\n' "$e"; return 1; }
+      fi
     else
       grep -q "ENGINE_FLUSH_OK" "$JOB_LOG" || { printf '  [FAIL] %s: the cold-start endpoint POST /flush_cache?timeout=20 did not answer 200 (the scheduler never went fully idle within 20 s, or the endpoint is gone)\n' "$e"; return 1; }
       [ "$(grep -c '^METRIC_OK ' "$JOB_LOG")" -eq "$n_names" ] || { printf '  [FAIL] %s: live /metrics lacks a name the regime bridge or the cold-start check reads:\n' "$e"; grep 'METRIC_MISSING' "$JOB_LOG" | sed 's/^/    /'; return 1; }
@@ -812,7 +845,7 @@ PY
   # (review MEDIUM 4); stage 12 pulls the whole rung-calibration tree.
   local rungs_root="results/rung-calibration/${RUN_ID}-$(date -u +%H%M%S)"
   plan_only || state put calibration.rungs_out_root "$rungs_root"
-  say "rung calibration (ADR-0154): rungs $rungs per engine, bound ${CALIBRATE_RUNGS_BOUND_S}s each, roots under $rungs_root"
+  say "rung calibration (ADR-0154, ADR-0156): rungs $rungs per engine on the anchor and the smallest class, bound ${CALIBRATE_RUNGS_BOUND_S}s each, roots under $rungs_root"
   for e in $CALIBRATE; do
     out="results/calibration/rungs_${EXP}_${e}.json"
     local jrc=0
@@ -826,14 +859,18 @@ PY
     fi
     run_step 0 "fetch rung calibration $e" -- pscp_from "$POD_REPO/$out" "$EXTRAS/calibration/rungs_${EXP}_${e}.json" || return 1
     plan_only && continue
-    run_step 0 "rung calibration $e: every rung ESTIMATED" -- "$PY3" - "$EXTRAS/calibration/rungs_${EXP}_${e}.json" <<'PY' || return 1
+    run_step 0 "rung calibration $e: every rung of every class ESTIMATED" -- "$PY3" - "$EXTRAS/calibration/rungs_${EXP}_${e}.json" <<'PY' || return 1
 import json, sys
 d = json.load(open(sys.argv[1], encoding="utf-8"))
 rungs = d.get("rungs") or {}
-print("schema=%s rungs=%s" % (d.get("schema"), {k: (v.get("label"), v.get("lambda_star_qps")) for k, v in rungs.items()}))
-bad = {k: v.get("label") for k, v in rungs.items() if v.get("label") != "ESTIMATED"}
-if d.get("schema") != "cage-rung-calibration-v1" or not rungs or bad:
-    print("  [FAIL] rung(s) not ESTIMATED: %s (ADR-0154: the plan refuses them; LADDER_EXHAUSTED: raise the start rate or the rung is beyond the ladder ceiling; NONE_SUSTAINABLE: lower it; RELAUNCH_FAILED / PROBE_FAILED: read logs/setup/calibrate_rungs_<engine>.log)" % bad)
+classes = d.get("classes") or {}
+# ADR-0156: the v2 artifact carries the anchor and the smallest class under classes;
+# every rung of every class must be ESTIMATED or the plan refuses the artifact.
+tables = {"%s %s" % (c.get("role"), seq): (c.get("rungs") or {}) for seq, c in classes.items()} or {"anchor": rungs}
+print("schema=%s classes=%s" % (d.get("schema"), {name: {k: (v.get("label"), v.get("lambda_star_qps")) for k, v in t.items()} for name, t in tables.items()}))
+bad = {"%s r=%s" % (name, k): v.get("label") for name, t in tables.items() for k, v in t.items() if v.get("label") != "ESTIMATED"}
+if d.get("schema") != "cage-rung-calibration-v2" or not rungs or not classes or bad:
+    print("  [FAIL] rung(s) not ESTIMATED: %s (ADR-0154, ADR-0156: the plan refuses them; LADDER_EXHAUSTED: raise the start rate or the rung is beyond the ladder ceiling; NONE_SUSTAINABLE: lower it, or on the smallest class the ladder is defective; RELAUNCH_FAILED / PROBE_FAILED: read logs/setup/calibrate_rungs_<engine>.log)" % (bad or d.get("schema")))
     sys.exit(1)
 PY
   done
@@ -861,16 +898,29 @@ bad = []
 for s in cells:
     argv = s.get("argv", [])
     n = sum(1 for a in argv if a == "--vllm-telemetry")
-    eng = s.get("engine")
+    # cell steps carry the engine and topology inside their cellspec record
+    # (gap triage 2026-10-09 L2: the top-level keys never existed, so the
+    # audit checked no cell)
+    eng = (s.get("cellspec") or {}).get("engine")
     if eng == "hf" and n != 0:
         bad.append(f"hf cell carries --vllm-telemetry: {s.get('row_key', '?')}")
     if eng not in (None, "hf") and n != 1:
         bad.append(f"{eng} cell carries --vllm-telemetry {n} times: {s.get('row_key', '?')}")
-    if s.get("topology") == "pd" and not any(k.startswith("CAGE_PD_") for k in (s.get("env") or {})):
+    if (s.get("cellspec") or {}).get("topology") == "pd" and not any(k.startswith("CAGE_PD_") for k in (s.get("env") or {})):
         bad.append(f"pd cell without CAGE_PD_* env: {s.get('row_key', '?')}")
 kinds = {}
 for s in steps: kinds[s.get("kind")] = kinds.get(s.get("kind"), 0) + 1
 print(f"plan schema={plan.get('schema')} steps={len(steps)} by kind={kinds} blocked={len(plan.get('blocked_row_keys', []))}")
+# ADR-0156 / S0F-68: the expected pressure-window spans, counted before the GO
+ws = plan.get("window_spans") or {}
+if ws.get("executable_pressure_cells"):
+    print(f"window spans (S0F-68): {ws['executable_pressure_cells']} executable pressure cells, "
+          f"min {ws['min_s']:.3g} s, median {ws['median_s']:.3g} s, max {ws['max_s']:.3g} s; "
+          f"{ws['below_floor']} below the {ws['floor_s']:g} s floor")
+    for seq, rec in (ws.get("by_class") or {}).items():
+        print(f"  class {seq} tokens: {rec['cells']} cells, {rec['below_floor']} below floor, min {rec['min_s']:.3g} s")
+    if ws["below_floor"]:
+        print(f"  [WARN] {ws['below_floor']} pressure window(s) span less than the {ws['floor_s']:g} s warm-up transient at W = per_row_n.window_requests (S0F-68): their regime labels rest on a few sampler ticks; W is registered, raising it is the owner's decision")
 for b in bad: print("  [FAIL] " + b)
 sys.exit(1 if bad else 0)
 PY

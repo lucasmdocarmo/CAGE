@@ -167,7 +167,9 @@ def test_vllm_stream_chat_happy_path(monkeypatch):
 
 
 def test_vllm_chat_payload_pins_are_unchanged(monkeypatch):
-    """The refactor must emit the exact pre-refactor payload (keys AND order)."""
+    """The payload keys AND order: the thinking pin always, logprobs never by
+    default (ADR-0042; gap triage 2026-10-09 H5: SGLang and LMDeploy never
+    request them, so the campaign payload shape is the same on every engine)."""
     lines = chat_stream_lines(["x"], usage=USAGE_WITH_CACHED)
     calls = install_post(monkeypatch, lambda _c: FakeStreamResponse(lines))
 
@@ -176,12 +178,30 @@ def test_vllm_chat_payload_pins_are_unchanged(monkeypatch):
     payload = calls[0]["json"]
     assert list(payload.keys()) == [
         "model", "messages", "max_tokens", "temperature", "top_p", "stream",
-        "chat_template_kwargs", "logprobs", "top_logprobs", "stream_options",
+        "chat_template_kwargs", "stream_options",
     ]
     assert payload["chat_template_kwargs"] == {"enable_thinking": False}
-    assert payload["logprobs"] is True
-    assert payload["top_logprobs"] == 0
+    assert "logprobs" not in payload and "top_logprobs" not in payload
     assert payload["stream_options"] == {"include_usage": True}
+
+
+def test_vllm_logprobs_are_opt_in_like_sglang(monkeypatch):
+    # ADR-0042: logprobs ride a request only when the caller asks (the pilot's
+    # abstention curves); the campaign runner never passes request_logprobs
+    lines = chat_stream_lines(["x"], usage=USAGE_WITH_CACHED)
+    calls = install_post(monkeypatch, lambda _c: FakeStreamResponse(lines))
+
+    adapter = VLLMAdapter(model_name="m", request_logprobs=True)
+    adapter.generate(chat_request(), stream=True)
+
+    payload = calls[0]["json"]
+    assert list(payload.keys()) == [
+        "model", "messages", "max_tokens", "temperature", "top_p", "stream",
+        "chat_template_kwargs", "logprobs", "top_logprobs", "stream_options",
+    ]
+    assert payload["logprobs"] is True and payload["top_logprobs"] == 0
+    assert adapter.capabilities()["logprobs"] is True
+    assert VLLMAdapter(model_name="m").capabilities()["logprobs"] is False
 
 
 def test_vllm_absent_cached_block_means_zero(monkeypatch):
