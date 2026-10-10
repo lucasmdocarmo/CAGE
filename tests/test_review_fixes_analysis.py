@@ -195,28 +195,24 @@ def _write_passing_calibration_report(path: Path) -> Path:
     the lock semantics they target. Payload mirrors
     tests/test_campaign_analysis.py::_write_calibration_report(passing=True).
     """
+    # C7 (2026-10-10): 400 splits per leg (the registered floor) and the
+    # exact CIs the counts give; the gate recomputes both.
+    from src.analysis.stats.calibration import _rejection_ci
+
+    aa_lo, aa_hi = _rejection_ci(16, 400)
+    inj_lo, inj_hi = _rejection_ci(340, 400)
     payload = {
         "seed": 7,
         "n_observations": 128,
         "aa": {
-            "n_splits": 200,
-            "alpha": 0.05,
-            "n_rejections": 8,
-            "fp_rate": 0.04,
-            "ci_low": 0.01,
-            "ci_high": 0.09,
+            "n_splits": 400, "alpha": 0.05, "n_rejections": 16,
+            "fp_rate": 16 / 400, "ci_low": aa_lo, "ci_high": aa_hi,
         },
         "injections": [
             {
-                "effect_size": 5.0,
-                "kind": "shift",
-                "n_splits": 200,
-                "alpha": 0.05,
-                "n_rejections": 170,
-                "power": 0.85,
-                "ci_low": 0.79,
-                "ci_high": 0.90,
-                "target_power": 0.8,
+                "effect_size": 5.0, "kind": "shift", "n_splits": 400,
+                "alpha": 0.05, "n_rejections": 340, "power": 0.85,
+                "ci_low": inj_lo, "ci_high": inj_hi, "target_power": 0.8,
             }
         ],
     }

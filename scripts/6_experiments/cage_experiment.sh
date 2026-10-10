@@ -1079,7 +1079,11 @@ stage_score() {
   # existing scoring/<id>/ is reused, and the derived predicate table is
   # rebuilt with --force on --redo (review 2026-10-06, MEDIUM 7).
   [ "$REDO" -eq 1 ] && force=" --force"
-  job_run score "$bound" "cd $POD_REPO && { [ -d $POD_RUN_ROOT/scoring/$SCORING_RUN_ID ] && echo 'scoring/$SCORING_RUN_ID exists: reused (append-only)' || $POD_PYTHON scripts/4_analysis/rescore_quality.py --run-root $POD_RUN_ROOT --full --device cuda --scoring-run-id $SCORING_RUN_ID; } && $POD_PYTHON scripts/4_analysis/build_predicate_table.py $POD_RUN_ROOT --scoring-run-id $SCORING_RUN_ID --max-null-fraction $MAX_NULL_FRACTION --freeze-file $POD_FREEZE_FILE$force" "$LAND/logs/runner" || return 1
+  # Review 2026-10-10 (R2): the rescorer reads the freeze file too, so the four
+  # instrument revisions are enforced at load (CAGE_*_REVISION) on the pod; (R3)
+  # the rescorer builds its pass under a partial name and renames it only once
+  # sealed, so the "exists: reused" branch here only ever meets a complete pass.
+  job_run score "$bound" "cd $POD_REPO && { [ -d $POD_RUN_ROOT/scoring/$SCORING_RUN_ID ] && echo 'scoring/$SCORING_RUN_ID exists: reused (append-only)' || $POD_PYTHON scripts/4_analysis/rescore_quality.py --run-root $POD_RUN_ROOT --full --device cuda --scoring-run-id $SCORING_RUN_ID --freeze-file $POD_FREEZE_FILE; } && $POD_PYTHON scripts/4_analysis/build_predicate_table.py $POD_RUN_ROOT --scoring-run-id $SCORING_RUN_ID --max-null-fraction $MAX_NULL_FRACTION --freeze-file $POD_FREEZE_FILE$force" "$LAND/logs/runner" || return 1
   return 0
 }
 

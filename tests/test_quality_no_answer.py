@@ -50,6 +50,11 @@ def _f1(generated: str, reference: str, all_answers: list | None = None) -> dict
         "Cannot be determined.",
         "This can't be determined from the passage.",
         "The answer cannot be found in the context.",
+        # review 2026-10-10 (Q2): the evidence-naming forms keep matching
+        "The answer is not in the context.",
+        "This is not available in the passage.",
+        "Not given in the text.",
+        "The date is not present in the provided document.",
     ],
 )
 def test_abstention_detector_positive(text: str) -> None:
@@ -71,6 +76,13 @@ def test_abstention_detector_positive(text: str) -> None:
         # bare "none"/"Na" are deliberately NOT abstentions: both occur as real gold spans
         "None",
         "Na",
+        # review 2026-10-10 (Q2): a bare "not in" / "not present" / "not available"
+        # inside an ordinary answer must not read as an abstention (6 wrong
+        # answers on unanswerable SQuAD items were credited on the 2026-10-08 data)
+        "SAT solvers do not usually handle problems that are not in the realm of Boolean satisfiability.",
+        "It was not present at the battle.",
+        "The data is not available for 2019.",
+        "He was not given the award.",
     ],
 )
 def test_abstention_detector_negative(text: str) -> None:
@@ -203,10 +215,36 @@ def test_all_answers_abstention_on_answerable_stays_zero() -> None:
         ("Answers: Paris", "Answers: Paris"),
         ("", ""),
         (None, ""),
+        # review 2026-10-10 (Q1): an answer that STARTS with a prompt label keeps
+        # its text (the old rule cut at position 0 and scored "" as an abstention)
+        (" \n\nContext 2: The University of Chicago is governed by a board.",
+         "The University of Chicago is governed by a board."),
+        ("Context 1: CNN/DailyMail (CNNDM) and New York Times (NYT). Context 2: more text",
+         "CNN/DailyMail (CNNDM) and New York Times (NYT)."),
+        ("Question: what is it?", "what is it?"),
+        ("A: Context 1: Paris", "Paris"),
+        # nothing but a label: the raw words stay (never an invented abstention)
+        ("Context 1:", "Context 1:"),
     ],
 )
 def test_sanitize_answer(raw, expected) -> None:
     assert sanitize_answer(raw) == expected
+
+
+def test_sanitizer_never_empties_a_non_blank_answer() -> None:
+    # Review 2026-10-10 (Q1): 15 ok rows of the 2026-10-08 landing began with a
+    # context label and were scored as abstentions; on an unanswerable item that
+    # read EM 1.0 for a context echo. The sanitized text must stay non-empty and
+    # the detector must not call it an abstention.
+    raw = " \n\nContext 2: The University of Chicago is governed by a board."
+    s = sanitize_answer(raw)
+    assert s and not is_no_answer_prediction(s)
+    r = _f1(s, "")
+    assert r["exact_match"] == 0.0 and r["predicted_no_answer"] == 0.0
+    # and an extractive answer echoing the label scores its words, not abstention
+    s2 = sanitize_answer("Context 1: CNN/DailyMail (CNNDM) and New York Times (NYT). Context 2: x")
+    assert _f1(s2, "CNN/DailyMail (CNNDM) and New York Times (NYT).")["exact_match"] == 1.0
+    assert _f1(s2, "CNN/DailyMail (CNNDM) and New York Times (NYT).")["predicted_no_answer"] == 0.0
 
 
 def _model_free_evaluator() -> QualityEvaluator:

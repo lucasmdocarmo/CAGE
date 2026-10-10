@@ -20,11 +20,14 @@ from src.analysis.stats.families import (
     FINGERPRINT_SUB_HYPOTHESES,
     FamilyMapError,
     HEADLINE_CONTRAST_ID,
+    PRESSURE_DATASET,
+    PRESSURE_FAMILY_SET,
     PRIMARY_CHAIN_ORDER,
     PRIMARY_IDS,
     REGISTERED_METRICS,
     UNGATED,
     compile_family_map,
+    registered_datasets,
 )
 from src.analysis.stats.gatekeeping import (
     GatekeepingError,
@@ -152,9 +155,32 @@ class TestFamilies:
                 # (per_query legs only — window-unit generics get no such row)
                 per_cell = len(DEFAULT_METRICS) + (1 if c.unit == "per_query" else 0)
             for slot, groups in legs:
-                n_ds = 1 if slot == "dataset" else len(DATASETS)
+                # C1 (2026-10-10): pressure families compile on the registered
+                # pressure dataset only; F1 on every roster dataset.
+                family = c.family if slot == c.slot else "F3"  # #15's extra leg
+                n_ds = (
+                    1 if slot == "dataset"
+                    else len(registered_datasets(family, DATASETS))
+                )
                 expected += len(groups) * per_cell * n_ds
         assert len(fm) == expected
+
+    def test_pressure_families_compile_on_the_registered_dataset_only_c1(self) -> None:
+        # C1 (2026-10-10): every window contrast compiled on every dataset in
+        # the run, so #13 and #14's registered sets carried three phantom
+        # legs (F2/F3 run on qasper only, run_campaign.py SESSION_GRIDS).
+        assert PRESSURE_DATASET == "qasper"
+        fm = compile_family_map(DATASETS)
+        pressure = fm[fm["family"].isin(sorted(PRESSURE_FAMILY_SET))]
+        assert set(pressure["dataset"]) == {PRESSURE_DATASET}
+        assert set(fm.loc[fm["family"] == "F1", "dataset"]) == set(DATASETS) | {"cross-dataset"}
+        for cid in (13, 14):
+            assert set(fm.loc[fm["contrast_id"] == cid, "dataset"]) == {PRESSURE_DATASET}
+        assert registered_datasets("F1", ("squad_v2", "qasper")) == ("squad_v2", "qasper")
+        assert registered_datasets("F2", ("squad_v2", "qasper")) == ("qasper",)
+        assert registered_datasets("DIST", ("squad_v2",)) == ()
+        # a roster without the pressure dataset compiles no window row at all
+        assert compile_family_map(["squad_v2"])["family"].isin(["F2", "F3", "DIST"]).sum() == 0
 
     def test_family_map_pinned_shape(self) -> None:
         # Pinned literals (2026-08-16, decision d). The 674-row TOTAL and the
@@ -164,19 +190,24 @@ class TestFamilies:
         # group|metric|dataset id pooled 9 per-query rows (#1,2,3,5,6,7,8,9,10
         # for group A) with 3 window rows (#15 F2 leg, #15 F3 leg, #17) in ONE
         # family — exactly the per-query/window unit mixing G19 flagged.
+        # C1 (2026-10-10): the window rows (families F2, F3, DIST) compile on
+        # the ONE registered pressure dataset instead of all four, so the
+        # 674-row total loses 3/4 of its 248 window rows: 674 - 186 = 488.
+        # Window rows per dataset: #12 4, #13 24, #14 4, #15 F2 leg 4, #15 F3
+        # leg 4, #16 4, #17 8, #18 4, #19 4, #20 2 = 62 (248 over four).
         fm = compile_family_map(DATASETS)
-        assert len(fm) == 674
+        assert len(fm) == 488
         assert fm["correction"].value_counts().to_dict() == {
-            "holm": 384,  # 336 secondary + 48 fingerprint superiority
-            "bh-fdr": 178,
-            "none": 64,  # #4 (32) + #14 (16) + #12 falsification (16)
-            "tost": 48,
+            "holm": 282,  # 270 secondary + 12 fingerprint superiority
+            "bh-fdr": 154,
+            "none": 40,  # #4 (32) + #14 (4) + #12 falsification (4)
+            "tost": 12,
         }
         assert fm.groupby("tier").size().to_dict() == {
-            "primary": 144,
-            "secondary": 336,
-            "exploratory": 178,
-            "falsification": 16,
+            "primary": 60,  # #4 32 + #13 24 + #14 4
+            "secondary": 270,
+            "exploratory": 154,
+            "falsification": 4,
         }
         holm_sizes = fm[fm["correction"] == "holm"].groupby("family_id").size()
         assert int(holm_sizes.max()) == 9  # was 12 pre-unit-split
@@ -822,6 +853,50 @@ class TestGatekeeping:
         assert all(p.status == "confirmatory" for p in trace.primaries)
         assert all(s.status == "confirmatory" for s in trace.secondaries)
 
+    def test_registered_order_closes_at_a_missing_endpoint_c2_c3(self) -> None:
+        # C2 (2026-10-10): with truth_tax absent, the old caller passed the
+        # computed endpoints only (headline -> fingerprint) and fingerprint
+        # was tested confirmatorily. The full registered order closes the
+        # chain at the missing endpoint. C3: the set's raw rule may pass, but
+        # its verdict (confirmed) is False for a descriptive endpoint.
+        primaries = [
+            PrimaryOutcome("headline", "squad_v2", 0.001),
+            PrimaryOutcome("fingerprint", "squad_v2", 0.001),
+        ]
+        secondaries = [
+            SecondaryOutcome("B18", "F3|fp|squad_v2", "fingerprint", "squad_v2", 0.001),
+        ]
+        trace = evaluate_chain(
+            primaries, secondaries,
+            registered_order=["headline", "truth_tax", "fingerprint"],
+        )
+        by_endpoint = {p.endpoint: p for p in trace.primaries}
+        assert by_endpoint["headline"].status == "confirmatory"
+        assert by_endpoint["headline"].passed is True
+        fp = by_endpoint["fingerprint"]
+        assert fp.status == "descriptive" and fp.passed is False
+        assert all(s.status == "descriptive" for s in trace.secondaries)
+        serial = {e.family_id: e for e in trace.events if e.family_id.startswith("primary-chain:")}
+        gate = serial["primary-chain:fingerprint"]
+        assert gate.upstream == "truth_tax" and gate.opened is False
+        assert gate.upstream_p is None  # absence is not evidence (C2-1)
+        sets = {d.endpoint: d for d in trace.set_decisions}
+        assert sets["headline"].confirmed is True
+        assert sets["fingerprint"].passed is True  # the raw within-set rule
+        assert sets["fingerprint"].status == "descriptive"
+        assert sets["fingerprint"].confirmed is False
+        assert trace.primary_order == ("headline", "fingerprint")
+
+    def test_registered_order_and_primary_order_are_exclusive_c2(self) -> None:
+        primaries = [PrimaryOutcome("headline", "squad_v2", 0.001)]
+        with pytest.raises(GatekeepingError, match="not both"):
+            evaluate_chain(
+                primaries, [], primary_order=["headline"],
+                registered_order=["headline"],
+            )
+        with pytest.raises(GatekeepingError, match="not in the registered order"):
+            evaluate_chain(primaries, [], registered_order=["truth_tax"])
+
     def test_intra_set_rule_holm_any(self) -> None:
         # One surviving co-primary under Holm keeps the chain open under the
         # declared disjunctive rule; the conjunctive default closes it.
@@ -1089,6 +1164,7 @@ from src.analysis.stats.calibration import (  # noqa: E402
     AAResult,
     CalibrationReport,
     InjectionResult,
+    _rejection_ci,
     build_report,
 )
 
@@ -1143,8 +1219,9 @@ class TestCalibrationReportSerializer:
         # load through the driver, and pass the confirmatory gate.
         rng = np.random.default_rng(7)
         data = rng.normal(0.0, 1.0, size=120)
+        # C7 (2026-10-10): the gate's registered floor is 400 splits per leg.
         report = build_report(
-            data, _mwu_p, n_splits=40, seed=11,
+            data, _mwu_p, n_splits=400, seed=11,
             effect_sizes=(1.5,), target_power=0.2,
         )
         out = report.write(tmp_path / "calibration_report.json")
@@ -1200,12 +1277,15 @@ class TestCalibrationReportSerializer:
     ) -> None:
         # Failure is documented (write always succeeds); refusal is the
         # consumer's job -- same doctrine as instrument_calibration.write_report.
+        # C7: counts at the registered floor with their exact CI (the gate
+        # recomputes; a hand-typed CI is refused as a mismatch).
+        lo, hi = _rejection_ci(200, 400)
         failing = CalibrationReport(
             seed=1,
             n_observations=80,
             aa=AAResult(
-                n_splits=40, alpha=0.05, n_rejections=20,
-                fp_rate=0.5, ci_low=0.338, ci_high=0.662,  # CI excludes alpha
+                n_splits=400, alpha=0.05, n_rejections=200,
+                fp_rate=0.5, ci_low=lo, ci_high=hi,  # CI excludes alpha
             ),
         )
         out = failing.write(tmp_path / "calibration_report.json")
@@ -1217,17 +1297,19 @@ class TestCalibrationReportSerializer:
     def test_missed_injection_target_round_trips_and_refuses(
         self, tmp_path: Path
     ) -> None:
+        aa_lo, aa_hi = _rejection_ci(20, 400)
+        inj_lo, inj_hi = _rejection_ci(100, 400)
         report = CalibrationReport(
             seed=1,
             n_observations=80,
             aa=AAResult(
-                n_splits=40, alpha=0.05, n_rejections=2,
-                fp_rate=0.05, ci_low=0.0061, ci_high=0.1692,
+                n_splits=400, alpha=0.05, n_rejections=20,
+                fp_rate=0.05, ci_low=aa_lo, ci_high=aa_hi,
             ),
             injections=(
                 InjectionResult(
-                    effect_size=0.5, kind="shift", n_splits=40, alpha=0.05,
-                    n_rejections=10, power=0.25, ci_low=0.127, ci_high=0.412,
+                    effect_size=0.5, kind="shift", n_splits=400, alpha=0.05,
+                    n_rejections=100, power=0.25, ci_low=inj_lo, ci_high=inj_hi,
                     target_power=0.8,  # point estimate misses -> FAIL
                 ),
             ),

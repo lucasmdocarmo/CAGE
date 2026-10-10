@@ -1146,3 +1146,79 @@ def test_validate_budget_plan_checks_the_pd_split_at_activation() -> None:
             cs.validate_budget_plan({**pd_plan, "pools_bytes": bad}, pd_spec)
     # non-pd plans never carry the check (single/tp plans have pools_bytes None)
     assert cs.validate_budget_plan(_budget_plan_doc(), _pressure_spec())["pools_bytes"] is None
+
+
+# ---------------------------------------------------------------------------
+# A8 (2026-10-10): journal order. The manifest is journaled when it is
+# created, and every window artifact (the metrics sentinel included) is
+# journaled before the sentinel is published, so no crash point leaves a
+# published file the write-time journal lacks.
+# ---------------------------------------------------------------------------
+
+
+def test_manifest_is_journaled_even_when_the_first_emission_raises(tmp_path: Path) -> None:
+    session = _session(tmp_path, env=MANIFEST_ENV, num_trials=2)
+    series = _regime_series(0.95, instance="prefill") + _regime_series(0.9, instance="decode")
+    with pytest.raises(cl.CampaignLayoutError, match="distinct instance roles"):
+        _emit_regime(session, tmp_path, 1, series=series)
+    assert (session.run_root / "manifest.json").is_file()
+    assert "manifest.json" in cs.read_write_time_journal(session.run_root)
+    # A resumed process opens the existing manifest; the run still seals.
+    resumed = _session(tmp_path, env=MANIFEST_ENV, num_trials=2)
+    assert resumed.reset_incomplete_windows() == [1]
+    _emit_regime(resumed, tmp_path / "resume", 1)  # fresh staging, no series
+    assert cs.seal_campaign_run(resumed.run_root).is_file()
+
+
+def test_a_crash_at_the_window_journal_leaves_the_window_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = _session(tmp_path, env=MANIFEST_ENV, num_trials=2)
+    real = cs.append_write_time_hashes
+
+    def crash_on_window(run_root: Path, paths: Any) -> None:
+        paths = list(paths)
+        if any(Path(p).parent.name.startswith("window_") for p in paths):
+            raise OSError("simulated crash at the journal append")
+        real(run_root, paths)
+
+    monkeypatch.setattr(cs, "append_write_time_hashes", crash_on_window)
+    with pytest.raises(OSError, match="simulated crash"):
+        _emit_regime(session, tmp_path, 1)
+    # The sentinel was never published: resume re-emits the window instead
+    # of keeping an unjournaled one the seal would refuse.
+    assert not (session.window_dir(1) / "metrics.json").exists()
+    assert session.window_complete(1) is False
+    monkeypatch.setattr(cs, "append_write_time_hashes", real)
+    # A real resume is a new process: a fresh session over the same tree.
+    resumed = _session(tmp_path, env=MANIFEST_ENV, num_trials=2)
+    assert resumed.reset_incomplete_windows() == [1]
+    _emit_regime(resumed, tmp_path / "resume", 1)
+    assert cs.seal_campaign_run(resumed.run_root).is_file()
+
+
+def test_the_sentinel_is_journaled_before_its_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = _session(tmp_path, env=MANIFEST_ENV, num_trials=2)
+    real_replace = cs.os.replace
+
+    def crash_on_sentinel(src: Any, dst: Any) -> None:
+        if Path(dst).name == cs.WINDOW_METRICS_NAME:
+            raise OSError("simulated crash before the sentinel rename")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(cs.os, "replace", crash_on_sentinel)
+    with pytest.raises(OSError, match="sentinel rename"):
+        _emit_regime(session, tmp_path, 1)
+    rel = session.window_dir(1).relative_to(session.run_root).as_posix()
+    journal = cs.read_write_time_journal(session.run_root)
+    assert f"{rel}/metrics.json" in journal  # journaled first
+    assert f"{rel}/requests.jsonl" in journal
+    assert not (session.window_dir(1) / "metrics.json").exists()
+    # The stale entry for the never-published file is ignored by the seal.
+    monkeypatch.setattr(cs.os, "replace", real_replace)
+    resumed = _session(tmp_path, env=MANIFEST_ENV, num_trials=2)
+    assert resumed.reset_incomplete_windows() == [1]
+    _emit_regime(resumed, tmp_path / "resume", 1)
+    assert cs.seal_campaign_run(resumed.run_root).is_file()

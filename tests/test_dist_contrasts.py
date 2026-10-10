@@ -603,6 +603,31 @@ class TestPressureAlignment:
         assert row["mean_y_anchor"] == pytest.approx(3.0)
         assert row["mean_y_engine"] == pytest.approx(2.0)
 
+    def test_engines_meet_only_within_one_match_key_c10(self) -> None:
+        # C10 (2026-10-10): (r, dataset) alone pooled different arms into one
+        # cross-engine row, reporting an arm difference as an engine one.
+        disjoint = dc.align_pressure_bundles(
+            [
+                {**_aw("v", "vllm", 0.5, yield_frac=0.7), "match_key": "arm=gold-fresh"},
+                {**_aw("s", "sglang", 0.5, yield_frac=0.3), "match_key": "arm=retr-trunc"},
+            ],
+            r_levels=[0.5],
+        )
+        assert disjoint["rows"] == []
+        reasons = sorted(b["reason"] for b in disjoint["bucket_skips"])
+        assert any("anchor engine only" in r for r in reasons)
+        assert any("no 'vllm' anchor" in r for r in reasons)
+        same = dc.align_pressure_bundles(
+            [
+                {**_aw("v", "vllm", 0.5, yield_frac=0.7), "match_key": "arm=gold-fresh"},
+                {**_aw("s", "sglang", 0.5, yield_frac=0.3), "match_key": "arm=gold-fresh"},
+            ],
+            r_levels=[0.5],
+        )
+        (row,) = same["rows"]
+        assert row["match_key"] == "arm=gold-fresh"
+        assert row["delta_y"] == pytest.approx(0.3 - 0.7)
+
     def test_alignment_axis_is_own_accounting_not_engine_gauge(self) -> None:
         section = dc.align_pressure_bundles([], r_levels=[0.5])
         assert "rho_own_time_avg" in section["alignment_axis"]
@@ -994,6 +1019,36 @@ class TestPressureAlignmentPass:
             )
         )
         assert doc["rows"]
+
+    def test_two_engines_on_different_arms_give_no_row_c10(
+        self, tmp_path: Path
+    ) -> None:
+        analysis_dir = tmp_path / "analysis"
+        analysis_dir.mkdir()
+        index = _index_frame(
+            [
+                _index_row(
+                    family="F2", arm=arm, engine=engine, budget_r=0.5,
+                    rate_frac=0.9, row_key=f"{engine}-cell",
+                    window_dir=f"cells/{engine}-cell/window_squad_v2-01",
+                )
+                for engine, arm in (("vllm", "gold-fresh"), ("sglang", "retr-trunc"))
+            ]
+        )
+        metrics = {
+            "cells/vllm-cell/window_squad_v2-01": _wm(yield_frac=0.7),
+            "cells/sglang-cell/window_squad_v2-01": _wm(yield_frac=0.5),
+        }
+        for window in metrics:
+            self._write_own(analysis_dir, window, 0.52)
+        result = rca.run_pressure_alignment_pass(
+            analysis_dir, index, metrics, rca.DESIGN_STAMP, blinding_active=False,
+        )
+        assert result is not None
+        assert result["rows"] == []
+        assert {b["match_key"].split("|")[1] for b in result["bucket_skips"]} == {
+            "arm=gold-fresh", "arm=retr-trunc",
+        }
 
     def test_missing_own_accounting_is_labeled_skip_citing_8_8(
         self, tmp_path: Path, capsys: pytest.CaptureFixture

@@ -171,8 +171,17 @@ def _flag_field(row: Mapping[str, Any], name: str) -> bool | None:
 
 
 def _is_error_row(row: Mapping[str, Any]) -> bool:
-    """The producer's error semantics: a non-empty ``error`` string."""
-    return bool(row.get("error"))
+    """A row with no completed generation to judge: a non-empty ``error``
+    string, or the shared validity predicate ``ok`` literally False (task
+    #127: an empty generation is ok False with error None).
+
+    C12 (2026-10-10): only ``error`` counted, so an ok-False empty generation
+    reached the no-answer detector, which reads "" as an abstention, and every
+    answerable item labeled abstention_shift True. The runner nulls every
+    quality column on these rows and predicate.py nulls their verdicts; a
+    label derived here would re-judge a row the pipeline already set aside.
+    """
+    return bool(row.get("error")) or row.get("ok") is False
 
 
 # --------------------------------------------------------------------------- #
@@ -191,7 +200,8 @@ def classify_truncated_generation(row: Mapping[str, Any]) -> LabelResult:
     label = "truncated_generation"
     if _is_error_row(row):
         return LabelResult(label, None, (
-            "error row (transport/serving failure) — there is no completed "
+            "error row or not-ok row (serving failure or empty generation): "
+            "there is no completed "
             "generation to judge for truncation"
         ))
     reason_value = row.get("finish_reason")
@@ -230,7 +240,8 @@ def classify_repetition(row: Mapping[str, Any]) -> LabelResult:
     label = "repetition"
     if _is_error_row(row):
         return LabelResult(label, None, (
-            "error row (transport/serving failure) — no generation to scan "
+            "error row or not-ok row (serving failure or empty generation): "
+            "no generation to scan "
             "for repetition"
         ))
     text = _text_field(row, "generated_answer")
@@ -256,14 +267,17 @@ def _abstained(row: Mapping[str, Any]) -> tuple[bool | None, str | None]:
     ``is_no_answer_prediction``), else the SAME detector applied to the
     sanitized stored generation. None ⇒ named reason.
     """
+    # Fresh review 2026-10-10 (C12-1): the error check runs before the scored
+    # flag, so a not-ok row that still carries a flag is never judged.
+    if _is_error_row(row):
+        return None, (
+            "error row or not-ok row (serving failure or empty generation): "
+            "no generation to run "
+            "abstention detection on"
+        )
     scored = _flag_field(row, "predicted_no_answer")
     if scored is not None:
         return scored, None
-    if _is_error_row(row):
-        return None, (
-            "error row (transport/serving failure) — no generation to run "
-            "abstention detection on"
-        )
     text = _text_field(row, "generated_answer")
     if text is None:
         return None, (

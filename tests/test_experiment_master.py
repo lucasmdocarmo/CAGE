@@ -430,6 +430,8 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         import sys
         from pathlib import Path
         a = sys.argv[1:]; root = Path(a[a.index("--run-root") + 1]); rid = a[a.index("--scoring-run-id") + 1]
+        # review 2026-10-10 (R2): a --full pass carries the freeze file that pins the instruments
+        assert "--full" in a and "--freeze-file" in a, a
         if (root / "scoring" / rid).exists():
             print(f"ERROR: {root / 'scoring' / rid} already exists: scoring passes are append-only", file=sys.stderr); sys.exit(2)
         (root / "scoring" / rid).mkdir(parents=True); print("scored", a); sys.exit(0)

@@ -750,7 +750,8 @@ class _FakeTensor:
 
     def __getitem__(self, key):
         row, sl = key
-        assert row == 0
+        # one sequence: row 0, or the whole-row slice torch accepts ([:, :n])
+        assert row == 0 or row == slice(None, None, None)
         return _FakeTensor(self.ids[sl])
 
 
@@ -865,11 +866,16 @@ def _fake_torch():
         # S0F-60: the oracle concatenates the cached corpus ids and the suffix
         # ids, and the stop criterion answers a bool tensor per sequence
         cat=lambda tensors, dim=1: _FakeTensor([i for t in tensors for i in t.ids]),
+        # review 2026-10-10 (F-01): the oracle compares the full prompt's
+        # leading ids with the cached corpus ids
+        equal=lambda a, b: a.ids == b.ids,
         full=lambda shape, value, dtype=None, device=None: _FakeTensor([int(bool(value))] * int(shape[0])),
         cuda=types.SimpleNamespace(
             is_available=lambda: False,
-            synchronize=lambda: None,
+            # C15-1: _sync passes a device index under device_map
+            synchronize=lambda index=None: None,
             empty_cache=lambda: None,
+            device_count=lambda: 1,
         ),
     )
 
@@ -955,8 +961,11 @@ def test_hf_oracle_corpus_prefix_reuse_and_crop(monkeypatch):
 
     assert resp.error is None
     assert resp.generated_text == "42"
-    # Only the suffix is tokenized and fed after the cached corpus.
-    assert resp.prompt_tokens == len(suffix.split())
+    # ADR-0162 amendment (review 2026-10-10, F-01/F-05): the WHOLE prompt is
+    # tokenized once and prompt_tokens is its length (cached corpus + suffix),
+    # the serving engines' quantity; the suffix-only count read a cached
+    # ratio above 1.
+    assert resp.prompt_tokens == n_prefix + len(suffix.split())
     # Self-instrumented cache telemetry: exactly the resident corpus length.
     assert resp.cached_prompt_tokens == n_prefix
     assert resp.corpus_prefill_ms == pytest.approx(prefill_ms)
@@ -967,8 +976,10 @@ def test_hf_oracle_corpus_prefix_reuse_and_crop(monkeypatch):
     assert cache.crop_calls == [n_prefix]
     # S0F-60: generate() receives the FULL ids (cached corpus + suffix) and a
     # mask over both; the suffix alone raised IndexError on the landing.
+    # F-01: the full ids come from ONE tokenization of the whole prompt.
     call = model.generate_calls[0]
-    assert call["input_ids"].ids == tok.encode_words(prefix) + tok.encode_words(suffix)
+    assert call["input_ids"].ids == tok.encode_words(prefix + suffix)
+    assert call["input_ids"].ids[:n_prefix] == tok.encode_words(prefix)
     assert call["attention_mask"].shape == (1, n_prefix + len(suffix.split()))
     assert call["stopping_criteria"] is None  # no stop list on this request
 
@@ -1214,3 +1225,79 @@ def test_hf_oracle_labels_token_ids_and_no_label_on_error(monkeypatch):
     model.raise_on_generate = RuntimeError("boom")
     resp = adapter.generate(req)
     assert resp.finish_reason == "error" and resp.num_tokens_source is None
+
+
+def test_hf_oracle_device_map_forwards_and_skips_manual_move_c15(monkeypatch):
+    # C15 (2026-10-10): session b's 70B oracle cannot load on one GPU; with
+    # device_map="auto" the loader places the shards, .to() never runs, and
+    # inputs go to the first parameter's device.
+    tok = _FakeTokenizer()
+    model = _FakeModel()
+    model.device = "cuda:0"
+    model.generated_ids = tok.encode_words("Paris")
+    moved: List[Any] = []
+    model.to = lambda device: moved.append(device) or model
+    loads: List[Dict[str, Any]] = []
+
+    def _stack():
+        def _load(name, **kwargs):
+            loads.append(kwargs)
+            return model
+        return (
+            _fake_torch(),
+            types.SimpleNamespace(from_pretrained=_load),
+            types.SimpleNamespace(from_pretrained=lambda name: tok),
+            _FakeCache,
+        )
+
+    monkeypatch.setattr(hf_mod, "_import_ml_stack", _stack)
+    monkeypatch.setattr(hf_mod, "_import_stopping_criteria", lambda: (_FakeStoppingCriteria, list))
+    oracle = HFOracleAdapter(model_name="fake-70b", device_map="auto")
+    assert loads == [{"torch_dtype": "bf16", "device_map": "auto"}]
+    assert moved == []
+    assert oracle.device == "cuda:0" and oracle.device_map == "auto"
+    response = oracle.generate(
+        InferenceRequest(prompt="What is the capital?", max_tokens=4, temperature=0.0)
+    )
+    assert response.error is None and response.generated_text.strip() == "Paris"
+    # The default path is unchanged: no device_map kwarg, one .to() call.
+    loads.clear()
+    HFOracleAdapter(model_name="fake-14b")
+    assert loads == [{"torch_dtype": "bf16"}] and len(moved) == 1
+    with pytest.raises(ValueError, match="device_map"):
+        HFOracleAdapter(model_name="m", device_map="balanced")
+
+
+def test_hf_oracle_sync_covers_every_device_under_device_map_c15_1(monkeypatch):
+    # Fresh review 2026-10-10 (C15-1): torch.cuda.synchronize() waits on the
+    # current device only; under device_map="auto" every device must be synced.
+    calls: List[Any] = []
+    tok = _FakeTokenizer()
+    model = _FakeModel()
+    model.device = "cuda:0"
+    model.to = lambda device: model
+    fake_torch = _fake_torch()
+    fake_torch.cuda = types.SimpleNamespace(
+        is_available=lambda: True,
+        synchronize=lambda index=None: calls.append(index),
+        empty_cache=lambda: None,
+        device_count=lambda: 2,
+    )
+
+    def _stack():
+        return (
+            fake_torch,
+            types.SimpleNamespace(from_pretrained=lambda name, **kwargs: model),
+            types.SimpleNamespace(from_pretrained=lambda name: tok),
+            _FakeCache,
+        )
+
+    monkeypatch.setattr(hf_mod, "_import_ml_stack", _stack)
+    monkeypatch.setattr(hf_mod, "_import_stopping_criteria", lambda: (_FakeStoppingCriteria, list))
+    sharded = HFOracleAdapter(model_name="fake-70b", device_map="auto")
+    sharded._sync()
+    assert calls == [0, 1]
+    calls.clear()
+    single = HFOracleAdapter(model_name="fake-14b", device="cuda")
+    single._sync()
+    assert calls == [None]

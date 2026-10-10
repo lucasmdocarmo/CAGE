@@ -505,3 +505,15 @@ class TestWriteWindowRegimeRouting:
         assert doc["inputs"]["rho_kv_time_avg"] == pytest.approx(0.7)
         assert doc["inputs"]["scarcity_events"] == 4
         assert doc["pd"]["budgets_by_role"] == {"single": 42}
+
+
+def test_one_role_without_the_counter_leaves_the_pooled_count_unknown_c11() -> None:
+    # C11 (2026-10-10): the counter never gates the label (ADR-0153); a role
+    # whose build exposes none records None and the pool sum stays unknown,
+    # never a partial sum that reads as the pair's count.
+    decode_no_counter = _series([2.0, 6.0], [0.1, 0.3], [None, None])
+    pooled = _pd_inputs(series_by_role={"prefill": _prefill(), "decode": decode_no_counter})
+    assert pooled.per_role["prefill"].scarcity_events == 4
+    assert pooled.per_role["decode"].scarcity_events is None
+    assert pooled.scarcity_events is None
+    assert pooled.rho_kv_time_avg == pytest.approx(_POOLED_RHO_3_TO_1)

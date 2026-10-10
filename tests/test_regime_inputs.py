@@ -16,6 +16,7 @@ from src.analysis.goodput import (
     IN_REGIME,
     PAST_CLIFF,
     UNPRESSURED,
+    classify_regime,
     label_regime,
 )
 from src.analysis.regime_inputs import (
@@ -165,9 +166,27 @@ class TestComputeWindowRegimeInputs:
         with pytest.raises(RegimeInputError, match="absence is not zero"):
             compute_window_regime_inputs(frame, 0.0, 10.0)
 
-    def test_absent_preempt_counter_raises_absence_is_not_zero(self) -> None:
-        frame = _samples([2.0, 6.0, 8.0], [0.5, 1.0, 0.8], [5, None, 9])
-        with pytest.raises(RegimeInputError, match="absence is not zero"):
+    @pytest.mark.parametrize("pre", [[5, None, 9], [None, None, None]])
+    def test_absent_preempt_counter_records_none_and_certifies_c11(
+        self, pre: list
+    ) -> None:
+        # C11 (2026-10-10): ADR-0153 records the counter and never gates the
+        # label on it; this test pinned the refusal the amendment retired. An
+        # absent counter is recorded as None (absence, never 0) and the window
+        # is still certified on occupancy and queue.
+        frame = _samples([2.0, 6.0, 8.0], [0.5, 1.0, 0.8], pre)
+        out = compute_window_regime_inputs(frame, 0.0, 10.0)
+        assert out.scarcity_events is None
+        assert out.rho_kv_time_avg > 0.0
+        assert classify_regime(
+            rho_kv=out.rho_kv_time_avg, attainment=1.0,
+            queue_waiting_share=out.queue_waiting_share,
+            scarcity_events=out.scarcity_events,
+        ) in {IN_REGIME, UNPRESSURED}
+
+    def test_partial_counter_still_detects_a_restart_c11(self) -> None:
+        frame = _samples([2.0, 6.0, 8.0], [0.5, 1.0, 0.8], [9, None, 3])
+        with pytest.raises(RegimeInputError, match="restart"):
             compute_window_regime_inputs(frame, 0.0, 10.0)
 
     def test_kv_gauge_outside_unit_interval_raises(self) -> None:

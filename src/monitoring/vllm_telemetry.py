@@ -196,7 +196,8 @@ class VllmTelemetrySampler:
         # aggregate vllm-named absence into an empty series.
         self.dialect = dialect
         self._samples: list = []
-        self._sample_ts: list = []  # wall-clock capture time, parallel to _samples
+        self._sample_ts: list = []  # epoch second each sample describes, parallel to _samples
+        self._sample_ts_source: list = []  # "snapshot" | "capture_end" (S0F-53), parallel
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._nvml_handles: Optional[list] = None  # index-aligned; None slot = bad handle
@@ -363,6 +364,30 @@ class VllmTelemetrySampler:
         self._thread.start()
         return self
 
+    @staticmethod
+    def _sample_stamp(snap: dict, t0: float, t1: float) -> "tuple[float, str]":
+        """The epoch second a sample describes, and where it came from (S0F-53).
+
+        ``capture_snapshot`` polls the engine twice, one second apart, and the
+        snapshot describes the SECOND poll (cage-stats 51bb9ac stamps
+        ``Snapshot.ts`` with that poll's wall clock). Stamping the record with
+        the capture START (the pre-fix rule) therefore put every sample about
+        one second before the state it describes; on a 6 to 11 s window the
+        regime bridge then read the first second of the window from before it
+        and dropped the last second (review 2026-10-10, F1). Rule: the
+        snapshot's own ``ts`` when it is a finite number inside the capture
+        span [t0, t1] (so an old cage-stats sending ``ts = 1.0``, the S0F-15
+        case, can never win), else the capture END, the closest instant to
+        the second poll this process observed. Never the start.
+        """
+        ts = snap.get("ts")
+        if (
+            isinstance(ts, (int, float)) and not isinstance(ts, bool)
+            and math.isfinite(ts) and t0 <= float(ts) <= t1
+        ):
+            return float(ts), "snapshot"
+        return t1, "capture_end"
+
     def _run(self) -> None:
         while not self._stop.is_set():
             t0 = time.time()
@@ -370,6 +395,7 @@ class VllmTelemetrySampler:
                 snap = capture_snapshot(
                     self.url, metrics_path=self.metrics_path, dialect=self.dialect
                 )
+                t1 = time.time()
                 if snap:
                     # Once per tick: cumulative NVML energy (mJ), None if
                     # unsupported. energy_mj = SUM across ALL visible GPUs
@@ -387,8 +413,10 @@ class VllmTelemetrySampler:
                         gpu_record = self._read_gpu_record()
                         if gpu_record is not None:
                             snap["gpu"] = gpu_record
+                    stamp, source = self._sample_stamp(snap, t0, t1)
                     self._samples.append(snap)
-                    self._sample_ts.append(t0)
+                    self._sample_ts.append(stamp)
+                    self._sample_ts_source.append(source)
             except Exception as e:
                 # capture_snapshot swallows flaky-network internally (returns
                 # None); a raise reaching here is its fail-loud dialect-support
@@ -458,19 +486,26 @@ class VllmTelemetrySampler:
         treat absence as single-instance.
         """
         records: list = []
-        for ts, snap in zip(self._sample_ts, self._samples):
+        sources = list(self._sample_ts_source) + [None] * (
+            len(self._sample_ts) - len(self._sample_ts_source)
+        )
+        for ts, source, snap in zip(self._sample_ts, sources, self._samples):
             if not isinstance(snap, dict):
                 continue
             rec = dict(snap)
-            # The sampler's own capture clock is the ONLY timestamp the
-            # regime bridge may see, and it is stamped AFTER the snapshot
-            # merge so a same-named snapshot field can never replace it
-            # (S0F-15, live 2026-09-30: cage-stats snapshots carry ``ts``
-            # = 1.0 on every tick; the pre-fix order let it overwrite the
-            # wall clock and every S0 window read UNKNOWN_TELEMETRY). Same
-            # policy as ``instance`` below: the sampler is the ground truth.
+            # The stamp the sampler chose in ``_sample_stamp`` is the ONLY
+            # timestamp the regime bridge may see, and it is written AFTER
+            # the snapshot merge so a same-named snapshot field can never
+            # replace it (S0F-15, live 2026-09-30: cage-stats snapshots
+            # carried ``ts`` = 1.0 on every tick; the pre-fix order let it
+            # overwrite the wall clock and every S0 window read
+            # UNKNOWN_TELEMETRY). S0F-53: the stamp is the snapshot's own
+            # second-poll clock when plausible, else the capture end, never
+            # the capture start; ``ts_source`` records which. Same policy as
+            # ``instance`` below: the sampler is the ground truth.
             rec["ts"] = round(ts, 3)
             rec["ts_s"] = rec["ts"]
+            rec["ts_source"] = source
             if "kv_usage" in rec:
                 rec.setdefault("kv_cache_usage", rec["kv_usage"])
             rec["instance"] = self.role

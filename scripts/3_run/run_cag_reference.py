@@ -111,7 +111,16 @@ RESULT_COLUMNS = [
     "empty_generation",
 ]
 
-QUERY_TEMPLATE = "\n\nQuestion: {question}\nAnswer:"
+#: The corpus/question boundary. Review 2026-10-10 (F-01): the cacheable
+#: prefix ends AFTER these two newlines and the per-query suffix starts at
+#: "Question:". Qwen3's BPE merges a block-final "." with a following "\n\n"
+#: into one token, so a prefix cut before the newlines tokenized differently
+#: on its own than inside the whole prompt; a letter never merges with a
+#: preceding newline under the Qwen3 pre-tokenizer, so this cut is stable.
+#: The runner still tokenizes the WHOLE prompt once and checks that its
+#: leading ids equal the cached corpus ids before every query.
+PREFIX_BOUNDARY = "\n\n"
+QUERY_TEMPLATE = "Question: {question}\nAnswer:"
 
 
 # --------------------------------------------------------------------------
@@ -119,22 +128,21 @@ QUERY_TEMPLATE = "\n\nQuestion: {question}\nAnswer:"
 # --------------------------------------------------------------------------
 
 def build_query_suffix(question: str) -> str:
-    """Per-query text appended after the cached corpus prefix.
-
-    Tokenized with add_special_tokens=False so the concatenation
-    corpus_prompt + suffix tokenizes exactly as one served prompt would.
-    """
+    """Per-query text appended after the cached corpus prefix (which ends
+    with PREFIX_BOUNDARY), so corpus_prompt + suffix is one served prompt
+    with the format_qa_prompt layout."""
     return QUERY_TEMPLATE.format(question=question)
 
 
 def build_corpus_prompt(block_text: str) -> str:
-    """The shared cacheable prefix: system prefix + corpus block.
+    """The shared cacheable prefix: system prefix + corpus block + boundary.
 
-    Mirrors format_qa_prompt's layout (prefix.rstrip() + "\\n" + <context>),
-    with the corpus block in the per-query-context slot, so answers are
-    comparable with the vLLM raw-completion arms.
+    Mirrors format_qa_prompt's layout (prefix.rstrip() + "\\n" + <context> +
+    "\\n\\n" before "Question:"), with the corpus block in the
+    per-query-context slot, so answers are comparable with the vLLM
+    raw-completion arms. Ends with PREFIX_BOUNDARY (review 2026-10-10, F-01).
     """
-    return DEFAULT_SYSTEM_PREFIX.rstrip() + "\n" + block_text
+    return DEFAULT_SYSTEM_PREFIX.rstrip() + "\n" + block_text + PREFIX_BOUNDARY
 
 
 # --------------------------------------------------------------------------
@@ -158,9 +166,11 @@ def compute_chat_prefix(render_full) -> str:
     ``render_full(question) -> str`` renders the FULL templated prompt for a
     question (tokenizer.apply_chat_template, add_generation_prompt=True).
     Probing with two sentinel questions and trimming the common prefix back to
-    just before the "\\n\\nQuestion:" marker yields everything the template
-    renders up to and including the corpus block -- the exact same
-    corpus/question boundary the raw path caches at. Template-agnostic.
+    the "\\n\\nQuestion:" marker yields everything the template renders up to
+    and including the corpus block and the PREFIX_BOUNDARY newlines -- the
+    exact same corpus/question boundary the raw path caches at (review
+    2026-10-10, F-01: the cut sits after the newlines so the prefix and the
+    whole prompt tokenize alike). Template-agnostic.
     """
     common = os.path.commonprefix([render_full("A?"), render_full("B?")])
     cut = common.rfind("\n\nQuestion:")
@@ -169,7 +179,7 @@ def compute_chat_prefix(render_full) -> str:
             "chat template did not preserve the corpus-block/question layout; "
             "cannot derive a cacheable corpus prefix (use CAGE_PROMPT_MODE=raw)"
         )
-    return common[:cut]
+    return common[:cut + len(PREFIX_BOUNDARY)]
 
 
 def chat_query_suffix(full_prompt: str, corpus_prefix: str) -> str:
@@ -440,15 +450,30 @@ def run_trial(
 
         for example in block.examples:
             if serving_prompt_mode == "chat":
-                suffix_text = chat_query_suffix(_render_full(example.question), corpus_prompt)
+                full_prompt = _render_full(example.question)
+                chat_query_suffix(full_prompt, corpus_prompt)  # refuses a foreign prefix
+                add_special = False
             else:
-                suffix_text = build_query_suffix(example.question)
-            q_enc = tok(suffix_text, return_tensors="pt",
-                        add_special_tokens=False).to(model.device)
-            q_len = int(q_enc.input_ids.shape[1])
-            # Attention mask must cover cached corpus + new query tokens.
-            attention_mask = torch.ones((1, base_len + q_len), dtype=torch.long,
-                                        device=model.device)
+                full_prompt = corpus_prompt + build_query_suffix(example.question)
+                add_special = True
+            # Review 2026-10-10 (F-01): the WHOLE prompt is tokenized once, the
+            # way one served prompt is, and its leading ids must equal the
+            # cached corpus ids (a BPE merge across the cut would otherwise
+            # serve a different input than the vLLM arms see). A mismatch is a
+            # protocol violation of the recipe, never an error row.
+            full_enc = tok(full_prompt, return_tensors="pt",
+                           add_special_tokens=add_special).to(model.device)
+            prompt_len = int(full_enc.input_ids.shape[1])
+            if prompt_len <= base_len or not torch.equal(
+                full_enc.input_ids[:, :base_len], enc.input_ids
+            ):
+                raise ValueError(
+                    f"[trial {trial}] block {block.block_id}: the full prompt of "
+                    f"{example.id} does not tokenize to the cached corpus ids plus a "
+                    "suffix (prefix boundary or tokenizer merge across the cut); "
+                    "refusing to serve against a mismatched KV cache (F-01)"
+                )
+            q_len = prompt_len - base_len
 
             answer = ""
             num_generated = 0
@@ -462,15 +487,15 @@ def run_trial(
                     # the cached part off itself; the suffix alone raised
                     # IndexError in transformers 4.57 on the 2026-10-08 landing.
                     out = model.generate(
-                        input_ids=torch.cat([enc.input_ids, q_enc.input_ids], dim=1),
-                        attention_mask=attention_mask,
+                        input_ids=full_enc.input_ids,
+                        attention_mask=full_enc.attention_mask,
                         past_key_values=cache,
                         max_new_tokens=max_new_tokens,
                         do_sample=False,
                         pad_token_id=pad_token_id,
                     )
-                answer = tok.decode(out[0, base_len + q_len:], skip_special_tokens=True)
-                num_generated = int(out.shape[1]) - (base_len + q_len)
+                answer = tok.decode(out[0, prompt_len:], skip_special_tokens=True)
+                num_generated = int(out.shape[1]) - prompt_len
             except Exception as exc:  # noqa: BLE001 -- record, crop, continue
                 error = f"{type(exc).__name__}: {exc}"
             finally:

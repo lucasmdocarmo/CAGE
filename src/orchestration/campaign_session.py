@@ -410,9 +410,13 @@ def derive_cell_spec(
 def append_write_time_hashes(run_root: Path, paths: Iterable[Path]) -> None:
     """sha256 each just-written artifact and append it to the run-root journal."""
     run_root = Path(run_root)
-    entries = hash_artifacts(list(paths), base_dir=run_root)
+    _append_journal_entries(run_root, hash_artifacts(list(paths), base_dir=run_root))
+
+
+def _append_journal_entries(run_root: Path, entries: Mapping[str, str]) -> None:
+    """Append ``{relpath: sha256}`` lines to the run-root journal, fsynced."""
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    journal = run_root / JOURNAL_NAME
+    journal = Path(run_root) / JOURNAL_NAME
     with journal.open("a", encoding="utf-8") as fh:
         for rel, sha in entries.items():
             fh.write(
@@ -768,13 +772,22 @@ def _normalize_json(value: Any) -> Any:
     return value
 
 
-def _atomic_write_json(path: Path, document: Mapping[str, Any]) -> Path:
+def _atomic_write_json(
+    path: Path, document: Mapping[str, Any], *, journal_root: Optional[Path] = None
+) -> Path:
+    """tmp + ``os.replace``. With ``journal_root`` the final file's hash is
+    journaled BEFORE the rename publishes it (A8, 2026-10-10): a crash after
+    the journal line leaves no file and a stale entry the seal ignores, never
+    a published file the journal lacks."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     try:
         tmp.write_text(
             json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
+        if journal_root is not None:
+            rel = path.resolve().relative_to(Path(journal_root).resolve()).as_posix()
+            _append_journal_entries(journal_root, {rel: _sha256_file(tmp)})
         os.replace(tmp, path)
     except BaseException:
         tmp.unlink(missing_ok=True)
@@ -860,7 +873,6 @@ class CampaignCellSession:
         # task's runner invocation owns (base, base+num_trials] exclusively.
         self.window_ordinal_base = int(window_ordinal_base)
         self._run: Any = None  # lazy CampaignRun
-        self._manifest_created = False
 
         cl = _campaign_layout()
         problems: list[str] = []
@@ -1250,7 +1262,11 @@ class CampaignCellSession:
             cellspec_schema_version=_CELLSPEC_SCHEMA_VERSION,
             extra=self._manifest_extra(),
         )
-        self._manifest_created = True
+        # A8 (2026-10-10): journal the manifest the moment it exists. It was
+        # journaled at the end of the first emission, so a first emission that
+        # raised left it unjournaled, a resumed process (which opens the
+        # existing file) never journaled it, and the seal refused the run.
+        append_write_time_hashes(self.run_root, [manifest_path])
         print(f"[campaign] manifest.json created at run start: {manifest_path}")
         return self._run
 
@@ -1459,19 +1475,20 @@ class CampaignCellSession:
             attainment=_attainment(requests_rows_n),
             role_budgets=self._role_budgets(cell.budget_plan, cage_stats_rows),
         )
-        metrics_path = _atomic_write_json(
-            handle.window_dir / WINDOW_METRICS_NAME, _normalize_json(experiment_summary)
-        )
-
-        # S0-15: hash ledger written at write time — journal every artifact of
-        # this emission (window files + the updated cell.json + the manifest
-        # when this emission created it).
+        # S0-15: hash ledger written at write time. A8 (2026-10-10): every
+        # artifact of this emission is journaled BEFORE the metrics sentinel
+        # is published, and the sentinel's own hash is journaled before its
+        # rename. The sentinel was written first, so a crash before the
+        # journal append left a window that resume treats as complete and the
+        # seal refuses as unjournaled.
         journal_paths = sorted(p for p in handle.window_dir.iterdir() if p.is_file())
         journal_paths.append(self.cell_dir / "cell.json")
-        if self._manifest_created:
-            journal_paths.append(self.run_root / "manifest.json")
-            self._manifest_created = False
         append_write_time_hashes(self.run_root, journal_paths)
+        metrics_path = _atomic_write_json(
+            handle.window_dir / WINDOW_METRICS_NAME,
+            _normalize_json(experiment_summary),
+            journal_root=self.run_root,
+        )
 
         print(
             f"[campaign] window {handle.window_key} emitted -> {handle.window_dir} "

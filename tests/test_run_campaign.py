@@ -2259,6 +2259,21 @@ class TestRulerPairing:
 # ---------------------------------------------------------------------------
 
 
+class TestRegisteredDatasetsAgreeWithTheFamilyMap:
+    def test_pressure_dataset_and_qa_roster_pins_c1(self):
+        # C1 (2026-10-10): src.analysis.stats.families registers the pressure
+        # dataset the session grids run F2/F3 on; the two must never drift.
+        from src.analysis.stats.families import (
+            KNOWN_DATASETS, PRESSURE_DATASET,
+        )
+
+        assert set(rc.QA_DATASETS) == KNOWN_DATASETS
+        for name, grid in rc.SESSION_GRIDS.items():
+            assert grid.f2_dataset == PRESSURE_DATASET, name
+            assert grid.f3_dataset == PRESSURE_DATASET, name
+            assert set(grid.f1_datasets) <= KNOWN_DATASETS, name
+
+
 class TestGpuCountProducer:
     def test_every_executable_session_a_cell_carries_gpu_count_1(self, plan_a):
         # Session a is the single-GPU anchor (§7.6 A): serving_tp=1 ⇒ every
@@ -2440,6 +2455,16 @@ class TestSessionB:
             if s["cellspec"]["topology"] == "single":
                 assert s["gpu_count"] == 4
 
+    def test_hf_cells_shard_on_the_4_gpu_box_only_c15(self, plan_b, plan_a):
+        # C15 (2026-10-10): the plan said "batch-1 device_map" but no cell
+        # carried it, so the 70B oracle would load onto one GPU and fail.
+        hf_b = [s for s in _cells(plan_b) if s["cellspec"]["engine"] == "hf"]
+        assert hf_b, "session b registers hf oracle cells"
+        for s in hf_b:
+            assert s["env"][rc.HF_DEVICE_MAP_ENV] == "auto"
+        for s in _cells(plan_a):
+            assert rc.HF_DEVICE_MAP_ENV not in s["env"]  # single GPU: one device
+
     def test_tp_leg_launches_tp8_at_the_dist_budget(self, plan_b, floor_table_b):
         # The tp leg rides the SINGLE-instance launcher at dist_tp_size=8,
         # serving floor(dist_budget_r × D_class) bytes total — per-rank
@@ -2515,7 +2540,9 @@ class TestSessionB:
         # Independent arithmetic for the TP-sharded budget env: GQA shards ⇒
         # per-rank = floor(r × D) // 4. llama-3.3-70b bf16 KV/token =
         # 2 (K,V) × 80 layers × 8 KV heads × 128 head_dim × 2 B = 327_680;
-        # SGLang tokens = per-rank // 327_680.
+        # SGLang tokens = floor(r × D) // 327_680: every rank holds all token
+        # slots of its head shard (C13, 2026-10-10; this test pinned
+        # per-rank // 327_680, a quarter of the plan at tp=4).
         per_token = 2 * 80 * 8 * 128 * 2
         assert per_token == 327_680
         for s in _relaunches(plan_b):
@@ -2528,7 +2555,7 @@ class TestSessionB:
                 assert s["env"]["CAGE_KV_BUDGET_BYTES"] == str(per_rank)
             if s["engine"] == "sglang" and s["kv_dtype"] is None:
                 assert s["env"]["CAGE_SGLANG_MAX_TOTAL_TOKENS"] == str(
-                    per_rank // per_token
+                    int(s["budget_r"] * demand_class) // per_token
                 )
 
     def test_dist_registration_shape_refusals(self):

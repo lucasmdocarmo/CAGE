@@ -168,13 +168,15 @@ def test_reference_chat_prefix_ends_at_corpus_question_boundary():
     runner = _load_reference_runner()
     render = _fake_render_full("BLOCK TEXT")
     prefix = runner.compute_chat_prefix(render)
-    assert prefix.endswith("Context 1: BLOCK TEXT")
+    # ADR-0162 amendment (review 2026-10-10, F-01): the cut sits AFTER the
+    # "\n\n" so the prefix and the whole prompt tokenize alike on Qwen3.
+    assert prefix.endswith("Context 1: BLOCK TEXT\n\n")
     assert "Question:" not in prefix[prefix.index("BLOCK TEXT"):]
 
     full = render("Who?")
     suffix = runner.chat_query_suffix(full, prefix)
     assert prefix + suffix == full
-    assert suffix.startswith("\n\nQuestion: Who?")
+    assert suffix.startswith("Question: Who?")
     assert suffix.endswith("<think>\n\n</think>\n\n")  # generation header in the suffix
 
 

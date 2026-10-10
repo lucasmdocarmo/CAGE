@@ -132,6 +132,41 @@ def gold_only(example: CAGExample) -> List[str]:
     return [c for c in (example.context or []) if any(c.startswith(f"{t}: ") for t in titles)]
 
 
+def gold_paragraphs(example: CAGExample) -> List[str]:
+    """The example's gold paragraph texts, per its loader's metadata.
+
+    The one rule for "which served paragraph is gold" (A2, 2026-10-10). It is
+    the retrieval gate table's rule (scripts/4_analysis/build_retrieval_gate_table.py
+    ``_gold_context_texts``; tests/test_data_loader_gold.py pins the two equal),
+    now shared with the runner's retrieval hit, retrieval rank and
+    gold-position fields, which used the WHOLE context: HotpotQA and MuSiQue
+    keep their distractors in ``.context`` and Qasper keeps the whole paper.
+
+    Key-sensitive: a gold key PRESENT with an empty value is a recorded
+    absence and returns [] (never the whole context).
+
+    - ``metadata["evidence_doc_ids"]`` (Qasper): the ids index the exact
+      context docs holding the human gold evidence; out-of-range ids skip.
+    - ``metadata["supporting_titles"]`` (HotpotQA, MuSiQue): ``gold_only``'s
+      title filter.
+    - neither key (SQuAD v2): the context IS its gold paragraph.
+    """
+    metadata = example.metadata or {}
+    context = example.context or []
+    if "evidence_doc_ids" in metadata:
+        return [
+            context[i]
+            for i in (metadata.get("evidence_doc_ids") or [])
+            if isinstance(i, int) and not isinstance(i, bool)
+            and 0 <= i < len(context) and context[i]
+        ]
+    if "supporting_titles" in metadata:
+        if not metadata.get("supporting_titles"):
+            return []
+        return [t for t in gold_only(example) if t]
+    return [t for t in gold_only(example) if t]
+
+
 class DatasetLoader:
     """Base class for dataset loaders."""
     

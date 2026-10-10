@@ -34,6 +34,7 @@ from src.data.loader import (
     AnswerabilityFlagError,
     CAGExample,
     get_loader,
+    gold_paragraphs,
     is_impossible_flag,
 )
 from src.inference.engine import InferenceEngine, InferenceRequest
@@ -1662,11 +1663,18 @@ def derive_corpus_prompt_prefix(build_prompt: Any) -> str:
     Chan et al. 2024, arXiv:2412.15605 manual-CAG recipe [chan2024cag]):
     ``build_prompt(question) -> str`` renders the FULL request prompt for a
     question over the block's context; probing with two sentinel questions and
-    trimming the common prefix back to just before the ``"\\n\\nQuestion:"``
-    marker yields everything the layout renders up to and including the corpus
-    block -- the exact prefix ``HFOracleAdapter.preload_corpus_prefix`` must
-    hold so each query's suffix literally extends the cached text. Fails
-    closed when the layout does not preserve the corpus/question boundary.
+    trimming the common prefix back to the ``"\\n\\nQuestion:"`` marker yields
+    everything the layout renders up to and including the corpus block AND
+    the two newlines after it -- the exact prefix
+    ``HFOracleAdapter.preload_corpus_prefix`` must hold so each query's suffix
+    literally extends the cached text. The cut sits AFTER the ``\\n\\n``
+    (review 2026-10-10, F-01): Qwen3's BPE merges a block-final ``.`` with the
+    following ``\\n\\n`` into one token, so a prefix ending at the ``.`` and a
+    suffix starting with ``\\n\\n`` tokenized separately gave different ids
+    than the whole prompt; a letter never merges with a preceding newline
+    under the Qwen3 pre-tokenizer, so the cut after the newlines is stable
+    (the adapter verifies the ids on every request). Fails closed when the
+    layout does not preserve the corpus/question boundary.
     """
     common = os.path.commonprefix([build_prompt("A?"), build_prompt("B?")])
     cut = common.rfind("\n\nQuestion:")
@@ -1676,7 +1684,7 @@ def derive_corpus_prompt_prefix(build_prompt: Any) -> str:
             "cannot derive a cacheable corpus prefix for the hf-oracle preload "
             "(expected the '\\n\\nQuestion:' marker after the context blocks)"
         )
-    return common[:cut]
+    return common[:cut + len("\n\n")]
 
 
 @dataclass(frozen=True)
@@ -2072,14 +2080,18 @@ def setup_inference_engine(
         # stack (EngineDependencyUnavailableError).
         hf_device = os.getenv("CAGE_HF_DEVICE", "auto").strip() or "auto"
         hf_dtype = os.getenv("CAGE_HF_DTYPE", "bfloat16").strip() or "bfloat16"
+        # C15: run_campaign sets CAGE_HF_DEVICE_MAP=auto on a multi-GPU box
+        # (session b's 70B oracle); unset keeps the one-device load.
+        hf_device_map = os.getenv("CAGE_HF_DEVICE_MAP", "").strip() or None
         print(
             f"Using HF Transformers reference oracle (in-process, "
-            f"device={hf_device}, dtype={hf_dtype})"
+            f"device={hf_device}, dtype={hf_dtype}, device_map={hf_device_map})"
         )
         engine = HFOracleAdapter(
             model_name=model_name,
             device=hf_device,
             dtype=hf_dtype,
+            **({"device_map": hf_device_map} if hf_device_map else {}),
         )
     else:
         raise ValueError(
@@ -2882,7 +2894,9 @@ def run_experiment(
                           # every query of the full-budget store).
                           "corpus_rung": _corpus_plan.rung,
                           "in_corpus": True if _in_ids is None else (ex.id in _in_ids),
-                          "gold_context": (ex.context or [None])[0]},
+                          # A2: the gold list, taken BEFORE the context
+                          # becomes the block (src.data.loader.gold_paragraphs).
+                          "gold_paragraphs": gold_paragraphs(ex)},
             )
             for ex in sorted(base_examples, key=lambda e: _q2b[e.id])
         ]
@@ -2913,7 +2927,7 @@ def run_experiment(
                 metadata={**(ex.metadata or {}),
                           "corpus_prefix": True,
                           "corpus_tokens": _block.token_count,
-                          "gold_context": (_gold_ctx[ex.id] or [None])[0]},
+                          "gold_paragraphs": gold_paragraphs(ex)},
             )
             for ex in base_examples if ex.id in _in_corpus
         ]
@@ -3071,7 +3085,7 @@ def run_experiment(
         # in stable order, so distractor selection is seed-stable by construction. The
         # first CAGE_DISTRACTOR_DOCS (default 1000) content-deduped paragraphs are added,
         # EXCLUDING the trial's gold paragraphs (both ex.context and the corpus-mode
-        # metadata gold_context). 0 disables (old behavior). The IR index content-hash
+        # metadata gold_paragraphs). 0 disables (old behavior). The IR index content-hash
         # (src/orchestration/ir.py corpus_doc_ids_sha1, checked by ensure_ir_index)
         # triggers the rebuild automatically when the corpus changes.
         _n_distractors = int(os.getenv("CAGE_DISTRACTOR_DOCS", "1000") or "0")
@@ -3080,9 +3094,10 @@ def run_experiment(
                 c for ex in base_examples for c in (ex.context or []) if c
             ]
             _gold_texts += [
-                (ex.metadata or {}).get("gold_context")
+                g
                 for ex in base_examples
-                if (ex.metadata or {}).get("gold_context")
+                for g in ((ex.metadata or {}).get("gold_paragraphs") or [])
+                if g
             ]
             _distractor_texts = select_distractor_texts(pool, _gold_texts, _n_distractors)
             _existing_ids = {d.doc_id for d in corpus_docs}
@@ -3377,6 +3392,16 @@ def run_experiment(
         question = example.question
         baseline_mode = baseline_config.baseline_type.value
         used_contexts: List[str] = list(example.context or [])
+        # A2 (2026-10-10): the gold set is the loader's gold evidence, never
+        # the whole context (distractors, the whole Qasper paper, or the
+        # corpus block itself). Corpus-prefix examples carry the list computed
+        # before their context became the block. Empty = recorded absence.
+        _meta = example.metadata if isinstance(example.metadata, dict) else {}
+        if "gold_paragraphs" in _meta:
+            _gold = [g for g in (_meta.get("gold_paragraphs") or []) if g]
+        else:
+            _gold = gold_paragraphs(example)
+        _gold_ids = [stable_text_id(g) for g in _gold]
 
         retrieval_cached = False
         retrieval_hit = None
@@ -3416,17 +3441,17 @@ def run_experiment(
             retrieved_docs = bm25_index.resolve_hits(hits)
             used_contexts = [d.text for d in retrieved_docs]
 
-            gold_doc_ids = [stable_text_id(c) for c in (example.context or []) if c]
+            gold_doc_ids = _gold_ids
             retrieval_hit = retrieval_hit_rate(
                 gold_doc_ids=gold_doc_ids,
                 retrieved_doc_ids=retrieved_doc_ids,
-                gold_texts=list(example.context or []),
+                gold_texts=_gold,
                 retrieved_texts=used_contexts,
             )
             retrieval_rank = retrieval_rank_of_gold(
                 gold_doc_ids=gold_doc_ids,
                 retrieved_doc_ids=retrieved_doc_ids,
-                gold_texts=list(example.context or []),
+                gold_texts=_gold,
                 retrieved_texts=used_contexts,
             )
         elif do_retrieval:
@@ -3458,14 +3483,14 @@ def run_experiment(
             retrieved_docs = ir_index.resolve_hits(hits)
             used_contexts = [d.text for d in retrieved_docs]
 
-            gold_doc_ids = [stable_text_id(c) for c in (example.context or []) if c]
+            gold_doc_ids = _gold_ids
             retrieval_hit = retrieval_hit_rate(
                 gold_doc_ids=gold_doc_ids,
                 retrieved_doc_ids=retrieved_doc_ids,
                 # Text fallback: doc-id hashes can diverge from the corpus even when the
                 # gold passage IS retrieved (whitespace/encoding), which zeroed the metric
                 # in Phase 2. used_contexts here is the retrieved passage text.
-                gold_texts=list(example.context or []),
+                gold_texts=_gold,
                 retrieved_texts=used_contexts,
             )
             # Graded companion (fix #5-C): 1-based rank of the gold passage -> MRR downstream.
@@ -3474,7 +3499,7 @@ def run_experiment(
             retrieval_rank = retrieval_rank_of_gold(
                 gold_doc_ids=gold_doc_ids,
                 retrieved_doc_ids=retrieved_doc_ids,
-                gold_texts=list(example.context or []),
+                gold_texts=_gold,
                 retrieved_texts=used_contexts,
             )
             if baseline_config.baseline_type.value == "redis":
@@ -3490,6 +3515,11 @@ def run_experiment(
             used_contexts = list(example.context or [])
         else:
             used_contexts = list(example.context or [])
+        if do_retrieval and not _gold:
+            # No recorded gold: hit and rank are unmeasurable, never a miss
+            # (retrieval_hit_rate scores unknown gold as 0.0).
+            retrieval_hit = None
+            retrieval_rank = None
 
         # Confound control: force the gold passage onto every arm when requested
         # (retrieval telemetry above is still recorded for the retrieval baselines).
@@ -3522,13 +3552,11 @@ def run_experiment(
         # the capped, PRE-compression list (compression rewrites text, which would break
         # the match; list positions are what the prompt layout uses). Matching is exact
         # text OR containment (corpus-prefix blocks CONTAIN the gold paragraph).
-        _gold_texts = [c for c in (example.context or []) if c]
-        _meta_gold = (example.metadata or {}).get("gold_context") if isinstance(example.metadata, dict) else None
-        if _meta_gold:
-            _gold_texts.append(_meta_gold)
-        gold_position_in_prompt = -1
-        for _pos, _doc in enumerate(used_contexts):
-            if _doc and any(_g == _doc or (_g in _doc) for _g in _gold_texts):
+        # A2: matched against the loader's gold set only; None when the loader
+        # recorded no gold (absence, distinct from -1 = gold not served).
+        gold_position_in_prompt: Optional[int] = None if not _gold else -1
+        for _pos, _doc in enumerate(used_contexts if _gold else []):
+            if _doc and any(_g == _doc or (_g in _doc) for _g in _gold):
                 gold_position_in_prompt = _pos
                 break
 

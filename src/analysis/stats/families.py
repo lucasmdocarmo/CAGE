@@ -70,6 +70,28 @@ CAMPAIGN_GROUPS: tuple[Group, ...] = ("A", "B", "C", "D")
 KNOWN_DATASETS: frozenset[str] = frozenset(
     {"squad_v2", "hotpotqa", "musique", "qasper"}
 )
+#: C1 (2026-10-10): the dataset the PRESSURE families run on. The registered
+#: session grids (scripts/3_run/run_campaign.py SESSION_GRIDS, f2_dataset and
+#: f3_dataset on every session; tests/test_run_campaign.py pins them equal to
+#: this constant) run F1 on every charter QA dataset and F2, F3 and DIST on
+#: Qasper only. ``compile_family_map`` emitted every window contrast on every
+#: dataset it was given, so the registered co-primary sets of #13 and #14
+#: carried three phantom legs that no run could supply (G5 then failed them
+#: by construction) and a root missing a QA dataset compiled a smaller #4 set.
+PRESSURE_DATASET: str = "qasper"
+PRESSURE_FAMILY_SET: frozenset[str] = frozenset({"F2", "F3", "DIST"})
+
+
+def registered_datasets(family: str, datasets: Sequence[str]) -> tuple[str, ...]:
+    """The datasets a family's rows compile on, out of the caller's roster.
+
+    F1 rows compile on every roster dataset; F2, F3 and DIST rows compile on
+    ``PRESSURE_DATASET`` alone (none when the roster lacks it). Order follows
+    the roster.
+    """
+    if family in PRESSURE_FAMILY_SET:
+        return tuple(d for d in datasets if d == PRESSURE_DATASET)
+    return tuple(datasets)
 # §9.1 co-primary metric pair (audit §2.1): serving = paired TTFT delta,
 # quality = the §8.5 per-dataset Y predicate. 2026-08-16 (assertion G7):
 # metric names are unified ON THE DRIVER'S namespace ('ttft_ms', the
@@ -536,7 +558,8 @@ def compile_family_map(
         for a, b, slot, family, groups, notes in leg_specs:
             comparison = f"{a} vs {b}" if a is not None and b is not None else slot
             row_datasets: tuple[str, ...] = (
-                ("cross-dataset",) if slot == "dataset" else tuple(datasets)
+                ("cross-dataset",) if slot == "dataset"
+                else registered_datasets(family, datasets)
             )
             for group in groups:
                 for dataset in row_datasets:

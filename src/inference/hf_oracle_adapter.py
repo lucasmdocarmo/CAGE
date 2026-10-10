@@ -13,12 +13,19 @@ scripts/3_run/run_cag_reference.py verbatim:
 - ``preload_corpus_prefix(text)``: prefill ONE fixed corpus block's KV with a
   single forward pass into a ``DynamicCache`` (recording corpus_prefill_ms);
 - ``generate(request)``: the request prompt must literally extend the cached
-  prefix; only the suffix is tokenized (``add_special_tokens=False``), the
-  cached corpus ids and the suffix ids are concatenated into the FULL input
+  prefix; the FULL prompt is tokenized once, exactly as the plain path
+  tokenizes it, its first ``base_len`` ids must equal the preloaded corpus
+  ids (else ``CorpusPrefixMismatchError``, a protocol violation, never an
+  error row), and the full ids are handed to ``generate`` beside the cache
   (transformers 4.57 slices the cached part off itself and refused
-  suffix-only ids with an IndexError on the 2026-10-08 landing, S0F-60) and
-  decoded greedily against the cache with an attention mask covering
-  cached-corpus + query tokens;
+  suffix-only ids with an IndexError on the 2026-10-08 landing, S0F-60).
+  Review 2026-10-10 (F-01): tokenizing the suffix on its own and
+  concatenating it produced different ids than the whole prompt, because
+  Qwen3's BPE merges across the cut (``.`` + ``\\n\\n`` is one token in the
+  whole prompt and two tokens when split), so the reuse path answered a
+  different input than the plain path. The caller places the cut after the
+  ``\\n\\n`` before ``Question:`` so the two tokenizations agree, and this
+  adapter verifies it on every request;
 - after EVERY query the cache is cropped back to the corpus length
   (``cache.crop(base_len)``) so query B never attends to query A's tokens --
   NON-OPTIONAL per the Chan et al. recipe: skipping it silently corrupts
@@ -94,6 +101,17 @@ def _import_stopping_criteria() -> Tuple[Any, Any]:
     return StoppingCriteria, StoppingCriteriaList
 
 
+class CorpusPrefixMismatchError(ValueError):
+    """The full prompt's leading ids differ from the preloaded corpus ids.
+
+    The KV cache holds the corpus ids as prefilled; serving a prompt whose own
+    tokenization starts differently (a BPE merge across the prefix cut, or a
+    prefix cut at the wrong character) would attend a cache that does not
+    match the input. Raised BEFORE generation and propagated as a protocol
+    violation (review 2026-10-10, F-01), never recorded as an error row.
+    """
+
+
 def _cut_at_stop(text: str, stops: Sequence[str]) -> Tuple[str, bool]:
     """The text before the earliest stop string, and whether one was found."""
     cuts = [i for i in (text.find(s) for s in stops if s) if i >= 0]
@@ -113,6 +131,7 @@ class HFOracleAdapter(InferenceEngine):
         device: str = "auto",
         dtype: str = "bfloat16",
         enforce_greedy: bool = True,
+        device_map: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         """Load the HF model/tokenizer (fail-closed on a missing ML stack).
@@ -127,6 +146,10 @@ class HFOracleAdapter(InferenceEngine):
                 not 0.0 raises: the oracle is T=0 greedy BY CONSTRUCTION
                 (charter D2.1) and must never silently ignore a sampling
                 request.
+            device_map: None (default: load, then ``.to(device)``) or
+                "auto": shard across the box's GPUs at load (C15,
+                2026-10-10; session b's llama-3.3-70b oracle cells do not
+                fit one GPU). Inputs then go to the first parameter's device.
             **kwargs: Forwarded to InferenceEngine (stored in self.config).
 
         Raises:
@@ -147,6 +170,9 @@ class HFOracleAdapter(InferenceEngine):
 
         if device not in ("auto", "cuda", "cpu"):
             raise ValueError(f"unknown device '{device}' (expected auto|cuda|cpu)")
+        if device_map not in (None, "auto"):
+            raise ValueError(f"unknown device_map {device_map!r} (expected None or 'auto')")
+        self.device_map = device_map
         self.device: str = (
             device if device != "auto"
             else ("cuda" if torch.cuda.is_available() else "cpu")
@@ -166,15 +192,23 @@ class HFOracleAdapter(InferenceEngine):
         self.dtype_name = dtype
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=dtype_map[dtype]
-        )
-        self.model.to(self.device)
+        load_kwargs: Dict[str, Any] = {"torch_dtype": dtype_map[dtype]}
+        if device_map is not None:
+            load_kwargs["device_map"] = device_map
+        self.model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+        if device_map is None:
+            self.model.to(self.device)
+        else:
+            # The loader placed the shards; inputs go where the first
+            # parameter (the embedding) lives [V: transformers 4.57.6
+            # PreTrainedModel.device -> modeling_utils.get_parameter_device].
+            self.device = str(self.model.device)
         self.model.eval()
 
         # Corpus-prefix reuse state (the manual CAG recipe, chan2024cag).
         self._corpus_cache: Optional[Any] = None
         self._corpus_input_ids: Optional[Any] = None  # the prefilled ids (S0F-60)
+        self._corpus_add_special_tokens: bool = True  # how the prefix was tokenized
         self._corpus_prefix_text: Optional[str] = None
         self._corpus_base_len: int = 0
         self._corpus_prefill_ms: Optional[float] = None
@@ -184,9 +218,19 @@ class HFOracleAdapter(InferenceEngine):
     # ------------------------------------------------------------------ #
 
     def _sync(self) -> None:
-        """CUDA barrier so perf_counter spans measure completed device work."""
-        if self.device == "cuda":
+        """CUDA barrier so perf_counter spans measure completed device work.
+
+        Fresh review 2026-10-10 (C15-1): ``torch.cuda.synchronize()`` waits on
+        the current device only; under ``device_map="auto"`` the layers span
+        several GPUs, so every device is synchronized.
+        """
+        if not str(self.device).startswith("cuda"):
+            return
+        if self.device_map is None:
             self._torch.cuda.synchronize()
+            return
+        for index in range(int(self._torch.cuda.device_count())):
+            self._torch.cuda.synchronize(index)
 
     def _pad_token_id(self) -> Optional[int]:
         """Tokenizer pad id, falling back to EOS (run_cag_reference.py convention)."""
@@ -249,6 +293,7 @@ class HFOracleAdapter(InferenceEngine):
 
         self._corpus_cache = cache
         self._corpus_input_ids = enc.input_ids
+        self._corpus_add_special_tokens = bool(add_special_tokens)
         self._corpus_prefix_text = prefix_text
         self._corpus_base_len = int(cache.get_seq_length())
         self._corpus_prefill_ms = prefill_ms
@@ -259,7 +304,7 @@ class HFOracleAdapter(InferenceEngine):
         a time -- run_cag_reference.py releases before the next block's prefill)."""
         if self._corpus_cache is not None:
             self._corpus_cache = None
-            if self.device == "cuda":
+            if str(self.device).startswith("cuda"):
                 self._torch.cuda.empty_cache()
         self._corpus_input_ids = None
         self._corpus_prefix_text = None
@@ -321,9 +366,9 @@ class HFOracleAdapter(InferenceEngine):
             run_cag_reference.py), never a fabricated first-token estimate.
 
         With a corpus prefix loaded (``preload_corpus_prefix``), the request
-        prompt MUST literally extend the cached prefix text; only the suffix
-        is tokenized (``add_special_tokens=False``), the full ids (cached
-        corpus + suffix) are handed to ``generate`` with the resident cache
+        prompt MUST literally extend the cached prefix text; the WHOLE prompt
+        is tokenized once (F-01), its leading ids must equal the cached corpus
+        ids, the full ids are handed to ``generate`` with the resident cache
         (S0F-60), and the cache is cropped back to the corpus length after
         the query -- NON-OPTIONAL per Chan et al. 2024 (else the next query
         attends to this one's question and answer). A stop list ends the
@@ -332,6 +377,8 @@ class HFOracleAdapter(InferenceEngine):
         Raises (fail-closed protocol violations, never error rows):
             ValueError: sampling temperature on the greedy oracle, or a prompt
                 that does not extend the loaded corpus prefix.
+            CorpusPrefixMismatchError (a ValueError): the full prompt's leading
+                ids differ from the cached corpus ids, or no suffix remains.
             EngineCapabilityUnavailableError: truncate_prompt_tokens requested.
         """
         self._validate_request(request)
@@ -364,23 +411,43 @@ class HFOracleAdapter(InferenceEngine):
             )
             if reuse:
                 assert self._corpus_prefix_text is not None
-                suffix_text = request.prompt[len(self._corpus_prefix_text):]
-                q_enc = self.tokenizer(
-                    suffix_text, return_tensors="pt", add_special_tokens=False
+                # Review 2026-10-10 (F-01): the FULL prompt is tokenized once,
+                # the way the plain path and the preload tokenize, so a BPE
+                # merge across the prefix cut can never make the reuse path
+                # answer different ids than the plain path. The leading
+                # base_len ids must equal the prefilled corpus ids, or the
+                # cache does not match the input: refuse, never an error row.
+                full = self.tokenizer(
+                    request.prompt, return_tensors="pt",
+                    add_special_tokens=self._corpus_add_special_tokens,
                 ).to(self.device)
-                q_len = int(q_enc.input_ids.shape[1])
-                prompt_tokens = q_len
-                prompt_len = self._corpus_base_len + q_len
+                base_len = self._corpus_base_len
+                prompt_len = int(full.input_ids.shape[1])
+                if prompt_len <= base_len:
+                    raise CorpusPrefixMismatchError(
+                        f"prompt tokenizes to {prompt_len} ids, not more than the "
+                        f"{base_len} cached corpus ids: no query suffix to serve"
+                    )
+                head = full.input_ids[:, :base_len]
+                if not torch.equal(head, self._corpus_input_ids):
+                    raise CorpusPrefixMismatchError(
+                        "the full prompt's first ids differ from the preloaded corpus "
+                        "ids (a tokenizer merge across the prefix cut, or a prefix "
+                        "derived at the wrong character); serving it would attend a "
+                        "KV cache that does not match the input (review 2026-10-10, "
+                        "F-01). Cut the cacheable prefix after the '\\n\\n' before "
+                        "'Question:' (derive_corpus_prompt_prefix)."
+                    )
+                # ADR-0118 / review F-05: prompt_tokens is the WHOLE prompt the
+                # row was served against (cached corpus + query), the same
+                # quantity the serving engines report, so cached / prompt is
+                # a ratio in [0, 1] (the suffix-only count read above 1).
+                prompt_tokens = prompt_len
                 # S0F-60: generate() takes the FULL ids beside the prefilled
                 # cache (it slices the cached part off itself); the suffix
                 # alone raised IndexError in transformers 4.57 on the landing.
-                gen_kwargs["input_ids"] = torch.cat(
-                    [self._corpus_input_ids, q_enc.input_ids], dim=1
-                )
-                # Attention mask must cover cached corpus + new query tokens.
-                gen_kwargs["attention_mask"] = torch.ones(
-                    (1, prompt_len), dtype=torch.long, device=self.model.device
-                )
+                gen_kwargs["input_ids"] = full.input_ids
+                gen_kwargs["attention_mask"] = full.attention_mask
                 gen_kwargs["past_key_values"] = self._corpus_cache
             else:
                 enc = self.tokenizer(request.prompt, return_tensors="pt").to(self.device)
@@ -399,6 +466,8 @@ class HFOracleAdapter(InferenceEngine):
             num_generated = int(out.shape[1]) - prompt_len
             answer, cut = _cut_at_stop(answer, stops)
             stop_matched = cut or bool(criterion is not None and criterion.matched)
+        except CorpusPrefixMismatchError:
+            raise  # a protocol violation, never an error row (the finally still crops)
         except Exception as exc:  # noqa: BLE001 -- record, crop, continue (run_cag_reference.py)
             error = f"{type(exc).__name__}: {exc}"
         finally:
@@ -473,7 +542,7 @@ class HFOracleAdapter(InferenceEngine):
         self.clear_corpus_prefix()
         if getattr(self, "model", None) is not None:
             self.model = None
-            if self.device == "cuda":
+            if str(self.device).startswith("cuda"):
                 self._torch.cuda.empty_cache()
 
     def capabilities(self) -> Dict[str, Any]:

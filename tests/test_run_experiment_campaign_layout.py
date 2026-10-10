@@ -2399,3 +2399,47 @@ def test_campaign_sampler_that_cannot_start_refuses_the_cell(
     assert "cannot spawn the sampler thread" in capsys.readouterr().out
     assert _RecordingEngine.calls == [], "no measured request may be sent"
     assert not _window_dirs(root, "no_cache", "squad_v2")
+
+
+# ---------------------------------------------------------------------------
+# A2 (2026-10-10): gold position comes from the loader's gold evidence. The
+# runner matched against the WHOLE context, so the first served paragraph
+# (a HotpotQA distractor here) always "contained gold" and scored position 0.
+# ---------------------------------------------------------------------------
+
+
+class _HotpotShapedLoader:
+    def __init__(self, dataset: str) -> None:
+        self.dataset = dataset
+
+    def load(self, max_examples: Optional[int] = None) -> list:
+        rows = []
+        for i in range(N_QUERIES):
+            titles = [] if i == 0 else [f"Gold {i}"]  # q000: recorded absence
+            rows.append(
+                CAGExample(
+                    id=f"{self.dataset}-q{i:03d}",
+                    question=f"What is fact {i}?",
+                    context=[f"Noise {i}: a distractor paragraph.",
+                             f"Gold {i}: the fact {i} is answer-{i}."],
+                    answer=f"answer-{i}",
+                    metadata={"supporting_titles": titles},
+                )
+            )
+        return rows
+
+
+def test_gold_position_follows_the_loader_gold_set_a2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    _run_cell(monkeypatch, root, "no_cache", "hotpotqa", ttft_base=200.0,
+              num_trials=1, loader_factory=_HotpotShapedLoader)
+    (window,) = _window_dirs(root, "no_cache", "hotpotqa")
+    rows = {r["example_id"]: r for r in _read_jsonl(window / "qa_evidence.jsonl")}
+    assert len(rows) == N_QUERIES
+    for example_id, row in rows.items():
+        if example_id.endswith("q000"):
+            assert row["gold_position_in_prompt"] is None  # no gold recorded
+        else:
+            assert row["gold_position_in_prompt"] == 1  # behind the distractor

@@ -79,6 +79,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 from collections import Counter
@@ -184,6 +185,14 @@ def parse_args() -> argparse.Namespace:
                    help="Allow --abandon on a pass whose own ledger VERIFIES "
                         "complete (normally refused: completed passes are audit "
                         "record, not failures).")
+    p.add_argument("--freeze-file", default=None, dest="freeze_file",
+                   help="Review 2026-10-10 (R2): the freeze artifact "
+                        "(MyDocs/registration/freeze_resolutions.json) whose "
+                        "INSTRUMENT_REVISIONS pin the four HF checkpoints. The pins "
+                        "are exported as CAGE_*_REVISION before the evaluator loads, "
+                        "so a checkpoint resolving to another commit fails the pass. "
+                        "REQUIRED with --full in scoring-tree mode; a pin missing from "
+                        "the file refuses the pass.")
     p.add_argument("--no-blinding-control", action="store_true",
                    dest="no_blinding_control",
                    help="TEST-ONLY control run: skip the #130 label-stripping "
@@ -698,6 +707,40 @@ def _apply_to_results_csv(trial_dir: Path, rows_out: list, full_mode: bool) -> i
     return updated
 
 
+#: Review 2026-10-10 (R1): the evidence keys a v2 row (one that carries the
+#: task #127 ``ok`` stamp) must have. A missing one is a writer defect, never
+#: filled with "" (an empty reference would read as an unanswerable item).
+_V2_REQUIRED_KEYS: tuple[str, ...] = ("generated_answer", "reference_answer", "used_contexts")
+
+
+class EvidenceSchemaError(ValueError):
+    """A v2 evidence row lacks a key the scorer would otherwise default."""
+
+
+def _row_not_ok(rec: dict[str, Any]) -> bool:
+    """True for a row the serving side stamped as not ok (task #127 fields:
+    ``ok`` False, a non-empty ``error``, or ``empty_generation`` True). Rows
+    without the stamp (pre-#127 pilot evidence) are scored as before."""
+    if rec.get("ok") is False:
+        return True
+    if rec.get("error"):
+        return True
+    return rec.get("empty_generation") is True
+
+
+def _unscored_metrics() -> dict[str, Any]:
+    """Every QualityMetrics column set to None (the not-ok row's record)."""
+    from src.evaluation.quality import QualityMetrics
+
+    keys = QualityMetrics(
+        faithfulness=None, relevance=None,
+        completeness_bertscore=None, completeness_rouge_l=None,
+    ).to_dict().keys()
+    out: dict[str, Any] = {k: None for k in keys}
+    out["instrument_status"] = None
+    return out
+
+
 def _score_evidence_file(
     ev_path: Path,
     evaluator: Any,
@@ -712,6 +755,16 @@ def _score_evidence_file(
     ``DuplicateEvidenceError`` unless ``allow_duplicates`` (then: keep-LAST,
     and the dropped count is returned so callers persist it -- task #127,
     charter §9.10: exclusions countable from artifacts).
+
+    Review 2026-10-10 (R1): a row the serving side stamped NOT OK (``ok``
+    False, ``error`` set, or ``empty_generation`` True) is never scored: its
+    empty answer is a serving failure, not an abstention (on the 2026-10-08
+    landing one window of 50 errored rows would have read EM 0.70 and
+    abstention accuracy 1.0). Such rows are emitted with every quality column
+    None, ``not_ok`` True and the stamp fields, and counted as ``n_not_ok``
+    by ``_quality_aggregate``. A v2 row (one carrying the ``ok`` stamp) that
+    lacks a required evidence key refuses (``EvidenceSchemaError``) instead
+    of scoring a default.
 
     ``blinder`` (task #130 decision (a), charter §9.8): when given, the
     arm-bearing cell identity (the evidence ``baseline`` field, else the
@@ -738,6 +791,14 @@ def _score_evidence_file(
         if not line.strip():
             continue
         rec = json.loads(line)
+        if "ok" in rec:
+            missing = [k for k in _V2_REQUIRED_KEYS if k not in rec]
+            if missing:
+                raise EvidenceSchemaError(
+                    f"{ev_path}: evidence row {rec.get('example_id')!r} carries the "
+                    f"ok stamp but lacks {missing}; refusing to score a default "
+                    "(review 2026-10-10, R1)"
+                )
         question = rec.get("question") or ""
         contexts = rec.get("used_contexts") or []
         if isinstance(contexts, str):  # tolerate stringified lists from older runs
@@ -787,31 +848,41 @@ def _score_evidence_file(
               f"{n_duplicates_dropped} row(s) (--allow-duplicates)")
         records = [records[i] for i in keep]
 
-    # Phase 2: ONE scoring call for both modes.
+    # Review 2026-10-10 (R1): rows the serving side stamped not ok never reach
+    # the scorer; they are emitted unscored below, in file order.
+    scored = [r for r in records if not _row_not_ok(r["rec"])]
+
+    # Phase 2: ONE scoring call for both modes (over the scorable rows only).
     metrics_list = evaluator.batch_evaluate(
-        [r["question"] for r in records],
-        [r["contexts"] for r in records],
-        [r["generated"] for r in records],
-        [r["reference"] for r in records],
-        all_answers=[r["all_answers"] for r in records],
-        is_impossible=[r["is_impossible"] for r in records],
+        [r["question"] for r in scored],
+        [r["contexts"] for r in scored],
+        [r["generated"] for r in scored],
+        [r["reference"] for r in scored],
+        all_answers=[r["all_answers"] for r in scored],
+        is_impossible=[r["is_impossible"] for r in scored],
         batched=batch_size is not None,
         nli_batch_size=batch_size if batch_size is not None else 32,
-    )
+    ) if scored else []
+    metrics_iter = iter(metrics_list)
 
     rows_out: list[dict[str, Any]] = []
-    for r, quality_metrics in zip(records, metrics_list):
+    for r in records:
         rec = r["rec"]
         generated = r["generated"]
         reference = r["reference"]
         question = r["question"]
-        metrics = quality_metrics.to_dict()
-
-        # B4: abstention is judged on the SANITIZED text ("A: I don't know." must
-        # count), matching evaluate()'s internal gate. sanitized_answer also lands
-        # in metrics via QualityMetrics.to_dict(); generated_answer stays raw.
-        sanitized = sanitize_answer(generated)
-        abstained = is_no_answer_prediction(sanitized)
+        not_ok = _row_not_ok(rec)
+        if not_ok:
+            metrics = _unscored_metrics()
+            sanitized = None
+            abstained = False
+        else:
+            metrics = next(metrics_iter).to_dict()
+            # B4: abstention is judged on the SANITIZED text ("A: I don't know." must
+            # count), matching evaluate()'s internal gate. sanitized_answer also lands
+            # in metrics via QualityMetrics.to_dict(); generated_answer stays raw.
+            sanitized = sanitize_answer(generated)
+            abstained = is_no_answer_prediction(sanitized)
 
         # B3d dual scoring: when the evidence row carries the PRE-COMPRESSION docs
         # ('original_contexts', written by the serving side for compressed arms),
@@ -829,7 +900,8 @@ def _score_evidence_file(
             except json.JSONDecodeError:
                 original_contexts = [original_contexts]
         if (
-            isinstance(original_contexts, list)
+            not not_ok
+            and isinstance(original_contexts, list)
             and any(c and str(c).strip() for c in original_contexts)
             and not abstained
         ):
@@ -860,6 +932,11 @@ def _score_evidence_file(
             "generated_answer": generated,
             "reference_answer": reference,
             "abstained": abstained,
+            # Review 2026-10-10 (R1): the serving side's validity stamp rides the
+            # score row; a not-ok row has every quality column None.
+            "not_ok": not_ok,
+            "error": rec.get("error") if not_ok else None,
+            "empty_generation": rec.get("empty_generation") if not_ok else None,
             "old_grounding_score": old_g,
             **metrics,
             # B3d: scores vs the PRE-compression originals ("" when unavailable).
@@ -890,8 +967,11 @@ def _build_evaluator(args: argparse.Namespace) -> Any:
 
 
 def _git_provenance() -> dict[str, Any]:
-    """Best-effort repo SHA for the scoring manifest; a tarball checkout
-    without git records an explicit null, never a fabricated SHA."""
+    """Repo SHA for the scoring manifest: git when the checkout has it, else
+    the BUILD_INFO the tarball ships (the pod runs a `git archive` tree, so
+    the 2026-10-08 scoring manifests would have carried null; review
+    2026-10-10, R4); an explicit null only when neither exists, never a
+    fabricated SHA."""
     try:
         sha = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT,
@@ -905,8 +985,62 @@ def _git_provenance() -> dict[str, Any]:
         )
         return {"code_git_sha": sha, "git_dirty": dirty}
     except (OSError, subprocess.CalledProcessError):
-        return {"code_git_sha": None, "git_dirty": None,
-                "git_note": "git unavailable at scoring time"}
+        pass
+    try:
+        from src.observability.provenance import git_dirty, git_sha
+
+        sha = git_sha(str(REPO_ROOT))
+        if sha:
+            return {"code_git_sha": sha, "git_dirty": git_dirty(str(REPO_ROOT)),
+                    "git_note": "from BUILD_INFO (tarball checkout)"}
+    except Exception:
+        pass
+    return {"code_git_sha": None, "git_dirty": None,
+            "git_note": "git and BUILD_INFO unavailable at scoring time"}
+
+
+def revision_pins_from_freeze(freeze_path: Path) -> dict[str, str]:
+    """The four CAGE_*_REVISION pins from the freeze artifact's
+    INSTRUMENT_REVISIONS (review 2026-10-10, R2). Fail closed: a missing or
+    empty revision for any of the evaluator's four instruments raises
+    ValueError naming it; the file must parse as JSON."""
+    from src.evaluation.quality import _REVISION_PIN_ENVS
+
+    try:
+        doc = json.loads(Path(freeze_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"freeze file {freeze_path} cannot be read as JSON: {exc}") from exc
+    table = doc.get("INSTRUMENT_REVISIONS")
+    if not isinstance(table, dict):
+        raise ValueError(f"freeze file {freeze_path} has no INSTRUMENT_REVISIONS object")
+    pins: dict[str, str] = {}
+    missing: list[str] = []
+    for inst in _REVISION_PIN_ENVS:
+        entry = table.get(inst)
+        rev = entry.get("revision") if isinstance(entry, dict) else None
+        if isinstance(rev, str) and rev.strip():
+            pins[inst] = rev.strip()
+        else:
+            missing.append(inst)
+    if missing:
+        raise ValueError(
+            f"freeze file {freeze_path}: INSTRUMENT_REVISIONS lacks a revision for "
+            f"{missing}; a --full pass needs every instrument pinned"
+        )
+    return pins
+
+
+def apply_revision_pins(pins: dict[str, str]) -> dict[str, str]:
+    """Export the pins as the CAGE_*_REVISION variables QualityEvaluator reads
+    at construction; returns {env_var: revision}."""
+    from src.evaluation.quality import _REVISION_PIN_ENVS
+
+    exported: dict[str, str] = {}
+    for inst, rev in pins.items():
+        env = _REVISION_PIN_ENVS[inst]
+        os.environ[env] = rev
+        exported[env] = rev
+    return exported
 
 
 def _instrument_models(evaluator: Any) -> dict[str, Any]:
@@ -946,6 +1080,7 @@ def _quality_aggregate(
     into a mean. ``mean`` is None when no row scored -- absence is not zero.
     """
     n_abstained = sum(1 for r in rows_out if r.get("abstained"))
+    n_not_ok = sum(1 for r in rows_out if r.get("not_ok"))
     metrics: dict[str, dict[str, Any]] = {}
     for key in sorted(_QUALITY_AGG_KEYS):
         values = [
@@ -961,6 +1096,8 @@ def _quality_aggregate(
     return {
         "rows": len(rows_out),
         "abstained": n_abstained,
+        # Review 2026-10-10 (R1): serving failures the pass never scored.
+        "n_not_ok": n_not_ok,
         # §9.10: keep-last dedup losses are persisted here, not stdout-only.
         "n_duplicates_dropped": n_duplicates_dropped,
         # Back-compat convenience view (scored keys only, same allowlist —
@@ -1064,13 +1201,53 @@ def run_scoring_tree(root: Path, scoring_run_id: str, args: argparse.Namespace) 
         )
         blinder = LabelBlinder(scoring_salt.salt)
 
+    # Review 2026-10-10 (R2): a --full pass loads the four HF checkpoints, and
+    # the registered revisions are enforced only through the CAGE_*_REVISION
+    # pins the evaluator reads at construction; nothing on the pod exported
+    # them, so stage 10 never enforced the freeze. The freeze file is REQUIRED
+    # here and a pin missing from it refuses before the tree is created.
+    freeze_file = getattr(args, "freeze_file", None)
+    revision_pins: dict[str, Any] = {"source": None, "pins": {}}
+    if args.full:
+        if not freeze_file:
+            print("ERROR: a --full scoring pass needs --freeze-file <freeze_resolutions.json>: "
+                  "the registered instrument revisions (INSTRUMENT_REVISIONS) are enforced "
+                  "through CAGE_*_REVISION at load, and nothing else sets them "
+                  "(review 2026-10-10, R2)", file=sys.stderr)
+            return 2
+        try:
+            pins = revision_pins_from_freeze(Path(freeze_file))
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        revision_pins = {"source": str(freeze_file), "pins": pins,
+                         "exported": apply_revision_pins(pins)}
+    elif freeze_file:
+        # fast mode loads no checkpoint; the pins are recorded, nothing to enforce
+        try:
+            revision_pins = {"source": str(freeze_file),
+                             "pins": revision_pins_from_freeze(Path(freeze_file))}
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+
     evaluator = _build_evaluator(args)
     written: list[Path] = []
     total_rows = 0
     total_abstained = 0
+    total_not_ok = 0
     total_duplicates_dropped = 0
 
-    scoring_dir.mkdir(parents=True)
+    # Review 2026-10-10 (R3): the pass is built under a partial name and
+    # renamed to scoring/<id>/ only after its own ledger is written, so a
+    # crash or a killed job never leaves a directory the master reads as a
+    # completed pass ("exists: reused"). A leftover partial directory is an
+    # unsealed fragment by construction and is removed.
+    work_dir = root / SCORING_DIRNAME / f".{scoring_run_id}.partial"
+    if work_dir.exists():
+        print(f"[rescore] removing the unsealed partial pass left by an earlier attempt: {work_dir}")
+        shutil.rmtree(work_dir)
+    work_dir.mkdir(parents=True)
     for ev_path in evidence_files:
         rows_out, n_dup = _score_evidence_file(
             ev_path, evaluator, batch_size=batch_size,
@@ -1081,7 +1258,7 @@ def run_scoring_tree(root: Path, scoring_run_id: str, args: argparse.Namespace) 
         if blinder is not None:
             rows_out = unblind_score_rows(rows_out, blinder)
         rel_window = ev_path.parent.relative_to(root)  # cells/<row_key>/window_<k>
-        out_window = scoring_dir / rel_window
+        out_window = work_dir / rel_window
         out_window.mkdir(parents=True, exist_ok=True)
 
         scores_path = out_window / QA_SCORES_NAME
@@ -1102,12 +1279,13 @@ def run_scoring_tree(root: Path, scoring_run_id: str, args: argparse.Namespace) 
 
         total_rows += len(rows_out)
         total_abstained += sum(1 for r in rows_out if r.get("abstained"))
+        total_not_ok += sum(1 for r in rows_out if r.get("not_ok"))
         total_duplicates_dropped += n_dup
 
     # Task #130 (a): seal this pass's token->label map and stamp the
     # "blinding" section the #112 prereg text cites.
     if blinder is not None and scoring_salt is not None:
-        map_path = scoring_dir / BLINDING_MAP_NAME
+        map_path = work_dir / BLINDING_MAP_NAME
         map_sha256 = write_blinding_map(map_path, blinder.mapping)
         written.append(map_path)
         blinding_section: dict[str, Any] = {
@@ -1147,11 +1325,16 @@ def run_scoring_tree(root: Path, scoring_run_id: str, args: argparse.Namespace) 
         # a repo NAME alone lets a silent upstream update change the
         # instrument under the same provenance id.
         "instrument_revisions": evaluator.instrument_provenance(),
+        # Review 2026-10-10 (R2): the registered pins this pass enforced (the
+        # freeze file and the CAGE_*_REVISION values exported before the load).
+        "revision_pins": revision_pins,
         "calibration_id": evaluator.calibration_id,
         "raw_run_id": raw_run_id,
         "raw_run_ledger_entries_sha256": entries_sha256,
         "n_evidence_files": len(evidence_files),
         "n_rows": total_rows,
+        # Review 2026-10-10 (R1): serving failures the pass never scored.
+        "n_not_ok": total_not_ok,
         # Task #127 duplicate accounting (§9.10: countable from artifacts).
         "allow_duplicates": allow_duplicates,
         "n_duplicates_dropped": total_duplicates_dropped,
@@ -1159,7 +1342,7 @@ def run_scoring_tree(root: Path, scoring_run_id: str, args: argparse.Namespace) 
         "blinding": blinding_section,
         **_git_provenance(),
     }
-    manifest_out = scoring_dir / SCORING_MANIFEST_NAME
+    manifest_out = work_dir / SCORING_MANIFEST_NAME
     manifest_out.write_text(
         json.dumps(scoring_manifest, indent=2) + "\n", encoding="utf-8"
     )
@@ -1168,14 +1351,16 @@ def run_scoring_tree(root: Path, scoring_run_id: str, args: argparse.Namespace) 
     # §6: "Scoring passes get their own ledger inside their own directory
     # before being used by stats."
     write_ledger(
-        hash_artifacts(written, base_dir=scoring_dir),
-        scoring_dir / "ledger.json",
+        hash_artifacts(written, base_dir=work_dir),
+        work_dir / "ledger.json",
     )
+    # R3: only a sealed pass gets the name the master and the predicate builder read.
+    work_dir.rename(scoring_dir)
 
     mode = "FULL" if args.full else "FAST (model-free metrics + abstention short-circuit)"
     print(f"SCORING_TREE_DONE  id={scoring_run_id}  mode={mode}  "
           f"files={len(evidence_files)}  rows={total_rows}  "
-          f"abstained={total_abstained}")
+          f"abstained={total_abstained}  not_ok={total_not_ok}")
     print(f"  tree   : {scoring_dir}")
     print(f"  sealed : {scoring_dir / 'ledger.json'}")
     return 0

@@ -267,9 +267,13 @@ def plan_budget(
                 ("--kv-cache-memory-bytes", str(per_rank)),
                 "direct bytes knob." + hybrid_note,
             ))
+            # C13 (2026-10-10): a block holds block_size token slots on every
+            # rank (each rank stores its head shard of those tokens), so the
+            # count is tokens_total // block_size at any tp. per_rank divided
+            # by the FULL-model bytes per token gave 1/tp of it under GQA.
             args.append(EngineArgs(
                 "vllm", "fallback", "single" if tp == 1 else "rank",
-                ("--num-gpu-blocks-override", str((per_rank // eff_kv_per_token) // block_size)),
+                ("--num-gpu-blocks-override", str(tokens_total // block_size)),
                 f"block-count fallback (block_size={block_size} tokens) for builds "
                 "without the bytes flag." + hybrid_note,
             ))
@@ -287,9 +291,14 @@ def plan_budget(
             )
     elif engine == "sglang":
         if pools is None:
+            # C13 (2026-10-10): the token cap is the pool's token-slot count,
+            # tokens_total at any tp [D: per-rank bytes budget/tp over
+            # per-rank bytes per token kv/tp]. per_rank // eff_kv_per_token was
+            # tokens_total / tp under GQA, a quarter of vLLM's realized pool
+            # at session b's tp=4 [A: slot semantics; gate (j) closes live].
             args.append(EngineArgs(
                 "sglang", "primary", "single" if tp == 1 else "rank",
-                ("--max-total-tokens", str(tokens_total if tp == 1 else per_rank // eff_kv_per_token)),
+                ("--max-total-tokens", str(tokens_total)),
                 "token-denominated pool cap: tokens = bytes // (kv/token x dtype)."
                 + hybrid_note,
             ))

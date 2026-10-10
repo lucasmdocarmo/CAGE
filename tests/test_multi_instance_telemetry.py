@@ -310,13 +310,15 @@ def _drive_ticks(monkeypatch, sampler, snaps, t0s):
     """Run sampler._run inline for len(snaps) ticks with controlled clocks.
 
     capture_snapshot is monkeypatched (records flow through the real _run
-    tick path); vt's time.time is fed t0 then t0+99 per tick so the recorded
-    sample ts is exactly t0 and the inter-tick wait is skipped (dt < 0).
+    tick path); vt's time.time is fed t0 (capture start), t0 again (capture
+    end; S0F-53 stamps the record with the capture END when the snapshot
+    carries no plausible clock) and t0+99 per tick, so the recorded sample ts
+    is exactly t0 and the inter-tick wait is skipped (dt < 0).
     """
     assert len(snaps) == len(t0s)
     times = []
     for t in t0s:
-        times.extend([t, t + 99.0])
+        times.extend([t, t, t + 99.0])
     time_iter = iter(times)
     monkeypatch.setattr(vt.time, "time", lambda: next(time_iter))
     snap_iter = iter(snaps)
@@ -365,9 +367,12 @@ def test_sampler_clock_survives_a_snapshot_ts_key(tmp_path: Path, monkeypatch):
     """S0F-15 (live 2026-09-30): cage-stats snapshots carry their OWN ``ts`` key
     (1.0 on every snapshot), and the record builder let it overwrite the
     sampler's wall clock, so every window read UNKNOWN_TELEMETRY (0 in-window
-    samples against epoch-bounded windows). The sampler's ``time.time()`` at
-    capture is the ONLY clock the regime bridge may see: it must win over any
-    same-named snapshot field, exactly as ``instance`` does.
+    samples against epoch-bounded windows). The sampler's own stamp is the
+    ONLY clock the regime bridge may see: a snapshot ``ts`` outside the
+    capture span (1.0 here) never wins, exactly as ``instance`` does. S0F-53
+    (2026-10-10): the stamp is the capture END (the fake clock makes it equal
+    to the start), and a snapshot ``ts`` inside the capture span is taken as
+    the sample's own clock (tests/test_sampler_timestamp_s0f53.py).
     """
     sampler = vt.VllmTelemetrySampler("http://p:8000", role="single")
     _drive_ticks(

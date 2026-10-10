@@ -48,11 +48,12 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import aiohttp
 import asyncio
 import requests
+import urllib3
 
 from .engine import (
     InferenceEngine,
@@ -76,6 +77,50 @@ SERVED_FINISH_REASONS: frozenset = frozenset({"stop", "length"})
 ERROR_KIND_ENGINE = "engine_error"
 ERROR_KIND_NO_FINISH = "no_finish_reason"
 ERROR_KIND_UNSERVED = "unserved_finish_reason"
+
+
+#: C14 (2026-10-10): the most bytes one read1 takes from an unframed stream.
+_UNFRAMED_READ1_BYTES = 65536
+
+
+def _sse_lines(resp: Any) -> Iterator[str]:
+    """The lines of a streamed SSE body, each yielded once it is complete.
+
+    A chunked body (vLLM and SGLang over HTTP/1.1) keeps requests'
+    ``iter_lines``, unchanged. An UNFRAMED body, the pd proxy's HTTP/1.0
+    answer with no length and no chunking (pd_proxy.py), made ``iter_lines``
+    block in ``read(512)`` until 512 bytes or the end of the stream, so the
+    first token waited behind later ones and ``ttft_ms`` landed late (ADR-0138
+    measured the same block on the proxy side). For that body this reads with
+    ``read1``, which returns after at most one system call [V: urllib3 2.7.0
+    HTTPResponse.read1 -> http.client.HTTPResponse.read1, Python 3.13], splits
+    on ``b"\n"`` and decodes each complete line as UTF-8, so a multi-byte
+    character cut across two reads stays whole.
+    """
+    raw = getattr(resp, "raw", None)
+    if raw is None or getattr(raw, "chunked", True):
+        yield from resp.iter_lines(decode_unicode=True)
+        return
+    pending = b""
+    while True:
+        try:
+            data = raw.read1(_UNFRAMED_READ1_BYTES, decode_content=True)
+        except urllib3.exceptions.HTTPError as exc:
+            # Fresh review 2026-10-10 (C14-1): requests wraps urllib3's
+            # ProtocolError, ReadTimeoutError and SSLError into its own
+            # exceptions inside iter_content; this branch reads urllib3
+            # directly, so the same mapping happens here. Both call sites
+            # catch requests.exceptions.RequestException and write an error
+            # row; an unwrapped urllib3 error would have aborted the window.
+            raise requests.exceptions.ConnectionError(str(exc)) from exc
+        if not data:
+            break
+        pending += data
+        *complete, pending = pending.split(b"\n")
+        for line in complete:
+            yield line.rstrip(b"\r").decode("utf-8")
+    if pending:
+        yield pending.rstrip(b"\r").decode("utf-8")
 
 
 def _exc_text(exc: BaseException) -> str:
@@ -447,7 +492,7 @@ class OpenAIChatAdapter(InferenceEngine):
                 router_replica = resp.headers.get("x-router-replica")
                 kv_transfer_params = self._header_kv_transfer(resp.headers)
 
-                for line in resp.iter_lines(decode_unicode=True):
+                for line in _sse_lines(resp):
                     if not line:
                         continue
                     if not line.startswith("data:"):
@@ -574,7 +619,7 @@ class OpenAIChatAdapter(InferenceEngine):
                 router_replica = resp.headers.get("x-router-replica")
                 kv_transfer_params = self._header_kv_transfer(resp.headers)
 
-                for line in resp.iter_lines(decode_unicode=True):
+                for line in _sse_lines(resp):
                     if not line:
                         continue
                     if not line.startswith("data:"):

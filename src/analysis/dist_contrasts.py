@@ -788,8 +788,16 @@ def align_pressure_bundles(
     error; outside the band the tie is moot and the window labels out).
     ``tol`` is recorded in the output.
 
-    Rows: per (bucket r, dataset), each non-anchor engine vs ``anchor_engine``
-    on the basis-labeled Y variable (aggregate ⇒ ``yield_frac``, per-gpu ⇒
+    ``match_key`` (optional string): the window's non-engine cell identity.
+    C10 (2026-10-10): buckets were keyed by (r, dataset) alone, so one
+    engine's gold-fresh windows could meet the other's retr-trunc windows and
+    delta_y reported an arm difference as an engine difference. The key now
+    joins the bucket identity; the driver passes the #14 match axes
+    (model, arm, retriever, policy, topology, rate_frac). A caller that
+    passes none keeps one key per (r, dataset).
+
+    Rows: per (bucket r, dataset, match_key), each non-anchor engine vs
+    ``anchor_engine`` on the basis-labeled Y variable (aggregate ⇒ ``yield_frac``, per-gpu ⇒
     ``yield_per_gpu``) — mean per side, delta, n, and the per-window values.
     """
     if basis not in _Y_FIELD_BY_BASIS:
@@ -816,8 +824,8 @@ def align_pressure_bundles(
 
     skips: list[dict[str, str]] = []
     labeled_out: list[dict[str, Any]] = []
-    #: (r_level, dataset) -> engine -> list of {window, rho_own, y}
-    buckets: dict[tuple[float, str], dict[str, list[dict[str, Any]]]] = {}
+    #: (r_level, dataset, match_key) -> engine -> list of {window, rho_own, y}
+    buckets: dict[tuple[float, str, str], dict[str, list[dict[str, Any]]]] = {}
 
     for idx, win in enumerate(windows):
         if not isinstance(win, Mapping):
@@ -889,15 +897,17 @@ def align_pressure_bundles(
                 f"registered r levels {sorted(nearest)} within tol={tol:g} — "
                 "the grid cannot place this window; refusing to guess a bucket"
             )
-        bucket = buckets.setdefault((nearest[0], str(win["dataset"])), {})
+        bucket = buckets.setdefault(
+            (nearest[0], str(win["dataset"]), str(win.get("match_key") or "")), {}
+        )
         bucket.setdefault(str(win["engine"]), []).append(
             {"window": label, "rho_own": rho_own, "metrics": win["metrics"]}
         )
 
     rows: list[dict[str, Any]] = []
     bucket_skips: list[dict[str, Any]] = []
-    for (r_level, dataset) in sorted(buckets):
-        engines = buckets[(r_level, dataset)]
+    for (r_level, dataset, match_key) in sorted(buckets):
+        engines = buckets[(r_level, dataset, match_key)]
         # §6.6 seam: ONE declared basis per pooled bucket before any Y read.
         assert_single_basis(
             [e["metrics"] for members in engines.values() for e in members],
@@ -908,6 +918,7 @@ def align_pressure_bundles(
                 {
                     "r_level": r_level,
                     "dataset": dataset,
+                    "match_key": match_key,
                     "engines": sorted(engines),
                     "reason": (
                         f"no {anchor_engine!r} anchor bundle in this bucket "
@@ -922,6 +933,7 @@ def align_pressure_bundles(
                 {
                     "r_level": r_level,
                     "dataset": dataset,
+                    "match_key": match_key,
                     "engines": sorted(engines),
                     "reason": "anchor engine only — no cross-engine partner",
                 }
@@ -942,6 +954,7 @@ def align_pressure_bundles(
                 {
                     "r_level": r_level,
                     "dataset": dataset,
+                    "match_key": match_key,
                     "engine": engine,
                     "anchor_engine": anchor_engine,
                     "basis": basis,

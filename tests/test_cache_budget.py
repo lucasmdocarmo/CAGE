@@ -239,3 +239,21 @@ def test_cli_refusal_exits_2(capsys: pytest.CaptureFixture[str]) -> None:
     ])
     assert rc == 2
     assert "REFUSED" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("tp", [2, 4])
+def test_tp_token_caps_equal_the_planned_tokens_c13(tp: int) -> None:
+    # C13 (2026-10-10): under GQA head sharding every rank holds all token
+    # slots, so the token-denominated knobs carry budget_tokens_total. They
+    # carried per_rank // full-model-bytes-per-token = tokens_total / tp.
+    sg = plan_budget(model="qwen3-14b", engine="sglang", r=1.0, demand=_D_14B,
+                     tp=tp, topology="tp")
+    assert sg.engine_args[0].args == ("--max-total-tokens", str(sg.budget_tokens_total))
+    vl = plan_budget(model="qwen3-14b", engine="vllm", r=1.0, demand=_D_14B,
+                     tp=tp, topology="tp")
+    fallback = next(a for a in vl.engine_args if a.kind == "fallback")
+    assert fallback.args == (
+        "--num-gpu-blocks-override", str(vl.budget_tokens_total // 16),
+    )
+    # The bytes knob stays per rank (the shard): total // tp.
+    assert vl.engine_args[0].args == ("--kv-cache-memory-bytes", str(vl.budget_bytes_total // tp))

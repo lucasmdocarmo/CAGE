@@ -656,6 +656,12 @@ SERVER_ENGINES: Tuple[str, ...] = ("vllm", "sglang", "lmdeploy")
 #: accepted ADR. BEHAVIOR, not identity: derive_cell_spec ignores it.
 SKIP_QUALITY_ENV: str = "CAGE_SKIP_QUALITY"
 SKIP_QUALITY_VALUE: str = "1"
+#: C15 (2026-10-10): the in-process hf oracle on a multi-GPU box shards at
+#: load (src/inference/hf_oracle_adapter.py device_map="auto"); session b's
+#: llama-3.3-70b oracle cells do not fit one GPU. Single-GPU boxes (S0,
+#: session a) never carry it and keep the one-device load. Behavior, never
+#: identity: derive_cell_spec ignores it.
+HF_DEVICE_MAP_ENV: str = "CAGE_HF_DEVICE_MAP"
 DECOUPLED_SCORING_ADR: str = "ADR-0055"
 
 #: Batch 2 finding W4 (2026-09-24; owner picked options 1A + 2A of the Spec
@@ -4601,6 +4607,8 @@ def _cell_step(
         # NOT identity (derive_cell_spec ignores it): the serving-stack fact
         # the campaign writer persists into cell.json (W4.2 → §6.6b / #18).
         env["CAGE_GPU_COUNT"] = str(gpu_count)
+    if spec.engine == "hf" and gpu_count is not None and gpu_count > 1:
+        env[HF_DEVICE_MAP_ENV] = "auto"
     if spec.topology == "pd":
         # S0F-22 Batch 1: the SAME value the pd relaunch carries (one table);
         # the runner refuses the env without PD_TELEMETRY_FLAG, so both ride

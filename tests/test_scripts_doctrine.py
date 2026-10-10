@@ -553,9 +553,29 @@ def test_sglang_launcher_enables_metrics_unconditionally() -> None:
     ONLY under --enable-metrics, so a launch without it turns every SGLang
     window into verified: False (a WARNING, never a mislabeled row, but a
     FAIL of S0-23). The flag must ride EVERY launch: at function depth of
-    start_server, outside any if/case block, never behind an env knob."""
+    the argv builder, outside any if/case block, never behind an env knob.
+
+    ADR-0162 (S0 attempt 2, 2026-10-10) moved the argv assembly and the one
+    launch exec out of start_server into _sglang_launch_once so start_server
+    can retry a short pool once. The pin follows the exec: the builder is
+    scanned, and two guards keep "every launch" true (start_server calls the
+    builder; no other function runs sglang.launch_server). The S0 attempt 3
+    pod suite caught the stale start_server anchor (2026-10-10 17:51Z)."""
     text = _strip_heredoc_bodies(SGLANG_LAUNCHER.read_text(encoding="utf-8"))
-    body = _function_body(text, "start_server")
+    launcher_fn = "_sglang_launch_once"
+    start_body = _function_body(text, "start_server")
+    assert f"{launcher_fn} " in start_body, (
+        f"start_server must launch through {launcher_fn} (ADR-0162)"
+    )
+    exec_lines = [
+        ln for ln in text.splitlines()
+        if "-m sglang.launch_server" in ln and "nohup" in ln
+    ]
+    body = _function_body(text, launcher_fn)
+    assert len(exec_lines) == 1 and exec_lines[0] in body, (
+        "the one sglang.launch_server exec must sit inside "
+        f"{launcher_fn}; found {exec_lines}"
+    )
     depth = 0
     hits: List[int] = []
     for i, line in enumerate(body.splitlines(), 1):
@@ -564,7 +584,7 @@ def test_sglang_launcher_enables_metrics_unconditionally() -> None:
         if _ENABLE_METRICS_LINE.match(line):
             hits.append(i)
             assert depth == 0, (
-                f"--enable-metrics at start_server line {i} sits inside a "
+                f"--enable-metrics at {launcher_fn} line {i} sits inside a "
                 f"conditional block (depth {depth}); it must be unconditional"
             )
         if _BASH_BLOCK_OPEN.match(line):
@@ -572,7 +592,7 @@ def test_sglang_launcher_enables_metrics_unconditionally() -> None:
         elif _BASH_BLOCK_CLOSE.match(line):
             depth -= 1
     assert len(hits) == 1, (
-        "start_server must add `sglang_args+=( --enable-metrics )` exactly "
+        f"{launcher_fn} must add `sglang_args+=( --enable-metrics )` exactly "
         f"once, found {len(hits)}"
     )
 

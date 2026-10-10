@@ -480,7 +480,14 @@ _NO_ANSWER_RE = re.compile(
     r"no\s+(information|mention|indication|answer|idea)|"
     r"insufficient\s+(information|context|detail)|"
     r"not\s+enough\s+(information|context|details?)|"
-    r"not\s+(in|found\s+in|provided|mentioned|stated|specified|available|present|given|sure)|"
+    # Review 2026-10-10 (Q2): the bare "not in" / "not available" / "not present"
+    # / "not given" matched ordinary answer text ("problems that are not in the
+    # realm of Boolean satisfiability", 6 wrong answers credited as correct
+    # abstentions on the 2026-10-08 landing). Those four need an object naming
+    # the evidence; the self-sufficient phrases keep matching on their own.
+    r"not\s+(found\s+in|provided|mentioned|stated|specified|sure)|"
+    r"not\s+(in|available\s+in|present\s+in|given\s+in|available|present|given)\s+"
+    r"(the\s+|this\s+|any\s+)?(provided\s+|given\s+)?(context|passage|text|document|article|information|source)|"
     r"does\s+not\s+(say|mention|provide|contain|specify|state|give|include)|"
     r"doesn'?t\s+(say|mention|provide|contain|specify|state|give|include)|"
     r"do(es)?\s+not\s+have\s+(the\s+)?answer|"
@@ -540,19 +547,36 @@ def sanitize_answer(text: Optional[str]) -> str:
     """Strip a leading answer-scaffold token and truncate fabricated continuations.
 
     1. Removes ONE leading scaffold token ('A:', 'Answer:', 'A.', 'Answer.').
-    2. Truncates at the first fabricated prompt-template continuation
-       ('Context:', 'Question 2:', ...), which is model runaway, not answer text.
+    2. Removes ONE leading prompt label ('Context 2:', 'Question:') when the
+       answer STARTS with it: the model echoed the label before its text
+       (review 2026-10-10, Q1: on the 2026-10-08 landing 15 ok rows began with
+       "Context N:" and the old rule cut at position 0, so a non-empty answer
+       became "" and scored as an abstention, EM 1.0 on unanswerable items).
+    3. Truncates at the first fabricated prompt-template continuation that
+       FOLLOWS answer text ('Context:', 'Question 2:', ...), which is model
+       runaway, not answer text.
+
+    The sanitizer never turns a non-blank generation into an empty string: when
+    nothing but labels remains, the raw stripped text is returned, so the
+    abstention detector judges the words the model wrote.
 
     Never applied destructively: callers keep the raw generation and store this result
     as ``sanitized_answer`` alongside it. ALL quality scoring (grounding, NLI,
     completeness, F1/EM, abstention detection) runs on the sanitized text.
     """
-    t = text or ""
-    t = _ANSWER_SCAFFOLD_PREFIX_RE.sub("", t, count=1)
+    raw = text or ""
+    t = _ANSWER_SCAFFOLD_PREFIX_RE.sub("", raw, count=1)
     m = _FABRICATED_CONTINUATION_RE.search(t)
-    if m:
+    if m and not t[: m.start()].strip():
+        # the answer starts with a prompt label: drop the label, keep the text
+        t = t[m.end():]
+        m = _FABRICATED_CONTINUATION_RE.search(t)
+    if m and t[: m.start()].strip():
         t = t[: m.start()]
-    return t.strip()
+    t = t.strip()
+    if not t and raw.strip():
+        return raw.strip()
+    return t
 
 
 @dataclass

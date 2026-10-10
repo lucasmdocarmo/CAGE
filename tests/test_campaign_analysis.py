@@ -68,7 +68,12 @@ RUN_ID = "20260802-1400-a-qwen3-14b"
 CAMPAIGN = "camp1"
 SESSION = "a"
 MODEL = "qwen3-14b"
-DATASETS = ["squad_v2", "hotpotqa"]
+#: C1 (2026-10-10): the fixture carries the registered pressure dataset
+#: (qasper) beside a plain QA dataset, so the F2/F3 executors see the
+#: registered layout: pressure legs compute on qasper and are labeled skips
+#: on squad_v2 (every fixture cell is still written on BOTH datasets).
+DATASETS = ["squad_v2", "qasper"]
+PRESSURE = "qasper"
 CELL_BASELINES = ["B1", "B3", "B6"]  # B6 vs B3 = the default headline contrast #4
 WINDOWS_PER_DATASET = 2
 #: §9.5 pressure fixtures need >= equivalence.MIN_UNIQUE_WINDOWS (= 5, the
@@ -241,35 +246,46 @@ def _f2_pair_specs() -> list[CellSpec]:
     ]
 
 
-def _write_calibration_report(path: Path, *, passing: bool = True) -> Path:
-    """A §9.7 CalibrationReport JSON artifact (A/A + one injection)."""
-    ci = [0.01, 0.09] if passing else [0.10, 0.20]  # nominal α=0.05 in/out of CI
-    payload = {
+def _calibration_payload(passing: bool = True) -> dict[str, Any]:
+    """A self-consistent §9.7 CalibrationReport payload: 400 splits per leg
+    (the registered floor) and the exact binomial CIs the counts give. C7
+    (2026-10-10): the gate recomputes rates and CIs from the counts, so the
+    old hand-typed CIs ([0.01, 0.09] at 8/200) no longer pass."""
+    from src.analysis.stats.calibration import _rejection_ci
+
+    k_aa = 16 if passing else 48  # 0.04 covers nominal 0.05; 0.12 excludes it
+    aa_low, aa_high = _rejection_ci(k_aa, 400)
+    inj_low, inj_high = _rejection_ci(340, 400)
+    return {
         "seed": 7,
         "n_observations": 128,
         "aa": {
-            "n_splits": 200,
+            "n_splits": 400,
             "alpha": 0.05,
-            "n_rejections": 8,
-            "fp_rate": 0.04,
-            "ci_low": ci[0],
-            "ci_high": ci[1],
+            "n_rejections": k_aa,
+            "fp_rate": k_aa / 400,
+            "ci_low": aa_low,
+            "ci_high": aa_high,
         },
         "injections": [
             {
                 "effect_size": 5.0,
                 "kind": "shift",
-                "n_splits": 200,
+                "n_splits": 400,
                 "alpha": 0.05,
-                "n_rejections": 170,
+                "n_rejections": 340,
                 "power": 0.85,
-                "ci_low": 0.79,
-                "ci_high": 0.90,
+                "ci_low": inj_low,
+                "ci_high": inj_high,
                 "target_power": 0.8,
             }
         ],
     }
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _write_calibration_report(path: Path, *, passing: bool = True) -> Path:
+    """A §9.7 CalibrationReport JSON artifact (A/A + one injection)."""
+    path.write_text(json.dumps(_calibration_payload(passing), indent=2), encoding="utf-8")
     return path
 
 
@@ -539,6 +555,45 @@ def test_confirmatory_refuses_failing_calibration(
     assert not (organized_run / "analysis").exists()
 
 
+def test_calibration_floors_match_the_producer_defaults_c7() -> None:
+    import run_calibration as rcal
+
+    assert rca.CALIBRATION_MIN_AA_SPLITS == rcal.DEFAULT_AA_SPLITS
+    assert rca.CALIBRATION_MIN_INJECTION_SPLITS == rcal.DEFAULT_INJECTION_SPLITS
+
+
+@pytest.mark.parametrize(
+    "mutate,match",
+    [
+        # 200/400 with a CI of [0, 1] covers any alpha: the counts disagree.
+        (lambda d: d["aa"].update(n_rejections=200, fp_rate=0.5, ci_low=0.0, ci_high=1.0),
+         "do not match the counts"),
+        (lambda d: d["aa"].update(n_splits=1, n_rejections=0, fp_rate=0.0,
+                                  ci_low=0.0, ci_high=0.975), "below the registered floor"),
+        (lambda d: d["aa"].update(alpha=0.10), "registered alpha"),
+        (lambda d: d.update(injections=[]), "no effect injection"),
+        (lambda d: d["injections"][0].update(power=0.95), "do not match the counts"),
+    ],
+    ids=["ci-0-1", "one-split", "alpha-0.10", "no-injections", "power-lie"],
+)
+def test_calibration_gate_recomputes_from_the_counts_c7(
+    tmp_path: Path, mutate: Callable[[dict[str, Any]], None], match: str
+) -> None:
+    # C7 (2026-10-10): each of these passed the gate, which read the rates,
+    # CIs and alpha straight from the file.
+    payload = _calibration_payload()
+    mutate(payload)
+    path = tmp_path / "cal.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    report = rca.load_calibration_report(path)
+    with pytest.raises(rca.CalibrationGateError, match=match):
+        rca.check_calibration(report, path)
+    # the untouched payload passes
+    good = tmp_path / "good.json"
+    good.write_text(json.dumps(_calibration_payload()), encoding="utf-8")
+    assert rca.check_calibration(rca.load_calibration_report(good), good)["verdict"] == "PASS"
+
+
 def test_confirmatory_refuses_malformed_calibration(
     organized_run: Path,
     tmp_path: Path,
@@ -567,6 +622,80 @@ def test_confirmatory_refuses_tampered_ledger(
     err = capsys.readouterr().err
     assert "LEDGER PRECONDITION FAILED" in err
     assert not (organized_run / "analysis_lock.json").exists()
+
+
+def test_confirmatory_refuses_a_file_added_after_the_seal_c6(
+    organized_run: Path,
+    calibration_ok: Path,
+    confirmatory_env: dict[str, Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # C6 (2026-10-10): the confirmatory ledger check ran without the
+    # extra-file sweep; an unsealed per-window file passed and could join.
+    window = next(iter((organized_run / "cells").glob("*/window_*")))
+    (window / "predicate.jsonl").write_text(
+        '{"example_id": "x", "predicate": true}\n', encoding="utf-8"
+    )
+    rc = rca.main(_confirmatory_argv(organized_run, calibration_ok))
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "LEDGER PRECONDITION FAILED" in err and "EXTRA" in err
+    assert not (organized_run / "analysis_lock.json").exists()
+
+
+def test_a_failure_after_the_outputs_never_releases_the_lock_c4(
+    organized_run: Path,
+    calibration_ok: Path,
+    confirmatory_env: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # C4 (2026-10-10): a pass that runs after stats.json and summary.md exist
+    # raised, the placeholder was released, and a second look could run.
+    def boom(*a: Any, **k: Any) -> None:
+        raise rca.AnalysisError("simulated failure in a late pass")
+
+    original = rca.run_conditioned_curves_pass
+    monkeypatch.setattr(rca, "run_conditioned_curves_pass", boom)
+    argv = _confirmatory_argv(organized_run, calibration_ok)
+    assert rca.main(argv) == 1
+    lock = json.loads((organized_run / "analysis_lock.json").read_text(encoding="utf-8"))
+    assert lock["phase"] == rca.LOCK_PHASE_COMMITTED
+    analysis_dir, stats = _load_stats(organized_run)
+    assert lock["analysis_dir"] == analysis_dir.name and stats["mode_stamp"] == "CONFIRMATORY"
+    capsys.readouterr()
+    monkeypatch.setattr(rca, "run_conditioned_curves_pass", original)
+    assert rca.main(argv) == 1
+    err = capsys.readouterr().err
+    assert "ONE-LOOK" in err and "did not finish" in err
+
+
+def test_a_failure_before_any_output_releases_the_committed_lock_c4_1(
+    organized_run: Path,
+    calibration_ok: Path,
+    confirmatory_env: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Fresh review 2026-10-10 (C4-1): the commit precedes the figure render;
+    # a renderer failure left the lock OUTPUTS_COMMITTED over an empty
+    # analysis dir with no unblinding, so the one look was spent on a crash.
+    def boom(*a: Any, **k: Any) -> None:
+        raise rca.AnalysisError("simulated renderer failure")
+
+    monkeypatch.setattr(rca, "render_figures", boom)
+    argv = _confirmatory_argv(organized_run, calibration_ok)
+    assert rca.main(argv) == 1
+    assert not (organized_run / "analysis_lock.json").exists()
+    for d in (organized_run / "analysis").iterdir():
+        assert not any(p.is_file() for p in d.rglob("*")), "no output was written"
+    monkeypatch.undo()  # the fixture's own patches are re-applied below
+    monkeypatch.setattr(
+        rca, "_git_head_state", lambda repo_dir=None: (REG_SHA, False)
+    )
+    monkeypatch.setattr(rca, "PREREG_PATH", confirmatory_env["prereg"])
+    monkeypatch.setattr(rca, "REGISTERED_MARGINS_PATH", confirmatory_env["margins"])
+    monkeypatch.setattr(rca, "ADR0086_REALIZED_N_LADDER", (N_EXAMPLES,))
+    assert rca.main(argv) == 0  # the look was never spent
 
 
 def test_confirmatory_runs_once_then_locks(
@@ -615,6 +744,41 @@ def test_confirmatory_runs_once_then_locks(
 # ---------------------------------------------------------------------------
 # §9.3 gatekeeping: registered Holm-within-family for secondaries
 # ---------------------------------------------------------------------------
+
+
+def test_truth_tax_registered_set_is_the_pressure_dataset_alone_c1(
+    organized_run: Path,
+) -> None:
+    # C1 (2026-10-10): the registered set of #14 (and #13) is ONE leg, on the
+    # pressure dataset; with every leg small the set passes. Before, the set
+    # expected a leg per run dataset and failed by construction (G5).
+    index = rca.load_index(organized_run)
+    ctx = rca.build_family_context(index, ["ttft_ms"], 0.05)
+    assert ctx is not None
+    assert ctx.registered_set_legs(14) == (f"{PRESSURE}|truth_tax",)
+    assert ctx.registered_set_legs(13) == (f"{PRESSURE}|fingerprint",)
+    assert ctx.contrast_datasets(14) == frozenset({PRESSURE})
+    assert ctx.contrast_datasets(4) == frozenset(DATASETS)
+    headline = [
+        {
+            "tier": "primary", "contrast_id": 4, "name": "RAG vs CAG (headline)",
+            "metric": "ttft_ms",
+            "cell_row_key": CellSpec.from_baseline("B6", model=MODEL).to_row_key(),  # type: ignore[arg-type]
+            "per_dataset": [{"dataset": ds, "p_value": 0.001, "median_delta": 1.0} for ds in DATASETS],
+        }
+    ]
+    gate = rca.run_gatekeeping(
+        headline, ctx,
+        extra_primaries=[
+            rca.PrimaryOutcome("contrast-14", f"{PRESSURE}|truth_tax", 0.001),
+            rca.PrimaryOutcome("contrast-13", f"{PRESSURE}|fingerprint", 0.001),
+        ],
+    )
+    decisions = {d["endpoint"]: d for d in gate["set_decisions"]}
+    for endpoint in ("contrast-4", "contrast-14", "contrast-13"):
+        assert decisions[endpoint]["missing_legs"] == []
+        assert decisions[endpoint]["confirmed"] is True, endpoint
+    assert gate["chain_complete"] is True
 
 
 def test_gatekeeping_gates_secondaries_with_holm_within_family(
@@ -916,6 +1080,120 @@ def test_figure_file_names_are_unique_in_stats(organized_run: Path) -> None:
     assert len(files) == len(set(files))
 
 
+def test_two_engine_headline_merges_engine_members_s0f66(tmp_path: Path) -> None:
+    # S0F-66 (A7): the 2026-10-08 landing's driver refused a two-engine tree
+    # with "duplicate primary outcome for endpoint='contrast-4'". One pair per
+    # engine now merges into ONE registered leg per (dataset, metric).
+    extra = [
+        CellSpec.from_baseline("B3", model=MODEL, engine="sglang"),  # type: ignore[arg-type]
+        CellSpec.from_baseline("B6", model=MODEL, engine="sglang"),  # type: ignore[arg-type]
+    ]
+    run_dir = _build_run_tree(tmp_path, extra_specs=extra)
+    org.organize_run(run_dir)
+    assert rca.main([str(run_dir), "--contrasts", "4"]) == 0
+    _, stats = _load_stats(run_dir)
+    entries = [e for e in stats["contrasts"] if e["contrast_id"] == 4]
+    assert {e["cell_row_key"].split("|")[4] for e in entries} == {"vllm", "sglang"}
+    gate = stats["gatekeeping"]
+    legs = [p for p in gate["primaries"] if p["endpoint"] == "contrast-4"]
+    assert sorted(p["dataset_metric"] for p in legs) == sorted(
+        f"{ds}|ttft_ms" for ds in DATASETS
+    )
+    for leg in legs:
+        dataset = leg["dataset_metric"].split("|")[0]
+        member_p = [
+            row["p_value"]
+            for e in entries
+            for row in e["per_dataset"]
+            if row["dataset"] == dataset
+        ]
+        assert len(member_p) == 2
+        assert leg["p_value"] == max(member_p)
+        assert [m["member"] for m in leg["members"]] == [
+            "sglang/single", "vllm/single",
+        ]
+        assert leg["missing_members"] == []
+        assert leg["directions_concordant"] is True
+        # The trace never carries a row key (the arm under blinding).
+        assert "B6" not in json.dumps(leg) and "retr-fresh" not in json.dumps(leg)
+
+
+def _primary_entry(engine: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "tier": "primary",
+        "contrast_id": 4,
+        "name": "B6 vs B3",
+        "metric": "ttft_ms",
+        "cell_row_key": CellSpec.from_baseline(
+            "B6", model=MODEL, engine=engine  # type: ignore[arg-type]
+        ).to_row_key(),
+        "per_dataset": rows,
+    }
+
+
+def test_member_expectation_is_per_dataset_not_per_endpoint_a7_1() -> None:
+    # Fresh review 2026-10-10 (CRITICAL): the registered grids run the hf
+    # oracle's B6 on two of the four QA datasets, so an endpoint-wide member
+    # expectation padded the other datasets' legs to p=1.0 and failed the
+    # headline by construction. A member is expected only on the datasets it
+    # supplied, and padded only on a metric leg it misses there.
+    stats = [
+        _primary_entry("vllm", [
+            {"dataset": "squad_v2", "p_value": 0.001, "median_delta": 5.0},
+            {"dataset": "hotpotqa", "p_value": 0.002, "median_delta": 4.0},
+        ]),
+        _primary_entry("hf", [
+            {"dataset": "squad_v2", "p_value": 0.003, "median_delta": 2.0},
+        ]),
+    ]
+    gate = rca.run_gatekeeping(stats, None)
+    by_leg = {p["dataset_metric"]: p for p in gate["primaries"]}
+    assert by_leg["hotpotqa|ttft_ms"]["missing_members"] == []
+    assert by_leg["hotpotqa|ttft_ms"]["p_value"] == 0.002
+    assert by_leg["squad_v2|ttft_ms"]["p_value"] == 0.003
+    assert all(p["passed"] for p in gate["primaries"])
+    # A member that supplied one metric of a dataset but not the other is
+    # padded on the leg it misses.
+    predicate_only_vllm = dict(_primary_entry("vllm", [
+        {"dataset": "squad_v2", "p_value": 0.004, "median_delta": 1.0},
+    ]), metric="predicate")
+    gate2 = rca.run_gatekeeping(stats + [predicate_only_vllm], None)
+    by_leg2 = {p["dataset_metric"]: p for p in gate2["primaries"]}
+    assert by_leg2["squad_v2|predicate"]["missing_members"] == ["hf/single"]
+    assert by_leg2["squad_v2|predicate"]["p_value"] == 1.0
+
+
+def test_merged_leg_rule_max_p_padding_and_discordance_s0f66() -> None:
+    stats = [
+        _primary_entry("vllm", [
+            {"dataset": "squad_v2", "p_value": 0.001, "median_delta": 5.0},
+            {"dataset": "hotpotqa", "p_value": 0.002, "median_delta": 4.0},
+        ]),
+        _primary_entry("sglang", [
+            {"dataset": "squad_v2", "p_value": 0.2, "median_delta": -3.0},
+        ]),
+    ]
+    gate = rca.run_gatekeeping(stats, None)
+    by_leg = {p["dataset_metric"]: p for p in gate["primaries"]}
+    squad = by_leg["squad_v2|ttft_ms"]
+    assert squad["p_value"] == 0.2 and squad["passed"] is False
+    assert squad["directions_concordant"] is False
+    hotpot = by_leg["hotpotqa|ttft_ms"]
+    # SGLang never ran hotpotqa: it is not expected there (fresh review
+    # 2026-10-10, CRITICAL: the endpoint-wide expectation this test first
+    # pinned padded the leg to p=1.0 and failed the headline by construction).
+    assert hotpot["missing_members"] == []
+    assert hotpot["p_value"] == 0.002 and hotpot["passed"] is True
+    # One engine alone reduces to the old per-pair outcome exactly.
+    solo = rca.run_gatekeeping(stats[:1], None)
+    assert {p["dataset_metric"]: p["p_value"] for p in solo["primaries"]} == {
+        "squad_v2|ttft_ms": 0.001, "hotpotqa|ttft_ms": 0.002,
+    }
+    # Two pairs of one member on one leg cannot be told apart: refused.
+    with pytest.raises(rca.AnalysisError, match="supplied twice"):
+        rca.run_gatekeeping([stats[0], stats[0]], None)
+
+
 def test_figures_agree_with_stats_bit_for_bit(organized_run: Path) -> None:
     # #131 item 6 (audit I1): every statistic a published figure consumed must
     # equal the stats.json value BIT-FOR-BIT. render_figures feeds the
@@ -1041,7 +1319,7 @@ def test_equivalence_tost_computed_with_margin_and_mask(tmp_path: Path) -> None:
 
     w = TOST_WINDOWS_PER_DATASET
     results = equiv["results"]
-    assert {r["dataset"] for r in results} == set(DATASETS)
+    assert {r["dataset"] for r in results} == {PRESSURE}  # C1: registered only
     for r in results:
         assert r["policy"] == "recompute"
         assert r["metric"] == "grounding_score"
@@ -1062,8 +1340,11 @@ def test_equivalence_tost_computed_with_margin_and_mask(tmp_path: Path) -> None:
         assert rope["p_rope"] >= 0.95
         assert rope["resampling"] == "window-block"
 
-    # offload has no cells; distribute is a topology-slot leg: labeled skips.
-    assert {s["policy"] for s in equiv["skipped"]} == {"offload", "distribute"}
+    # offload has no cells; distribute is a topology-slot leg: labeled skips;
+    # recompute's squad_v2 leg is not a registered pressure dataset (C1).
+    assert {s["policy"] for s in equiv["skipped"]} == {"recompute", "offload", "distribute"}
+    (c1_skip,) = [s for s in equiv["skipped"] if s["policy"] == "recompute"]
+    assert c1_skip["reason"].startswith("squad_v2: not a registered dataset")
 
 
 def test_equivalence_window_floor_refuses_below_five_windows(
@@ -1131,7 +1412,7 @@ def test_equivalence_excludes_missing_policy_event_rows(tmp_path: Path) -> None:
     _, stats = _load_stats(run_dir)
     w = TOST_WINDOWS_PER_DATASET
     results = stats["equivalence"]["results"]
-    assert {r["dataset"] for r in results} == set(DATASETS)
+    assert {r["dataset"] for r in results} == {PRESSURE}
     for r in results:
         # 8 examples x w windows excluded AND counted — never mask=False.
         assert r["n_policy_event_missing"] == n_missing_examples * w
@@ -1162,8 +1443,9 @@ def test_equivalence_skipped_without_event_mask(tmp_path: Path) -> None:
     equiv = stats["equivalence"]
     assert equiv["results"] == []
     recompute_skips = [s for s in equiv["skipped"] if s["policy"] == "recompute"]
-    assert len(recompute_skips) == 1
-    assert "policy_event" in recompute_skips[0]["reason"]
+    # one skip for the unregistered squad_v2 leg (C1), one for the missing mask
+    assert len(recompute_skips) == 2
+    assert any("policy_event" in s["reason"] for s in recompute_skips)
 
 
 # ---------------------------------------------------------------------------
@@ -1200,6 +1482,43 @@ def test_blinded_design_input_masks_labels_and_suppresses_figures(
         (organized_run / "blinding" / "sealed_arm_map.json").read_text(encoding="utf-8")
     )
     assert sealed["unblinded_utc"] is None
+
+
+def test_blinded_output_identifies_no_contrast_c8(organized_run: Path) -> None:
+    # C8 (2026-10-10): the public registry maps each contrast id to its
+    # baseline pair, so a visible id, name, tier or chain order turned a
+    # BLINDED arm code back into a known arm.
+    _seal_arm_map(organized_run)
+    assert rca.main([str(organized_run), "--contrasts", "4", "3", "--metrics", "ttft_ms"]) == 0
+    _, stats = _load_stats(organized_run)
+    assert stats["blinding"]["active"] is True
+    text = json.dumps(stats)
+    for forbidden in ("RAG vs CAG", "Retrieval's price", '"contrast_id": 4', '"contrast_id": 3',
+                      "contrast-4", "contrast-3", "retr-fresh", "gold-fresh", "B6", "B3"):
+        assert forbidden not in text, forbidden
+    codes = {e["contrast_id"] for e in stats["contrasts"]}
+    assert len(codes) == 2 and all(c.startswith("CONTRAST-") for c in codes)
+    for entry in stats["contrasts"]:
+        assert entry["name"] == entry["tier"] == entry["upstream"] == "BLINDED"
+    assert stats["requested_contrast_ids"] == "BLINDED"
+    assert "skipped" in stats["gatekeeping"]
+    # A fingerprint skip such as "no B11-vs-B6 pressure pair" names arms.
+    probe_fp = {"contrasts": [], "skipped": {"contrasts": []},
+                "fingerprint": {"skipped": [{"leg": "truncate", "reason": "no B11-vs-B6 pressure pair"}]}}
+    rca.apply_contrast_blinding(probe_fp, {"a": "ARM-01"})
+    assert probe_fp["fingerprint"]["skipped"] == [{"leg": "BLINDED", "reason": "BLINDED"}]
+    probe_iu = {"contrasts": [], "skipped": {"contrasts": []},
+                "fingerprint": {"per_dataset_intersection": [
+                    {"dataset": "qasper", "missing_legs": ["truncate"], "note": "incomplete fingerprint"}]}}
+    rca.apply_contrast_blinding(probe_iu, {"a": "ARM-01"})
+    (iu,) = probe_iu["fingerprint"]["per_dataset_intersection"]
+    assert iu["missing_legs"] == ["BLINDED"] and iu["note"] == "BLINDED"
+    # The codes are keyed by the sealed mapping: another seal gives other codes.
+    other = {"a": "ARM-09"}
+    probe = {"contrasts": [{"contrast_id": 4, "metric": "ttft_ms", "per_dataset": []}],
+             "skipped": {"contrasts": []}}
+    rca.apply_contrast_blinding(probe, other)
+    assert probe["contrasts"][0]["contrast_id"] not in codes
 
 
 def test_confirmatory_records_one_time_unblinding(
@@ -1350,7 +1669,7 @@ def test_equivalence_tost_pairs_with_unset_coords(tmp_path: Path) -> None:
     assert rc == 0
     _, stats = _load_stats(run_dir)
     results = stats["equivalence"]["results"]
-    assert {r["dataset"] for r in results} == set(DATASETS)
+    assert {r["dataset"] for r in results} == {PRESSURE}
     for r in results:
         assert r["policy"] == "recompute"
         assert r["equivalent"] is True
@@ -1538,6 +1857,36 @@ def test_confirmatory_tost_margin_bound_to_registered_artifact(
     _assert_nothing_written(organized_run)
 
 
+def test_registered_tost_metric_resolves_its_margin_c5(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # C5 (2026-10-10): the family map keyed "faithfulness_score", a column
+    # nothing produces; the registered TOST runs on "faithfulness".
+    margins = tmp_path / "registered_margins.json"
+    margins.write_text(json.dumps({"quality_continuous": 0.05}), encoding="utf-8")
+    monkeypatch.setattr(rca, "REGISTERED_MARGINS_PATH", margins)
+    margin, record = rca.resolve_registered_margin(None, "faithfulness")
+    assert margin == 0.05 and record["margin_key"] == "quality_continuous"
+
+
+def test_confirmatory_refuses_an_instrument_without_a_margin_c5(
+    organized_run: Path,
+    calibration_ok: Path,
+    confirmatory_env: dict[str, Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The fixture's margins carry grounding_score only: "faithfulness" maps to
+    # quality_continuous, which is absent, so the look refuses before the lock.
+    rc = rca.main(
+        _confirmatory_argv(
+            organized_run, calibration_ok, "--equivalence-metric", "faithfulness"
+        )
+    )
+    assert rc == 1
+    assert "resolves no registered" in capsys.readouterr().err
+    _assert_nothing_written(organized_run)
+
+
 def test_confirmatory_registered_set_fails_on_missing_predicate_leg(
     organized_run: Path,
     calibration_ok: Path,
@@ -1560,9 +1909,17 @@ def test_confirmatory_registered_set_fails_on_missing_predicate_leg(
         d for d in gate["set_decisions"] if d["endpoint"] == "contrast-4"
     )
     assert decision["passed"] is False
+    # C1: the look compiles over the FULL registered roster, so the two
+    # datasets this run never served (hotpotqa, musique) are missing legs on
+    # BOTH metrics, beside the unbuilt predicate legs of the served datasets.
+    absent = sorted(rca.KNOWN_DATASETS - set(DATASETS))
+    assert absent == ["hotpotqa", "musique"]
     assert decision["missing_legs"] == sorted(
-        f"{ds}|predicate" for ds in DATASETS
+        [f"{ds}|predicate" for ds in rca.KNOWN_DATASETS]
+        + [f"{ds}|ttft_ms" for ds in absent]
     )
+    assert stats["family_map"]["datasets"] == sorted(rca.KNOWN_DATASETS)
+    assert stats["family_map"]["run_datasets"] == sorted(DATASETS)
     assert any(
         "build_predicate_table.py" in r for r in decision["missing_leg_reasons"]
     )
@@ -1682,10 +2039,14 @@ def test_window_secondary_gates_on_registered_upstream_not_headline(
     assert entry15["family_id"].endswith("|F2|window")
     gate = stats["gatekeeping"]
     ungated_15 = [u for u in gate["ungated"] if u["contrast_id"] == 15]
-    assert ungated_15, "the #15 rows must be listed, never dropped"
+    assert {u["dataset"] for u in ungated_15} == set(DATASETS), "listed, never dropped"
     for u in ungated_15:
-        assert u["upstream"] == "contrast-14"
-        assert "contrast-14" in u["reason"]
+        if u["dataset"] == PRESSURE:
+            assert u["upstream"] == "contrast-14"
+            assert "contrast-14" in u["reason"]
+        else:
+            # C1: F2 is registered on the pressure dataset only
+            assert "not a §9.3 family-map row" in u["reason"]
     assert not any(s["contrast"].startswith("#15") for s in gate["secondaries"])
 
 
@@ -1766,9 +2127,10 @@ def test_fingerprint_incomplete_legs_yield_iu_p_one(tmp_path: Path) -> None:
     fp_primaries = [
         p for p in gate["primaries"] if p["endpoint"] == "contrast-13"
     ]
-    assert {p["dataset_metric"] for p in fp_primaries} == {
-        f"{ds}|fingerprint" for ds in DATASETS
-    }
+    assert {p["dataset_metric"] for p in fp_primaries} == {f"{PRESSURE}|fingerprint"}
+    # C1: the squad_v2 pressure cells are labeled skips, never chain legs.
+    assert {s["leg"] for s in fp["skipped"]} == {"evict", "compress", "truncate"}
+    assert any(s["reason"].startswith("squad_v2: not a registered dataset") for s in fp["skipped"])
     for p in fp_primaries:
         assert p["p_value"] == 1.0
         assert p["passed"] is False
@@ -1799,13 +2161,28 @@ def test_fingerprint_complete_legs_holm_and_iu_pass(tmp_path: Path) -> None:
         assert iu["p_intersection_union"] < 0.05
     gate = stats["gatekeeping"]
     assert gate["primary_chain_order_executed"] == ["contrast-4", "contrast-13"]
+    # C2/C3 (2026-10-10): the registered order is 4 -> 14 -> 13 and this run
+    # computes no #14, so the chain closes there. This test pinned #13 as a
+    # confirmatory pass behind the missing gate (the review's H1/H2 defect);
+    # the complete fingerprint is still visible in the raw set rule.
     for p in gate["primaries"]:
         if p["endpoint"] == "contrast-13":
-            assert p["passed"] is True
+            assert p["status"] == "descriptive" and p["passed"] is False
     decision_13 = next(
         d for d in gate["set_decisions"] if d["endpoint"] == "contrast-13"
     )
     assert decision_13["passed"] is True
+    assert decision_13["status"] == "descriptive"
+    assert decision_13["confirmed"] is False
+    closure = next(
+        e for e in gate["events"] if e["family_id"] == "primary-chain:contrast-13"
+    )
+    assert closure["upstream"] == "contrast-14" and closure["opened"] is False
+    summary = (sorted((run_dir / "analysis").iterdir())[-1] / "summary.md").read_text(
+        encoding="utf-8"
+    )
+    assert "co-primary set `contrast-13`: **DESCRIPTIVE" in summary
+    assert "co-primary set `contrast-13`: **PASSED" not in summary
 
 
 # ---------------------------------------------------------------------------
@@ -2104,3 +2481,21 @@ def test_run_phase2_stats_sh_still_parses() -> None:
         check=False,
     )
     assert proc.returncode == 0, f"bash -n failed:\n{proc.stderr}"
+
+
+def test_predicate_tree_refuses_a_file_added_after_its_build_c6(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    pred_dir = run_dir / "predicate" / "s1"
+    rows = pred_dir / "cells" / "cellA" / "window_squad_v2-01" / "predicate.jsonl"
+    rows.parent.mkdir(parents=True)
+    rows.write_text('{"example_id": "e0", "predicate": true}\n', encoding="utf-8")
+    manifest = pred_dir / rca.PREDICATE_MANIFEST_NAME
+    manifest.write_text(json.dumps({
+        "schema_version": 1, "scoring_run_id": "s1",
+        "raw_run_ledger_entries_sha256": "0" * 64, "config": {}, "counts": {},
+    }), encoding="utf-8")
+    write_ledger(hash_artifacts([rows, manifest], base_dir=pred_dir), pred_dir / "ledger.json")
+    assert rca._verify_predicate_tree(run_dir, pred_dir)["scoring_run_id"] == "s1"
+    (rows.parent / "stray.jsonl").write_text("{}\n", encoding="utf-8")
+    with pytest.raises(rca.AnalysisError, match="EXTRA"):
+        rca._verify_predicate_tree(run_dir, pred_dir)

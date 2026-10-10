@@ -89,8 +89,12 @@ def test_cached_corpus_path_matches_the_plain_full_prompt_path(oracle: HFOracleA
     # serves the same greedy continuation as the plain path
     assert cached.generated_text == plain.generated_text
     assert cached.num_tokens == plain.num_tokens
-    assert cached.prompt_tokens == len(_ids(oracle, SUFFIX)) == 3
+    # ADR-0162 amendment (review 2026-10-10, F-05): prompt_tokens is the WHOLE
+    # prompt (cached corpus + suffix), the serving engines' quantity, so the
+    # cached ratio stays in [0, 1]; the suffix-only pin (3) read above 1.
+    assert cached.prompt_tokens == base_len + len(_ids(oracle, SUFFIX)) == 8
     assert cached.cached_prompt_tokens == base_len
+    assert cached.cached_prompt_tokens <= cached.prompt_tokens
     assert cached.corpus_prefill_ms == pytest.approx(prefill_ms)
     # cropped back to the corpus length after the query (the Chan et al. recipe)
     assert oracle._corpus_cache.get_seq_length() == base_len
@@ -100,6 +104,29 @@ def test_cached_corpus_path_matches_the_plain_full_prompt_path(oracle: HFOracleA
     )
     assert again.generated_text == plain.generated_text
     assert oracle._corpus_cache.get_seq_length() == base_len
+
+
+def test_a_prompt_whose_ids_do_not_extend_the_cached_ids_is_refused(oracle: HFOracleAdapter) -> None:
+    """Review 2026-10-10 (F-01): the full prompt's leading ids must equal the
+    preloaded corpus ids. The word-level tokenizer maps 'eagleX' to [UNK], so
+    a prompt that extends the prefix TEXT by characters, not by whole words,
+    tokenizes to different leading ids: a protocol violation, never an error
+    row, and the cache is still cropped back."""
+    from src.inference.hf_oracle_adapter import CorpusPrefixMismatchError
+
+    oracle.preload_corpus_prefix(PREFIX)
+    base_len = oracle._corpus_base_len
+    with pytest.raises(CorpusPrefixMismatchError):
+        oracle.generate(
+            InferenceRequest(prompt=PREFIX + "X frost grape", temperature=0.0, max_tokens=4, request_id="bad")
+        )
+    assert oracle._corpus_cache.get_seq_length() == base_len
+    # a prompt equal to the prefix alone has no suffix to serve
+    with pytest.raises(CorpusPrefixMismatchError):
+        oracle.generate(InferenceRequest(prompt=PREFIX, temperature=0.0, max_tokens=4, request_id="empty"))
+    # the cache still serves a well-formed request afterwards
+    ok = oracle.generate(InferenceRequest(prompt=PREFIX + SUFFIX, temperature=0.0, max_tokens=4, request_id="ok"))
+    assert ok.error is None
 
 
 def test_stop_list_ends_generation_and_cuts_the_text(oracle: HFOracleAdapter) -> None:

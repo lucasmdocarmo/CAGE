@@ -183,6 +183,7 @@ from src.analysis.stats.calibration import (  # noqa: E402
     AAResult,
     CalibrationReport,
     InjectionResult,
+    _rejection_ci,
 )
 from src.analysis.stats.corrections import benjamini_hochberg, holm  # noqa: E402
 from src.analysis.stats.equivalence import (  # noqa: E402
@@ -436,7 +437,11 @@ METRIC_MARGIN_FAMILY: dict[str, str] = {
     "latency_ms": "serving_continuous",
     "ttft_from_scheduled_ms": "serving_continuous",
     "grounding_score": "quality_continuous",
-    "faithfulness_score": "quality_continuous",
+    # C5 (2026-10-10): the registered TOST runs on the produced column
+    # ``faithfulness`` (run_power_sim.py TOST_METRIC); the old key
+    # ``faithfulness_score`` named a column nothing writes, so the registered
+    # equivalence legs never resolved a margin.
+    "faithfulness": "quality_continuous",
 }
 #: W16 (charter section 6.3, ADR-0016 and ADR-0060; applied 2026-10-09 on the
 #: owner's "fix the remaining issues"): on an OPEN-LOOP row the section 6.1
@@ -1161,8 +1166,14 @@ def _verify_predicate_tree(run_dir: Path, pred_dir: Path) -> dict[str, Any]:
             f"{own_ledger} missing — a predicate table is sealed at build "
             "time (build_predicate_table.py); an unsealed table proves nothing"
         )
+    # C6 (2026-10-10): sweep the sealed rows' mirror for files added after
+    # the build (EXTRA), as organize_results/verify_results do on cells/.
+    pred_cells = pred_dir / "cells"
     try:
-        mismatches = verify_ledger(own_ledger, pred_dir)
+        mismatches = verify_ledger(
+            own_ledger, pred_dir,
+            extra_roots=(pred_cells,) if pred_cells.is_dir() else None,
+        )
     except LedgerError as exc:
         raise AnalysisError(f"{own_ledger}: {exc}") from exc
     if mismatches:
@@ -2088,11 +2099,62 @@ def load_calibration_report(path: Path) -> CalibrationReport:
     return report
 
 
+#: C7 (2026-10-10): the minimum splits per calibration leg, the registered
+#: producer's defaults (scripts/4_analysis/run_calibration.py
+#: DEFAULT_AA_SPLITS / DEFAULT_INJECTION_SPLITS: the P0 dry run's 200,
+#: doubled). tests/test_campaign_analysis.py pins them equal.
+CALIBRATION_MIN_AA_SPLITS: int = 400
+CALIBRATION_MIN_INJECTION_SPLITS: int = 400
+_CALIBRATION_RECOMPUTE_TOL: float = 1e-9
+
+
+def _check_calibration_counts(
+    leg: str, n_splits: int, n_rejections: int, rate: float,
+    ci_low: float, ci_high: float, alpha: float, min_splits: int, source: Path,
+) -> None:
+    """Recompute one leg's rate and exact CI from its counts (C7): the gate
+    read ``fp_rate``/``power``/``ci_*``/``alpha`` straight from the file, so
+    50 rejections in 100 splits with a CI of [0, 1] passed."""
+    if n_splits < min_splits:
+        raise CalibrationGateError(
+            f"calibration {leg}: n_splits={n_splits} is below the registered "
+            f"floor {min_splits} (run_calibration.py defaults) in {source}"
+        )
+    if not 0 <= n_rejections <= n_splits:
+        raise CalibrationGateError(
+            f"calibration {leg}: n_rejections={n_rejections} outside "
+            f"[0, n_splits={n_splits}] in {source}"
+        )
+    if alpha != REGISTERED_ALPHA:
+        raise CalibrationGateError(
+            f"calibration {leg}: alpha={alpha!r} differs from the registered "
+            f"alpha {REGISTERED_ALPHA!r} in {source}; operating "
+            "characteristics at another alpha do not certify this look"
+        )
+    expected_low, expected_high = _rejection_ci(n_rejections, n_splits)
+    stated = (rate, ci_low, ci_high)
+    expected = (n_rejections / n_splits, expected_low, expected_high)
+    if any(abs(a - b) > _CALIBRATION_RECOMPUTE_TOL for a, b in zip(stated, expected)):
+        raise CalibrationGateError(
+            f"calibration {leg}: the stated rate and CI {stated} do not match "
+            f"the counts ({n_rejections}/{n_splits} gives {expected}, exact "
+            f"binomial 95%) in {source}; the gate recomputes, never trusts"
+        )
+
+
 def check_calibration(report: CalibrationReport, source: Path) -> dict[str, Any]:
     """§9.7 gate, mirroring ``prereg.assemble_preregistration``'s refusals.
 
+    C7 (2026-10-10): every rate, CI and alpha is recomputed or checked from
+    the counts first, the split floors hold, and the injection list may not
+    be empty (an empty list proved nothing).
     Returns the summary recorded into stats.json when the gate passes.
     """
+    aa = report.aa
+    _check_calibration_counts(
+        "A/A", aa.n_splits, aa.n_rejections, aa.fp_rate, aa.ci_low,
+        aa.ci_high, aa.alpha, CALIBRATION_MIN_AA_SPLITS, source,
+    )
     if not report.aa.approximates_nominal:
         raise CalibrationGateError(
             f"calibration A/A FAILED (FP rate CI [{report.aa.ci_low:.4f}, "
@@ -2100,6 +2162,21 @@ def check_calibration(report: CalibrationReport, source: Path) -> dict[str, Any]
             f"in {source} — the confirmatory look is BLOCKED until the "
             "machinery passes §9.7 (same rule prereg.py applies to "
             "registration)"
+        )
+    for i, inj in enumerate(report.injections):
+        _check_calibration_counts(
+            f"injection[{i}] (effect {inj.effect_size:g})", inj.n_splits,
+            inj.n_rejections, inj.power, inj.ci_low, inj.ci_high, inj.alpha,
+            CALIBRATION_MIN_INJECTION_SPLITS, source,
+        )
+    if not report.injections:
+        # A target power on every injection is S0F-73 (the producer does not
+        # stamp the section 9.6 simulated power yet; an owner item), so the
+        # gate requires the injections themselves, not their targets.
+        raise CalibrationGateError(
+            f"calibration report {source} carries no effect injection: "
+            "section 9.7 requires injected effects of known size to be "
+            "recovered, and no such test was run"
         )
     failed = [i for i in report.injections if i.meets_target is False]
     if failed:
@@ -2124,9 +2201,17 @@ def verify_run_ledger(run_dir: Path) -> dict[str, Any]:
     against its sealed content-hash ledger — analyzed data is provably the
     sealed data. Any mismatch (or a missing/tampered ledger) refuses."""
     ledger_path = run_dir / LEDGER_NAME
+    # C6 (2026-10-10): the confirmatory precondition skipped the extra-file
+    # sweep that organize_results/verify_results run on cells/, while
+    # load_per_query opens optional per-window files when they exist; a file
+    # added after the seal would pass the check and join the data.
+    cells_dir = run_dir / "cells"
     try:
         entries = read_ledger(ledger_path)
-        mismatches = verify_ledger(ledger_path, run_dir)
+        mismatches = verify_ledger(
+            ledger_path, run_dir,
+            extra_roots=(cells_dir,) if cells_dir.is_dir() else None,
+        )
     except LedgerError as exc:
         raise AnalysisError(
             f"LEDGER PRECONDITION FAILED (§9.10): {exc} — confirmatory "
@@ -2265,6 +2350,81 @@ def apply_blinding_to_sections(
         )
 
 
+#: C8 (2026-10-10): per-entry fields that fingerprint WHICH registered
+#: contrast an entry is. The public registry maps each contrast to its
+#: baseline pair (families.CONTRASTS), so a visible contrast id, name, tier
+#: or upstream turned "cell BLINDED:ARM-02" back into a known arm.
+_CONTRAST_IDENTIFYING_FIELDS: tuple[str, ...] = (
+    "name", "tier", "tier_source", "family", "family_id", "upstream",
+    "registered_sidedness", "executed_alternative", "correction",
+)
+_BLINDED = "BLINDED"
+
+
+def apply_contrast_blinding(
+    stats: dict[str, Any], mapping: Mapping[str, str]
+) -> None:
+    """§9.8 contrast-level masking (C8), in place, after the arm masking.
+
+    Each contrast id becomes an opaque code keyed by the sealed mapping
+    (as secret as the arm codes), the identifying fields are masked, entries
+    are sorted by code (the order revealed the request), and the sections
+    whose structure is registered (the serial chain order, the exploratory
+    tier, the skipped-contrast reasons, the requested id list) are
+    suppressed until the logged unblinding.
+    """
+    secret = json.dumps(dict(sorted(mapping.items())), sort_keys=True)
+
+    def code(contrast_id: Any) -> str:
+        digest = hashlib.sha256(f"{secret}|{contrast_id}".encode("utf-8")).hexdigest()
+        return f"CONTRAST-{digest[:8].upper()}"
+
+    for entry in stats.get("contrasts", ()):
+        entry["contrast_id"] = code(entry["contrast_id"])
+        for field_name in _CONTRAST_IDENTIFYING_FIELDS:
+            if field_name in entry:
+                entry[field_name] = _BLINDED
+        for row in entry.get("per_dataset", ()):
+            # None on primary rows only: the column itself revealed the tier.
+            if "p_holm_across_datasets" in row:
+                row["p_holm_across_datasets"] = _BLINDED
+    stats["contrasts"] = sorted(
+        stats.get("contrasts", ()), key=lambda e: (str(e["contrast_id"]), str(e["metric"]))
+    )
+    stats["requested_contrast_ids"] = _BLINDED
+    stats["gatekeeping"] = {
+        "skipped": (
+            "suppressed under section 9.8 blinding: the registered serial "
+            "chain order identifies each endpoint's contrast and so its arms; "
+            "computed, withheld until the logged unblinding"
+        )
+    }
+    stats["exploratory"] = {
+        "suppressed": "section 9.8 blinding (contrast-identifying)",
+        "n_computed": 0,
+    }
+    for leg in stats.get("fingerprint", {}).get("legs", ()):
+        # One leg name identifies the B11-vs-B6 arm pair (section 7.3).
+        leg["leg"] = _BLINDED
+        leg["predicted"] = _BLINDED
+    for skip_entry in stats.get("fingerprint", {}).get("skipped", ()):
+        # Review 2026-10-10: the leg name and a skip reason such as "no
+        # B11-vs-B6 pressure pair" name arms by baseline id.
+        skip_entry["leg"] = _BLINDED
+        skip_entry["reason"] = _BLINDED
+    for iu in stats.get("fingerprint", {}).get("per_dataset_intersection", ()):
+        # Fresh review 2026-10-10 (C8-1): the missing-leg names too.
+        iu["missing_legs"] = [_BLINDED] * len(iu.get("missing_legs", ()))
+        if "note" in iu:
+            iu["note"] = _BLINDED
+    skipped = stats.get("skipped", {})
+    skipped["contrasts"] = [
+        {"contrast_id": code(s["contrast_id"]), "name": _BLINDED,
+         "label": s.get("label"), "reason": _BLINDED}
+        for s in skipped.get("contrasts", ())
+    ]
+
+
 # ---------------------------------------------------------------------------
 # §9.3 family map + Dmitrienko serial gatekeeping
 # ---------------------------------------------------------------------------
@@ -2275,6 +2435,9 @@ class FamilyContext:
     """The compiled §9.3 registered test table, scoped to this run."""
 
     group: str
+    #: the datasets the table was compiled over: the run's charter datasets
+    #: in design-input, the full registered roster at the confirmatory look
+    #: (C1, 2026-10-10: an absent dataset is then a missing leg, G5).
     datasets: tuple[str, ...]
     table: pd.DataFrame
     #: membership set: (contrast_id, metric, dataset) rows for this run's group.
@@ -2290,6 +2453,13 @@ class FamilyContext:
         self, contrast_id: int, metric: str, dataset: str, family: str
     ) -> MapRow | None:
         return self.rows.get((contrast_id, metric, dataset, family))
+
+    def contrast_datasets(self, contrast_id: int) -> frozenset[str]:
+        """The datasets the table registers rows for under ``contrast_id``
+        (C1): the pressure families compile on ``families.PRESSURE_DATASET``
+        alone, so an executor must never compute a chain leg elsewhere."""
+        rows = self.table[self.table["contrast_id"] == contrast_id]
+        return frozenset(str(d) for d in rows["dataset"] if d != "cross-dataset")
 
     def registered_family_sizes(self) -> dict[str, int]:
         """family_id -> registered Holm m (the map's holm-corrected rows)."""
@@ -2334,12 +2504,17 @@ class FamilyContext:
 
 
 def build_family_context(
-    index: pd.DataFrame, metrics: Sequence[str], alpha: float
+    index: pd.DataFrame, metrics: Sequence[str], alpha: float,
+    *, confirmatory: bool = False,
 ) -> FamilyContext | None:
     """Compile ``families.compile_family_map`` for this run's group/datasets.
 
     Returns None (a labeled absence recorded in stats.json) when the run has
     no charter family-map dataset at all — confirmatory mode refuses on that.
+    C1 (2026-10-10): the confirmatory look compiles over the FULL registered
+    roster (``families.KNOWN_DATASETS``), so a run missing a registered
+    dataset fails the headline set on the absent legs instead of compiling a
+    smaller table that passes on what is present (the G5 shrink one level up).
     """
     model = str(index["model"].iloc[0])
     group = GROUP_OF_MODEL.get(model)
@@ -2348,9 +2523,10 @@ def build_family_context(
             f"model {model!r} has no §7.6.1 campaign group — cannot compile "
             f"the §9.3 family map (roster: {sorted(GROUP_OF_MODEL)})"
         )
-    datasets = tuple(sorted(set(index["dataset"].unique()) & KNOWN_DATASETS))
-    if not datasets:
+    run_datasets = tuple(sorted(set(index["dataset"].unique()) & KNOWN_DATASETS))
+    if not run_datasets:
         return None
+    datasets = tuple(sorted(KNOWN_DATASETS)) if confirmatory else run_datasets
     try:
         table = compile_family_map(datasets, metrics=tuple(metrics), alpha=alpha)
     except FamilyMapError as exc:
@@ -2465,22 +2641,71 @@ def run_gatekeeping(
         int(p.endpoint.rsplit("-", 1)[1]) for p in extra_primaries
     }
 
+    # S0F-66 (A7, 2026-10-10): several matched pairs can supply one registered
+    # leg, one per engine or per topology (select_contrast_pairs pairs within
+    # _PAIR_MATCH_AXES). The registered table keys a leg by (dataset, metric)
+    # and lists engines as family MEMBERS (families.py, audit section 2.2), so
+    # the members merge into ONE outcome with the intersection-union p (the
+    # max): the merged leg rejects only when every member rejects at alpha,
+    # which keeps its type-I error at or below alpha. A member that supplies
+    # one metric leg of a DATASET but not the other is padded at p=1.0 on the
+    # missing leg (absence is not evidence, G5). The expectation is per
+    # dataset, never per endpoint: the registered grids run the hf oracle's
+    # B6 on two of the four QA datasets (run_campaign.py SESSION_GRIDS
+    # hf_oracle_cells), so an endpoint-wide expectation padded the other two
+    # datasets' legs to p=1.0 and failed the headline by construction (fresh
+    # review 2026-10-10, CRITICAL). Before this, two engines raised the
+    # chain's duplicate-outcome refusal and stage 13 stopped the master.
+    leg_members: dict[tuple[str, str], dict[str, dict[str, Any]]] = {}
     for entry in contrast_stats:
         if entry["tier"] != "primary":
             continue
         cid = int(entry["contrast_id"])
         computed_primary_ids.add(cid)
+        # Engine and topology only: the row key itself reveals the arm and
+        # this trace is not masked under blinding (section 9.8).
+        axes = fp.parse_row_key(str(entry["cell_row_key"]))
+        member = f"{axes['engine']}/{axes['topology']}"
         for row in entry["per_dataset"]:
             if "p_value" not in row:
                 continue
-            key = f"{row['dataset']}|{entry['metric']}"
-            primaries.append(
-                PrimaryOutcome(
-                    endpoint=_primary_endpoint(cid),
-                    dataset=key,
-                    p_value=float(row["p_value"]),
+            leg = (_primary_endpoint(cid), f"{row['dataset']}|{entry['metric']}")
+            members = leg_members.setdefault(leg, {})
+            if member in members:
+                raise AnalysisError(
+                    f"primary leg {leg[1]!r} of {leg[0]!r} is supplied twice "
+                    f"by member {member!r}: ambiguous, refusing to guess"
                 )
-            )
+            delta = row.get("median_delta", row.get("mean_diff"))
+            members[member] = {
+                "member": member,
+                "p_value": float(row["p_value"]),
+                "delta": None if delta is None else float(delta),
+            }
+    expected_members: dict[tuple[str, str], set[str]] = {}
+    for (endpoint, key), members in leg_members.items():
+        dataset_of_leg = key.split("|", 1)[0]
+        expected_members.setdefault((endpoint, dataset_of_leg), set()).update(members)
+    leg_audit: dict[tuple[str, str], dict[str, Any]] = {}
+    for (endpoint, key), members in leg_members.items():
+        expected = expected_members[(endpoint, key.split("|", 1)[0])]
+        missing_members = sorted(expected - set(members))
+        p_merged = (
+            1.0 if missing_members
+            else max(m["p_value"] for m in members.values())
+        )
+        primaries.append(
+            PrimaryOutcome(endpoint=endpoint, dataset=key, p_value=p_merged)
+        )
+        signs = {
+            m["delta"] > 0 for m in members.values()
+            if m["delta"] is not None and m["delta"] != 0.0
+        }
+        leg_audit[(endpoint, key)] = {
+            "members": [members[k] for k in sorted(members)],
+            "missing_members": missing_members,
+            "directions_concordant": len(signs) <= 1,
+        }
 
     if not primaries:
         return {
@@ -2552,11 +2777,10 @@ def run_gatekeeping(
                 )
             )
 
-    registered_order = [
-        _primary_endpoint(cid)
-        for cid in PRIMARY_CHAIN_ORDER
-        if cid in computed_primary_ids
-    ]
+    # C2 (2026-10-10): the FULL registered order goes to the chain, which
+    # closes at the first endpoint with no outcome. Filtering it to the
+    # computed endpoints let a missing #14 drop out of 4 -> 14 -> 13.
+    registered_order = [_primary_endpoint(cid) for cid in PRIMARY_CHAIN_ORDER]
     missing_endpoints = [
         _primary_endpoint(cid)
         for cid in PRIMARY_CHAIN_ORDER
@@ -2582,7 +2806,7 @@ def run_gatekeeping(
             primaries,
             secondaries,
             alpha=alpha,
-            primary_order=registered_order,
+            registered_order=registered_order,
             intra_set_rule=intra_set_rule,  # type: ignore[arg-type]
             registered_sets=registered_sets,
             registered_family_sizes=registered_family_sizes,
@@ -2618,6 +2842,15 @@ def run_gatekeeping(
                 "alpha": p.alpha,
                 "passed": p.passed,
                 "status": p.status,
+                # S0F-66: the merged members of a contrast-derived leg (None
+                # on the executor primaries of #13 and #14).
+                "members": leg_audit.get((p.endpoint, p.dataset), {}).get("members"),
+                "missing_members": leg_audit.get((p.endpoint, p.dataset), {}).get(
+                    "missing_members"
+                ),
+                "directions_concordant": leg_audit.get(
+                    (p.endpoint, p.dataset), {}
+                ).get("directions_concordant"),
             }
             for p in trace.primaries
         ],
@@ -2640,6 +2873,10 @@ def run_gatekeeping(
                 "endpoint": d.endpoint,
                 "rule": d.rule,
                 "passed": d.passed,
+                # C3: the endpoint's verdict; "passed" is the raw set rule,
+                # computed even for an endpoint the serial chain closed.
+                "status": d.status,
+                "confirmed": d.confirmed,
                 "binding_p": d.binding_p,
                 "supplied_legs": list(d.supplied_legs),
                 "registered_legs": (
@@ -2859,8 +3096,20 @@ def compute_equivalence(
             cells, refs, _POLICY_PAIR_MATCH_AXES, f"equivalence leg {policy!r}"
         )
         found_pair = False
+        registered = family_ctx.contrast_datasets(FINGERPRINT_CONTRAST_ID)
         for cell_key, ref_key, datasets in matched:
-            datasets = sorted(set(datasets) & set(family_ctx.datasets))
+            charter = sorted(set(datasets) & set(family_ctx.datasets))
+            for dataset in charter:
+                if dataset not in registered:
+                    # C1: the table registers the pressure families on one
+                    # dataset; a leg elsewhere is not a registered test.
+                    skip(
+                        policy,
+                        f"{dataset}: not a registered dataset for contrast "
+                        f"#{FINGERPRINT_CONTRAST_ID} (the section 9.3 table "
+                        f"registers it on {sorted(registered)}; C1)",
+                    )
+            datasets = [d for d in charter if d in registered]
             if not datasets:
                 continue
             found_pair = True
@@ -3084,8 +3333,18 @@ def compute_fingerprint(
         if matched is None:
             continue
         found = False
+        registered = family_ctx.contrast_datasets(FINGERPRINT_CONTRAST_ID)
         for cell_key, ref_key, datasets in matched:
-            datasets = sorted(set(datasets) & set(family_ctx.datasets))
+            charter = sorted(set(datasets) & set(family_ctx.datasets))
+            for dataset in charter:
+                if dataset not in registered:
+                    skip(
+                        leg,
+                        f"{dataset}: not a registered dataset for contrast "
+                        f"#{FINGERPRINT_CONTRAST_ID} (the section 9.3 table "
+                        f"registers it on {sorted(registered)}; C1)",
+                    )
+            datasets = [d for d in charter if d in registered]
             if not datasets:
                 continue
             found = True
@@ -3714,7 +3973,12 @@ def compute_truth_tax(
     def skip(reason: str) -> None:
         section["skipped"].append({"reason": reason})
 
-    #: (dataset, leg-engine) -> p, guarded against duplicate supply.
+    #: dataset -> {leg key -> p}. C9 (2026-10-10): a leg is one engine in one
+    #: matched pressure group (_TRUTH_TAX_GROUP_AXES). Keyed by engine alone,
+    #: a second in-regime group of the same engine raised and stopped the run
+    #: (S1's F2 carries several arms and rungs per dataset). Every leg now
+    #: enters Holm within its dataset, then the intersection-union max, so
+    #: arms are never pooled into one engine bundle.
     leg_p: dict[str, dict[str, float]] = {}
     #: window dir -> full ladder metrics (None = excluded from population).
     tt_cache: dict[str, WindowMetrics | None] = {}
@@ -3749,6 +4013,15 @@ def compute_truth_tax(
             continue
         if family_ctx is not None and str(dataset) not in family_ctx.datasets:
             skip(f"dataset {dataset!r} is not a §9.3 family-map dataset")
+            continue
+        if family_ctx is not None and str(dataset) not in family_ctx.contrast_datasets(14):
+            # C1: F2 is registered on one dataset; a truth-tax leg elsewhere
+            # is not a registered test and never reaches the chain.
+            skip(
+                f"dataset {dataset!r} is not a registered dataset for contrast "
+                f"#14 (the section 9.3 table registers it on "
+                f"{sorted(family_ctx.contrast_datasets(14))}; C1)"
+            )
             continue
         for axes_key, grp in ds_grp.groupby(
             list(_TRUTH_TAX_GROUP_AXES), dropna=False
@@ -3786,17 +4059,20 @@ def compute_truth_tax(
                 result = batch_means_contrast(
                     cell_values, anchor_values, alternative="two-sided"
                 )
-                if engine in leg_p.get(str(dataset), {}):
+                leg_key = engine + "|" + "|".join(
+                    f"{k}={v}" for k, v in zip(_TRUTH_TAX_GROUP_AXES, axes_key)
+                )
+                if leg_key in leg_p.get(str(dataset), {}):
                     raise AnalysisError(
-                        f"contrast #14: engine leg {engine!r} × {dataset} is "
-                        "supplied by two matched pressure groups — "
-                        "ambiguous; refusing to guess"
+                        f"contrast #14: leg {leg_key!r} x {dataset} is supplied "
+                        "twice (driver invariant: one group per axes key)"
                     )
-                leg_p.setdefault(str(dataset), {})[engine] = result.p_value
+                leg_p.setdefault(str(dataset), {})[leg_key] = result.p_value
                 section["legs"].append(
                     {
                         "dataset": str(dataset),
                         "engine": engine,
+                        "leg_key": leg_key,
                         "anchor_engine": _TRUTH_TAX_ANCHOR_ENGINE,
                         "axes": {
                             k: str(v)
@@ -3824,14 +4100,15 @@ def compute_truth_tax(
         for leg_row in section["legs"]:
             if leg_row["dataset"] != dataset:
                 continue
-            leg_idx = list(supplied).index(leg_row["engine"])
+            leg_idx = list(supplied).index(leg_row["leg_key"])
             leg_row["p_holm_within_dataset"] = float(adjusted[leg_idx])
         section["per_dataset_intersection"].append(
             {
                 "dataset": dataset,
                 "p_intersection_union": p_iu,
                 "n_legs": len(supplied),
-                "engines": sorted(supplied),
+                "engines": sorted({key.split("|", 1)[0] for key in supplied}),
+                "legs": sorted(supplied),
             }
         )
         primaries.append(
@@ -4010,6 +4287,8 @@ def _fmt_effect(row: Mapping[str, Any]) -> str:
 def _fmt_p_holm(row: Mapping[str, Any]) -> str:
     """``None`` for primary-tier rows (§9.1: no cross-dataset correction)."""
     p_holm = row.get("p_holm_across_datasets")
+    if isinstance(p_holm, str):
+        return p_holm  # C8: the blinded placeholder (the None text named the tier)
     return f"{p_holm:.3g}" if p_holm is not None else "n/a (primary tier, full α)"
 
 
@@ -4108,7 +4387,13 @@ def build_summary_md(stats: Mapping[str, Any]) -> str:
             f"- intra-set rule: `{gate['intra_set_rule']}` at α={gate['alpha']:g}"
         )
         for decision in gate.get("set_decisions", ()):
-            verdict = "PASSED" if decision["passed"] else "FAILED"
+            # C3: PASSED only for a set the serial chain tested.
+            if decision["confirmed"]:
+                verdict = "PASSED"
+            elif decision["passed"]:
+                verdict = "DESCRIPTIVE (serial chain closed upstream; not a confirmatory pass)"
+            else:
+                verdict = "FAILED"
             lines.append(
                 f"- co-primary set `{decision['endpoint']}`: **{verdict}** "
                 f"(binding p={decision['binding_p']:.3g})"
@@ -4225,7 +4510,7 @@ def build_summary_md(stats: Mapping[str, Any]) -> str:
             lines.append(
                 f"- **{iu['dataset']}: IU p = "
                 f"{iu['p_intersection_union']:.3g}** "
-                f"({iu['n_legs']} engine leg(s))"
+                f"({iu['n_legs']} leg(s), one per engine and pressure group)"
             )
         for skipped_leg in truth_tax.get("skipped", ()):
             lines.append(f"- SKIPPED — {skipped_leg['reason']}")
@@ -4360,6 +4645,13 @@ def _one_look_refusal_message(run_dir: Path, lock: dict[str, Any]) -> str:
             f"{lock.get('started_utc', '<unknown time>')} under registered "
             f"SHA {lock.get('registered_sha', '<unknown>')!r})"
         )
+    elif lock.get("phase") == LOCK_PHASE_COMMITTED:
+        detail = (
+            "a confirmatory look began writing its outputs at "
+            f"{lock.get('committed_utc', '<unknown time>')} under registered "
+            f"SHA {lock.get('registered_sha', '<unknown>')!r} and did not "
+            "finish; its outputs or its unblinding exist, so the look is spent"
+        )
     else:
         detail = (
             "this run's confirmatory analysis ran at "
@@ -4409,12 +4701,49 @@ def _acquire_confirmatory_lock(run_dir: Path, registered_sha: str) -> None:
         os.close(fd)
 
 
-def _release_placeholder_lock(run_dir: Path) -> None:
+#: C4 (2026-10-10): the lock phase between the computed pipeline and the
+#: finalized DONE lock. The placeholder was released on ANY failure, including
+#: one in the passes that run after stats.json, summary.md, the figures and
+#: the one-time unblinding exist, so a second confirmatory look could run.
+LOCK_PHASE_COMMITTED = "OUTPUTS_COMMITTED"
+
+
+def _commit_confirmatory_lock(
+    run_dir: Path, registered_sha: str, analysis_dir: Path
+) -> None:
+    """Move the IN_PROGRESS placeholder to ``LOCK_PHASE_COMMITTED`` (atomic
+    replace) right before the first irreversible step of the look: the
+    unblinding or the first output file. ``_release_placeholder_lock`` removes
+    only IN_PROGRESS, so from here a failure leaves the look spent."""
+    lock_path = run_dir / LOCK_NAME
+    current = read_lock(run_dir)
+    if current is None or current.get("phase") != "IN_PROGRESS":
+        raise OneLookError(
+            f"{lock_path} is not this look's IN_PROGRESS placeholder "
+            f"({current!r}); refusing to commit outputs (section 9.11)"
+        )
+    payload = {
+        **current,
+        "phase": LOCK_PHASE_COMMITTED,
+        "committed_utc": datetime.now(timezone.utc).isoformat(),
+        "analysis_dir": analysis_dir.name,
+    }
+    tmp_path = lock_path.with_name(f"{lock_path.name}.tmp-{os.getpid()}")
+    tmp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp_path, lock_path)
+
+
+def _release_placeholder_lock(
+    run_dir: Path, analysis_dir: Path | None = None
+) -> None:
     """Undo ``_acquire_confirmatory_lock`` after a failed pipeline attempt.
 
-    Only removes the lock if it is STILL the IN_PROGRESS placeholder — never
-    a lock some other state finalized — so this can't ever delete a genuine
-    completed-look record.
+    Removes the IN_PROGRESS placeholder. Fresh review 2026-10-10 (C4-1): an
+    ``OUTPUTS_COMMITTED`` lock is also removed when nothing irreversible
+    happened, which is checked on disk: ``analysis_dir`` holds no file and the
+    sealed arm map (when one exists) is not unblinded. A finalized DONE lock,
+    a committed lock with any output, or a committed lock after the
+    unblinding is never touched.
     """
     lock_path = run_dir / LOCK_NAME
     try:
@@ -4423,8 +4752,25 @@ def _release_placeholder_lock(run_dir: Path) -> None:
         # Corrupt JSON: read_lock's own fail-closed policy owns this state;
         # do not delete evidence we cannot parse.
         return
-    if current is not None and current.get("phase") == "IN_PROGRESS":
+    if current is None:
+        return
+    if current.get("phase") == "IN_PROGRESS":
         lock_path.unlink(missing_ok=True)
+        return
+    if current.get("phase") != LOCK_PHASE_COMMITTED or analysis_dir is None:
+        return
+    outputs = [p for p in Path(analysis_dir).rglob("*") if p.is_file()]
+    if outputs:
+        return
+    seal = sealed_map_path(run_dir)
+    if seal.is_file():
+        try:
+            sealed = json.loads(seal.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return  # cannot prove the seal is unspent: keep the lock
+        if sealed.get("unblinded_utc") is not None:
+            return
+    lock_path.unlink(missing_ok=True)
 
 
 def write_lock(
@@ -5278,6 +5624,13 @@ def run_pressure_alignment_pass(
                 "window": window,
                 "engine": str(rec.engine),
                 "dataset": str(rec.dataset),
+                # C10: engines meet only within one non-engine identity (the
+                # #14 match axes; budget_r is replaced by the rho_own bucket).
+                "match_key": "|".join(
+                    f"{axis}={getattr(rec, axis)}"
+                    for axis in _TRUTH_TAX_GROUP_AXES
+                    if axis != "budget_r"
+                ),
                 "rho_own": rho_own,
                 "rho_own_reason": rho_own_reason,
                 "metrics": metrics,
@@ -5708,6 +6061,7 @@ def run_analysis(
         },
     }
     lock_acquired_here = False
+    analysis_dir: Path | None = None
     if mode == "confirmatory":
         if not registered_sha:
             raise OneLookError("confirmatory mode requires a registered SHA")
@@ -5726,6 +6080,16 @@ def run_analysis(
             tost_margin, equivalence_metric
         )
         preconditions["registration"]["tost_margin"] = margin_record
+        if equivalence_metric is not None and tost_margin is None:
+            # C5: a named instrument with no registered margin would skip the
+            # registered equivalence legs and still spend the one look.
+            raise AnalysisError(
+                f"confirmatory --equivalence-metric {equivalence_metric!r} "
+                "resolves no registered section 9.5 margin "
+                f"({margin_record.get('artifact')}; key tried: "
+                f"{margin_record.get('margin_key')!r}); refusing before the "
+                "one-look lock rather than skipping the registered legs (G1d)"
+            )
         if calibration_report is None:
             raise CalibrationGateError(
                 "confirmatory mode requires --calibration-report: the §9.7 "
@@ -5819,7 +6183,9 @@ def run_analysis(
         ]
         window_contrasts = [c for c in computable if c.unit == "window"]
 
-        family_ctx = build_family_context(index, metrics, alpha)
+        family_ctx = build_family_context(
+            index, metrics, alpha, confirmatory=(mode == "confirmatory")
+        )
         if mode == "confirmatory" and family_ctx is None:
             raise AnalysisError(
                 "confirmatory refusal (§9.3): none of this run's datasets "
@@ -6109,6 +6475,11 @@ def run_analysis(
                 {
                     "group": family_ctx.group,
                     "datasets": list(family_ctx.datasets),
+                    # C1: the run's charter datasets; equals `datasets` in
+                    # design-input, a subset of the roster at the look.
+                    "run_datasets": sorted(
+                        set(index["dataset"].unique()) & KNOWN_DATASETS
+                    ),
                     "n_rows": int(len(family_ctx.table)),
                     "source": "families.compile_family_map (§9.3)",
                 }
@@ -6156,6 +6527,14 @@ def run_analysis(
         if blinding_active:
             # G12: mask EVERY arm-revealing section, not just the entries.
             apply_blinding_to_sections(stats, mapping, index)
+            # C8: and every contrast-identifying field (registry -> arms).
+            apply_contrast_blinding(stats, mapping)
+
+        # C4: everything above is computation; the unblinding and the output
+        # files below cannot be undone, so the look is committed first.
+        if mode == "confirmatory":
+            assert registered_sha is not None
+            _commit_confirmatory_lock(run_dir, registered_sha, analysis_dir)
 
         # §9.8: the confirmatory look IS the freeze — record the one-time
         # unblinding event AFTER the pipeline computed, BEFORE the outputs
@@ -6229,7 +6608,8 @@ def run_analysis(
             ):
                 gate_13_outcome = {
                     "endpoint": decision["endpoint"],
-                    "passed": bool(decision["passed"]),
+                    # C3: the #18 gate opens only on a confirmatory pass.
+                    "passed": bool(decision["confirmed"]),
                     "source": "stats['gatekeeping']['set_decisions']",
                 }
                 break
@@ -6275,7 +6655,7 @@ def run_analysis(
         # a placeholder THIS process created is removed, and only while it is
         # still IN_PROGRESS (never a lock some other completed run finalized).
         if lock_acquired_here:
-            _release_placeholder_lock(run_dir)
+            _release_placeholder_lock(run_dir, analysis_dir)
         raise
 
     return AnalysisResult(

@@ -202,9 +202,11 @@ def test_corpus_fallback_branch_uses_gold_only_filter():
         "context (parity with the manifest path in src/data/manifest.py); raw "
         ".context includes HotpotQA/MuSiQue distractors"
     )
-    assert "_gold_ctx[ex.id] or [None]" in branch, (
-        "metadata['gold_context'] must come from the gold-filtered context, not "
-        "context[0], which can be a distractor paragraph"
+    # A2 (2026-10-10): the single gold_context label (the first gold-only
+    # paragraph) became the full gold list from the shared loader rule.
+    assert "gold_paragraphs(ex)" in branch and "gold_context" not in branch, (
+        "metadata['gold_paragraphs'] must come from src.data.loader.gold_paragraphs "
+        "(the gate table's rule), never context[0], which can be a distractor"
     )
 
 

@@ -79,6 +79,19 @@ SLO_FLOORS = {
 
 
 @pytest.fixture(autouse=True)
+def _fixture_dataset_is_the_pressure_dataset(monkeypatch: pytest.MonkeyPatch) -> None:
+    # C1 (2026-10-10): the section 9.3 table registers the pressure families
+    # (F2, F3, DIST) on families.PRESSURE_DATASET (qasper) only, and the #14
+    # executor skips any other dataset. This module's F2 fixture lives on
+    # squad_v2 (span-QA predicate rows, no Qasper tau), so squad_v2 stands in
+    # as the registered pressure dataset here; the registered layout itself
+    # is pinned in tests/test_stats_engine.py and tests/test_campaign_analysis.py.
+    from src.analysis.stats import families
+
+    monkeypatch.setattr(families, "PRESSURE_DATASET", DATASET)
+
+
+@pytest.fixture(autouse=True)
 def _no_machine_freeze_artifact(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1261,3 +1274,39 @@ def test_truth_tax_refuses_rows_without_num_tokens(tmp_path: Path) -> None:
         rca.run_analysis(
             run_dir, contrast_ids=[14], metrics=["ttft_ms"], mode="design-input",
         )
+
+
+def test_truth_tax_runs_one_leg_per_engine_and_pressure_group_c9(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # C9 (2026-10-10): two in-regime F2 groups (here two rate rungs) on the
+    # same engine raised "supplied by two matched pressure groups" and
+    # stopped the analysis. Each (engine, group) is now one leg; Holm runs
+    # across every leg of the dataset, then the intersection-union max.
+    base = _f2_specs()
+    second_rung = [
+        CellSpec(
+            arm="gold-fresh", retriever="none", policy="none", topology="single",
+            engine=engine, model=MODEL, family="F2",  # type: ignore[arg-type]
+            budget_r=0.5, rate_frac=0.95,
+        )
+        for engine in ("vllm", "sglang")
+    ]
+    monkeypatch.setitem(globals(), "_f2_specs", lambda: base + second_rung)
+    run_dir = _build_sealed_run(tmp_path)
+    _reseal_and_prepare(run_dir)
+    index = rca.load_index(run_dir)
+    predicate_root, _manifest = rca.resolve_predicate_root(run_dir, None)
+    family_ctx = rca.build_family_context(index, ["ttft_ms"], 0.05)
+    section, primaries, _ladder = rca.compute_truth_tax(
+        run_dir, index, family_ctx, predicate_root=predicate_root, alpha=0.05
+    )
+    legs = [leg for leg in section["legs"] if leg["dataset"] == DATASET]
+    assert len(legs) == 2 and {leg["engine"] for leg in legs} == {"sglang"}
+    assert len({leg["leg_key"] for leg in legs}) == 2
+    (iu,) = section["per_dataset_intersection"]
+    assert iu["n_legs"] == 2 and iu["engines"] == ["sglang"]
+    from src.analysis.stats.corrections import holm as holm_ref
+    expected = float(max(holm_ref([leg["p_value"] for leg in legs])))
+    assert iu["p_intersection_union"] == pytest.approx(expected)
+    assert len(primaries) == 1 and primaries[0].p_value == pytest.approx(expected)

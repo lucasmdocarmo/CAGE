@@ -49,7 +49,11 @@ def test_module_imports_without_torch():
 
 
 def test_query_suffix_matches_cag_recipe():
-    assert runner.build_query_suffix("Who?") == "\n\nQuestion: Who?\nAnswer:"
+    # ADR-0162 amendment (review 2026-10-10, F-01): the "\n\n" boundary moved
+    # into the cached prefix so the prefix and the whole prompt tokenize alike
+    # on Qwen3 (a block-final "." merges with a following "\n\n").
+    assert runner.PREFIX_BOUNDARY == "\n\n"
+    assert runner.build_query_suffix("Who?") == "Question: Who?\nAnswer:"
 
 
 def test_corpus_prompt_layout_matches_vllm_raw_completion_path():
@@ -57,7 +61,7 @@ def test_corpus_prompt_layout_matches_vllm_raw_completion_path():
 
     block_text = "You are given the following reference documents:\n\nDocument 1:\npara"
     prompt = runner.build_corpus_prompt(block_text)
-    assert prompt == DEFAULT_SYSTEM_PREFIX.rstrip() + "\n" + block_text
+    assert prompt == DEFAULT_SYSTEM_PREFIX.rstrip() + "\n" + block_text + "\n\n"
     # Full served prompt has the same slot layout as format_qa_prompt, with the
     # corpus block in the per-query-context slot.
     full = prompt + runner.build_query_suffix("Who?")

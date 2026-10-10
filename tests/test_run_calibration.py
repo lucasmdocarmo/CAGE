@@ -227,7 +227,8 @@ def e2e(
     mini_archive: dict[str, Path], tmp_path_factory: pytest.TempPathFactory
 ) -> dict[str, object]:
     report, provenance = rc.run_calibration(
-        mini_archive, seed=123, alpha=0.05, aa_splits=100, injection_splits=60
+        # C7 (2026-10-10): the consumer gate's registered floor is 400 per leg.
+        mini_archive, seed=123, alpha=0.05, aa_splits=400, injection_splits=400
     )
     out_dir = tmp_path_factory.mktemp("cal_out")
     paths = rc.write_outputs(report, provenance, out_dir)
@@ -272,8 +273,8 @@ class TestEndToEnd:
     def test_provenance_records_required_fields(self, e2e: dict) -> None:
         prov = e2e["provenance"]
         assert prov["seed"] == 123
-        assert prov["aa_splits_per_dataset"] == 100
-        assert prov["injection_splits"] == 60
+        assert prov["aa_splits_per_dataset"] == 400
+        assert prov["injection_splits"] == 400
         assert set(prov["source_runs"]) == {"squad_v2", "hotpotqa"}
         assert "valid row = NOT error AND NOT empty_generation" in (
             prov["loader"]["validity_rule"]
@@ -305,11 +306,14 @@ class TestEndToEnd:
         import run_campaign_analysis as rca
         from src.analysis.stats.calibration import CalibrationReport
 
+        from src.analysis.stats.calibration import _rejection_ci
+
+        lo, hi = _rejection_ci(80, 400)  # C7: the gate recomputes the CI
         bad = CalibrationReport(
             seed=1,
             n_observations=100,
             aa=AAResult(n_splits=400, alpha=0.05, n_rejections=80,
-                        fp_rate=0.2, ci_low=0.162, ci_high=0.243),
+                        fp_rate=0.2, ci_low=lo, ci_high=hi),
             injections=(),
         )
         path = bad.write(tmp_path / "calibration_report.json")

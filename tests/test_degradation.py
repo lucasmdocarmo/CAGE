@@ -450,3 +450,29 @@ def test_fingerprint_legs_run_on_degradation_label(tmp_path: Path) -> None:
         # "greater" (the coping policy RAISES the failure rate).
         assert leg["executed_alternative"] == "greater"
         assert leg["p_value"] < 0.05
+
+
+def test_not_ok_empty_generation_is_never_judged_c12() -> None:
+    # C12 (2026-10-10): an ok-False empty generation (error None) reached the
+    # no-answer detector, which reads "" as an abstention, so abstention_shift
+    # came out True on an answerable item. The runner nulls the quality
+    # columns on such rows; every label must stay None with a named reason.
+    row = _row(
+        ok=False, empty_generation=True, error=None, generated_answer="",
+        finish_reason="stop", predicted_no_answer=None, is_answerable=None,
+        grounded=None, grounding_score=None, all_answers=["Paris"],
+    )
+    results = deg.classify_request(row)
+    assert results, "classify_request returned no labels"
+    for name, result in results.items():
+        assert result.value is None, (name, result)
+        assert result.reason, name
+    assert "not-ok row" in results["abstention_shift"].reason
+
+
+def test_a_scored_flag_on_a_not_ok_row_is_still_not_judged_c12_1() -> None:
+    # Fresh review 2026-10-10 (C12-1): the scored flag was read before the
+    # error check, so a not-ok row carrying one kept its abstention label.
+    row = _row(ok=False, error=None, generated_answer="", predicted_no_answer=1.0, is_answerable=1.0)
+    result = deg.classify_abstention_shift(row)
+    assert result.value is None and "not-ok row" in result.reason

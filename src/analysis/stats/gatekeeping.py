@@ -39,6 +39,7 @@ unchanged; the REGISTERED campaign analysis must pass them from the map.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import Literal, Mapping, Sequence
 
@@ -126,6 +127,15 @@ class SetDecision:
     registered_legs: tuple[str, ...] | None
     missing_legs: tuple[str, ...]
     reason: str
+    #: C3 (2026-10-10): whether the serial chain tested this endpoint
+    #: confirmatorily. ``passed`` is the raw within-set rule and is computed
+    #: for a descriptive endpoint too; consumers read ``confirmed``.
+    status: SecondaryStatus = "confirmatory"
+
+    @property
+    def confirmed(self) -> bool:
+        """The endpoint's verdict: the set passed AND the chain tested it."""
+        return self.passed and self.status == "confirmatory"
 
 
 @dataclass(frozen=True)
@@ -133,7 +143,9 @@ class GateEvent:
     family_id: str
     upstream: str
     dataset: str
-    upstream_p: float
+    #: None on the serial event that closes the chain at an endpoint with no
+    #: outcome (C2): absence is not evidence, so no sentinel p is recorded.
+    upstream_p: float | None
     opened: bool
     reason: str
 
@@ -292,6 +304,7 @@ def evaluate_chain(
     registered_sets: Mapping[str, Sequence[str]] | None = None,
     registered_family_sizes: Mapping[str, int] | None = None,
     upstream_by_family: Mapping[str, str] | None = None,
+    registered_order: Sequence[str] | None = None,
 ) -> GatekeepingTrace:
     """Evaluate the §9.3 chain and return the full auditable trace.
 
@@ -322,6 +335,12 @@ def evaluate_chain(
       (the map's ``upstream`` column). Every supplied family must appear; a
       member wired to a different upstream fails loud (the topology is
       registered, never the caller's choice — assertion G10).
+    - ``registered_order`` (C2, 2026-10-10; exclusive with ``primary_order``):
+      the FULL registered serial sequence, which may name endpoints with no
+      outcome. The chain closes at the first such endpoint and every later
+      endpoint is descriptive, with a gate event naming the missing one. The
+      caller used to pass only the computed endpoints, so a missing #14 left
+      the chain 4 -> 13 and #13 could pass confirmatorily.
     """
     if not 0.0 < alpha < 1.0:
         raise GatekeepingError(f"alpha={alpha} must be in (0, 1)")
@@ -354,6 +373,30 @@ def evaluate_chain(
                 f"endpoints explicitly (chain_complete), never here"
             )
 
+    closed_from: set[str] = set()
+    missing_upstream: str | None = None
+    if registered_order is not None:
+        if primary_order is not None:
+            raise GatekeepingError(
+                "pass primary_order or registered_order, not both"
+            )
+        reg = [str(e) for e in registered_order]
+        if len(set(reg)) != len(reg):
+            raise GatekeepingError(f"registered_order has duplicates: {reg}")
+        unregistered = sorted(set(by_endpoint) - set(reg))
+        if unregistered:
+            raise GatekeepingError(
+                f"supplied endpoints {unregistered} are not in the registered "
+                f"order {reg} (Dmitrienko serial, section 9.3)"
+            )
+        first_missing = next(
+            (i for i, e in enumerate(reg) if e not in by_endpoint), None
+        )
+        if first_missing is not None:
+            missing_upstream = reg[first_missing]
+            closed_from = set(reg[first_missing + 1:])
+        primary_order = [e for e in reg if e in by_endpoint]
+
     if primary_order is None:
         ordered_endpoints = list(by_endpoint)
     else:
@@ -379,9 +422,29 @@ def evaluate_chain(
             endpoint, members, intra_set_rule, alpha,
             registered_sets.get(endpoint) if registered_sets is not None else None,
         )
-        set_decisions[endpoint] = set_decision
+        closed_by_missing = endpoint in closed_from
+        if closed_by_missing:
+            chain_open = False
         status: SecondaryStatus = "confirmatory" if chain_open else "descriptive"
-        if primary_order is not None and previous_endpoint is not None:
+        set_decision = dataclasses.replace(set_decision, status=status)
+        set_decisions[endpoint] = set_decision
+        if closed_by_missing:
+            events.append(
+                GateEvent(
+                    family_id=f"primary-chain:{endpoint}",
+                    upstream=str(missing_upstream),
+                    dataset="ALL",
+                    upstream_p=None,
+                    opened=False,
+                    reason=(
+                        f"serial gate: endpoint {endpoint!r} labeled "
+                        f"descriptive: the registered upstream endpoint "
+                        f"{missing_upstream!r} has no outcome, so the serial "
+                        f"chain closes there (absence never passes a gate; C2)"
+                    ),
+                )
+            )
+        elif primary_order is not None and previous_endpoint is not None:
             previous_set = set_decisions[previous_endpoint]
             incomplete_note = (
                 f" [upstream set incomplete: registered legs "

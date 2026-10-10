@@ -884,7 +884,10 @@ def test_derive_corpus_prompt_prefix_raw_layout():
     full = format_qa_prompt("What emits light?", ctxs)
     assert full.startswith(prefix)  # the literal-prefix contract the oracle enforces
     assert ctxs[0] in prefix  # the corpus block is inside the cached prefix
-    assert full[len(prefix):].startswith("\n\nQuestion:")  # suffix = per-query tail
+    # ADR-0162 amendment (review 2026-10-10, F-01): the cut sits AFTER the
+    # "\n\n" so the prefix and the whole prompt tokenize alike on Qwen3.
+    assert prefix.endswith("\n\n")
+    assert full[len(prefix):].startswith("Question:")  # suffix = per-query tail
 
 
 def test_derive_corpus_prompt_prefix_chat_fallback_layout():

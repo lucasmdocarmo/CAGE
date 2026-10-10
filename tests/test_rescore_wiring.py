@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -783,6 +784,191 @@ def test_rescore_threads_is_impossible_into_the_scorer(tmp_path: Path) -> None:
         "e3": ANSWERABILITY_REFERENCE_DERIVED,
     }
     assert out[1]["is_answerable"] == 0.0 and out[1]["no_answer_correct"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Review 2026-10-10: R1 (not-ok rows are never scored), R2 (freeze pins),
+# R3 (a crashed pass leaves no scoring/<id>/)
+# ---------------------------------------------------------------------------
+
+NOT_OK_ROW: dict[str, Any] = {
+    "example_id": "x0",
+    "question": "Who?",
+    "used_contexts": ["ctx"],
+    "generated_answer": "",
+    "reference_answer": "",
+    "all_answers": [],
+    "is_impossible": True,
+    "baseline": "B3",
+    "repeat_index": 0,
+    "ok": False,
+    "error": "ConnectionError: engine down",
+    "empty_generation": False,
+}
+
+
+def test_not_ok_rows_are_emitted_unscored(tmp_path: Path) -> None:
+    """R1: a serving error with an empty answer must not read as an abstention
+    (EM 1.0 on an unanswerable item). Every quality column is None, not_ok is
+    True, the stamp rides along, and quality.json counts n_not_ok."""
+    rows = [NOT_OK_ROW, {**EVIDENCE_ROWS[0], "ok": True, "error": None, "empty_generation": False},
+            {**NOT_OK_ROW, "example_id": "x1", "error": None, "empty_generation": True}]
+    ev = _write_evidence(tmp_path / "qa_evidence.jsonl", rows)
+    out, _ = rq._score_evidence_file(ev, _fast_evaluator())
+    by_id = {r["example_id"]: r for r in out}
+    for rid in ("x0", "x1"):
+        r = by_id[rid]
+        assert r["not_ok"] is True and r["abstained"] is False
+        for key in ("exact_match", "f1_score", "predicted_no_answer", "no_answer_correct",
+                    "is_answerable", "grounding_score", "sanitized_answer"):
+            assert r[key] is None, (rid, key, r[key])
+    assert by_id["x0"]["error"] == "ConnectionError: engine down"
+    assert by_id["x1"]["empty_generation"] is True
+    # the ok row scores as before, and the file order is preserved
+    assert by_id["e0"]["not_ok"] is False and by_id["e0"]["exact_match"] == 1.0
+    assert [r["example_id"] for r in out] == ["x0", "e0", "x1"]
+    agg = rq._quality_aggregate(out)
+    assert agg["n_not_ok"] == 2 and agg["abstained"] == 0
+    assert agg["metrics"]["exact_match"] == {"mean": 1.0, "n": 1, "n_none": 2}
+    # legacy rows without the stamp keep scoring (pre-#127 evidence)
+    legacy, _ = rq._score_evidence_file(
+        _write_evidence(tmp_path / "legacy.jsonl", [EVIDENCE_ROWS[1]]), _fast_evaluator()
+    )
+    assert legacy[0]["not_ok"] is False and legacy[0]["abstained"] is True
+
+
+def test_batched_and_sequential_agree_with_not_ok_rows(tmp_path: Path) -> None:
+    rows = [NOT_OK_ROW, *[{**r, "ok": True, "error": None, "empty_generation": False} for r in EVIDENCE_ROWS]]
+    ev = _write_evidence(tmp_path / "qa_evidence.jsonl", rows)
+    seq, _ = rq._score_evidence_file(ev, _fast_evaluator())
+    bat, _ = rq._score_evidence_file(ev, _fast_evaluator(), batch_size=2)
+    assert seq == bat and len(seq) == len(rows)
+
+
+def test_a_v2_row_missing_an_answer_key_is_refused(tmp_path: Path) -> None:
+    row = {k: v for k, v in NOT_OK_ROW.items() if k != "reference_answer"}
+    row.update(ok=True, error=None, empty_generation=False, generated_answer="x")
+    ev = _write_evidence(tmp_path / "qa_evidence.jsonl", [row])
+    with pytest.raises(rq.EvidenceSchemaError, match="reference_answer"):
+        rq._score_evidence_file(ev, _fast_evaluator())
+
+
+def test_tree_pass_records_n_not_ok(tmp_path: Path) -> None:
+    run = _make_v2_tree(tmp_path)
+    _write_evidence(run / "cells" / "B1" / "window_squad_v2-01" / "qa_evidence.jsonl",
+                    [NOT_OK_ROW, *EVIDENCE_ROWS])
+    (run / "ledger.json").unlink()
+    sealed = [p for p in sorted(run.rglob("*")) if p.is_file()]
+    write_ledger(hash_artifacts(sealed, base_dir=run), run / "ledger.json")
+    assert rq.run_scoring_tree(run, "s11-notok", _args()) == 0
+    sdir = run / "scoring" / "s11-notok"
+    q = json.loads((sdir / "cells" / "B1" / "window_squad_v2-01" / "quality.json").read_text())
+    assert q["n_not_ok"] == 1 and q["rows"] == len(EVIDENCE_ROWS) + 1
+    man = json.loads((sdir / "scoring_manifest.json").read_text())
+    assert man["n_not_ok"] == 1
+    assert man["revision_pins"] == {"source": None, "pins": {}}
+
+
+def test_a_crashed_pass_leaves_no_sealed_directory_and_a_retry_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R3: the pass is built under scoring/.<id>.partial/ and renamed only after
+    its ledger is written; the master treats an existing scoring/<id>/ as a
+    completed pass, so a crash must never leave one."""
+    run = _make_v2_tree(tmp_path)
+    real = rq._score_evidence_file
+    calls = {"n": 0}
+
+    def boom(*a: Any, **k: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("worker OOM mid-pass")
+        return real(*a, **k)
+
+    monkeypatch.setattr(rq, "_score_evidence_file", boom)
+    with pytest.raises(RuntimeError, match="OOM"):
+        rq.run_scoring_tree(run, "s12-crash", _args())
+    assert not (run / "scoring" / "s12-crash").exists()
+    partial = run / "scoring" / ".s12-crash.partial"
+    assert partial.is_dir() and not (partial / "ledger.json").exists()
+    # the retry removes the fragment and seals a complete pass under the id
+    monkeypatch.setattr(rq, "_score_evidence_file", real)
+    assert rq.run_scoring_tree(run, "s12-crash", _args()) == 0
+    assert not partial.exists()
+    sdir = run / "scoring" / "s12-crash"
+    assert verify_ledger(sdir / "ledger.json", sdir) == []
+
+
+def _freeze(tmp_path: Path, drop: str | None = None) -> Path:
+    table = {
+        "nli": {"model": "m-nli", "revision": "aaa111"},
+        "embedding": {"model": "m-emb", "revision": "bbb222"},
+        "bertscore": {"model": "m-bs", "revision": "ccc333"},
+        "lettucedetect": {"model": "m-ld", "revision": "ddd444"},
+    }
+    if drop:
+        table[drop] = {"model": "m", "revision": ""}
+    path = tmp_path / "freeze_resolutions.json"
+    path.write_text(json.dumps({"INSTRUMENT_REVISIONS": table}), encoding="utf-8")
+    return path
+
+
+def test_full_tree_pass_requires_the_freeze_file_and_exports_the_pins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """R2: nothing on the pod exported CAGE_*_REVISION, so the freeze was never
+    enforced at stage 10. A --full tree pass refuses without --freeze-file,
+    refuses a file missing a pin, and otherwise exports the four pins before
+    the evaluator is built and records them in the manifest."""
+    for env in ("CAGE_NLI_REVISION", "CAGE_EMBEDDING_REVISION",
+                "CAGE_BERTSCORE_REVISION", "CAGE_LETTUCEDETECT_REVISION"):
+        monkeypatch.delenv(env, raising=False)
+    run = _make_v2_tree(tmp_path)
+    # the model stack never loads in this test: the evaluator is the fast one,
+    # built through the real seam so the env is read at construction
+    seen: dict[str, Any] = {}
+
+    def fake_build(args: Any) -> Any:
+        seen["env"] = {k: os.environ.get(k) for k in (
+            "CAGE_NLI_REVISION", "CAGE_EMBEDDING_REVISION",
+            "CAGE_BERTSCORE_REVISION", "CAGE_LETTUCEDETECT_REVISION")}
+        ev = _fast_evaluator()
+        seen["pins"] = dict(ev._revision_pins)
+        return ev
+
+    monkeypatch.setattr(rq, "_build_evaluator", fake_build)
+    assert rq.run_scoring_tree(run, "s13-nopin", _args(full=True, freeze_file=None)) == 2
+    assert "--freeze-file" in capsys.readouterr().err
+    assert not (run / "scoring" / "s13-nopin").exists()
+    assert rq.run_scoring_tree(
+        run, "s13-missing", _args(full=True, freeze_file=str(_freeze(tmp_path, drop="nli")))
+    ) == 2
+    assert "nli" in capsys.readouterr().err
+    freeze = _freeze(tmp_path)
+    assert rq.run_scoring_tree(run, "s13-pinned", _args(full=True, freeze_file=str(freeze))) == 0
+    assert seen["env"] == {
+        "CAGE_NLI_REVISION": "aaa111", "CAGE_EMBEDDING_REVISION": "bbb222",
+        "CAGE_BERTSCORE_REVISION": "ccc333", "CAGE_LETTUCEDETECT_REVISION": "ddd444",
+    }
+    assert seen["pins"] == {"nli": "aaa111", "embedding": "bbb222",
+                            "bertscore": "ccc333", "lettucedetect": "ddd444"}
+    man = json.loads((run / "scoring" / "s13-pinned" / "scoring_manifest.json").read_text())
+    assert man["revision_pins"]["source"] == str(freeze)
+    assert man["revision_pins"]["pins"]["lettucedetect"] == "ddd444"
+    assert man["revision_pins"]["exported"]["CAGE_NLI_REVISION"] == "aaa111"
+
+
+def test_freeze_file_flag_parses_and_pins_read_the_real_freeze_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["rescore_quality.py", "--run-root", "x",
+                                      "--freeze-file", "f.json"])
+    assert rq.parse_args().freeze_file == "f.json"
+    real = REPO_ROOT / "MyDocs" / "registration" / "freeze_resolutions.json"
+    if real.is_file():
+        pins = rq.revision_pins_from_freeze(real)
+        assert set(pins) == {"nli", "embedding", "bertscore", "lettucedetect"}
+        assert all(len(v) == 40 for v in pins.values())
 
 
 def test_rescore_refuses_a_flag_that_disagrees_with_the_gold(tmp_path: Path) -> None:

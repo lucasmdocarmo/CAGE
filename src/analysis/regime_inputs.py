@@ -136,7 +136,7 @@ class WindowRegimeInputs:
     """
 
     rho_kv_time_avg: float
-    scarcity_events: int
+    scarcity_events: int | None
     n_samples: int
     coverage: float
     window_start_s: float
@@ -146,7 +146,7 @@ class WindowRegimeInputs:
     waiting_mean: float
     n_waiting_samples: int
 
-    def to_flat_dict(self) -> dict[str, int | float]:
+    def to_flat_dict(self) -> dict[str, int | float | None]:
         """Flat mapping suitable as CSV columns (joins a CellSpec row key)."""
         return asdict(self)
 
@@ -254,13 +254,14 @@ def compute_window_regime_inputs(
     rho_kv_time_avg = float(((hold_until - ts_w) * kv_w).sum() / covered)
 
     pre = pd.to_numeric(samples[preempt_col], errors="coerce").to_numpy(dtype=float)
-    pre_w = pre[in_window]
-    if np.isnan(pre_w).any():
-        raise RegimeInputError(
-            f"preemption counter {preempt_col!r} is None/NaN on in-window "
-            "sample(s): absence is not zero — scarcity cannot be certified "
-            "without the counter (E2b)"
-        )
+    pre_all = pre[in_window]
+    # C11 (2026-10-10): ADR-0153 records the preemption counter beside the
+    # label and never gates on it, yet an absent counter still refused the
+    # window as UNKNOWN_TELEMETRY. cage-stats emits None when an SGLang build
+    # exposes no counter, so every window of such a build was skipped. An
+    # absent value now records scarcity_events=None (absence, never 0); the
+    # integer, sign and restart checks still run on the values present.
+    pre_w = pre_all[~np.isnan(pre_all)]
     if (pre_w != np.floor(pre_w)).any():
         raise RegimeInputError(
             f"column {preempt_col!r} is a cumulative event counter and must "
@@ -276,7 +277,10 @@ def compute_window_regime_inputs(
             "delta): the server restarted mid-window, which invalidates the "
             "window"
         )
-    scarcity_events = int(pre_w[-1] - pre_w[0])
+    scarcity_events = (
+        None if np.isnan(pre_all).any() or pre_w.size == 0
+        else int(pre_w[-1] - pre_w[0])
+    )
 
     # ADR-0153 clause (b): the admission queue. A sample without the gauge
     # cannot certify scarcity, so it refuses exactly like the occupancy gauge.
@@ -351,7 +355,7 @@ class PDWindowRegimeInputs:
     """
 
     rho_kv_time_avg: float
-    scarcity_events: int
+    scarcity_events: int | None
     n_samples: int
     coverage: float
     window_start_s: float
@@ -363,7 +367,7 @@ class PDWindowRegimeInputs:
     per_role: Mapping[str, WindowRegimeInputs]
     budgets_by_role: Mapping[str, int]
 
-    def to_flat_dict(self) -> dict[str, int | float]:
+    def to_flat_dict(self) -> dict[str, int | float | None]:
         """Flat mapping with EXACTLY the ``WindowRegimeInputs`` keys.
 
         The per-role breakdown is deliberately NOT flattened here: the §6.1
@@ -520,7 +524,12 @@ def compute_pd_window_regime_inputs(
     # a lone role reproduces its own numbers exactly (max/sum of one).
     return PDWindowRegimeInputs(
         rho_kv_time_avg=rho_pooled,
-        scarcity_events=sum(w.scarcity_events for w in per_role.values()),
+        # C11: one role without the counter leaves the pooled count unknown.
+        scarcity_events=(
+            None
+            if any(w.scarcity_events is None for w in per_role.values())
+            else sum(w.scarcity_events for w in per_role.values())
+        ),
         n_samples=n_total,
         coverage=min(w.coverage for w in per_role.values()),
         window_start_s=reference.window_start_s,
