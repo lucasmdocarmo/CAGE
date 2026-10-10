@@ -1310,3 +1310,30 @@ def test_truth_tax_runs_one_leg_per_engine_and_pressure_group_c9(
     expected = float(max(holm_ref([leg["p_value"] for leg in legs])))
     assert iu["p_intersection_union"] == pytest.approx(expected)
     assert len(primaries) == 1 and primaries[0].p_value == pytest.approx(expected)
+
+
+def test_truth_tax_passes_the_cell_gpu_count_c8(tmp_path: Path) -> None:
+    """C8 (2026-10-10): the #14 seam left gpu_count at evaluate_window's
+    default 1, so a tp cell's per-GPU goodput equaled its aggregate. The
+    registered #14 fractions do not move."""
+    run_dir = _build_sealed_run(tmp_path)
+    for cell_json in sorted(run_dir.glob("cells/*/cell.json")):
+        if "|vllm|" in cell_json.parent.name and "|F2" in cell_json.parent.name:
+            doc = json.loads(cell_json.read_text(encoding="utf-8"))
+            doc["gpu_count"] = 4
+            cell_json.write_text(json.dumps(doc), encoding="utf-8")
+    _reseal_and_prepare(run_dir)
+    index = rca.load_index(run_dir)
+    predicate_root, _manifest = rca.resolve_predicate_root(run_dir, None)
+    family_ctx = rca.build_family_context(index, ["ttft_ms"], 0.05)
+    _section, _primaries, ladder = rca.compute_truth_tax(
+        run_dir, index, family_ctx, predicate_root=predicate_root, alpha=0.05
+    )
+    vllm = {k: m for k, m in ladder.items() if "|vllm|" in k}
+    other = {k: m for k, m in ladder.items() if "|vllm|" not in k}
+    assert vllm and other
+    for metrics in vllm.values():
+        assert metrics.gpu_count == 4
+        assert metrics.goodput_per_gpu == pytest.approx(metrics.goodput_rps / 4)
+    for metrics in other.values():
+        assert metrics.gpu_count == 1

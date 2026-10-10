@@ -5114,7 +5114,17 @@ class TestW4ReviewFixesTestsLens:
                 backend=val("--backend"), model=val("--model"), dataset=step["dataset"],
                 num_trials=step["windows"], seed=int(val("--seed")), kv_cache_dtype=val("--kv-cache-dtype"),
             )
-            session = cs.CampaignCellSession.from_cli(args, env=step["env"])
+            # O4 (2026-10-10): from_cli checks a new run's manifest inputs. In
+            # production they come from the parent env (the master exports
+            # CAGE_PROVIDER/CAGE_HARDWARE on both pod jobs) and from the
+            # runner (--query-manifest sets CAGE_QUERY_MANIFEST before
+            # from_cli); the step env carries neither.
+            parent_env = {
+                "CAGE_PROVIDER": "runpod",
+                "CAGE_HARDWARE": "H100 x 1",
+                "CAGE_DATASET_MANIFESTS_SHA256": "0" * 64,
+            }
+            session = cs.CampaignCellSession.from_cli(args, env={**parent_env, **step["env"]})
             assert session is not None, step["row_key"]
             assert session.row_key == step["row_key"]
             assert session.slo_floors == plan["calibration"]["floors"]

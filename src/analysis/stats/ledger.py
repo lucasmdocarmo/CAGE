@@ -228,11 +228,20 @@ def _find_extra_files(
                 dirnames[:] = []  # symlink cycle: prune, do not recurse forever
                 continue
             visited.add(real)
+            # O1 (2026-10-10): dot entries are outside the seal (seal_run and
+            # seal_campaign_run skip any dot path part), so the sweep skips
+            # them too: Finder's .DS_Store and the driver's .STATUS-* files
+            # under cells/ failed organize and verify as EXTRA.
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
             for name in filenames:
+                if name.startswith("."):
+                    continue
                 file_path = Path(dirpath) / name
                 if file_path.resolve() == ledger_abs:
                     continue  # the seal itself is not a sealed artifact
                 key = Path(os.path.relpath(file_path, base)).as_posix()
+                if any(part.startswith(".") for part in Path(key).parts):
+                    continue  # a dot part above the sweep root
                 if key not in known:
                     extras.add(f"EXTRA {key}")
     return sorted(extras)

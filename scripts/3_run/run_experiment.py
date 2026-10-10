@@ -2125,6 +2125,14 @@ def setup_inference_engine(
     return engine
 
 
+def _count_since(now: Optional[int], before: Optional[int]) -> Optional[int]:
+    """A cumulative counter's increase since ``before`` (C2); None when either
+    reading is None (absence is not zero)."""
+    if now is None or before is None:
+        return None
+    return now - before
+
+
 def merge_open_loop_row(row: Dict[str, Any], record: RequestRecord) -> Dict[str, Any]:
     """Merge one open-loop RequestRecord's accounting fields into a results row.
 
@@ -4373,6 +4381,13 @@ def run_experiment(
     # preparation and recording time outside the dispatch span is derivable.
     # The window itself is stamped by the measured stages (see
     # measured_window_t_start above).
+    # C2 (2026-10-10): one reranker serves the warm-up stages too, so its pair
+    # counters are read here and the summary reports the measured stage only
+    # (20 warm-up queries at pool 10 added 200 pairs beside 50 measured rows).
+    rerank_counts_before = (
+        getattr(reranker, "scored_pairs", None),
+        getattr(reranker, "truncated_pairs", None),
+    )
     stage_t_start = time.time()
     performance_evaluator.start()
     try:
@@ -4770,8 +4785,13 @@ def run_experiment(
             # silently; 512 tokens on BAAI/bge-reranker-large, the 2026-10-08
             # run log warned "519 > 512"); None without a reranker.
             "rerank_max_length": getattr(reranker, "max_length", None),
-            "rerank_scored_pairs": getattr(reranker, "scored_pairs", None),
-            "rerank_truncated_pairs": getattr(reranker, "truncated_pairs", None),
+            # C2: measured-stage counts (None stays None).
+            "rerank_scored_pairs": _count_since(
+                getattr(reranker, "scored_pairs", None), rerank_counts_before[0]
+            ),
+            "rerank_truncated_pairs": _count_since(
+                getattr(reranker, "truncated_pairs", None), rerank_counts_before[1]
+            ),
         }
 
         print("\n" + "=" * 70)

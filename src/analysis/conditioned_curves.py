@@ -142,8 +142,9 @@ def evidence_position_bin(
     pos = _as_int(position)
     if position is None:
         return None, (
-            "gold_position_in_prompt absent from the stored row — the "
-            "producer's served-context containment column is required"
+            "gold_position_in_prompt absent from the stored row, or None "
+            "because the example records no gold evidence (A2: "
+            "gold_paragraphs returned none); no evidence position to bin"
         )
     if pos is None or pos < -1:
         return None, (

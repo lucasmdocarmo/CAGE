@@ -98,6 +98,7 @@ import math
 import os
 import shutil
 import sys
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
@@ -1030,7 +1031,7 @@ class CampaignCellSession:
         slo_floors = parse_slo_floors(raw_floors) if raw_floors else None
         raw_plan = (env.get(BUDGET_PLAN_ENV) or "").strip()
         budget_plan = parse_budget_plan(raw_plan, spec) if raw_plan else None
-        return cls(
+        session = cls(
             run_root=Path(root),
             dataset=args.dataset,
             spec=spec,
@@ -1043,6 +1044,43 @@ class CampaignCellSession:
             slo_floors=slo_floors,
             budget_plan=budget_plan,
         )
+        session._preflight_new_run()
+        return session
+
+    def _preflight_new_run(self) -> None:
+        """O4 (2026-10-10): the run-level manifest inputs, checked before any
+        window serves. ``_ensure_run`` read them only at the first emission,
+        after the window's GPU time was spent (attempt 3 lost 6 ladder windows
+        to an unset CAGE_PROVIDER). A run whose manifest exists needs none of
+        them. engine_version stays at emission: it can come from the backend's
+        own report."""
+        if (self.run_root / "manifest.json").is_file():
+            return
+        cl = _campaign_layout()
+        problems: list[str] = []
+        self._require_env("CAGE_PROVIDER", "the provider (neocloud name or gcp)", problems)
+        self._require_env("CAGE_HARDWARE", "the machine shape / GPU SKU x count", problems)
+        try:
+            sha = self._resolve_dataset_manifests_sha256()
+        except CampaignSessionError as exc:
+            problems.extend(exc.problems)
+        else:
+            if not cl._SHA256_RE.match(sha):
+                problems.append(
+                    f"dataset_manifests_sha256 {sha!r} is not a lowercase hex sha256 "
+                    "(write_manifest refuses it at the first emission)"
+                )
+        try:
+            self._manifest_extra()
+        except CampaignSessionError as exc:
+            problems.extend(exc.problems)
+        if not cl.CAMPAIGN_RE.match(self.campaign):
+            problems.append(
+                f"campaign {self.campaign!r} (the campaign-root grandparent) "
+                f"violates the §1 slug grammar {cl.CAMPAIGN_RE.pattern}"
+            )
+        if problems:
+            raise CampaignSessionError(problems)
 
     # -- paths / resume ---------------------------------------------------
 
@@ -1091,6 +1129,13 @@ class CampaignCellSession:
         reset: list[int] = []
         cell_dir = self.cell_dir
         meta_path = cell_dir / "cell.json"
+        # O8 (2026-10-10): a killed cell.json write leaves its tmp beside the
+        # published cell.json, which stays the record; CellWriter refuses any
+        # unknown entry, so the tmp blocked every later emission of the cell.
+        stray_tmp = meta_path.with_name(meta_path.name + ".tmp")
+        if stray_tmp.is_file():
+            stray_tmp.unlink()
+            print(f"[campaign] removed crash residue {stray_tmp}")
         meta: Optional[dict[str, Any]] = None
         if meta_path.is_file():
             try:
@@ -1261,12 +1306,17 @@ class CampaignCellSession:
             dataset_manifests_sha256=self._resolve_dataset_manifests_sha256(),
             cellspec_schema_version=_CELLSPEC_SCHEMA_VERSION,
             extra=self._manifest_extra(),
+            # A8 + O2 (2026-10-10): the manifest's hash is journaled from the
+            # complete tmp file BEFORE the rename publishes it. Journaled after
+            # the rename, a crash between the two left a published manifest no
+            # resumed process journals (the reopen branch above never writes),
+            # and the seal refused the run. Journaled first, a crash before
+            # the rename leaves a stale entry and no file; the next process
+            # writes a new manifest whose entry supersedes it.
+            before_publish=lambda tmp: _append_journal_entries(
+                self.run_root, {manifest_path.name: _sha256_file(tmp)}
+            ),
         )
-        # A8 (2026-10-10): journal the manifest the moment it exists. It was
-        # journaled at the end of the first emission, so a first emission that
-        # raised left it unjournaled, a resumed process (which opens the
-        # existing file) never journaled it, and the seal refused the run.
-        append_write_time_hashes(self.run_root, [manifest_path])
         print(f"[campaign] manifest.json created at run start: {manifest_path}")
         return self._run
 
@@ -1386,14 +1436,23 @@ class CampaignCellSession:
                     }
                 )
                 have.add(ident)
-        if len(requests_rows) != len(evidence_rows):
+        # O7 (2026-10-10): the two chains must carry the same identities, not
+        # only the same count; an orphan evidence row offset a valid request
+        # row that had none, and the window emitted.
+        request_ids = Counter(self._identity(r) for r in requests_rows)
+        evidence_ids = Counter(self._identity(r) for r in evidence_rows)
+        if request_ids != evidence_ids:
             consort = (experiment_summary.get("consort") or {}) if isinstance(
                 experiment_summary, Mapping
             ) else {}
+            only_requests = sorted((request_ids - evidence_ids).elements(), key=repr)
+            only_evidence = sorted((evidence_ids - request_ids).elements(), key=repr)
             raise CampaignSessionError(
                 f"window would fail verify_results reconciliation: "
                 f"{len(requests_rows)} results row(s) vs {len(evidence_rows)} "
-                f"evidence row(s) after dispatch-stub reconciliation "
+                f"evidence row(s) after dispatch-stub reconciliation; "
+                f"identities only in results {only_requests[:5]}, only in "
+                f"evidence {only_evidence[:5]} "
                 f"(consort: {dict(consort)}) — a lost evidence append on a "
                 "valid row is §9.10-accountable, not paperable-over"
             )

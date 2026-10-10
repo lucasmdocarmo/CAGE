@@ -150,6 +150,9 @@ class PerformanceEvaluator:
         
         # Process handle for resource monitoring
         self.process = psutil.Process() if monitor_resources else None
+        # B9a (2026-10-10): psutil's first cpu_percent() on a Process returns
+        # a 0.0 placeholder (no earlier call to measure from); it only primes.
+        self._cpu_primed = False
     
     def start(self) -> None:
         """Start performance tracking."""
@@ -175,8 +178,10 @@ class PerformanceEvaluator:
         try:
             cpu_percent = self.process.cpu_percent()
             memory_mb = self.process.memory_info().rss / 1024 / 1024
-            
-            self.cpu_samples.append(cpu_percent)
+
+            if self._cpu_primed:
+                self.cpu_samples.append(cpu_percent)
+            self._cpu_primed = True
             self.memory_samples.append(memory_mb)
         except Exception as e:
             print(f"Warning: Failed to sample resources: {e}")
@@ -550,8 +555,17 @@ class GPUMetricsTracker:
             return False
     
     def is_available(self) -> bool:
-        """Check if GPU monitoring is available."""
-        return self._nvml_initialized and self._device_count > 0
+        """Check if GPU monitoring is available.
+
+        B7 (2026-10-10): every device needs its handle. ``_nvml_initialized``
+        is set before the handles are listed, so one failing
+        ``nvmlDeviceGetHandleByIndex`` left the tracker available with no
+        handles, and each tick counted a sample that read nothing."""
+        return (
+            self._nvml_initialized
+            and self._device_count > 0
+            and len(self._device_handles) == self._device_count
+        )
     
     def get_device_count(self) -> int:
         """Get number of GPUs detected."""

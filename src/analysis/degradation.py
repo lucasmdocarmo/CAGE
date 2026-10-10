@@ -389,9 +389,10 @@ def classify_wrong_context(row: Mapping[str, Any]) -> LabelResult:
     position = row.get("gold_position_in_prompt")
     if position is None:
         return LabelResult(label, None, (
-            "gold_position_in_prompt absent from the stored row — the "
-            "producer's served-context containment column is required to "
-            "tell gold-grounded from wrong-context-grounded"
+            "gold_position_in_prompt absent from the stored row, or None "
+            "because the example records no gold evidence (A2: "
+            "gold_paragraphs returned none); the served-context containment "
+            "is required to tell gold-grounded from wrong-context-grounded"
         ))
     if isinstance(position, bool) or not isinstance(position, (int, float)) or (
         isinstance(position, float) and not position.is_integer()

@@ -3770,6 +3770,17 @@ def _window_truth_tax(
             "supplies the pre-costed window duration"
         )
     duration_s = float(window_meta["t_end"]) - float(window_meta["t_start"])
+    # C8 (2026-10-10): the per-GPU basis (section 6.1) needs the cell's GPU
+    # count; evaluate_window defaulted it to 1, so a tp cell's per-GPU values
+    # equaled its aggregates. An absent key is a single-GPU cell (CellWriter
+    # refuses tp and pd cells without one); a malformed value refuses.
+    gpu_count = cell_meta.get(_GPU_COUNT_CELL_KEY, 1)
+    if isinstance(gpu_count, bool) or not isinstance(gpu_count, int) or gpu_count < 1:
+        raise AnalysisError(
+            f"contrast #14 (truth_tax): cell.json {_GPU_COUNT_CELL_KEY!r} is "
+            f"{gpu_count!r} for {window_label}; the per-GPU basis needs an "
+            "integer >= 1"
+        )
 
     requests = _read_jsonl(window_dir / "requests.jsonl")
     if not requests:
@@ -3862,14 +3873,16 @@ def _window_truth_tax(
     )
     try:
         metrics = evaluate_window(
-            pd.DataFrame(records), baseline, duration_s=duration_s
+            pd.DataFrame(records), baseline, duration_s=duration_s,
+            gpu_count=gpu_count,
         )
     except GoodputError as exc:
         raise AnalysisError(
             f"contrast #14 (truth_tax): {window_label}: {exc}"
         ) from exc
     clock = _ttft_clock_record(
-        window_label, basis_counts, metrics, send_records, baseline, duration_s
+        window_label, basis_counts, metrics, send_records, baseline, duration_s,
+        gpu_count=gpu_count,
     )
     return metrics, None, clock
 

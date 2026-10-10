@@ -89,8 +89,12 @@ class FakeStreamResponse:
     def raise_for_status(self) -> None:
         pass
 
-    def iter_lines(self, decode_unicode: bool = True):
-        return iter(self._lines)
+    def iter_lines(self, decode_unicode: bool = False):
+        # requests 2.34.2: bytes lines unless decode_unicode=True (B1: the
+        # adapter now reads bytes and decodes UTF-8 itself).
+        if decode_unicode:
+            return iter(self._lines)
+        return iter(line.encode("utf-8") for line in self._lines)
 
 
 class FakeJSONResponse:
@@ -999,6 +1003,29 @@ def test_hf_oracle_crop_happens_even_on_generation_error(monkeypatch):
     assert "CUDA out of memory" in (resp.error or "")
     cache = model.generate_calls[0]["past_key_values"]
     assert cache.crop_calls == [len(prefix.split())]  # record, crop, continue
+
+
+@pytest.mark.parametrize(
+    "exc", [IndexError("x"), TypeError("x"), AttributeError("x"), KeyError("x")],
+    ids=["IndexError", "TypeError", "AttributeError", "KeyError"],
+)
+def test_hf_oracle_programming_error_fails_the_cell_b4(monkeypatch, exc):
+    """B4 (2026-10-10): a programming error raises out of generate() (the
+    cell fails) instead of becoming an error row on every request; the S0F-60
+    IndexError was recorded on every B3 row and the cells completed. The
+    finally block still crops the cache."""
+    adapter, model, _tok = _oracle(monkeypatch)
+    prefix = "corpus block"
+    adapter.preload_corpus_prefix(prefix)
+    model.raise_on_generate = exc
+
+    req = InferenceRequest(
+        prompt=prefix + " Question", temperature=0.0, max_tokens=8, request_id="q1"
+    )
+    with pytest.raises(type(exc)):
+        adapter.generate(req)
+    cache = model.generate_calls[0]["past_key_values"]
+    assert cache.crop_calls == [len(prefix.split())]
 
 
 def test_hf_oracle_mismatched_prefix_fails_closed(monkeypatch):

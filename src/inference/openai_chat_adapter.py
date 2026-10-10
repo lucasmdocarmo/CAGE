@@ -87,7 +87,7 @@ def _sse_lines(resp: Any) -> Iterator[str]:
     """The lines of a streamed SSE body, each yielded once it is complete.
 
     A chunked body (vLLM and SGLang over HTTP/1.1) keeps requests'
-    ``iter_lines``, unchanged. An UNFRAMED body, the pd proxy's HTTP/1.0
+    ``iter_lines`` and decodes each bytes line as UTF-8 (B1). An UNFRAMED body, the pd proxy's HTTP/1.0
     answer with no length and no chunking (pd_proxy.py), made ``iter_lines``
     block in ``read(512)`` until 512 bytes or the end of the stream, so the
     first token waited behind later ones and ``ttft_ms`` landed late (ADR-0138
@@ -99,7 +99,14 @@ def _sse_lines(resp: Any) -> Iterator[str]:
     """
     raw = getattr(resp, "raw", None)
     if raw is None or getattr(raw, "chunked", True):
-        yield from resp.iter_lines(decode_unicode=True)
+        # B1 (2026-10-10): bytes lines, decoded as UTF-8 here. With
+        # decode_unicode=True requests decoded a text/* body that names no
+        # charset as ISO-8859-1 and split it with str.splitlines, which also
+        # breaks on U+0085, U+2028 and \x1c-\x1e [V requests 2.34.2
+        # utils.get_encoding_from_headers, models.py:1018]; bytes.splitlines
+        # breaks on \r and \n only.
+        for line in resp.iter_lines():
+            yield line.decode("utf-8")
         return
     pending = b""
     while True:
@@ -121,6 +128,17 @@ def _sse_lines(resp: Any) -> Iterator[str]:
             yield line.rstrip(b"\r").decode("utf-8")
     if pending:
         yield pending.rstrip(b"\r").decode("utf-8")
+
+
+def _sse_json(data: str) -> Any:
+    """One SSE data payload as JSON. B1 (2026-10-10): a payload that is not
+    JSON raises ValueError, which every streaming loop records as an error
+    row. It was skipped, so a broken chunk dropped its text and the request
+    still read as served."""
+    try:
+        return json.loads(data)
+    except ValueError as exc:
+        raise ValueError(f"malformed SSE data payload (not JSON): {data[:120]!r}") from exc
 
 
 def _exc_text(exc: BaseException) -> str:
@@ -470,7 +488,7 @@ class OpenAIChatAdapter(InferenceEngine):
 
     def _stream_completion(self, request: InferenceRequest) -> InferenceResponse:
         """Stream a completion to measure TTFT and optionally collect usage telemetry."""
-        start_time = time.time()
+        start_time = time.perf_counter()
         first_token_time: Optional[float] = None
         full_text_parts: List[str] = []
         finish_reason: Optional[str] = None
@@ -501,11 +519,9 @@ class OpenAIChatAdapter(InferenceEngine):
                     data = line[5:].strip()
                     if data == "[DONE]":
                         break
-
-                    try:
-                        obj = json.loads(data)
-                    except Exception:
+                    if not data:
                         continue
+                    obj = _sse_json(data)
 
                     # S0F-25: an in-band error object is a failed request,
                     # never a chunk to skip (the except below records it).
@@ -536,14 +552,14 @@ class OpenAIChatAdapter(InferenceEngine):
                     if text_delta:
                         full_text_parts.append(text_delta)
                         if first_token_time is None:
-                            first_token_time = time.time()
+                            first_token_time = time.perf_counter()
 
                     if isinstance(choice, dict):
                         finish_reason = choice.get("finish_reason") or finish_reason
         except (requests.exceptions.RequestException, ValueError) as e:
             # ValueError covers a malformed/truncated streamed chunk (json parse) so a bad
             # response becomes a recorded error row, not a run-ending crash.
-            total_time = (time.time() - start_time) * 1000
+            total_time = (time.perf_counter() - start_time) * 1000
             return self._finalize(
                 InferenceResponse(
                     request_id=request.request_id,
@@ -559,8 +575,8 @@ class OpenAIChatAdapter(InferenceEngine):
                 cached_prompt_tokens=None,
             )
 
-        total_time_ms = (time.time() - start_time) * 1000
-        ttft_ms = ((first_token_time - start_time) * 1000) if first_token_time else total_time_ms
+        total_time_ms = (time.perf_counter() - start_time) * 1000
+        ttft_ms = ((first_token_time - start_time) * 1000) if first_token_time is not None else total_time_ms
         generated_text = "".join(full_text_parts)
 
         num_tokens, num_tokens_source = self._completion_token_count(
@@ -596,7 +612,7 @@ class OpenAIChatAdapter(InferenceEngine):
         Same TTFT semantics as the raw path: TTFT = wall-clock until the FIRST
         non-empty content delta chunk arrives.
         """
-        start_time = time.time()
+        start_time = time.perf_counter()
         first_token_time: Optional[float] = None
         full_text_parts: List[str] = []
         finish_reason: Optional[str] = None
@@ -628,11 +644,9 @@ class OpenAIChatAdapter(InferenceEngine):
                     data = line[5:].strip()
                     if data == "[DONE]":
                         break
-
-                    try:
-                        obj = json.loads(data)
-                    except Exception:
+                    if not data:
                         continue
+                    obj = _sse_json(data)
 
                     # S0F-25: an in-band error object is a failed request,
                     # never a chunk to skip (the except below records it).
@@ -664,7 +678,7 @@ class OpenAIChatAdapter(InferenceEngine):
                     if text_delta:
                         full_text_parts.append(text_delta)
                         if first_token_time is None:
-                            first_token_time = time.time()
+                            first_token_time = time.perf_counter()
 
                     token_logprobs.extend(self._extract_chat_logprobs(choice))
 
@@ -672,7 +686,7 @@ class OpenAIChatAdapter(InferenceEngine):
         except (requests.exceptions.RequestException, ValueError) as e:
             # Same guard as the raw path: a malformed/failed stream becomes a
             # recorded error row, not a run-ending crash.
-            total_time = (time.time() - start_time) * 1000
+            total_time = (time.perf_counter() - start_time) * 1000
             return self._finalize(
                 self._attach_logprob_stats(
                     InferenceResponse(
@@ -691,8 +705,8 @@ class OpenAIChatAdapter(InferenceEngine):
                 cached_prompt_tokens=None,
             )
 
-        total_time_ms = (time.time() - start_time) * 1000
-        ttft_ms = ((first_token_time - start_time) * 1000) if first_token_time else total_time_ms
+        total_time_ms = (time.perf_counter() - start_time) * 1000
+        ttft_ms = ((first_token_time - start_time) * 1000) if first_token_time is not None else total_time_ms
         generated_text = "".join(full_text_parts)
 
         num_tokens, num_tokens_source = self._completion_token_count(
@@ -727,7 +741,7 @@ class OpenAIChatAdapter(InferenceEngine):
         self, request: InferenceRequest, messages: List[Dict[str, str]]
     ) -> InferenceResponse:
         """Non-streaming chat completion (TTFT unobservable -> full response time)."""
-        start_time = time.time()
+        start_time = time.perf_counter()
 
         router_replica = None
         try:
@@ -740,7 +754,7 @@ class OpenAIChatAdapter(InferenceEngine):
             router_replica = resp.headers.get("x-router-replica")
 
             result = resp.json()
-            total_time_ms = (time.time() - start_time) * 1000
+            total_time_ms = (time.perf_counter() - start_time) * 1000
 
             choice = result.get("choices", [{}])[0]
             message = choice.get("message") or {}
@@ -786,7 +800,7 @@ class OpenAIChatAdapter(InferenceEngine):
             )
 
         except (requests.exceptions.RequestException, ValueError) as e:
-            total_time_ms = (time.time() - start_time) * 1000
+            total_time_ms = (time.perf_counter() - start_time) * 1000
             return self._finalize(
                 self._attach_logprob_stats(
                     InferenceResponse(
@@ -807,7 +821,7 @@ class OpenAIChatAdapter(InferenceEngine):
 
     def _raw_completion(self, request: InferenceRequest) -> InferenceResponse:
         """Non-streaming raw completion (TTFT unobservable -> full response time)."""
-        start_time = time.time()
+        start_time = time.perf_counter()
         payload = self._build_payload(request, stream=False)
 
         router_replica = None
@@ -821,7 +835,7 @@ class OpenAIChatAdapter(InferenceEngine):
             router_replica = resp.headers.get("x-router-replica")
 
             result = resp.json()
-            total_time_ms = (time.time() - start_time) * 1000
+            total_time_ms = (time.perf_counter() - start_time) * 1000
 
             choice = result.get("choices", [{}])[0]
             generated_text = choice.get("text", "")
@@ -871,7 +885,7 @@ class OpenAIChatAdapter(InferenceEngine):
             # ValueError covers an HTTP-200 truncated/malformed body (resp.json() raises
             # json.JSONDecodeError, a ValueError) so it becomes a recorded error row rather
             # than propagating out of the unguarded measured loop and aborting the baseline.
-            total_time_ms = (time.time() - start_time) * 1000
+            total_time_ms = (time.perf_counter() - start_time) * 1000
             return self._finalize(
                 InferenceResponse(
                     request_id=request.request_id,
@@ -940,7 +954,7 @@ class OpenAIChatAdapter(InferenceEngine):
         Note: retry semantics are NOT applied on the async path (single
         attempt), matching the pre-refactor behavior.
         """
-        start_time = time.time()
+        start_time = time.perf_counter()
 
         payload: Dict[str, Any] = {
             "model": self.model_name,
@@ -964,7 +978,7 @@ class OpenAIChatAdapter(InferenceEngine):
                     resp.raise_for_status()
                     result = await resp.json()
 
-                    total_time_ms = (time.time() - start_time) * 1000
+                    total_time_ms = (time.perf_counter() - start_time) * 1000
 
                     choice = result.get("choices", [{}])[0]
                     generated_text = choice.get("text", "")
@@ -1013,7 +1027,7 @@ class OpenAIChatAdapter(InferenceEngine):
                     return response
 
         except Exception as e:
-            total_time_ms = (time.time() - start_time) * 1000
+            total_time_ms = (time.perf_counter() - start_time) * 1000
             return self._finalize(
                 InferenceResponse(
                     request_id=request.request_id,
@@ -1068,7 +1082,7 @@ class OpenAIChatAdapter(InferenceEngine):
             url = self.completions_url
             payload = self._build_payload(request, stream=True)
 
-        start_time = time.time()
+        start_time = time.perf_counter()
         first_token_time: Optional[float] = None
         full_text_parts: List[str] = []
         finish_reason: Optional[str] = None
@@ -1098,10 +1112,9 @@ class OpenAIChatAdapter(InferenceEngine):
                         data = line[5:].strip()
                         if data == "[DONE]":
                             break
-                        try:
-                            obj = json.loads(data)
-                        except Exception:
+                        if not data:
                             continue
+                        obj = _sse_json(data)
 
                         # S0F-25: same rule as the sync loops.
                         engine_error = _engine_error_text(obj)
@@ -1147,14 +1160,14 @@ class OpenAIChatAdapter(InferenceEngine):
                         if text_delta:
                             full_text_parts.append(text_delta)
                             if first_token_time is None:
-                                first_token_time = time.time()
+                                first_token_time = time.perf_counter()
                                 if on_first_token is not None:
                                     on_first_token()
         except Exception as e:
             # Same guard as async_generate: a transport/parse failure becomes
             # a recorded error row, never a dispatcher-visible exception type
             # change.
-            total_time_ms = (time.time() - start_time) * 1000
+            total_time_ms = (time.perf_counter() - start_time) * 1000
             return self._finalize(
                 self._attach_logprob_stats(
                     InferenceResponse(
@@ -1173,10 +1186,10 @@ class OpenAIChatAdapter(InferenceEngine):
                 cached_prompt_tokens=None,
             )
 
-        total_time_ms = (time.time() - start_time) * 1000
+        total_time_ms = (time.perf_counter() - start_time) * 1000
         ttft_ms = (
             ((first_token_time - start_time) * 1000)
-            if first_token_time
+            if first_token_time is not None
             else total_time_ms
         )
         generated_text = "".join(full_text_parts)

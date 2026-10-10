@@ -207,21 +207,40 @@ class CampaignLayoutError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
-def _atomic_write_text(path: Path, text: str) -> Path:
+def _atomic_write_text(
+    path: Path,
+    text: str,
+    *,
+    before_publish: Callable[[Path], None] | None = None,
+) -> Path:
+    """tmp + ``os.replace``. ``before_publish(tmp)`` runs after the tmp is
+    complete and before the rename (O2, 2026-10-10: the session journals the
+    manifest's hash there, so a published manifest is always journaled)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + _TMP_SUFFIX)
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        if before_publish is not None:
+            before_publish(tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     return path
 
 
-def _atomic_write_json(path: Path, document: Mapping[str, Any]) -> Path:
+def _atomic_write_json(
+    path: Path,
+    document: Mapping[str, Any],
+    *,
+    before_publish: Callable[[Path], None] | None = None,
+) -> Path:
     try:
         text = json.dumps(document, indent=2, sort_keys=True) + "\n"
     except TypeError as exc:
         # No default=str: silent type drift is Topic-8 H3's defect, not a fix.
         raise CampaignLayoutError(f"{path.name}: not JSON-serializable: {exc}") from exc
-    return _atomic_write_text(path, text)
+    return _atomic_write_text(path, text, before_publish=before_publish)
 
 
 def _atomic_write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> Path:
@@ -294,6 +313,7 @@ def write_manifest(
     repo_dir: Path | None = None,
     git_provenance: Callable[[Path], tuple[str, bool]] | None = None,
     extra: Mapping[str, Any] | None = None,
+    before_publish: Callable[[Path], None] | None = None,
 ) -> Path:
     """Write §3 manifest.json at run START — every required field enforced.
 
@@ -303,6 +323,8 @@ def write_manifest(
     §3: amended never — an existing manifest.json refuses (a re-run is a new
     run_id). ``extra`` may add optional keys (e.g. the organizer's optional
     ``datasets`` narrowing) but can never shadow a required field.
+    ``before_publish`` is passed to the atomic writer (O2: the campaign
+    session journals the complete tmp file's hash before the rename).
     """
     run_root = Path(run_root)
     manifest_path = run_root / "manifest.json"
@@ -394,7 +416,7 @@ def write_manifest(
     missing = [k for k in MANIFEST_REQUIRED_FIELDS if manifest.get(k) in (None, "")]
     if missing:
         raise CampaignLayoutError(f"manifest missing §3 required field(s) {missing}")
-    return _atomic_write_json(manifest_path, manifest)
+    return _atomic_write_json(manifest_path, manifest, before_publish=before_publish)
 
 
 # ---------------------------------------------------------------------------

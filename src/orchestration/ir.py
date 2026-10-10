@@ -633,8 +633,9 @@ class CrossEncoderReranker:
     BAAI/bge-reranker-large; the 2026-10-08 run log warned "519 > 512" and
     "1311 > 512"), and sentence_transformers truncates a longer pair
     silently, so a long passage is ranked on its head alone. ``scored_pairs``
-    and ``truncated_pairs`` count both per run (the runner writes them into
-    the retrieval summary); the ranking itself is unchanged.
+    and ``truncated_pairs`` count both cumulatively over this object's life
+    (the runner writes their measured-stage increase into the retrieval
+    summary, C2 2026-10-10); the ranking itself is unchanged.
     """
 
     def __init__(self, model_name: str, *, device: str = "cpu") -> None:

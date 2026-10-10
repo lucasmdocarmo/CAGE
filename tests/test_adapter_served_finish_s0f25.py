@@ -89,6 +89,16 @@ STREAMS: Dict[str, List[Tuple[Any, ...]]] = {
         ("raw", {"choices": [{"text": "", "delta": {"content": ""}, "finish_reason": {"type": "stop"}}]}),
         ("done",),
     ],
+    # B1 (2026-10-10): a data payload that is not JSON, between two tokens
+    "malformed_payload": [
+        ("tok", "A"), ("verbatim", '{"choices": ['), ("tok", "C"),
+        ("finish", "stop"), ("done",),
+    ],
+    # B1: raw UTF-8 tokens (ensure_ascii=False) on a text/event-stream with no
+    # charset: a 2-byte character and U+2028 inside the answer
+    "non_ascii": [
+        ("tok_utf8", "Å"), ("tok_utf8", " x"), ("finish", "stop"), ("done",),
+    ],
 }
 
 #: scenario -> the finish_reason of a non-streamed body ("__absent__" omits the key).
@@ -160,6 +170,10 @@ class _Handler(BaseHTTPRequestHandler):
                 send(json.dumps({**choice("", event[1]), "usage": USAGE}))
             elif kind == "raw":
                 send(json.dumps(event[1]))
+            elif kind == "verbatim":
+                send(event[1])
+            elif kind == "tok_utf8":
+                send(json.dumps(choice(event[1], None), ensure_ascii=False))
             elif kind == "done":
                 send("[DONE]")
         self.wfile.write(b"0\r\n\r\n")
@@ -398,3 +412,51 @@ def test_served_set_and_source_pins() -> None:
     # every exception text goes through the never-empty helper
     assert "error=str(e)" not in code
     assert code.count("error=_exc_text(e)") == 6
+
+
+@pytest.mark.parametrize("label,chat,use_async", STREAM_PATHS, ids=[p[0] for p in STREAM_PATHS])
+def test_a_malformed_data_payload_is_an_error_row_b1(base_url, label, chat, use_async) -> None:
+    """B1 (2026-10-10): a payload that is not JSON was skipped, so the answer
+    lost its text and still read as served ("AC" with stop)."""
+    resp = _stream(base_url, "malformed_payload", chat, use_async)
+    assert resp.finish_reason == "error"
+    assert "malformed SSE data payload" in (resp.error or "")
+    assert resp.generated_text == ""
+
+
+@pytest.mark.parametrize("label,chat,use_async", STREAM_PATHS, ids=[p[0] for p in STREAM_PATHS])
+def test_a_non_ascii_answer_survives_the_chunked_reader_b1(base_url, label, chat, use_async) -> None:
+    """B1: the chunked sync branch decoded a text/event-stream with no charset
+    as ISO-8859-1 and split it with str.splitlines; the 2-byte character and
+    U+2028 broke the lines, and the sync paths lost or garbled the answer."""
+    resp = _stream(base_url, "non_ascii", chat, use_async)
+    assert resp.error is None
+    assert resp.finish_reason == "stop"
+    assert resp.generated_text == "Å x"
+
+
+def test_ttft_ignores_a_wall_clock_step_b5(base_url, monkeypatch) -> None:
+    """B5 (2026-10-10): the adapter clocked TTFT and latency on time.time(),
+    which a clock correction can move backwards mid-request. The durations now
+    use perf_counter, so a wall clock that steps back 10 s changes nothing."""
+    import types
+
+    real_time = time.time
+    calls = {"n": 0}
+
+    def stepping_wall_clock() -> float:
+        calls["n"] += 1
+        return real_time() - (10.0 if calls["n"] > 1 else 0.0)
+
+    monkeypatch.setattr(
+        oca, "time",
+        types.SimpleNamespace(
+            time=stepping_wall_clock, perf_counter=time.perf_counter,
+            monotonic=time.monotonic, sleep=time.sleep,
+        ),
+    )
+    for label, chat, use_async in STREAM_PATHS:
+        calls["n"] = 0
+        resp = _stream(base_url, "ok_stop", chat, use_async)
+        assert resp.error is None, label
+        assert 0.0 <= resp.ttft_ms <= resp.total_time_ms, (label, resp.ttft_ms)

@@ -824,9 +824,15 @@ def test_session_parses_gpu_count_and_ordinal_base_from_env(tmp_path: Path) -> N
     from src.orchestration.campaign_session import CampaignCellSession
 
     root = tmp_path / "results" / "camp1" / "a" / RUN_ID
+    # O4 (2026-10-10): a new run's manifest inputs are checked in from_cli.
+    manifest_env = {
+        "CAGE_PROVIDER": "test",
+        "CAGE_HARDWARE": "test-gpu x1",
+        "CAGE_DATASET_MANIFESTS_SHA256": "0" * 64,
+    }
     session = CampaignCellSession.from_cli(
         _session_args(root),
-        env={"CAGE_GPU_COUNT": "8", "CAGE_WINDOW_ORDINAL_BASE": "6"},
+        env={**manifest_env, "CAGE_GPU_COUNT": "8", "CAGE_WINDOW_ORDINAL_BASE": "6"},
     )
     assert session is not None
     assert session.gpu_count == 8
@@ -835,7 +841,7 @@ def test_session_parses_gpu_count_and_ordinal_base_from_env(tmp_path: Path) -> N
     assert session.window_key(1) == "ruler-07"
     assert session.window_dir(3).name == "window_ruler-09"
     # unset envs keep the pre-W4.2/W4.4 behavior byte-identical
-    legacy = CampaignCellSession.from_cli(_session_args(root), env={})
+    legacy = CampaignCellSession.from_cli(_session_args(root), env=manifest_env)
     assert legacy is not None
     assert legacy.gpu_count is None
     assert legacy.window_ordinal_base == 0

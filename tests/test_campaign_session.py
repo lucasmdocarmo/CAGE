@@ -679,8 +679,11 @@ def test_parse_budget_plan_refusals() -> None:
 
 def test_from_cli_parses_the_pins_and_the_constructor_validates(tmp_path: Path) -> None:
     root = _run_root(tmp_path)
+    # O4 (2026-10-10): a new run's manifest inputs are checked in from_cli,
+    # so an activation with no manifest yet carries MANIFEST_ENV.
     env = {
         **PRESSURE_ENV,
+        **MANIFEST_ENV,
         "CAGE_SLO_FLOORS_JSON": json.dumps(FLOORS),
         "CAGE_BUDGET_PLAN_JSON": json.dumps(_budget_plan_doc()),
     }
@@ -689,7 +692,9 @@ def test_from_cli_parses_the_pins_and_the_constructor_validates(tmp_path: Path) 
     assert session.slo_floors == FLOORS
     assert session.budget_plan == _budget_plan_doc()
     # unset pins keep the pre-W4 behavior: nothing recorded, nothing refused
-    legacy = cs.CampaignCellSession.from_cli(_pressure_args(root), env=PRESSURE_ENV)
+    legacy = cs.CampaignCellSession.from_cli(
+        _pressure_args(root), env={**PRESSURE_ENV, **MANIFEST_ENV}
+    )
     assert legacy is not None
     assert legacy.slo_floors is None and legacy.budget_plan is None
     # malformed pins refuse naming the env
@@ -1222,3 +1227,151 @@ def test_the_sentinel_is_journaled_before_its_rename(
     assert resumed.reset_incomplete_windows() == [1]
     _emit_regime(resumed, tmp_path / "resume", 1)
     assert cs.seal_campaign_run(resumed.run_root).is_file()
+
+
+# ---------------------------------------------------------------------------
+# S0F-86 LOW batch (2026-10-10): R1, O7, O8, O2, O4
+# ---------------------------------------------------------------------------
+
+
+def _open_loop_window(session: cs.CampaignCellSession, tmp_path: Path) -> Any:
+    """An open-loop window shaped the way the runner shapes one: request rows
+    carry the dispatcher columns (RequestRecord.to_row), evidence rows carry
+    record_index = the schedule index (run_experiment evidence_integrity_fields);
+    request 1 came back as an adapter error row (the response, not a raise)."""
+    from src.orchestration.load_generator import RequestRecord
+
+    records = [
+        RequestRecord(index=i, scheduled_offset_s=0.1 * i, scheduled_ts=100.0 + 0.1 * i)
+        for i in range(3)
+    ]
+    errors = {1: "Timeout on reading data from socket"}
+    rows = [
+        {"example_id": f"q{i}", "error": errors.get(i), **rec.to_row()}
+        for i, rec in enumerate(records)
+    ]
+    staging = tmp_path / "staging-open-loop"
+    staging.mkdir(parents=True, exist_ok=True)
+    (staging / "qa_evidence.jsonl").write_text(
+        "".join(
+            json.dumps({
+                "example_id": f"q{i}", "repeat_index": None, "record_index": i,
+                "ok": i not in errors, "error": errors.get(i), "generated_answer": "x",
+            }) + "\n"
+            for i in range(3)
+        ),
+        encoding="utf-8",
+    )
+    return session.emit_window(
+        ordinal=1, trial_seed=7, results_rows=rows, staging_dir=staging,
+        experiment_summary={
+            "experiment": {"stale_index_opt_in": False},
+            "consort": ZERO_CONSORT,
+        },
+        backend_metadata={"server_version": "0.0-test"},
+        telemetry_snapshot=None, t_start=0.0, t_end=4.0,
+    )
+
+
+def test_an_open_loop_error_row_reconciles_with_its_evidence_row_r1(tmp_path: Path) -> None:
+    """R1: the request row of an open-loop error carried no record_index while
+    its evidence row carried the schedule index, so reconciliation added a
+    stub and refused the window (3 results rows vs 4 evidence rows)."""
+    session = _session(tmp_path, env=MANIFEST_ENV, num_trials=2)
+    handle = _open_loop_window(session, tmp_path)
+    rows = [
+        json.loads(line)
+        for line in (handle.window_dir / "requests.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [r["record_index"] for r in rows] == [0, 1, 2]
+    evidence = (handle.window_dir / "qa_evidence.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(evidence) == 3  # no synthesized stub beside the real error evidence
+    assert cs.seal_campaign_run(session.run_root).is_file()
+
+
+def test_reconciliation_compares_identities_not_counts_o7(tmp_path: Path) -> None:
+    """O7: requests {a, b} against evidence {a, x} had equal counts and
+    emitted; the identities differ, so the window refuses naming both."""
+    session = _session(tmp_path, env=MANIFEST_ENV, num_trials=2)
+    requests = [
+        session._normalize_request_row({"example_id": eid}, i)
+        for i, eid in enumerate(("a", "b"))
+    ]
+    evidence = [
+        {"example_id": eid, "repeat_index": None, "record_index": None, "ok": True}
+        for eid in ("a", "x")
+    ]
+    with pytest.raises(cs.CampaignSessionError, match="only in results") as exc:
+        session._reconcile_evidence(requests, evidence, {"consort": dict(ZERO_CONSORT)})
+    assert "('b', None, None)" in str(exc.value)
+    assert "('x', None, None)" in str(exc.value)
+
+
+def test_a_stray_cell_json_tmp_is_removed_by_the_resume_reset_o8(tmp_path: Path) -> None:
+    """O8: a killed cell.json write leaves cell.json.tmp, which CellWriter
+    refuses as an unknown entry; the reset never cleaned it, so every later
+    emission of the cell failed."""
+    session = _session(tmp_path, env=MANIFEST_ENV, num_trials=2)
+    _emit_regime(session, tmp_path, 1)
+    stray = session.cell_dir / "cell.json.tmp"
+    stray.write_text('{"partial": ', encoding="utf-8")
+    resumed = _session(tmp_path, env=MANIFEST_ENV, num_trials=2)
+    assert resumed.reset_incomplete_windows() == []
+    assert not stray.exists()
+    _emit_regime(resumed, tmp_path / "resume", 2)
+    assert resumed.window_complete(1) and resumed.window_complete(2)
+    assert cs.seal_campaign_run(resumed.run_root).is_file()
+
+
+def test_a_crash_right_after_the_manifest_rename_still_seals_o2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """O2 (A8-1): the manifest was journaled after its rename, so a crash
+    between the two left a published manifest that no resumed process ever
+    journals (the reopen branch writes nothing) and the seal refused."""
+    session = _session(tmp_path, env=MANIFEST_ENV, num_trials=2)
+    real_replace = cs.os.replace
+
+    def crash_after_manifest(src: Any, dst: Any) -> None:
+        real_replace(src, dst)
+        if Path(dst).name == "manifest.json":
+            raise OSError("simulated crash right after the manifest rename")
+
+    monkeypatch.setattr(cs.os, "replace", crash_after_manifest)
+    with pytest.raises(OSError, match="manifest rename"):
+        _emit_regime(session, tmp_path, 1)
+    monkeypatch.setattr(cs.os, "replace", real_replace)
+    assert (session.run_root / "manifest.json").is_file()
+    assert "manifest.json" in cs.read_write_time_journal(session.run_root)
+    resumed = _session(tmp_path, env=MANIFEST_ENV, num_trials=2)
+    resumed.reset_incomplete_windows()
+    _emit_regime(resumed, tmp_path / "resume", 1)
+    assert cs.seal_campaign_run(resumed.run_root).is_file()
+
+
+def test_from_cli_checks_a_new_runs_manifest_inputs_before_serving_o4(tmp_path: Path) -> None:
+    """O4: provider, hardware, the dataset manifest sha and the campaign slug
+    were read only at the first emission, after the window served (attempt 3
+    lost 6 ladder windows to an unset CAGE_PROVIDER)."""
+    root = _run_root(tmp_path)
+    with pytest.raises(cs.CampaignSessionError) as exc:
+        cs.CampaignCellSession.from_cli(_pressure_args(root), env=PRESSURE_ENV)
+    text = str(exc.value)
+    for name in ("CAGE_PROVIDER", "CAGE_HARDWARE", "dataset_manifests_sha256"):
+        assert name in text
+    with pytest.raises(cs.CampaignSessionError, match="lowercase hex"):
+        cs.CampaignCellSession.from_cli(
+            _pressure_args(root),
+            env={**PRESSURE_ENV, **MANIFEST_ENV, "CAGE_DATASET_MANIFESTS_SHA256": "NOT-A-SHA"},
+        )
+    with pytest.raises(cs.CampaignSessionError, match="CAGE_CAMPAIGN_DATASETS"):
+        cs.CampaignCellSession.from_cli(
+            _pressure_args(root),
+            env={**PRESSURE_ENV, **MANIFEST_ENV, "CAGE_CAMPAIGN_DATASETS": "squad_v2"},
+        )
+    assert cs.CampaignCellSession.from_cli(
+        _pressure_args(root), env={**PRESSURE_ENV, **MANIFEST_ENV}
+    ) is not None
+    # A run whose manifest exists needs none of them.
+    _emit(_session(tmp_path, env=MANIFEST_ENV), tmp_path, 1)
+    assert cs.CampaignCellSession.from_cli(_pressure_args(root), env=PRESSURE_ENV) is not None

@@ -121,6 +121,30 @@ def unblind(sealed_map_path: Path, log_path: Path) -> dict[str, str]:
         raise AlreadyUnblindedError(
             f"already unblinded at {sealed['unblinded_utc']}: {sealed_map_path}"
         )
+    # S5 (2026-10-10): the log is the event record too. map_sha256 does not
+    # cover the stamp (the seal was hashed with it empty), so resetting
+    # unblinded_utc to null re-armed a seal whose UNBLIND event is logged.
+    if log_path.is_file():
+        for lineno, line in enumerate(
+            log_path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise BlindingError(
+                    f"unblind log line {lineno} is not valid JSON: {log_path}"
+                ) from exc
+            if (
+                isinstance(event, dict)
+                and event.get("event") == "UNBLIND"
+                and event.get("map_sha256") == sealed["map_sha256"]
+            ):
+                raise AlreadyUnblindedError(
+                    f"the unblind log records an UNBLIND event for this seal at "
+                    f"{event.get('utc')} (line {lineno}): {log_path}"
+                )
     mapping: dict[str, str] = dict(sealed["mapping"])  # type: ignore[arg-type]
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     event = {
@@ -133,8 +157,9 @@ def unblind(sealed_map_path: Path, log_path: Path) -> dict[str, str]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(event, sort_keys=True) + "\n")
-    # Stamp the seal AFTER the log write: a crash between the two leaves an
-    # extra log line, never a silently re-usable seal.
+    # Stamp the seal AFTER the log write: a crash between the two leaves a
+    # logged event, so the next unblind refuses (S5), never a silently
+    # re-usable seal.
     sealed["unblinded_utc"] = now
     sealed_map_path.write_text(json.dumps(sealed, indent=2) + "\n", encoding="utf-8")
     return {blind: real for real, blind in mapping.items()}

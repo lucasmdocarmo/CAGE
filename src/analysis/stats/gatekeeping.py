@@ -470,11 +470,25 @@ def evaluate_chain(
                     ),
                 )
             )
-        for m in members:
+        # S3 (2026-10-10): under "holm-any" a per-dataset decision (the gate
+        # its secondary families read) uses the member's Holm-adjusted p at
+        # the registered leg count, as the set verdict does; the raw p let a
+        # leg pass, and open its families, inside a set that failed.
+        if intra_set_rule == "holm-any":
+            legs = set_decision.registered_legs
+            decision_p = list(
+                _holm_at_registered_m(
+                    [m.p_value for m in members],
+                    len(legs) if legs is not None else len(members),
+                )
+            )
+        else:
+            decision_p = [m.p_value for m in members]
+        for m, p_decide in zip(members, decision_p):
             decision = PrimaryDecision(
                 endpoint=m.endpoint, dataset=m.dataset, p_value=m.p_value,
                 alpha=alpha,
-                passed=chain_open and m.p_value < alpha,
+                passed=chain_open and p_decide < alpha,
                 status=status,
             )
             gate_state[(m.endpoint, m.dataset)] = decision

@@ -466,8 +466,13 @@ class HFOracleAdapter(InferenceEngine):
             num_generated = int(out.shape[1]) - prompt_len
             answer, cut = _cut_at_stop(answer, stops)
             stop_matched = cut or bool(criterion is not None and criterion.matched)
-        except CorpusPrefixMismatchError:
-            raise  # a protocol violation, never an error row (the finally still crops)
+        except (CorpusPrefixMismatchError, IndexError, TypeError, AttributeError, KeyError):
+            # A protocol violation or a programming error fails the cell, never
+            # an error row (the finally still crops). B4 (2026-10-10): the
+            # S0F-60 IndexError was recorded on every B3 row of the 2026-10-08
+            # landing and the cells still completed. RuntimeError, CUDA out of
+            # memory included, stays a per-row error below.
+            raise
         except Exception as exc:  # noqa: BLE001 -- record, crop, continue (run_cag_reference.py)
             error = f"{type(exc).__name__}: {exc}"
         finally:

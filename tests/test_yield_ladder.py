@@ -303,7 +303,14 @@ def _no_machine_freeze_artifact(
 
 
 @pytest.fixture()
-def predicate_run(tmp_path: Path) -> Path:
+def predicate_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    # C1 (ADR-0163): #14 compiles on families.PRESSURE_DATASET (qasper) only;
+    # the shared predicate-chain tree lives on squad_v2, so it stands in as
+    # the pressure dataset here, as in tests/test_predicate_chain.py. This
+    # test failed at d6a2066 (ADR-0164 records the miss).
+    from src.analysis.stats import families
+
+    monkeypatch.setattr(families, "PRESSURE_DATASET", tpc.DATASET)
     run_dir = tpc._build_sealed_run(tmp_path)
     tpc._write_scoring_pass(run_dir)
     assert bpt.main([

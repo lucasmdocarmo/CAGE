@@ -301,7 +301,11 @@ def test_to_row_exposes_arrival_s_for_goodput():
         # arrival_s = INTENDED open-loop arrival per D6 §6.3 -- the exact
         # column src/analysis/goodput.py requires.
         assert row["arrival_s"] == offset
+        # R1 (2026-10-10): the schedule index rides the request row, the
+        # value the evidence row already carries (the #127 identity triple).
+        assert row["record_index"] == record.index
         assert set(row) == {
+            "record_index",
             "arrival_s",
             "scheduled_ts",
             "actual_send_ts",

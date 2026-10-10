@@ -381,9 +381,13 @@ class RequestRecord:
 
         ``arrival_s`` is the INTENDED arrival offset from run start — exactly
         what ``src/analysis/goodput.py`` requires ("arrival_s = INTENDED
-        open-loop arrival per §6.3").
+        open-loop arrival per §6.3"). ``record_index`` is the schedule index,
+        the same value the evidence row carries (R1, 2026-10-10): the request
+        row had none, so the #127 identity of an open-loop error row never
+        matched its evidence row and the window refused at emission.
         """
         return {
+            "record_index": self.index,
             "arrival_s": self.scheduled_offset_s,
             "scheduled_ts": self.scheduled_ts,
             "actual_send_ts": self.actual_send_ts,
