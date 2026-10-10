@@ -349,6 +349,10 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         if a[0] == "rungs":
             print("1 0.5"); sys.exit(0)
         if a[0] == "calibrate-rungs":
+            # ADR-0160 (S0 attempt 2): the ladder windows run the campaign seam, which
+            # refuses without the provider and hardware env (campaign_session.py)
+            if not os.environ.get("CAGE_PROVIDER") or not os.environ.get("CAGE_HARDWARE"):
+                print("campaign mode refused: CAGE_PROVIDER / CAGE_HARDWARE unset", file=sys.stderr); sys.exit(1)
             out = Path(a[a.index("--out") + 1]); out.parent.mkdir(parents=True, exist_ok=True)
             fail = os.environ.get("CAGE_TEST_RUNGS_FAIL") == "1"
             label = "LADDER_EXHAUSTED" if fail else "ESTIMATED"
@@ -1140,6 +1144,11 @@ def test_the_run_job_states_provider_and_hardware_for_the_campaign_seam(world: D
     assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
     cmd = (world["home"] / ".cage_jobs" / "run.cmd").read_text(encoding="utf-8")
     assert "CAGE_PROVIDER=runpod CAGE_HARDWARE='NVIDIA H100 80GB HBM3 x 1' " in cmd, cmd[:400]
+    # ADR-0160 (S0 attempt 2, 2026-10-10): the rung ladder's windows run the same
+    # seam; the job carries the same env and the same poison strip as the run job
+    rungs = (world["home"] / ".cage_jobs" / "calibrate_rungs_vllm.cmd").read_text(encoding="utf-8")
+    assert "CAGE_PROVIDER=runpod CAGE_HARDWARE='NVIDIA H100 80GB HBM3 x 1' " in rungs, rungs[:400]
+    assert "env -u CAGE_SLO_FLOORS_JSON" in rungs
 
 
 def test_pod_results_dir_relinks_the_results_root_and_the_cells_land_there(world: Dict[str, Path], tmp_path: Path) -> None:

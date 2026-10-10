@@ -849,7 +849,11 @@ PY
   for e in $CALIBRATE; do
     out="results/calibration/rungs_${EXP}_${e}.json"
     local jrc=0
-    job_run "calibrate_rungs_$e" "$CALIBRATE_RUNGS_BOUND_S" "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT$POD_ENGINE_ENV && $POD_PYTHON scripts/3_run/run_campaign.py calibrate-rungs --session $SESSION --engine $e --floor-table results/calibration/floor_table.json --calibration results/calibration/${EXP}_${e}.json --rungs $rungs$qm2$reh2 --seed $SEED --freeze-file $POD_FREEZE_FILE --out $out --out-root $rungs_root" "$LAND/logs/setup" || jrc=1
+    # S0 attempt 2 (2026-10-10 01:00 UTC, ADR-0160): the ladder windows run the
+    # runner in campaign mode, so the job carries the same seam env as the run
+    # job (CAGE_PROVIDER, CAGE_HARDWARE, the poison strip); without them every
+    # probe refused before its first request and all six rungs read PROBE_FAILED.
+    job_run "calibrate_rungs_$e" "$CALIBRATE_RUNGS_BOUND_S" "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT$POD_ENGINE_ENV && env $RUN_ENV_UNSET CAGE_PROVIDER=runpod CAGE_HARDWARE='$GPU_ID x $GPU_COUNT' $POD_PYTHON scripts/3_run/run_campaign.py calibrate-rungs --session $SESSION --engine $e --floor-table results/calibration/floor_table.json --calibration results/calibration/${EXP}_${e}.json --rungs $rungs$qm2$reh2 --seed $SEED --freeze-file $POD_FREEZE_FILE --out $out --out-root $rungs_root" "$LAND/logs/setup" || jrc=1
     if [ "$jrc" -ne 0 ]; then
       # calibrate-rungs exits 1 when a rung is not ESTIMATED and still writes
       # the artifact: fetch it so the labels are readable on the Mac (review LOW 10).
