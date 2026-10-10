@@ -1008,6 +1008,34 @@ class TestCalibrateRungs:
         assert doc["workload"]["arm"] == "gold-fresh" and doc["workload"]["replay"] is True
         assert doc["workload"]["seq_tokens"] == _ANCHOR_SEQ_TOKENS and doc["workload"]["window_mode"] == "duration"
 
+    def test_partial_artifact_lands_after_every_rung_and_the_loader_refuses_it(self, tmp_path):
+        # ADR-0162 (S0 attempt 2): a rung job killed at its bound after hours left
+        # no artifact. Every finished rung is written at once, marked incomplete;
+        # the loader refuses the partial file, so it is forensics only.
+        class DiesOnTheSmallestClass(FakeWorld):
+            def __call__(self, argv, env):
+                if "--campaign-root" in list(argv) and env.get("CAGE_CELL_ARM") == "retr-trunc":
+                    raise RuntimeError("pod job killed at its bound")
+                return super().__call__(argv, env)
+
+        world = DiesOnTheSmallestClass(cap=6.0, cap_by_arm={"retr-trunc": 12.0})
+        partial = tmp_path / "rungs_partial.json"
+        with pytest.raises(RuntimeError, match="killed"):
+            _calibrate(tmp_path, world, _two_class_grid(), partial_out=partial)
+        doc = json.loads(partial.read_text(encoding="utf-8"))
+        assert doc["complete"] is False and doc["schema"] == rc.RUNG_CALIBRATION_SCHEMA
+        assert doc["rungs"] and all(rec["label"] == "ESTIMATED" for rec in doc["rungs"].values())
+        assert doc["classes"]["348"]["rungs"] == {}
+        with pytest.raises(rc.PlanError, match="INCOMPLETE"):
+            rc.load_rung_calibration(partial)
+        # a run that finishes writes complete: true and loads
+        full_dir = tmp_path / "full"
+        world2 = FakeWorld(cap=6.0, cap_by_arm={"retr-trunc": 12.0})
+        full = _calibrate(full_dir, world2, _two_class_grid(), partial_out=full_dir / "rungs.json")
+        assert full["complete"] is True
+        (full_dir / "rungs_final.json").write_text(json.dumps(full), encoding="utf-8")
+        assert rc.load_rung_calibration(full_dir / "rungs_final.json").small_lambda_at(0.5) is not None
+
     def test_every_window_is_the_gold_cell_under_the_rung_relaunch(self, tmp_path):
         world = FakeWorld(cap=6.0)
         doc = _calibrate(tmp_path, world, _pressure_grid())

@@ -247,7 +247,12 @@ start_server() {
         # we force a restart rather than risk mislabeling the arm's data.
         live_cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
         dials_match=true
-        [[ "$live_cmd" == *"--mem-fraction-static $mem_fraction"* ]] || dials_match=false
+        # ADR-0162: under a token cap the fraction may have been raised to hold
+        # the cap (see the retry below), so the cap is the binding dial there and
+        # the fraction is compared only on a fraction-only launch.
+        if [ -z "${CAGE_SGLANG_MAX_TOTAL_TOKENS:-}" ]; then
+            [[ "$live_cmd" == *"--mem-fraction-static $mem_fraction"* ]] || dials_match=false
+        fi
         [[ "$live_cmd" == *"--context-length ${VLLM_MAX_MODEL_LEN}"* ]] || dials_match=false
         # The token-cap budget knob (T2.1) is a dial too: reusing a server
         # launched under a DIFFERENT budget (or none) labels data with a pool
@@ -297,6 +302,94 @@ start_server() {
         fi
     fi
 
+    # ADR-0162 (S0 attempt 2, 2026-10-10): --max-total-tokens only CAPS the pool
+    # the fraction dial yields, never grows it. The r=1.25 anchor rung asked
+    # 298,687 tokens and SGLang allocated 282,583 at 0.90 on the H100 [V], a
+    # 5.4% shortfall above the 5% parity tolerance that no earlier start had
+    # exercised. When a cap is requested, the launch is checked against the
+    # realized pool (S0F-24 record) and retried ONCE at a raised fraction when
+    # the start came up short; a second shortfall fails the start, so no window
+    # ever runs under a pool below its plan. A start that never gets ready
+    # returns its failure as before (its cause is unknown; a blind retry would
+    # spend another full timeout on a guess).
+    local attempt=1 rc=0 raised
+    while :; do
+        rc=0; _sglang_launch_once "$model" "$want_prefix_cache" "$mem_fraction" || rc=$?
+        [ "$rc" -eq 0 ] || return "$rc"
+        [ -n "${CAGE_SGLANG_MAX_TOTAL_TOKENS:-}" ] || return 0
+        _sglang_pool_covers_cap && return 0
+        if [ "$attempt" -ge 2 ]; then
+            echo -e "${RED}✗ KV pool still short of --max-total-tokens ${CAGE_SGLANG_MAX_TOTAL_TOKENS} at --mem-fraction-static $mem_fraction (realized ${SGLANG_REALIZED_TOKENS:-none} tokens): refusing to serve a smaller pool than planned (ADR-0162)${NC}"
+            stop_server
+            return 1
+        fi
+        # Review 2026-10-10 (MEDIUM 2, LOW 3): a failed computation, or one that
+        # lands on the fraction already tried, must not leave the short server
+        # serving or repeat the identical start; both refuse at once.
+        raised="$(_sglang_raised_fraction "$mem_fraction")" || raised=""
+        if [ -z "$raised" ] || [ "$raised" = "$(printf '%.3f' "$mem_fraction")" ]; then
+            echo -e "${RED}✗ KV pool short of --max-total-tokens ${CAGE_SGLANG_MAX_TOTAL_TOKENS} at --mem-fraction-static $mem_fraction (realized ${SGLANG_REALIZED_TOKENS:-none} tokens) and no higher fraction is available (CAGE_SGLANG_MEM_FRACTION_MAX=${CAGE_SGLANG_MEM_FRACTION_MAX:-0.95}): refusing to serve a smaller pool than planned (ADR-0162)${NC}"
+            stop_server
+            return 1
+        fi
+        echo -e "${YELLOW}KV pool short of --max-total-tokens ${CAGE_SGLANG_MAX_TOTAL_TOKENS} at --mem-fraction-static $mem_fraction (realized ${SGLANG_REALIZED_TOKENS:-none} tokens); restarting once at $raised (ADR-0162)${NC}"
+        stop_server
+        mem_fraction="$raised"
+        attempt=2
+    done
+}
+
+_sglang_pool_covers_cap() {
+    # 0 when the realized pool (CURRENT.kvpool.json, S0F-24) holds the requested
+    # token cap; sets SGLANG_REALIZED_TOKENS. Without a usable record the pool
+    # cannot be compared here: gate (j) reads the start log later, so this
+    # returns 0 with a note instead of restarting on a capture failure.
+    local rec="$LOG_DIR/CURRENT.kvpool.json"
+    SGLANG_REALIZED_TOKENS=""
+    [ -f "$rec" ] || { echo "  (no KV pool record to compare with the token cap; gate (j) decides)"; return 0; }
+    SGLANG_REALIZED_TOKENS="$(python3 -c 'import json, sys; d = json.load(open(sys.argv[1], encoding="utf-8")); t = d.get("tokens"); print(int(t) if isinstance(t, (int, float)) and not isinstance(t, bool) else "")' "$rec" 2>/dev/null || true)"
+    [ -n "$SGLANG_REALIZED_TOKENS" ] || { echo "  (KV pool record carries no token count; gate (j) decides)"; return 0; }
+    [ "$SGLANG_REALIZED_TOKENS" -ge "${CAGE_SGLANG_MAX_TOTAL_TOKENS}" ]
+}
+
+_sglang_raised_fraction() {
+    # The fraction that holds the cap: the current one plus the shortfall in
+    # bytes (realized bytes per token from the record) over the device total,
+    # plus 0.005, capped at CAGE_SGLANG_MEM_FRACTION_MAX (0.95: SGLang budgets
+    # activations from 1 - F). Without a readable record, the cap.
+    local f="$1" rec="$LOG_DIR/CURRENT.kvpool.json" total
+    total="$(cage_gpu_total_mib || true)"
+    python3 - "$f" "${CAGE_SGLANG_MAX_TOTAL_TOKENS}" "${SGLANG_REALIZED_TOKENS:-}" "$rec" "${total:-}" "${CAGE_SGLANG_MEM_FRACTION_MAX:-0.95}" <<'PY'
+import json
+import sys
+
+f, cap, realized, rec, total_mib, fmax = sys.argv[1:7]
+f = float(f); cap = int(cap)
+try:
+    fmax = float(fmax)
+    if not (0.0 < fmax <= 1.0):
+        raise ValueError(fmax)
+except ValueError:
+    print(f"  (CAGE_SGLANG_MEM_FRACTION_MAX={fmax!r} is not a fraction in (0, 1]; using 0.95)", file=sys.stderr)
+    fmax = 0.95
+raised = fmax
+try:
+    d = json.load(open(rec, encoding="utf-8"))
+    tokens = int(d["tokens"]); nbytes = int(d["bytes"]); total = float(total_mib) * 1024 * 1024
+    if realized and tokens > 0 and nbytes > 0 and total > 0:
+        per_token = nbytes / tokens
+        raised = min(fmax, max(f + 0.005, f + (cap - int(realized)) * per_token / total + 0.005))
+except Exception:
+    pass
+print(f"{raised:.3f}")
+PY
+}
+
+_sglang_launch_once() {
+    # One launch of the composed argv, the readiness wait and the pool capture
+    # (the body of start_server before ADR-0162); $1 model, $2 want_prefix_cache,
+    # $3 the --mem-fraction-static to pass.
+    local model="$1" want_prefix_cache="$2" mem_fraction="$3"
     local timestamp log_file
     timestamp=$(date +%Y%m%d_%H%M%S)
     log_file="$LOG_DIR/sglang_${model//\//_}_${timestamp}.log"

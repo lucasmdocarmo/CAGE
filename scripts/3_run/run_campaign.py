@@ -5068,6 +5068,13 @@ def load_rung_calibration(path: Path) -> RungCalibration:
         )
     if doc.get("confirmatory") is not False:
         problems.append("confirmatory must be the literal false")
+    if doc.get("complete") is False:
+        # ADR-0162: a per-rung partial write of a calibrate-rungs job that never
+        # finished (killed at its bound); its rungs are forensics, never a plan input
+        problems.append(
+            "the artifact is INCOMPLETE (complete: false): calibrate-rungs did not finish; "
+            "re-run it (a killed job leaves this partial record for forensics)"
+        )
     raw_engine = doc.get("engine")
     engine = ENGINE_OF_BACKEND.get(raw_engine) if isinstance(raw_engine, str) else None
     if engine is None:
@@ -7529,9 +7536,14 @@ def calibrate_rungs(
     anchor_only: bool = False,
     exec_fn: Callable[[Sequence[str], Mapping[str, str]], int] = _exec,
     log: Callable[[str], None] = print,
+    partial_out: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Measure lambda* per budget rung for ONE engine and return the
     ``cage-rung-calibration-v2`` artifact document (the caller writes it).
+    With ``partial_out`` the document is also written after EVERY rung with
+    ``complete: false`` (ADR-0162: a rung job killed at its bound after hours
+    of probing left nothing behind on 2026-10-10); the loader refuses an
+    incomplete artifact, so the partial file is forensics, never a plan input.
 
     Two classes, the ANCHOR first (ADR-0154) and then the engine's SMALLEST
     executable class below it (ADR-0156; skipped when the engine serves the
@@ -7687,6 +7699,7 @@ def calibrate_rungs(
                     "start_qps": None,
                     "steps": [],
                 }
+                _flush_partial()
                 previous_lambda = None
                 continue
             manifest_rec = manifests.get(cell.dataset)
@@ -7795,6 +7808,7 @@ def calibrate_rungs(
                     "error": str(exc),
                     "steps": step_records,
                 }
+                _flush_partial()
                 previous_lambda = None
                 continue
             log(
@@ -7817,6 +7831,110 @@ def calibrate_rungs(
                 ).hexdigest(),
             }
             previous_lambda = estimate.lambda_star_qps
+            _flush_partial()
+
+    def _build_doc(complete: bool) -> Dict[str, Any]:
+        gold_cell = anchor_cells[0]
+        classes: Dict[str, Dict[str, Any]] = {
+            str(anchor_tokens): {
+                "role": "anchor",
+                "arm": DEMAND_ANCHOR_ARM,
+                "baseline_id": gold_cell.baseline_id,
+                "family": "F2",
+                "prefix_mode": "OFF",
+                "seq_tokens": anchor_tokens,
+                "dataset": gold_cell.dataset,
+                "rungs": anchor_records,
+            }
+        }
+        if small_cells:
+            small = small_cells[0]
+            small_seq = demand_seq_tokens(grid, small.spec)
+            classes[str(small_seq)] = {
+                "role": "smallest",
+                "arm": small.spec.arm,
+                "baseline_id": small.baseline_id,
+                "family": small.spec.family,
+                "prefix_mode": "OFF" if _prefix_off(small.spec) else "ON",
+                "seq_tokens": small_seq,
+                "dataset": small.dataset,
+                "corpus_budget_tokens": small.spec.corpus_budget_tokens,
+                "rungs": small_records,
+                "note": (
+                    None if _prefix_off(small.spec) else
+                    "a prefix-ON class replays its pool with the cache warm, so its ladder "
+                    "over-reads the sustainable rate [D]"
+                ),
+            }
+        return {
+            "schema": RUNG_CALIBRATION_SCHEMA,
+            "procedure_version": PROCEDURE_VERSION,
+            "confirmatory": False,
+            # ADR-0162: false on the per-rung partial writes; the loader refuses them
+            "complete": complete,
+            "adr": RUNG_CALIBRATION_ADR,
+            "two_anchor_adr": TWO_ANCHOR_ADR,
+            "finding": RUNG_CALIBRATION_FINDING,
+            "engine": BACKEND_OF_ENGINE[engine],
+            "model": HF_ID_OF_SLUG[grid.model],
+            "session": session,
+            "rehearsal_n": rehearsal_n,
+            "seed": seed,
+            "anchor_seq_tokens": anchor_tokens,
+            "workload": {
+                "arm": DEMAND_ANCHOR_ARM,
+                "baseline_id": gold_cell.baseline_id,
+                "dataset": gold_cell.dataset,
+                "num_queries": cell_num_queries(grid, gold_cell)[1],
+                "seq_tokens": anchor_tokens,
+                "prefix_mode": "OFF",
+                "query_manifest": None if manifests.get(gold_cell.dataset) is None else manifests[gold_cell.dataset]["path"],
+                "window_mode": "duration",
+                "replay": True,
+                "replay_note": (
+                    "the pool is replayed modulo under CAGE_ALLOW_REPLAY=1, the cal-v2 probe's "
+                    "own convention (calibrate_cell.probe_rate); the V3 pool guard refuses an "
+                    "arrival count above the prepared pool, so calibration windows run in "
+                    "duration mode and never enter confirmatory analysis"
+                ),
+            },
+            "ladder": {
+                "window_s": PROBE_WINDOW_S,
+                "warmup_s": PROBE_WARMUP_S,
+                "factor": PROBE_LADDER_FACTOR,
+                "max_steps": PROBE_MAX_STEPS,
+                "bisect_steps": PROBE_BISECT_STEPS,
+                "attainment_min": PROBE_ATTAINMENT_MIN,
+                "start_rule": START_QPS_RULE,
+                "start_decode_tokens": LADDER_START_DECODE_TOKENS,
+                "chain_divisor": LADDER_CHAIN_DIVISOR,
+                "floor_start_qps": floor_start,
+                "first_start_qps": first_start,
+                "floor": dict(floors),
+                "floor_artifact": cal_header["artifacts"][engine],
+            },
+            "interpolation": {
+                "adr": TWO_ANCHOR_ADR,
+                "rule": (
+                    "lambda(s) = lambda_g x (s_g / s)^alpha, alpha = ln(lambda_m / lambda_g) / "
+                    "ln(s_g / s_m) per rung; the plan computes alpha from the two anchors above"
+                ),
+                "anchor_only": anchor_only,
+            },
+            "stop_failures": stop_failures,
+            "rungs": anchor_records,
+            "classes": classes,
+        }
+
+    def _flush_partial() -> None:
+        # ADR-0162: every finished rung lands on disk at once; a job killed at
+        # its bound leaves the rungs it measured, marked incomplete.
+        if partial_out is None:
+            return
+        partial_out.parent.mkdir(parents=True, exist_ok=True)
+        partial_out.write_text(
+            json.dumps(_build_doc(False), indent=2, sort_keys=False) + "\n", encoding="utf-8"
+        )
 
     try:
         _ladder("anchor", anchor_cells, anchor_records)
@@ -7826,95 +7944,7 @@ def calibrate_rungs(
         if resident is not None:
             _stop(resident, "end of calibration")
 
-    gold_cell = anchor_cells[0]
-    classes: Dict[str, Dict[str, Any]] = {
-        str(anchor_tokens): {
-            "role": "anchor",
-            "arm": DEMAND_ANCHOR_ARM,
-            "baseline_id": gold_cell.baseline_id,
-            "family": "F2",
-            "prefix_mode": "OFF",
-            "seq_tokens": anchor_tokens,
-            "dataset": gold_cell.dataset,
-            "rungs": anchor_records,
-        }
-    }
-    if small_cells:
-        small = small_cells[0]
-        small_seq = demand_seq_tokens(grid, small.spec)
-        classes[str(small_seq)] = {
-            "role": "smallest",
-            "arm": small.spec.arm,
-            "baseline_id": small.baseline_id,
-            "family": small.spec.family,
-            "prefix_mode": "OFF" if _prefix_off(small.spec) else "ON",
-            "seq_tokens": small_seq,
-            "dataset": small.dataset,
-            "corpus_budget_tokens": small.spec.corpus_budget_tokens,
-            "rungs": small_records,
-            "note": (
-                None if _prefix_off(small.spec) else
-                "a prefix-ON class replays its pool with the cache warm, so its ladder "
-                "over-reads the sustainable rate [D]"
-            ),
-        }
-    return {
-        "schema": RUNG_CALIBRATION_SCHEMA,
-        "procedure_version": PROCEDURE_VERSION,
-        "confirmatory": False,
-        "adr": RUNG_CALIBRATION_ADR,
-        "two_anchor_adr": TWO_ANCHOR_ADR,
-        "finding": RUNG_CALIBRATION_FINDING,
-        "engine": BACKEND_OF_ENGINE[engine],
-        "model": HF_ID_OF_SLUG[grid.model],
-        "session": session,
-        "rehearsal_n": rehearsal_n,
-        "seed": seed,
-        "anchor_seq_tokens": anchor_tokens,
-        "workload": {
-            "arm": DEMAND_ANCHOR_ARM,
-            "baseline_id": gold_cell.baseline_id,
-            "dataset": gold_cell.dataset,
-            "num_queries": cell_num_queries(grid, gold_cell)[1],
-            "seq_tokens": anchor_tokens,
-            "prefix_mode": "OFF",
-            "query_manifest": None if manifests.get(gold_cell.dataset) is None else manifests[gold_cell.dataset]["path"],
-            "window_mode": "duration",
-            "replay": True,
-            "replay_note": (
-                "the pool is replayed modulo under CAGE_ALLOW_REPLAY=1, the cal-v2 probe's "
-                "own convention (calibrate_cell.probe_rate); the V3 pool guard refuses an "
-                "arrival count above the prepared pool, so calibration windows run in "
-                "duration mode and never enter confirmatory analysis"
-            ),
-        },
-        "ladder": {
-            "window_s": PROBE_WINDOW_S,
-            "warmup_s": PROBE_WARMUP_S,
-            "factor": PROBE_LADDER_FACTOR,
-            "max_steps": PROBE_MAX_STEPS,
-            "bisect_steps": PROBE_BISECT_STEPS,
-            "attainment_min": PROBE_ATTAINMENT_MIN,
-            "start_rule": START_QPS_RULE,
-            "start_decode_tokens": LADDER_START_DECODE_TOKENS,
-            "chain_divisor": LADDER_CHAIN_DIVISOR,
-            "floor_start_qps": floor_start,
-            "first_start_qps": first_start,
-            "floor": dict(floors),
-            "floor_artifact": cal_header["artifacts"][engine],
-        },
-        "interpolation": {
-            "adr": TWO_ANCHOR_ADR,
-            "rule": (
-                "lambda(s) = lambda_g x (s_g / s)^alpha, alpha = ln(lambda_m / lambda_g) / "
-                "ln(s_g / s_m) per rung; the plan computes alpha from the two anchors above"
-            ),
-            "anchor_only": anchor_only,
-        },
-        "stop_failures": stop_failures,
-        "rungs": anchor_records,
-        "classes": classes,
-    }
+    return _build_doc(True)
 
 
 def _cmd_rungs(args: argparse.Namespace) -> int:
@@ -7934,6 +7964,7 @@ def _cmd_calibrate_rungs(args: argparse.Namespace) -> int:
     if args.launcher_cmd:
         override = tuple(shlex.split(args.launcher_cmd))
         launcher_cmds = {engine: override for engine in DEFAULT_LAUNCHER_CMDS}
+    out = Path(args.out)
     doc = calibrate_rungs(
         args.session,
         args.engine,
@@ -7949,8 +7980,8 @@ def _cmd_calibrate_rungs(args: argparse.Namespace) -> int:
         launcher_cmds=launcher_cmds,
         start_qps=args.start_qps,
         anchor_only=args.anchor_only,
+        partial_out=out,  # ADR-0162: the same file, incomplete until this final write
     )
-    out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(doc, indent=2, sort_keys=False) + "\n", encoding="utf-8")
     not_estimated: Dict[str, str] = {}

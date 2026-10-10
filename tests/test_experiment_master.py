@@ -59,6 +59,16 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$host" ] || { echo "fake ssh: no host" >&2; exit 255; }
+# ADR-0161: an outage injector; .ssh_fail holds a count of round trips that
+# fail like a timed-out channel (exit 255, nothing run).
+if [ -s "$CAGE_TEST_HOME/.ssh_fail" ]; then
+  n=$(cat "$CAGE_TEST_HOME/.ssh_fail")
+  if [ "$n" -gt 0 ]; then
+    echo $(( n - 1 )) > "$CAGE_TEST_HOME/.ssh_fail"
+    echo "ssh: connect to host $host port 2222: Operation timed out" >&2
+    exit 255
+  fi
+fi
 echo "ssh $host :: $*" >> "$CAGE_TEST_LOG"
 export HOME="$CAGE_TEST_HOME"
 cd "$HOME"
@@ -77,6 +87,15 @@ while [ $# -gt 0 ]; do
     *) args+=("$1"); shift ;;
   esac
 done
+# ADR-0161: the same injector for scp (.scp_fail)
+if [ -s "$CAGE_TEST_HOME/.scp_fail" ]; then
+  n=$(cat "$CAGE_TEST_HOME/.scp_fail")
+  if [ "$n" -gt 0 ]; then
+    echo $(( n - 1 )) > "$CAGE_TEST_HOME/.scp_fail"
+    echo "scp: Connection closed" >&2
+    exit 255
+  fi
+fi
 echo "scp ${args[*]}" >> "$CAGE_TEST_LOG"
 resolve() { p="${1#*:}"; case "$p" in /*) echo "$p" ;; *) echo "$CAGE_TEST_HOME/$p" ;; esac; }
 src="${args[0]}"; dst="${args[1]}"
@@ -1044,6 +1063,9 @@ def test_pod_jobs_that_start_engines_put_the_driver_venv_first_on_path(world: Di
         assert cmd.startswith(f"cd {world['pod_repo']} && {prefix}"), (name, cmd[:160])
     for name in ("validate_vllm", "calibrate_vllm", "calibrate_rungs_vllm"):
         assert "VLLM_START_TIMEOUT=600" in (world["home"] / ".cage_jobs" / f"{name}.cmd").read_text(encoding="utf-8")
+    # ADR-0162: the SGLang start timeout rides every engine job beside the vLLM one
+    for name in ("validate_vllm", "calibrate_vllm", "calibrate_rungs_vllm", "run"):
+        assert " SGLANG_START_TIMEOUT=600" in (world["home"] / ".cage_jobs" / f"{name}.cmd").read_text(encoding="utf-8"), name
     # preflight gate (p) judges exactly the datasets stage 3 staged (the profile's CHARTER_DATASETS)
     assert "CAGE_DATASETS=squad_v2,musique,qasper" in (world["home"] / ".cage_jobs" / "validate_vllm.cmd").read_text(encoding="utf-8")
     assert "cage-env/bin" not in (world["home"] / ".cage_jobs" / "setup.cmd").read_text(encoding="utf-8")
@@ -1194,6 +1216,32 @@ def test_the_pod_suite_runs_once_per_shipped_sha_and_again_after_a_reship(world:
     proc = _master(world, "--only", "validate", "--redo")
     assert proc.returncode == 0, proc.stdout[-2000:]
     assert "already passed" not in proc.stdout and submits() == 2
+
+
+def test_a_transient_ssh_failure_is_retried_and_a_persistent_one_fails_the_step(world: Dict[str, Path]) -> None:
+    # ADR-0161 (S0 attempt 2, 2026-10-10 01:29Z): one timed-out channel ended the
+    # run while the pod job ran on. Idempotent round trips (pssh, pscp_to,
+    # pscp_from) get three attempts on exit 255; a remote command's own failure
+    # is still reported after one.
+    assert _master(world, "--yes", "provision", "--to", "provision").returncode == 0
+    (world["home"] / ".scp_fail").write_text("1\n", encoding="utf-8")   # the tarball copy times out once
+    (world["home"] / ".ssh_fail").write_text("1\n", encoding="utf-8")   # the unpack round trip times out once
+    proc = _master(world, "--from", "ship", "--to", "ship", CAGE_SSH_RETRY_S="0")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert proc.stdout.count("[retry] ssh channel to the pod failed (exit 255)") == 2
+    assert "attempt 2 of 3" in proc.stdout
+    assert _state(world)["stages"]["ship"]["status"] == "passed"
+    # three consecutive channel failures fail the step and the stage, naming rc 255
+    (world["home"] / ".ssh_fail").write_text("3\n", encoding="utf-8")
+    proc = _master(world, "--from", "ship", "--redo", "--to", "ship", CAGE_SSH_RETRY_S="0")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "[FAIL] unpack on the pod: rc=255" in proc.stdout
+    assert proc.stdout.count("[retry] ssh channel to the pod failed (exit 255)") == 2
+    (world["home"] / ".ssh_fail").write_text("0\n", encoding="utf-8")
+    # a remote command that fails on its own merits is never retried
+    proc = _master(world, "--only", "preflight-mac", "--redo", CAGE_TEST_PODS='[{"id": "pod123"}, {"id": "stranger"}]',
+                   CAGE_TEST_VOLUMES='[{"id": "vol123"}]')
+    assert proc.returncode == 1 and "[retry]" not in proc.stdout
 
 
 def test_stage_2_probes_that_the_results_root_accepts_the_pipe_character(world: Dict[str, Path]) -> None:

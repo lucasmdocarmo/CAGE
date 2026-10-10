@@ -40,6 +40,16 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$host" ] || { echo "fake ssh: no host" >&2; exit 255; }
+# ADR-0161: an outage injector. The file .ssh_fail holds a count of round
+# trips that fail like a timed-out channel (exit 255, nothing on stdout).
+if [ -s "$CAGE_TEST_HOME/.ssh_fail" ]; then
+  n=$(cat "$CAGE_TEST_HOME/.ssh_fail")
+  if [ "$n" -gt 0 ]; then
+    echo $(( n - 1 )) > "$CAGE_TEST_HOME/.ssh_fail"
+    echo "Connection timed out during banner exchange" >&2
+    exit 255
+  fi
+fi
 echo "$host" >> "$CAGE_TEST_HOME/.ssh_hosts"
 export HOME="$CAGE_TEST_HOME"
 cd "$HOME"
@@ -56,6 +66,15 @@ while [ $# -gt 0 ]; do
     *) args+=("$1"); shift ;;
   esac
 done
+# ADR-0161: the same outage injector as the fake ssh (.scp_fail)
+if [ -s "$CAGE_TEST_HOME/.scp_fail" ]; then
+  n=$(cat "$CAGE_TEST_HOME/.scp_fail")
+  if [ "$n" -gt 0 ]; then
+    echo $(( n - 1 )) > "$CAGE_TEST_HOME/.scp_fail"
+    echo "scp: Connection closed" >&2
+    exit 255
+  fi
+fi
 src="${args[0]}"; dst="${args[1]}"
 path="${src#*:}"
 cp "$CAGE_TEST_HOME/$path" "$dst"
@@ -86,7 +105,9 @@ def pod(tmp_path: Path) -> Dict[str, Path]:
 def _env(pod: Dict[str, Path], **extra: str) -> Dict[str, str]:
     env = {
         k: v for k, v in os.environ.items()
-        if not k.startswith("CAGE_POD") and k not in ("CAGE_JOBS_DIR", "CAGE_SSH_KEY")
+        # PYTHONUNBUFFERED stripped so the unbuffered-job test proves the wrapper,
+        # never an inherited shell export (review 2026-10-10, LOW 6)
+        if not k.startswith("CAGE_POD") and k not in ("CAGE_JOBS_DIR", "CAGE_SSH_KEY", "PYTHONUNBUFFERED")
     }
     env["PATH"] = f"{pod['bin']}:{env.get('PATH', '')}"
     env["CAGE_TEST_HOME"] = str(pod["home"])
@@ -209,6 +230,76 @@ def test_lost_when_the_pid_is_alive_but_not_our_job(pod: Dict[str, Path]) -> Non
     assert proc.stdout.strip() == "LOST" and proc.returncode == 1
     proc = _run(pod, "wait", "reused", "5")
     assert proc.returncode == 1 and proc.stdout.strip().endswith("LOST")
+
+
+def test_status_reports_unreachable_when_the_ssh_channel_fails(pod: Dict[str, Path]) -> None:
+    # ADR-0161 (S0 attempt 2, 2026-10-10 01:29Z): a timed-out ssh round trip is
+    # the channel, not the job; it must not read as the handle-less UNKNOWN.
+    assert _run(pod, "submit", "blink", "sleep 15").returncode == 0
+    (pod["home"] / ".ssh_fail").write_text("1\n", encoding="utf-8")
+    proc = _run(pod, "status", "blink")
+    assert proc.stdout.strip() == "UNREACHABLE" and proc.returncode == 1
+    assert "banner exchange" in proc.stderr
+    assert _run(pod, "status", "blink").stdout.strip() == "RUNNING"  # the next round trip is fine
+    _run(pod, "kill", "blink")
+
+
+def test_wait_rides_out_a_short_ssh_outage_and_still_reads_the_verdict(pod: Dict[str, Path]) -> None:
+    # Two failed polls inside the grace, then the job's own exit code decides.
+    assert _run(pod, "submit", "outage", "sleep 3; exit 0").returncode == 0
+    (pod["home"] / ".ssh_fail").write_text("2\n", encoding="utf-8")
+    proc = _run(pod, "wait", "outage", "60", CAGE_POD_JOB_UNREACHABLE_GRACE_S="60")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    lines = proc.stdout.strip().splitlines()
+    assert lines[-1] == "DONE(0)"
+    assert sum(1 for ln in lines if "unverified for" in ln and "ADR-0161" in ln) == 2
+    assert "UNREACHABLE for" not in proc.stdout
+    # the verdict of a job that FAILED during the outage is still its exit code
+    assert _run(pod, "submit", "outage2", "exit 5").returncode == 0
+    (pod["home"] / ".ssh_fail").write_text("1\n", encoding="utf-8")
+    proc = _run(pod, "wait", "outage2", "60", CAGE_POD_JOB_UNREACHABLE_GRACE_S="60")
+    assert proc.returncode == 1 and proc.stdout.strip().endswith("FAILED(5)")
+
+
+def test_wait_fails_after_the_unreachable_grace_and_names_the_billing_risk(pod: Dict[str, Path]) -> None:
+    assert _run(pod, "submit", "dark", "sleep 30").returncode == 0
+    (pod["home"] / ".ssh_fail").write_text("1000\n", encoding="utf-8")
+    proc = _run(pod, "wait", "dark", "60", CAGE_POD_JOB_UNREACHABLE_GRACE_S="2")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    last = proc.stdout.strip().splitlines()[-1]
+    assert last.startswith("UNREACHABLE for ") and "may still be RUNNING and billing" in last
+    assert "CAGE_POD_JOB_UNREACHABLE_GRACE_S=2" in last
+    # grace 0 restores the fail-at-once behavior
+    proc = _run(pod, "wait", "dark", "60", CAGE_POD_JOB_UNREACHABLE_GRACE_S="0")
+    assert proc.returncode == 1 and proc.stdout.strip().splitlines()[-1].startswith("UNREACHABLE for 0s")
+    (pod["home"] / ".ssh_fail").write_text("0\n", encoding="utf-8")
+    _run(pod, "kill", "dark")
+
+
+def test_fetch_retries_a_failed_channel_and_gives_up_after_three(pod: Dict[str, Path]) -> None:
+    # ADR-0161: a copy is safe to repeat; the channel's 255 gets three attempts.
+    assert _run(pod, "submit", "copyme", "echo payload").returncode == 0
+    assert _wait_status(pod, "copyme", "DONE") == "DONE(0)"
+    dest = pod["jobs"].parent / "fetched_retry"
+    (pod["home"] / ".scp_fail").write_text("2\n", encoding="utf-8")
+    proc = _run(pod, "fetch", "copyme", str(dest), CAGE_SSH_RETRY_S="0")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    # the retry lines go to stderr (review 2026-10-10, MEDIUM 1): stdout stays data
+    assert proc.stderr.count("attempt") == 2 and "attempt 3 of 3" in proc.stderr
+    assert "attempt" not in proc.stdout and proc.stdout.strip().startswith("fetched ->")
+    assert (dest / "copyme.log").read_text(encoding="utf-8").startswith("payload")
+    (pod["home"] / ".scp_fail").write_text("5\n", encoding="utf-8")
+    proc = _run(pod, "fetch", "copyme", str(dest / "again"), CAGE_SSH_RETRY_S="0")
+    assert proc.returncode == 1 and "fetch failed for 'copyme'" in proc.stderr
+    assert proc.stderr.count("attempt") == 2
+    (pod["home"] / ".scp_fail").write_text("0\n", encoding="utf-8")
+
+
+def test_jobs_run_with_unbuffered_python_output(pod: Dict[str, Path]) -> None:
+    # ADR-0162: a killed job's python lines must be in its log, not in a buffer.
+    assert _run(pod, "submit", "buf", "echo PYTHONUNBUFFERED=$PYTHONUNBUFFERED").returncode == 0
+    assert _wait_status(pod, "buf", "DONE") == "DONE(0)"
+    assert "PYTHONUNBUFFERED=1" in (pod["home"] / ".cage_jobs" / "buf.log").read_text(encoding="utf-8")
 
 
 def test_a_landed_status_wins_over_the_pid_heuristics(pod: Dict[str, Path]) -> None:

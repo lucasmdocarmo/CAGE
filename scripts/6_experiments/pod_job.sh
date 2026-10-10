@@ -20,7 +20,7 @@
 #
 # USAGE
 #   pod_job.sh submit <name> '<command>' [deadline_s]   detached; prints the remote pid
-#   pod_job.sh status <name>            RUNNING | DONE(0) | FAILED(n) | KILLED | CRASHED | LOST | UNKNOWN
+#   pod_job.sh status <name>            RUNNING | DONE(0) | FAILED(n) | KILLED | CRASHED | LOST | UNKNOWN | UNREACHABLE
 #   pod_job.sh tail   <name> [lines]    bounded log read (default 40), never a firehose
 #   pod_job.sh grep   <name> [pattern]  error triage over the remote log
 #   pod_job.sh wait   <name> [seconds]  poll with backoff up to a HARD deadline (default 1800); 124 at the deadline
@@ -34,6 +34,9 @@
 #   CAGE_SSH_KEY        private key path (optional; ssh's default identity otherwise)
 #   CAGE_JOBS_DIR       local handle dir (default <repo>/.agent/pod_jobs); the master
 #                       points it at experiments/<S>/<date>/extras/jobs
+#   CAGE_POD_JOB_UNREACHABLE_GRACE_S  seconds `wait` keeps polling while every ssh round
+#                       trip fails (default 600; ADR-0161: on 2026-10-10 one timed-out
+#                       poll failed stage 5 while the job ran on). 0 = fail at once.
 #
 # LOCAL STATE   $CAGE_JOBS_DIR/<name>.json
 #   { id, mode:"pod-ssh", host, port, handle:"pid:<remote_pid>", remote_log,
@@ -78,6 +81,21 @@ plus_s() {
 
 need_host() { [ -n "$HOST" ] || die "CAGE_POD_SSH is unset (user@host of the pod)"; }
 
+# ADR-0161: a copy is safe to repeat, so `fetch` gives the channel 3 attempts
+# when it exits 255 (refused or timed-out connection); any other code returns
+# at once. submit, status and kill never go through here.
+retry255() {
+  local n=1 rc
+  while :; do
+    rc=0; "$@" || rc=$?
+    [ "$rc" -eq 255 ] || return "$rc"
+    [ "$n" -lt 3 ] || return 255
+    echo "ssh channel to $HOST failed (exit 255) at $(iso): attempt $((n + 1)) of 3 in ${CAGE_SSH_RETRY_S:-20}s (ADR-0161)" >&2
+    sleep "${CAGE_SSH_RETRY_S:-20}"
+    n=$((n + 1))
+  done
+}
+
 # One bounded ssh round trip. Never streams; the caller decides what to read.
 rssh() {
   need_host
@@ -116,7 +134,7 @@ cmd_submit() {
     rm -f $RDIR/$name.status
     : > $RDIR/$name.log
     printf '%s' '$enc' | base64 -d > $RDIR/$name.cmd
-    nohup setsid bash -c '( bash $RDIR/$name.cmd ) >> $RDIR/$name.log 2>&1; echo \$? > $RDIR/$name.status' >/dev/null 2>&1 &
+    nohup setsid bash -c '( PYTHONUNBUFFERED=1 bash $RDIR/$name.cmd ) >> $RDIR/$name.log 2>&1; echo \$? > $RDIR/$name.status' >/dev/null 2>&1 &
     echo \$! > $RDIR/$name.pid
     echo \$!
   " | tr -d '\r\n ')"
@@ -155,7 +173,13 @@ cmd_status() {
   # The checks are not atomic: a job that ends between the status read and
   # the ps read must report its exit code, never LOST (S0F-32: the suite's
   # fake jobs, 2026-10-07), so the status file is re-read after any miss.
-  out="$(rssh "if [ -f $RDIR/$name.status ]; then cat $RDIR/$name.status; elif kill -0 $pid 2>/dev/null && ps -o args= -p $pid 2>/dev/null | grep -q '$name.cmd'; then echo RUNNING; elif [ -f $RDIR/$name.status ]; then cat $RDIR/$name.status; elif kill -0 $pid 2>/dev/null; then echo LOST; else echo CRASHED; fi" | tr -d '\r\n ')"
+  # ADR-0161: the remote snippet always exits 0, so a non-zero round trip is the
+  # ssh channel itself (timeout, refused, banner exchange): UNREACHABLE, a word
+  # `wait` may ride out, never the UNKNOWN of a job without a handle.
+  local raw rc=0
+  raw="$(rssh "if [ -f $RDIR/$name.status ]; then cat $RDIR/$name.status; elif kill -0 $pid 2>/dev/null && ps -o args= -p $pid 2>/dev/null | grep -q '$name.cmd'; then echo RUNNING; elif [ -f $RDIR/$name.status ]; then cat $RDIR/$name.status; elif kill -0 $pid 2>/dev/null; then echo LOST; else echo CRASHED; fi")" || rc=$?
+  if [ "$rc" -ne 0 ]; then echo "UNREACHABLE"; return 1; fi
+  out="$(printf '%s' "$raw" | tr -d '\r\n ')"
   case "$out" in
     RUNNING) echo "RUNNING"; return 0 ;;
     LOST)    echo "LOST";    return 1 ;;   # a live pid that is not our job (pid reuse)
@@ -186,12 +210,26 @@ cmd_wait() {
   local name="${1:?}" limit="${2:-1800}"
   check_name "$name"
   printf '%s' "$limit" | grep -qE '^[0-9]+$' || die "seconds must be an integer: $limit"
-  local deadline=$(( $(now) + limit )) delay="${CAGE_POD_JOB_POLL_S:-10}" s
+  local grace="${CAGE_POD_JOB_UNREACHABLE_GRACE_S:-600}"
+  printf '%s' "$grace" | grep -qE '^[0-9]+$' || die "CAGE_POD_JOB_UNREACHABLE_GRACE_S must be an integer: $grace"
+  local deadline=$(( $(now) + limit )) delay="${CAGE_POD_JOB_POLL_S:-10}" s down_since="" down
   while :; do
     s="$(cmd_status "$name" || true)"
     case "$s" in
       DONE*)                               echo "$s"; return 0 ;;
+      UNREACHABLE)
+        # ADR-0161: the pod's ssh endpoint blinked (RunPod read "initializing" for
+        # seconds on 2026-10-10) while the detached job ran on. Keep polling for the
+        # grace; a reachable poll of any kind resets the streak.
+        [ -n "$down_since" ] || down_since="$(now)"
+        down=$(( $(now) - down_since ))
+        if [ "$down" -ge "$grace" ]; then
+          echo "UNREACHABLE for ${down}s: every ssh poll of '$name' on $HOST failed since $(date -u -r "$down_since" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$down_since" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$down_since"); the job may still be RUNNING and billing (CAGE_POD_JOB_UNREACHABLE_GRACE_S=$grace)"
+          return 1
+        fi
+        echo "ssh to $HOST failed at $(iso): '$name' unverified for ${down}s, polling for up to ${grace}s (ADR-0161)" ;;
       FAILED*|KILLED|CRASHED|LOST|UNKNOWN) echo "$s"; return 1 ;;
+      *)                                   down_since="" ;;
     esac
     if [ "$(now)" -ge "$deadline" ]; then
       echo "DEADLINE_EXCEEDED after ${limit}s: '$name' still RUNNING on $HOST (still billing)."
@@ -220,10 +258,10 @@ cmd_fetch() {
   need_host
   mkdir -p "$dest"
   if [ -n "$KEY" ]; then
-    scp -P "$PORT" -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=no "$HOST:.cage_jobs/$name.log" "$dest/$name.log" \
+    retry255 scp -P "$PORT" -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=no "$HOST:.cage_jobs/$name.log" "$dest/$name.log" \
       && echo "fetched -> $dest/$name.log" || die "fetch failed for '$name'"
   else
-    scp -P "$PORT" -o BatchMode=yes -o StrictHostKeyChecking=no "$HOST:.cage_jobs/$name.log" "$dest/$name.log" \
+    retry255 scp -P "$PORT" -o BatchMode=yes -o StrictHostKeyChecking=no "$HOST:.cage_jobs/$name.log" "$dest/$name.log" \
       && echo "fetched -> $dest/$name.log" || die "fetch failed for '$name'"
   fi
 }

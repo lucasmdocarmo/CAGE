@@ -133,6 +133,11 @@ POD_VENV_BIN="$POD_REPO/${POD_PYTHON%/*}"
 # CUDA-graph lever; the string is empty when the profile leaves it unset).
 POD_ENGINE_ENV=""
 [ "${CAGE_SGLANG_DISABLE_PIECEWISE_CUDA_GRAPH:-0}" = "1" ] && POD_ENGINE_ENV=" CAGE_SGLANG_DISABLE_PIECEWISE_CUDA_GRAPH=1"
+# ADR-0162 (S0 attempt 2): SGLang starts took 200 to 208 s of the launcher's
+# 300 s default [V]; the profile's SGLANG_START_TIMEOUT rides every engine job
+# beside VLLM_START_TIMEOUT (600 unless the profile says otherwise).
+SGLANG_START_TIMEOUT="${SGLANG_START_TIMEOUT:-600}"
+POD_ENGINE_ENV=" SGLANG_START_TIMEOUT=$SGLANG_START_TIMEOUT$POD_ENGINE_ENV"
 FREEZE_FILE="${FREEZE_FILE:-$PROJECT_DIR/MyDocs/registration/freeze_resolutions.json}"
 POD_FREEZE_FILE="MyDocs/registration/freeze_resolutions.json"
 SCORE_BOUND_MIN="${SCORE_BOUND_MIN:-180}"
@@ -316,18 +321,50 @@ pod_env() {
   SSH_OPTS="-p $POD_PORT -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=25"
   [ -z "${SSH_KEY:-}" ] || SSH_OPTS="$SSH_OPTS -i $SSH_KEY"
 }
+# ADR-0161 (S0 attempt 2, 2026-10-10): one timed-out channel must not end a
+# 16 h run. Up to 3 attempts when the previous one exited 255 (ssh and scp both
+# return 255 for a refused or timed-out connection, measured 2026-10-10); any
+# other code returns at once, so a failing REMOTE command is reported after one
+# attempt. Only idempotent round trips go through here: every pssh command of
+# this script repeats safely (tar over an existing tree, probes, counts, the
+# backup daemon's "already running" path) and every copy is a copy; the backup
+# stop's time-anchored marker check uses pssh_once. Job submits never retry: a repeat could start a second engine
+# (pod_job.sh refuses a RUNNING name, but a submit whose reply was lost has no
+# local handle to check against).
+SSH_RETRY_S="${CAGE_SSH_RETRY_S:-20}"
+ssh_retry() {
+  local n=1 rc
+  while :; do
+    rc=0; "$@" || rc=$?
+    [ "$rc" -eq 255 ] || return "$rc"
+    [ "$n" -lt 3 ] || return 255
+    # stderr: a caller that captures stdout as data ($(pssh ...)) never sees it;
+    # run_step merges 2>&1 so the step log keeps it (review 2026-10-10, MEDIUM 1)
+    printf '  [retry] ssh channel to the pod failed (exit 255) at %s: attempt %s of 3 in %ss (ADR-0161)\n' "$(utc)" "$((n + 1))" "$SSH_RETRY_S" >&2
+    sleep "$SSH_RETRY_S"
+    n=$((n + 1))
+  done
+}
 pssh() { # pssh '<remote command>'
+  # shellcheck disable=SC2086
+  ssh_retry ssh $SSH_OPTS "$POD_SSH" "$1"
+}
+pssh_once() { # pssh_once '<remote command>': ONE attempt, for a command whose repeat
+  # is not safe (review 2026-10-10, LOW 5: the backup stop samples t0 remotely and
+  # compares the sync marker with it; a retry after a mid-command drop re-samples
+  # t0 after the marker and fails a stop that succeeded). A blip there fails the
+  # stage, and the resume runs it again from a clean state.
   # shellcheck disable=SC2086
   ssh $SSH_OPTS "$POD_SSH" "$1"
 }
 pscp_to()   { # pscp_to <local> <remote path>
   # shellcheck disable=SC2086
-  scp -P "$POD_PORT" ${SSH_KEY:+-i "$SSH_KEY"} -o BatchMode=yes -o StrictHostKeyChecking=no "$1" "$POD_SSH:$2"; }
+  ssh_retry scp -P "$POD_PORT" ${SSH_KEY:+-i "$SSH_KEY"} -o BatchMode=yes -o StrictHostKeyChecking=no "$1" "$POD_SSH:$2"; }
 pscp_from() { # pscp_from <remote path> <local>; a remote DIRECTORY is given as "<dir>/."
   # so its contents land in <local> instead of nesting as <local>/<dir> (scp -r
   # into an existing directory nests; review 2026-10-06, LOW 13) [A on OpenSSH].
   # shellcheck disable=SC2086
-  scp -r -P "$POD_PORT" ${SSH_KEY:+-i "$SSH_KEY"} -o BatchMode=yes -o StrictHostKeyChecking=no "$POD_SSH:$1" "$2"; }
+  ssh_retry scp -r -P "$POD_PORT" ${SSH_KEY:+-i "$SSH_KEY"} -o BatchMode=yes -o StrictHostKeyChecking=no "$POD_SSH:$1" "$2"; }
 
 job_run() {
   # job_run <name> <deadline_s> <remote command> [logdir]: submit, wait, fetch
@@ -1049,7 +1086,7 @@ stage_score() {
 stage_collect() {
   pod_env
   local backend; backend="$( [ "$BACKUP_SCHEME" = "file" ] && echo local || echo "$BACKUP_SCHEME")"
-  run_step 0 "backup daemon stop + marker check" -- pssh "cd $POD_REPO && t0=\$(date -u +%s); CAGE_BACKUP_TARGET=$BACKUP_TARGET bash scripts/5_observability/gcs_backup_daemon.sh stop $BACKUP_RUN_REL; m=\$(stat -c %Y .agent/last_sync_ok_$backend 2>/dev/null || echo 0); echo marker_mtime=\$m stop_started=\$t0; [ \"\$m\" -ge \"\$t0\" ]" || return 1
+  run_step 0 "backup daemon stop + marker check" -- pssh_once "cd $POD_REPO && t0=\$(date -u +%s); CAGE_BACKUP_TARGET=$BACKUP_TARGET bash scripts/5_observability/gcs_backup_daemon.sh stop $BACKUP_RUN_REL; m=\$(stat -c %Y .agent/last_sync_ok_$backend 2>/dev/null || echo 0); echo marker_mtime=\$m stop_started=\$t0; [ \"\$m\" -ge \"\$t0\" ]" || return 1
   local token="collect_${EXP}_$(date -u +%Y%m%d_%H%M%S)"
   job_run collect 1800 "cd $POD_REPO && CAGE_BACKUP_TARGET=$BACKUP_TARGET CAGE_COLLECT_TOKEN=$token bash scripts/5_observability/collect_logs.sh" "$LAND/logs/system" || return 1
   plan_only || grep -q "sentinel=COLLECT_OK_$token" "$JOB_LOG" || { printf '  [FAIL] collect_logs.sh wrote no COLLECT_OK_%s sentinel\n' "$token"; return 1; }
