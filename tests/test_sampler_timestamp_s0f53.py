@@ -44,9 +44,22 @@ def _one_tick(
     monkeypatch.setitem(sys.modules, "pynvml", None)  # no NVML in the test
     monkeypatch.setattr(t, "capture_snapshot", capture)
     sampler._run()
+    bounds["after"] = time.time()
     assert len(sampler._samples) == 1
     rec = sampler._series_records()[0]
+    _AFTER[id(rec)] = bounds["after"]
     return bounds["t0"], bounds["t1"], rec
+
+
+# The sampler reads its capture-end clock after the fake returns, a few
+# microseconds after the fake's t1; rounded to ms the two can differ by 0.001
+# (pod suite, S0 attempt 4). The capture-end stamp is checked as a bracket
+# [t1, the clock after _run()], exact and free of tolerance.
+_AFTER: dict = {}
+
+
+def _is_capture_end(rec: dict, t1: float) -> bool:
+    return round(t1, 3) <= rec["ts"] <= round(_AFTER[id(rec)], 3)
 
 
 def test_snapshot_clock_inside_the_capture_span_wins(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -79,7 +92,7 @@ def test_an_implausible_snapshot_clock_falls_back_to_the_capture_end(
     t0, t1, rec = _one_tick(monkeypatch, sampler, lambda: dict(snap))
     assert rec["ts_source"] == "capture_end"
     assert math.isfinite(rec["ts"])
-    assert rec["ts"] == round(t1, 3)
+    assert _is_capture_end(rec, t1)
     assert rec["ts"] > round(t0, 3)
 
 
@@ -88,10 +101,10 @@ def test_a_snapshot_clock_from_the_future_or_the_past_is_refused(
 ) -> None:
     sampler = t.VllmTelemetrySampler("http://localhost:8000")
     _t0, t1, rec = _one_tick(monkeypatch, sampler, lambda: {"ts": time.time() + 100.0})
-    assert rec["ts_source"] == "capture_end" and rec["ts"] == round(t1, 3)
+    assert rec["ts_source"] == "capture_end" and _is_capture_end(rec, t1)
     sampler = t.VllmTelemetrySampler("http://localhost:8000")
     _t0, t1, rec = _one_tick(monkeypatch, sampler, lambda: {"ts": time.time() - 100.0})
-    assert rec["ts_source"] == "capture_end" and rec["ts"] == round(t1, 3)
+    assert rec["ts_source"] == "capture_end" and _is_capture_end(rec, t1)
 
 
 def test_sample_stamp_rule_is_pure() -> None:
