@@ -488,7 +488,9 @@ def evaluate_chain(
             decision = PrimaryDecision(
                 endpoint=m.endpoint, dataset=m.dataset, p_value=m.p_value,
                 alpha=alpha,
-                passed=chain_open and p_decide < alpha,
+                # bool(): the Holm path yields numpy floats, and a numpy bool
+                # is not JSON-serializable in stats.json (review L2).
+                passed=bool(chain_open and p_decide < alpha),
                 status=status,
             )
             gate_state[(m.endpoint, m.dataset)] = decision

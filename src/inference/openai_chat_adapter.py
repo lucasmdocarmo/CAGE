@@ -1106,7 +1106,10 @@ class OpenAIChatAdapter(InferenceEngine):
                     kv_transfer_params = self._header_kv_transfer(resp.headers)
 
                     async for raw_line in resp.content:
-                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        # Review L5 (ADR-0164): strict, as the sync reader
+                        # decodes; invalid UTF-8 is an error row on every
+                        # path instead of a served answer with U+FFFD in it.
+                        line = raw_line.decode("utf-8").strip()
                         if not line or not line.startswith("data:"):
                             continue
                         data = line[5:].strip()

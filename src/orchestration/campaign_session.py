@@ -1412,10 +1412,11 @@ class CampaignCellSession:
         Open-loop arrivals dropped by the cap / dispatch errors produce a
         results stub but never reach record_result, so no evidence row exists;
         emit a synthesized evidence stub carrying the SAME identity triple and
-        the shared validity fields (ok=False + the error). A count mismatch
-        that is NOT explained by error stubs — a lost append on a VALID row —
-        refuses: the window would fail verify_results reconciliation anyway,
-        and on-pod is the right place to hear it.
+        the shared validity fields (ok=False + the error). Any identity left
+        unmatched after the stubs (a lost append on a VALID row, an orphan
+        evidence row) refuses on the pod, where it can still be heard. O7
+        (2026-10-10): the check compares the identity multisets, which is
+        stricter than verify_results check (b), a count comparison.
         """
         have = {self._identity(r) for r in evidence_rows}
         for row in requests_rows:
@@ -1448,9 +1449,10 @@ class CampaignCellSession:
             only_requests = sorted((request_ids - evidence_ids).elements(), key=repr)
             only_evidence = sorted((evidence_ids - request_ids).elements(), key=repr)
             raise CampaignSessionError(
-                f"window would fail verify_results reconciliation: "
-                f"{len(requests_rows)} results row(s) vs {len(evidence_rows)} "
-                f"evidence row(s) after dispatch-stub reconciliation; "
+                f"window refused at reconciliation (O7, the identity multisets "
+                f"of requests and evidence): {len(requests_rows)} results "
+                f"row(s) vs {len(evidence_rows)} evidence row(s) after the "
+                f"dispatch stubs; "
                 f"identities only in results {only_requests[:5]}, only in "
                 f"evidence {only_evidence[:5]} "
                 f"(consort: {dict(consort)}) — a lost evidence append on a "

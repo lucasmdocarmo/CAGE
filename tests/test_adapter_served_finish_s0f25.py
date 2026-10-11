@@ -97,7 +97,12 @@ STREAMS: Dict[str, List[Tuple[Any, ...]]] = {
     # B1: raw UTF-8 tokens (ensure_ascii=False) on a text/event-stream with no
     # charset: a 2-byte character and U+2028 inside the answer
     "non_ascii": [
-        ("tok_utf8", "Å"), ("tok_utf8", " x"), ("finish", "stop"), ("done",),
+        ("tok_utf8", "\u00c5"), ("tok_utf8", "\u2028x"), ("finish", "stop"), ("done",),
+    ],
+    # review L5: a data line that is not valid UTF-8 (a lone 0xff byte)
+    "invalid_utf8": [
+        ("tok", "A"), ("bytes", b'{"choices": [{"text": "\xff", "delta": {"content": "\xff"}, "finish_reason": null}]}'),
+        ("finish", "stop"), ("done",),
     ],
 }
 
@@ -174,6 +179,10 @@ class _Handler(BaseHTTPRequestHandler):
                 send(event[1])
             elif kind == "tok_utf8":
                 send(json.dumps(choice(event[1], None), ensure_ascii=False))
+            elif kind == "bytes":
+                raw = b"data: " + event[1] + b"\n\n"
+                self.wfile.write(f"{len(raw):x}\r\n".encode() + raw + b"\r\n")
+                self.wfile.flush()
             elif kind == "done":
                 send("[DONE]")
         self.wfile.write(b"0\r\n\r\n")
@@ -432,7 +441,7 @@ def test_a_non_ascii_answer_survives_the_chunked_reader_b1(base_url, label, chat
     resp = _stream(base_url, "non_ascii", chat, use_async)
     assert resp.error is None
     assert resp.finish_reason == "stop"
-    assert resp.generated_text == "Å x"
+    assert resp.generated_text == "\u00c5\u2028x"
 
 
 def test_ttft_ignores_a_wall_clock_step_b5(base_url, monkeypatch) -> None:
@@ -460,3 +469,13 @@ def test_ttft_ignores_a_wall_clock_step_b5(base_url, monkeypatch) -> None:
         resp = _stream(base_url, "ok_stop", chat, use_async)
         assert resp.error is None, label
         assert 0.0 <= resp.ttft_ms <= resp.total_time_ms, (label, resp.ttft_ms)
+
+
+@pytest.mark.parametrize("label,chat,use_async", STREAM_PATHS, ids=[p[0] for p in STREAM_PATHS])
+def test_invalid_utf8_is_an_error_row_on_every_path_l5(base_url, label, chat, use_async) -> None:
+    """Review L5 (ADR-0164): the sync reader decodes strictly (B1) while the
+    async reader replaced bad bytes with U+FFFD and served the answer; both
+    now write an error row."""
+    resp = _stream(base_url, "invalid_utf8", chat, use_async)
+    assert resp.finish_reason == "error"
+    assert resp.generated_text == ""

@@ -558,8 +558,15 @@ def walk_run_tree(run_dir: Path, manifest: Mapping[str, Any]) -> list[WindowReco
                     f"artifact(s) {missing} (§1 per-window contract)"
                 )
                 continue
-            jsonl_files = sorted(window_dir.glob("*.jsonl"))
-            aux_json = sorted(window_dir.glob("*.json"))
+            # Review L3 (ADR-0164): pathlib's "*" matches dot files, which the
+            # seal skips; with the O1 sweep no longer flagging them, a stray
+            # "._requests.jsonl" would have been indexed as a window artifact.
+            jsonl_files = sorted(
+                p for p in window_dir.glob("*.jsonl") if not p.name.startswith(".")
+            )
+            aux_json = sorted(
+                p for p in window_dir.glob("*.json") if not p.name.startswith(".")
+            )
             artifacts = tuple(
                 p.relative_to(run_dir).as_posix() for p in (*jsonl_files, *aux_json)
             )

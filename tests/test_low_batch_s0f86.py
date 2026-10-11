@@ -83,6 +83,9 @@ def test_holm_any_decisions_use_the_adjusted_p_s3() -> None:
         [], intra_set_rule="holm-any", primary_order=["contrast-4"],
     )
     assert [d.passed for d in ok.primaries] == [True, True]
+    # review L2: plain bools, so stats.json can serialize the decisions
+    assert all(type(d.passed) is bool for d in ok.primaries + trace.primaries)
+    json.dumps([d.passed for d in ok.primaries])
 
 
 def test_a_logged_unblind_refuses_a_reset_seal_s5(tmp_path: Path) -> None:
@@ -135,7 +138,7 @@ def test_the_gpu_tracker_needs_a_handle_per_device_b7(monkeypatch: pytest.Monkey
 
 def test_the_first_cpu_percent_only_primes_b9a() -> None:
     """B9a: psutil's first cpu_percent() on a Process returns a 0.0
-    placeholder [V psutil 7.2.2 __init__.py:1083-1086]; it entered the
+    placeholder [V psutil 7.2.2 __init__.py:1080-1083]; it entered the
     average (0.0 and 50.0 read 25.0)."""
     readings = iter([0.0, 50.0])
     evaluator = performance.PerformanceEvaluator(monitor_resources=True)
@@ -192,3 +195,41 @@ def test_rerank_counters_report_the_measured_stage_only_c2() -> None:
     assert runner._count_since(250, 200) == 50
     assert runner._count_since(None, 0) is None
     assert runner._count_since(3, None) is None
+
+
+def test_a_logged_unblind_keeps_the_committed_lock_m1(tmp_path: Path) -> None:
+    """M1 (review of ADR-0164): unblind logs its event, then stamps the seal.
+    A failure between the two left the stamp null; the lock release dropped
+    the OUTPUTS_COMMITTED lock while S5 refused every retry, so the look was
+    blocked and never recorded as spent. The logged event now keeps it."""
+    scripts = REPO_ROOT / "scripts" / "4_analysis"
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    import run_campaign_analysis as rca
+
+    run_dir = tmp_path / "run"
+    analysis_dir = run_dir / "analysis" / "20261010T000000Z"
+    analysis_dir.mkdir(parents=True)
+    df = pd.DataFrame({"arm": ["B1", "B3", "B6"]})
+    _, sealed = blinding.scramble_labels(df, "arm", 7, rca.sealed_map_path(run_dir))
+    log = run_dir / rca.BLINDING_DIRNAME / rca.UNBLIND_LOG_NAME
+    sha = "a" * 40
+
+    # Without a logged event an empty committed look is released (C4-1).
+    rca._acquire_confirmatory_lock(run_dir, sha)
+    rca._commit_confirmatory_lock(run_dir, sha, analysis_dir)
+    rca._release_placeholder_lock(run_dir, analysis_dir)
+    assert not (run_dir / rca.LOCK_NAME).exists()
+
+    # The M1 state: the log line was written, the stamp was not.
+    rca._acquire_confirmatory_lock(run_dir, sha)
+    rca._commit_confirmatory_lock(run_dir, sha, analysis_dir)
+    blinding.unblind(sealed, log)
+    doc = json.loads(sealed.read_text(encoding="utf-8"))
+    doc["unblinded_utc"] = None
+    sealed.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    rca._release_placeholder_lock(run_dir, analysis_dir)
+    lock = json.loads((run_dir / rca.LOCK_NAME).read_text(encoding="utf-8"))
+    assert lock["phase"] == rca.LOCK_PHASE_COMMITTED  # the look stays spent
+    with pytest.raises(blinding.AlreadyUnblindedError):
+        blinding.unblind(sealed, log)

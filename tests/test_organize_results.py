@@ -850,3 +850,18 @@ def test_parse_row_key_dir_accepts_b12_rung() -> None:
     # Unknown coord segments still refuse, naming every accepted form.
     with pytest.raises(org.OrganizeError, match="cb<int>"):
         org.parse_row_key_dir("corpus-trunc|none|none|single|vllm|qwen3-14b|F1|xx700")
+
+
+def test_dot_files_are_neither_extra_nor_indexed_artifacts_l3(run_tree: Path) -> None:
+    """ADR-0164 O1 + review L3: dot files are outside the seal. The EXTRA
+    sweep no longer flags them (Finder's .DS_Store, macOS AppleDouble
+    "._" copies), so the organizer must not index them as window artifacts
+    either; pathlib's "*" glob matches dot names."""
+    wdir = sorted(run_tree.glob("cells/*/window_*"))[0]
+    (wdir / "._requests.jsonl").write_bytes(b"\x00\x05\x16\x07")
+    (wdir / ".DS_Store").write_bytes(b"\x00")
+    (wdir / ".hidden.json").write_text("{}", encoding="utf-8")
+    csv_path, _ = org.organize_run(run_tree)
+    df = pd.read_csv(csv_path)
+    all_artifacts = [a for cell in df["artifacts"] for a in cell.split(";")]
+    assert not any(Path(a).name.startswith(".") for a in all_artifacts)
