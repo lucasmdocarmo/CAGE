@@ -7,7 +7,7 @@ saturation rate λ*). The pilot's flat ~20 baseline names conflated these axes;
 ``from_legacy`` translates them (best-effort, documented per name) so pilot
 archives can be re-keyed. Downstream stats/figure code — including every
 serving-yield (Y) scored cell — keys rows on ``CellSpec.to_row_key()``.
-
+ 
 Charter bindings enforced here:
 - §7.1 arms (11 names; ``gold-trunc`` retired) and the B1-B12 numbered layer,
   including the reuse-bit classification (FRESH = B1/B5/B6/B9/B11,
