@@ -106,6 +106,38 @@ def _load_sealed(sealed_map_path: Path) -> dict[str, object]:
     return sealed
 
 
+def logged_unblind_event(log_path: Path, map_sha256: str) -> dict[str, object] | None:
+    """The logged UNBLIND event for the seal with ``map_sha256``, or None.
+
+    S5 (2026-10-10): the log line is written before the seal's stamp, so it
+    is the first record of the irreversible event; ``unblind`` and the
+    analysis driver's lock release both read it here. A log line that is not
+    JSON raises ``BlindingError`` (an unreadable record cannot prove the seal
+    unspent).
+    """
+    log_path = Path(log_path)
+    if not log_path.is_file():
+        return None
+    for lineno, line in enumerate(
+        log_path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise BlindingError(
+                f"unblind log line {lineno} is not valid JSON: {log_path}"
+            ) from exc
+        if (
+            isinstance(event, dict)
+            and event.get("event") == "UNBLIND"
+            and event.get("map_sha256") == map_sha256
+        ):
+            return event
+    return None
+
+
 def unblind(sealed_map_path: Path, log_path: Path) -> dict[str, str]:
     """One-time unblinding: verify the seal, log the dated event, return the map.
 
@@ -124,27 +156,12 @@ def unblind(sealed_map_path: Path, log_path: Path) -> dict[str, str]:
     # S5 (2026-10-10): the log is the event record too. map_sha256 does not
     # cover the stamp (the seal was hashed with it empty), so resetting
     # unblinded_utc to null re-armed a seal whose UNBLIND event is logged.
-    if log_path.is_file():
-        for lineno, line in enumerate(
-            log_path.read_text(encoding="utf-8").splitlines(), start=1
-        ):
-            if not line.strip():
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise BlindingError(
-                    f"unblind log line {lineno} is not valid JSON: {log_path}"
-                ) from exc
-            if (
-                isinstance(event, dict)
-                and event.get("event") == "UNBLIND"
-                and event.get("map_sha256") == sealed["map_sha256"]
-            ):
-                raise AlreadyUnblindedError(
-                    f"the unblind log records an UNBLIND event for this seal at "
-                    f"{event.get('utc')} (line {lineno}): {log_path}"
-                )
+    logged = logged_unblind_event(log_path, str(sealed["map_sha256"]))
+    if logged is not None:
+        raise AlreadyUnblindedError(
+            f"the unblind log records an UNBLIND event for this seal at "
+            f"{logged.get('utc')}: {log_path}"
+        )
     mapping: dict[str, str] = dict(sealed["mapping"])  # type: ignore[arg-type]
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     event = {

@@ -4754,9 +4754,9 @@ def _release_placeholder_lock(
     Removes the IN_PROGRESS placeholder. Fresh review 2026-10-10 (C4-1): an
     ``OUTPUTS_COMMITTED`` lock is also removed when nothing irreversible
     happened, which is checked on disk: ``analysis_dir`` holds no file and the
-    sealed arm map (when one exists) is not unblinded. A finalized DONE lock,
-    a committed lock with any output, or a committed lock after the
-    unblinding is never touched.
+    sealed arm map (when one exists) is not unblinded, by its stamp or by a
+    logged UNBLIND event (M1). A finalized DONE lock, a committed lock with
+    any output, or a committed lock after the unblinding is never touched.
     """
     lock_path = run_dir / LOCK_NAME
     try:
@@ -4782,6 +4782,20 @@ def _release_placeholder_lock(
         except json.JSONDecodeError:
             return  # cannot prove the seal is unspent: keep the lock
         if sealed.get("unblinded_utc") is not None:
+            return
+        # M1 (review of ADR-0164): unblind logs its event before it stamps
+        # the seal, so a failure between the two left the stamp null; the
+        # release then dropped the committed lock while S5 refused every
+        # retry, and the look was never recorded as spent. A logged event
+        # (or a log that cannot be read) keeps the lock.
+        try:
+            logged = blinding_mod.logged_unblind_event(
+                run_dir / BLINDING_DIRNAME / UNBLIND_LOG_NAME,
+                str(sealed.get("map_sha256")),
+            )
+        except blinding_mod.BlindingError:
+            return
+        if logged is not None:
             return
     lock_path.unlink(missing_ok=True)
 
