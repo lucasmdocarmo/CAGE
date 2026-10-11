@@ -75,6 +75,10 @@ MEASURED_WRAPPER_MAX: Dict[str, int] = {
 }
 #: The worst rendered request observed in that run (qa, seed 42): fits the cap.
 MEASURED_RENDERED_MAX: int = 32_481
+#: C1 review (ADR-0165): the worst wrapper the generator can DRAW (exhaustive
+#: over keys: niah_multiquery with four zephyr-* keys), not just observe. With
+#: the noise haystacks filled to the target it bounds every rendered request.
+WORST_DRAWABLE_WRAPPER_MAX: int = 110
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +381,9 @@ def test_the_registered_shape_arithmetic() -> None:
     # the rendered request fits the input shape, and the shape plus the output fits the cap
     assert rc.RULER_HAYSTACK_TOKENS + measured_max <= rc.RULER_CONTEXT_TOKENS
     assert MEASURED_RENDERED_MAX <= rc.RULER_CONTEXT_TOKENS
+    # C1: a full haystack plus the worst drawable wrapper still fits the cap
+    assert rc.RULER_WRAPPER_ALLOWANCE >= WORST_DRAWABLE_WRAPPER_MAX
+    assert rc.RULER_HAYSTACK_TOKENS + WORST_DRAWABLE_WRAPPER_MAX <= rc.RULER_CONTEXT_TOKENS
     assert rc.RULER_CONTEXT_TOKENS + rc.RULER_OUTPUT_TOKENS <= rc.DEFAULT_MAX_MODEL_LEN
     assert set(MEASURED_WRAPPER_MAX) == set(rc.RULER_F2_TASKS)
 

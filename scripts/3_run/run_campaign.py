@@ -580,7 +580,12 @@ assert RULER_OUTPUT_TOKENS == _ruler.OUTPUT_TOKENS_HINT, (
 #: 107, 97 and 99 (qa questions 5 to 31 tokens); system plus template alone
 #: 63 with an empty user message, 73 with a minimal one. The allowance
 #: covers the maximum (107) with 21 to spare; the worst rendered request
-#: observed was 32,481 of the 32,512 cap. The runner renders every prompt
+#: observed was 32,481 of the 32,512 cap. C1 review (ADR-0165): the worst
+#: wrapper the generator can draw is 110 (niah_multiquery with four
+#: zephyr-* keys, exhaustive over keys), 18 under the allowance; with the
+#: noise haystacks now filled to the target, the worst possible rendered
+#: request is 32,384 + 110 = 32,494 (observed 32,480 over 840 items per
+#: task). The runner renders every prompt
 #: (measured and warm-up pool) and refuses the cell when one
 #: exceeds the cap (--ruler-rendered-input-cap), so the allowance is a sizing
 #: input, never a guarantee. The haystack target every RULER cell carries as

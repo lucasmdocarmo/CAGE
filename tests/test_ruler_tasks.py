@@ -505,3 +505,84 @@ def test_score_example_refuses_non_ruler_examples():
     alien = CAGExample(id="x", question="q", context=["c"], answer="a", metadata={})
     with pytest.raises(ValueError, match="scoring contract"):
         score_example(alien, "a")
+
+
+def _bpe_like_counter(text: str) -> int:
+    """A whitespace count that charges a trailing space as its own token, the
+    way a BPE tokenizer (Qwen3) charges a lone space that has no next word to
+    merge into: count("N ") = 20 while the marginal cost of N in joined text
+    is 19."""
+    return len(text.split()) + (1 if text.endswith(" ") else 0)
+
+
+@pytest.mark.parametrize("task", ("niah_single", "niah_multikey", "niah_multiquery", "variable_tracking"))
+def test_noise_haystack_fills_to_within_one_sentence_of_the_target_c1(task):
+    """C1 (S0F-87, ADR-0165): the noise count was sized from the stand-alone
+    cost of "NOISE " (20 here, 25 under Qwen3) instead of its marginal cost
+    in the joined text (19, 24 under Qwen3), so the haystack filled about
+    19/20 (Qwen3: 24/25, 31,072 to 31,087 of 32,384). It now fills to within
+    one noise sentence of the target and never past it."""
+    target = 2000
+    marginal = _bpe_like_counter(NOISE_SENTENCE + " " + NOISE_SENTENCE) - _bpe_like_counter(NOISE_SENTENCE)
+    assert marginal == 19
+    loader = _loader(task, seed=1, context_length_tokens=target,
+                     tokenizer=_bpe_like_counter, tokenizer_name="bpe-like")
+    for ex in loader.load(max_examples=5):
+        actual = ex.metadata["actual_context_tokens"]
+        assert actual == _bpe_like_counter(ex.context[0])
+        assert target - marginal < actual <= target, actual
+
+
+def test_noise_fill_terminates_on_a_counter_that_never_grows_c1():
+    """C1 guard: the fill loop grows the noise count while the text still
+    fits, which assumes more text costs more tokens. A constant counter must
+    terminate (the pre-C1 assembly returned; an unguarded loop never would).
+    Review L2 (ADR-0165): the counter raises after 1,000 calls, so a regressed
+    guard fails this test instead of hanging the run (no pytest timeout)."""
+    calls = {"n": 0}
+
+    def constant(text: str) -> int:
+        calls["n"] += 1
+        if calls["n"] > 1000:
+            raise AssertionError("the fill loop did not stop on a counter that never grows")
+        return 7
+
+    loader = _loader("niah_multikey", seed=1, context_length_tokens=512,
+                     tokenizer=constant, tokenizer_name="constant")
+    (ex,) = loader.load(max_examples=1)
+    assert ex.metadata["actual_context_tokens"] == 7
+    assert ex.metadata["needle_key"] in ex.question
+
+
+@pytest.mark.parametrize("task", ("niah_multikey", "niah_multiquery", "variable_tracking"))
+def test_an_overshooting_estimate_shrinks_to_the_largest_fit_c1(task):
+    """Review L3 (ADR-0165): the shrink branch (the marginal estimate lands
+    over the target) is exercised on purpose. A counter that charges slightly
+    more per word as the text grows makes the small-text estimate overshoot at
+    2,000 tokens; the result must fit, be the largest noise count that fits
+    (one more sentence costs 19 or 20 here) and keep every needle once and in
+    depth order."""
+    def growing(text: str) -> int:
+        words = len(text.split())
+        return words + words // 50
+
+    target = 2000
+    loader = _loader(task, seed=1, context_length_tokens=target,
+                     tokenizer=growing, tokenizer_name="growing")
+    seen = []
+    real = RulerLoader._layout
+    loader._layout = lambda needles, depths, n: (seen.append(n), real(needles, depths, n))[1]
+    for ex in loader.load(max_examples=3):
+        actual = ex.metadata["actual_context_tokens"]
+        assert actual == growing(ex.context[0])
+        assert target - 20 < actual <= target, actual
+        if task == "variable_tracking":
+            names = ex.metadata["chain_variables"]
+            first = ex.context[0].index(f"VAR {names[0]} = ")
+            hops = [ex.context[0].index(f"VAR {names[i]} = VAR {names[i - 1]}.") for i in range(1, len(names))]
+            assert [first] + hops == sorted([first] + hops)
+        else:
+            keys = ex.metadata.get("needle_keys") or [ex.metadata["needle_key"]]
+            for key in keys:
+                assert ex.context[0].count(f"special magic numbers for {key} is:") == 1
+    assert any(b < a for a, b in zip(seen, seen[1:])), "the shrink branch never ran"

@@ -276,6 +276,8 @@ class RulerLoader(DatasetLoader):
         # Lazily built once per loader (deterministic under seed); tuple of
         # (answerable pool, ordered-deduped distractor paragraphs).
         self._qa_pool_cache: Optional[Tuple[List[CAGExample], List[str]]] = None
+        # (haystack, token count) of the last _assemble call (review M1).
+        self._last_assembled: Optional[Tuple[str, int]] = None
         if tokenizer is None:
             self._count = _whitespace_token_counter
             self.tokenizer_name = "whitespace-proxy"
@@ -321,11 +323,38 @@ class RulerLoader(DatasetLoader):
             if name not in taken:
                 return name
 
+    @staticmethod
+    def _layout(needles: List[str], depths: List[float], n_noise: int) -> List[str]:
+        """The sentence list for ``n_noise`` noise sentences with every needle
+        slotted against that FIXED count.
+
+        Recomputing ``round(depth * len(sentences))`` against a list that
+        grows during insertion (the pre-Wave-4 scheme) let depths closer than
+        ~1/n_noise land out of order: the shallower needle's index, scaled by
+        the already-grown list, could overshoot the deeper needle's slot.
+        """
+        slotted = sorted(
+            (min(round(depth * n_noise), n_noise), depth, j)
+            for j, depth in enumerate(depths)
+        )
+        sentences: List[str] = []
+        pos = 0
+        for slot in range(n_noise + 1):
+            while pos < len(slotted) and slotted[pos][0] == slot:
+                sentences.append(needles[slotted[pos][2]])
+                pos += 1
+            if slot < n_noise:
+                sentences.append(NOISE_SENTENCE)
+        return sentences
+
     def _assemble(self, rng: random.Random, needles: List[str], depths: List[float]) -> str:
         """Assemble a haystack of noise sentences with needles at ``depths``.
 
-        Greedy fill up to the token target, then trim noise (never needles)
-        so the result NEVER exceeds ``context_length_tokens``. Needles whose
+        Fill with the LARGEST noise count whose joined text fits the token
+        target (C1, 2026-10-10: the haystack reaches the target to within one
+        noise sentence under any counter whose count grows with each added
+        noise sentence), then trim noise (never needles)
+        as a last resort so the result NEVER exceeds ``context_length_tokens``. Needles whose
         depths are ordered come out in that order — GUARANTEED, at every
         context length: every slot is computed against the fixed noise count
         BEFORE any needle is placed (``round`` is monotone in depth; slot
@@ -344,33 +373,56 @@ class RulerLoader(DatasetLoader):
         byte-identical at every depth (one placement cannot see a grown
         list). No frozen artifact pins the old bytes; both halves of this
         split are regression-pinned in ``tests/test_ruler_tasks.py``.
+
+        DISCLOSED BEHAVIOR CHANGE (C1, 2026-10-10, ADR-0165): under a BPE
+        tokenizer the noise haystacks grow from about 96 percent of the
+        target to within one noise sentence of it (Qwen3-14B at 32,384:
+        about 1,300 more tokens), and every needle slot moves with the larger
+        noise count. Under the whitespace proxy the bytes are unchanged
+        (marginal and stand-alone noise costs agree there).
         """
-        per_noise = max(1, self._count(NOISE_SENTENCE + " "))
+        # C1 (S0F-87, 2026-10-10): the noise sentence's MARGINAL cost in the
+        # joined text. ``count(NOISE + " ")`` charged the trailing space as
+        # its own token under a BPE tokenizer (Qwen3: 25 against a marginal
+        # 24; the space merges into the next sentence's first word), so the
+        # estimate filled 24/25 of the target (31,072 to 31,087 of 32,384 on
+        # the 2026-10-08 landing). Under the whitespace proxy both read 19.
+        per_noise = max(
+            1, self._count(NOISE_SENTENCE + " " + NOISE_SENTENCE) - self._count(NOISE_SENTENCE)
+        )
         needle_tokens = sum(self._count(n + " ") for n in needles)
         budget = self.context_length_tokens - needle_tokens
         n_noise = max(1, budget // per_noise)
 
-        # Slot every needle against the FIXED n_noise up front. Recomputing
-        # ``round(depth * len(sentences))`` against a list that grows during
-        # insertion (the previous scheme) let depths closer than ~1/n_noise
-        # land out of order: the shallower needle's index, scaled by the
-        # already-grown list, could overshoot the deeper needle's slot.
-        slotted = sorted(
-            (min(round(depth * n_noise), n_noise), depth, j)
-            for j, depth in enumerate(depths)
-        )
-        sentences: List[str] = []
-        pos = 0
-        for slot in range(n_noise + 1):
-            while pos < len(slotted) and slotted[pos][0] == slot:
-                sentences.append(needles[slotted[pos][2]])
-                pos += 1
-            if slot < n_noise:
-                sentences.append(NOISE_SENTENCE)
-
+        target = self.context_length_tokens
+        sentences = self._layout(needles, depths, n_noise)
         text = " ".join(sentences)
-        # Trim trailing NOISE (never a needle) until within target.
-        while self._count(text) > self.context_length_tokens and len(sentences) > len(needles):
+        # C1: settle on the LARGEST noise count whose joined text fits, so the
+        # haystack reaches the target to within one noise sentence whatever
+        # the tokenizer merges at the needle seams (for a counter that grows
+        # with each added sentence). Every candidate is laid
+        # out from scratch, so the slots always match the final count.
+        current = self._count(text)
+        if current <= target:
+            while True:
+                grown = self._layout(needles, depths, n_noise + 1)
+                grown_text = " ".join(grown)
+                grown_count = self._count(grown_text)
+                # A counter that does not grow with the text (a broken or
+                # constant tokenizer) would loop forever here; stop instead.
+                if grown_count > target or grown_count <= current:
+                    break
+                n_noise, sentences, text, current = n_noise + 1, grown, grown_text, grown_count
+        else:
+            while n_noise > 1 and current > target:
+                n_noise -= 1
+                sentences = self._layout(needles, depths, n_noise)
+                text = " ".join(sentences)
+                current = self._count(text)
+        # Trim trailing NOISE (never a needle) until within target. Review M1
+        # (ADR-0165): ``current`` is always the count of ``text`` here, so no
+        # 32K-token text is tokenized twice.
+        while current > target and len(sentences) > len(needles):
             for i in range(len(sentences) - 1, -1, -1):
                 if sentences[i] == NOISE_SENTENCE:
                     del sentences[i]
@@ -378,6 +430,9 @@ class RulerLoader(DatasetLoader):
             else:  # pragma: no cover - only needles left
                 break
             text = " ".join(sentences)
+            current = self._count(text)
+        # _metadata reuses this count for the same string object.
+        self._last_assembled = (text, current)
         return text
 
     def _assemble_qa(
@@ -497,7 +552,11 @@ class RulerLoader(DatasetLoader):
             "dataset": "ruler",
             "task": self.task,
             "target_context_tokens": self.context_length_tokens,
-            "actual_context_tokens": self._count(haystack),
+            "actual_context_tokens": (
+                self._last_assembled[1]
+                if self._last_assembled is not None and self._last_assembled[0] is haystack
+                else self._count(haystack)
+            ),
             "tokenizer_name": self.tokenizer_name,
             "seed": self.seed,
             "item_index": index,
