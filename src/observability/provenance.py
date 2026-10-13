@@ -79,21 +79,29 @@ def _build_info(repo_dir: str) -> Dict[str, str]:
 
 
 def git_sha(repo_dir: str) -> Optional[str]:
-    """Full commit SHA of ``repo_dir`` (BUILD_INFO fallback for tarball deploys)."""
-    sha = _run_cmd(["git", "rev-parse", "HEAD"], cwd=repo_dir)
+    """Full commit SHA of ``repo_dir``.
+
+    BUILD_INFO first (Q-6, S0F-88): a tarball deploy has BUILD_INFO and no
+    .git, and asking git first logged a failed-command warning twice per
+    S0 window. A Mac checkout has no BUILD_INFO (package_repo.sh writes it
+    only into the archive), so git answers there as before.
+    """
+    sha = _build_info(repo_dir).get("sha")
     if sha:
         return sha
-    return _build_info(repo_dir).get("sha") or None
+    return _run_cmd(["git", "rev-parse", "HEAD"], cwd=repo_dir) or None
 
 
 def git_dirty(repo_dir: str) -> Optional[bool]:
-    """True if ``repo_dir`` has uncommitted changes -- flags a non-reproducible run."""
-    out = _run_cmd(["git", "status", "--porcelain"], cwd=repo_dir)
-    if out is not None:
-        return bool(out.strip())
+    """True if ``repo_dir`` has uncommitted changes -- flags a non-reproducible run.
+
+    BUILD_INFO first, as in :func:`git_sha` (Q-6)."""
     dirty = _build_info(repo_dir).get("dirty")
     if dirty in ("0", "1"):
         return dirty == "1"
+    out = _run_cmd(["git", "status", "--porcelain"], cwd=repo_dir)
+    if out is not None:
+        return bool(out.strip())
     return None
 
 

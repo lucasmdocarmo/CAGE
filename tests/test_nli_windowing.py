@@ -163,11 +163,17 @@ def test_windowing_tokenizes_each_sentence_once() -> None:
     assert calls["n"] == 1
 
 
-def test_single_oversized_sentence_still_forms_window() -> None:
+def test_single_oversized_sentence_is_split_within_the_budget() -> None:
+    # S0F-88 audit (Q-10, ADR-0167): this test pinned the old behavior, a
+    # 900-token sentence returned whole for the pipeline to truncate, which
+    # silently dropped the premise past 512 tokens. The sentence is now split
+    # on the NLI tokenizer's counts (the LettuceDetect branch's hard split).
     ev, _ = _evaluator_with_fake_nli()
-    giant = "word " * 900  # one 900-token "sentence", no terminators
-    windows = ev._split_premise_windows(giant.strip())
-    assert windows == [giant.strip()]  # single sentence: returned whole, truncation caps it
+    giant = " ".join(f"w{i}" for i in range(900))  # one 900-token "sentence"
+    windows = ev._split_premise_windows(giant)
+    assert len(windows) > 2
+    assert all(len(w.split()) <= QualityEvaluator.NLI_PREMISE_WINDOW_TOKENS for w in windows)
+    assert set(" ".join(windows).split()) == set(giant.split())  # no token lost
 
 
 def test_premise_mode_lands_in_quality_metrics() -> None:

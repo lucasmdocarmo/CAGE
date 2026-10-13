@@ -14,7 +14,9 @@ THE REGISTERED PROCEDURE (this docstring is the text embedded in
 PRE_REGISTRATION.md; the constants below ARE the registered values):
 
 1. Single-stream floor — ``FLOOR_N_REQUESTS`` (30) sequential streamed
-   requests at concurrency 1; the floor is the ``FLOOR_STATISTIC`` (median)
+   requests at concurrency 1, each COLD (cal-v3, S0F-88 B-13: the engine's
+   prefix cache is flushed before every request; the cal-v2 floor re-served
+   one cached block); the floor is the ``FLOOR_STATISTIC`` (median)
    of the per-request streamed TTFT and TPOT, reported in seconds
    (``summarize_floor``). The floor pair feeds ``goodput.SLOBaseline``
    unchanged. A floor is computed over COMPLETE telemetry only: any missing
@@ -37,7 +39,12 @@ PRE_REGISTRATION.md; the constants below ARE the registered values):
    60–90 s band) with the first ``PROBE_WARMUP_S`` = 10 s trimmed (Jain
    warmup removal, D6 §6.3). A ladder step is SUSTAINABLE iff its completed
    fraction (attainment) is ≥ ``PROBE_ATTAINMENT_MIN`` = 0.9, the charter's
-   criterion (c). lambda* is the HIGHEST sustainable rate immediately
+   criterion (c), AND (cal-v3, S0F-88 B-2, owner ruling R1 of 2026-10-12)
+   the requests that complete INSIDE the trimmed window number at least
+   ``PROBE_SERVED_MIN`` = 0.9 of the arrivals inside it: attainment alone
+   counted a request finished minutes late as attained, so on S0 attempt 4
+   every lambda* ran up to the client's connection limit at 2.4 to 4 times
+   the engine's capacity. lambda* is the HIGHEST sustainable rate immediately
    followed by an unsustainable step (``decide_lambda_star``). ADR-0121
    (2026-09-30) withdrew the earlier "not retrograde versus the previous
    sustainable step" clause: with attainment ≥ 0.9, a step's completed
@@ -86,6 +93,7 @@ __all__ = [
     "LambdaStarEstimate",
     "LambdaStarLabel",
     "PROBE_ATTAINMENT_MIN",
+    "PROBE_SERVED_MIN",
     "PROBE_BISECT_STEPS",
     "PROBE_LADDER_FACTOR",
     "PROBE_MAX_STEPS",
@@ -111,12 +119,30 @@ __all__ = [
 # summary statistic over their per-request streamed TTFT/TPOT.
 FLOOR_N_REQUESTS: Final[int] = 30
 FLOOR_STATISTIC: Final[str] = "median"
+# B-13 (S0F-88, owner ruling R2, per engine; per class is the next batch):
+# every floor request starts COLD: the engine's prefix cache is flushed right
+# before it. The S0 attempt 4 floor replayed ONE 2,633-token calibration block
+# 30 times with the cache on (vLLM prefix hit rate 83 to 89 percent during the
+# floor), so the floor TTFT of 0.06 s was a cached TTFT and every relative SLO
+# inherited it. A flushed cache recomputes the whole block for every request,
+# which is what distinct requests were meant to buy, with the request shape
+# (the start rung and the SLO basis derive from it) unchanged.
+FLOOR_COLD_PER_REQUEST: Final[bool] = True
 
 # Probe stage: geometric ladder of open-loop Poisson windows.
 PROBE_LADDER_FACTOR: Final[float] = 1.3   # geometric step between probe rates
 PROBE_WINDOW_S: Final[float] = 75.0       # per-rate window (charter band 60-90 s)
 PROBE_WARMUP_S: Final[float] = 10.0       # Jain warmup trim per window (§6.3)
 PROBE_ATTAINMENT_MIN: Final[float] = 0.9  # completed fraction for "sustainable"
+# B-2 (S0F-88, owner ruling R1, cal-v3): the engine must also SERVE what
+# arrives: completions finishing inside the trimmed window [PROBE_WARMUP_S,
+# PROBE_WINDOW_S) over the arrivals inside it. Attainment alone counts a
+# request completed 4 minutes late as attained, so on S0 attempt 4 lambda*
+# ran up to the client's limit, 2.4 to 4 times the engine's capacity; with
+# this check lambda* lands at 90 to 102 percent of the measured capacity on
+# all 12 S0 rungs (recomputed from the pulled windows). Same 0.9 as
+# attainment: no new constant beyond reusing the charter's threshold.
+PROBE_SERVED_MIN: Final[float] = 0.9
 # ADR-0122: the ladder climbs until the FIRST unsustainable step; this is a
 # hard CEILING, not the ladder length (30 x 75 s = 37.5 min of climb; when
 # rung 30 is the failing one, two bisect windows follow: 32 windows, 40 min).
@@ -129,17 +155,19 @@ PROBE_BISECT_STEPS: Final[int] = 2
 # an operator-given --start-qps is recorded under the "operator" rule.
 START_QPS_RULE: Final[str] = "floor-service-rate"
 
-PROCEDURE_VERSION: Final[str] = "cal-v2 (2026-09-30)"
+PROCEDURE_VERSION: Final[str] = "cal-v3 (2026-10-12)"
 
 LambdaStarLabel = Literal["ESTIMATED", "NONE_SUSTAINABLE", "LADDER_EXHAUSTED"]
 
 _PROCEDURE_MANIFEST: Final[Dict[str, Any]] = {
     "floor_n_requests": FLOOR_N_REQUESTS,
     "floor_statistic": FLOOR_STATISTIC,
+    "floor_cold_per_request": FLOOR_COLD_PER_REQUEST,
     "probe_ladder_factor": PROBE_LADDER_FACTOR,
     "probe_window_s": PROBE_WINDOW_S,
     "probe_warmup_s": PROBE_WARMUP_S,
     "probe_attainment_min": PROBE_ATTAINMENT_MIN,
+    "probe_served_min": PROBE_SERVED_MIN,
     "probe_max_steps": PROBE_MAX_STEPS,
     "probe_bisect_steps": PROBE_BISECT_STEPS,
     "start_qps_rule": START_QPS_RULE,
@@ -236,6 +264,15 @@ class ProbeStep:
     # or "bisect" (a midpoint window inside the bracket). Provenance only:
     # the decision rule treats every step alike.
     phase: str = "ladder"
+    # B-2 (S0F-88, cal-v3): requests that completed (without error) INSIDE
+    # the trimmed window [PROBE_WARMUP_S, PROBE_WINDOW_S), whatever their
+    # arrival; may exceed n_scheduled by the warm-up arrivals that finish
+    # after the trim. None only on a step built without completion clocks
+    # (unit tests, pre-cal-v3 replays); both live producers set it.
+    n_served_in_window: Optional[int] = None
+    # S0F-88 audit: the window's peak requests in flight (the dispatcher's
+    # max_in_flight_observed); attempt 4's client cap read 1,005 here.
+    max_in_flight: Optional[int] = None
 
     def __post_init__(self) -> None:
         _require_positive_finite("rate_qps", self.rate_qps)
@@ -258,6 +295,13 @@ class ProbeStep:
             raise CalibrationError(
                 "throughput_rps", self.throughput_rps, "must be finite and >= 0"
             )
+        if self.n_served_in_window is not None:
+            if _require_int("n_served_in_window", self.n_served_in_window) < 0:
+                raise CalibrationError(
+                    "n_served_in_window", self.n_served_in_window, "must be >= 0"
+                )
+        if self.max_in_flight is not None and _require_int("max_in_flight", self.max_in_flight) < 0:
+            raise CalibrationError("max_in_flight", self.max_in_flight, "must be >= 0")
 
     @property
     def attainment(self) -> float:
@@ -268,6 +312,37 @@ class ProbeStep:
             )
         return self.n_completed / self.n_scheduled
 
+    @property
+    def served_ratio(self) -> Optional[float]:
+        """In-window completions over in-window arrivals (B-2, cal-v3); None
+        when the step carries no completion clocks."""
+        if self.n_served_in_window is None:
+            return None
+        return self.n_served_in_window / self.n_scheduled
+
+    @property
+    def served_in_window_rps(self) -> Optional[float]:
+        """Completions per second inside the trimmed window (Q-2): the rate
+        the engine SERVED. ``throughput_rps`` counts completions of the
+        window's arrivals whenever they finish, so at attainment 1.0 it
+        equals the offered rate (it read 7.14 while 4.41 rps were served on
+        S0 attempt 4); it stays as the offered-completion rate. Named apart
+        from the open-loop window's ``DispatchReport.served_rps`` (first
+        send to last completion), a different span (S0F-88 audit)."""
+        if self.n_served_in_window is None:
+            return None
+        return self.n_served_in_window / (PROBE_WINDOW_S - PROBE_WARMUP_S)
+
+    @property
+    def sustainable(self) -> bool:
+        """The cal-v3 verdict: attainment >= PROBE_ATTAINMENT_MIN (criterion
+        (c)) AND, when the step carries completion clocks, the in-window
+        served ratio >= PROBE_SERVED_MIN (B-2)."""
+        if self.attainment < PROBE_ATTAINMENT_MIN:
+            return False
+        ratio = self.served_ratio
+        return ratio is None or ratio >= PROBE_SERVED_MIN
+
     def to_manifest(self) -> Dict[str, Any]:
         return {
             "rate_qps": self.rate_qps,
@@ -276,6 +351,11 @@ class ProbeStep:
             "throughput_rps": self.throughput_rps,
             "attainment": self.attainment,
             "phase": self.phase,
+            "n_served_in_window": self.n_served_in_window,
+            "served_ratio": self.served_ratio,
+            "served_in_window_rps": self.served_in_window_rps,
+            "sustainable": self.sustainable,
+            "max_in_flight": self.max_in_flight,
         }
 
 
@@ -328,7 +408,10 @@ def decide_lambda_star(steps: Sequence[ProbeStep]) -> LambdaStarEstimate:
     """THE registered lambda* decision rule over a probed rate ladder.
 
     A step is SUSTAINABLE iff attainment ≥ ``PROBE_ATTAINMENT_MIN`` (the
-    charter's criterion (c)). ADR-0121 withdrew the former retrograde-
+    charter's criterion (c)) and, when it carries completion clocks, its
+    in-window served ratio ≥ ``PROBE_SERVED_MIN`` (``ProbeStep.sustainable``,
+    cal-v3 B-2: both counts come from ONE window's realized arrivals, so the
+    ADR-0121 objection to comparing two steps' draws does not apply). ADR-0121 withdrew the former retrograde-
     throughput clause: at attainment ≥ 0.9 a step's completed throughput is
     its realized arrival draw times attainment, so comparing it with the
     previous step compares two Poisson draws and cannot detect saturation
@@ -359,10 +442,8 @@ def decide_lambda_star(steps: Sequence[ProbeStep]) -> LambdaStarEstimate:
                 "probe rates must be strictly increasing (a ladder, not a bag)",
             )
 
-    # Attainment alone decides (ADR-0121): completed fraction ≥ 0.9 per step.
-    sustainable: list[bool] = [
-        step.attainment >= PROBE_ATTAINMENT_MIN for step in seq
-    ]
+    # cal-v3 (B-2): attainment AND the in-window served ratio decide.
+    sustainable: list[bool] = [step.sustainable for step in seq]
 
     # Highest sustainable step immediately followed by an unsustainable one.
     bracket_idx: Optional[int] = None
@@ -418,6 +499,12 @@ class FloorMeasurement:
     tpot_s: float
     n_requests: int
     statistic: str = FLOOR_STATISTIC
+    # S0F-88 B-13 (owner 2026-10-12, "Per engine, distinct prompts"): how
+    # many distinct prompts the floor served, and the largest cached-prompt
+    # count any floor response reported (None when the engine reports no
+    # cache telemetry; the floor refuses any count above 0).
+    n_distinct_prompts: Optional[int] = None
+    cached_tokens_max: Optional[int] = None
 
     def __post_init__(self) -> None:
         _require_positive_finite("ttft_s", self.ttft_s)
@@ -427,6 +514,10 @@ class FloorMeasurement:
             raise CalibrationError("n_requests", self.n_requests, "must be > 0")
         if not isinstance(self.statistic, str) or not self.statistic.strip():
             raise CalibrationError("statistic", self.statistic, "must be a non-empty string")
+        for name in ("n_distinct_prompts", "cached_tokens_max"):
+            value = getattr(self, name)
+            if value is not None and _require_int(name, value) < 0:
+                raise CalibrationError(name, value, "must be >= 0")
 
     def to_manifest(self) -> Dict[str, Any]:
         return {
@@ -434,6 +525,8 @@ class FloorMeasurement:
             "tpot_s": self.tpot_s,
             "n_requests": self.n_requests,
             "statistic": self.statistic,
+            "n_distinct_prompts": self.n_distinct_prompts,
+            "cached_tokens_max": self.cached_tokens_max,
         }
 
 
@@ -534,6 +627,9 @@ class CellCalibration:
     # on the command line). None keeps pre-cal-v2 constructors valid.
     start_qps: Optional[float] = None
     start_qps_source: Optional[str] = None
+    # S0F-88 audit: the client's open-file limits (raise_open_file_limit's
+    # record) the probes ran under; None on direct constructors.
+    open_file_limit: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         for name, value in (("model", self.model), ("engine", self.engine)):
@@ -577,4 +673,5 @@ class CellCalibration:
             "start_qps_source": self.start_qps_source,
             "floor": self.floor.to_manifest(),
             "lambda_star": self.lambda_star.to_manifest(),
+            "open_file_limit": None if self.open_file_limit is None else dict(self.open_file_limit),
         }

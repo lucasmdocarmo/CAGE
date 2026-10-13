@@ -184,6 +184,11 @@ _INSTANCE_FIELD = "instance"
 #: clause fields queue_waiting_share, waiting_max, waiting_mean and
 #: n_waiting_samples beside the version-1 fields; the label vocabulary is
 #: unchanged). A reader that needs the queue fields checks this version.
+#: Additive keys since (no version change, the S0F-88 B-11 precedent): the
+#: top-level ``max_hold_s`` (Q-8; when a number, ``inputs.coverage`` counts a
+#: sample's hold only up to it), ``kv_ceiling``/``clause_a_rule`` on a
+#: refused window too (null rule), and ``inputs.longest_hold_s`` and
+#: ``inputs.hold_excess_s`` (review L9).
 _REGIME_SCHEMA_VERSION = 2
 
 
@@ -1026,6 +1031,18 @@ def load_telemetry_series(path: Path) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=columns)
 
 
+def _clause_a_record(queued_median: float | None, kv_ceiling: float | None) -> dict[str, Any]:
+    """S0F-88 B-11: which clause (a) rule labeled the window, recorded beside
+    the label so a reader can re-derive it (classify_regime's order)."""
+    if queued_median is None:
+        rule = "rho_kv_time_avg >= RHO_KV_MIN"
+    elif kv_ceiling is None:
+        rule = "rho_kv_queued_median >= RHO_KV_MIN"
+    else:
+        rule = "rho_kv_queued_median >= RHO_KV_REL_MIN x kv_ceiling"
+    return {"kv_ceiling": kv_ceiling, "clause_a_rule": rule}
+
+
 def write_window_regime(
     window_dir: Path,
     *,
@@ -1036,6 +1053,8 @@ def write_window_regime(
     min_samples: int = 2,
     min_coverage: float = 0.8,
     role_budgets: Mapping[str, int] | None = None,
+    kv_ceiling: float | None = None,
+    max_hold_s: float | None = None,
 ) -> Path:
     """Compute one window's §6.1 regime inputs and write ``regime.json``.
 
@@ -1073,6 +1092,12 @@ def write_window_regime(
     exactly matching the roles present, a non-positive/non-int budget — are
     CALLER bugs and raise; only genuine telemetry refusals inside a role's
     series are recorded as ``UNKNOWN_TELEMETRY``.
+
+    ``max_hold_s`` (S0F-88 Q-8): a sample's hold counts as observed only up
+    to this many seconds; a sampler whose scrapes failed records no sample,
+    and its silence must not read as covered. The campaign session passes
+    regime_inputs.MAX_SAMPLE_HOLD_S; None (the default) keeps every hold, the
+    pre-Q-8 rule. Recorded top-level in regime.json.
     """
     window_dir = Path(window_dir)
     if not window_dir.is_dir():
@@ -1111,6 +1136,8 @@ def write_window_regime(
             min_samples=min_samples,
             min_coverage=min_coverage,
             role_budgets=role_budgets,
+            kv_ceiling=kv_ceiling,
+            max_hold_s=max_hold_s,
         )
 
     # T4.1 fail-closed gate — the load-bearing refusal of the PD stack: a
@@ -1142,6 +1169,7 @@ def write_window_regime(
         "t_end": float(t_end),
         "telemetry_source": source.name,
         "attainment": None if attainment is None else float(attainment),
+        "max_hold_s": max_hold_s,
     }
     try:
         inputs = compute_window_regime_inputs(
@@ -1150,6 +1178,7 @@ def write_window_regime(
             float(t_end),
             min_samples=min_samples,
             min_coverage=min_coverage,
+            max_hold_s=max_hold_s,
         )
     except RegimeInputError as exc:
         document.update(
@@ -1158,6 +1187,9 @@ def write_window_regime(
                 "inputs": None,
                 "label": REGIME_UNKNOWN,
                 "refusal_reason": str(exc),
+                # S0F-88 audit: the certified document's keys, no rule applied
+                "kv_ceiling": kv_ceiling,
+                "clause_a_rule": None,
             }
         )
     else:
@@ -1169,6 +1201,10 @@ def write_window_regime(
                 attainment=float(attainment),
                 queue_waiting_share=inputs.queue_waiting_share,
                 scarcity_events=inputs.scarcity_events,
+                # S0F-88 B-11 (R3): clause (a) on the queued occupancy,
+                # relative to the measured ceiling when the cell pins one
+                rho_kv_queued_median=inputs.rho_kv_queued_median,
+                kv_ceiling=kv_ceiling,
             )
         document.update(
             {
@@ -1176,6 +1212,7 @@ def write_window_regime(
                 "inputs": inputs.to_flat_dict(),
                 "label": label,
                 "refusal_reason": None,
+                **_clause_a_record(inputs.rho_kv_queued_median, kv_ceiling),
             }
         )
     return _atomic_write_json(window_dir / "regime.json", document)
@@ -1192,6 +1229,8 @@ def _write_pd_window_regime(
     min_samples: int,
     min_coverage: float,
     role_budgets: Mapping[str, int],
+    kv_ceiling: float | None = None,
+    max_hold_s: float | None = None,
 ) -> Path:
     """T2.3 summed-pool lane of ``write_window_regime`` (§6.5).
 
@@ -1276,6 +1315,7 @@ def _write_pd_window_regime(
         "t_end": t_end,
         "telemetry_source": source.name,
         "attainment": None if attainment is None else float(attainment),
+        "max_hold_s": max_hold_s,
     }
     try:
         inputs = compute_pd_window_regime_inputs(
@@ -1285,6 +1325,7 @@ def _write_pd_window_regime(
             budgets_by_role=budgets,
             min_samples=min_samples,
             min_coverage=min_coverage,
+            max_hold_s=max_hold_s,
         )
     except RegimeInputError as exc:
         document.update(
@@ -1293,6 +1334,8 @@ def _write_pd_window_regime(
                 "inputs": None,
                 "label": REGIME_UNKNOWN,
                 "refusal_reason": str(exc),
+                "kv_ceiling": kv_ceiling,
+                "clause_a_rule": None,
                 # Split recorded even on refusal; per_role stays None — a
                 # refused pool never carries partial numerics (E2b).
                 "pd": {"budgets_by_role": budgets, "per_role": None},
@@ -1307,6 +1350,10 @@ def _write_pd_window_regime(
                 attainment=float(attainment),
                 queue_waiting_share=inputs.queue_waiting_share,
                 scarcity_events=inputs.scarcity_events,
+                # S0F-88 B-11 (R3): clause (a) on the queued occupancy,
+                # relative to the measured ceiling when the cell pins one
+                rho_kv_queued_median=inputs.rho_kv_queued_median,
+                kv_ceiling=kv_ceiling,
             )
         document.update(
             {
@@ -1316,6 +1363,7 @@ def _write_pd_window_regime(
                 "inputs": inputs.to_flat_dict(),
                 "label": label,
                 "refusal_reason": None,
+                **_clause_a_record(inputs.rho_kv_queued_median, kv_ceiling),
                 "pd": {
                     "budgets_by_role": dict(inputs.budgets_by_role),
                     "per_role": {

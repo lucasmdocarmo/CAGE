@@ -981,7 +981,7 @@ def test_openloop_gate_runs_schedule_and_replay_guard() -> None:
 # ---------------------------------------------------------------------------
 
 _CAL_V1 = {
-    "procedure_version": "cal-v2 (2026-09-30)",
+    "procedure_version": "cal-v3 (2026-10-12)",
     "model": "qwen3-14b",
     "engine": "vllm",
     "budget_fraction": 0.9,
@@ -1005,7 +1005,7 @@ def test_calibration_gate_accepts_a_cal_v1_manifest(tmp_path: Path) -> None:
     proc = _run_gate("CAGE-CALIBRATION-ARTIFACT-GATE",
                      env=_clean_env(CAGE_CALIBRATION_MANIFESTS=str(p)))
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "cal-v2 shape OK" in proc.stdout
+    assert "cal-v3 shape OK" in proc.stdout
 
 
 def test_calibration_gate_declared_but_missing_fails(tmp_path: Path) -> None:
@@ -1017,8 +1017,10 @@ def test_calibration_gate_declared_but_missing_fails(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("mutate,needle", [
-    (lambda d: d.pop("floor"), "missing required cal-v2 keys"),
-    (lambda d: d.update(procedure_version="cal-v1 (2026-08-12)"), "is not cal-v2"),
+    (lambda d: d.pop("floor"), "missing required cal-v3 keys"),
+    (lambda d: d.update(procedure_version="cal-v1 (2026-08-12)"), "is not cal-v3"),
+    # S0F-88 B-2: a cal-v2 artifact (no in-window served check) refuses too
+    (lambda d: d.update(procedure_version="cal-v2 (2026-09-30)"), "is not cal-v3"),
     (lambda d: d.update(confirmatory=True), "confirmatory must be False"),
     (lambda d: d.update(budget_fraction=-1), "not positive finite"),
     (lambda d: d.update(lambda_star={}), "not a non-empty object"),

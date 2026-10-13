@@ -25,6 +25,14 @@ ADR-0149): SGLang 0.5.10.post1 then performs the flush once its scheduler
 is fully idle and answers 400 past the deadline, so a refused flush is
 still a typed error, never a silent warm window.
 
+Cache report (S0F-88 U7): the launcher always passes --enable-cache-report,
+and SGLang 0.5.10.post1 then sends ``prompt_tokens_details`` as
+``{"cached_tokens": n}`` when n > 0 and as null when n == 0, the same null it
+sends with the report off (usage_processor.py:13-15 at the tag). A null is
+therefore read as 0 only after ``probe_cache_report`` read
+``enable_cache_report: true`` from GET /server_info (http_server.py:601-618);
+otherwise it stays None.
+
 kv_transfer_params stays unparsed: the field is vLLM/NIXL-shaped; SGLang's
 disaggregation metadata format (if any) is unconfirmed (ADR-0007 item 6).
 
@@ -41,6 +49,8 @@ the run when the served text still carries the marker.
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
+
+import requests
 
 from .engine import InferenceRequest  # noqa: F401  (re-exported for type context)
 from .openai_chat_adapter import OpenAIChatAdapter
@@ -113,6 +123,24 @@ class SGLangAdapter(OpenAIChatAdapter):
             else dict(SGLANG_CHAT_TEMPLATE_KWARGS)
         )
         self.request_logprobs = request_logprobs
+        # S0F-88 U7: True only after probe_cache_report read the server's flag
+        self.cache_report: bool = False
+
+    def probe_cache_report(self) -> Optional[bool]:
+        """Read ``enable_cache_report`` from GET /server_info (S0F-88 U7).
+
+        Returns the server's boolean, or None when the endpoint does not
+        answer with one; ``cache_report`` is set True only on a True reading,
+        so an unread flag never turns a null into a fabricated 0."""
+        try:
+            resp = requests.get(f"{self.api_base}/server_info", timeout=10)
+            resp.raise_for_status()
+            value = resp.json().get("enable_cache_report")
+        except (requests.exceptions.RequestException, ValueError, AttributeError):
+            value = None
+        flag = value if isinstance(value, bool) else None
+        self.cache_report = flag is True
+        return flag
 
     def _apply_engine_chat_extras(self, payload: Dict[str, Any]) -> None:
         """SGLang chat extras: the thinking pin by default (ADR-0151), an
@@ -130,11 +158,16 @@ class SGLangAdapter(OpenAIChatAdapter):
 
         Parses ``prompt_tokens``/``completion_tokens`` and, when present,
         ``prompt_tokens_details.cached_tokens`` (SGLang's per-request cached-
-        token reporting is charter D2.1 [VERIFY-LIVE]). An absent cached-token
-        block stays ``None`` -- deliberately NOT the vLLM absent-means-zero
-        coercion, whose semantics are unverified on SGLang.
+        token reporting is charter D2.1 [VERIFY-LIVE]). An absent or null
+        cached-token block stays ``None`` unless the server's cache report is
+        verified on (``cache_report``, S0F-88 U7): SGLang then sends null for
+        a request with no cached token, so a usage object with a prompt count
+        and no details means 0 cached.
         """
-        return super()._extract_usage(usage)
+        prompt_tokens, cached, completion_tokens = super()._extract_usage(usage)
+        if self.cache_report and cached is None and prompt_tokens is not None:
+            cached = 0
+        return prompt_tokens, cached, completion_tokens
 
     def capabilities(self) -> Dict[str, Any]:
         """Capability declaration driving the charter-D2 telemetry-parity gate.
@@ -149,8 +182,9 @@ class SGLangAdapter(OpenAIChatAdapter):
             "in_process": False,
             "streamed_ttft": True,
             "cached_token_telemetry": "verify-live",  # D2.1: per-request granularity unverified
-            "cached_token_server_flag": None,
-            "cached_token_absent_means_zero": False,  # absence stays None, never coerced
+            # S0F-88 U7: the launcher flag; null reads as 0 only once verified on
+            "cached_token_server_flag": "--enable-cache-report",
+            "cached_token_absent_means_zero": self.cache_report,
             "kv_usage_gauge": False,  # adapter never scrapes /metrics (ADR-0007 item 5)
             "flush_endpoint": self._flush_endpoint,
             "kv_transfer_params": False,  # NIXL-shaped; no SGLang parser (ADR-0007 item 6)

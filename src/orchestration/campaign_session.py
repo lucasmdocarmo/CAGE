@@ -120,6 +120,7 @@ __all__ = [
     "BUDGET_PLAN_CELL_KEY",
     "BUDGET_PLAN_ENV",
     "CONSORT_COUNTERS",
+    "KV_CEILING_ENV",
     "CampaignCellSession",
     "CampaignSessionError",
     "ENGINE_OF_BACKEND",
@@ -132,6 +133,7 @@ __all__ = [
     "parse_budget_plan",
     "parse_slo_floors",
     "read_write_time_journal",
+    "refuse_connect_error_rows",
     "refuse_dropped_rows_summary",
     "resolve_model_slug",
     "seal_campaign_run",
@@ -175,6 +177,12 @@ SLO_FLOORS_ENV = "CAGE_SLO_FLOORS_JSON"
 BUDGET_PLAN_ENV = "CAGE_BUDGET_PLAN_JSON"
 SLO_FLOORS_MANIFEST_KEY = "slo_floors"
 BUDGET_PLAN_CELL_KEY = "budget_plan"
+#: S0F-88 B-11 (owner ruling R3): the measured KV fill ceiling of this cell's
+#: (engine, demand class, r), from the rung calibration's queued windows,
+#: pinned by run_campaign on budgeted cells; regime clause (a) then compares
+#: the queued occupancy median with RHO_KV_REL_MIN x this value. Absent = no
+#: measured ceiling (the absolute RHO_KV_MIN applies).
+KV_CEILING_ENV = "CAGE_KV_CEILING"
 #: The engines a floor may be keyed by: the §7.3 server engines (the
 #: in-process oracle serves no floor).
 _FLOOR_ENGINES: frozenset[str] = frozenset(_get_args(Engine)) - {"hf"}
@@ -578,6 +586,36 @@ def refuse_dropped_rows_summary(experiment_summary: Mapping[str, Any]) -> None:
         raise CampaignSessionError(problems)
 
 
+def refuse_connect_error_rows(results_rows: Iterable[Mapping[str, Any]]) -> None:
+    """Refuse a window with any connect-phase error row (B-4, S0F-88).
+
+    A request that failed to open its connection never reached the engine,
+    so counting it as an unserved request mislabels a client fault as an
+    engine result: in S0 attempt 4 every "unsustainable" calibration step
+    and every lambda* came from 15,817 such rows (the client's 1,024
+    open-file limit, B-1). Zero tolerance (owner ruling R16, 2026-10-12):
+    one such row refuses the window before any artifact is written; a
+    refused ladder window becomes a PROBE_FAILED rung on the existing path.
+    """
+    from src.orchestration.load_generator import is_connect_error
+
+    hits = [
+        (i, text)
+        for i, row in enumerate(results_rows)
+        for text in (row.get("error"), row.get("dispatch_error"))
+        if is_connect_error(text)
+    ]
+    if hits:
+        first_index, first_text = hits[0]
+        raise CampaignSessionError(
+            f"{len(hits)} request row(s) failed to connect to the engine (first: "
+            f"row {first_index}, {first_text!r}); a connect-phase failure is a "
+            "client fault, never an engine result, so the window is refused "
+            "(B-4, S0F-88). Check the client's open-file limit (B-1) and that "
+            "the engine is up"
+        )
+
+
 def _json_norm(value: Any) -> Any:
     """One JSON round trip: tuples become lists, keys sort, so a pin, its
     on-disk copy and a caller's tuple-spelled record compare equal."""
@@ -833,8 +871,18 @@ class CampaignCellSession:
         env: Mapping[str, str] | None = None,
         slo_floors: Mapping[str, Any] | None = None,
         budget_plan: Mapping[str, Any] | None = None,
+        kv_ceiling: float | None = None,
     ) -> None:
         self.env = os.environ if env is None else env
+        if kv_ceiling is not None and (
+            isinstance(kv_ceiling, bool) or not isinstance(kv_ceiling, (int, float))
+            or not math.isfinite(kv_ceiling) or not 0.0 < kv_ceiling <= 1.0
+        ):
+            raise CampaignSessionError(
+                f"{KV_CEILING_ENV}={kv_ceiling!r} must be a number in (0, 1] (a measured "
+                "KV fill ceiling, S0F-88 B-11)"
+            )
+        self.kv_ceiling = None if kv_ceiling is None else float(kv_ceiling)
         self.run_root = Path(run_root)
         self.dataset = dataset
         self.spec = spec
@@ -1031,6 +1079,10 @@ class CampaignCellSession:
         slo_floors = parse_slo_floors(raw_floors) if raw_floors else None
         raw_plan = (env.get(BUDGET_PLAN_ENV) or "").strip()
         budget_plan = parse_budget_plan(raw_plan, spec) if raw_plan else None
+        ceiling_problems: list[str] = []
+        kv_ceiling = _env_float(env, KV_CEILING_ENV, ceiling_problems)
+        if ceiling_problems:
+            raise CampaignSessionError(ceiling_problems)
         session = cls(
             run_root=Path(root),
             dataset=args.dataset,
@@ -1043,6 +1095,7 @@ class CampaignCellSession:
             env=env,
             slo_floors=slo_floors,
             budget_plan=budget_plan,
+            kv_ceiling=kv_ceiling,
         )
         session._preflight_new_run()
         return session
@@ -1476,6 +1529,7 @@ class CampaignCellSession:
         """Emit ONE §1 measurement window through campaign_layout's writers."""
         refuse_stale_index_summary(experiment_summary)
         refuse_dropped_rows_summary(experiment_summary)
+        refuse_connect_error_rows(results_rows)
         cl = _campaign_layout()
         run = self._ensure_run(backend_metadata)
         cell = run.cell(
@@ -1529,12 +1583,19 @@ class CampaignCellSession:
         # recorded as UNKNOWN_TELEMETRY by the writer on every cell; a series
         # with two or more roles on a non-pd cell, or a pd series missing a
         # budgeted role, raises there (T4.1), never a pooled label.
+        # S0F-88 Q-8: a sampler whose scrapes failed records nothing, so a
+        # hold counts as observed only up to MAX_SAMPLE_HOLD_S (lazy import:
+        # regime_inputs loads pandas, as campaign_layout does).
+        from src.analysis.regime_inputs import MAX_SAMPLE_HOLD_S
+
         cl.write_window_regime(
             handle.window_dir,
             t_start=float(t_start),
             t_end=float(t_end),
             attainment=_attainment(requests_rows_n),
             role_budgets=self._role_budgets(cell.budget_plan, cage_stats_rows),
+            kv_ceiling=self.kv_ceiling,  # S0F-88 B-11
+            max_hold_s=MAX_SAMPLE_HOLD_S,
         )
         # S0-15: hash ledger written at write time. A8 (2026-10-10): every
         # artifact of this emission is journaled BEFORE the metrics sentinel

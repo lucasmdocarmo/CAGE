@@ -359,15 +359,17 @@ def test_cell_calibration_manifest_shape_and_json_round_trip():
     assert restored["model"] == "qwen3-8b"
     assert restored["engine"] == "vllm"
     assert restored["budget_fraction"] == 0.5
-    assert restored["procedure_version"] == "cal-v2 (2026-09-30)"
+    assert restored["procedure_version"] == "cal-v3 (2026-10-12)"
     assert restored["confirmatory"] is False  # never enters confirmatory analysis
     assert restored["procedure"] == {
         "floor_n_requests": 30,
         "floor_statistic": "median",
+        "floor_cold_per_request": True,  # S0F-88 B-13 (cal-v3)
         "probe_ladder_factor": 1.3,
         "probe_window_s": 75.0,
         "probe_warmup_s": 10.0,
         "probe_attainment_min": 0.9,
+        "probe_served_min": 0.9,  # S0F-88 B-2 (cal-v3)
         "probe_max_steps": 30,  # ADR-0122 ceiling
         "probe_bisect_steps": 2,  # ADR-0122
         "start_qps_rule": "floor-service-rate",  # ADR-0122
@@ -377,6 +379,8 @@ def test_cell_calibration_manifest_shape_and_json_round_trip():
         "tpot_s": 0.01,
         "n_requests": 30,
         "statistic": "median",
+        "n_distinct_prompts": None,  # S0F-88 B-13 cold evidence (direct constructor)
+        "cached_tokens_max": None,
     }
     lam = restored["lambda_star"]
     assert lam["label"] == "ESTIMATED"
@@ -473,7 +477,7 @@ def test_calibration_records_the_start_rung_provenance():
         lambda_star=est, start_qps=0.72, start_qps_source=START_QPS_RULE,
     )
     doc = cal.to_manifest()
-    assert doc["procedure_version"] == "cal-v2 (2026-09-30)"
+    assert doc["procedure_version"] == "cal-v3 (2026-10-12)"
     assert doc["start_qps"] == pytest.approx(0.72)
     assert doc["start_qps_source"] == "floor-service-rate"
     assert doc["procedure"]["probe_bisect_steps"] == PROBE_BISECT_STEPS

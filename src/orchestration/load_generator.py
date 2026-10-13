@@ -52,6 +52,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import math
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Final, List, Literal, Optional, Sequence, Tuple
@@ -70,7 +71,71 @@ __all__ = [
     "OpenLoopDispatcher",
     "ensure_no_measured_replay",
     "trim_to_measurement_window",
+    "CONNECT_ERROR_RE",
+    "is_connect_error",
+    "raise_open_file_limit",
 ]
+
+#: B-4 (S0F-88, 2026-10-12): the text aiohttp gives a request that failed to
+#: open its connection ("Cannot connect to host {host}:{port} ssl:{ssl}
+#: [{strerror}]", client_exceptions.py:202-205). Such a request never reached
+#: the engine: S0 attempt 4 logged 15,817 of them, all from the client's 1,024
+#: open-file limit (B-1), six with the errno text "[None]". Matched on the
+#: stable prefix, at the start of the text or after an exception-type label
+#: ("ClientConnectorError: ..."). A dead engine's "connection refused" matches
+#: too, and is equally not an engine result.
+#: S0F-88 audit: the closed-loop path's requests/urllib3 forms too, read
+#: from real calls to a closed and an unroutable port (urllib3 2.7.0,
+#: connection.py:212-220): "(Caused by NewConnectionError(" (refused, or
+#: EMFILE) and "(Caused by ConnectTimeoutError(". Review L8: matched on that
+#: wrapper only, so a served error body that quotes an upstream's "Failed to
+#: establish a new connection" (a PD router's 502) stays a served result.
+CONNECT_ERROR_RE: Final["re.Pattern[str]"] = re.compile(
+    r"(?:^|: )Cannot connect to host |\(Caused by (?:NewConnectionError|ConnectTimeoutError)\("
+)
+
+
+def is_connect_error(text: Any) -> bool:
+    """True when ``text`` is a connect-phase failure (see CONNECT_ERROR_RE)."""
+    return isinstance(text, str) and CONNECT_ERROR_RE.search(text) is not None
+
+
+def raise_open_file_limit() -> Dict[str, Any]:
+    """B-1 (S0F-88): raise this process's soft RLIMIT_NOFILE to its hard limit.
+
+    Every in-flight open-loop request holds one socket, so the soft limit is
+    a ceiling on concurrency: at the Linux default of 1,024 the S0 attempt 4
+    client failed every request above about 1,005 in flight with "Too many
+    open files", and every calibrated lambda* was the client's ceiling, not
+    the engine's. Never lowers a limit. Returns the limits before and after
+    for the window record: integers, ``"unlimited"`` for RLIM_INFINITY, and
+    ``None`` only where the platform has no ``resource`` module.
+    """
+    try:
+        import resource
+    except ImportError:  # pragma: no cover - non-Unix
+        return {"soft_before": None, "soft_after": None, "hard": None}
+    inf = resource.RLIM_INFINITY
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft != inf:
+        # The hard limit first; a kernel that refuses it (Linux fs.nr_open
+        # below an unlimited hard limit, macOS kern.maxfilesperproc) gets the
+        # next finite candidate. Candidates at or below the soft limit, or
+        # above a finite hard limit, are skipped: the call never lowers.
+        for target in (hard, 1 << 20, 1 << 16):
+            if target != inf and (target <= soft or (hard != inf and target > hard)):
+                continue
+            try:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+                break
+            except (ValueError, OSError):
+                continue
+    after, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+
+    def _num(value: int) -> Any:
+        return "unlimited" if value == inf else int(value)
+
+    return {"soft_before": _num(soft), "soft_after": _num(after), "hard": _num(hard)}
 
 # PUBLICATION.md D6 §6.1: offered rates are pre-registered fractions of the
 # PREDICTED saturation rate lambda* per (model, engine, budget).
@@ -373,8 +438,26 @@ class RequestRecord:
         return self.actual_send_ts is not None
 
     @property
+    def result_error(self) -> Optional[str]:
+        """The error text the send returned INSIDE its result (B-12, S0F-88).
+
+        The streaming adapters catch transport and engine failures and return
+        a response carrying ``error`` instead of raising, so ``self.error``
+        (exceptions raised to the dispatcher) missed them: one S0 attempt 4
+        window reported 0 errors and 6,610 completions beside 1,557 error
+        rows. Empty text is absence, matching the adapters' contract that an
+        error text is never empty (``_exc_text``)."""
+        err = getattr(self.result, "error", None)
+        return str(err) if err else None
+
+    @property
     def completed(self) -> bool:
-        return self.sent and self.completion_ts is not None and self.error is None
+        return (
+            self.sent
+            and self.completion_ts is not None
+            and self.error is None
+            and self.result_error is None
+        )
 
     def to_row(self) -> Dict[str, Any]:
         """Row fields for the results schema.
@@ -414,6 +497,9 @@ class DispatchReport:
     records: List[RequestRecord] = field(default_factory=list)
     dropped_or_delayed: int = 0
     max_in_flight_observed: int = 0
+    # S0F-88 U3: the steady-state pre-load that preceded the measured
+    # arrivals (counts and span; its rows are never kept), None when none ran
+    preload: Optional[Dict[str, Any]] = None
 
     @property
     def n_scheduled(self) -> int:
@@ -429,11 +515,44 @@ class DispatchReport:
 
     @property
     def n_errors(self) -> int:
-        return sum(1 for r in self.records if r.error is not None)
+        # B-12: raised and returned errors both count (see result_error).
+        return sum(
+            1 for r in self.records if r.error is not None or r.result_error is not None
+        )
 
     @property
     def n_dropped(self) -> int:
         return sum(1 for r in self.records if r.dropped_by_cap)
+
+    @property
+    def served_rps(self) -> Optional[float]:
+        """Completed requests per second over the served span, first send to
+        last completion (Q-5, S0F-88; the S0F-87 item 7 ruling R12).
+
+        The runner's QPS divides completions by the SUM of their latencies,
+        a closed-loop single-stream rate: on an open-loop window it read 0.54
+        while 50 completions finished in 3.54 s (14.1 rps). None when nothing
+        completed or the span is not positive.
+        """
+        done = [r for r in self.records if r.completed]
+        if not done:
+            return None
+        span = max(r.completion_ts for r in done) - min(r.actual_send_ts for r in done)  # type: ignore[type-var]
+        return len(done) / span if span > 0 else None
+
+    @property
+    def served_tokens_per_second(self) -> Optional[float]:
+        """S0F-88 audit (Q-5): output tokens of the completed requests over the
+        same span as ``served_rps``; None when nothing completed or a
+        completion carries no token count."""
+        done = [r for r in self.records if r.completed]
+        if not done:
+            return None
+        tokens = [getattr(r.result, "num_tokens", None) for r in done]
+        if any(isinstance(t, bool) or not isinstance(t, int) for t in tokens):
+            return None
+        span = max(r.completion_ts for r in done) - min(r.actual_send_ts for r in done)  # type: ignore[type-var]
+        return sum(tokens) / span if span > 0 else None  # type: ignore[arg-type]
 
     def to_manifest(self) -> Dict[str, Any]:
         return {
@@ -446,6 +565,9 @@ class DispatchReport:
             "n_dropped": self.n_dropped,
             "dropped_or_delayed": self.dropped_or_delayed,
             "max_in_flight_observed": self.max_in_flight_observed,
+            "served_rps": self.served_rps,
+            "served_tokens_per_second": self.served_tokens_per_second,
+            "preload": None if self.preload is None else dict(self.preload),
         }
 
 

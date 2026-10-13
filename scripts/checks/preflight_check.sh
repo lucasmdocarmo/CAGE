@@ -23,7 +23,7 @@
 #   (k) per-backend endpoint liveness (final-scope engines, serial serving)
 #   (l) campaign-layout round-trip (v2 producer -> organizer)      [#118 item]
 #   (m) open-loop schedule + measured-replay guard smoke           [#118 item]
-#   (n) calibration artifact (cal-v2) presence/shape               [#118 item]
+#   (n) calibration artifact (cal-v3) presence/shape               [#118 item]
 #   (o) regime-inputs bridge on live telemetry (live-only; skips)  [#118 item]
 #   (p) dataset staleness refusal (requested charter datasets staged on disk)
 #   (q) cage-stats pin parity (requirements.txt pinned SHA == installed commit;
@@ -809,10 +809,10 @@ gate_rc $?
 # ---------------------------------------------------------------------------
 # (n) calibration artifact presence/shape (task #138 gate c3; #118).
 # ---------------------------------------------------------------------------
-echo "(n) calibration artifact (cal-v2) presence/shape"
+echo "(n) calibration artifact (cal-v3) presence/shape"
 python3 - <<'PY'
 # CAGE-CALIBRATION-ARTIFACT-GATE (task #138 gate c3; merges #118). Once
-# scripts/3_run/calibrate_cell.py has minted cal-v2 artifacts, every declared
+# scripts/3_run/calibrate_cell.py has minted cal-v3 artifacts, every declared
 # manifest must exist, parse, and carry the CellCalibration.to_manifest shape
 # (src/orchestration/calibration.py). Pre-calibration the gate SKIPS with an
 # explicit reason -- declared-but-missing is a FAILURE, never a skip.
@@ -824,7 +824,7 @@ import sys
 
 raw = os.environ.get("CAGE_CALIBRATION_MANIFESTS", "").strip()
 if not raw:
-    print("  [SKIP] pre-calibration: no cal-v2 manifest declared (set "
+    print("  [SKIP] pre-calibration: no cal-v3 manifest declared (set "
           "CAGE_CALIBRATION_MANIFESTS=<path-or-glob[,...]> once "
           "scripts/3_run/calibrate_cell.py has run at S0)")
     sys.exit(3)
@@ -851,15 +851,16 @@ for p in paths:
         continue
     missing = [k for k in REQUIRED if k not in doc]
     if missing:
-        print(f"  [FAIL] {p}: missing required cal-v2 keys {missing}")
+        print(f"  [FAIL] {p}: missing required cal-v3 keys {missing}")
         ok = False
         continue
     problems = []
-    # ADR-0121/0122 (2026-09-30): the registered procedure is cal-v2; a cal-v1
-    # artifact (retrograde ladder rule, fixed 12 rungs) must never seed a grid.
-    if not str(doc["procedure_version"]).startswith("cal-v2"):
+    # ADR-0121/0122 (2026-09-30): a cal-v1 artifact (retrograde ladder rule,
+    # fixed 12 rungs) must never seed a grid; S0F-88 B-2 (2026-10-12): nor a
+    # cal-v2 one (attainment without the in-window served check).
+    if not str(doc["procedure_version"]).startswith("cal-v3"):
         problems.append(
-            f"procedure_version={doc['procedure_version']!r} is not cal-v2")
+            f"procedure_version={doc['procedure_version']!r} is not cal-v3")
     if doc["confirmatory"] is not False:
         problems.append("confirmatory must be False (calibration data NEVER "
                         "enters confirmatory analysis)")
@@ -874,7 +875,7 @@ for p in paths:
         print(f"  [FAIL] {p}: " + "; ".join(problems))
         ok = False
     else:
-        print(f"  [PASS] {p}: cal-v2 shape OK (model={doc['model']} "
+        print(f"  [PASS] {p}: cal-v3 shape OK (model={doc['model']} "
               f"engine={doc['engine']} budget_fraction={bf})")
 sys.exit(0 if ok else 1)
 PY

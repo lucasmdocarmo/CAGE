@@ -245,6 +245,7 @@ from src.analysis.conditioned_curves import (  # noqa: E402
     pressure_bin_of,
     quality_by_evidence_position,
     quality_by_rho_own,
+    quality_metrics_for,
 )
 from src.analysis.degradation import (  # noqa: E402
     LABEL_COLUMNS as DEGRADATION_LABEL_COLUMNS,
@@ -529,6 +530,7 @@ HIGHER_IS_BETTER: dict[str, bool] = {
     "context_relevance": True,
     "completeness_bertscore": True,
     "completeness_rouge_l": True,
+    "ruler_native_score": True,  # ADR-0170: the RULER instrument's native metric
     "predicate": True,
     "goodput_frac": True,
     "yield_frac": True,
@@ -1965,24 +1967,26 @@ def render_figures(
             continue
 
         wlt_path = out_dir / f"wlt_{metric}.png"
-        fp.plot_win_loss_tie_registered(
+        if _render_figure(
+            figures, {"file": wlt_path.name, "kind": "wlt_per_dataset", "metric": metric},
+            fp.plot_win_loss_tie_registered,
             rows,
             wlt_path,
             title=f"[{stamp}] W/L/T per contrast × dataset — {metric} "
             "(registered per-dataset triples, stats.json)",
-        )
-        figures.append(_figure_record(wlt_path, "wlt_per_dataset", metric, rows))
+        ):
+            figures[-1] = _figure_record(wlt_path, "wlt_per_dataset", metric, rows)
 
         pooled_path = out_dir / f"wlt_{metric}_pooled_supplementary.png"
-        fp.plot_win_loss_tie_registered(
+        if _render_figure(
+            figures, {"file": pooled_path.name, "kind": "wlt_pooled_supplementary", "metric": metric},
+            fp.plot_win_loss_tie_registered,
             rows,
             pooled_path,
             title=f"[{stamp}] W/L/T per contrast — {metric}",
             pooled=True,
-        )
-        figures.append(
-            _figure_record(pooled_path, "wlt_pooled_supplementary", metric, rows)
-        )
+        ):
+            figures[-1] = _figure_record(pooled_path, "wlt_pooled_supplementary", metric, rows)
 
         by_reference: dict[str, list[fp.ContrastStatRow]] = {}
         for row in rows:
@@ -2008,16 +2012,38 @@ def render_figures(
                 name = f"forest_{metric}.png"
                 title_ref = ref_label
             forest_path = out_dir / name
-            fp.plot_forest_registered(
+            if _render_figure(
+                figures, {"file": forest_path.name, "kind": "forest", "metric": metric},
+                fp.plot_forest_registered,
                 ref_rows,
                 forest_path,
                 title=f"[{stamp}] paired Δ{metric} vs {title_ref} "
                 "(registered statistics)",
-            )
-            figures.append(
-                _figure_record(forest_path, "forest", metric, ref_rows)
-            )
+            ):
+                figures[-1] = _figure_record(forest_path, "forest", metric, ref_rows)
     return figures
+
+
+def _render_figure(
+    figures: list[dict[str, Any]], record: dict[str, Any], render: Any, *args: Any, **kwargs: Any
+) -> bool:
+    """Render one figure; a failure is recorded, never fatal (S0F-88 item 15).
+
+    S0 attempt 4's analysis stage died in one plot's color-budget check and
+    wrote no numbers. The numbers come from frames the pass serializes on
+    its own, so a figure that cannot render appends its record with a
+    ``figure_error`` and a printed FIGURE FAILED line, and the pass goes on.
+    Returns True when the figure rendered (the record is appended either
+    way, so a caller may replace ``figures[-1]`` with a richer record).
+    """
+    try:
+        render(*args, **kwargs)
+    except Exception as exc:  # noqa: BLE001 -- recorded, the pass continues
+        print(f"[analysis] FIGURE FAILED {record.get('file')}: {type(exc).__name__}: {exc}")
+        figures.append({**record, "figure_error": f"{type(exc).__name__}: {exc}"})
+        return False
+    figures.append(record)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -5804,7 +5830,23 @@ def run_conditioned_curves_pass(
                     f"own_accounting.json rho_own is {raw!r} (non-numeric) — "
                     "malformed artifact; regenerate the own-accounting pass"
                 )
-        for metric in metrics:
+        # ADR-0170: a RULER window conditions on its native score and carries
+        # its task into the curve identity; a RULER window whose rows name
+        # several tasks or none is a named skip, never pooled
+        window_metrics = quality_metrics_for(rec.dataset, metrics)
+        window_task: str | None = None
+        task_reason: str | None = None
+        if str(rec.dataset) == "ruler":
+            tasks = sorted({str(r["ruler_task"]) for r in requests if isinstance(r.get("ruler_task"), str) and r.get("ruler_task")})
+            if len(tasks) == 1:
+                window_task = tasks[0]
+            else:
+                task_reason = (
+                    f"RULER window names {len(tasks)} task(s) {tasks} on its rows; the native "
+                    "metric is reported per task (ADR-0170, charter D5#5) and this window "
+                    "cannot be assigned one"
+                )
+        for metric in window_metrics:
             values = [
                 float(row[metric])
                 for row in requests
@@ -5827,6 +5869,9 @@ def run_conditioned_curves_pass(
                     {"window": window, "metric": metric, "reason": rho_reason}
                 )
                 continue
+            if task_reason is not None:
+                rho_skips.append({"window": window, "metric": metric, "reason": task_reason})
+                continue
             rho_rows.append(
                 {
                     "window": window,
@@ -5837,6 +5882,7 @@ def run_conditioned_curves_pass(
                     "metric": metric,
                     "value": float(np.mean(values)),
                     "n": len(values),
+                    "task": window_task,
                 }
             )
 
@@ -5875,6 +5921,16 @@ def run_conditioned_curves_pass(
             bin_label, bin_reason = evidence_position_bin(
                 raw_trial.get("gold_position_in_prompt"), n_contexts
             )
+            if str(rec.dataset) == "ruler":
+                # ADR-0170 (review M1): the instrument has no evidence-position
+                # design (one haystack context, position always 0) and is never
+                # scored by the QA F1 this curve carries; a named skip before
+                # any binning, never a pooled RULER panel
+                count_evidence(
+                    "RULER trial: the instrument has no evidence-position design and is "
+                    "scored by its native metric per task only (ADR-0170)"
+                )
+                continue
             if bin_label is None:
                 count_evidence(bin_reason)
                 continue
@@ -5946,7 +6002,9 @@ def run_conditioned_curves_pass(
             continue
         for metric in sorted(set(curve["metric"])):
             outpath = analysis_dir / f"{prefix}_{metric}.png"
-            plot_fn(
+            record = {"curve": curve_name, "metric": metric, "file": outpath.name}
+            _render_figure(
+                figures, record, plot_fn,
                 curve[curve["metric"] == metric],
                 outpath,
                 config=config_cls(
@@ -5954,16 +6012,15 @@ def run_conditioned_curves_pass(
                     title=f"{curve_name} — {metric} [{stamp}]",
                 ),
             )
-            figures.append(
-                {"curve": curve_name, "metric": metric, "file": outpath.name}
-            )
 
     document: dict[str, Any] = {
         "schema_version": CONDITIONED_CURVES_SCHEMA_VERSION,
         "mode_stamp": stamp,
         "generated_utc": datetime.now(timezone.utc).isoformat(),
         "source": "§8.12 Layer-5 conditioned quality curves (W4.11)",
-        "metrics": list(metrics),
+        # ADR-0170 (review L2): every metric a window joined on, the RULER
+        # native metric included, not only the caller's default list
+        "metrics": sorted(set(metrics) | {str(w["metric"]) for w in rho_rows}),
         "quality_vs_rho_own": {
             "axis": (
                 "rho_own from own_accounting.json (§8.8 PRIMARY pressure "
@@ -5973,7 +6030,9 @@ def run_conditioned_curves_pass(
                 "one curve per coordinate-free cell identity curve_key = "
                 "arm|retriever|policy|topology|engine|model|family (§8.12: "
                 "per mechanism × engine); pressure coordinates are the "
-                "swept variable, never part of a curve's identity"
+                "swept variable, never part of a curve's identity; a RULER "
+                "window conditions on ruler_native_score and its curve key "
+                "carries |task=<task> (ADR-0170: per task, never the mean)"
             ),
             "bin_edges": list(RHO_OWN_BIN_EDGES),
             "windows": rho_rows,

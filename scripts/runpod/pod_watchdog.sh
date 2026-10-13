@@ -207,9 +207,12 @@ cmd_arm() {
   pid=$!
   disown "$pid" 2>/dev/null || true
   printf '%s\n' "$pid" > "$pf.tmp" && mv -f "$pf.tmp" "$pf"   # atomic: the loop never reads a truncated pidfile
-  # Keep an idle Mac awake while the loop lives (a closed lid still sleeps it).
+  # Keep the Mac awake while the loop lives: -i blocks idle sleep, -s blocks
+  # system sleep on AC power (review 2026-10-13 item 12; man caffeinate). A
+  # closed lid or an automatic update restart still ends the loop: the run
+  # checklist keeps the lid open and automatic installs off.
   if command -v caffeinate >/dev/null 2>&1; then
-    nohup caffeinate -i -w "$pid" >/dev/null 2>&1 &
+    nohup caffeinate -i -s -w "$pid" >/dev/null 2>&1 &
     disown $! 2>/dev/null || true
   fi
   sleep 1

@@ -50,6 +50,7 @@ import pandas as pd
 from src.analysis.goodput import label_regime as _goodput_label_regime
 
 __all__ = [
+    "MAX_SAMPLE_HOLD_S",
     "PDWindowRegimeInputs",
     "REGIME_UNKNOWN",
     "RegimeInputError",
@@ -65,6 +66,17 @@ __all__ = [
 # grid labels; UNKNOWN_TELEMETRY marks rows whose telemetry could not certify
 # any of the three, and such rows never enter in-regime aggregates.
 REGIME_UNKNOWN: str = "UNKNOWN_TELEMETRY"
+
+#: S0F-88 audit (Q-8): the longest gap between two telemetry samples that
+#: still counts as observed. Beyond it, the excess is unobserved time: it
+#: leaves the coverage and the time average (a failed scrape records no
+#: sample, so a silent sampler held its last value under the zero-order
+#: hold and read as covered). 2.0 s is eight ticks of the 0.25 s sampler
+#: (TELEMETRY_SAMPLE_INTERVAL_S). On the S0 attempt 4 landing (1.0 s ticks,
+#: median hold 1.14 to 1.49 s) the rule refuses the same 3 of 178 certified
+#: windows at 1.5, 2.0 and 3.0 s, each with one blackout of 24 to 46 percent
+#: of its window [V MyDocs/RunPod/S0_ATTEMPT4_EVIDENCE/q8_effect.py].
+MAX_SAMPLE_HOLD_S: float = 2.0
 
 
 class RegimeInputError(ValueError):
@@ -126,13 +138,23 @@ class WindowRegimeInputs:
     ``rho_kv_time_avg`` = zero-order-hold time-weighted mean of the occupancy
     gauge over the covered span; ``scarcity_events`` = cumulative-preemption
     delta (last − first in-window value; recorded, never a gate since
-    ADR-0153); ``coverage`` = covered_time / window duration, where covered
-    time runs from the first in-window sample to ``window_end_s`` (the
-    pre-first-sample gap is never extrapolated). ``queue_waiting_share`` =
+    ADR-0153); ``coverage`` = observed time / window duration, where
+    observed time runs from the first in-window sample to ``window_end_s``
+    (the pre-first-sample gap is never extrapolated) less every hold's
+    excess over ``max_hold_s`` (S0F-88 Q-8). ``queue_waiting_share`` =
     the share of in-window samples with ``waiting`` > 0 (clause (b) of the
     §6.1 criterion per ADR-0153); ``waiting_max``/``waiting_mean`` = the
     gauge's in-window maximum and sample mean; ``n_waiting_samples`` = the
-    number of queued samples.
+    number of queued samples. ``rho_kv_queued_median`` (S0F-88 B-11, owner
+    ruling R3) = the median occupancy over the samples with ``waiting`` > 0,
+    the pool's fill WHILE requests wait (None when no sample is queued): the
+    time average dilutes it with the ramp and the drain (vLLM 4779 at r=0.75
+    averaged 0.878 to 0.898 while its queued median read 0.903 to 0.915).
+    ``longest_hold_s`` (review L9) = the longest gap from an in-window
+    sample to the next sample or ``window_end_s``, before the hold rule;
+    ``hold_excess_s`` = the seconds the hold rule removed from the observed
+    time (0.0 without a rule). With ``coverage`` they show how much of a
+    window the sampler missed and where.
     """
 
     rho_kv_time_avg: float
@@ -145,6 +167,9 @@ class WindowRegimeInputs:
     waiting_max: float
     waiting_mean: float
     n_waiting_samples: int
+    rho_kv_queued_median: float | None = None
+    longest_hold_s: float | None = None
+    hold_excess_s: float | None = None
 
     def to_flat_dict(self) -> dict[str, int | float | None]:
         """Flat mapping suitable as CSV columns (joins a CellSpec row key)."""
@@ -162,6 +187,7 @@ def compute_window_regime_inputs(
     waiting_col: str = "waiting",
     min_samples: int = 2,
     min_coverage: float = 0.8,
+    max_hold_s: float | None = None,
 ) -> WindowRegimeInputs:
     """Certify one window's (ρ_KV time-avg, queue share, scarcity_events)
     from telemetry.
@@ -179,7 +205,12 @@ def compute_window_regime_inputs(
     value holds until the next sample's timestamp; the last holds until
     ``window_end_s``; the span before the first in-window sample is NOT
     covered (no backward extrapolation). The denominator is the covered time
-    (first in-window ts .. window_end_s). ``queue_waiting_share`` is the
+    (first in-window ts .. window_end_s). A hold longer than ``max_hold_s``
+    counts only up to ``max_hold_s``: its excess is unobserved and leaves
+    both the coverage and the time average (S0F-88 Q-8). None, the
+    default, keeps every hold (the pre-Q-8 rule this function's math tests
+    pin); the campaign's regime writer passes ``MAX_SAMPLE_HOLD_S``.
+    ``queue_waiting_share`` is the
     plain sample share (queued samples / in-window samples), the form the
     owner decided on 2026-10-09 (ADR-0153).
 
@@ -193,6 +224,10 @@ def compute_window_regime_inputs(
     """
     min_samples = _check_min_samples(min_samples)
     min_coverage = _check_min_coverage(min_coverage)
+    if max_hold_s is not None:
+        max_hold_s = _check_finite_scalar("max_hold_s", max_hold_s)
+        if max_hold_s <= 0.0:
+            raise RegimeInputError(f"max_hold_s={max_hold_s!r} must be > 0")
     window_start_s = _check_finite_scalar("window_start_s", window_start_s)
     window_end_s = _check_finite_scalar("window_end_s", window_end_s)
     if window_end_s <= window_start_s:
@@ -239,19 +274,22 @@ def compute_window_regime_inputs(
         )
 
     duration = window_end_s - window_start_s
-    covered = window_end_s - float(ts_w[0])
+    # Zero-order hold: each sample holds until the next; the last holds to
+    # window_end_s. Duplicate timestamps contribute zero-width segments. Q-8:
+    # a hold counts as observed only up to max_hold_s.
+    holds = np.append(ts_w[1:], window_end_s) - ts_w
+    observed = holds if max_hold_s is None else np.minimum(holds, max_hold_s)
+    covered = float(observed.sum())
     coverage = covered / duration
     if coverage < min_coverage:
         raise RegimeInputError(
             f"telemetry coverage {coverage:.3f} of window "
             f"[{window_start_s:g}, {window_end_s:g}) is below min_coverage="
-            f"{min_coverage:g} — a sparsely-sampled window cannot certify "
-            "pressure"
+            f"{min_coverage:g} (first sample at +{float(ts_w[0]) - window_start_s:.2f} s, "
+            f"longest hold {float(holds.max()):.2f} s): a sparsely-sampled window "
+            "cannot certify pressure"
         )
-    # Zero-order hold: each sample holds until the next; the last holds to
-    # window_end_s. Duplicate timestamps contribute zero-width segments.
-    hold_until = np.append(ts_w[1:], window_end_s)
-    rho_kv_time_avg = float(((hold_until - ts_w) * kv_w).sum() / covered)
+    rho_kv_time_avg = float((observed * kv_w).sum() / covered)
 
     pre = pd.to_numeric(samples[preempt_col], errors="coerce").to_numpy(dtype=float)
     pre_all = pre[in_window]
@@ -303,6 +341,7 @@ def compute_window_regime_inputs(
             f"column {waiting_col!r} is a request count and must hold integer values"
         )
     n_waiting_samples = int((waiting_w > 0.0).sum())
+    queued = kv_w[waiting_w > 0.0]
 
     return WindowRegimeInputs(
         rho_kv_time_avg=rho_kv_time_avg,
@@ -315,6 +354,9 @@ def compute_window_regime_inputs(
         waiting_max=float(waiting_w.max()),
         waiting_mean=float(waiting_w.mean()),
         n_waiting_samples=n_waiting_samples,
+        rho_kv_queued_median=float(np.median(queued)) if queued.size else None,
+        longest_hold_s=float(holds.max()),
+        hold_excess_s=float((holds - observed).sum()),
     )
 
 
@@ -366,6 +408,12 @@ class PDWindowRegimeInputs:
     n_waiting_samples: int
     per_role: Mapping[str, WindowRegimeInputs]
     budgets_by_role: Mapping[str, int]
+    # S0F-88 B-11: the pd lane keeps the absolute time-average rule (None);
+    # a pooled queued median over two pools is not defined yet.
+    rho_kv_queued_median: float | None = None
+    # Review L9: the worst role's sampling gaps (MAX), like coverage's MIN.
+    longest_hold_s: float | None = None
+    hold_excess_s: float | None = None
 
     def to_flat_dict(self) -> dict[str, int | float | None]:
         """Flat mapping with EXACTLY the ``WindowRegimeInputs`` keys.
@@ -386,6 +434,9 @@ class PDWindowRegimeInputs:
             "waiting_max": self.waiting_max,
             "waiting_mean": self.waiting_mean,
             "n_waiting_samples": self.n_waiting_samples,
+            "rho_kv_queued_median": self.rho_kv_queued_median,
+            "longest_hold_s": self.longest_hold_s,
+            "hold_excess_s": self.hold_excess_s,
         }
 
 
@@ -428,6 +479,7 @@ def compute_pd_window_regime_inputs(
     waiting_col: str = "waiting",
     min_samples: int = 2,
     min_coverage: float = 0.8,
+    max_hold_s: float | None = None,
 ) -> PDWindowRegimeInputs:
     """Certify one PD (summed-pool, §6.5) window from per-role telemetry.
 
@@ -503,6 +555,7 @@ def compute_pd_window_regime_inputs(
                 waiting_col=waiting_col,
                 min_samples=min_samples,
                 min_coverage=min_coverage,
+                max_hold_s=max_hold_s,
             )
         except RegimeInputError as exc:
             # Propagate, never soften: same type, original message intact,
@@ -542,6 +595,12 @@ def compute_pd_window_regime_inputs(
         n_waiting_samples=sum(w.n_waiting_samples for w in per_role.values()),
         per_role=per_role,
         budgets_by_role={role: int(budgets_by_role[role]) for role in per_role},
+        # S0F-88 B-11: a lone role is its own pool (the single-role
+        # differential holds field for field); two pools have no queued
+        # median yet and keep the absolute time-average rule.
+        rho_kv_queued_median=(reference.rho_kv_queued_median if len(per_role) == 1 else None),
+        longest_hold_s=max(w.longest_hold_s for w in per_role.values()),
+        hold_excess_s=max(w.hold_excess_s for w in per_role.values()),
     )
 
 
@@ -598,6 +657,9 @@ def compute_regime_inputs(
                     "waiting_max": math.nan,
                     "waiting_mean": math.nan,
                     "n_waiting_samples": math.nan,
+                    "rho_kv_queued_median": math.nan,
+                    "longest_hold_s": math.nan,
+                    "hold_excess_s": math.nan,
                     "telemetry_ok": False,
                     "refusal_reason": str(exc),
                 }
@@ -621,6 +683,12 @@ def compute_regime_inputs(
         "waiting_max",
         "waiting_mean",
         "n_waiting_samples",
+        # review 2026-10-13 item 28: the fixed list dropped the fields added
+        # since (B-11 queued median, L9 hold statistics); the frame now carries
+        # every WindowRegimeInputs field
+        "rho_kv_queued_median",
+        "longest_hold_s",
+        "hold_excess_s",
         "telemetry_ok",
         "refusal_reason",
     ]

@@ -643,7 +643,14 @@ class CrossEncoderReranker:
 
         self.model_name = model_name
         self.device = device
-        self._model = CrossEncoder(model_name, device=device)
+        # review 2026-10-13 item 9: the frozen HF revision (freeze_resolutions
+        # INSTRUMENT_REVISIONS.reranker) pins the load when CAGE_RERANKER_REVISION
+        # is set, as CAGE_*_REVISION pins the scoring instruments; unpinned loads
+        # record the repo's current head (sentence-transformers 5.7.0 accepts
+        # ``revision`` [V inspect.signature]).
+        self.revision: Optional[str] = (os.environ.get("CAGE_RERANKER_REVISION") or "").strip() or None
+        # the keyword is passed only when pinned: an unpinned load is the call it always was
+        self._model = CrossEncoder(model_name, device=device, **({"revision": self.revision} if self.revision else {}))
         self._tokenizer = getattr(self._model, "tokenizer", None)
         self.max_length: Optional[int] = _reranker_input_cap(self._model, self._tokenizer)
         self.scored_pairs: int = 0

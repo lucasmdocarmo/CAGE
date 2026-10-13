@@ -368,8 +368,9 @@ class VllmTelemetrySampler:
     def _sample_stamp(snap: dict, t0: float, t1: float) -> "tuple[float, str]":
         """The epoch second a sample describes, and where it came from (S0F-53).
 
-        ``capture_snapshot`` polls the engine twice, one second apart, and the
-        snapshot describes the SECOND poll (cage-stats 51bb9ac stamps
+        ``capture_snapshot`` polls the engine twice, one sampler interval
+        apart (Q-8; one second before S0F-88), and the snapshot describes the
+        SECOND poll (cage-stats 51bb9ac stamps
         ``Snapshot.ts`` with that poll's wall clock). Stamping the record with
         the capture START (the pre-fix rule) therefore put every sample about
         one second before the state it describes; on a 6 to 11 s window the
@@ -392,8 +393,13 @@ class VllmTelemetrySampler:
         while not self._stop.is_set():
             t0 = time.time()
             try:
+                # Q-8 (S0F-88): the sampler's interval is also the gap between
+                # cage-stats' two polls; without it every tick waited 1 s
+                # between polls whatever the interval, so a 2 to 4 s window got
+                # 2 or 3 samples and read UNKNOWN_TELEMETRY (coverage < 0.8).
                 snap = capture_snapshot(
-                    self.url, metrics_path=self.metrics_path, dialect=self.dialect
+                    self.url, metrics_path=self.metrics_path, dialect=self.dialect,
+                    interval=self.interval,
                 )
                 t1 = time.time()
                 if snap:
@@ -617,18 +623,27 @@ def dashboard_text(
     metrics_path: str = "/metrics",
     api_key: Optional[str] = None,
     interval: float = 1.0,
+    dialect: str = "vllm",
 ) -> Optional[str]:
-    """Return a one-shot static terminal dashboard string, or None if unavailable."""
+    """Return a one-shot static terminal dashboard string, or None if unavailable.
+
+    ``dialect`` (Q-5, S0F-88): forwarded to cage-stats like the sampler's.
+    Without it the dashboard read an SGLang server as vLLM and printed
+    "returned no vllm metrics" 90 times on S0 attempt 4 while the sampler's
+    own series and the regime label were valid. The CLI fallback reads vLLM
+    series only, so it is skipped for any other dialect.
+    """
     api = _try_import_api()
     if api is not None:
         try:
-            return api.dashboard_text(
-                url, metrics_path=metrics_path, api_key=api_key, interval=interval
-            )
+            kwargs: dict = {"metrics_path": metrics_path, "api_key": api_key, "interval": interval}
+            if dialect != "vllm":
+                kwargs["dialect"] = dialect
+            return api.dashboard_text(url, **kwargs)
         except Exception as e:
             print(f"[telemetry] cage_stats dashboard failed: {e}")
     exe = shutil.which("cage-stats")
-    if exe:
+    if exe and dialect == "vllm":
         try:
             cmd = [exe, "--once", "--url", url]
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)

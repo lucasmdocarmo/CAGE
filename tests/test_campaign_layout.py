@@ -463,8 +463,33 @@ def test_regime_label_with_attainment(tmp_path: Path) -> None:
         handle.window_dir, t_start=0.0, t_end=10.0, attainment=0.95
     )
     doc = json.loads(path.read_text(encoding="utf-8"))
-    # rho 0.7 < 0.9 with attainment 0.95 -> UNPRESSURED (goodput thresholds).
-    assert doc["label"] == UNPRESSURED and doc["attainment"] == 0.95
+    # S0F-88 B-11 (owner ruling R3): the time average reads 0.7 (an unqueued
+    # 0.5 sample dilutes it) but the pool was 0.8 to 1.0 full while requests
+    # waited (queued median 0.9), so clause (a) holds: IN_REGIME. Before
+    # S0F-88 the time average labeled this window UNPRESSURED.
+    assert doc["inputs"]["rho_kv_time_avg"] == pytest.approx(0.7)
+    assert doc["inputs"]["rho_kv_queued_median"] == pytest.approx(0.9)
+    assert doc["label"] == IN_REGIME and doc["attainment"] == 0.95
+    assert doc["clause_a_rule"] == "rho_kv_queued_median >= RHO_KV_MIN" and doc["kv_ceiling"] is None
+
+
+def test_regime_queued_pool_below_the_threshold_is_unpressured_b11(tmp_path: Path) -> None:
+    # S0F-88 B-11: requests waited but the pool was only 0.6 to 0.7 full
+    telemetry = [
+        {"ts_s": 2.0, "kv_cache_usage": 0.5, "preemptions_total": 0, "waiting": 0},
+        {"ts_s": 6.0, "kv_cache_usage": 0.7, "preemptions_total": 0, "waiting": 3},
+        {"ts_s": 8.0, "kv_cache_usage": 0.6, "preemptions_total": 0, "waiting": 2},
+    ]
+    handle = _one_window(tmp_path, telemetry)
+    path = cl.write_window_regime(handle.window_dir, t_start=0.0, t_end=10.0, attainment=0.95)
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    assert doc["inputs"]["rho_kv_queued_median"] == pytest.approx(0.65)
+    assert doc["label"] == UNPRESSURED
+    # with a measured ceiling of 0.68, 0.65 >= 0.95 x 0.68 = 0.646: IN_REGIME
+    path = cl.write_window_regime(handle.window_dir, t_start=0.0, t_end=10.0, attainment=0.95, kv_ceiling=0.68)
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    assert doc["label"] == IN_REGIME and doc["kv_ceiling"] == 0.68
+    assert doc["clause_a_rule"] == "rho_kv_queued_median >= RHO_KV_REL_MIN x kv_ceiling"
 
 
 def test_regime_in_regime_label(tmp_path: Path) -> None:

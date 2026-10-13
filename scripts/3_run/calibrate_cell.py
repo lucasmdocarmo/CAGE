@@ -136,12 +136,73 @@ def build_requests(manifest_path: str) -> List[Any]:
     return requests
 
 
+#: S0F-88 review L1: the cold floor flushes right after a streamed request
+#: ends, and an engine that still counts it may refuse the flush. The flush is
+#: retried every FLOOR_FLUSH_POLL_S up to the runner's own quiescence bound
+#: (run_experiment.COLD_START_QUIESCE_TIMEOUT_S, ADR-0102), then raises.
+FLOOR_FLUSH_WAIT_S = 30.0
+FLOOR_FLUSH_POLL_S = 0.5
+
+
+async def _flush_cold(flush: Any) -> None:
+    from src.inference.errors import EngineCapabilityUnavailableError
+
+    deadline = asyncio.get_running_loop().time() + FLOOR_FLUSH_WAIT_S
+    while True:
+        try:
+            flush()
+            return
+        except EngineCapabilityUnavailableError:
+            if asyncio.get_running_loop().time() >= deadline:
+                raise
+            await asyncio.sleep(FLOOR_FLUSH_POLL_S)
+
+
 async def measure_floor(adapter: Any, requests: Sequence[Any]) -> FloorMeasurement:
-    """Floor stage: FLOOR_N_REQUESTS sequential streamed single-stream calls."""
+    """Floor stage: FLOOR_N_REQUESTS sequential streamed single-stream calls,
+    each on a DISTINCT prompt and each from a cold cache (S0F-88 B-13, owner
+    2026-10-12 "Per engine, distinct prompts": attempt 4's floor sent one
+    prompt 30 times and read 83 to 89 percent prefix hits)."""
+    from dataclasses import replace as _replace
+
     ttft_ms: List[float] = []
     tpot_ms: List[float] = []
+    # review 2026-10-13 item 31: counted over the requests the floor SERVES
+    # (the first FLOOR_N_REQUESTS), not over the whole list, so a repeat
+    # inside the served head is refused even when the tail is distinct.
+    served = list(requests[:FLOOR_N_REQUESTS])
+    distinct = list(dict.fromkeys(getattr(r, "prompt", None) for r in served))
+    if len(distinct) < FLOOR_N_REQUESTS or None in distinct:
+        raise CalibrationError(
+            "floor_prompts", len(distinct),
+            f"the floor needs {FLOOR_N_REQUESTS} distinct prompts and the first "
+            f"{len(served)} requests carry {len(distinct)} (one request per corpus block; use "
+            f"a manifest with at least {FLOOR_N_REQUESTS} distinct blocks, S0F-88 B-13)",
+        )
+    cached_seen: List[int] = []
+    # B-13 (S0F-88, cal-v3): every floor request starts cold. The adapters'
+    # fail-closed flush (vLLM POST /reset_prefix_cache, SGLang POST
+    # /flush_cache) raises when the engine has no flush endpoint, so a floor
+    # that cannot be cold is refused, never measured warm.
+    flush = getattr(adapter, "flush_cache", None)
+    if not callable(flush):
+        raise CalibrationError(
+            "flush_cache", None,
+            "the floor needs a cold engine before every request (S0F-88 B-13) and this "
+            "adapter has no cache flush",
+        )
     for i in range(FLOOR_N_REQUESTS):
-        response = await adapter.async_stream_generate(requests[i % len(requests)])
+        await _flush_cold(flush)
+        response = await adapter.async_stream_generate(requests[i])
+        cached = getattr(response, "cached_prompt_tokens", None)
+        if isinstance(cached, int) and not isinstance(cached, bool):
+            if cached > 0:
+                raise CalibrationError(
+                    "floor_cached_tokens", cached,
+                    f"request {i} reused {cached} cached prompt tokens after the flush; "
+                    "the floor must be cold (S0F-88 B-13)",
+                )
+            cached_seen.append(cached)
         if response.error:
             raise CalibrationError(
                 "floor_request",
@@ -160,7 +221,12 @@ async def measure_floor(adapter: Any, requests: Sequence[Any]) -> FloorMeasureme
             (float(response.total_time_ms) - float(response.ttft_ms))
             / (response.num_tokens - 1)
         )
-    return summarize_floor(ttft_ms, tpot_ms)
+    return _replace(
+        summarize_floor(ttft_ms, tpot_ms),
+        n_distinct_prompts=FLOOR_N_REQUESTS,
+        # None when the engine reported no cache telemetry on any request
+        cached_tokens_max=max(cached_seen) if cached_seen else None,
+    )
 
 
 async def probe_rate(
@@ -171,6 +237,7 @@ async def probe_rate(
     from src.orchestration.load_generator import (
         OpenLoopDispatcher,
         generate_arrival_schedule,
+        is_connect_error,
         trim_to_measurement_window,
     )
 
@@ -187,6 +254,23 @@ async def probe_rate(
         )
 
     report = await OpenLoopDispatcher().run(schedule, send)
+    # B-4 (S0F-88, owner ruling R16): a request that failed to connect never
+    # reached the engine; one such request makes the probe a client fault,
+    # never an attainment reading (S0 attempt 4: every lambda* was the
+    # client's 1,024 open-file ceiling, B-1).
+    connect_failures = [
+        r for r in report.records
+        if is_connect_error(r.error) or is_connect_error(r.result_error)
+    ]
+    if connect_failures:
+        raise CalibrationError(
+            "connect_errors",
+            len(connect_failures),
+            f"request(s) at {rate_qps} qps failed to connect to the engine "
+            f"(first: {connect_failures[0].result_error or connect_failures[0].error!r}); "
+            "a client fault, not a saturation reading (B-4); check the open-file "
+            "limit (B-1) and that the engine is up",
+        )
     kept = trim_to_measurement_window(report.records, warmup_s=PROBE_WARMUP_S)
     if not kept:
         raise CalibrationError(
@@ -195,10 +279,17 @@ async def probe_rate(
             f"no arrivals in the post-warmup window at {rate_qps} qps — "
             f"window too short for this rate",
         )
-    n_completed = sum(
+    # B-12: RequestRecord.completed now also excludes an error returned
+    # inside the result; ``result is not None`` keeps the old guard against
+    # a send that returned nothing.
+    n_completed = sum(1 for r in kept if r.completed and r.result is not None)
+    # B-2 (cal-v3): completions that FINISH inside the trimmed window, on the
+    # dispatcher's own clock, whatever their arrival.
+    n_served = sum(
         1
-        for r in kept
-        if r.completed and r.result is not None and not getattr(r.result, "error", None)
+        for r in report.records
+        if r.completed and r.result is not None and r.completion_ts is not None
+        and PROBE_WARMUP_S <= r.completion_ts - report.run_start_ts < PROBE_WINDOW_S
     )
     return ProbeStep(
         rate_qps=float(rate_qps),
@@ -206,7 +297,14 @@ async def probe_rate(
         n_completed=n_completed,
         throughput_rps=n_completed / (PROBE_WINDOW_S - PROBE_WARMUP_S),
         phase=phase,
+        n_served_in_window=n_served,
+        max_in_flight=int(report.max_in_flight_observed),
     )
+
+
+def _fmt(value: Optional[float], spec: str) -> str:
+    """A step's optional served figure for the log ("n/a" when unclocked)."""
+    return "n/a" if value is None else format(value, spec)
 
 
 async def run_probe_ladder(
@@ -215,8 +313,9 @@ async def run_probe_ladder(
     """Probe stage: climb until the first unsustainable rung, then bisect.
 
     ADR-0122: the climb runs the geometric ladder from ``start_qps`` until
-    the FIRST unsustainable rung (attainment < PROBE_ATTAINMENT_MIN, the only
-    test since ADR-0121) or the PROBE_MAX_STEPS ceiling. Once bracketed
+    the FIRST unsustainable rung (attainment < PROBE_ATTAINMENT_MIN, or, since
+    cal-v3 (S0F-88 B-2), served-in-window ratio < PROBE_SERVED_MIN) or the
+    PROBE_MAX_STEPS ceiling. Once bracketed
     (a sustainable rung immediately below the failing one), PROBE_BISECT_STEPS
     midpoint windows narrow the bracket; each one moves the bracket's lower
     edge up (sustainable) or its upper edge down (unsustainable). The
@@ -231,15 +330,16 @@ async def run_probe_ladder(
         steps.append(step)
         print(
             f"[calibrate]   attainment={step.attainment:.3f} "
-            f"throughput={step.throughput_rps:.4g} rps"
+            f"served={_fmt(step.served_ratio, '.3f')} served_in_window_rps={_fmt(step.served_in_window_rps, '.4g')} "
+            f"throughput={step.throughput_rps:.4g} rps max_in_flight={step.max_in_flight}"
         )
-        # ADR-0121: attainment alone decides (the same test as
-        # decide_lambda_star); a throughput fall between rungs is the
-        # Poisson arrival draw, never a stop signal.
-        if step.attainment < PROBE_ATTAINMENT_MIN:
+        # cal-v3 (B-2): the same verdict as decide_lambda_star (attainment
+        # AND the in-window served ratio); a throughput fall between rungs is
+        # the Poisson arrival draw, never a stop signal (ADR-0121).
+        if not step.sustainable:
             break  # saturation bracketed; no need to probe higher rates
     # ADR-0122: refine the bracket [last sustainable, first unsustainable].
-    if len(steps) >= 2 and steps[-1].attainment < PROBE_ATTAINMENT_MIN:
+    if len(steps) >= 2 and not steps[-1].sustainable:
         lo, hi = steps[-2].rate_qps, steps[-1].rate_qps
         for j in range(PROBE_BISECT_STEPS):
             mid = (lo + hi) / 2.0
@@ -253,9 +353,9 @@ async def run_probe_ladder(
             steps.append(step)
             print(
                 f"[calibrate]   attainment={step.attainment:.3f} "
-                f"throughput={step.throughput_rps:.4g} rps"
+                f"served={_fmt(step.served_ratio, '.3f')} throughput={step.throughput_rps:.4g} rps"
             )
-            if step.attainment >= PROBE_ATTAINMENT_MIN:
+            if step.sustainable:
                 lo = mid
             else:
                 hi = mid
@@ -295,6 +395,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+    # B-1 (S0F-88): every in-flight probe request holds one socket; the
+    # default soft limit of 1,024 capped S0 attempt 4's probes at about
+    # 1,005 in flight.
+    from src.orchestration.load_generator import raise_open_file_limit
+
+    open_file_limit = raise_open_file_limit()
+    print(f"[calibrate] open-file limit: {open_file_limit}")
     requests = build_requests(args.manifest)
     adapter = build_adapter(args.backend, args.model, args.api_base)
     print(
@@ -332,6 +439,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         lambda_star=estimate,
         start_qps=start_qps,
         start_qps_source=start_source,
+        open_file_limit=open_file_limit,
     )
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)

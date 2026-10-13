@@ -177,6 +177,15 @@ def _rungs_for(grid, directory: Path) -> Optional[Dict[str, Path]]:
                 for r in rungs
             },
         }
+        if rc.ruler_pressure_class(grid, engine) is not None:
+            # ADR-0169: a grid with RULER cells needs the instrument's own ladder
+            doc["classes"] = {str(rc.RULER_RATE_CLASS_TOKENS): {
+                "role": rc.RULER_ROLE, "arm": "gold-fresh", "baseline_id": "B1", "family": "F2",
+                "prefix_mode": "OFF", "seq_tokens": rc.RULER_RATE_CLASS_TOKENS, "demand_seq_tokens": 4779,
+                "dataset": "ruler", "ruler_task": grid.f2_ruler_tasks[0], "floor": None,
+                "rungs": {f"{r:g}": {"r": r, "label": "ESTIMATED", "lambda_star_qps": 0.5 * r,
+                                     "sustained_rate_qps": 0.5 * r, "first_unsustainable_qps": 0.65 * r,
+                                     "steps": []} for r in rungs}}}
         path = directory / f"rungs_{engine}.json"
         path.write_text(json.dumps(doc), encoding="utf-8")
         out[engine] = path

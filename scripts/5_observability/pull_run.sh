@@ -93,6 +93,7 @@ transport_pull "${TARGET}" "${DEST}"
 # mismatch lines. Any of those -> nonzero exit -> the DO-NOT-TEARDOWN trap.
 echo "[pull_run] [2/3] verifying content-hash ledger against the pulled tree"
 VERIFY_SRC='
+import os
 import sys
 from pathlib import Path
 
@@ -119,10 +120,41 @@ if mismatches:
     print(f"LEDGER-VERIFY-FAILED: {len(mismatches)} mismatch(es) of {len(entries)} sealed artifacts.", file=sys.stderr)
     sys.exit(1)
 
+# S0F-88 audit (U5): the transfer mirrors without deleting (a deleting mirror
+# would carry a lost source into the backup), so a file the run tree removed
+# after an earlier backup pass (a reset window) can arrive here. Every file
+# under cells/ outside the seal (dot entries excepted: the seal skips them by
+# design) is MOVED, never deleted, to the sibling <run_dir>.stale/ under its
+# relative path and listed in STALE_FILES.txt there; verify_results names it.
+stale = []
+cells = run_dir / "cells"
+if cells.is_dir():
+    for path in sorted(cells.rglob("*")):
+        rel = path.relative_to(run_dir)
+        if path.is_file() and not any(part.startswith(".") for part in rel.parts) and rel.as_posix() not in entries:
+            stale.append(rel)
+if stale:
+    stale_root = run_dir.parent / (run_dir.name + ".stale")
+    for rel in stale:
+        target = stale_root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(run_dir / rel, target)
+        print(f"STALE (outside the seal, moved to {stale_root.name}/): {rel.as_posix()}", file=sys.stderr)
+    # review L3: a re-pull brings the same leftovers back; the list stays one
+    # line per path, and only directories the move emptied are removed
+    listing = stale_root / "STALE_FILES.txt"
+    known = set(filter(None, listing.read_text(encoding="utf-8").splitlines())) if listing.is_file() else set()
+    listing.write_text("".join(n + "\n" for n in sorted(known | {r.as_posix() for r in stale})), encoding="utf-8")
+    emptied = {parent for rel in stale for parent in (run_dir / rel).parents if cells in parent.parents}
+    for path in sorted(emptied, key=lambda p: len(p.parts), reverse=True):
+        if path.is_dir() and not any(path.iterdir()):
+            path.rmdir()  # emptied by the move above; holds no data
+
 files = sorted(p for p in run_dir.rglob("*") if p.is_file())
 total_bytes = sum(p.stat().st_size for p in files)
 gib = total_bytes / (1024 ** 3)
 print(f"ledger artifacts verified : {len(entries)}")
+print(f"files outside the seal    : {len(stale)} (moved to the .stale sibling)")
 print(f"files pulled              : {len(files)}")
 print(f"bytes pulled              : {total_bytes} ({gib:.3f} GiB)")
 print(f"egress cost estimate      : ~${gib * 0.12:.2f} (at $0.12/GiB order of magnitude)")
@@ -131,5 +163,5 @@ print(f"egress cost estimate      : ~${gib * 0.12:.2f} (at $0.12/GiB order of ma
 
 # --- [3/3] verdict ----------------------------------------------------------
 _verified=1
-echo "[pull_run] [3/3] ledger intact — local copy is provably identical to the sealed run data."
+echo "[pull_run] [3/3] ledger intact: every sealed artifact of the local copy is byte-identical to the seal (files outside the seal, if any, were moved to the .stale sibling and listed above)."
 echo "SAFE TO TEARDOWN"

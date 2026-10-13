@@ -460,6 +460,59 @@ def _read_cell_meta(cell_dir: Path, problems: list[str]) -> dict[str, Any] | Non
     return meta
 
 
+#: The sentinel run_campaign writes when it skips a cell's dataset
+#: (``cells/<row_key>/.STATUS-<dataset>[-from-NN]``, one line
+#: ``STATUS=failed dataset=<ds> reason=<r> utc=<iso>``).
+_SENTINEL_PREFIX = ".STATUS-"
+_SENTINEL_REASON_RE = re.compile(r"\breason=(\S+)")
+
+
+def sentinel_only_reasons(cell_dir: Path) -> list[str] | None:
+    """The sentinel reasons of a cell that holds sentinels and nothing else,
+    or None.
+
+    A cell qualifies only when it has NO visible entry (no cell.json, no
+    window) and EVERY sentinel names a reason. Such a cell never wrote data:
+    it is excluded from the index and the verifier names it (SKIP when every
+    reason is a ``dry-window-*`` label, FAIL otherwise, owner ruling R15).
+    A sentinel without a reason, or a sentinel beside windows, is not this
+    case and stays a layout failure. Decision 3 of 2026-10-13: an S0 tree
+    with such cells is sealed, scored and analyzed as PARTIAL, so the
+    organizer must not treat them as violations (it raised LayoutError on
+    "missing cell.json" before).
+    """
+    entries = list(cell_dir.iterdir())
+    if any(not p.name.startswith(".") for p in entries):
+        return None
+    sentinels = sorted(p for p in entries if p.name.startswith(_SENTINEL_PREFIX) and p.is_file())
+    if not sentinels:
+        return None
+    reasons: list[str] = []
+    for path in sentinels:
+        match = _SENTINEL_REASON_RE.search(path.read_text(encoding="utf-8", errors="replace"))
+        if match is None:
+            return None
+        reasons.append(f"{path.name}: {match.group(1)}")
+    return reasons
+
+
+def dry_window_skip_reasons(cell_dir: Path) -> list[str] | None:
+    """The sentinel reasons of a cell skipped by a failed dry window, or None.
+
+    Q-9 (S0F-88): a dry window that does not read IN_REGIME skips every
+    pressure cell of its serving configuration (ADR-0153) and leaves a cell
+    directory holding sentinels only; both seals and both walkers skip dot
+    entries, so such a cell read as "missing cell.json" (20 FAIL on S0
+    attempt 4). The sentinel-only case (``sentinel_only_reasons``) where
+    EVERY reason is a ``dry-window-*`` label; a relaunch or runner failure
+    is the FAIL case of that function (owner ruling R15).
+    """
+    reasons = sentinel_only_reasons(cell_dir)
+    if reasons is None or not all(r.split(": ", 1)[1].startswith("dry-window-") for r in reasons):
+        return None
+    return reasons
+
+
 def walk_run_tree(run_dir: Path, manifest: Mapping[str, Any]) -> list[WindowRecord]:
     """Walk cells/ into WindowRecords; collect and raise ALL violations together."""
     problems: list[str] = []
@@ -493,6 +546,12 @@ def walk_run_tree(run_dir: Path, manifest: Mapping[str, Any]) -> list[WindowReco
                 f"cells/{cell_dir.name}: model {spec.model!r} != manifest model "
                 f"{declared_model!r} (§3: one run = one model)"
             )
+            continue
+        if sentinel_only_reasons(cell_dir) is not None:
+            # Q-9: a cell skipped whole by a failed dry window, or failed
+            # before any window (relaunch or runner failure), carries no
+            # window to index; the verifier names it (SKIP or FAIL), and
+            # run_campaign's exit code recorded it (decision 3, 2026-10-13).
             continue
         cell_meta = _read_cell_meta(cell_dir, problems)
         if cell_meta is None:

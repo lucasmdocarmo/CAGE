@@ -15,6 +15,7 @@ import sys
 import json
 import csv
 import hashlib
+import math
 import re
 import time
 import platform
@@ -45,12 +46,15 @@ from src.inference.sglang_adapter import SGLangAdapter
 from src.inference.lmdeploy_adapter import LMDeployAdapter
 from src.inference.hf_oracle_adapter import HFOracleAdapter
 from src.orchestration.load_generator import (
+    ArrivalSchedule,
     DispatchReport,
     LoadGeneratorError,
     OpenLoopDispatcher,
     RequestRecord,
     ensure_no_measured_replay,
     generate_arrival_schedule,
+    is_connect_error,
+    raise_open_file_limit,
     trim_to_measurement_window,
 )
 from src.evaluation.quality import (
@@ -101,6 +105,15 @@ import psutil
 _PROM_REGISTRY = CollectorRegistry()
 _PROM_STARTED = False
 _RUNNER_METRICS: Dict[str, Any] = {}
+#: B-1 (S0F-88): the open-file limits ``main()`` set before any request; the
+#: open-loop block of metrics.json records them. Empty when ``run_experiment``
+#: is driven without ``main()`` (tests); recorded then as null.
+_OPEN_FILE_LIMITS: Dict[str, Any] = {}
+#: Q-8 (S0F-88): the telemetry sampler's tick (and cage-stats' gap between its
+#: two polls). At 1.0 s the 2 to 4 s open-loop windows got 2 or 3 samples and
+#: read UNKNOWN_TELEMETRY (coverage 0.545 to 0.788 < 0.8); about 0.4 s per tick
+#: at 0.25 s. run_campaign.TELEMETRY_SAMPLE_INTERVAL_S mirrors it.
+TELEMETRY_SAMPLE_INTERVAL_S: float = 0.25
 
 
 def get_runner_metrics() -> Dict[str, Any]:
@@ -228,13 +241,21 @@ def capture_git_metadata() -> Dict[str, Any]:
         error_text = probe_error
         if repo_probe is not None:
             error_text = (repo_probe.stderr or repo_probe.stdout or "").strip() or probe_error
+        # Q-6 (S0F-88): a pod receives the repo as a tarball with BUILD_INFO
+        # and no .git; every S0 attempt 4 metrics.json recorded git_commit
+        # null. The packaged sha and dirty flag stand in.
+        from src.observability.provenance import _build_info
+
+        build = _build_info(str(repo_root))
+        dirty = build.get("dirty")
         return {
-            "git_commit": None,
+            "git_commit": build.get("sha") or None,
             "git_branch": None,
-            "git_dirty": None,
+            "git_dirty": (dirty == "1") if dirty in ("0", "1") else None,
             "git_repository_present": False,
             "git_root": None,
             "git_error": error_text,
+            "git_source": "BUILD_INFO" if build.get("sha") else None,
         }
 
     git_root = Path(repo_probe.stdout.strip())
@@ -308,11 +329,14 @@ def capture_backend_metadata(
     }
 
     if backend == "vllm":
+        # S0F-88 audit (U1): the installed version from package metadata. The
+        # former `import vllm` loaded torch in the window tail and held every
+        # vLLM window 25 to 32 s after its last completion on S0 attempt 4.
         try:
-            import vllm  # type: ignore
+            from importlib.metadata import PackageNotFoundError, version as _pkg_version
 
-            metadata["client_library_version"] = getattr(vllm, "__version__", None)
-        except Exception:
+            metadata["client_library_version"] = _pkg_version("vllm")
+        except (ImportError, PackageNotFoundError):
             metadata["client_library_version"] = None
 
         if use_offline:
@@ -342,11 +366,16 @@ def capture_backend_metadata(
         # without engine provenance, and this branch did not exist, so every
         # SGLang cell was refused after running. SGLang serves from its own
         # venv (ADR-0120), so its client library is not importable here; the
-        # server answers GET /get_server_info with {"version": sglang.__version__,
-        # ...} [V installed 0.5.10.post1, srt/entrypoints/http_server.py line 617].
-        info_payload = _safe_get_json(f"{api_base}/get_server_info")
+        # server answers GET /server_info with {"version": sglang.__version__,
+        # ...every server argument} [V 0.5.10.post1, srt/entrypoints/
+        # http_server.py:601-618]. S0F-88 U10: /get_server_info is its
+        # deprecated alias and logged a warning at every window.
+        info_payload = _safe_get_json(f"{api_base}/server_info")
         if isinstance(info_payload, dict):
             metadata["server_version"] = info_payload.get("version")
+            # S0F-88 U7: whether rows can carry a cached-token count
+            report = info_payload.get("enable_cache_report")
+            metadata["cache_report_enabled"] = report if isinstance(report, bool) else None
         models_payload = _safe_get_json(f"{api_base}/v1/models")
         if isinstance(models_payload, dict):
             loaded_models = [
@@ -1474,6 +1503,23 @@ def check_ruler_rendered_inputs(
     return record
 
 
+def served_prompt_tokens(
+    question: str, contexts: Sequence[str], *, tokenizer: Any, prompt_mode: str
+) -> int:
+    """Token count of the request the engine serves for ``question`` over
+    ``contexts`` (Q-4, S0F-88): chat mode renders ``format_qa_messages``
+    through the chat template with the adapters' pinned kwargs, raw mode
+    counts ``format_qa_prompt``; the same rule as check_ruler_rendered_inputs.
+    """
+    if prompt_mode == "chat":
+        return rendered_chat_prompt_tokens(
+            tokenizer,
+            format_qa_messages(question, list(contexts)),
+            chat_template_kwargs=RULER_RENDER_TEMPLATE_KWARGS,
+        )
+    return len(tokenizer.encode(format_qa_prompt(question, list(contexts)), add_special_tokens=False))
+
+
 def check_prepared_covers_arrivals(
     *, n_prepared: int, n_arrivals: Optional[int], dropped_ids: Sequence[str]
 ) -> None:
@@ -1903,6 +1949,14 @@ class OracleCorpusPreloader:
                 "refusing to silently serve full prefix-free prompts in a "
                 "true-CAG cell (charter D2 idea-gain zero point)"
             )
+        if prompt_mode_value == "chat" and not callable(getattr(engine, "render_messages", None)):
+            # Q-3 (W19 option A): a chat-mode oracle serves the rendered chat
+            # template, so the cached prefix must be rendered the same way.
+            raise RuntimeError(
+                "chat-mode corpus prefix with backend=hf-oracle requires the "
+                "adapter's render_messages() seam (W19 option A, S0F-88 Q-3); "
+                "refusing to cache a prefix the served prompt would not extend"
+            )
         self.engine = engine
         self._prompt_mode = prompt_mode_value
         self._loaded_block: Any = self._UNLOADED
@@ -1917,18 +1971,20 @@ class OracleCorpusPreloader:
         if block_id == self._loaded_block:
             return
 
+        chat = self._prompt_mode == "chat"
+
         def _build(q: str) -> str:
-            # Reproduce EXACTLY the prompt text the runner attaches to the
-            # request (hf-oracle serves request.prompt; in chat mode that is
-            # the flattened fallback prompt).
-            if self._prompt_mode == "chat":
-                return messages_to_fallback_prompt(
-                    format_qa_messages(q, used_contexts)
-                )
+            # Reproduce EXACTLY the text the oracle serves: in chat mode the
+            # adapter renders request.messages through the chat template
+            # (Q-3, W19 option A), so the prefix is rendered the same way;
+            # in raw mode it serves request.prompt as given.
+            if chat:
+                return self.engine.render_messages(format_qa_messages(q, used_contexts))
             return format_qa_prompt(q, used_contexts)
 
         prefix = derive_corpus_prompt_prefix(_build)
-        prefill_ms = self.engine.preload_corpus_prefix(prefix)
+        # A rendered template already carries its special tokens as text.
+        prefill_ms = self.engine.preload_corpus_prefix(prefix, add_special_tokens=not chat)
         self._loaded_block = block_id
         self.preload_count += 1
         print(
@@ -2259,8 +2315,19 @@ def dispatch_open_loop(
     max_in_flight: Optional[int] = None,
     distribution: str = "poisson",
     on_first_send: Optional[Callable[[], None]] = None,
+    preload_requests: Optional[List[InferenceRequest]] = None,
 ) -> Tuple[List[RequestRecord], DispatchReport]:
     """Run one open-loop dispatch pass over prepared requests (charter D6 §6.1).
+
+    ``preload_requests`` (S0F-88 U3, owner decision 2026-10-12): distinct
+    unmeasured requests sent FIRST at the same rate, each once, so the queue
+    is built when the measured arrivals start; the measured arrivals continue
+    the same Poisson stream. ``on_first_send`` fires at the first MEASURED
+    send, only measured records are returned (re-indexed from 0, intended
+    arrivals relative to the measured stream's start), and the report carries
+    the pre-load's counts under ``preload``. A pre-load request that failed to
+    connect refuses the window (B-4: the offered load never reached the
+    engine).
 
     ``on_first_send`` (ADR-0055 amendment 2026-09-19, W1 option C) is called
     exactly once, synchronously, right before the FIRST request is handed to
@@ -2335,17 +2402,66 @@ def dispatch_open_loop(
         )
     dispatcher = OpenLoopDispatcher(max_in_flight=max_in_flight, cap_policy="delay")
     first_send_pending = on_first_send is not None
+    pre = list(preload_requests or [])
+    n_pre = len(pre)
+    shift = 0.0
+    run_schedule = schedule
+    if n_pre:
+        # its own stream (seed + 1): the measured schedule stays the plan's
+        pre_schedule = generate_arrival_schedule(
+            rate_qps, seed=seed + 1, n_requests=n_pre,
+            distribution=distribution,  # type: ignore[arg-type]
+        )
+        shift = pre_schedule.span_s
+        run_schedule = ArrivalSchedule(
+            rate_qps=schedule.rate_qps,
+            seed=schedule.seed,
+            distribution=schedule.distribution,
+            offsets_s=tuple(pre_schedule.offsets_s) + tuple(shift + o for o in schedule.offsets_s),
+        )
 
     async def _send(i: int, on_first_token: Any) -> Any:
         nonlocal first_send_pending
+        if i < n_pre:
+            return await engine.async_stream_generate(pre[i], on_first_token=on_first_token)
         if first_send_pending:
             first_send_pending = False
             on_first_send()  # type: ignore[misc]  (guarded by the flag above)
         return await engine.async_stream_generate(
-            requests[i % len(requests)], on_first_token=on_first_token
+            requests[(i - n_pre) % len(requests)], on_first_token=on_first_token
         )
 
-    report = asyncio.run(dispatcher.run(schedule, _send))
+    report = asyncio.run(dispatcher.run(run_schedule, _send))
+    if n_pre:
+        pre_records = [r for r in report.records if r.index < n_pre]
+        refused = [r for r in pre_records if is_connect_error(r.error) or is_connect_error(r.result_error)]
+        if refused:
+            raise LoadGeneratorError(
+                "preload_connect_errors",
+                len(refused),
+                "pre-load request(s) failed to connect to the engine (first: "
+                f"{refused[0].result_error or refused[0].error!r}); the offered load never "
+                "reached it, so the window is refused (S0F-88 U3 with B-4)",
+            )
+        measured = [r for r in report.records if r.index >= n_pre]
+        for r in measured:
+            r.index -= n_pre
+            r.scheduled_offset_s -= shift
+        report = DispatchReport(
+            schedule=schedule,
+            run_start_ts=report.run_start_ts + shift,
+            records=measured,
+            dropped_or_delayed=report.dropped_or_delayed,
+            max_in_flight_observed=report.max_in_flight_observed,
+            preload={
+                "n_requests": n_pre,
+                "planned_span_s": shift,
+                "n_completed": sum(1 for r in pre_records if r.completed),
+                "n_errors": sum(1 for r in pre_records if not r.completed),
+                "seed": seed + 1,
+                "finding": "S0F-88 U3",
+            },
+        )
     if warmup_s > 0:
         kept = trim_to_measurement_window(report.records, warmup_s=warmup_s)
     else:
@@ -2397,6 +2513,7 @@ def run_experiment(
     open_loop_duration_s: Optional[float] = None,
     open_loop_num_arrivals: Optional[int] = None,
     open_loop_warmup_s: float = 0.0,
+    open_loop_preload_s: float = 0.0,
     open_loop_max_in_flight: Optional[int] = None,
     # Routing migration
     routing_switch_at: Optional[int],
@@ -2455,6 +2572,7 @@ def run_experiment(
     # leaves every non-RULER caller untouched. A campaign RULER cell without
     # it refuses.
     ruler_rendered_input_cap: Optional[int] = None,
+    request_cap_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Run a single baseline experiment.
@@ -2570,6 +2688,17 @@ def run_experiment(
                 "campaign mode refuses --open-loop-warmup-s > 0: the measurement "
                 "window opens at the first send (ADR-0055 amendment 2026-09-19), "
                 "so trimmed rows would sit inside the stamped window",
+            )
+        if isinstance(open_loop_preload_s, bool) or not isinstance(open_loop_preload_s, (int, float)) or not math.isfinite(open_loop_preload_s) or open_loop_preload_s < 0:
+            raise LoadGeneratorError(
+                "open_loop_preload_s", open_loop_preload_s, "must be a finite number >= 0 (S0F-88 U3)"
+            )
+        if open_loop_preload_s > 0 and open_loop_num_arrivals is None:
+            raise LoadGeneratorError(
+                "open_loop_preload_s",
+                open_loop_preload_s,
+                "the steady-state pre-load precedes a W-arrival window (--arrival-count); a "
+                "duration window has none (S0F-88 U3)",
             )
         if (open_loop_duration_s is None) == (open_loop_num_arrivals is None):
             raise LoadGeneratorError(
@@ -2975,6 +3104,87 @@ def run_experiment(
         measured_ids=_measured_ids_for_pool,
         measured_context_keys=_measured_context_keys,
     )
+    # Q-4 (S0F-88): a cell given its server's request cap draws only warm-ups
+    # whose served request (prompt + max_tokens) fits it; the excluded count
+    # lands in metrics.json beside the other warm-up exclusions.
+    # Decision 1B: the serving prompt mode (chat template by default). Bound
+    # HERE because the Q-4 warm-up length check below renders with it before
+    # the PROMPT MODE line prints (S0F-88 review C1: bound later, every capped
+    # cell raised NameError at the warm-up draw).
+    _prompt_mode = prompt_mode()
+    # S0F-88 audit (L5): whether this arm's prepared prompt is built from
+    # retrieved passages (prepare_example retrieves on every example, warm-ups
+    # included). The raw-context length check below judges the prompt only
+    # where the raw context is what the engine is sent.
+    _serves_retrieved = (
+        baseline_config.baseline_type.value in {"rag", "redis", "hybrid"}
+        or context_source == "retrieved"
+    )
+    # Review L5: --context-source gold puts the raw context back on a retrieval
+    # arm (prepare_example still retrieves, for telemetry only), so its draws
+    # keep the raw-context filter.
+    _judged_on_prepared = _serves_retrieved and context_source != "gold"
+    _warmup_cap_record: Optional[Dict[str, Any]] = None
+    _warmup_fits: Optional[Callable[[CAGExample], bool]] = None
+    # L5: a capped pre-load is checked too, with or without a warm-up pool
+    if request_cap_tokens is not None and (warmup_pool_queries > 0 or open_loop_preload_s > 0):
+        if isinstance(request_cap_tokens, bool) or not isinstance(request_cap_tokens, int) or request_cap_tokens < 1:
+            raise WarmupPoolError(f"--request-cap-tokens must be an integer >= 1, got {request_cap_tokens!r}")
+        _cap_tokenizer = _ruler_tokenizer if _ruler_tokenizer is not None else ruler_token_counter(model)[2]
+        _warmup_cap_record = {
+            "request_cap_tokens": request_cap_tokens,
+            "max_tokens": max_tokens,
+            "excluded_by_length": 0,
+            "served_tokens_max": 0,
+            # L5: retrieval arms are judged on the prepared request instead
+            "retrieval_arm": _judged_on_prepared,
+            "prepared_tokens_max": 0,
+            # review 2026-10-13 item 25: prepared requests over the cap are
+            # excluded and the warm-up pool refilled, never a refusal
+            "excluded_by_prepared_length": 0,
+            "replaced_by_prepared_length": 0,
+        }
+
+        def _warmup_fits(ex: CAGExample) -> bool:
+            n_tok = served_prompt_tokens(
+                ex.question, ex.context or [], tokenizer=_cap_tokenizer, prompt_mode=_prompt_mode
+            )
+            if n_tok + max_tokens > request_cap_tokens:
+                _warmup_cap_record["excluded_by_length"] += 1
+                return False
+            _warmup_cap_record["served_tokens_max"] = max(_warmup_cap_record["served_tokens_max"], n_tok)
+            return True
+
+    # L5: a retrieval arm's raw context is never served, so its draws take no
+    # raw-context filter (at the 4,096 cap that filter kept 153 of 532 qasper
+    # candidates); its prepared requests are checked by _check_prepared_fits.
+    _draw_fits = None if _judged_on_prepared else _warmup_fits
+
+    def _prepared_request_fits(meta: Dict[str, Any], request_id: str) -> bool:
+        """L5: the prepared warm-up or pre-load request against the server's
+        cap, counted over its prepared contexts with the draw check's rule.
+        Review 2026-10-13 item 25: a request over the cap is EXCLUDED (counted,
+        printed) and its slot refilled or left out, as the raw-context filter
+        does at draw time; it used to refuse the whole cell, which under
+        decision 3's exit 1 would have blocked the whole run on one long
+        retrieved passage. The cell refuses only when the warm-up pool cannot
+        be filled (draw_warmup_pool's own refusal)."""
+        if _warmup_cap_record is None:
+            return True
+        n_tok = served_prompt_tokens(
+            meta["question"], meta["used_contexts"], tokenizer=_cap_tokenizer, prompt_mode=_prompt_mode
+        )
+        if n_tok + max_tokens > request_cap_tokens:
+            _warmup_cap_record["excluded_by_prepared_length"] += 1
+            print(
+                f"[length-cap] excluded {request_id}: its prepared request serves {n_tok} prompt "
+                f"tokens + max_tokens {max_tokens} > --request-cap-tokens {request_cap_tokens} "
+                "(S0F-88 L5; review 2026-10-13 item 25: excluded and redrawn, never a refusal)"
+            )
+            return False
+        _warmup_cap_record["prepared_tokens_max"] = max(_warmup_cap_record["prepared_tokens_max"], n_tok)
+        return True
+
     warmup_pool_examples: List[CAGExample] = draw_warmup_pool(
         _warmup_candidates,
         measured_ids=_measured_ids_for_pool,
@@ -2982,6 +3192,7 @@ def run_experiment(
         n=warmup_pool_queries,
         seed=seed,
         trial=warmup_pool_trial,
+        fits=_draw_fits,
     )
     warmup_pool_ids: List[str] = [ex.id for ex in warmup_pool_examples]
     code_dataset = is_code_dataset(dataset, base_examples)
@@ -3241,7 +3452,7 @@ def run_experiment(
     # the task+abstention instruction, Qwen3 thinking disabled via
     # chat_template_kwargs {"enable_thinking": false}); CAGE_PROMPT_MODE=raw is the
     # escape hatch that reproduces the legacy raw-completions path byte-for-byte.
-    _prompt_mode = prompt_mode()
+    # (_prompt_mode is bound above, before the warm-up draw.)
     print(f"PROMPT MODE: {_prompt_mode} "
           f"({'chat template via /v1/chat/completions' if _prompt_mode == 'chat' else 'legacy raw completions'})")
 
@@ -3309,6 +3520,40 @@ def run_experiment(
 
     # Setup inference engine
     engine = setup_inference_engine(model, baseline_config, backend=backend, use_offline=use_offline)
+    # S0F-88 U7: an SGLang null cached-token block reads as 0 only once the
+    # server's cache report is verified on (GET /server_info). Review L1: a
+    # campaign window refuses without it, since its zero-cached rows would read
+    # None and every cached-token mean would average the hits alone.
+    _cache_report: Optional[bool] = None
+    if callable(getattr(engine, "probe_cache_report", None)):
+        # review 2026-10-13 item 26: one unanswered GET is a blip, not a
+        # verdict; the probe is retried before a window is refused, and a
+        # verified False still refuses at once.
+        for _try in range(CACHE_REPORT_PROBE_TRIES):
+            _cache_report = engine.probe_cache_report()
+            if _cache_report is not None:
+                break
+            if _try + 1 < CACHE_REPORT_PROBE_TRIES:
+                print(
+                    f"[sglang] cache report probe unanswered (try {_try + 1} of "
+                    f"{CACHE_REPORT_PROBE_TRIES}); retrying in {CACHE_REPORT_PROBE_WAIT_S:g} s"
+                )
+                time.sleep(CACHE_REPORT_PROBE_WAIT_S)
+        if _cache_report is True:
+            print("[sglang] cache report ON (enable_cache_report=true): a null cached count reads as 0")
+        elif campaign_session is not None:
+            _why = (
+                f"did not answer the cache report probe in {CACHE_REPORT_PROBE_TRIES} tries"
+                if _cache_report is None
+                else f"reports enable_cache_report={_cache_report!r} on /server_info"
+            )
+            raise RuntimeError(
+                f"the SGLang server {_why}: a campaign window needs the per-request cached-token "
+                "count (the launcher passes --enable-cache-report; S0F-88 U7)"
+            )
+        else:
+            print(f"[sglang] WARNING: enable_cache_report={_cache_report!r} on the server; rows with no "
+                  "cached token record cached_prompt_tokens=None (S0F-88 U7)")
 
     # hf-oracle corpus-prefix preload (charter D2 idea-gain zero point): when
     # the reference oracle serves a corpus-prefix workload, preload each
@@ -3424,10 +3669,7 @@ def run_experiment(
 
         # Retrieve when the baseline is retrieval-backed OR when context_source forces
         # retrieved context onto every arm (confound control).
-        do_retrieval = (
-            baseline_config.baseline_type.value in {"rag", "redis", "hybrid"}
-            or context_source == "retrieved"
-        )
+        do_retrieval = _serves_retrieved
         if do_retrieval and retriever != "dense":
             # Stage-tagged BM25 / hybrid-RRF retrieval (charter sec. 7.2 /
             # sec. 8.2). The redis/hybrid retrieval-cache baselines were
@@ -3693,6 +3935,31 @@ def run_experiment(
             _quality_row = {k: None for k in _quality_row}
             code_metrics = None
 
+        # ADR-0170 (owner 2026-10-13, "do the native score fix before attempt
+        # 5"): the RULER instrument is scored by its NATIVE containment match
+        # per task (charter D5#5: "scored with RULER's native length-robust
+        # metric", "per-task reporting (never the mean)"), never by the QA
+        # F1/EM of a 32K haystack. The two keys exist on RULER rows only, so
+        # every other dataset's row is byte-identical. Absent stays absent: an
+        # error or empty generation is never scored 0. A RULER item without
+        # the scoring contract (task, gold_answers) is a generator bug and
+        # score_example refuses, which fails the cell at its first row on the
+        # campaign path (the pilot path counts a refused row as dropped; the
+        # registered loader always carries the contract, review L1).
+        _ruler_row: Dict[str, Any] = {}
+        _ruler_meta: Dict[str, Any] = {}
+        if dataset == "ruler":
+            from src.data.ruler import score_example  # pure, lazy like ruler_token_counter
+
+            _ruler_meta = example.metadata if isinstance(example.metadata, dict) else {}
+            _ruler_row = {
+                "ruler_task": _ruler_meta.get("task"),
+                "ruler_native_score": (
+                    None if (response.error or _empty_gen)
+                    else score_example(example, response.generated_text)
+                ),
+            }
+
         kv_transfer_params_str = ""
         if response.kv_transfer_params is not None:
             try:
@@ -3805,6 +4072,7 @@ def run_experiment(
             # speedup claims INCLUDE it, so e2e comparisons must be able to add it back.
             "compression_latency_ms": (meta.get("compression_stats") or {}).get("compression_latency_ms"),
             **_quality_row,
+            **_ruler_row,  # ADR-0170: RULER rows only
         }
         # Adapter honesty/provenance columns (ADR-0007 / charter D2), appended
         # AFTER the existing columns via the union-of-keys CSV convention:
@@ -3898,6 +4166,12 @@ def run_experiment(
             if meta.get("retrieval_pool_size") is not None:
                 _evidence["retrieval_pool_size"] = meta.get("retrieval_pool_size")
                 _evidence["retrieval_reranked"] = meta.get("retrieval_reranked")
+            # ADR-0170: the RULER scoring contract rides the evidence row so an
+            # offline rescore can recompute the native score (RULER rows only).
+            if _ruler_row:
+                _evidence["ruler_task"] = _ruler_meta.get("task")
+                _evidence["ruler_gold_answers"] = _ruler_meta.get("gold_answers")
+                _evidence["ruler_native_score"] = _ruler_row.get("ruler_native_score")
         except Exception as _ev_exc:
             # Row construction failed: the loss is identical to a write failure
             # from the evidence chain's point of view -- count it the same way.
@@ -3919,7 +4193,71 @@ def run_experiment(
         total_stage_examples = sum(len(unit) for unit in units)
         stage_processed = 0
 
+        def _build_closed_loop_request(example: CAGExample) -> Tuple[Dict[str, Any], InferenceRequest]:
+            meta = prepare_example(example)
+            messages = None
+            if _prompt_mode == "chat":
+                # Decision 1B: chat-template serving; context first,
+                # question last inside the user message (prefix sharing
+                # preserved), abstention instruction in the system message.
+                messages = format_qa_messages(meta["question"], meta["used_contexts"])
+                prompt = messages_to_fallback_prompt(messages)
+            else:
+                prompt = format_qa_prompt(meta["question"], meta["used_contexts"])
+            request = InferenceRequest(
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=0.0,
+                top_p=0.95,
+                request_id=example.id,
+                truncate_prompt_tokens=truncate_prompt_tokens,
+                stop=_request_stop,
+            )
+            if messages is not None:
+                # Plain attribute consumed by VLLMAdapter -> /v1/chat/completions.
+                request.messages = messages
+            return meta, request
+
+        # S0F-88 U6 (owner decision 2026-10-12, "Prepare before the clock"):
+        # every unit's retrieval, rerank, compression and prompt rendering run
+        # HERE, before the first timed send, as the open-loop path already
+        # does. On S0 attempt 4 a closed-loop rerank window spent 6 percent of
+        # its span serving; its window time and energy measured the CPU. A
+        # multi-turn turn's prompt depends on the earlier answers, so only its
+        # retrieval is precomputed (an exception is kept for the turn's guard).
+        prepared_units: List[Tuple[List[CAGExample], List[Dict[str, Any]], List[InferenceRequest]]] = []
+        prepared_turns: List[List[Any]] = []
         for unit in units:
+            if workload_mode == "multi_turn":
+                turn_metas: List[Any] = []
+                for example in unit:
+                    try:
+                        turn_metas.append(prepare_example(example))
+                    except Exception as _ex:  # surfaced by the turn's own guard below
+                        turn_metas.append(_ex)
+                prepared_turns.append(turn_metas)
+                continue
+            metas_u: List[Dict[str, Any]] = []
+            requests_u: List[InferenceRequest] = []
+            kept_u: List[CAGExample] = []  # examples whose prepare_example() succeeded
+            for example in unit:
+                # Per-query guard (B4): a failed prepare (retrieval / rerank /
+                # compression) skips just this example instead of aborting the baseline.
+                try:
+                    meta, request = _build_closed_loop_request(example)
+                except Exception as _ex:
+                    if collect_results:
+                        consort_counters["n_dropped_prepare"] += 1
+                    print(f"[{stage_name}] prepare failed for {example.id}: {_ex}; skipping")
+                    continue
+                if not collect_results and not _prepared_request_fits(meta, example.id):
+                    continue  # a warm-up over the cap is excluded (L5, item 25); the pool was refilled before this stage
+                metas_u.append(meta)
+                requests_u.append(request)
+                kept_u.append(example)
+            prepared_units.append((kept_u, metas_u, requests_u))
+
+        for unit_index, unit in enumerate(units):
             batch_id += 1
 
             if workload_mode == "multi_turn":
@@ -3929,7 +4267,9 @@ def run_experiment(
                     # Per-query guard (B4): a single failing turn (retrieval / rerank /
                     # compression / metric-eval / OOM) must not abort the whole baseline.
                     try:
-                        meta = prepare_example(example)
+                        meta = prepared_turns[unit_index][turn_idx]
+                        if isinstance(meta, Exception):
+                            raise meta  # its prepare failed before the clock (U6)
                         messages = None
                         if _prompt_mode == "chat":
                             # Decision 1B: chat-template serving; system carries the
@@ -3973,7 +4313,17 @@ def run_experiment(
                                           turn_index=turn_idx, settle_ms=settle_ms)
                         elif response.error:
                             print(f"[warmup] Request {example.id} failed: {response.error}")
+                            if campaign_session is not None and is_context_length_error(response.error):
+                                # Q-4: a warm-up the server refused for its length
+                                # means the registered W_warm was not served.
+                                raise WarmupPoolError(
+                                    f"warm-up request {example.id} was refused for its length "
+                                    f"({response.error}); the campaign window would warm up on "
+                                    "fewer requests than registered (S0F-88 Q-4)"
+                                )
                         history.append((meta["question"], response.generated_text or ""))
+                    except WarmupPoolError:
+                        raise  # Q-4: a warm-up refused for its length fails the window
                     except Exception as _ex:
                         # One guard covers the whole turn (prepare+send+record), so the
                         # drop is counted as a turn, not attributed to a stage (§9.10).
@@ -3990,44 +4340,9 @@ def run_experiment(
                     if collect_results:
                         measured_processed += 1
             else:
-                metas: List[Dict[str, Any]] = []
-                requests: List[InferenceRequest] = []
-                kept: List[CAGExample] = []  # examples whose prepare_example() succeeded
-                for example in unit:
+                kept, metas, requests = prepared_units[unit_index]
+                for _example in unit:
                     maybe_reshuffle_router(sent_requests)
-                    # Per-query guard (B4): a failed prepare (retrieval / rerank /
-                    # compression) skips just this example instead of aborting the baseline.
-                    try:
-                        meta = prepare_example(example)
-                        messages = None
-                        if _prompt_mode == "chat":
-                            # Decision 1B: chat-template serving; context first,
-                            # question last inside the user message (prefix sharing
-                            # preserved), abstention instruction in the system message.
-                            messages = format_qa_messages(meta["question"], meta["used_contexts"])
-                            prompt = messages_to_fallback_prompt(messages)
-                        else:
-                            prompt = format_qa_prompt(meta["question"], meta["used_contexts"])
-                        request = InferenceRequest(
-                            prompt=prompt,
-                            max_tokens=max_tokens,
-                            temperature=0.0,
-                            top_p=0.95,
-                            request_id=example.id,
-                            truncate_prompt_tokens=truncate_prompt_tokens,
-                            stop=_request_stop,
-                        )
-                        if messages is not None:
-                            # Plain attribute consumed by VLLMAdapter -> /v1/chat/completions.
-                            request.messages = messages
-                    except Exception as _ex:
-                        if collect_results:
-                            consort_counters["n_dropped_prepare"] += 1
-                        print(f"[{stage_name}] prepare failed for {example.id}: {_ex}; skipping")
-                        continue
-                    metas.append(meta)
-                    requests.append(request)
-                    kept.append(example)
 
                 if not requests:
                     continue  # whole unit failed to prepare; nothing to send
@@ -4044,9 +4359,9 @@ def run_experiment(
                 # unit's rows records the same measured value.
                 settle_ms = settle_before_request() if collect_results else 0.0
                 # Window bracket (option C): the first measured send opens the
-                # window, every measured completion moves its end; only the
-                # first unit's preparation and the last unit's recording fall
-                # outside (later units interleave inside the span).
+                # window, every measured completion moves its end; every unit's
+                # preparation now runs before it (S0F-88 U6), so only the
+                # per-unit recording interleaves inside the span.
                 if collect_results and measured_window_t_start is None:
                     measured_window_t_start = time.time()
                 if len(requests) == 1:
@@ -4082,7 +4397,15 @@ def run_experiment(
                                           turn_index=0, settle_ms=settle_ms)
                         elif response.error:
                             print(f"[warmup] Request {example.id} failed: {response.error}")
-                    except (AnswerabilityMismatchError, AnswerabilityFlagError):
+                            if campaign_session is not None and is_context_length_error(response.error):
+                                # Q-4: a warm-up the server refused for its length
+                                # means the registered W_warm was not served.
+                                raise WarmupPoolError(
+                                    f"warm-up request {example.id} was refused for its length "
+                                    f"({response.error}); the campaign window would warm up on "
+                                    "fewer requests than registered (S0F-88 Q-4)"
+                                )
+                    except (AnswerabilityMismatchError, AnswerabilityFlagError, WarmupPoolError):
                         # A8: a label defect is never a per-query drop (it would
                         # hide in n_dropped_record); it fails the cell.
                         raise
@@ -4165,11 +4488,42 @@ def run_experiment(
             dropped_ids=dropped_prepare_ids,
         )
 
+        # S0F-88 U3: the steady-state pre-load, prepared before the clock like
+        # the measured set; distinct disjoint warm-up candidates, each once
+        preload_requests: List[InferenceRequest] = []
+        if open_loop_preload_s > 0:
+            pool = draw_preload_pool(
+                _warmup_candidates,
+                measured_ids=_measured_ids_for_pool,
+                measured_context_keys=_measured_context_keys,
+                n_max=math.ceil(float(open_loop_rate_qps) * float(open_loop_preload_s)),
+                seed=seed,
+                trial=warmup_pool_trial,
+                fits=_draw_fits,
+            )
+            for ex in pool:
+                try:
+                    _meta, _req = build_open_loop_request(ex)
+                except Exception as _ex:  # one candidate, never the window
+                    print(f"[open-loop] pre-load prepare failed for {ex.id}: {_ex}; skipping")
+                    continue
+                if not _prepared_request_fits(_meta, ex.id):  # L5, item 25: excluded, the pre-load runs shorter
+                    continue
+                preload_requests.append(_req)
+            if not preload_requests:
+                raise LoadGeneratorError(
+                    "open_loop_preload_s",
+                    open_loop_preload_s,
+                    "no pre-load request could be drawn or prepared (S0F-88 U3): the "
+                    "window would start without its registered steady-state load",
+                )
         print(
             f"Open-loop dispatch: rate={open_loop_rate_qps} qps, "
             f"duration_s={open_loop_duration_s}, n_arrivals={open_loop_num_arrivals}, "
             f"warmup_s={open_loop_warmup_s}, max_in_flight={open_loop_max_in_flight}, "
-            f"{len(prepared)} prepared requests (schedule index maps modulo)"
+            f"{len(prepared)} prepared requests (schedule index maps modulo), "
+            f"pre-load {len(preload_requests)} distinct requests "
+            f"(about {len(preload_requests) / float(open_loop_rate_qps):.1f} s at the offered rate)"
         )
         # Window bracket (option C): t_start at the FIRST send (the dispatcher
         # fires the hook right before it), t_end right after the dispatcher
@@ -4186,6 +4540,7 @@ def run_experiment(
             warmup_s=open_loop_warmup_s,
             max_in_flight=open_loop_max_in_flight,
             on_first_send=lambda: first_send_ts.append(time.time()),
+            preload_requests=preload_requests or None,
         )
         if first_send_ts:
             measured_window_t_start = first_send_ts[0]
@@ -4239,6 +4594,57 @@ def run_experiment(
     # reset (main's trial loop) and BEFORE the measured stage, with
     # collect_results=False so nothing reaches results rows, requests.jsonl
     # or qa_evidence.jsonl. Only the summary line + the ids' sha256 persist.
+    # S0F-88 L5 (review 2026-10-13 item 25): on an arm judged on its prepared
+    # request, a drawn warm-up whose prepared request exceeds the cap is
+    # excluded and REPLACED from the remaining disjoint candidates, as the
+    # raw-context filter does at draw time; the cell refuses only when the
+    # pool cannot be filled (draw_warmup_pool's own refusal). The replacements
+    # are prepared again in the stage's own pre-pass (a bounded extra cost).
+    if _judged_on_prepared and _warmup_cap_record is not None and warmup_pool_examples:
+        def _prepared_fits(ex: CAGExample) -> bool:
+            try:
+                _m = prepare_example(ex)
+            except Exception as _ex:  # noqa: BLE001 -- one candidate, never the pool
+                print(f"[warmup-pool] prepare failed for {ex.id}: {_ex}; excluded from the pool")
+                return False
+            return _prepared_request_fits(_m, ex.id)
+
+        _kept = [ex for ex in warmup_pool_examples if _prepared_fits(ex)]
+        _short = len(warmup_pool_examples) - len(_kept)
+        if _short:
+            _drawn_ids = {ex.id for ex in warmup_pool_examples}
+            _extra = draw_warmup_pool(
+                [c for c in _warmup_candidates if c.id not in _drawn_ids],
+                measured_ids=_measured_ids_for_pool,
+                measured_context_keys=_measured_context_keys,
+                n=_short,
+                seed=seed,
+                trial=warmup_pool_trial,
+                fits=_prepared_fits,
+            )
+            _warmup_cap_record["replaced_by_prepared_length"] += len(_extra)
+            print(
+                f"[warmup-pool] {_short} drawn warm-up(s) excluded on the prepared request cap "
+                f"and replaced from the remaining candidates (S0F-88 L5, review 2026-10-13 item 25)"
+            )
+            warmup_pool_examples = _kept + _extra
+            warmup_pool_ids = [ex.id for ex in warmup_pool_examples]
+            warmup_pool_requests = [
+                CAGExample(
+                    id=f"{ex.id}__warmup_pool{idx}",
+                    question=ex.question,
+                    context=ex.context,
+                    answer=ex.answer,
+                    metadata={**(ex.metadata or {}), "warmup": True, "warmup_pool": True,
+                              "repeat_index": None},
+                )
+                for idx, ex in enumerate(warmup_pool_examples)
+            ]
+            warmup_pool_work_units = (
+                [[ex] for ex in warmup_pool_requests] if workload_mode == "open_loop"
+                else build_work_units(warmup_pool_requests)
+            )
+
     warmup_pool_ids_sha256_value: Optional[str] = None
     if warmup_pool_work_units:
         warmup_pool_ids_sha256_value = warmup_pool_ids_sha256(warmup_pool_ids)
@@ -4315,7 +4721,7 @@ def run_experiment(
                 for _role, _url in telemetry_endpoints:
                     vllm_role_samplers.append(
                         VllmTelemetrySampler(
-                            _url, interval=1.0, dialect=_telemetry_dialect,
+                            _url, interval=TELEMETRY_SAMPLE_INTERVAL_S, dialect=_telemetry_dialect,
                             role=_role,
                         ).start()
                     )
@@ -4335,7 +4741,7 @@ def run_experiment(
                 # speculative-decode acceptance is sampled even when cage-stats is absent
                 # (Phase-2 gap: the cage-stats gate skipped the scraper -> acceptance was None).
                 vllm_sampler = VllmTelemetrySampler(
-                    api_base, interval=1.0, dialect=_telemetry_dialect
+                    api_base, interval=TELEMETRY_SAMPLE_INTERVAL_S, dialect=_telemetry_dialect
                 ).start()
             except Exception as e:
                 # S0F-26: a campaign window without its sampler would be
@@ -4454,6 +4860,16 @@ def run_experiment(
 
     # Compute aggregate metrics
     perf_metrics = performance_evaluator.compute_metrics()
+    if workload_mode == "open_loop":
+        # S0F-88 audit (Q-5, owner ruling R12): completions over SUMMED
+        # per-request latency is a single-stream rate, meaningless when the
+        # open-loop requests overlap (S0 attempt 4 printed 0.54 QPS while 50
+        # completions finished in 3.54 s). The window's rate is the served
+        # rate over its own span (metrics open_loop.served_rps and
+        # served_tokens_per_second); the summed-latency fields are absent
+        # here (ADR-0148: None when no such reading exists).
+        perf_metrics.queries_per_second = None
+        perf_metrics.tokens_per_second = None
     gpu_metrics = gpu_tracker.compute_metrics().to_dict() if gpu_monitoring else None
 
     # Optional vLLM serving telemetry via cage-stats — captures what CAGE's own
@@ -4541,12 +4957,25 @@ def run_experiment(
                         )
                     else:
                         vllm_telemetry_snapshot, _ = capture(api_base)
-                _dash = dashboard_text(api_base)
+                # Q-5: the dashboard reads the sampler's dialect; a backend
+                # with none (LMDeploy, the in-process oracle) gets none, as
+                # the sampler's loud skip already says (resolve_telemetry_dialect).
+                _dash = (
+                    dashboard_text(api_base, dialect=_telemetry_dialect)
+                    if _telemetry_dialect else None
+                )
                 if _dash:
                     print("\n" + "=" * 70)
-                    print("vLLM TELEMETRY (cage-stats)")
+                    print(f"{backend} TELEMETRY (cage-stats)")
                     print("=" * 70)
-                    print(_dash)
+                    # S0F-88 audit (U10): the headless cage-stats dashboard
+                    # never reads NVML, so its GPU line always says
+                    # unavailable; this process samples NVML itself
+                    # (cage_stats.jsonl, "source": "nvml")
+                    print("\n".join(
+                        line for line in _dash.splitlines()
+                        if "unavailable (no NVML/nvidia-smi)" not in line
+                    ))
             # Dependency-free backstop: ALWAYS ensure spec-decode acceptance is captured from
             # /metrics, even when cage-stats is absent or sampling missed the spec counters.
             # T4.1 repair: single-instance path ONLY — the multi-instance dict never
@@ -4610,10 +5039,16 @@ def run_experiment(
     print("=" * 70)
     # ADR-0148: a field is None when nothing was measured (an all-error window,
     # no TPOT sample, no resource sample); format_metric prints it as n/a.
-    print(
-        f"Throughput: {format_metric(perf_metrics.queries_per_second)} QPS, "
-        f"{format_metric(perf_metrics.tokens_per_second)} tokens/sec"
-    )
+    if workload_mode == "open_loop" and open_loop_report is not None:
+        print(
+            f"Throughput (served, open loop): {format_metric(open_loop_report.served_rps)} rps, "
+            f"{format_metric(open_loop_report.served_tokens_per_second)} tokens/sec"
+        )
+    else:
+        print(
+            f"Throughput: {format_metric(perf_metrics.queries_per_second)} QPS, "
+            f"{format_metric(perf_metrics.tokens_per_second)} tokens/sec"
+        )
     print(f"Latency (avg): {format_metric(perf_metrics.avg_latency_ms)} ms")
     print(f"Latency (p95): {format_metric(perf_metrics.p95_latency_ms)} ms")
     print(f"TTFT (avg): {format_metric(perf_metrics.avg_ttft_ms)} ms")
@@ -4685,6 +5120,10 @@ def run_experiment(
         "is_answerable": mean_or_none("is_answerable"),
         "predicted_no_answer": mean_or_none("predicted_no_answer"),
     }
+    if dataset == "ruler":
+        # ADR-0170: RULER's quality is its native score (RULER windows only,
+        # so every other dataset's summary keeps its exact keys)
+        avg_quality["ruler_native_score"] = mean_or_none("ruler_native_score")
 
     print("\n" + "=" * 70)
     print("QUALITY METRICS (Average)")
@@ -4944,6 +5383,10 @@ def run_experiment(
         compression_analytical = None
 
     # Save aggregate metrics as JSON
+    # ADR-0170: the RULER task this window served (one per window by the
+    # driver's per-task ordinal ranges, ADR-0096); several would be recorded
+    # as the sorted list, never collapsed. None outside RULER.
+    _ruler_tasks_seen = sorted({r.get("ruler_task") for r in results if r.get("ruler_task")}) if dataset == "ruler" else []
     experiment_summary = {
         "experiment": {
             "baseline": experiment_label,
@@ -4951,6 +5394,10 @@ def run_experiment(
             "model": model,
             "dataset": dataset,
             "dataset_split": default_dataset_split(dataset),
+            **(
+                {"ruler_task": _ruler_tasks_seen[0] if len(_ruler_tasks_seen) == 1 else _ruler_tasks_seen}
+                if dataset == "ruler" else {}
+            ),
             "num_queries": len(base_examples),
             "num_measured_requests": len(measured_examples),
             "num_warmup_requests": len(warmup_examples),
@@ -4987,6 +5434,9 @@ def run_experiment(
             # pre-existing run shape; "bm25"/"hybrid-rrf" for the
             # stage-tagged paths.
             "retriever": retriever,
+            # B-6 (S0F-88): where the cross-encoder ran (campaign rerank cells
+            # pin cuda since R8); None when no reranker served the cell.
+            "reranker_device": reranker_device if reranker is not None else None,
         },
         "workload": {
             "repeat_queries": repeat_queries,
@@ -5003,7 +5453,11 @@ def run_experiment(
                     "open_loop": {
                         **open_loop_report.to_manifest(),
                         "warmup_s": open_loop_warmup_s,
+                        "preload_s_requested": open_loop_preload_s,  # S0F-88 U3
                         "max_in_flight": open_loop_max_in_flight,
+                        # B-1: the client's open-file limits (every in-flight
+                        # request holds one socket).
+                        "open_file_limit": dict(_OPEN_FILE_LIMITS) or None,
                     }
                 }
                 if open_loop_report is not None
@@ -5050,6 +5504,14 @@ def run_experiment(
             "evidence_write_failures": evidence_failures["count"],
             "evidence_write_first_error": evidence_failures["first_error"],
         },
+        # S0F-88 audit (Q-3): served answers that are empty or whitespace only
+        # (52 HF oracle rows on S0 attempt 4, visible only per row), counted on
+        # the rows' own empty_generation flag; verify_results check (o) names
+        # them per window
+        "empty_generations": sum(1 for r in results if r.get("empty_generation")),
+        # S0F-88 U7 (review L1): the runner's own reading of the SGLang cache
+        # report before serving (None on every other engine)
+        "cache_report_probe": _cache_report,
     }
 
     # Atomic writes (task #127, audit H10): metrics.json is the completeness
@@ -5100,6 +5562,9 @@ def run_experiment(
             "excluded_by_context": _warmup_split.excluded_by_context,
             "included_in_metrics": False,
             "adr": "ADR-0102",
+            # Q-4 (S0F-88): the request-cap filter of a capped cell (absent
+            # on uncapped cells, so their schema stays byte-identical).
+            **({"length_cap": _warmup_cap_record} if _warmup_cap_record is not None else {}),
         }
     # ADR-0102 cold-start provenance (campaign mode): the per-window reset
     # record main() obtained from _reset_prefix_cache (mechanism, endpoint,
@@ -5204,6 +5669,11 @@ def warmup_pool_ids_sha256(ids: List[str]) -> str:
 #: on datasets where several questions share one paragraph (SQuAD v2). The
 #: measured set itself is never touched by the slate size.
 WARMUP_POOL_CANDIDATE_MULTIPLIER: int = 4
+#: Review 2026-10-13 item 26: how often the SGLang cache-report probe (GET
+#: /server_info, S0F-88 U7) is retried when it goes unanswered, and the wait
+#: between tries, before a campaign window is refused.
+CACHE_REPORT_PROBE_TRIES: int = 3
+CACHE_REPORT_PROBE_WAIT_S: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -5304,6 +5774,7 @@ def draw_warmup_pool(
     n: int,
     seed: int,
     trial: int,
+    fits: Optional[Callable[[CAGExample], bool]] = None,
 ) -> List[CAGExample]:
     """ADR-0102: draw ``n`` warm-up examples DISJOINT from the measured set.
 
@@ -5338,7 +5809,62 @@ def draw_warmup_pool(
             f"load a larger split or lower --warmup-pool-queries (ADR-0102 W_warm)"
         )
     rng = _random.Random(f"cage-warmup-pool:{int(seed)}:{int(trial)}")
-    return rng.sample(split.disjoint, n)
+    if fits is None:
+        return rng.sample(split.disjoint, n)
+    # Q-4 (S0F-88, owner ruling R11, ADR-0102 amendment): a capped cell keeps
+    # only candidates whose served request fits the server's request cap
+    # (68 warm-up HTTP 400 on S0 attempt 4; 13 of 20 lost on 4,096-token
+    # servers). The seeded order is a shuffle of the disjoint set, scanned
+    # until n fit: deterministic, and only about n / fit-rate candidates are
+    # rendered. Uncapped draws keep the rng.sample path above unchanged.
+    order = list(split.disjoint)
+    rng.shuffle(order)
+    chosen: List[CAGExample] = []
+    for ex in order:
+        if fits(ex):
+            chosen.append(ex)
+            if len(chosen) == n:
+                return chosen
+    raise WarmupPoolError(
+        f"warm-up pool needs {n} examples whose served request fits the cell's "
+        f"request cap but only {len(chosen)} of {len(order)} disjoint candidates "
+        f"fit (S0F-88 Q-4); load a larger split or lower --warmup-pool-queries"
+    )
+
+
+def draw_preload_pool(
+    candidates: List[CAGExample],
+    *,
+    measured_ids: Set[str],
+    measured_context_keys: Set[str],
+    n_max: int,
+    seed: int,
+    trial: int,
+    fits: Optional[Callable[[CAGExample], bool]] = None,
+) -> List[CAGExample]:
+    """S0F-88 U3: up to ``n_max`` examples DISJOINT from the measured set for
+    the steady-state pre-load, each served once (never replayed: a replayed
+    prompt is served from the prefix cache on prefix-ON cells and fills the
+    pool less than real traffic). Seeded like ``draw_warmup_pool`` on its own
+    key; ``fits`` is the same request-cap filter (Q-4). Returns fewer than
+    ``n_max`` when fewer disjoint candidates fit, and the pre-load then runs
+    shorter (its span is recorded)."""
+    import random as _random
+
+    if n_max <= 0:
+        return []
+    split = partition_warmup_candidates(
+        candidates, measured_ids=measured_ids, measured_context_keys=measured_context_keys,
+    )
+    order = list(split.disjoint)
+    _random.Random(f"cage-preload-pool:{int(seed)}:{int(trial)}").shuffle(order)
+    chosen: List[CAGExample] = []
+    for ex in order:
+        if fits is None or fits(ex):
+            chosen.append(ex)
+            if len(chosen) == n_max:
+                break
+    return chosen
 
 
 #: ADR-0102 (repair 2026-09-16): the Prometheus gauge, per server backend,
@@ -5641,6 +6167,11 @@ def main():
     # A TTY is already line-buffered; a non-TextIOWrapper stdout is left alone.
     if not sys.stdout.isatty() and hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
+    # B-1 (S0F-88): raise the open-file soft limit before any socket opens;
+    # at 1,024 the S0 attempt 4 client failed every request above about
+    # 1,005 in flight with "Too many open files".
+    _OPEN_FILE_LIMITS.update(raise_open_file_limit())
+    print(f"[runner] open-file limit: {_OPEN_FILE_LIMITS}")
 
     parser = argparse.ArgumentParser(
         description="Run CAGE baseline experiments",
@@ -5904,6 +6435,14 @@ def main():
              "arrival offset is before this many seconds",
     )
     parser.add_argument(
+        "--open-loop-preload-s",
+        type=float,
+        default=0.0,
+        help="S0F-88 U3: before the --arrival-count measured arrivals, send distinct "
+             "unmeasured warm-up-pool requests at the same rate for up to this many "
+             "seconds so the queue is built when measuring starts (never scored)",
+    )
+    parser.add_argument(
         "--max-in-flight",
         type=int,
         default=None,
@@ -5977,6 +6516,15 @@ def main():
         "--reranker-model",
         default="BAAI/bge-reranker-large",
         help="Optional cross-encoder reranker model (set to 'none' to disable)",
+    )
+    parser.add_argument(
+        "--request-cap-tokens",
+        type=int,
+        default=None,
+        help="S0F-88 Q-4: the serving engine's request cap (max_model_len) for this "
+             "cell; warm-up pool candidates whose served request (prompt plus "
+             "--max-tokens) exceeds it are not drawn, and a warm-up the engine "
+             "refuses for its length fails a campaign window. Unset = no filter",
     )
     parser.add_argument(
         "--reranker-device",
@@ -6221,6 +6769,7 @@ def main():
             open_loop_duration_s=args.duration_s,
             open_loop_num_arrivals=args.arrival_count,
             open_loop_warmup_s=args.open_loop_warmup_s,
+            open_loop_preload_s=args.open_loop_preload_s,
             open_loop_max_in_flight=args.max_in_flight,
             routing_switch_at=args.routing_switch_at,
             reranker_model=reranker_model,
@@ -6243,6 +6792,7 @@ def main():
             warmup_pool_queries=args.warmup_pool_queries,
             warmup_pool_trial=1,
             ruler_rendered_input_cap=args.ruler_rendered_input_cap,
+            request_cap_tokens=args.request_cap_tokens,
         )
 
     def _run_trials(top_k_value: int) -> None:
@@ -6348,6 +6898,7 @@ def main():
                 open_loop_duration_s=args.duration_s,
                 open_loop_num_arrivals=args.arrival_count,
                 open_loop_warmup_s=args.open_loop_warmup_s,
+                open_loop_preload_s=args.open_loop_preload_s,
                 open_loop_max_in_flight=args.max_in_flight,
                 routing_switch_at=args.routing_switch_at,
                 reranker_model=reranker_model,
@@ -6376,6 +6927,7 @@ def main():
                     cold_start_record if campaign_session is not None else None
                 ),
                 ruler_rendered_input_cap=args.ruler_rendered_input_cap,
+            request_cap_tokens=args.request_cap_tokens,
             )
 
             # Load trial results. A metrics.json that EXISTS but does not parse is
@@ -6421,6 +6973,8 @@ def main():
             "completeness_bertscore", "completeness_rouge_l",
             "f1_score", "precision", "recall", "exact_match",
         ]
+        if args.dataset == "ruler":
+            quality_keys.append("ruler_native_score")  # ADR-0170 (review L3)
 
         def aggregate_numeric_section(section_name: str) -> Dict[str, Any]:
             numeric_values: Dict[str, List[float]] = {}

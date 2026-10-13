@@ -4,7 +4,8 @@ Live H100 (2026-10-07): the campaign seam refuses any window whose backend
 reports neither server_version nor client_library_version, and
 capture_backend_metadata covered vllm and ollama only, so every SGLang and
 HF-oracle cell was refused after running its window. SGLang's version comes
-from GET /get_server_info (its own venv is not importable here); the HF
+from GET /server_info (its own venv is not importable here; S0F-88 U10 moved
+off the deprecated /get_server_info alias, which warned at every call); the HF
 oracle's from the transformers library it runs in-process.
 """
 from __future__ import annotations
@@ -24,14 +25,14 @@ def _load():
     return module
 
 
-def test_sglang_reports_the_server_version_from_get_server_info(monkeypatch) -> None:
+def test_sglang_reports_the_server_version_from_server_info(monkeypatch) -> None:
     rx = _load()
     seen = []
 
     def fake_get(url, *, timeout=5):
         seen.append(url)
-        if url.endswith("/get_server_info"):
-            return {"version": "0.5.10.post1", "model_path": "Qwen/Qwen3-14B"}
+        if url.endswith("/server_info"):
+            return {"version": "0.5.10.post1", "model_path": "Qwen/Qwen3-14B", "enable_cache_report": True}
         if url.endswith("/v1/models"):
             return {"data": [{"id": "Qwen/Qwen3-14B"}]}
         return None
@@ -40,7 +41,8 @@ def test_sglang_reports_the_server_version_from_get_server_info(monkeypatch) -> 
     md = rx.capture_backend_metadata(api_base="http://localhost:30000/", backend="sglang", model_name="Qwen/Qwen3-14B", use_offline=False)
     assert md["server_version"] == "0.5.10.post1"
     assert md["loaded_model"] == "Qwen/Qwen3-14B" and md["loaded_models"] == ["Qwen/Qwen3-14B"]
-    assert "http://localhost:30000/get_server_info" in seen
+    assert "http://localhost:30000/server_info" in seen and not any("get_server_info" in u for u in seen)
+    assert md["cache_report_enabled"] is True  # S0F-88 U7
 
 
 def test_hf_oracle_reports_the_transformers_version(monkeypatch) -> None:
@@ -64,7 +66,7 @@ def test_every_engine_of_session_a_has_engine_provenance(monkeypatch) -> None:
     rx = _load()
     def fake_get(url, *, timeout=5):
         if url.endswith("/version"): return {"version": "0.19.1"}
-        if url.endswith("/get_server_info"): return {"version": "0.5.10.post1"}
+        if url.endswith("/server_info"): return {"version": "0.5.10.post1"}
         if url.endswith("/v1/models"): return {"data": [{"id": "m"}]}
         return None
     monkeypatch.setattr(rx, "_safe_get_json", fake_get)

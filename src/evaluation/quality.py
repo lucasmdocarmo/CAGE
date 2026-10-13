@@ -636,6 +636,12 @@ class QualityMetrics:
     # unanswerable); None only when F1/EM were not scored at all.
     answerability_provenance: Optional[str] = None
     cache_relevance: Optional[float] = None  # 0-1, proportion of useful cache blocks
+    # Q-10 (S0F-88, owner ruling R19): True when a context was longer than the
+    # embedder's max_seq_length, so context_relevance scored a CUT context
+    # (sentence-transformers truncates silently; all 400 RULER rows of S0
+    # attempt 4); False when every context fit; None when not scored or the
+    # embedder exposes no tokenizer or limit (unknown, never assumed False).
+    context_relevance_truncated: Optional[bool] = None
     # Hallucination (LettuceDetect, PRIMARY grounding signal)
     grounding_score: Optional[float] = None  # 0-1, 1 - hallucinated_span_ratio (None if detector unavailable)
     hallucination_detected: Optional[bool] = None  # True if any answer span is unsupported
@@ -711,6 +717,7 @@ class QualityMetrics:
             # Honest name for the retriever-diagnostic, plus a back-compat alias.
             "context_relevance": self.relevance,
             "relevance": self.relevance,
+            "context_relevance_truncated": self.context_relevance_truncated,
             "completeness_bertscore": self.completeness_bertscore,
             "completeness_rouge_l": self.completeness_rouge_l,
             "f1_score": self.f1_score,
@@ -1443,6 +1450,12 @@ class QualityEvaluator:
     # windows (and, as before, over docs). Kept below nli_max_length=512 so the
     # premise+hypothesis pair never hits pipeline truncation.
     NLI_PREMISE_WINDOW_TOKENS = 400
+    # S0F-88 review L2: the hard split searches at most this many characters
+    # per budget token for one chunk. A search bound only: a chunk can come out
+    # smaller than the budget, never larger. The NLI tokenizer averaged 4.24
+    # characters per token over the 1,067 context documents of S0 attempt 4 and
+    # never more than 7.3 in one document [V, 2026-10-12].
+    NLI_SPLIT_MAX_CHARS_PER_TOKEN = 8
 
     def _nli_tokenizer(self):
         """The loaded NLI pipeline's tokenizer, or None if unavailable."""
@@ -1473,9 +1486,34 @@ class QualityEvaluator:
         sentences = _split_sentences(text)
         tokenizer = self._nli_tokenizer()
         counts = self._sentence_token_counts(sentences, tokenizer)
-        return self._sentence_window_split(
-            text, sentences, counts, self.NLI_PREMISE_WINDOW_TOKENS
-        )
+        budget = self.NLI_PREMISE_WINDOW_TOKENS
+        if tokenizer is not None and any(c > budget for c in counts):
+            # S0F-88 audit (Q-10): a single sentence over the budget (terminator-
+            # free text: a table, a key-value dump) came back whole and the
+            # pipeline's truncation cut the premise silently. Split it on the
+            # NLI tokenizer's own counts first, as the LettuceDetect branch
+            # does; a doc without such a sentence is windowed exactly as before.
+            # Review L2: the search per chunk is bounded
+            # (NLI_SPLIT_MAX_CHARS_PER_TOKEN), and a split that fails keeps the
+            # pre-split sentences, so it never aborts a scoring pass.
+            refined: List[str] = []
+            refined_counts: List[int] = []
+            try:
+                for sentence, count in zip(sentences, counts):
+                    if count <= budget:
+                        refined.append(sentence)
+                        refined_counts.append(count)
+                        continue
+                    parts = self._hard_token_split(
+                        sentence, tokenizer, budget,
+                        max_chars=budget * self.NLI_SPLIT_MAX_CHARS_PER_TOKEN,
+                    )
+                    refined.extend(parts)
+                    refined_counts.extend(self._count_tokens_strict(parts, tokenizer))
+            except Exception:  # noqa: BLE001 -- the pre-split windows stand
+                refined, refined_counts = sentences, counts
+            sentences, counts = refined, refined_counts
+        return self._sentence_window_split(text, sentences, counts, budget)
 
     @staticmethod
     def _sentence_token_counts(texts: List[str], tokenizer: Any) -> List[int]:
@@ -1501,8 +1539,14 @@ class QualityEvaluator:
         detector's OWN tokenizer counts -- a whitespace proxy could under-count
         and silently skip a REQUIRED windowed pass. Tokenizer errors propagate
         to the caller's typed-failure handling (fail-closed).
+
+        ``verbose=False`` (Q-7, S0F-88): this call only COUNTS tokens, it
+        never feeds the model, so transformers' once-per-tokenizer warning
+        "sequence length is longer than the specified maximum (32353 >
+        8192)" on a 32K RULER context was noise: the windowing below keeps
+        every predicted context within the detector budget.
         """
-        enc = tokenizer(list(texts), add_special_tokens=False)
+        enc = tokenizer(list(texts), add_special_tokens=False, verbose=False)
         return [len(ids) for ids in enc["input_ids"]]
 
     @staticmethod
@@ -1557,7 +1601,7 @@ class QualityEvaluator:
 
     @classmethod
     def _hard_token_split(
-        cls, text: str, tokenizer: Any, max_tokens: int
+        cls, text: str, tokenizer: Any, max_tokens: int, max_chars: Optional[int] = None
     ) -> List[str]:
         """Token-budget hard split (~50% overlap) for a text sentence
         alignment cannot shrink (D8 §8.5, LettuceDetect branch only).
@@ -1575,12 +1619,16 @@ class QualityEvaluator:
         so any evidence span shorter than half a chunk appears whole in some
         chunk. Raises (fail-closed, into the caller's typed
         ``_scoring_failure`` path) when not even one character fits.
+
+        ``max_chars`` (S0F-88 review L2) bounds each chunk's search: a chunk
+        then holds at most that many characters, so it can only be smaller,
+        never over budget; None keeps the whole remaining text in the search.
         """
         chunks: List[str] = []
         start = 0
         n = len(text)
         while start < n:
-            lo, hi = 1, n - start
+            lo, hi = 1, n - start if max_chars is None else min(n - start, max_chars)
             best = 0
             while lo <= hi:
                 mid = (lo + hi) // 2
@@ -2012,12 +2060,27 @@ class QualityEvaluator:
         model is unavailable.
         """
         nonempty_ctx = [c for c in (context or []) if c and str(c).strip()]
+        self.last_relevance_truncated = None  # Q-10: per call, read by the caller
         if not self.use_embeddings or not nonempty_ctx:
             return None
         model = self.embedding_model  # strict: raises on load failure
         if model is None:
             self._note_unavailable_row("embedding")
             return None
+        # Q-10 (S0F-88): sentence-transformers cuts every input at
+        # max_seq_length without a signal ("Truncate any inputs longer than
+        # this value", sentence_transformers 5.7.0 models.Transformer); count
+        # with the embedder's own tokenizer and record whether a cut happened.
+        limit = getattr(model, "max_seq_length", None)
+        tok = getattr(model, "tokenizer", None)
+        if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0 and callable(tok):
+            try:
+                self.last_relevance_truncated = any(
+                    len(tok(c, add_special_tokens=True, verbose=False)["input_ids"]) > limit
+                    for c in nonempty_ctx
+                )
+            except Exception:  # noqa: BLE001 -- unknown stays unknown (None)
+                self.last_relevance_truncated = None
 
         try:
             # Encode question and context
@@ -2317,6 +2380,7 @@ class QualityEvaluator:
             sanitized_text, reference_answer, all_answers, is_impossible=is_impossible
         )
         relevance = self.evaluate_relevance(question, context)
+        relevance_truncated = getattr(self, "last_relevance_truncated", None)
 
         # Abstention-aware grounding/faithfulness (2026-07-15 audit): an abstention like
         # "Don't know." is by construction unsupported by the context, so LettuceDetect and
@@ -2358,6 +2422,7 @@ class QualityEvaluator:
         return QualityMetrics(
             faithfulness=faith["faithfulness"],
             relevance=relevance,
+            context_relevance_truncated=relevance_truncated,
             completeness_bertscore=completeness["bertscore_f1"],
             completeness_rouge_l=completeness["rouge_l_f1"],
             f1_score=f1_metrics["f1"],
@@ -2474,9 +2539,11 @@ class QualityEvaluator:
 
         # Relevance (question<->context; computed for ALL rows, like evaluate()).
         relevances: List[Optional[float]] = []
+        relevance_truncated: List[Optional[bool]] = []
         for i in range(n):
             self._row_status_tokens = row_tokens[i]
             relevances.append(self.evaluate_relevance(rows[i][0], rows[i][1]))
+            relevance_truncated.append(getattr(self, "last_relevance_truncated", None))
 
         # Faithfulness: ONE batched call across every row's (premise, claim) pairs.
         faiths = self._batch_faithfulness(
@@ -2519,6 +2586,7 @@ class QualityEvaluator:
                 QualityMetrics(
                     faithfulness=faith["faithfulness"],
                     relevance=relevances[i],
+                    context_relevance_truncated=relevance_truncated[i],
                     completeness_bertscore=completeness["bertscore_f1"],
                     completeness_rouge_l=completeness["rouge_l_f1"],
                     f1_score=f1_metrics["f1"],

@@ -10,6 +10,7 @@ Two families:
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 # Bytes per element by KV cache dtype.
@@ -62,6 +63,28 @@ def compression_ratio(original_tokens: int, compressed_tokens: int) -> Optional[
     return float(compressed_tokens) / float(original_tokens)
 
 
+def _model_config(model_name: str) -> dict:
+    """The model's config.json as a dict: the locally cached file through
+    huggingface_hub (about 0.05 s), else ``AutoConfig``. S0F-88 audit (U1):
+    importing transformers in the window tail held every vLLM window 25 to
+    32 s after its last completion on S0 attempt 4."""
+    try:
+        import json as _json
+
+        from huggingface_hub import try_to_load_from_cache
+
+        path = try_to_load_from_cache(model_name, "config.json")
+        if isinstance(path, str) and os.path.isfile(path):
+            with open(path, encoding="utf-8") as handle:
+                return dict(_json.load(handle))
+    except Exception:  # noqa: BLE001 -- no package, a local path, a bad repo id: AutoConfig decides
+        pass
+    from transformers import AutoConfig
+
+    cfg = AutoConfig.from_pretrained(model_name)
+    return cfg.to_dict() if callable(getattr(cfg, "to_dict", None)) else dict(vars(cfg))
+
+
 def analytical_kv_footprint(
     model_name: str,
     num_tokens: int,
@@ -89,20 +112,18 @@ def analytical_kv_footprint(
     from the run summary on any host.
     """
     try:
-        from transformers import AutoConfig
-
-        cfg = AutoConfig.from_pretrained(model_name)
-        num_layers = getattr(cfg, "num_hidden_layers", None)
-        num_heads = getattr(cfg, "num_attention_heads", None)
-        num_kv_heads = getattr(cfg, "num_key_value_heads", None) or num_heads
-        hidden = getattr(cfg, "hidden_size", None)
-        head_dim = getattr(cfg, "head_dim", None) or (
+        cfg = _model_config(model_name)
+        num_layers = cfg.get("num_hidden_layers")
+        num_heads = cfg.get("num_attention_heads")
+        num_kv_heads = cfg.get("num_key_value_heads") or num_heads
+        hidden = cfg.get("hidden_size")
+        head_dim = cfg.get("head_dim") or (
             int(hidden // num_heads) if hidden and num_heads else None
         )
         if mla_latent_dim is None:
-            kv_lora_rank = getattr(cfg, "kv_lora_rank", None)
+            kv_lora_rank = cfg.get("kv_lora_rank")
             if kv_lora_rank:
-                qk_rope_head_dim = getattr(cfg, "qk_rope_head_dim", 0) or 0
+                qk_rope_head_dim = cfg.get("qk_rope_head_dim", 0) or 0
                 mla_latent_dim = int(kv_lora_rank) + int(qk_rope_head_dim)
         if not (num_layers and num_kv_heads and head_dim and num_tokens):
             return None

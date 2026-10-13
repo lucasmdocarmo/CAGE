@@ -188,7 +188,7 @@ def _calibration_doc(
 ) -> Dict[str, Any]:
     ttft_s, tpot_s = _CAL_FLOORS.get(engine, (0.1, 0.01))
     return {
-        "procedure_version": "cal-v2 (2026-09-30)",
+        "procedure_version": "cal-v3 (2026-10-12)",
         "model": model,
         "engine": engine,
         "budget_fraction": budget_fraction,
@@ -262,6 +262,9 @@ _RUNG_LAMBDA = 8.0
 #: x the anchor's, so the fixture's log-log slope is alpha = ln(4) / ln(s_g / s_m)
 #: (about 0.53 for 4,779 over 348 tokens), distinguishable from the KV-bound 1.
 _RUNG_SMALL_FACTOR = 4.0
+#: ADR-0169 fixtures: the RULER ladder's lambda* per rung is _RUNG_RULER_LAMBDA x r,
+#: far below the anchor's 8 x r (S0 attempt 4: about 0.46 rps against 18 rps).
+_RUNG_RULER_LAMBDA = 0.5
 
 
 def _rung_table(rungs, lam: float, labels: Optional[Dict[float, str]]) -> Dict[str, Any]:
@@ -291,11 +294,14 @@ def _rung_calibration_doc(
     small_factor: float = _RUNG_SMALL_FACTOR,
     small_labels: Optional[Dict[float, str]] = None,
     anchor_seq_tokens: int = _ANCHOR_SEQ_TOKENS,
+    ruler: Optional[float] = None,
+    ruler_labels: Optional[Dict[float, str]] = None,
 ) -> Dict[str, Any]:
     """One ``cage-rung-calibration-v2`` artifact as calibrate-rungs writes it;
     ``labels`` overrides an anchor rung's label (a non-ESTIMATED rung carries no
     value); ``small`` = (seq_tokens, arm) adds the smallest-class ladder
-    (ADR-0156) at ``small_factor`` x the anchor's lambda* per rung."""
+    (ADR-0156) at ``small_factor`` x the anchor's lambda* per rung; ``ruler``
+    adds the RULER instrument's own ladder (ADR-0169) at ``ruler`` x r."""
     records = _rung_table(rungs, lam, labels)
     classes: Dict[str, Any] = {
         str(anchor_seq_tokens): {
@@ -310,6 +316,15 @@ def _rung_calibration_doc(
             "role": "smallest", "arm": arm, "baseline_id": "B11", "family": "F2",
             "prefix_mode": "OFF", "seq_tokens": seq, "dataset": "qasper",
             "rungs": _rung_table(rungs, lam * small_factor, small_labels),
+        }
+    if ruler is not None:
+        # ADR-0169: the RULER ladder on the anchor's budget, keyed by SHAPE-32K
+        classes[str(rc.RULER_RATE_CLASS_TOKENS)] = {
+            "role": rc.RULER_ROLE, "arm": rc.DEMAND_ANCHOR_ARM, "baseline_id": "B1", "family": "F2",
+            "prefix_mode": "OFF", "ladder_prefix_mode": "OFF", "seq_tokens": rc.RULER_RATE_CLASS_TOKENS,
+            "demand_seq_tokens": anchor_seq_tokens, "dataset": "ruler", "ruler_task": "niah_multikey",
+            "floor": {"ttft_s": 2.3, "tpot_s": 0.018, "n_requests": 9, "statistic": "median"},
+            "rungs": _rung_table(rungs, ruler, ruler_labels), "adr": rc.RULER_RATE_ADR,
         }
     return {
         "schema": rc.RUNG_CALIBRATION_SCHEMA,
@@ -346,6 +361,8 @@ def _write_rung_calibrations(
         per_engine = dict(overrides)
         if grid is not None and "small" not in per_engine:
             per_engine["small"] = _smallest_for(grid, engine)
+        if grid is not None and "ruler" not in per_engine and rc.ruler_pressure_class(grid, engine) is not None:
+            per_engine["ruler"] = _RUNG_RULER_LAMBDA  # ADR-0169: the grid carries RULER cells here
         path = directory / f"rungs_{engine}.json"
         path.write_text(
             json.dumps(_rung_calibration_doc(engine, session, rungs, **per_engine)),
@@ -499,7 +516,7 @@ if root and (__DRY_SUFFIX__ + "-") in os.path.basename(root) and os.environ.get(
     with open(os.path.join(wdir, "regime.json"), "w", encoding="utf-8") as fh:
         json.dump({
             "schema_version": 2,
-            "label": os.environ.get("STUB_REGIME_LABEL", "IN_REGIME"),
+            "label": os.environ.get("STUB_REGIME_LABEL_B%d" % base, os.environ.get("STUB_REGIME_LABEL", "IN_REGIME")),
             "attainment": 0.97,
             "inputs": {"rho_kv_time_avg": 0.93, "queue_waiting_share": 0.8, "waiting_max": 7},
             "refusal_reason": None,
@@ -901,13 +918,17 @@ class TestOrdering:
                 if s["engine"] == "vllm":
                     assert env.pop("VLLM_KV_CACHE_DTYPE") == "fp8"
                 else:
-                    # the SGLang launcher's own documented fp8 token
-                    assert env.pop("SGLANG_KV_CACHE_DTYPE") == "fp8_e5m2"
+                    # U8 (owner decision 2026-10-12): E4M3 on both engines
+                    assert env.pop("SGLANG_KV_CACHE_DTYPE") == "fp8_e4m3"
             if s["connector"] == "lmcache":
                 assert s["engine"] == "vllm"  # sglang store cells are BLOCKED
                 # verbatim run_kv_store.sh:123 — never re-derived
                 assert env.pop("VLLM_KV_TRANSFER_CONFIG") == (
                     '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'
+                )
+                # S0F-88 U2: the CPU store sized for the relaunch's largest window
+                assert env.pop("LMCACHE_MAX_LOCAL_CPU_SIZE") == str(
+                    s["lmcache_store"]["max_local_cpu_size_gib"]
                 )
             if s["budget_r"] is None:
                 assert env == {}, "budget-free relaunch must carry no budget env"
@@ -1018,7 +1039,15 @@ class TestCellSteps:
             assert src["gold_lambda_star_qps"] == pytest.approx(gold)
             assert src["seq_tokens_gold"] == _ANCHOR_SEQ_TOKENS
             assert src["seq_tokens_class"] == seq
-            if seq == _ANCHOR_SEQ_TOKENS:
+            if s["dataset"] == "ruler":
+                # ADR-0169 (decision 5): the RULER instrument rides the anchor's
+                # budget but offers its OWN ladder's lambda* (_RUNG_RULER_LAMBDA x r)
+                assert seq == _ANCHOR_SEQ_TOKENS and s["cellspec"]["arm"] == "gold-fresh"
+                assert s["rate_basis"] == rc.LAMBDA_BASIS_RULER
+                assert s["lambda_star_rps"] == pytest.approx(_RUNG_RULER_LAMBDA * r)
+                assert src["rate_class_seq_tokens"] == rc.RULER_RATE_CLASS_TOKENS and src["alpha"] is None
+                seen.add("ruler")
+            elif seq == _ANCHOR_SEQ_TOKENS:
                 assert s["cellspec"]["arm"] in ("gold-fresh", "gold-reuse")
                 assert s["rate_basis"] == rc.LAMBDA_BASIS_RUNG
                 assert s["lambda_star_rps"] == pytest.approx(gold)
@@ -1039,7 +1068,7 @@ class TestCellSteps:
                 assert src["alpha"] == pytest.approx(alpha) and src["kv_bound_alpha"] == 1.0
                 seen.add("interpolated")
             assert s["lambda_star_rps"] != pytest.approx(s["lambda_kv_pred_rps"])
-        assert seen == {"anchor", "small", "interpolated"}
+        assert seen == {"anchor", "small", "interpolated", "ruler"}
 
     def test_blocked_pressure_cells_carry_a_reviewable_rate(self, plan_a, tmp_path, calibrations_a):
         # A blocked cell never runs. On a calibrated (engine, r) it carries the
@@ -1371,10 +1400,12 @@ class TestBehaviorRealization:
         # served. The knob is a named module constant citing its ADR, pinned
         # in the argv (never a runner default) and reviewable in the header.
         assert rc.RERANK_POOL == 10
+        # B-6 (S0F-88, R8): the cross-encoder runs on the GPU
         assert rc.RETRIEVER_ARGV["rerank"] == (
             "--retriever", "dense",
             "--reranker-model", rc.RERANKER_MODEL,
             "--rerank-pool", "10",
+            "--reranker-device", "cuda",
         )
         assert rc.RETRIEVER_ARGV["dense"] == (
             "--retriever", "dense", "--reranker-model", "none",
@@ -4312,6 +4343,7 @@ class TestSloFloorsProducerW4:
         # step env owns it; a shell export is refused on presence by 'run').
         assert rc.CELL_PIN_ENVS == (
             "CAGE_SLO_FLOORS_JSON", "CAGE_BUDGET_PLAN_JSON", "CAGE_TELEMETRY_ENDPOINTS",
+            "CAGE_KV_CEILING",  # S0F-88 review L2
         )
         assert rc.PD_TELEMETRY_ENDPOINTS_ENV == "CAGE_TELEMETRY_ENDPOINTS"
         assert rc.FLOOR_BUDGET_FRACTION == 1.5
@@ -4331,7 +4363,7 @@ class TestSloFloorsProducerW4:
         assert cal.budget_fraction == 1.5
         assert (cal.ttft_s, cal.tpot_s) == _CAL_FLOORS["vllm"]
         assert cal.n_requests == 30 and cal.statistic == "median"
-        assert cal.procedure_version == "cal-v2 (2026-09-30)"
+        assert cal.procedure_version == "cal-v3 (2026-10-12)"
         assert cal.lambda_star_label == "ESTIMATED"
         import hashlib as _hashlib
         assert cal.sha256 == _hashlib.sha256(path.read_bytes()).hexdigest()
@@ -4403,7 +4435,7 @@ class TestSloFloorsProducerW4:
 
     def test_header_records_the_floors_and_their_artifacts(self, plan_a, calibrations_a):
         cal = plan_a["calibration"]
-        assert cal["procedure_version"] == "cal-v2 (2026-09-30)"
+        assert cal["procedure_version"] == "cal-v3 (2026-10-12)"
         assert cal["budget_fraction"] == 1.5
         assert cal["registered_budget_fraction"] == 1.5
         assert cal["env"] == "CAGE_SLO_FLOORS_JSON"

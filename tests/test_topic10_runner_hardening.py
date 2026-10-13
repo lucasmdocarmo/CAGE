@@ -446,7 +446,9 @@ def test_j12_run_tests_default_path_is_local_pytest_no_cluster() -> None:
     assert "--with-cluster" in text and "CAGE_TESTS_WITH_CLUSTER" in text, (
         "GPU/cluster mode must be an explicit opt-in flag (J12)"
     )
-    assert "-m pytest tests/" in text, "the default path must run pytest"
+    # S0F-88 review H1: the default target is tests/, dropped only when an
+    # explicit tests/... path is passed (behavior pinned in test_s0f88_batch2)
+    assert "TARGET=(tests/)" in text and '-m pytest ${TARGET[@]+' in text, "the default path must run pytest"
     starts = [m.start() for m in re.finditer(r"manage_vllm_cluster\.py start", text)]
     assert len(starts) == 1, "expected exactly one gated cluster start"
     gate = text.index('if [ "$WITH_CLUSTER" = "1" ]')

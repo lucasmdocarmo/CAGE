@@ -55,7 +55,8 @@ planner_tests = _load("test_run_campaign_for_batch_c", REPO_ROOT / "tests" / "te
 
 MANIFESTS = {
     "squad_v2": REPO_ROOT / "data" / "manifests" / "squad_v2_50x3_seed42.json",
-    "qasper": REPO_ROOT / "data" / "manifests" / "qasper_50x3_seed42.json",
+    # S0F-88 U3: S0's qasper manifest serves 100-arrival pressure windows
+    "qasper": REPO_ROOT / "data" / "manifests" / "qasper_100x3_seed42.json",
 }
 CHARTER_DATASETS = ("squad_v2", "musique", "qasper")
 
@@ -202,6 +203,7 @@ class TestPreflight:
         r = rc.preflight_registration_check("a", floor_avg_seq_tokens="4779",
                                             query_manifests=MANIFESTS, charter_datasets=CHARTER_DATASETS)
         text = "\n".join(r["problems"])
+        # S0F-88 audit: the run projection scales to S1's n, so no projection blocker
         assert "hotpotqa" in text and "shortfall" in text and len(r["problems"]) == 2
 
     def test_the_anchor_shape_and_an_unknown_session_are_problems(self) -> None:

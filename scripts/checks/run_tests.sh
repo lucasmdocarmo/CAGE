@@ -70,4 +70,10 @@ else
   log "local mode: running pytest with NO GPU/cluster requirement (--with-cluster opts in)"
 fi
 
-"$PYTHON" -m pytest tests/ ${PYTEST_ARGS[@]+"${PYTEST_ARGS[@]}"}
+# S0F-88 review H1: explicit test paths run alone. A file argument used to run
+# the whole suite plus that file, so the stage 0 load gate ran every test.
+TARGET=(tests/)
+for a in ${PYTEST_ARGS[@]+"${PYTEST_ARGS[@]}"}; do
+  case "$a" in tests/*) TARGET=() ;; esac
+done
+"$PYTHON" -m pytest ${TARGET[@]+"${TARGET[@]}"} ${PYTEST_ARGS[@]+"${PYTEST_ARGS[@]}"}

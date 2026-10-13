@@ -99,8 +99,17 @@ class StubAdapter:
     def __init__(self, responses=None):
         self._responses = list(responses or [])
         self.calls = 0
+        self.flushes = 0
+        self.log = []  # "flush" / "generate", in order
+
+    def flush_cache(self):
+        # B-13 (S0F-88): every real adapter has the fail-closed flush; the
+        # floor flushes before each of its requests.
+        self.flushes += 1
+        self.log.append("flush")
 
     async def async_stream_generate(self, request, on_first_token=None):
+        self.log.append("generate")
         response = (
             self._responses[self.calls % len(self._responses)]
             if self._responses
@@ -173,10 +182,11 @@ class TestMeasureFloor:
     def test_floor_medians_from_streamed_telemetry(self, tmp_path: Path):
         # ttft 100 ms; tpot = (600-100)/(6-1) = 100 ms -> 0.1 s each.
         adapter = StubAdapter()
-        requests = cc.build_requests(str(_green_manifest(tmp_path)))
+        # S0F-88 B-13: the floor needs FLOOR_N_REQUESTS distinct prompts
+        requests = cc.build_requests(str(_green_manifest(tmp_path, n_blocks=FLOOR_N_REQUESTS)))
         floor = asyncio.run(cc.measure_floor(adapter, requests))
         assert isinstance(floor, FloorMeasurement)
-        assert adapter.calls == FLOOR_N_REQUESTS  # registered n, modulo-wrapped
+        assert adapter.calls == FLOOR_N_REQUESTS  # registered n, one per distinct prompt
         assert floor.n_requests == FLOOR_N_REQUESTS
         assert floor.ttft_s == pytest.approx(0.1)
         assert floor.tpot_s == pytest.approx(0.1)
@@ -187,13 +197,13 @@ class TestMeasureFloor:
 
     def test_error_response_fails_closed(self, tmp_path: Path):
         adapter = StubAdapter([_response(error="engine 500")])
-        requests = cc.build_requests(str(_green_manifest(tmp_path)))
+        requests = cc.build_requests(str(_green_manifest(tmp_path, n_blocks=FLOOR_N_REQUESTS)))
         with pytest.raises(CalibrationError, match="drop-nothing"):
             asyncio.run(cc.measure_floor(adapter, requests))
 
     def test_single_token_response_fails_closed(self, tmp_path: Path):
         adapter = StubAdapter([_response(num_tokens=1)])
-        requests = cc.build_requests(str(_green_manifest(tmp_path)))
+        requests = cc.build_requests(str(_green_manifest(tmp_path, n_blocks=FLOOR_N_REQUESTS)))
         with pytest.raises(CalibrationError, match=">= 2 generated tokens"):
             asyncio.run(cc.measure_floor(adapter, requests))
 
@@ -266,10 +276,12 @@ class TestMainReportContract:
         assert doc["procedure"] == {
             "floor_n_requests": FLOOR_N_REQUESTS,
             "floor_statistic": "median",
+            "floor_cold_per_request": True,  # S0F-88 B-13 (cal-v3)
             "probe_ladder_factor": PROBE_LADDER_FACTOR,
             "probe_window_s": PROBE_WINDOW_S,
             "probe_warmup_s": PROBE_WARMUP_S,
             "probe_attainment_min": PROBE_ATTAINMENT_MIN,
+            "probe_served_min": 0.9,  # S0F-88 B-2 (cal-v3)
             "probe_max_steps": PROBE_MAX_STEPS,
             "probe_bisect_steps": 2,  # ADR-0122
             "start_qps_rule": "floor-service-rate",  # ADR-0122
@@ -281,6 +293,8 @@ class TestMainReportContract:
         assert doc["floor"] == {
             "ttft_s": 0.1, "tpot_s": 0.02,
             "n_requests": FLOOR_N_REQUESTS, "statistic": "median",
+            # S0F-88 B-13: the direct-constructed floor carries no cold evidence
+            "n_distinct_prompts": None, "cached_tokens_max": None,
         }
         ls = doc["lambda_star"]
         assert ls["label"] == "ESTIMATED"
@@ -428,3 +442,21 @@ def test_main_derives_the_start_rung_from_the_floor_when_unset(tmp_path, monkeyp
     doc = json.loads(out_path.read_text(encoding="utf-8"))
     assert doc["start_qps"] == pytest.approx(expected)
     assert doc["start_qps_source"] == "floor-service-rate"
+
+
+def test_the_floor_flushes_the_cache_before_every_request_b13(tmp_path: Path):
+    """S0F-88 B-13 (owner ruling R2, per engine): the cal-v2 floor re-served
+    one cached calibration block 30 times (vLLM prefix hits 83 to 89 percent),
+    so its TTFT was a cached TTFT. Every floor request now starts cold."""
+    requests = cc.build_requests(str(_green_manifest(tmp_path, n_blocks=FLOOR_N_REQUESTS)))
+    adapter = StubAdapter()
+    asyncio.run(cc.measure_floor(adapter, requests))
+    assert adapter.flushes == FLOOR_N_REQUESTS == 30
+    assert adapter.log == ["flush", "generate"] * FLOOR_N_REQUESTS
+
+    class _NoFlush:
+        async def async_stream_generate(self, request, on_first_token=None):
+            return _response()
+
+    with pytest.raises(CalibrationError, match="cold"):
+        asyncio.run(cc.measure_floor(_NoFlush(), requests))

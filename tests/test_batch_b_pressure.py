@@ -29,6 +29,7 @@ from test_run_campaign import (  # noqa: E402
     _ANCHOR_DEMAND,
     _ANCHOR_SEQ_TOKENS,
     _RUNG_LAMBDA,
+    _RUNG_RULER_LAMBDA,
     _RUNG_SMALL_FACTOR,
     _cell_calls,
     _cells,
@@ -191,7 +192,7 @@ class TestRungArtifact:
             (lambda d: d.update(schema="cage-rung-calibration-v1"), "predates the second anchor"),
             (lambda d: d.update(classes=[]), "classes must be a mapping"),
             (lambda d: d["classes"].update({"349": dict(d["classes"]["348"], seq_tokens=349)}), "two 'smallest' entries"),
-            (lambda d: d["classes"]["348"].update(role="middle"), "must be 'anchor' or 'smallest'"),
+            (lambda d: d["classes"]["348"].update(role="middle"), "must be 'anchor', 'smallest', 'measured' or 'ruler'"),
             (lambda d: d["classes"]["348"].update(seq_tokens=347), "the integer >= 1 the key names"),
             (lambda d: d["classes"]["348"].update(arm=""), "must name the smallest class's arm"),
             (lambda d: d["classes"]["348"].update(prefix_mode="on"), "must be 'ON' or 'OFF'"),
@@ -317,9 +318,16 @@ class TestRungRegistration:
         with pytest.raises(rc.PlanError, match=r"alpha -\d\.\d+ < 0"):
             self._build(floor_table, calibrations_a, slower)
         # a pure request cap (equal rates, alpha 0) is legal and interpolates flat
-        flat = _write_rung_calibrations(tmp_path / "flat", ("vllm", "sglang"), "a", rungs, small=(348, "retr-trunc"), small_factor=1.0)
+        # (ADR-0169: session a's RULER cells need the RULER ladder too for the plan to build)
+        flat = _write_rung_calibrations(
+            tmp_path / "flat", ("vllm", "sglang"), "a", rungs, small=(348, "retr-trunc"), small_factor=1.0,
+            ruler=_RUNG_RULER_LAMBDA,
+        )
         plan = self._build(floor_table, calibrations_a, flat)
         for s in _pressure_cells(plan):
+            if s["dataset"] == "ruler":  # ADR-0169: the instrument offers its own ladder's rate
+                assert s["lambda_star_rps"] == pytest.approx(_RUNG_RULER_LAMBDA * s["cellspec"]["budget_r"])
+                continue
             assert s["lambda_star_rps"] == pytest.approx(_RUNG_LAMBDA * s["cellspec"]["budget_r"])
 
     def test_cli_registers_and_refuses_malformed(self, tmp_path, floor_table, calibrations_a):
@@ -474,10 +482,11 @@ class TestDryWindowPlan:
             )
             assert following["lambda_star_rps"] == s["lambda_star_rps"]
             assert following["serving"] == s["serving"] and following["budget_plan"] == s["budget_plan"]
-            assert s["rate_frac"] == 0.95 and s["expected_label"] == "IN_REGIME"
-            assert s["offered_rate_rps"] == pytest.approx(0.95 * s["lambda_star_rps"])
+            # S0F-88 (owner 2026-10-12): the gate runs at 1.2 x lambda*
+            assert s["rate_frac"] == rc.DRY_WINDOW_RATE_FRAC == 1.2 and s["expected_label"] == "IN_REGIME"
+            assert s["offered_rate_rps"] == pytest.approx(1.2 * s["lambda_star_rps"])
             spec = rc.CellSpec.from_flat_dict(s["cellspec"])
-            assert spec.rate_frac == 0.95 and spec.to_row_key() == s["row_key"]
+            assert spec.rate_frac == 1.2 and spec.to_row_key() == s["row_key"]
             assert s["row_key"] != following["row_key"]
             argv = s["argv"]
             assert float(argv[argv.index("--rate") + 1]) == pytest.approx(s["offered_rate_rps"], rel=1e-5)
@@ -488,7 +497,7 @@ class TestDryWindowPlan:
             assert "--arrival-count" not in argv and "--open-loop-warmup-s" not in argv
             assert s["duration_s"] == rc.DRY_WINDOW_DURATION_S == PROBE_WINDOW_S and s["replay"] is True
             assert s["env"][rc.LADDER_REPLAY_ENV] == "1"
-            assert s["env"]["CAGE_CELL_RATE_FRAC"] == "0.95"
+            assert s["env"]["CAGE_CELL_RATE_FRAC"] == "1.2"
             assert "CAGE_WINDOW_ORDINAL_BASE" not in s["env"]
             assert s["windows"] == 1 and s["gate"] and s["adr"] == "ADR-0153"
             # the preceding relaunch is the class's budgeted one
@@ -501,7 +510,7 @@ class TestDryWindowPlan:
     def test_header(self, plan_a):
         header = plan_a["dry_window"]
         assert header["adr"] == "ADR-0153" and header["finding"] == "S0F-61"
-        assert header["rate_frac"] == 0.95 and header["expected_label"] == "IN_REGIME"
+        assert header["rate_frac"] == 1.2 and header["expected_label"] == "IN_REGIME"
         assert header["root_suffix"] == "-dry" and header["exit_code"] == 3 and header["count"] == 19
 
     def test_dry_root_is_a_sibling_keyed_on_the_plan(self, plan_a):
@@ -621,7 +630,7 @@ class TestLoadPlanBatchB:
         [
             (lambda s: s.update(expected_label="UNPRESSURED"), "registered gate"),
             (lambda s: s.update(rate_frac=0.85), "registered gate"),
-            (lambda s: s["argv"].__setitem__(s["argv"].index("--rate") + 1, "99"), r"is not 0\.95 x"),
+            (lambda s: s["argv"].__setitem__(s["argv"].index("--rate") + 1, "99"), r"is not 1\.2 x"),
             (lambda s: s["argv"].__setitem__(s["argv"].index("--num-trials") + 1, "3"), "exactly one window"),
             (lambda s: s.update(row_key="tampered"), "not minted from its cellspec"),
             (lambda s: s["demand_class"].update(seq_tokens=1), "differs from its relaunch"),
@@ -674,7 +683,8 @@ class TestWindowSpans:
         for s in _cells(plan_a):
             if s["family"] not in PRESSURE:
                 assert s["window_span_s_expected"] is None and s["window_span_below_floor"] is None
-        assert rc.WINDOW_SPAN_FLOOR_S == PROBE_WARMUP_S == 10.0 and rc.TELEMETRY_SAMPLE_INTERVAL_S == 1.0
+        # Q-8 (S0F-88): the sampler ticks at 0.25 s (was 1.0 s)
+        assert rc.WINDOW_SPAN_FLOOR_S == PROBE_WARMUP_S == 10.0 and rc.TELEMETRY_SAMPLE_INTERVAL_S == 0.25
 
     def test_header_summarizes_the_executable_spans_per_class(self, plan_a):
         ws = plan_a["window_spans"]
@@ -756,13 +766,13 @@ class TestDryWindowRun:
         side = json.loads((dry_root / "dry_attempts" / f"{dry['row_key']}.01.json").read_text(encoding="utf-8"))
         assert side["label"] == "IN_REGIME" and side["ordinal"] == 1 and side["runner_exit"] == 0
         assert side["identity"] == rc.dry_window_identity(dry)
-        assert side["identity"]["offered_rate_rps"] == pytest.approx(0.95 * _RUNG_LAMBDA * 0.5)
+        assert side["identity"]["offered_rate_rps"] == pytest.approx(1.2 * _RUNG_LAMBDA * 0.5)
         (dry_call,) = _dry_calls(stub)
         assert dry_call["argv"][dry_call["argv"].index("--campaign-root") + 1] == str(dry_root)
         assert float(dry_call["argv"][dry_call["argv"].index("--rate") + 1]) == pytest.approx(
-            0.95 * _RUNG_LAMBDA * 0.5
+            1.2 * _RUNG_LAMBDA * 0.5
         )
-        assert dry_call["env"]["CAGE_CELL_RATE_FRAC"] == "0.95"
+        assert dry_call["env"]["CAGE_CELL_RATE_FRAC"] == "1.2"
         cell_calls = _cell_calls(stub)
         assert len(cell_calls) == 3  # F1 + the two F2 cells
         # order: the dry window ran before either pressure cell
@@ -815,6 +825,9 @@ class TestDryWindowRun:
         assert rc.run_plan(plan, root) == 1  # launch-failed cells
         assert _dry_calls(stub) == [] and _cell_calls(stub) == []
         for s in _cells(plan):
+            # S0F-88 U4: a later relaunch of a class whose dry window already
+            # failed is skipped; its cells still name the relaunch failure
+            # (Q-9, R15: a relaunch failure is a FAIL, never a dry-window skip)
             assert "reason=relaunch-failed" in _sentinel(root, s)
 
     def test_an_in_regime_attempt_is_reused_only_for_the_same_plan(self, tmp_path, floor_table, stub):
@@ -876,10 +889,147 @@ class TestDryWindowRun:
         monkeypatch.setenv("STUB_REGIME_LABEL", "UNKNOWN_TELEMETRY")
         assert rc.main(["run", "--plan", str(path), "--campaign-root", str(_run_root(tmp_path))]) == 3
 
+    def test_fail_fast_infra_stops_at_the_first_failed_relaunch(self, tmp_path, floor_table, stub, monkeypatch, capsys):
+        # Review 2026-10-13 B1 (S0 key RUN_FAIL_FAST=infra): the first failed
+        # relaunch ends the run; without it every relaunch is tried in turn.
+        plan = _stub_plan(_pressure_grid(), floor_table, stub.cmd)
+        monkeypatch.setenv("STUB_FAIL_MARKER", "restart")  # every relaunch fails
+        assert rc.run_plan(plan, _run_root(tmp_path / "ff"), fail_fast="infra") == 1
+        restarts = [c for c in stub.calls() if c["argv"][0] == "restart"]
+        assert len(restarts) == 1 and _cell_calls(stub) == []
+        out = capsys.readouterr().out
+        assert "FAIL FAST (infra): relaunch failed (exit 1) at step" in out and "step(s) not run after" in out
+        assert "[run_campaign] totals:" in out  # decision 3's PARTIAL route reads the totals
+        assert rc.run_plan(plan, _run_root(tmp_path / "walk"), fail_fast="off") == 1
+        # without the stop every relaunch not already skipped by U4 is tried: more than one
+        assert len([c for c in stub.calls() if c["argv"][0] == "restart"]) >= 1 + 2
+        with pytest.raises(rc.RunError, match="fail_fast must be"):
+            rc.run_plan(plan, _run_root(tmp_path / "bad"), fail_fast="sometimes")
+
+    def test_fail_fast_all_stops_at_the_first_failed_cell_but_infra_does_not(
+        self, tmp_path, floor_table, stub, monkeypatch, capsys
+    ):
+        plan = _stub_plan(_pressure_grid(), floor_table, stub.cmd)
+        # the first cell the run executes is the first F2 cell; its rate is its marker
+        first = next(s for s in plan["steps"] if s["kind"] == "cell" and s["family"] == "F2")
+        rate = first["argv"][first["argv"].index("--rate") + 1]
+        monkeypatch.setenv("STUB_FAIL_MARKER", f"--rate {rate}")
+        assert rc.run_plan(plan, _run_root(tmp_path / "all"), fail_fast="all") == 1
+        assert len(_cell_calls(stub)) == 1  # the failed cell, then the stop
+        assert "FAIL FAST (all): cell" in capsys.readouterr().out
+        # infra tier: a failed cell is a measured outcome, the run goes on
+        assert rc.run_plan(plan, _run_root(tmp_path / "infra"), fail_fast="infra") == 1
+        assert len(_cell_calls(stub)) == 1 + len(_cells(plan))
+
+    def test_a_resume_skips_a_relaunch_whose_segment_is_complete(self, tmp_path, floor_table, stub, capsys):
+        # Review 2026-10-13 C3: the second run of a complete plan starts no
+        # engine (18 SGLang relaunches were 1.3 h on attempt 4); a forced
+        # rerun starts them again.
+        plan = _stub_plan(_pressure_grid(), floor_table, stub.cmd)
+        root = _run_root(tmp_path)
+        assert rc.run_plan(plan, root) == 0
+        n_first = len([c for c in stub.calls() if c["argv"][0] == "restart"])
+        assert n_first == sum(1 for s in plan["steps"] if s["kind"] == "relaunch") > 0
+        capsys.readouterr()
+        # the stub runner writes no cell windows; a completed run leaves each
+        # window's metrics.json (count_complete_windows' sentinel): mark them
+        for s in _cells(plan):
+            for k in range(1, int(s["windows"]) + 1):
+                wdir = root / "cells" / s["row_key"] / f"window_{s['dataset']}-{k:02d}"
+                wdir.mkdir(parents=True, exist_ok=True)
+                (wdir / "metrics.json").write_text("{}", encoding="utf-8")
+        dry_root = rc.dry_window_root(root, plan)
+        incomplete = [(s["kind"], s.get("row_key")) for s in plan["steps"]
+                      if s["kind"] != "relaunch" and not rc._segment_step_complete(root, dry_root, s)]
+        assert incomplete == []
+        assert rc.run_plan(plan, root) == 0
+        assert len([c for c in stub.calls() if c["argv"][0] == "restart"]) == n_first  # no new restart
+        out = capsys.readouterr().out
+        assert out.count("(review 2026-10-13 C3)") == n_first and "skipped-complete" in out
+        assert rc.run_plan(plan, root, force_rerun=True) == 0
+        assert len([c for c in stub.calls() if c["argv"][0] == "restart"]) == 2 * n_first
+
+    def test_an_unknown_telemetry_dry_window_is_rerun_once_under_the_flag(
+        self, tmp_path, floor_table, stub, monkeypatch
+    ):
+        # Decision 10 (2026-10-13): UNKNOWN_TELEMETRY is a refused measurement,
+        # not a rate verdict; with --dry-window-telemetry-rerun the window runs
+        # again at the next ordinal, and the rerun's label counts.
+        plan = _stub_plan(_pressure_grid(), floor_table, stub.cmd)
+        monkeypatch.setenv("STUB_REGIME_LABEL_B0", "UNKNOWN_TELEMETRY")
+        monkeypatch.setenv("STUB_REGIME_LABEL_B1", "IN_REGIME")
+        root = _run_root(tmp_path)
+        assert rc.run_plan(plan, root, dry_telemetry_rerun=True) == 0
+        assert len(_dry_calls(stub)) == 2
+        dry_root = rc.dry_window_root(root, plan)
+        (dry,) = [s for s in plan["steps"] if s["kind"] == "dry_window"]
+        for ordinal, label in ((1, "UNKNOWN_TELEMETRY"), (2, "IN_REGIME")):
+            side = json.loads((dry_root / "dry_attempts" / f"{dry['row_key']}.{ordinal:02d}.json").read_text(encoding="utf-8"))
+            assert side["label"] == label and side["ordinal"] == ordinal
+        assert [c["env"]["CAGE_CELL_FAMILY"] for c in _cell_calls(stub)].count("F2") == 2  # the pressure cells ran
+        # a second UNKNOWN_TELEMETRY (one rerun only) still fails the dry window
+        monkeypatch.setenv("STUB_REGIME_LABEL_B1", "UNKNOWN_TELEMETRY")
+        monkeypatch.setenv("STUB_REGIME_LABEL_B2", "IN_REGIME")
+        root2 = _run_root(tmp_path / "second")
+        assert rc.run_plan(plan, root2, dry_telemetry_rerun=True) == rc.EXIT_DRY_WINDOW_FAILED
+        # without the flag (a registered run) the first label counts, as before
+        monkeypatch.delenv("STUB_REGIME_LABEL_B1"); monkeypatch.delenv("STUB_REGIME_LABEL_B2")
+        root3 = _run_root(tmp_path / "third")
+        assert rc.run_plan(plan, root3) == rc.EXIT_DRY_WINDOW_FAILED
+
 
 # ---------------------------------------------------------------------------
 # calibrate-rungs (ADR-0154): the cal-v2 ladder through the runner
 # ---------------------------------------------------------------------------
+
+
+def _seg(engine, **relaunch):
+    step = {"kind": "relaunch", "engine": engine, "prefix_mode": "OFF", "budget_r": 0.5}
+    step.update(relaunch)
+    return step
+
+
+def _cell(engine, dataset="qasper", family="F2", arm="gold-fresh", blocked=None):
+    return {"kind": "cell", "engine": engine, "dataset": dataset, "family": family,
+            "cellspec": {"arm": arm, "engine": engine}, "blocked_on": blocked}
+
+
+def test_front_load_puts_one_segment_of_each_first_contact_kind_first_a2():
+    # Review 2026-10-13 A2: whole relaunch segments move; the hf pre-block stays
+    # first; every other segment keeps its order; the relaunch count is unchanged.
+    hf = {"kind": "cell", "engine": "hf", "dataset": "qasper", "family": "F1", "cellspec": {"arm": "gold-fresh"}}
+    steps = [
+        hf,
+        _seg("sglang", budget_r=None), _cell("sglang", family="F1"),                               # 1 bf16 F1
+        _seg("sglang", kv_dtype="fp8"), {"kind": "dry_window", "engine": "sglang"}, _cell("sglang"),  # 2 fp8 pressure
+        _seg("sglang"), {"kind": "dry_window", "engine": "sglang"}, _cell("sglang", dataset="ruler"),  # 3 ruler pressure
+        _seg("sglang", budget_r=None), _cell("sglang", family="F1", arm="retr-comp"),             # 4 retr-comp F1
+        _seg("vllm", budget_r=None), _cell("vllm", family="F1"),                                   # 5
+        _seg("vllm", kv_dtype="fp8"), {"kind": "dry_window", "engine": "vllm"}, _cell("vllm"),       # 6 fp8 pressure
+        _seg("vllm", connector="lmcache"), {"kind": "dry_window", "engine": "vllm"}, _cell("vllm"),  # 7 lmcache
+        _seg("vllm"), _cell("vllm", dataset="ruler", blocked="x"),                                 # 8 blocked ruler: not a contact
+    ]
+    ordered, moved = rc.front_load_first_contacts(list(steps))
+    assert len(ordered) == len(steps) and ordered[0] is hf
+    assert [m["kind"] for m in moved] == [
+        "fp8 start", "fp8 start", "lmcache start", "ruler pressure", "retr-comp closed loop"]
+    assert [m["engine"] for m in moved] == ["sglang", "vllm", "vllm", "sglang", "sglang"]
+    # "first pressure" of each engine was already picked by its fp8 segment (no double move);
+    # the vLLM ruler cell is blocked, so no vLLM ruler segment moves
+    relaunches = [s for s in ordered if s["kind"] == "relaunch"]
+    assert len(relaunches) == 8
+    assert [(r["engine"], r.get("kv_dtype"), r.get("connector")) for r in relaunches[:5]] == [
+        ("sglang", "fp8", None), ("vllm", "fp8", None), ("vllm", None, "lmcache"), ("sglang", None, None), ("sglang", None, None)]
+    # the rest keep their original order
+    tail = [(r["engine"], r.get("budget_r")) for r in relaunches[5:]]
+    assert tail == [("sglang", None), ("vllm", None), ("vllm", 0.5)]
+    # every segment travels whole: each dry window still follows its relaunch
+    for i, s in enumerate(ordered):
+        if s["kind"] == "dry_window":
+            assert ordered[i - 1]["kind"] == "relaunch" and ordered[i - 1]["engine"] == s["engine"]
+    # a plan with no first contact moves nothing
+    plain, moved2 = rc.front_load_first_contacts([hf, _seg("vllm", budget_r=None), _cell("vllm", family="F1")])
+    assert moved2 == [] and [s["kind"] for s in plain] == ["cell", "relaunch", "cell"]
 
 
 class FakeWorld:
@@ -890,10 +1040,23 @@ class FakeWorld:
 
     def __init__(
         self, cap: float, *, relaunch_rc: int = 0, write_rows: bool = True, regime: str = "IN_REGIME",
-        cap_by_arm: Optional[Dict[str, float]] = None,
+        cap_by_arm: Optional[Dict[str, float]] = None, ruler_cap: Optional[float] = None,
+        ruler_floor: Tuple[float, float] = (2.3, 0.018), ruler_floor_loaded: bool = False,
+        ruler_floor_unloaded_rows: Optional[int] = None, ruler_floor_refusals: int = 0,
     ):
+        # review 2026-10-13 (ADR-0169 LOW 4): exactly this many unloaded rows in a
+        # floor window (the rest loaded), and this many floor windows that the
+        # runner "refuses" (exit 1, no rows) before one succeeds
+        self.ruler_floor_unloaded_rows = ruler_floor_unloaded_rows
+        self.ruler_floor_refusals = ruler_floor_refusals
         self.cap = cap
         self.cap_by_arm = dict(cap_by_arm or {})  # ADR-0156: a class's own capacity
+        # ADR-0169: the RULER instrument's capacity (dataset ruler windows) and the
+        # floor its floor window reports (ttft_s, tpot_s); ``ruler_floor_loaded``
+        # sends every floor row with other requests in flight (no unloaded row)
+        self.ruler_cap = ruler_cap
+        self.ruler_floor = ruler_floor
+        self.ruler_floor_loaded = ruler_floor_loaded
         self.relaunch_rc = relaunch_rc
         self.write_rows = write_rows
         self.regime = regime
@@ -919,17 +1082,45 @@ class FakeWorld:
             model=argv[argv.index("--model") + 1],
             env=env,
         )
-        wdir = root / "cells" / spec.to_row_key() / f"window_{argv[argv.index('--dataset') + 1]}-01"
+        dataset = argv[argv.index("--dataset") + 1]
+        wdir = root / "cells" / spec.to_row_key() / f"window_{dataset}-01"
         wdir.mkdir(parents=True)
+        if "--arrival-count" in argv:
+            # ADR-0169: the RULER floor window (W arrivals, no duration); every
+            # row carries the dispatcher's in-flight count and its clocks
+            count = int(argv[argv.index("--arrival-count") + 1])
+            if self.ruler_floor_refusals > 0:
+                self.ruler_floor_refusals -= 1
+                return 1  # the runner refused the floor window before any row
+            ttft_s, tpot_s = self.ruler_floor
+            unloaded = (
+                self.ruler_floor_unloaded_rows if self.ruler_floor_unloaded_rows is not None
+                else (0 if self.ruler_floor_loaded else count)
+            )
+            rows = [
+                {"arrival_s": k / rate, "ok": True, "example_id": f"f{k}", "num_tokens": 10,
+                 "in_flight_at_send": 1 if k < unloaded else 3,
+                 "ttft_from_send_ms": ttft_s * 1000.0, "tpot_ms": tpot_s * 1000.0,
+                 "scheduled_ts": 1000.0 + k / rate, "completion_ts": 1000.0 + k / rate + ttft_s}
+                for k in range(count)
+            ]
+            (wdir / "requests.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+            return 0
         n = max(1, round(rate * PROBE_WINDOW_S))
         cap = self.cap_by_arm.get(env.get("CAGE_CELL_ARM", ""), self.cap)
+        if dataset == "ruler" and self.ruler_cap is not None:
+            cap = self.ruler_cap  # ADR-0169: the instrument's own capacity
         ok_share = min(1.0, cap / rate)
         # the runner's Jain trim drops the warmup rows; attainment over the
         # KEPT rows is exactly min(1, cap / rate) up to one row
         kept = [i * PROBE_WINDOW_S / n for i in range(n) if i * PROBE_WINDOW_S / n >= PROBE_WARMUP_S]
         n_ok = round(len(kept) * ok_share)
+        # S0F-88 B-2 (cal-v3): every real row carries the dispatcher clocks
+        # (RequestRecord.to_row); an ok request completes at its arrival
+        # here, so the in-window served ratio equals the modeled attainment.
         rows = [
-            {"arrival_s": arrival, "ok": k < n_ok, "example_id": f"q{k}"}
+            {"arrival_s": arrival, "ok": k < n_ok, "example_id": f"q{k}",
+             "scheduled_ts": 1000.0 + arrival, "completion_ts": 1000.0 + arrival}
             for k, arrival in enumerate(kept)
         ]
         (wdir / "requests.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
@@ -1117,9 +1308,49 @@ class TestCalibrateRungs:
         assert {rec["label"] for rec in doc["rungs"].values()} == {rc.RUNG_LABEL_PROBE_FAILED}
         for rec in doc["rungs"].values():
             assert "wrote no" in rec["error"] and rec["steps"] == [] and rec["lambda_star_qps"] is None
-        assert len(world.runner_calls()) == 2  # one window attempt per rung
+        # one window attempt per rung plus its retry (review 2026-10-13 item 3)
+        assert len(world.runner_calls()) == 2 * (1 + rc.LADDER_WINDOW_RETRIES)
         # the second rung restarts from the floor start (no previous lambda*)
         assert doc["rungs"]["0.5"]["start_qps"] == doc["rungs"]["1"]["start_qps"]
+
+    def test_fail_fast_stops_the_ladder_at_the_first_rung_that_is_not_estimated(self, tmp_path):
+        # Review 2026-10-13 item 3 (S0F-77): a dead runner fails the first rung;
+        # with fail_fast the second rung is never walked, the document is
+        # incomplete and names the stop; without it every rung is walked.
+        world = FakeWorld(cap=6.0, write_rows=False)
+        doc = _calibrate(tmp_path / "ff", world, _pressure_grid(), fail_fast=True)
+        assert list(doc["rungs"]) == ["1"] and doc["rungs"]["1"]["label"] == rc.RUNG_LABEL_PROBE_FAILED
+        assert doc["complete"] is False and doc["fail_fast_stop"] == "anchor r=1: PROBE_FAILED"
+        # one window plus its one retry (item 3), then the stop
+        assert len(world.runner_calls()) == 1 + rc.LADDER_WINDOW_RETRIES
+        assert world.verbs()[-1] == "stop"
+        walked = _calibrate(tmp_path / "walk", FakeWorld(cap=6.0, write_rows=False), _pressure_grid())
+        assert list(walked["rungs"]) == ["1", "0.5"] and walked["fail_fast_stop"] is None and walked["complete"] is True
+
+    def test_a_window_that_dies_once_is_retried_at_a_fresh_root_and_the_rung_estimates(self, tmp_path):
+        # Review 2026-10-13 item 3: one dead window used to label the rung
+        # PROBE_FAILED; it is retried once, and the rung measures normally.
+        class _DiesOnce(FakeWorld):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self.died = 0
+
+            def __call__(self, argv, env):
+                if "--campaign-root" in argv and self.died == 0:
+                    self.died += 1
+                    self.calls.append((list(argv), dict(env)))
+                    return 1  # the runner died before writing rows
+                return super().__call__(argv, env)
+
+        world = _DiesOnce(cap=6.0)
+        doc = _calibrate(tmp_path, world, _pressure_grid())
+        assert {rec["label"] for rec in doc["rungs"].values()} == {"ESTIMATED"}
+        steps = doc["rungs"]["1"]["steps"]
+        assert steps[0]["phase"] == "ladder" and steps[0]["attempt"] == 2  # the retry's record
+        assert all(s["attempt"] == 1 for s in steps[1:]) and len(world.runner_calls()) == 1 + sum(
+            len(r["steps"]) for r in doc["rungs"].values())
+        roots = {s["root"] for s in doc["rungs"]["1"]["steps"]}
+        assert len(roots) == len(doc["rungs"]["1"]["steps"])  # the retry took a fresh root
 
     def test_none_sustainable_and_ladder_exhausted(self, tmp_path):
         tiny = _calibrate(tmp_path / "tiny", FakeWorld(cap=0.01), _pressure_grid(), rungs=(1.0,))
@@ -1318,7 +1549,7 @@ kept = [i * 75.0 / n for i in range(n) if i * 75.0 / n >= 10.0]
 n_ok = round(len(kept) * share)
 with open(os.path.join(wdir, "requests.jsonl"), "w", encoding="utf-8") as fh:
     for k, t in enumerate(kept):
-        fh.write(json.dumps({"arrival_s": t, "ok": k < n_ok}) + "\\n")
+        fh.write(json.dumps({"arrival_s": t, "ok": k < n_ok, "scheduled_ts": 1000.0 + t, "completion_ts": 1000.0 + t}) + "\\n")
 sys.exit(0)
 """.replace("__REPO_ROOT__", repr(str(rc.REPO_ROOT)))
 
@@ -1386,3 +1617,276 @@ class TestCalibrateRungsCli:
         assert doc["rungs"]["0.5"]["label"] == "ESTIMATED"
         assert doc["classes"]["348"]["rungs"]["0.5"]["label"] == "NONE_SUSTAINABLE"
         assert "smallest 348 tokens r=0.5" in capsys.readouterr().err
+
+
+def test_all_classes_ladders_each_mid_class_at_its_pressure_rungs_b9(tmp_path):
+    """S0F-88 B-9 (owner ruling R5): with --all-classes a class between the
+    smallest and the anchor gets its own ladder at its pressure rungs, and the
+    plan offers it a fraction of THAT lambda*, never the interpolation."""
+    grid = _tiny_grid(
+        f1_baselines=("B1",), f2_baselines=("B1", "B6", "B11"), f2_budgets=(1.0, 0.5), f2_rates=(0.85,),
+    )
+    mid_cells = [c for c in rc.enumerate_cells(grid) if c.baseline_id == "B6" and c.spec.family == "F2"]
+    assert mid_cells
+    mid_arm = mid_cells[0].spec.arm
+    mid_seq = rc.demand_seq_tokens(grid, mid_cells[0].spec)
+    assert 348 < mid_seq < _ANCHOR_SEQ_TOKENS
+    world = FakeWorld(cap=6.0, cap_by_arm={"retr-trunc": 24.0, mid_arm: 12.0})
+    doc = _calibrate(tmp_path, world, grid, all_classes=True)
+    mid = doc["classes"][str(mid_seq)]
+    assert (mid["role"], mid["arm"], mid["baseline_id"]) == ("measured", mid_arm, "B6")
+    for key in ("1", "0.5"):
+        rec = mid["rungs"][key]
+        assert rec["label"] == "ESTIMATED"
+        assert rec["lambda_star_qps"] <= 12.0 / 0.9 * 1.01 and rec["first_unsustainable_qps"] >= 12.0 / 0.9 * 0.99
+        for s in rec["steps"]:
+            assert Path(s["root"]).name.startswith(f"cal-vllm-c{mid_seq}-r{key.replace('.', 'p')}-s")
+    cal = rc.load_rung_calibration(_write_doc(tmp_path, doc, "rungs_vllm.json"))
+    lam, basis, source = rc.rung_lambda_for_class(cal, 1.0, mid_seq, _ANCHOR_SEQ_TOKENS)
+    assert basis == rc.LAMBDA_BASIS_MEASURED and lam == mid["rungs"]["1"]["lambda_star_qps"]
+    assert source["alpha"] is None
+    # without --all-classes the mid class is interpolated, as before
+    plain = _calibrate(tmp_path / "plain", FakeWorld(cap=6.0, cap_by_arm={"retr-trunc": 24.0, mid_arm: 12.0}), grid)
+    assert all(c["role"] != "measured" for c in plain["classes"].values())
+    cal_plain = rc.load_rung_calibration(_write_doc(tmp_path / "plain", plain, "rungs_vllm.json"))
+    assert rc.rung_lambda_for_class(cal_plain, 1.0, mid_seq, _ANCHOR_SEQ_TOKENS)[1] == rc.LAMBDA_BASIS_INTERPOLATED
+
+
+def _prefix_on_grid():
+    """S0F-88 B-8: one prefix-ON pressure configuration (B2, F3 at r=0.5)."""
+    return _tiny_grid(
+        f1_baselines=("B1",), f3_baselines=("B2",), f3_budgets=(0.5,), f3_rates=(0.95,),
+    )
+
+
+def test_a_prefix_on_relief_runs_its_cells_and_any_other_label_still_fails_b8(
+    tmp_path, floor_table, stub, monkeypatch, capsys
+):
+    """S0F-88 B-8 (owner ruling R4): a prefix-ON configuration offers the OFF
+    twin's rate and budget; reading UNPRESSURED there is the measured relief,
+    so its pressure cells run. PAST_CLIFF on it still fails the class."""
+    plan = _stub_plan(_prefix_on_grid(), floor_table, stub.cmd)
+    (dry,) = _dry_steps(plan)
+    assert dry["serving"]["prefix_mode"] == "ON"
+    monkeypatch.setenv("STUB_REGIME_LABEL", "UNPRESSURED")
+    root = _run_root(tmp_path)
+    assert rc.run_plan(plan, root) == 0
+    assert "DRY WINDOW PREFIX RELIEF" in capsys.readouterr().out
+    assert sorted(c["env"]["CAGE_CELL_FAMILY"] for c in _cell_calls(stub)) == ["F1", "F3"]
+    assert all(_sentinel(root, s) == "" for s in _cells(plan))
+    monkeypatch.setenv("STUB_REGIME_LABEL", "PAST_CLIFF")
+    root2 = root.parent / "run-002"
+    assert rc.run_plan(plan, root2) == rc.EXIT_DRY_WINDOW_FAILED
+    assert any("reason=dry-window-PAST_CLIFF" in _sentinel(root2, s) for s in _cells(plan) if s["family"] == "F3")
+
+
+def test_a_prefix_off_unpressured_dry_window_still_fails_b8(tmp_path, floor_table, stub, monkeypatch):
+    """The relief rule is prefix-ON only: the anchor (prefix OFF) reading
+    UNPRESSURED still skips its class (ADR-0153 unchanged there)."""
+    plan = _stub_plan(_pressure_grid(), floor_table, stub.cmd)
+    monkeypatch.setenv("STUB_REGIME_LABEL", "UNPRESSURED")
+    assert rc.run_plan(plan, _run_root(tmp_path)) == rc.EXIT_DRY_WINDOW_FAILED
+
+
+# --------------------------------------------------------------------------- #
+# ADR-0169 (decision 5, 2026-10-13): the RULER instrument's own rate ladder
+# --------------------------------------------------------------------------- #
+
+
+def _ruler_grid():
+    """The anchor (B1 gold-fresh) on F2 with the RULER instrument paired on it
+    (ADR-0096), vLLM only; no class below the anchor."""
+    return _tiny_grid(
+        f1_baselines=("B1",), f2_baselines=("B1",), f2_budgets=(1.0, 0.5), f2_rates=(0.85,),
+        f2_ruler_baselines=("B1",), f2_ruler_tasks=("niah_multikey", "qa"),
+    )
+
+
+def _ruler_plan(tmp_path: Path, doc: Dict[str, Any], grid) -> Dict[str, Any]:
+    path = _write_doc(tmp_path, doc, "rungs_vllm.json")
+    floor = rc.load_floor_table(tmp_path / "ft.json")
+    orig = rc.SESSION_GRIDS
+    rc.SESSION_GRIDS = {"a": grid}
+    try:
+        return rc.build_plan(
+            "a", floor, window_duration_s=60.0,
+            calibrations={"vllm": tmp_path / "cal" / "calibration_vllm.json"},
+            rung_calibrations={"vllm": path},
+        )
+    finally:
+        rc.SESSION_GRIDS = orig
+
+
+class TestRulerLadder:
+    def test_ruler_ladder_starts_from_its_floor_and_the_plan_offers_its_own_lambda(self, tmp_path):
+        """The RULER ladder runs after the anchor's under the same relaunch, starts
+        from the floor window's unloaded rows, chains its own rungs, and the plan
+        offers RULER cells a fraction of THAT lambda* while the Qasper twin keeps
+        the anchor's (S0 attempt 4 offered the twin's 15.9 rps against 0.46 rps)."""
+        grid = _ruler_grid()
+        world = FakeWorld(cap=6.0, ruler_cap=0.4, ruler_floor=(2.3, 0.018))
+        doc = _calibrate(tmp_path, world, grid)
+        ruler = doc["classes"][str(rc.RULER_RATE_CLASS_TOKENS)]
+        assert (ruler["role"], ruler["arm"], ruler["baseline_id"], ruler["dataset"]) == (
+            rc.RULER_ROLE, "gold-fresh", "B1", "ruler",
+        )
+        assert ruler["ruler_task"] == "niah_multikey" and ruler["demand_seq_tokens"] == _ANCHOR_SEQ_TOKENS
+        assert ruler["seq_tokens"] == rc.RULER_RATE_CLASS_TOKENS == 32768
+        floor = ruler["floor"]
+        assert floor["ttft_s"] == pytest.approx(2.3) and floor["tpot_s"] == pytest.approx(0.018)
+        assert floor["n_requests"] == rc.RULER_FLOOR_ARRIVALS and floor["rate_qps"] == rc.RULER_FLOOR_RATE_QPS
+        expected_start = floor_start_qps(
+            FloorMeasurement(ttft_s=2.3, tpot_s=0.018, n_requests=12, statistic="median"),
+            max_tokens=rc.LADDER_START_DECODE_TOKENS,
+        )
+        assert ruler["rungs"]["1"]["start_qps"] == pytest.approx(expected_start)
+        assert "floor_start_qps of the RULER floor window" in ruler["rungs"]["1"]["start_basis"]
+        for key in ("1", "0.5"):
+            rec = ruler["rungs"][key]
+            assert rec["label"] == "ESTIMATED"
+            assert rec["lambda_star_qps"] <= 0.4 / 0.9 * 1.01 and rec["first_unsustainable_qps"] >= 0.4 / 0.9 * 0.99
+            assert rec["class"]["ruler_task"] == "niah_multikey" and rec["class"]["dataset"] == "ruler"
+            for s in rec["steps"]:
+                assert Path(s["root"]).name.startswith(f"cal-vllm-ruler-r{key.replace('.', 'p')}-s")
+        # the tighter rung chains from the RULER rung above it, never from the anchor's 6 rps
+        assert ruler["rungs"]["0.5"]["start_qps"] == pytest.approx(
+            ruler["rungs"]["1"]["lambda_star_qps"] / rc.LADDER_CHAIN_DIVISOR
+        )
+        # the anchor's ladder is untouched
+        for rec in doc["rungs"].values():
+            assert rec["label"] == "ESTIMATED" and rec["lambda_star_qps"] >= 6.0 / 0.9 * 0.9
+        # the floor window: W arrivals at the floor rate, the RULER flags, no duration
+        floors = [(a, e) for a, e in world.runner_calls() if "--arrival-count" in a]
+        assert len(floors) == 1
+        argv, env = floors[0]
+        assert argv[argv.index("--arrival-count") + 1] == str(rc.RULER_FLOOR_ARRIVALS)
+        assert float(argv[argv.index("--rate") + 1]) == pytest.approx(rc.RULER_FLOOR_RATE_QPS)
+        assert "--duration-s" not in argv and argv[argv.index("--dataset") + 1] == "ruler"
+        assert argv[argv.index("--ruler-task") + 1] == "niah_multikey"
+        assert Path(argv[argv.index("--campaign-root") + 1]).name == "cal-vllm-ruler-r1-s00"
+        assert env[rc.LADDER_REPLAY_ENV] == "1" and env["CAGE_CELL_ARM"] == "gold-fresh"
+        # every RULER ladder window is the RULER cell at the 75 s duration
+        ruler_windows = [a for a, _e in world.runner_calls() if a[a.index("--dataset") + 1] == "ruler" and "--duration-s" in a]
+        assert ruler_windows and all("--ruler-task" in a and a[a.index("--duration-s") + 1] == f"{PROBE_WINDOW_S:g}" for a in ruler_windows)
+        # order: the anchor's two rungs, then the RULER ladder's two rungs (four relaunches)
+        verbs = world.verbs()
+        assert verbs.count("restart") == 4
+        datasets = [a[a.index("--dataset") + 1] for a, _e in world.runner_calls()]
+        assert datasets.index("ruler") > max(i for i, d in enumerate(datasets) if d == "qasper")
+        # the plan: RULER cells offer a fraction of the RULER lambda*, the twin the anchor's
+        plan = _ruler_plan(tmp_path, doc, grid)
+        cal = rc.load_rung_calibration(_write_doc(tmp_path, doc, "rungs_vllm.json"))
+        ruler_steps = [s for s in _pressure_cells(plan) if s["dataset"] == "ruler"]
+        twins = {s["row_key"]: s for s in _pressure_cells(plan) if s["dataset"] == "qasper"}
+        assert len(ruler_steps) == 4  # 2 rungs x 2 tasks
+        for s in ruler_steps:
+            r = s["cellspec"]["budget_r"]
+            assert s["rate_basis"] == rc.LAMBDA_BASIS_RULER
+            assert s["lambda_star_rps"] == pytest.approx(cal.ruler_lambda_at(r))
+            assert s["offered_rate_rps"] == pytest.approx(0.85 * cal.ruler_lambda_at(r))
+            source = s["lambda_star_source"]
+            assert source["rate_class_seq_tokens"] == 32768 and source["seq_tokens_class"] == _ANCHOR_SEQ_TOKENS
+            assert source["adr"] == rc.RULER_RATE_ADR and source["gold_lambda_star_qps"] == pytest.approx(cal.lambda_at(r))
+            twin = twins[s["row_key"]]  # the pairing by row key holds (ADR-0096)
+            assert twin["lambda_star_rps"] == pytest.approx(cal.lambda_at(r)) and twin["rate_basis"] == rc.LAMBDA_BASIS_RUNG
+            assert twin["lambda_star_rps"] > 10 * s["lambda_star_rps"]
+        header = plan["rung_calibration"]["artifacts"]["vllm"]["ruler_class"]
+        assert header["seq_tokens"] == 32768 and header["floor"]["ttft_s"] == pytest.approx(2.3)
+
+    def test_a_loaded_floor_window_labels_the_rung_and_names_the_operator_start(self, tmp_path):
+        world = FakeWorld(cap=6.0, ruler_cap=0.4, ruler_floor_loaded=True)
+        doc = _calibrate(tmp_path, world, _ruler_grid(), fail_fast=True)
+        ruler = doc["classes"][str(rc.RULER_RATE_CLASS_TOKENS)]
+        rec = ruler["rungs"]["1"]
+        assert rec["label"] == rc.RUNG_LABEL_PROBE_FAILED and rec["lambda_star_qps"] is None
+        assert "unloaded ok rows" in rec["error"] and "--ruler-start-qps" in rec["error"]
+        assert ruler["floor"] is None and "0.5" not in ruler["rungs"]  # fail-fast stopped the ladder
+        assert doc["fail_fast_stop"].startswith(f"{rc.RULER_ROLE} r=1:") and doc["complete"] is False
+        # the anchor's rungs were measured before it
+        assert all(rec["label"] == "ESTIMATED" for rec in doc["rungs"].values())
+
+    def test_an_operator_start_skips_the_floor_window(self, tmp_path):
+        world = FakeWorld(cap=6.0, ruler_cap=0.4)
+        doc = _calibrate(tmp_path, world, _ruler_grid(), ruler_start_qps=0.3)
+        ruler = doc["classes"][str(rc.RULER_RATE_CLASS_TOKENS)]
+        assert not [a for a, _e in world.runner_calls() if "--arrival-count" in a]
+        assert ruler["floor"] is None and ruler["start_basis"] == "--ruler-start-qps 0.3 (operator)"
+        assert ruler["rungs"]["1"]["start_qps"] == pytest.approx(0.3)
+        assert all(rec["label"] == "ESTIMATED" for rec in ruler["rungs"].values())
+        with pytest.raises(rc.PlanError, match="--ruler-start-qps"):
+            _calibrate(tmp_path / "bad", FakeWorld(cap=6.0), _ruler_grid(), ruler_start_qps=0.0)
+
+    def test_the_plan_refuses_an_artifact_without_the_ruler_ladder(self, tmp_path):
+        """--anchor-only skips the RULER ladder; a plan with executable RULER
+        cells then refuses the artifact instead of offering the twin's rate."""
+        grid = _ruler_grid()
+        doc = _calibrate(tmp_path, FakeWorld(cap=6.0, ruler_cap=0.4), grid, anchor_only=True)
+        assert str(rc.RULER_RATE_CLASS_TOKENS) not in doc["classes"]
+        with pytest.raises(rc.PlanError, match="no ESTIMATED RULER lambda"):
+            _ruler_plan(tmp_path, doc, grid)
+        # a RULER rung that failed refuses the same way (never the twin's rate)
+        doc2 = _calibrate(tmp_path / "two", FakeWorld(cap=6.0, ruler_cap=0.4, ruler_floor_loaded=True), grid)
+        with pytest.raises(rc.PlanError, match=r"r=1 \(PROBE_FAILED\)"):
+            _ruler_plan(tmp_path / "two", doc2, grid)
+
+    def test_a_grid_without_ruler_cells_ladders_nothing_extra(self, tmp_path):
+        world = FakeWorld(cap=6.0, ruler_cap=0.4)
+        doc = _calibrate(tmp_path, world, _pressure_grid())
+        assert set(doc["classes"]) == {str(_ANCHOR_SEQ_TOKENS)}
+        assert not [a for a, _e in world.runner_calls() if "--arrival-count" in a]
+        assert world.verbs().count("restart") == 2
+
+    def test_the_loader_refuses_a_malformed_ruler_entry(self, tmp_path):
+        base = _calibrate(tmp_path, FakeWorld(cap=6.0, ruler_cap=0.4), _ruler_grid())
+        key = str(rc.RULER_RATE_CLASS_TOKENS)
+        bad = json.loads(json.dumps(base))
+        del bad["classes"][key]["demand_seq_tokens"]
+        with pytest.raises(rc.PlanError, match="demand_seq_tokens"):
+            rc.load_rung_calibration(_write_doc(tmp_path, bad, "bad1.json"))
+        two = json.loads(json.dumps(base))
+        two["classes"]["99999"] = {**two["classes"][key], "seq_tokens": 99999}
+        with pytest.raises(rc.PlanError, match="two 'ruler' entries"):
+            rc.load_rung_calibration(_write_doc(tmp_path, two, "bad2.json"))
+        floor = json.loads(json.dumps(base))
+        floor["classes"][key]["floor"] = {"ttft_s": -1.0, "tpot_s": 0.01}
+        with pytest.raises(rc.PlanError, match="floor must be null"):
+            rc.load_rung_calibration(_write_doc(tmp_path, floor, "bad3.json"))
+        cal = rc.load_rung_calibration(_write_doc(tmp_path, base, "ok.json"))
+        assert cal.ruler_seq_tokens == 32768 and cal.ruler_task == "niah_multikey"
+        assert cal.ruler_floor["ttft_s"] == pytest.approx(2.3) and cal.ruler_lambda_at(0.5) is not None
+
+    def test_a_refused_floor_window_is_retried_once_at_a_fresh_root(self, tmp_path):
+        """Review 2026-10-13 (ADR-0169 MEDIUM 1): a floor window with too few
+        unloaded rows (Poisson overlap, runner exit 0) or one the runner refused
+        is retried once at a fresh root; the second refusal labels the rung."""
+        # exit 1 then success: the floor lands at s01 and the rung estimates
+        world = FakeWorld(cap=6.0, ruler_cap=0.4, ruler_floor_refusals=1)
+        doc = _calibrate(tmp_path, world, _ruler_grid())
+        ruler = doc["classes"][str(rc.RULER_RATE_CLASS_TOKENS)]
+        floors = [a for a, _e in world.runner_calls() if "--arrival-count" in a]
+        assert len(floors) == 2
+        assert [Path(a[a.index("--campaign-root") + 1]).name for a in floors] == ["cal-vllm-ruler-r1-s00", "cal-vllm-ruler-r1-s01"]
+        assert ruler["floor"]["root"].endswith("cal-vllm-ruler-r1-s01") and ruler["rungs"]["1"]["label"] == "ESTIMATED"
+        # exit 0 with too few unloaded rows is retried the same way, and two refusals label the rung
+        # (fail-fast: without it a RULER rung that failed before any lambda* measures
+        # the floor again at the next rung, two more windows, as the docstring says)
+        few = FakeWorld(cap=6.0, ruler_cap=0.4, ruler_floor_unloaded_rows=rc.RULER_FLOOR_MIN_ROWS - 1)
+        doc2 = _calibrate(tmp_path / "few", few, _ruler_grid(), fail_fast=True)
+        assert len([a for a, _e in few.runner_calls() if "--arrival-count" in a]) == 2
+        assert doc2["classes"][str(rc.RULER_RATE_CLASS_TOKENS)]["rungs"]["1"]["label"] == rc.RUNG_LABEL_PROBE_FAILED
+        assert doc2["fail_fast_stop"].startswith(f"{rc.RULER_ROLE} r=1:")
+        # exactly the minimum of unloaded rows passes (LOW 4: the threshold)
+        enough = FakeWorld(cap=6.0, ruler_cap=0.4, ruler_floor_unloaded_rows=rc.RULER_FLOOR_MIN_ROWS)
+        doc3 = _calibrate(tmp_path / "enough", enough, _ruler_grid())
+        ruler3 = doc3["classes"][str(rc.RULER_RATE_CLASS_TOKENS)]
+        assert ruler3["floor"]["n_requests"] == rc.RULER_FLOOR_MIN_ROWS and ruler3["rungs"]["1"]["label"] == "ESTIMATED"
+
+    def test_the_plan_refuses_a_ruler_ladder_of_another_request_shape(self, tmp_path):
+        """Review 2026-10-13 (ADR-0169 LOW 3): the RULER entry must be SHAPE-32K."""
+        grid = _ruler_grid()
+        doc = _calibrate(tmp_path, FakeWorld(cap=6.0, ruler_cap=0.4), grid)
+        key = str(rc.RULER_RATE_CLASS_TOKENS)
+        odd = json.loads(json.dumps(doc))
+        odd["classes"]["16384"] = {**odd["classes"].pop(key), "seq_tokens": 16384}
+        with pytest.raises(rc.PlanError, match="request shape is 16384 tokens"):
+            _ruler_plan(tmp_path, odd, grid)

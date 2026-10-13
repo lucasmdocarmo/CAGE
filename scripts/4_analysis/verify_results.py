@@ -75,7 +75,14 @@ the first:
     (the 2026-10-08 landing: 2,450 of 2,450 SGLang rows, 2 tokens each); a
     window where half or more of the served rows carry it FAILs, fewer is a
     WARN, and the median ``num_tokens`` over served rows rides the accounting
-    (the landing's signature was a median of 2 against 4 to 29 on vLLM).
+    (the landing's signature was a median of 2 against 4 to 29 on vLLM);
+(o) served rows with no answer are named (ADR-0167, S0F-88 Q-3): a
+    requests.jsonl row without ``error`` whose ``empty_generation`` is true
+    (the generated text is empty or whitespace only) answered nothing and is
+    excluded downstream; a window where half or more of the served rows are
+    empty FAILs (the (n) share), fewer is a WARN (the attempt 4 landing
+    2026-10-11_0056: 52 served rows, 51 of them one space, in three HF
+    oracle cells, and this gate said nothing).
 
 ``--pilot --results-dir DIR`` preserves the pilot-era metrics-vs-CSV check
 (``verify_dir``) verbatim for pilot trees; that mode keeps writing its report
@@ -183,9 +190,11 @@ REPORT_MD_NAME = "verification_report.md"
 
 @dataclass(frozen=True)
 class Finding:
-    """One verification finding; ``FAIL`` findings flip the gate."""
+    """One verification finding; ``FAIL`` findings flip the gate. ``SKIP``
+    (Q-9, S0F-88) records a cell a failed dry window skipped whole: known
+    and explained, never a pass of the missing windows, never a FAIL."""
 
-    severity: Literal["FAIL", "WARN"]
+    severity: Literal["FAIL", "WARN", "SKIP"]
     check: str
     where: str
     detail: str
@@ -743,6 +752,82 @@ def _check_degenerate_output(
     return len(marked), median
 
 
+def _check_empty_output(
+    rows: list[dict[str, Any]], rel: str, findings: list[Finding]
+) -> None:
+    """Check (o), ADR-0167 (S0F-88 Q-3): served rows that answered nothing.
+    Keys on the producer's ``empty_generation`` flag, the field the §9.10
+    accounting counts, so the finding and the accounting cannot disagree."""
+    served = [row for row in rows if not row.get("error")]
+    empty = [row for row in served if row.get("empty_generation") is True]
+    if not empty:
+        return
+    share = len(empty) / len(served)
+    findings.append(
+        Finding(
+            "FAIL" if share >= _DEGENERATE_SHARE_FAIL else "WARN",
+            "empty-output",
+            rel,
+            f"{len(empty)} of {len(served)} served row(s) carry an empty or "
+            f"whitespace-only generated_answer (first: {empty[0].get('example_id')!r}): "
+            "the engine returned no answer, the row is excluded from every metric, "
+            "and the arm's served population shrinks (ADR-0167, S0F-88 Q-3)",
+        )
+    )
+
+
+def _check_ruler_native_rows(
+    rows: list[dict[str, Any]], rel: str, findings: list[Finding]
+) -> None:
+    """Check (p), ADR-0170 (charter D5#5): on a RULER window every served row
+    with an answer carries the instrument's native score (a finite number in
+    [0, 1]) and its task (one of the registered RULER tasks); a row scored
+    only by the QA path, or an unknown task, FAILs the window. Error and
+    empty-generation rows are outside the rule (absent stays absent)."""
+    from src.data.ruler import NATIVE_METRICS
+
+    scored = [
+        row for row in rows
+        if row.get("ok") is True and not row.get("error") and row.get("empty_generation") is not True
+    ]
+    missing: list[str] = []
+    bad_task: list[str] = []
+    for row in scored:
+        rid = str(row.get("example_id"))
+        score = row.get("ruler_native_score")
+        if (
+            isinstance(score, bool)
+            or not isinstance(score, (int, float))
+            or not math.isfinite(score)
+            or not 0.0 <= float(score) <= 1.0
+        ):
+            missing.append(rid)
+        if row.get("ruler_task") not in NATIVE_METRICS:
+            bad_task.append(rid)
+    if missing:
+        findings.append(
+            Finding(
+                "FAIL",
+                "ruler-native",
+                rel,
+                f"{len(missing)} of {len(scored)} served RULER row(s) carry no native score "
+                f"in [0, 1] (first: {missing[:3]}): the instrument is scored by its native "
+                "containment match per task, never by the QA F1 (ADR-0170, charter D5#5)",
+            )
+        )
+    if bad_task:
+        findings.append(
+            Finding(
+                "FAIL",
+                "ruler-native",
+                rel,
+                f"{len(bad_task)} of {len(scored)} served RULER row(s) carry no registered "
+                f"ruler_task (first: {bad_task[:3]}; registered: {sorted(NATIVE_METRICS)}): "
+                "per-task reporting needs the task on every row (ADR-0170)",
+            )
+        )
+
+
 def _check_regime(
     window_dir: Path, rel_window: str, engine: str | None, findings: list[Finding]
 ) -> str | None:
@@ -787,7 +872,7 @@ def _check_window(
     topology: str | None = None,
     engine: str | None = None,
 ) -> dict[str, Any]:
-    """Run checks (a)-(c), (i)-(n) + accounting (e) for one window; returns its summary.
+    """Run checks (a)-(c), (i)-(o) + accounting (e) for one window; returns its summary.
     ``topology`` and ``engine`` are the cell's (from its §2 dirname); a None
     topology skips (k), a None engine keeps (m) to recording the label."""
     rel_window = window_dir.relative_to(run_dir).as_posix()
@@ -901,6 +986,14 @@ def _check_window(
         if requests_rows is not None
         else (None, None)
     )
+
+    # (o) served rows with no answer (ADR-0167, S0F-88 Q-3).
+    if requests_rows is not None:
+        _check_empty_output(requests_rows, f"{rel_window}/requests.jsonl", findings)
+
+    # (p) the RULER instrument's native score on every served row (ADR-0170).
+    if requests_rows is not None and dataset == "ruler":
+        _check_ruler_native_rows(requests_rows, f"{rel_window}/requests.jsonl", findings)
 
     # (e) §9.10 exclusion accounting — absence is NOT zero: rows lacking any
     # validity field are counted as validity-unknown, never as valid.
@@ -1065,6 +1158,34 @@ def _walk_cells(
         except org.OrganizeError as exc:
             findings.append(Finding("FAIL", "layout", cell_rel, str(exc)))
 
+        skip_reasons = org.dry_window_skip_reasons(cell_dir)
+        if skip_reasons is not None:
+            findings.append(
+                Finding(
+                    "SKIP",
+                    "layout",
+                    cell_rel,
+                    "skipped whole by a failed dry window (ADR-0153; no cell.json, "
+                    "no window): " + "; ".join(skip_reasons),
+                )
+            )
+            continue
+        failed_reasons = org.sentinel_only_reasons(cell_dir)
+        if failed_reasons is not None:
+            # R15 (Q-9): a relaunch or runner failure is a FAIL, named by its
+            # reason rather than as "missing cell.json" (decision 3, 2026-10-13:
+            # a PARTIAL S0 tree is still verified, scored and analyzed).
+            findings.append(
+                Finding(
+                    "FAIL",
+                    "layout",
+                    cell_rel,
+                    "cell failed before any window (no cell.json, no window; "
+                    "owner ruling R15): " + "; ".join(failed_reasons),
+                )
+            )
+            continue
+
         meta: dict[str, Any] | None = None
         meta_path = cell_dir / org.CELL_META_NAME
         if not meta_path.is_file():
@@ -1224,6 +1345,22 @@ def verify_run(run_dir: Path) -> dict[str, Any]:
 
     accounting_rows = _walk_cells(run_dir, findings)
     ledger_summary = _check_ledger(run_dir, findings)
+    # S0F-88 audit (U5): files under cells/ outside the seal that pull_run.sh
+    # moved (never deleted) to the sibling <run>.stale/; named here, since the
+    # extra-file sweep of check (f) no longer sees them in the tree.
+    stale_list = run_dir.parent / f"{run_dir.name}.stale" / "STALE_FILES.txt"
+    if stale_list.is_file():
+        stale_names = [ln for ln in stale_list.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        findings.append(
+            Finding(
+                "WARN",
+                "ledger",
+                f"{run_dir.name}.stale/STALE_FILES.txt",
+                f"{len(stale_names)} file(s) under cells/ were outside the seal and pull_run.sh "
+                f"moved them out of the tree (first: {stale_names[:3]}): leftovers of a window "
+                "the run reset after a backup pass, or files added after sealing (S0F-88 U5)",
+            )
+        )
 
     # Task #119: the §8.5 predicate tables (predicate/<scoring_run_id>/) —
     # schema-guarded exactly like organize time (mirror-only rule, manifest
@@ -1266,6 +1403,7 @@ def verify_run(run_dir: Path) -> dict[str, Any]:
 
     n_fail = sum(1 for f in findings if f.severity == "FAIL")
     n_warn = sum(1 for f in findings if f.severity == "WARN")
+    n_skip = sum(1 for f in findings if f.severity == "SKIP")
     return {
         "verifier": "verify_results v2 (task #129)",
         "layout_authority": "docs/RESULTS_LAYOUT.md",
@@ -1274,6 +1412,7 @@ def verify_run(run_dir: Path) -> dict[str, Any]:
         "ok": n_fail == 0,
         "n_fail": n_fail,
         "n_warn": n_warn,
+        "n_skip": n_skip,
         "findings": [asdict(f) for f in findings],
         "accounting": {"per_window": accounting_rows, "totals": totals},
         "ledger": ledger_summary,
@@ -1288,7 +1427,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         f"- run: `{report['run_dir']}`",
         f"- verdict: **{'PASS' if report['ok'] else 'FAIL'}** "
-        f"({report['n_fail']} FAIL, {report['n_warn']} WARN)",
+        f"({report['n_fail']} FAIL, {report['n_warn']} WARN, "
+        f"{report.get('n_skip', 0)} SKIP)",
         f"- windows checked: {report['accounting']['totals']['n_windows']}",
         f"- ledger: "
         + (
@@ -1298,7 +1438,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         ),
         "",
     ]
-    for severity in ("FAIL", "WARN"):
+    for severity in ("FAIL", "WARN", "SKIP"):
         selected = [f for f in report["findings"] if f["severity"] == severity]
         lines.append(f"## {severity} findings ({len(selected)})")
         lines.append("")
@@ -1565,7 +1705,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     json_path, md_path = write_report(report, out_dir)
     verdict = "PASS" if report["ok"] else "FAIL"
-    print(f"[verify_results] {verdict}: {report['n_fail']} FAIL, {report['n_warn']} WARN")
+    print(f"[verify_results] {verdict}: {report['n_fail']} FAIL, {report['n_warn']} WARN, {report['n_skip']} SKIP")
     print(f"[verify_results] report : {json_path}")
     print(f"[verify_results] summary: {md_path}")
     return 0 if report["ok"] else 1

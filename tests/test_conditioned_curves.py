@@ -351,21 +351,49 @@ class TestRenderers:
                 config=fp.RhoOwnCurveConfig(metric="f1_score"),
             )
 
-    def test_rho_own_refuses_over_color_budget(self, tmp_path: Path) -> None:
-        # 9 distinct cells exceed the pinned 8-color colorblind-safe budget
-        # — the encoding refuses (I11: never silently truncate levels).
+    def test_rho_own_splits_a_panel_past_the_color_budget(self, tmp_path: Path) -> None:
+        # S0F-88 item 15: 9 cells of one (engine, family) exceed the pinned
+        # 8-color budget; the row splits into two labeled parts, nothing is
+        # truncated (I11) and nothing refuses (attempt 4's stage 13 died here).
         frames = []
         for i in range(9):
             frame = _rho_windows().iloc[[0]].copy()
             frame["row_key"] = f"arm{i}|bm25|none|single|vllm|m|F2|r0.5|lam0.9"
             frames.append(frame)
         curve = cc.quality_by_rho_own(pd.concat(frames, ignore_index=True))
-        with pytest.raises(ValueError, match="colorblind-safe budget"):
-            fp.plot_quality_vs_rho_own(
-                curve,
-                tmp_path / "x.png",
-                config=fp.RhoOwnCurveConfig(metric="f1_score"),
-            )
+        rows = fp._rho_panel_rows(sorted(curve["curve_key"].astype(str).unique()))
+        assert [label for label, _ in rows] == ["vllm F2 (part 1/2)", "vllm F2 (part 2/2)"]
+        assert [len(keys) for _, keys in rows] == [8, 1]
+        out = fp.plot_quality_vs_rho_own(
+            curve, tmp_path / "x.png", config=fp.RhoOwnCurveConfig(metric="f1_score")
+        )
+        assert out.is_file() and out.stat().st_size > 0
+
+    def test_rho_own_renders_attempt_5s_23_cells_faceted_by_engine_and_family(
+        self, tmp_path: Path
+    ) -> None:
+        # The attempt 5 plan carries 23 cell identities over two engines and
+        # two pressure families; one panel of them exceeded the budget.
+        frames = []
+        for i in range(23):
+            engine = "vllm" if i % 2 else "sglang"
+            family = "F2" if i % 3 else "F3"
+            frame = _rho_windows().iloc[[0]].copy()
+            frame["row_key"] = f"arm{i}|bm25|none|single|{engine}|m|{family}|r0.5|lam0.9"
+            frames.append(frame)
+        curve = cc.quality_by_rho_own(pd.concat(frames, ignore_index=True))
+        rows = fp._rho_panel_rows(sorted(curve["curve_key"].astype(str).unique()))
+        assert sum(len(keys) for _, keys in rows) == 23
+        assert all(len(keys) <= 8 for _, keys in rows)
+        assert [label for label, _ in rows] == ["sglang F2", "sglang F3", "vllm F2", "vllm F3"]
+        out = fp.plot_quality_vs_rho_own(
+            curve, tmp_path / "x.png", config=fp.RhoOwnCurveConfig(metric="f1_score")
+        )
+        assert out.is_file() and out.stat().st_size > 0
+
+    def test_rho_own_refuses_a_curve_key_without_the_seven_axes(self) -> None:
+        with pytest.raises(fp.FigureDataError, match="7 canonical axes"):
+            fp._rho_panel_rows(["rag|bm25|none"])
 
     def test_evidence_position_heatmap_renders(self, tmp_path: Path) -> None:
         curve = cc.quality_by_evidence_position(_evidence_trials())
@@ -502,6 +530,33 @@ def test_pass_emits_artifact_with_named_skips(tmp_path: Path) -> None:
     assert "conditioned_evidence_position_f1_score.png" in figure_files
     for name in figure_files:
         assert (analysis_dir / name).stat().st_size > 0
+
+
+def test_pass_records_a_failed_figure_and_still_writes_the_numbers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    # S0F-88 item 15: attempt 4's stage 13 died in one figure and wrote no
+    # numbers; a figure failure is now a recorded line, never a stop.
+    run_dir, index, analysis_dir = _pass_fixture(tmp_path)
+
+    def boom(*args, **kwargs):
+        raise ValueError("10 categorical levels exceed the 8-color colorblind-safe budget")
+
+    monkeypatch.setattr(rca.fp, "plot_quality_vs_rho_own", boom)
+    document = rca.run_conditioned_curves_pass(
+        run_dir, index, analysis_dir, "DESIGN-INPUT-ONLY",
+        blinding_active=False, metrics=("f1_score",),
+    )
+    assert document is not None and (analysis_dir / rca.CONDITIONED_CURVES_NAME).is_file()
+    assert document["quality_vs_rho_own"]["curve"]  # the numbers landed
+    (failed,) = [f for f in document["figures"] if "figure_error" in f]
+    assert failed["file"] == "conditioned_rho_own_f1_score.png"
+    assert failed["figure_error"].startswith("ValueError: 10 categorical levels")
+    assert "FIGURE FAILED conditioned_rho_own_f1_score.png" in capsys.readouterr().out
+    assert not (analysis_dir / "conditioned_rho_own_f1_score.png").exists()
+    # the other figure of the pass still rendered
+    assert any(f.get("file") == "conditioned_evidence_position_f1_score.png" and "figure_error" not in f
+               for f in document["figures"])
 
 
 def test_pass_suppressed_under_blinding(tmp_path: Path) -> None:

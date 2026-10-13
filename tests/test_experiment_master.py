@@ -114,7 +114,7 @@ case "$cmd" in
   pod)
     case "$sub" in
       list) echo "${CAGE_TEST_PODS:-[]}" ;;
-      get) echo "{\"id\": \"$3\", \"runtimeStatus\": \"${CAGE_TEST_RUNTIME:-running}\", \"desiredStatus\": \"RUNNING\"}" ;;
+      get) echo "{\"id\": \"$3\", \"runtimeStatus\": \"${CAGE_TEST_RUNTIME:-running}\", \"desiredStatus\": \"RUNNING\", \"memoryInGb\": 172}" ;;
       *) echo "{}" ;;
     esac ;;
   network-volume)
@@ -152,8 +152,12 @@ def world(tmp_path: Path) -> Dict[str, Path]:
     _w(b / "scp", FAKE_SCP)
     _w(b / "runpodctl", FAKE_RUNPODCTL)
     _w(b / "setsid", "#!/bin/sh\nexec \"$@\"\n")
-    # /metrics answers with the live names of 2026-10-07 (S0F-37); everything else is a silent 200
-    _w(b / "curl", "#!/bin/bash\ncase \"$*\" in *\"/metrics\"*) printf 'sglang:token_usage 0.1\\nsglang:num_retracted_reqs 0\\nsglang:num_running_reqs 0\\nsglang:num_queue_reqs 0\\nvllm:kv_cache_usage_perc 0.1\\n' ;; esac\nexit 0\n")
+    # P-2 (S0F-88): stage 2 compares the Mac HEAD with the packaged sha; the
+    # fake HEAD is the fake packager's sha unless a test moves it.
+    _w(b / "git", "#!/bin/bash\ncase \"$*\" in *\"rev-parse HEAD\"*) echo \"${CAGE_TEST_HEAD_SHA:-${CAGE_TEST_SHA:-0123456789abcdef0123456789abcdef01234567}}\" ;; *) exit 1 ;; esac\n")
+    # /metrics answers with the live names of 2026-10-07 (S0F-37), /server_info
+    # with SGLang's launch arguments (S0F-88 U7); everything else is a silent 200
+    _w(b / "curl", "#!/bin/bash\ncase \"$*\" in *\"/metrics\"*) printf 'sglang:token_usage 0.1\\nsglang:num_retracted_reqs 0\\nsglang:num_running_reqs 0\\nsglang:num_queue_reqs 0\\nvllm:kv_cache_usage_perc 0.1\\n' ;; *\"/server_info\"*) printf '{\"version\":\"0.5.10.post1\",\"enable_cache_report\":%s}\\n' \"${CAGE_TEST_CACHE_REPORT:-true}\" ;; esac\nexit 0\n")
     _w(b / "nvidia-smi", r'''
         #!/bin/bash
         case "$*" in
@@ -174,7 +178,7 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         ''')
 
     # --- the fake Mac-side scripts tree -----------------------------------
-    _w(fake_scripts / "checks" / "run_tests.sh", "#!/bin/bash\necho \"run_tests $*\" >> \"$CAGE_TEST_LOG\"; echo '4000 passed'; exit 0\n")
+    _w(fake_scripts / "checks" / "run_tests.sh", "#!/bin/bash\necho \"run_tests CAGE_LOAD_GATE=${CAGE_LOAD_GATE:-} $*\" >> \"$CAGE_TEST_LOG\"; case \"$*\" in *test_load_gate_p1*) echo \"${CAGE_TEST_LOAD_GATE_OUT:-1 passed}\" ;; *) echo '4000 passed' ;; esac; exit 0\n")
     _w(fake_scripts / "ops" / "package_repo.sh", r'''
         #!/bin/bash
         echo "package_repo $*" >> "$CAGE_TEST_LOG"
@@ -232,11 +236,13 @@ def world(tmp_path: Path) -> Dict[str, Path]:
             if session not in ("a", "b"):
                 raise PlanError(f"session {session!r} is not a registered grid")
             return _Grid(session)
-        def preflight_registration_check(session, *, floor_avg_seq_tokens, rehearsal_n=None, query_manifests=None, charter_datasets=(), floor_concurrency=None):
+        def preflight_registration_check(session, *, floor_avg_seq_tokens, rehearsal_n=None, query_manifests=None, charter_datasets=(), floor_concurrency=None, gpu_id=None):
             # gap triage 2026-10-09: the stage 0 registration preflight; two test knobs
             import os
             get_session_grid(session)
             problems = []
+            if not gpu_id:  # S0F-88 B-7: the master passes the profile's GPU_ID
+                problems.append("the master passed no GPU_ID to the pool ceiling check (S0F-88 B-7)")
             if str(floor_avg_seq_tokens).strip() != "4779":
                 problems.append(f"FLOOR_AVG_SEQ_TOKENS={floor_avg_seq_tokens} but session {session!r} registers 4779 served tokens for the anchor arm 'gold-fresh' (ADR-0155)")
             if os.environ.get("CAGE_TEST_PREFLIGHT_PROBLEMS"):
@@ -319,6 +325,8 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         ''')
     # the pod suite job runs `python -m pytest` inside the fake repo: one passing test (SUITE_ON_POD=1 worlds)
     _w(pr / "tests" / "test_pod_suite_ok.py", "def test_ok():\n    assert True\n", exe=False)
+    # P-1: the stage 4 live-load gate names its own file; a passing stand-in here
+    _w(pr / "tests" / "test_load_gate_p1.py", "def test_gate():\n    assert True\n", exe=False)
     _w(pr / "scripts" / "runpod" / "setup_runpod.sh", r'''
         #!/bin/bash
         echo "setup_runpod CHARTER_DATASETS=$CHARTER_DATASETS PREFETCH_MODELS=$PREFETCH_MODELS" >> "$CAGE_TEST_LOG"
@@ -338,7 +346,7 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         ''')
     for eng in ("vllm", "sglang", "lmdeploy"):
         # a start writes the realized-pool record the validate probes read (ADR-0142)
-        _w(pr / "scripts" / "2_serving" / f"manage_{eng}_server.sh", f"#!/bin/bash\necho \"launcher {eng} $*\" >> \"$CAGE_TEST_LOG\"; [ \"$1\" = start ] && {{ mkdir -p logs/{eng}; echo '{{}}' > logs/{eng}/CURRENT.kvpool.json; }}; echo \"{eng} $1 ok\"; exit 0\n")
+        _w(pr / "scripts" / "2_serving" / f"manage_{eng}_server.sh", f"#!/bin/bash\nextra=\"\"; [ -z \"${{VLLM_KV_CACHE_DTYPE:-}}${{SGLANG_KV_CACHE_DTYPE:-}}\" ] || extra=\" kv=${{VLLM_KV_CACHE_DTYPE:-}}${{SGLANG_KV_CACHE_DTYPE:-}}\"; [ -z \"${{LMCACHE_MAX_LOCAL_CPU_SIZE:-}}\" ] || extra=\"$extra store=${{LMCACHE_MAX_LOCAL_CPU_SIZE}}\"; echo \"launcher {eng} $*$extra\" >> \"$CAGE_TEST_LOG\"; case \"$1\" in start|restart) mkdir -p logs/{eng}; echo '{{}}' > logs/{eng}/CURRENT.kvpool.json; [ -n \"${{LMCACHE_MAX_LOCAL_CPU_SIZE:-}}\" ] && echo \"'max_local_cpu_size': ${{LMCACHE_MAX_LOCAL_CPU_SIZE}}.0,\" >> logs/{eng}/vllm_fake.log ;; esac; echo \"{eng} $1 ok\"; exit 0\n")
     _w(pr / "scripts" / "checks" / "preflight_check.sh", "#!/bin/bash\necho \"preflight $* BACKENDS=$CAGE_PREFLIGHT_BACKENDS\" >> \"$CAGE_TEST_LOG\"; echo 'PREFLIGHT PASS -- all Gate-2 components green.'; exit \"${CAGE_TEST_PREFLIGHT_RC:-0}\"\n")
     # S0F-59 (ADR-0151): the thinking pin probe, one per server engine at stage 4
     _w(pr / "scripts" / "checks" / "probe_thinking_pin.py", r'''
@@ -348,17 +356,37 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         backend = a[a.index("--backend") + 1]
         out = Path(a[a.index("--out") + 1]); out.parent.mkdir(parents=True, exist_ok=True)
         ok = os.environ.get("CAGE_TEST_THINKING_RC", "0") != "1"
+        # review 2026-10-13 A1: the stage 4 start check calls this probe with a
+        # start_check_<name> record; CAGE_TEST_START_CHECK_RC=1 fails those calls only
+        if "start_check_" in out.name and os.environ.get("CAGE_TEST_START_CHECK_RC") == "1":
+            ok = False
         out.write_text(json.dumps({"backend": backend, "ok": ok}), encoding="utf-8")
         with open(os.environ["CAGE_TEST_LOG"], "a", encoding="utf-8") as fh:
             fh.write(f"thinking_probe {backend} {a[a.index('--api-base') + 1]}\n")
         print(f"THINKING_PIN_OK backend={backend} num_tokens=3" if ok else f"THINKING_PIN_FAILED backend={backend} reason=test")
         sys.exit(0 if ok else 1)
         ''', exe=False)
+    # S0F-88 U2 (review H1): the pod memory probe on the LMCache path
+    _w(pr / "scripts" / "checks" / "probe_pod_memory.py", r'''
+        import os, sys
+        ok = os.environ.get("CAGE_TEST_POD_MEMORY_RC", "0") != "1"
+        print("POD_MEMORY_OK need_gib=22 available_gib=150.0 source=cgroup-v2" if ok else "POD_MEMORY_FAILED need_gib=172 available_gib=150.0 source=cgroup-v2")
+        sys.exit(0 if ok else 1)
+        ''', exe=False)
+    # S0F-88 B-6: the reranker device probe, once at stage 4 after the vLLM stop
+    _w(pr / "scripts" / "checks" / "probe_reranker_device.py", r'''
+        import os, sys
+        with open(os.environ["CAGE_TEST_LOG"], "a", encoding="utf-8") as fh:
+            fh.write("rerank_device_probe\n")
+        ok = os.environ.get("CAGE_TEST_RERANK_RC", "0") != "1"
+        print("RERANK_DEVICE_OK queries=50 identical=50 max_abs_score_diff=1e-06" if ok else "RERANK_DEVICE_FAILED reason=test")
+        sys.exit(0 if ok else 1)
+        ''', exe=False)
     _w(pr / "scripts" / "3_run" / "calibrate_cell.py", r'''
         import json, sys
         from pathlib import Path
         a = sys.argv[1:]; out = Path(a[a.index("--output") + 1]); out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps({"procedure_version": "cal-v2 (2026-09-30)", "start_qps_source": "floor-service-rate", "lambda_star": 2.5, "argv": a}), encoding="utf-8")
+        out.write_text(json.dumps({"procedure_version": "cal-v3 (2026-10-12)", "start_qps_source": "floor-service-rate", "lambda_star": 2.5, "argv": a}), encoding="utf-8")
         print("[calibrate] wrote", out); sys.exit(0)
         ''', exe=False)
     _w(pr / "scripts" / "3_run" / "run_campaign.py", r'''
@@ -373,7 +401,9 @@ def world(tmp_path: Path) -> Dict[str, Path]:
             if not os.environ.get("CAGE_PROVIDER") or not os.environ.get("CAGE_HARDWARE"):
                 print("campaign mode refused: CAGE_PROVIDER / CAGE_HARDWARE unset", file=sys.stderr); sys.exit(1)
             out = Path(a[a.index("--out") + 1]); out.parent.mkdir(parents=True, exist_ok=True)
-            fail = os.environ.get("CAGE_TEST_RUNGS_FAIL") == "1"
+            fail = os.environ.get("CAGE_TEST_RUNGS_FAIL") == "1" and (
+                not os.environ.get("CAGE_TEST_RUNGS_FAIL_ENGINE")
+                or os.environ.get("CAGE_TEST_RUNGS_FAIL_ENGINE") == a[a.index("--engine") + 1])
             label = "LADDER_EXHAUSTED" if fail else "ESTIMATED"
             rungs = {r: {"r": float(r), "label": label, "lambda_star_qps": None if fail else 3.0 * float(r)}
                      for r in a[a.index("--rungs") + 1].split(",")}
@@ -396,6 +426,13 @@ def world(tmp_path: Path) -> Dict[str, Path]:
                               {"kind": "cell", "cellspec": {"engine": "vllm", "topology": "single"}, "row_key": "k1", "argv": ["run_experiment.py", "--vllm-telemetry"]},
                               {"kind": "cell", "cellspec": {"engine": "hf", "topology": "single"}, "row_key": "k2", "argv": ["run_cag_reference.py"]}],
                     "blocked_row_keys": ["k9"] if os.environ.get("CAGE_TEST_BLOCKED") else []}
+            # S0F-88 B-5: the measured run projection the plan stage compares with HOURS
+            total = float(os.environ.get("CAGE_TEST_PROJECTION_S", "1200"))
+            plan["run_projection"] = {
+                "total_s": total, "total_h": round(total / 3600, 2), "source": "test",
+                "by_kind_s": {"relaunch": 60.0, "dry_window": 0.0, "cell": total - 60.0},
+                "unmeasured_steps": ["cell k3"] if os.environ.get("CAGE_TEST_UNMEASURED") else [],
+                "note": "test"}
             if os.environ.get("CAGE_TEST_BAD_PLAN"):
                 plan["steps"][1]["argv"] = ["run_experiment.py"]
             out.write_text(json.dumps(plan), encoding="utf-8"); print("plan written"); sys.exit(0)
@@ -411,12 +448,21 @@ def world(tmp_path: Path) -> Dict[str, Path]:
             (root / "observability" / "serving_configs" / "x_vllm.json").write_text(json.dumps({"engine": "vllm", "gpu_memory_utilization": 0.9, "kv_pool_bytes_realized": 5713920000}), encoding="utf-8")
             print("env CAGE_RUN_ROOT=", os.environ.get("CAGE_RUN_ROOT"), "VLLM_START_TIMEOUT=", os.environ.get("VLLM_START_TIMEOUT"))
             print("run argv:", " ".join(a))
-            for bad in ("CAGE_SLO_FLOORS_JSON", "CAGE_ALLOW_STALE_INDEX", "VLLM_PORT"):
+            for bad in ("CAGE_SLO_FLOORS_JSON", "CAGE_ALLOW_STALE_INDEX", "VLLM_PORT", "CAGE_KV_CEILING"):
                 if bad in os.environ:
                     print(f"REFUSED: {bad} is set", file=sys.stderr); sys.exit(2)
             if os.environ.get("CAGE_TEST_RUN_DRY_FAILED"):
                 print("[run_campaign] DRY WINDOW FAILED: engine=vllm class=4779 tokens r=0.5 rate=2.85 rps expected IN_REGIME, label='UNPRESSURED'")
+                print("[run_campaign] totals: {'ok': 79, 'dry-window-failed': 14, 'skipped-dry-window': 28}")
                 sys.exit(3)
+            if os.environ.get("CAGE_TEST_RUN_CELL_FAILED"):
+                # decision 3 (2026-10-13): the run finished (totals printed) with a failed cell
+                print("  [               failed] gold-fresh|none|none|single|vllm|qwen3-14b|F1 (qasper)")
+                print("[run_campaign] totals: {'ok': 109, 'failed': 1}")
+                sys.exit(1)
+            if os.environ.get("CAGE_TEST_RUN_CRASH"):
+                print("Traceback (most recent call last):\n  boom", file=sys.stderr)
+                sys.exit(1)
             if os.environ.get("CAGE_TEST_RUN_STOP_FAILED"):
                 print("[run_campaign] STOP FAILED (exit 1, timeout): launcher=vllm")
                 if "--seal" in a: (root / "ledger.json").write_text("{}", encoding="utf-8")
@@ -621,7 +667,9 @@ def test_full_sequence_with_both_gos_lands_the_run(world: Dict[str, Path]) -> No
     for n in re.findall(r"\.cage_jobs/([A-Za-z0-9_.-]+)\.cmd", world["log"].read_text(encoding="utf-8")):
         if not names or names[-1] != n:
             names.append(n)
-    assert names == ["setup", "validate_vllm", "calibrate_vllm", "calibrate_rungs_vllm", "plan", "run", "score", "collect"]
+    # P-1 (S0F-88): stage 4 runs the live-load gate as its own pod job
+    # review 2026-10-13 A1: the stage 4 start check is one more pod job after the engine probes
+    assert names == ["setup", "load_gate", "validate_vllm", "start_check", "calibrate_vllm", "calibrate_rungs_vllm", "plan", "run", "score", "collect"]
     assert any("setup_runpod CHARTER_DATASETS=squad_v2 musique qasper PREFETCH_MODELS=Qwen/Qwen3-14B" in c for c in calls), \
         [c for c in calls if "setup" in c.lower()]
     assert any("preflight Qwen/Qwen3-14B http://localhost:8000 BACKENDS=vllm" in c for c in calls), \
@@ -782,8 +830,8 @@ def test_short_seatbelt_fails_stage_0_before_anything_bills(world: Dict[str, Pat
     world["profile"] = short
     proc = _master(world)
     assert proc.returncode == 1
-    # 1 + 25 + 60 + 150 (ADR-0154 rung calibration, 9,000 s) + 15 + 60 + 180 + 30 + 60
-    assert "SEATBELT=2h (120 min) is shorter than the 581 min the stages need" in proc.stdout
+    # 1 + 10 (S0F-88 load gate) + 25 + 60 + 150 (ADR-0154 rung calibration, 9,000 s) + 15 + 60 + 180 + 30 + 60
+    assert "SEATBELT=2h (120 min) is shorter than the 591 min the stages need" in proc.stdout
     assert not any("provision_pod" in c for c in _calls(world))
 
 
@@ -792,15 +840,16 @@ def test_shipped_profiles_cover_their_stage_bounds_and_name_registered_models() 
     cb = importlib.import_module("src.orchestration.cache_budget")
     for p in sorted((EXPDIR / "profiles").glob("S*.env")):
         proc = subprocess.run(["bash", "-c", f'set -a; source "{EXPDIR}/profiles/_common.env"; source "{p}"; '
-                               'printf "%s|%s|%s|%s|%s|%s|%s|%s|%s" "$MODEL_SLUG" "$SEATBELT" "$HOURS" "$SETUP_BOUND_MIN" "$ENGINES" "$CALIBRATE" "${SCORE_BOUND_MIN:-180}" "$CALIBRATE_RUNGS_BOUND_S" "$FLOOR_AVG_SEQ_TOKENS"'],
+                               'printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" "$MODEL_SLUG" "$SEATBELT" "$HOURS" "$SETUP_BOUND_MIN" "$ENGINES" "$CALIBRATE" "${SCORE_BOUND_MIN:-180}" "$CALIBRATE_RUNGS_BOUND_S" "$FLOOR_AVG_SEQ_TOKENS" "${SUITE_ON_POD:-0}"'],
                               capture_output=True, text=True, env=PROFILE_ENV)
-        slug, seatbelt, hours, setup_min, engines, calibrate, score_min, rungs_bound_s, floor_tokens = proc.stdout.split("|")
+        slug, seatbelt, hours, setup_min, engines, calibrate, score_min, rungs_bound_s, floor_tokens, suite_on_pod = proc.stdout.split("|")
         assert slug in cb.MODEL_KV, f"{p.name}: MODEL_SLUG={slug} is not in cache_budget.MODEL_KV {sorted(cb.MODEL_KV)}"
         # ADR-0155: every shipped profile sizes the floor table on the anchor shape
         assert floor_tokens == "4779", f"{p.name}: FLOOR_AVG_SEQ_TOKENS={floor_tokens} is not the registered anchor shape"
         n_srv = len([e for e in engines.split() if e != "hf"]); n_cal = len(calibrate.split())
-        need = (int(setup_min) + n_srv * 25 + n_cal * 60 + n_cal * int(rungs_bound_s) // 60 + 15 + int(hours) * 60
-                + int(score_min) + 30 + 60)
+        # S0F-88 review L4: plus the stage 4 load gate (10 min) and the pod suite (30 min when SUITE_ON_POD=1)
+        need = (int(setup_min) + 10 + (30 if suite_on_pod == "1" else 0) + n_srv * 25 + n_cal * 60
+                + n_cal * int(rungs_bound_s) // 60 + 15 + int(hours) * 60 + int(score_min) + 30 + 60)
         unit = seatbelt[-1]; n = int(seatbelt[:-1])
         have = n * 60 if unit == "h" else n if unit == "m" else n * 1440
         assert have >= need, f"{p.name}: SEATBELT={seatbelt} ({have} min) < {need} min needed"
@@ -829,6 +878,26 @@ def test_plan_audit_refuses_a_cell_without_telemetry(world: Dict[str, Path]) -> 
     assert proc.returncode == 1
     assert "vllm cell carries --vllm-telemetry 0 times: k1" in proc.stdout
     assert _state(world)["stages"]["plan"]["status"] == "failed"
+
+
+def test_the_plan_stage_refuses_a_run_projected_past_hours_and_prices_the_whole_pod_b5_p4(
+    world: Dict[str, Path],
+) -> None:
+    # S0F-88 B-5 (R9): the measured projection (1.5 h) exceeds HOURS=1
+    proc = _master(world, "--yes", "provision", CAGE_TEST_PROJECTION_S="5400")
+    assert proc.returncode == 1
+    assert "run projection (S0F-88 B-5): 1.50 h against the 1 h bound" in proc.stdout
+    assert "the projected run (1.50 h) exceeds HOURS=1" in proc.stdout
+    assert _state(world)["stages"]["plan"]["status"] == "failed"
+    # S0F-88 P-4: the cost estimate covers every stage bound (591 min), not HOURS alone
+    provision = [c for c in _calls(world) if "provision_pod" in c]
+    assert provision and all("--hours 9.8 " in c for c in provision)
+
+
+def test_the_plan_stage_refuses_a_step_without_a_measured_duration_b5(world: Dict[str, Path]) -> None:
+    proc = _master(world, "--yes", "provision", CAGE_TEST_UNMEASURED="1")
+    assert proc.returncode == 1
+    assert "1 plan step(s) have no measured duration (e.g. cell k3)" in proc.stdout
 
 
 def test_an_unexpected_teardown_exit_code_fails_stage_14(world: Dict[str, Path]) -> None:
@@ -861,7 +930,11 @@ def test_rung_calibration_job_feeds_the_plan(world: Dict[str, Path]) -> None:
     assert " start " not in cmd, "the job's relaunches are the plan's own; no engine start before it"
     plan_cmd = (world["home"] / ".cage_jobs" / "plan.cmd").read_text(encoding="utf-8")
     assert "--rung-calibration vllm=results/calibration/rungs_S1_vllm.json" in plan_cmd
-    assert "rung calibration (ADR-0154, ADR-0156): rungs 1,0.5 per engine on the anchor and the smallest class" in proc.stdout
+    # ADR-0169: the RULER instrument's ladder is named beside the two anchors
+    assert (
+        "rung calibration (ADR-0154, ADR-0156, ADR-0169): rungs 1,0.5 per engine on the anchor, "
+        "the RULER instrument (where registered) and the smallest class"
+    ) in proc.stdout
     fetched = world["exp_root"] / "S1" / DATE / "extras" / "calibration" / "rungs_S1_vllm.json"
     assert json.loads(fetched.read_text(encoding="utf-8"))["rungs"]["1"]["label"] == "ESTIMATED"
     calls = _calls(world)
@@ -903,6 +976,21 @@ def test_stage_4_proves_the_lmcache_import_when_the_plan_needs_it(world: Dict[st
     log = (world["exp_root"] / "S1" / DATE / "logs" / "setup" / "validate_vllm.log").read_text(encoding="utf-8")
     assert "LMCACHE_IMPORT_MISSING" in log and "PREFLIGHT PASS" in log
     assert not (world["home"] / ".cage_jobs" / "calibrate_vllm.cmd").exists(), "stage 5 must not run"
+
+
+def test_stage_4_refuses_a_pod_whose_own_memory_cannot_hold_the_lmcache_store(world: Dict[str, Path]) -> None:
+    # S0F-88 U2 (review H1): /proc/meminfo shows the host's memory inside a pod;
+    # the probe reads the container's cgroup, and its failure fails stage 4
+    proc = _master(world, "--yes", "provision", "--to", "validate", CAGE_TEST_NEEDS_LMCACHE="1",
+                   CAGE_TEST_LMCACHE_IMPORT_RC="0", CAGE_TEST_POD_MEMORY_RC="1")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "memory left to the pod container" in proc.stdout and "POD_MEMORY_FAILED" in proc.stdout
+    cmd = (world["home"] / ".cage_jobs" / "validate_vllm.cmd").read_text(encoding="utf-8")
+    assert "probe_pod_memory.py --need-gib" in cmd and "/proc/meminfo" not in cmd
+    ok = _master(world, "--from", "validate", "--redo", "--to", "validate", CAGE_TEST_NEEDS_LMCACHE="1",
+                 CAGE_TEST_LMCACHE_IMPORT_RC="0", CAGE_TEST_POD_MEMORY_RC="0")
+    assert ok.returncode == 0, ok.stdout[-3000:]
+    assert "POD_MEMORY_OK" in ok.stdout
 
 
 def test_stage_3_installs_lmcache_when_the_profile_opts_in(world: Dict[str, Path], tmp_path: Path) -> None:
@@ -947,6 +1035,192 @@ def test_run_exit_3_dry_window_failed_fails_the_stage_loudly(world: Dict[str, Pa
     st = _state(world)
     assert st["stages"]["run"]["status"] == "failed"
     assert any("exit 3: DRY WINDOW FAILED" in n for n in st["stages"]["run"]["notes"])
+
+
+def test_stage_4_starts_every_first_time_serving_configuration_once(world: Dict[str, Path], tmp_path: Path) -> None:
+    # Review 2026-10-13 A1 (items 29, 32): the fp8 starts, the LMCache start at
+    # the plan's store and the GPU reranker beside vLLM run once at stage 4.
+    two = tmp_path / "S1_two.env"
+    two.write_text(world["profile"].read_text(encoding="utf-8").replace('ENGINES="vllm hf"', 'ENGINES="vllm sglang hf"'), encoding="utf-8")
+    world["profile"] = two
+    proc = _master(world, "--yes", "provision", "--to", "validate")
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-1500:]
+    cmd = (world["home"] / ".cage_jobs" / "start_check.cmd").read_text(encoding="utf-8")
+    assert "SGLANG_KV_CACHE_DTYPE=fp8_e4m3 bash scripts/2_serving/manage_sglang_server.sh restart" not in cmd  # through one()
+    assert "one sglang_fp8_e4m3 sglang http://localhost:30000 manage_sglang_server.sh SGLANG_KV_CACHE_DTYPE=fp8_e4m3" in cmd
+    assert "one vllm_fp8 vllm http://localhost:8000 manage_vllm_server.sh VLLM_KV_CACHE_DTYPE=fp8" in cmd
+    assert "probe_reranker_device.py --out logs/rerank_device_probe_beside_vllm.json" in cmd
+    assert cmd.index("manage_vllm_server.sh restart") < cmd.index("rerank_device_probe_beside_vllm")
+    log = (world["exp_root"] / "S1" / DATE / "logs" / "setup" / "start_check.log").read_text(encoding="utf-8")
+    for marker in ("START_OK:sglang_fp8_e4m3", "START_OK:vllm_fp8", "START_OK:rerank_beside_vllm", "COMPUTE_APPS=0"):
+        assert marker in log, marker
+    assert "START_FAILED" not in log and _state(world)["stages"]["validate"]["status"] == "passed"
+    calls = _calls(world)
+    assert any("launcher sglang restart" in c and "kv=fp8_e4m3" in c for c in calls)
+    assert any("launcher vllm restart" in c and "kv=fp8" in c for c in calls)
+    if "LMCACHE_MAX_LOCAL_CPU_SIZE=" in cmd:  # the fake registration reports an LMCache plan
+        assert "START_OK:lmcache_store_" in log and any("store=22" in c for c in calls)
+
+
+def test_stage_4_start_check_fails_the_stage_when_a_first_time_start_fails(world: Dict[str, Path]) -> None:
+    # a first-time configuration that starts but does not serve fails stage 4,
+    # named, before calibration bills (the per-engine probes still pass)
+    proc = _master(world, "--yes", "provision", "--to", "validate", CAGE_TEST_START_CHECK_RC="1")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "START_FAILED:vllm_fp8" in proc.stdout
+    assert "did not start or serve (review 2026-10-13 A1)" in proc.stdout
+    assert _state(world)["stages"]["validate"]["status"] == "failed"
+    assert not (world["home"] / ".cage_jobs" / "calibrate_vllm.cmd").exists()
+
+
+def test_stage_5_resumes_per_engine_and_carries_the_fail_fast_and_timeout_knobs(
+    world: Dict[str, Path], tmp_path: Path
+) -> None:
+    # Review 2026-10-13 item 3 and item 21: an engine whose calibration and
+    # ladder passed on this pod and build is not rerun on the resume; the
+    # ladder job carries --fail-fast and CAGE_STEP_TIMEOUT_S, the run job the
+    # timeout and the dry-window rerun flag, when the profile sets them.
+    prof = tmp_path / "S1_knobs.env"
+    prof.write_text(world["profile"].read_text(encoding="utf-8").replace('ENGINES="vllm hf"', 'ENGINES="vllm sglang hf"').replace('CALIBRATE="vllm"', 'CALIBRATE="vllm sglang"')
+                    + "\nLADDER_FAIL_FAST=1\nSTEP_TIMEOUT_S=5400\nDRY_TELEMETRY_RERUN=1\nSEATBELT=72h\n", encoding="utf-8")
+    world["profile"] = prof
+    proc = _master(world, "--yes", "provision", "--to", "calibrate", CAGE_TEST_RUNGS_FAIL="1", CAGE_TEST_RUNGS_FAIL_ENGINE="sglang")
+    assert proc.returncode == 1, proc.stdout[-4000:]
+    st = _state(world)
+    assert st["stages"].get("calibrate", {}).get("status") == "failed", proc.stdout[-3000:] + proc.stderr[-1000:]
+    done_key = f"{st['pod']['id']}:{st['build']['sha']}"
+    assert st["calibration"]["cell_done"]["vllm"] == done_key and st["calibration"]["rungs_done"]["vllm"] == done_key
+    assert "rungs_done" not in st["calibration"] or "sglang" not in st["calibration"]["rungs_done"]
+    rungs_cmd = (world["home"] / ".cage_jobs" / "calibrate_rungs_vllm.cmd").read_text(encoding="utf-8")
+    assert " --fail-fast" in rungs_cmd and "CAGE_STEP_TIMEOUT_S=5400" in rungs_cmd
+    before = sum(1 for c in _calls(world) if "calibrate_rungs_vllm.cmd" in c or "calibrate_vllm.cmd" in c)
+    proc = _master(world, "--from", "calibrate", "--redo", "--to", "run")
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-1500:]
+    assert "calibrate_cell vllm already passed on this pod and build" in proc.stdout
+    assert "rung calibration vllm already passed on this pod and build" in proc.stdout
+    after = sum(1 for c in _calls(world) if "calibrate_rungs_vllm.cmd" in c or "calibrate_vllm.cmd" in c)
+    assert after == before  # vLLM's two jobs were not resubmitted
+    assert _state(world)["calibration"]["rungs_done"]["sglang"] == done_key
+    run_cmd = (world["home"] / ".cage_jobs" / "run.cmd").read_text(encoding="utf-8")
+    assert "CAGE_STEP_TIMEOUT_S=5400" in run_cmd and run_cmd.rstrip().endswith("--dry-window-telemetry-rerun")
+    assert "--fail-fast" not in run_cmd  # RUN_FAIL_FAST unset on this profile
+    plan_cmd = (world["home"] / ".cage_jobs" / "plan.cmd").read_text(encoding="utf-8")
+    assert "--front-load-first-contacts" not in plan_cmd  # FRONT_LOAD unset
+
+
+def test_stage_4_fails_when_the_sglang_server_does_not_report_cached_tokens(world: Dict[str, Path], tmp_path: Path) -> None:
+    # Review 2026-10-13 item 8 (U7 was pinned as text): /server_info answers
+    # enable_cache_report=false, stage 4 fails naming it, before calibration bills
+    two = tmp_path / "S1_two.env"
+    two.write_text(world["profile"].read_text(encoding="utf-8").replace('ENGINES="vllm hf"', 'ENGINES="vllm sglang hf"'), encoding="utf-8")
+    world["profile"] = two
+    proc = _master(world, "--yes", "provision", "--to", "validate", CAGE_TEST_CACHE_REPORT="false")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    # the probe sets rc=1 on CACHE_REPORT_OFF, so the job itself fails the
+    # stage and job_run prints the job's tail, which names the marker
+    assert "CACHE_REPORT_OFF" in proc.stdout and "stage validate FAILED" in proc.stdout
+    assert _state(world)["stages"]["validate"]["status"] == "failed"
+    assert not (world["home"] / ".cage_jobs" / "calibrate_vllm.cmd").exists()  # nothing billed past stage 4
+    log = (world["exp_root"] / "S1" / DATE / "logs" / "setup" / "failed")
+    assert any("CACHE_REPORT_OFF" in p.read_text(encoding="utf-8") for p in log.glob("validate_sglang_*.log"))
+
+
+def test_the_run_job_strips_an_exported_kv_ceiling_pin(world: Dict[str, Path]) -> None:
+    # Review 2026-10-13 item 8 (ADR-0166 L2 had no test): CAGE_KV_CEILING in
+    # the master's environment never reaches the run job (RUN_ENV_UNSET); the
+    # fake run refuses when it does
+    proc = _master(world, "--yes", "provision", "--to", "run", CAGE_KV_CEILING="0.9")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    run_cmd = (world["home"] / ".cage_jobs" / "run.cmd").read_text(encoding="utf-8")
+    assert "-u CAGE_KV_CEILING" in run_cmd
+    log = (world["exp_root"] / "S1" / DATE / "logs" / "runner" / "run.log").read_text(encoding="utf-8")
+    assert "REFUSED: CAGE_KV_CEILING is set" not in log and "run argv:" in log
+
+
+def test_the_front_load_and_run_fail_fast_keys_reach_the_plan_and_run_jobs(world: Dict[str, Path], tmp_path: Path) -> None:
+    # Review 2026-10-13 A2 and B1: S0 profile keys, carried as flags
+    prof = tmp_path / "S1_speed.env"
+    prof.write_text(world["profile"].read_text(encoding="utf-8") + "\nFRONT_LOAD=1\nRUN_FAIL_FAST=infra\n", encoding="utf-8")
+    world["profile"] = prof
+    proc = _master(world, "--yes", "provision", "--to", "run")
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-1500:]
+    plan_cmd = (world["home"] / ".cage_jobs" / "plan.cmd").read_text(encoding="utf-8")
+    assert " --front-load-first-contacts --out results/calibration/plan_" in plan_cmd
+    run_cmd = (world["home"] / ".cage_jobs" / "run.cmd").read_text(encoding="utf-8")
+    assert run_cmd.rstrip().endswith("--seal --fail-fast infra")
+
+
+def test_the_pod_memory_cloud_type_and_archive_dir_reach_their_consumers(world: Dict[str, Path], tmp_path: Path) -> None:
+    # Review 2026-10-13: item 2 (the pod's allocated memory recorded at readiness
+    # and passed to the stage 4 memory probe), item 24 (the profile's CLOUD_TYPE
+    # and PORTS reach the provisioner), item 17 (the archive dir reaches the
+    # backup daemon's start and stop).
+    prof = tmp_path / "S1_arch.env"
+    prof.write_text(world["profile"].read_text(encoding="utf-8") + "\nBACKUP_ARCHIVE_DIR=/workspace/backup-archives\nBACKUP_ARCHIVE_EVERY=3\n", encoding="utf-8")
+    world["profile"] = prof
+    proc = _master(world, "--yes", "provision", "--to", "run")
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-1500:]
+    st = _state(world)
+    assert st["pod"]["memory_gb"] == "172"
+    steps = world["exp_root"] / "S1" / DATE / "extras" / "steps"
+    (prov,) = [p for p in steps.glob("provision_*provision_pod_in*.log")]
+    assert "--cloud-type SECURE --ports 22/tcp" in prov.read_text(encoding="utf-8")
+    vllm_cmd = (world["home"] / ".cage_jobs" / "validate_vllm.cmd").read_text(encoding="utf-8")
+    if "probe_pod_memory.py" in vllm_cmd:  # the fake registration reports an LMCache plan
+        assert "probe_pod_memory.py --need-gib" in vllm_cmd and "--pod-gib 172" in vllm_cmd
+    calls = _calls(world)
+    assert any("gcs_backup_daemon.sh start" in c and "CAGE_BACKUP_ARCHIVE_DIR=/workspace/backup-archives CAGE_BACKUP_ARCHIVE_EVERY=3" in c for c in calls)
+
+
+def _partial_profile(world: Dict[str, Path], tmp_path: Path, *, rehearsal: bool = True) -> None:
+    text = world["profile"].read_text(encoding="utf-8") + "\nPARTIAL_TREE_OK=1\n"
+    if rehearsal:
+        text += "REHEARSAL_N=50\n"
+    prof = tmp_path / "S1_partial.env"
+    prof.write_text(text, encoding="utf-8")
+    world["profile"] = prof
+
+
+def test_a_failed_dry_window_passes_as_partial_and_is_sealed_under_the_s0_consent(
+    world: Dict[str, Path], tmp_path: Path
+) -> None:
+    # Decision 3 (2026-10-13): under PARTIAL_TREE_OK=1 on a rehearsal profile
+    # the run stage passes as PARTIAL, the seal runs, and the state records it.
+    _partial_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "seal", CAGE_TEST_RUN_DRY_FAILED="1")
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-1500:]
+    assert "[PARTIAL] run ended with exit 3 = DRY WINDOW FAILED" in proc.stdout
+    assert "PARTIAL tree accepted on the profile's PARTIAL_TREE_OK=1" in proc.stdout
+    assert "sealing a PARTIAL tree (exit 3: dry window(s) failed" in proc.stdout
+    st = _state(world)
+    assert st["stages"]["run"]["status"] == "passed" and st["stages"]["seal"]["status"] == "passed"
+    assert st["run"]["partial"].startswith("exit 3")
+    assert any("PARTIAL tree accepted" in n for n in st["stages"]["run"]["notes"])
+    assert any(".cage_jobs/seal.cmd" in c for c in _calls(world))
+
+
+def test_a_failed_cell_passes_as_partial_but_a_crash_still_fails(world: Dict[str, Path], tmp_path: Path) -> None:
+    # exit 1 with the run's totals line = failed cells (PARTIAL); exit 1 with
+    # no totals line = a crash, which fails the stage even with the consent.
+    _partial_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "run", CAGE_TEST_RUN_CELL_FAILED="1")
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-1500:]
+    assert "[PARTIAL] run ended with exit 1 = failed cell(s) or relaunch(es)" in proc.stdout
+    assert _state(world)["run"]["partial"].startswith("exit 1")
+    proc = _master(world, "--from", "run", "--redo", "--to", "run", CAGE_TEST_RUN_CRASH="1")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "[FAIL] run ended" in proc.stdout and _state(world)["stages"]["run"]["status"] == "failed"
+
+
+def test_the_partial_consent_is_refused_on_a_registered_profile_before_anything_bills(
+    world: Dict[str, Path], tmp_path: Path
+) -> None:
+    _partial_profile(world, tmp_path, rehearsal=False)
+    proc = _master(world, "--yes", "provision", "--to", "run")
+    assert proc.returncode == 1
+    assert "PARTIAL_TREE_OK=1 on a registered run (REHEARSAL_N empty)" in proc.stdout
+    assert _state(world)["stages"]["preflight-mac"]["status"] == "failed"
+    assert not any("pod create" in c for c in _calls(world))
 
 
 def test_floor_avg_seq_tokens_must_be_the_anchor_shape(world: Dict[str, Path], tmp_path: Path) -> None:
@@ -1010,7 +1284,10 @@ def test_mac_suite_zero_skips_only_the_suite_loudly_and_records_it(world: Dict[s
     # ADR-0145: the default runs the suite gate; MAC_SUITE=0 skips that one step,
     # says so, notes it in the state, and every other stage 0 check still runs.
     assert _master(world).returncode == 10
-    assert sum(1 for c in _calls(world) if c.startswith("run_tests")) == 1
+    # P-1: the suite is one run_tests call; the live-load gate is its own call
+    suite = lambda calls: sum(1 for c in calls if c.startswith("run_tests") and "test_load_gate_p1" not in c)
+    gate = lambda calls: sum(1 for c in calls if c.startswith("run_tests") and "test_load_gate_p1" in c)
+    assert suite(_calls(world)) == 1 and gate(_calls(world)) == 1
     skip = tmp_path / "S1_nosuite.env"
     skip.write_text(world["profile"].read_text(encoding="utf-8") + "\nMAC_SUITE=0\n", encoding="utf-8")
     world["profile"] = skip
@@ -1021,7 +1298,8 @@ def test_mac_suite_zero_skips_only_the_suite_loudly_and_records_it(world: Dict[s
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Mac test suite SKIPPED (MAC_SUITE=0" in proc.stdout
     calls = _calls(world)
-    assert sum(1 for c in calls if c.startswith("run_tests")) == 1          # the suite did not run again
+    assert suite(calls) == 1          # the suite did not run again
+    assert gate(calls) == 2           # the P-1 gate runs even under MAC_SUITE=0
     assert sum(1 for c in calls if c.startswith("package_repo")) == 2        # the other checks did
     assert sum(1 for c in calls if c.startswith("runpodctl gpu list")) == 2
     st = _state(world)
@@ -1101,11 +1379,41 @@ def test_a_stage_0_redo_mid_run_keeps_the_run_id_and_tolerates_its_own_pod_and_v
     assert "run id kept" in proc.stdout
     st = _state(world)
     assert st["run_id"] == rid and st["build"]["sha"].startswith("fedcba")
-    proc = _master(world, "--only", "ship", "--redo", **ours)
+    # P-2: after the fix the Mac HEAD is the new commit the tarball carries.
+    proc = _master(world, "--only", "ship", "--redo", CAGE_TEST_SHA="fedcba9876543210fedcba9876543210fedcba98", **ours)
     assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-800:]
     assert _state(world)["stages"]["ship"]["status"] == "passed"
     proc = _master(world, "--only", "preflight-mac", "--redo", CAGE_TEST_PODS='[{"id": "pod123"}, {"id": "stranger"}]', CAGE_TEST_VOLUMES='[{"id": "vol123"}]')
     assert proc.returncode == 1 and "clean room: pods exist" in proc.stdout
+
+
+def test_ship_refuses_a_tarball_older_than_the_mac_head_p2(world: Dict[str, Path]) -> None:
+    # P-2 (S0F-88, 2026-10-11): a fix committed after stage 0, then
+    # `--only ship --redo`, shipped the tarball stage 0 built (4df4da9, not
+    # cef4cde). Ship now compares the Mac HEAD with the packaged sha.
+    proc = _master(world, "--yes", "provision", "--to", "ship")
+    assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-800:]
+    ours = {"CAGE_TEST_PODS": '[{"id": "pod123"}]', "CAGE_TEST_VOLUMES": '[{"id": "vol123"}]'}
+    moved = "1111111111111111111111111111111111111111"
+    proc = _master(world, "--only", "ship", "--redo", CAGE_TEST_HEAD_SHA=moved, **ours)
+    assert proc.returncode == 1, proc.stdout[-2000:]
+    assert f"Mac HEAD is {moved}" in proc.stdout
+    assert "--only preflight-mac --redo" in proc.stdout
+    # the documented remedy: repackage at the new HEAD, then ship passes
+    assert _master(world, "--only", "preflight-mac", "--redo", CAGE_TEST_SHA=moved, **ours).returncode == 0
+    proc = _master(world, "--only", "ship", "--redo", CAGE_TEST_SHA=moved, **ours)
+    assert proc.returncode == 0, proc.stdout[-2000:]
+
+
+def test_stage_0_runs_the_live_load_gate_and_refuses_a_skip_p1(world: Dict[str, Path]) -> None:
+    # P-1 (S0F-88, R17): the gate runs at stage 0 with CAGE_LOAD_GATE=1 even
+    # under MAC_SUITE=0, and a gate that skipped (env lost) is not a pass.
+    proc = _master(world, "--only", "preflight-mac")
+    assert proc.returncode == 0, proc.stdout[-2000:]
+    gate_calls = [c for c in _calls(world) if "test_load_gate_p1.py" in c]
+    assert gate_calls and "CAGE_LOAD_GATE=1" in gate_calls[0]
+    proc = _master(world, "--only", "preflight-mac", "--redo", CAGE_TEST_LOAD_GATE_OUT="1 skipped")
+    assert proc.returncode == 1 and "live-load gate did not run and pass" in proc.stdout
 
 
 def test_validate_runs_the_preflight_on_vllm_only_and_engine_probes_on_sglang(world: Dict[str, Path], tmp_path: Path) -> None:
@@ -1124,12 +1432,16 @@ def test_validate_runs_the_preflight_on_vllm_only_and_engine_probes_on_sglang(wo
     assert "probe_thinking_pin.py --backend vllm --api-base http://localhost:8000" in vllm_cmd
     assert "probe_thinking_pin.py --backend sglang --api-base http://localhost:30000" in sgl_cmd
     assert vllm_cmd.index("probe_thinking_pin.py") < vllm_cmd.index("manage_vllm_server.sh stop")
+    # S0F-88 B-6: the device probe runs once, on the free GPU after the vLLM stop
+    assert vllm_cmd.index("manage_vllm_server.sh stop") < vllm_cmd.index("probe_reranker_device.py")
+    assert "probe_reranker_device.py" not in sgl_cmd
     log = (world["exp_root"] / "S1" / DATE / "logs" / "setup" / "validate_sglang.log").read_text(encoding="utf-8")
     for marker in ("VALIDATE_API_OK", "RUNNING_REQS=0", "ENGINE_FLUSH_OK", "METRIC_OK sglang:token_usage", "METRIC_OK sglang:num_retracted_reqs",
-                   "METRIC_OK sglang:num_running_reqs", "METRIC_OK sglang:num_queue_reqs", "POOL_RECORD_OK", "THINKING_PIN_OK backend=sglang", "COMPUTE_APPS=0"):
+                   "METRIC_OK sglang:num_running_reqs", "METRIC_OK sglang:num_queue_reqs", "POOL_RECORD_OK", "THINKING_PIN_OK backend=sglang", "COMPUTE_APPS=0",
+                   "CACHE_REPORT_ON"):  # S0F-88 U7
         assert marker in log, marker
     vllm_log = (world["exp_root"] / "S1" / DATE / "logs" / "setup" / "validate_vllm.log").read_text(encoding="utf-8")
-    assert "THINKING_PIN_OK backend=vllm" in vllm_log
+    assert "THINKING_PIN_OK backend=vllm" in vllm_log and "RERANK_DEVICE_OK" in vllm_log
     assert "thinking_probe vllm http://localhost:8000" in _calls(world)
     assert "thinking_probe sglang http://localhost:30000" in _calls(world)
     assert _state(world)["stages"]["validate"]["status"] == "passed"
@@ -1214,7 +1526,7 @@ def test_the_pod_suite_runs_once_per_shipped_sha_and_again_after_a_reship(world:
     assert "pod suite already passed on sha" in proc.stdout and submits() == 1
     ours = {"CAGE_TEST_PODS": '[{"id": "pod123"}]', "CAGE_TEST_VOLUMES": '[{"id": "vol123"}]'}
     assert _master(world, "--only", "preflight-mac", "--redo", CAGE_TEST_SHA="abcdefabcdefabcdefabcdefabcdefabcdefabcd", **ours).returncode == 0
-    assert _master(world, "--only", "ship", "--redo", **ours).returncode == 0
+    assert _master(world, "--only", "ship", "--redo", CAGE_TEST_SHA="abcdefabcdefabcdefabcdefabcdefabcdefabcd", **ours).returncode == 0
     proc = _master(world, "--only", "validate", "--redo")
     assert proc.returncode == 0, proc.stdout[-2000:]
     assert "already passed" not in proc.stdout and submits() == 2

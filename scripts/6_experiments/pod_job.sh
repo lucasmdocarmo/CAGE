@@ -128,13 +128,18 @@ cmd_submit() {
 
   # setsid: own process group, so the job survives the ssh channel closing.
   # ( ... ); echo $? > status : the exit code is the ONLY durable record.
+  # B-1 (S0F-88): the job's open-file soft limit is raised to the hard limit
+  # first (every in-flight request holds one socket; the 1,024 default capped
+  # S0 attempt 4's client at about 1,005 in flight). The runners raise it
+  # again themselves; this layer covers every other pod job too. A refusal
+  # leaves the limit as it was and the job runs.
   local pid
   pid="$(rssh "
     mkdir -p $RDIR
     rm -f $RDIR/$name.status
     : > $RDIR/$name.log
     printf '%s' '$enc' | base64 -d > $RDIR/$name.cmd
-    nohup setsid bash -c '( PYTHONUNBUFFERED=1 bash $RDIR/$name.cmd ) >> $RDIR/$name.log 2>&1; echo \$? > $RDIR/$name.status' >/dev/null 2>&1 &
+    nohup setsid bash -c '( ulimit -Sn \$(ulimit -Hn) 2>/dev/null || true; PYTHONUNBUFFERED=1 bash $RDIR/$name.cmd ) >> $RDIR/$name.log 2>&1; echo \$? > $RDIR/$name.status' >/dev/null 2>&1 &
     echo \$! > $RDIR/$name.pid
     echo \$!
   " | tr -d '\r\n ')"

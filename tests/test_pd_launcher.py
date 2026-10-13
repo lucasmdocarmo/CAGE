@@ -1462,7 +1462,7 @@ def _calibrations_for(grid, directory: Path) -> Dict[str, Path]:
     out: Dict[str, Path] = {}
     for engine in sorted(engines - {"hf"}):
         doc = {
-            "procedure_version": "cal-v2 (2026-09-30)",
+            "procedure_version": "cal-v3 (2026-10-12)",
             "model": rc.HF_ID_OF_SLUG[grid.model],
             "engine": engine,
             "budget_fraction": 1.5,

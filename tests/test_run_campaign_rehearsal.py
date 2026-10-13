@@ -31,7 +31,8 @@ from test_run_campaign import (  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFESTS = {
     "squad_v2": REPO_ROOT / "data" / "manifests" / "squad_v2_50x3_seed42.json",
-    "qasper": REPO_ROOT / "data" / "manifests" / "qasper_50x3_seed42.json",
+    # S0F-88 U3: qasper serves 100-arrival pressure windows (S0.env)
+    "qasper": REPO_ROOT / "data" / "manifests" / "qasper_100x3_seed42.json",
 }
 DATASETS = frozenset(MANIFESTS)
 
@@ -54,11 +55,14 @@ def test_rehearsal_keeps_every_arm_engine_family_hf_cell_ruler_task_and_rung() -
     assert g.f1_datasets == ("squad_v2", "qasper")                      # QA_DATASETS order, manifests only
     assert g.hf_oracle_cells == (("B1", ("squad_v2", "qasper")),            # no B2: ADR-0152
                                  ("B3", ("squad_v2", "qasper")), ("B6", ("squad_v2", "qasper")))
-    assert g.f2_budgets == (0.75,) and g.f2_rates == (0.85,)             # lower medians of the §6.1 factorial
-    assert g.f2_fine_budgets == (1.25,) and g.f2_fine_rates == (0.85,)   # the first fine-only coordinate
-    assert g.f3_budgets == (0.5,) and g.f3_rates == (0.95,)              # lower medians of the §6.8 reduced grid
+    # S0F-88 (owner 2026-10-12, "cells 1.05x"): lower-median budgets, every
+    # pressure rate at the smallest registered fraction above 1 x lambda*
+    assert g.f2_budgets == (0.75,) and g.f2_rates == (1.05,)             # §6.1 factorial
+    assert g.f2_fine_budgets == (1.25,) and g.f2_fine_rates == (1.05,)   # the first fine-only budget
+    assert g.f3_budgets == (0.5,) and g.f3_rates == (1.05,)              # §6.8 reduced grid
     assert g.replications == 1
-    assert (g.n_primary, g.n_secondary, g.n_identity, g.window_requests) == (50, 50, 50, 50)
+    # S0F-88 U3 (owner decision 2026-10-12): pressure windows at 100 arrivals
+    assert (g.n_primary, g.n_secondary, g.n_identity, g.window_requests) == (50, 50, 50, 100)
     assert dict(g.achievable_n) == {}
     # coverage: every (baseline, engine, family) of session a appears in the rehearsal
     assert _coverage(a) <= _coverage(g)
@@ -91,8 +95,8 @@ def test_rehearsal_plan_builds_against_the_real_manifests_through_the_cli(tmp_pa
     reh = plan["rehearsal"]
     assert reh["of"] == "a" and reh["n"] == 50 and reh["windows"] == 1
     assert reh["datasets"] == ["qasper", "squad_v2"] and reh["adr"] == "ADR-0144"
-    assert reh["f2_coordinates"] == [[0.75, 0.85]] and reh["f2_fine_coordinates"] == [[1.25, 0.85]]
-    assert reh["f3_coordinates"] == [[0.5, 0.95]] and "lower-median" in reh["rule"]
+    assert reh["f2_coordinates"] == [[0.75, 1.05]] and reh["f2_fine_coordinates"] == [[1.25, 1.05]]
+    assert reh["f3_coordinates"] == [[0.5, 1.05]] and "smallest registered fraction above 1" in reh["rule"]
     assert plan["session"] == "a" and plan["replications"] == 1
     assert plan["counts"]["cells"] == 110 and plan["counts"]["windows"] == 110  # ADR-0152 (old 112)
     # Relaunches (ADR-0155, one boundary per engine x prefix x budget x
@@ -107,9 +111,10 @@ def test_rehearsal_plan_builds_against_the_real_manifests_through_the_cli(tmp_pa
     # 1126, 1205, 480} = 6, plus retr-store lmcache on vLLM => 12 + 11 = 23.
     assert plan["counts"]["relaunches"] == 38 and plan["counts"]["blocked"] == 3
     assert plan["counts"]["dry_windows"] == 23
-    assert plan["per_row_n"]["n_primary"] == 50 and plan["per_row_n"]["window_requests"] == 50
+    assert plan["per_row_n"]["n_primary"] == 50 and plan["per_row_n"]["window_requests"] == 100
     cells = [s for s in plan["steps"] if s["kind"] == "cell"]
-    assert {s["num_queries"] for s in cells} == {50} and {s["windows"] for s in cells} == {1}
+    assert {s["num_queries"] for s in cells} == {50, 100} and {s["windows"] for s in cells} == {1}
+    assert {s["num_queries"] for s in cells if s["family"] in ("F2", "F3")} == {100}  # U3
     # the #4 contrast arms (B3 vs B6, primary engine, F1) are present on both manifest datasets
     primary = {(s["baseline"], s["dataset"]) for s in cells if s["row_class"] == "primary"}
     assert primary == {("B3", "squad_v2"), ("B3", "qasper"), ("B6", "squad_v2"), ("B6", "qasper")}

@@ -33,6 +33,12 @@
 #                         With NEITHER set, `start` DIES (J4) unless
 #                         CAGE_ALLOW_NO_BACKUP=1 explicitly accepts no backup.
 #   CAGE_BACKUP_INTERVAL  seconds between syncs (default 300)
+#   CAGE_BACKUP_ARCHIVE_DIR  review 2026-10-13 item 17: when set, a tar.gz of the
+#                         watched tree is also written there (<basename>.tar.gz,
+#                         replaced atomically) every CAGE_BACKUP_ARCHIVE_EVERY
+#                         syncs (default 6) and once at stop. For a mirror that
+#                         sits on the same disk as the data (S0: the network
+#                         volume refuses "|" in names, the archive's name has none).
 #   CAGE_PHASE            phase segment (default phase2)
 #
 # STATE  .agent/daemons/<scope>/gcs_backup.{pid,log}, scope = sanitized phase_dir, so
@@ -117,22 +123,41 @@ stop_pidfile() {  # stop_pidfile <pidfile> -> stop the daemon it names (idempote
 # mirrors the local layout ($BUCKET/results/<phase>/...), matching teardown's pull.
 sync_once() { bash "$SYNC_SH" "$PHASE_DIR" "$BUCKET" "$PHASE_DIR"; }
 
+ARCHIVE_DIR="${CAGE_BACKUP_ARCHIVE_DIR:-}"
+ARCHIVE_EVERY="${CAGE_BACKUP_ARCHIVE_EVERY:-6}"
+# archive_once <phase_dir> <archive_dir>: one tar.gz of the tree, written to a
+# temporary name and moved into place, so a reader never sees a partial file.
+archive_once() {
+  local tree="$1" dir="$2" name tmp
+  [ -d "$tree" ] || { warn "archive: $tree is not a directory"; return 1; }
+  mkdir -p "$dir" || return 1
+  name="$(basename "$tree").tar.gz"; tmp="$dir/.$name.tmp"
+  tar czf "$tmp" -C "$(dirname "$tree")" "$(basename "$tree")" && mv -f "$tmp" "$dir/$name" \
+    && log "archived $tree -> $dir/$name ($(du -h "$dir/$name" | cut -f1))"
+}
+
 # The detached loop body (runs under setsid in its own session). Args are passed
 # POSITIONALLY -- never interpolated into the -c string -- so paths with spaces or
 # quotes cannot inject. The pidfile is removed by the EXIT trap on ANY exit path;
 # `sleep & wait` makes TERM/INT take effect immediately instead of after INTERVAL.
 # shellcheck disable=SC2016  # single-quoted on purpose: expands inside the child
 LOOP_BODY='
-  pidf="$1" sync_sh="$2" phase_dir="$3" bucket="$4" logf="$5" interval="$6"
+  pidf="$1" sync_sh="$2" phase_dir="$3" bucket="$4" logf="$5" interval="$6" self="$7" archive_dir="$8" archive_every="$9"
   echo "$$" > "$pidf"
   _sleep_pid=""
   cleanup() { [ -n "$_sleep_pid" ] && kill "$_sleep_pid" 2>/dev/null; rm -f "$pidf"; }
   trap cleanup EXIT
   trap "exit 143" TERM
   trap "exit 130" INT
+  n=0
   while true; do
     bash "$sync_sh" "$phase_dir" "$bucket" "$phase_dir" >>"$logf" 2>&1 \
       || echo "[gcs-backup] $(date -u +%Y-%m-%dT%H:%M:%SZ) sync FAILED (will retry in ${interval}s)" >>"$logf"
+    n=$((n + 1))
+    if [ -n "$archive_dir" ] && [ $((n % archive_every)) -eq 0 ]; then
+      CAGE_BACKUP_ARCHIVE_DIR="$archive_dir" bash "$self" archive "$phase_dir" >>"$logf" 2>&1 \
+        || echo "[gcs-backup] $(date -u +%Y-%m-%dT%H:%M:%SZ) archive FAILED (will retry after the next syncs)" >>"$logf"
+    fi
     sleep "$interval" & _sleep_pid=$!
     wait "$_sleep_pid" || true
     _sleep_pid=""
@@ -171,12 +196,14 @@ case "$ACTION" in
     # 200>&-: never let the detached loop inherit a caller's J3 run-lock fd
     # (acquire_run_lock in _common.sh) -- a daemon outliving its runner would
     # otherwise hold the run lock and block every resume.
+    case "$ARCHIVE_EVERY" in ''|*[!0-9]*|0) warn "CAGE_BACKUP_ARCHIVE_EVERY='$ARCHIVE_EVERY' not a positive integer"; exit 2 ;; esac
+    [ -z "$ARCHIVE_DIR" ] || log "archives: $PHASE_DIR -> $ARCHIVE_DIR/$(basename "$PHASE_DIR").tar.gz every $ARCHIVE_EVERY syncs and at stop"
     if command -v setsid >/dev/null 2>&1; then
-      setsid bash -c "$LOOP_BODY" _ "$PIDF" "$SYNC_SH" "$PHASE_DIR" "$BUCKET" "$LOGF" "$INTERVAL" \
+      setsid bash -c "$LOOP_BODY" _ "$PIDF" "$SYNC_SH" "$PHASE_DIR" "$BUCKET" "$LOGF" "$INTERVAL" "$SCRIPT_DIR/gcs_backup_daemon.sh" "$ARCHIVE_DIR" "$ARCHIVE_EVERY" \
         >/dev/null 2>&1 200>&- &
     else
       warn "setsid not found (macOS?) -> falling back to nohup+disown for the loop"
-      nohup bash -c "$LOOP_BODY" _ "$PIDF" "$SYNC_SH" "$PHASE_DIR" "$BUCKET" "$LOGF" "$INTERVAL" \
+      nohup bash -c "$LOOP_BODY" _ "$PIDF" "$SYNC_SH" "$PHASE_DIR" "$BUCKET" "$LOGF" "$INTERVAL" "$SCRIPT_DIR/gcs_backup_daemon.sh" "$ARCHIVE_DIR" "$ARCHIVE_EVERY" \
         >/dev/null 2>&1 200>&- &
       disown %+ 2>/dev/null || true
     fi
@@ -188,9 +215,16 @@ case "$ACTION" in
       exit 1
     fi
     ;;
+  archive)
+    # review 2026-10-13 item 17: one archive now (the loop calls this too)
+    [ -n "$ARCHIVE_DIR" ] || die "archive: CAGE_BACKUP_ARCHIVE_DIR is unset"
+    archive_once "$PHASE_DIR" "$ARCHIVE_DIR"
+    ;;
   stop)
     if [ -f "$PIDF" ]; then
       stop_pidfile "$PIDF"
+      # item 17: the final archive, after the loop stopped, before the final sync
+      [ -z "$ARCHIVE_DIR" ] || archive_once "$PHASE_DIR" "$ARCHIVE_DIR" || warn "final archive FAILED"
     else
       # Back-compat: `stop` with no/other phase_dir must still find daemons started
       # under any scope (the pre-scoping behavior); stop every live one, loudly.

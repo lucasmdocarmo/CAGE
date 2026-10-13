@@ -45,8 +45,10 @@ __all__ = [
     "EVIDENCE_POSITION_BINS",
     "NO_PRESSURE_COORDS_BIN",
     "RHO_OWN_BIN_EDGES",
+    "RULER_QUALITY_METRICS",
     "S2_POLICY_EVENT_JOIN_UNAVAILABLE",
     "evidence_position_bin",
+    "quality_metrics_for",
     "mechanism_engine_key",
     "policy_event_curve",
     "pressure_bin_of",
@@ -59,6 +61,19 @@ __all__ = [
 #: are producer/scored columns of requests.jsonl; a metric absent from a
 #: window's rows is a NAMED skip, never a zero).
 CONDITIONED_QUALITY_METRICS: tuple[str, ...] = ("f1_score", "grounding_score")
+
+#: ADR-0170 (charter D5#5): the RULER instrument is scored by its NATIVE
+#: containment match (the runner's ``ruler_native_score`` row column), never
+#: by the QA F1 or the grounding instrument of a 32K haystack; its curves are
+#: reported per task (``quality_by_rho_own`` appends the window's task to the
+#: curve key when the input carries a ``task`` column), never pooled.
+RULER_QUALITY_METRICS: tuple[str, ...] = ("ruler_native_score",)
+
+
+def quality_metrics_for(dataset: Any, default: Sequence[str]) -> tuple[str, ...]:
+    """The quality columns the driver conditions on for ``dataset``: the RULER
+    native metric on RULER windows (ADR-0170), ``default`` everywhere else."""
+    return RULER_QUALITY_METRICS if str(dataset) == "ruler" else tuple(default)
 
 #: Pinned ρ_own bin edges (left-closed). The final edge is open-ended:
 #: rho_own is byte-seconds over budget×duration and MAY exceed 1.0
@@ -289,6 +304,14 @@ def quality_by_rho_own(windows: pd.DataFrame) -> pd.DataFrame:
     _require_columns(windows, _RHO_INPUT_COLUMNS, "quality_by_rho_own")
     frame = windows.copy()
     frame["curve_key"] = [mechanism_engine_key(k) for k in frame["row_key"]]
+    if "task" in frame.columns:
+        # ADR-0170: a RULER window's task is part of its curve identity (the
+        # charter reports the instrument per task, never the mean); rows
+        # without a task (every other dataset) keep the plain key
+        frame["curve_key"] = [
+            f"{key}|task={task}" if isinstance(task, str) and task else key
+            for key, task in zip(frame["curve_key"], frame["task"])
+        ]
     frame["rho_bin"] = [rho_own_bin(v) for v in frame["rho_own"]]
     grouped = (
         frame.groupby(

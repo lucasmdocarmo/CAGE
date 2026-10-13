@@ -162,7 +162,12 @@ seatbelt_need_minutes() { # the stage bounds the pod must survive, in minutes
   local n_srv=0 n_cal=0 e
   for e in $ENGINES; do [ "$e" = "hf" ] || n_srv=$((n_srv + 1)); done
   for e in $CALIBRATE; do n_cal=$((n_cal + 1)); done
-  printf '%s' "$(( SETUP_BOUND_MIN + n_srv * VALIDATE_BOUND_S / 60 + n_cal * CALIBRATE_BOUND_S / 60 + n_cal * CALIBRATE_RUNGS_BOUND_S / 60 + PLAN_BOUND_S / 60 + HOURS * 60 + SCORE_BOUND_MIN + COLLECT_BOUND_S / 60 + PULL_MARGIN_MIN ))"
+  # S0F-88 review L4: stage 4's load gate (600 s) and pod suite (1,800 s when SUITE_ON_POD=1) bill too
+  local suite_min=0; [ "${SUITE_ON_POD:-0}" = "1" ] && suite_min=30
+  printf '%s' "$(( SETUP_BOUND_MIN + 10 + suite_min + n_srv * VALIDATE_BOUND_S / 60 + n_cal * CALIBRATE_BOUND_S / 60 + n_cal * CALIBRATE_RUNGS_BOUND_S / 60 + PLAN_BOUND_S / 60 + HOURS * 60 + SCORE_BOUND_MIN + COLLECT_BOUND_S / 60 + PULL_MARGIN_MIN ))"
+}
+pod_hours_bound() { # S0F-88 P-4: the pod bills through every stage bound, not the run (HOURS) alone
+  awk -v m="$(seatbelt_need_minutes)" 'BEGIN { printf "%.1f", m / 60 }'
 }
 
 DATE="${DATE_ARG:-${CAGE_EXP_DATE:-$(date -u +%Y-%m-%d)}}"
@@ -300,6 +305,12 @@ step_out() { cat "$STEP_LOG"; }            # the last step's captured output
 step_has() { grep -qF -- "$1" "$STEP_LOG"; } # literal substring in the last step's output (never a regex)
 
 plan_only() { [ "$PLAN" -eq 1 ]; }
+# Decision 3 (2026-10-13, S0 only): PARTIAL_TREE_OK=1 lets a run stage that
+# ended with failed cells, failed relaunches or failed dry windows pass as
+# PARTIAL (recorded in state run.partial), so the tree is still sealed, scored
+# and analyzed; stage 0 refuses the key on a registered profile.
+partial_ok() { [ "${PARTIAL_TREE_OK:-0}" = "1" ]; }
+run_partial() { [ -n "$(state get run.partial 2>/dev/null || true)" ]; }
 
 # the ssh front door to the pod (pod_job.sh reads the same env)
 pod_env() {
@@ -429,7 +440,7 @@ engine_api()      { case "$1" in vllm) echo http://localhost:8000 ;; sglang) ech
 server_engines()  { local e; for e in $ENGINES; do [ "$e" = "hf" ] || echo "$e"; done; }
 
 # env pins run_campaign.py refuses on presence or on a mismatch (drift sweep 2026-10-06, 8e)
-RUN_ENV_UNSET="-u CAGE_SLO_FLOORS_JSON -u CAGE_BUDGET_PLAN_JSON -u CAGE_TELEMETRY_ENDPOINTS -u CAGE_ALLOW_STALE_INDEX -u CAGE_SGLANG_API_BASE -u CAGE_LMDEPLOY_API_BASE -u VLLM_PORT -u SGLANG_PORT -u CAGE_PD_PROXY_PORT -u CAGE_PD_PREFILL_PORT -u CAGE_PD_DECODE_PORT"
+RUN_ENV_UNSET="-u CAGE_SLO_FLOORS_JSON -u CAGE_BUDGET_PLAN_JSON -u CAGE_KV_CEILING -u CAGE_TELEMETRY_ENDPOINTS -u CAGE_ALLOW_STALE_INDEX -u CAGE_SGLANG_API_BASE -u CAGE_LMDEPLOY_API_BASE -u VLLM_PORT -u SGLANG_PORT -u CAGE_PD_PROXY_PORT -u CAGE_PD_PREFILL_PORT -u CAGE_PD_DECODE_PORT"
 
 portal_block() {
   pod_env
@@ -480,6 +491,10 @@ stage_preflight_mac() {
   plan_only || { grep -v '^#' "$STEP_LOG" > "$EXTRAS/ops/pods_before.json"; json_only_ours "$EXTRAS/ops/pods_before.json" $(state get pod.id 2>/dev/null || true) || { printf '  [FAIL] clean room: pods exist before this experiment (see %s)\n' "$EXTRAS/ops/pods_before.json"; return 1; }; }
   run_step 0 "clean room: network-volume list" -- runpodctl network-volume list || return 1
   plan_only || { grep -v '^#' "$STEP_LOG" > "$EXTRAS/ops/volumes_before.json"; json_only_ours "$EXTRAS/ops/volumes_before.json" $(state get pod.volume_id 2>/dev/null || true) || { printf '  [FAIL] clean room: network volumes exist before this experiment (see %s)\n' "$EXTRAS/ops/volumes_before.json"; return 1; }; }
+  if [ "${PARTIAL_TREE_OK:-0}" = "1" ] && [ -z "${REHEARSAL_N:-}" ]; then
+    printf '  [FAIL] PARTIAL_TREE_OK=1 on a registered run (REHEARSAL_N empty): a partial tree is never sealed on a registered run (decision 3 of 2026-10-13, S0 only); unset it or set REHEARSAL_N\n'
+    return 1
+  fi
   # The Mac suite is the free gate. MAC_SUITE=0 skips that one step loudly when
   # the profile vouches for HEAD and says why (SUITE_ON_POD=1 keeps the suite
   # on the pod); every other stage 0 check stays (owner, 2026-10-07, ADR-0145).
@@ -489,6 +504,14 @@ stage_preflight_mac() {
   else
     run_step 0 "Mac test suite" -- bash "$SCRIPTS/checks/run_tests.sh" -q -p no:cacheprovider || return 1
     plan_only || cp "$STEP_LOG" "$LAND/logs/setup/suite_mac.log"
+  fi
+  # P-1 (S0F-88, owner ruling R17): the live-load gate on the Mac, always (it is
+  # one test file; MAC_SUITE=0 does not skip it). The real client must serve
+  # 2,000+ requests in flight after raising a forced 1,024 open-file limit; at
+  # 1,024 it fails, as S0 attempt 4's client did (B-1).
+  run_step 0 "live-load gate (P-1)" -- env CAGE_LOAD_GATE=1 bash "$SCRIPTS/checks/run_tests.sh" -q -p no:cacheprovider tests/test_load_gate_p1.py || return 1
+  if ! plan_only && { ! step_has "passed" || step_has "skipped"; }; then
+    printf '  [FAIL] the live-load gate did not run and pass (P-1); see %s\n' "$STEP_LOG"; return 1
   fi
   run_step 0 "package the repo" -- bash "$SCRIPTS/ops/package_repo.sh" "$tarball" || return 1
   if ! plan_only; then
@@ -514,13 +537,13 @@ stage_preflight_mac() {
   # the rehearsal derivation) runs HERE, before anything bills; the probe
   # also says whether an executable vLLM cell needs the LMCache module, which
   # stage 4 then proves importable on the pod (S0F-57).
-  run_step 0 "session '$SESSION' registration preflight (anchor shape, datasets staged, manifest coverage, pool vs max_model_len)" -- "$PY" - "$SCRIPTS/3_run/run_campaign.py" "$SESSION" "$FLOOR_AVG_SEQ_TOKENS" "${REHEARSAL_N:-}" "$QUERY_MANIFESTS" "$CHARTER_DATASETS" "$PROJECT_DIR" "$FLOOR_CONCURRENCY" <<'PY' || return 1
+  run_step 0 "session '$SESSION' registration preflight (anchor shape, datasets staged, manifest coverage, pool vs max_model_len, pool vs GPU memory after weights)" -- "$PY" - "$SCRIPTS/3_run/run_campaign.py" "$SESSION" "$FLOOR_AVG_SEQ_TOKENS" "${REHEARSAL_N:-}" "$QUERY_MANIFESTS" "$CHARTER_DATASETS" "$PROJECT_DIR" "$FLOOR_CONCURRENCY" "$GPU_ID" <<'PY' || return 1
 import importlib.util, sys
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("cage_run_campaign_probe", sys.argv[1])
 m = importlib.util.module_from_spec(spec); sys.modules[spec.name] = m
 spec.loader.exec_module(m)
-session, floor_tokens, rehearsal, manifests_raw, datasets_raw, project, concurrency = sys.argv[2:9]
+session, floor_tokens, rehearsal, manifests_raw, datasets_raw, project, concurrency, gpu_id = sys.argv[2:10]
 manifests = {}
 for item in manifests_raw.split():
     ds, _sep, rel = item.partition("=")
@@ -530,16 +553,19 @@ try:
         session, floor_avg_seq_tokens=floor_tokens,
         rehearsal_n=int(rehearsal) if rehearsal.strip() else None,
         query_manifests=manifests, charter_datasets=tuple(datasets_raw.split()),
-        floor_concurrency=int(concurrency))
+        floor_concurrency=int(concurrency), gpu_id=gpu_id)
 except Exception as exc:
     print(f"REFUSED: session {session!r}: {exc}"); sys.exit(1)
 print(f"session {session!r}: anchor shape {report['anchor_seq_tokens']} served tokens; {report['cells']} cells, "
-      f"{report['executable_cells']} executable; NEEDS_LMCACHE={1 if report['needs_lmcache'] else 0}")
+      f"{report['executable_cells']} executable; NEEDS_LMCACHE={1 if report['needs_lmcache'] else 0}; "
+      f"LMCACHE_STORE_GIB={report.get('lmcache_store_gib') or 0}")
 for p in report["problems"]:
     print(f"REFUSED: {p}")
 sys.exit(1 if report["problems"] else 0)
 PY
   plan_only || { if step_has "NEEDS_LMCACHE=1"; then state put registration.needs_lmcache 1; else state put registration.needs_lmcache 0; fi; }
+  # S0F-88 U2: the largest LMCache CPU store the plan will size (GiB, 0 = none)
+  plan_only || state put registration.lmcache_store_gib "$(grep -o 'LMCACHE_STORE_GIB=[0-9]*' "$STEP_LOG" | tail -1 | cut -d= -f2)"
   run_step 0 "stock read (gpu list --include-unavailable)" -- runpodctl gpu list --include-unavailable || return 1
   if ! plan_only; then
     grep -v '^#' "$STEP_LOG" > "$EXTRAS/ops/gpu_list.json"
@@ -571,7 +597,7 @@ PY
   need_min="$(seatbelt_need_minutes)"
   say "seatbelt $SEATBELT = $seat_min min; the stage bounds need $need_min min (setup $SETUP_BOUND_MIN, validate, calibrate, calibrate-rungs $((CALIBRATE_RUNGS_BOUND_S / 60)) per engine, plan, run $((HOURS * 60)), score $SCORE_BOUND_MIN, collect, pull margin $PULL_MARGIN_MIN)"
   run_step 0 "seatbelt covers the stage bounds" -- test "$seat_min" -ge "$need_min" || { printf '  [FAIL] SEATBELT=%s (%s min) is shorter than the %s min the stages need; raise SEATBELT in the profile\n' "$SEATBELT" "$seat_min" "$need_min"; return 1; }
-  run_step 0 "provision plan print" -- bash "$SCRIPTS/runpod/provision_pod.sh" --gpu-id "$GPU_ID" --gpu-count "$GPU_COUNT" --disk-gb "$DISK_GB" --volume-gb "$VOLUME_GB" --terminate-after "$SEATBELT" --hours "$HOURS" --purpose "$EXP $DATE" || return 1
+  run_step 0 "provision plan print" -- bash "$SCRIPTS/runpod/provision_pod.sh" --gpu-id "$GPU_ID" --gpu-count "$GPU_COUNT" --disk-gb "$DISK_GB" --volume-gb "$VOLUME_GB" --cloud-type "$CLOUD_TYPE" --ports "$PORTS" --terminate-after "$SEATBELT" --hours "$(pod_hours_bound)" --purpose "$EXP $DATE" || return 1
   plan_only || step_has "PLAN ONLY" || { printf '  [FAIL] provision plan print lacks the PLAN ONLY line\n'; return 1; }
   if ! plan_only; then
     # S0F-36: a stage 0 redo (a code fix re-shipped mid-run) keeps the run id;
@@ -621,7 +647,8 @@ stage_provision() {
       [ -n "$vol" ] || { printf '  [FAIL] volume created in %s but its id was not parsed; find it with runpodctl network-volume list\n' "$dc"; return 1; }
       state put pod.volume_id "$vol"; state put pod.dc "$dc"
     fi
-    run_step 0 "provision pod in $dc (--yes)" -- bash "$SCRIPTS/runpod/provision_pod.sh" --gpu-id "$GPU_ID" --gpu-count "$GPU_COUNT" --disk-gb "$DISK_GB" --data-center-ids "$dc" --network-volume-id "$vol" --terminate-after "$SEATBELT" --hours "$HOURS" --purpose "$EXP $DATE" --yes
+    # review 2026-10-13 item 24: CLOUD_TYPE and PORTS are the profile's, not the provisioner's defaults
+    run_step 0 "provision pod in $dc (--yes)" -- bash "$SCRIPTS/runpod/provision_pod.sh" --gpu-id "$GPU_ID" --gpu-count "$GPU_COUNT" --disk-gb "$DISK_GB" --data-center-ids "$dc" --network-volume-id "$vol" --cloud-type "$CLOUD_TYPE" --ports "$PORTS" --terminate-after "$SEATBELT" --hours "$(pod_hours_bound)" --purpose "$EXP $DATE" --yes
     local rc=$?
     if plan_only; then created=1; break; fi
     out="$(step_out)"
@@ -652,11 +679,15 @@ stage_provision() {
     while :; do
       out="$(runpodctl pod get "'"$POD_ID"'" 2>&1)" || true
       status="$(printf "%s" "$out" | sed -nE "s/.*\"runtimeStatus\"[[:space:]]*:[[:space:]]*\"([a-z]+)\".*/\1/p" | head -1)"
-      echo "runtimeStatus=${status:-unknown}"
+      mem="$(printf "%s" "$out" | sed -nE "s/.*\"memoryInGb\"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p" | head -1)"
+      echo "runtimeStatus=${status:-unknown} memoryInGb=${mem:-unknown}"
       [ "$status" = "running" ] && exit 0
       [ "$(date +%s)" -ge "$deadline" ] && { echo "pod not running after '"$POD_READY_TIMEOUT_S"'s"; exit 1; }
       sleep '"$POD_READY_POLL_S"'
     done' || return 1
+  # review 2026-10-13 item 2: the pod's allocated memory is the stage 4 memory
+  # probe's bound (inside the container /proc/meminfo shows the host)
+  plan_only || state put pod.memory_gb "$(step_out | grep -o 'memoryInGb=[0-9]*' | tail -1 | cut -d= -f2)"
   run_step 0 "ssh info" -- runpodctl ssh info "$POD_ID" || return 1
   if ! plan_only; then
     if [ -n "${CAGE_POD_SSH_OVERRIDE:-}" ]; then
@@ -693,6 +724,19 @@ sys.exit(3)' 2>/dev/null || true)"
 stage_ship() {
   pod_env
   local tarball; tarball="$(state get build.tarball 2>/dev/null || true)"; tarball="${tarball:-$EXTRAS/ops/repo.tar.gz}"
+  # P-2 (S0F-88): ship sends the tarball stage 0 built. On 2026-10-11 a fix was
+  # committed after stage 0 and `--only ship --redo` shipped the old code
+  # (4df4da9 instead of cef4cde); only the sha line in the log showed it.
+  if ! plan_only; then
+    local built head; built="$(state get build.sha 2>/dev/null || true)"
+    head="$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null || true)"
+    if [ -z "$head" ]; then
+      say "no git HEAD readable at $PROJECT_DIR: the tarball-vs-HEAD check is skipped"
+    elif [ "$head" != "$built" ]; then
+      printf '  [FAIL] the tarball stage 0 built carries %s but the Mac HEAD is %s (P-2); repackage, then ship:\n    bash %s %s --date %s --only preflight-mac --redo\n' "${built:-none}" "$head" "$0" "$EXP" "$DATE"
+      return 1
+    fi
+  fi
   run_step 0 "scp tarball" -- pscp_to "$tarball" "$POD_TARBALL" || return 1
   local relink=""
   if [ -n "$POD_RESULTS_DIR" ]; then
@@ -762,6 +806,13 @@ stage_validate() {
       plan_only || state put suite_pod.sha "$build_sha"
     fi
   fi
+  # P-1 (S0F-88, R17): the live-load gate once more on the pod, where the
+  # Linux limits and the pod's own Python run the client (the suite above
+  # skips it: CAGE_LOAD_GATE is unset there).
+  job_run load_gate 600 "cd $POD_REPO && env $RUN_ENV_UNSET CAGE_LOAD_GATE=1 $POD_PYTHON -m pytest -q -s -p no:cacheprovider tests/test_load_gate_p1.py" "$LAND/logs/setup" || return 1
+  if ! plan_only && { ! grep -q " passed" "$JOB_LOG" || grep -q "skipped" "$JOB_LOG"; }; then
+    printf '  [FAIL] the pod live-load gate did not run and pass (P-1); see %s\n' "$JOB_LOG"; return 1
+  fi
   # Preflight gate (p) judges the datasets named by CAGE_DATASETS (comma list)
   # and the FULL charter roster when it is unset (live 2026-10-07: it refused
   # hotpotqa, scbench and sharegpt, which this profile never stages); the
@@ -780,8 +831,9 @@ stage_validate() {
     # check read (the live scrape of 2026-10-07: sglang:token_usage,
     # sglang:num_retracted_reqs, sglang:num_running_reqs), and the launcher's
     # realized-pool record (ADR-0142). An engine with no registered set refuses.
-    local probe="" names="" gauge="" n_names=0 thinking="" needs_lmcache
+    local probe="" names="" gauge="" n_names=0 thinking="" needs_lmcache store_gib
     needs_lmcache="$(state get registration.needs_lmcache 2>/dev/null || echo 0)"
+    store_gib="$(state get registration.lmcache_store_gib 2>/dev/null || echo 0)"
     case "$e" in
       vllm) probe="CAGE_PREFLIGHT_BACKENDS=$e bash scripts/checks/preflight_check.sh '$MODEL' $api; rc=\$?"
             # S0F-57 (gap triage 2026-10-09, C1): the plan's vLLM retr-store (B8)
@@ -789,7 +841,10 @@ stage_validate() {
             # that relaunch died with ModuleNotFoundError after hours of billing.
             # When stage 0 found such a cell executable, the import is proven here.
             # (the marker alone: the check below fails the stage with the fix text)
-            [ "$needs_lmcache" = "1" ] && probe="$probe; $POD_PYTHON -c 'import lmcache' && echo LMCACHE_IMPORT_OK || echo LMCACHE_IMPORT_MISSING" ;;
+            [ "$needs_lmcache" = "1" ] && probe="$probe; $POD_PYTHON -c 'import lmcache' && echo LMCACHE_IMPORT_OK || echo LMCACHE_IMPORT_MISSING"
+            # S0F-88 U2 (review H1): the pod's OWN memory (its cgroup; /proc/meminfo
+            # shows the host's) must hold the largest LMCache store, read while vLLM is up
+            [ "$needs_lmcache" = "1" ] && probe="$probe; $POD_PYTHON scripts/checks/probe_pod_memory.py --need-gib ${store_gib:-0} --pod-gib $(state get pod.memory_gb 2>/dev/null || echo 0) --out logs/pod_memory_probe.json" ;;
       # sglang:num_queue_reqs is the queue gauge the section 6.1 clause (b)
       # regime label reads (ADR-0153; gap triage 2026-10-09 M3).
       sglang) names="sglang:token_usage sglang:num_retracted_reqs sglang:num_running_reqs sglang:num_queue_reqs"; gauge="sglang:num_running_reqs" ;;
@@ -808,6 +863,9 @@ stage_validate() {
       # adapter sends; the launcher's start now also waits for SGLang's own
       # ready line. Quoted so the remote shell never globs the "?".
       probe="rc=0; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do r=\$(curl -fsS $api/metrics 2>/dev/null | grep '^$gauge' | awk '{print \$NF}' | head -1); r=\${r%.*}; [ \"\${r:-1}\" = 0 ] && break; sleep 2; done; echo \"RUNNING_REQS=\${r:-unread}\"; curl -fsS -X POST \"$api/flush_cache?timeout=20\" >/dev/null && echo ENGINE_FLUSH_OK || { echo ENGINE_FLUSH_FAILED; rc=1; }; m=\$(curl -fsS $api/metrics 2>/dev/null); for n in $names; do printf '%s\\n' \"\$m\" | grep -q \"^\$n\" && echo \"METRIC_OK \$n\" || { echo \"METRIC_MISSING \$n\"; rc=1; }; done; [ -s logs/$e/CURRENT.kvpool.json ] && echo POOL_RECORD_OK || { echo POOL_RECORD_MISSING; rc=1; }"
+      # S0F-88 U7: the server's own record that every row carries a cached-
+      # token count (/server_info lists every launch argument at 0.5.10.post1)
+      probe="$probe; curl -fsS $api/server_info 2>/dev/null | grep -Eq '\"enable_cache_report\": *true' && echo CACHE_REPORT_ON || { echo CACHE_REPORT_OFF; rc=1; }"
     fi
     # S0F-59 (ADR-0151): one chat request built the way the campaign runner
     # builds every request (its own adapter construction, the chat messages,
@@ -815,44 +873,102 @@ stage_validate() {
     # or the request fails. The 2026-10-08 landing served 2,450 of 2,450
     # SGLang rows as "<think>" in 2 tokens and no gate said a word.
     thinking="$POD_PYTHON scripts/checks/probe_thinking_pin.py --backend $e --api-base $api --model '$MODEL' --out logs/$e/CURRENT.thinking_probe.json || rc=1"
+    # S0F-88 B-6 (R8): the reranker serves on the GPU; once, after the vLLM
+    # engine stops (the GPU is free), the probe compares its served top k with
+    # the CPU ranking on 50 registered questions.
+    local rerank=""
+    # (the separator rides the variable: an empty one must leave no bare ";")
+    [ "$e" = "vllm" ] && rerank="; $POD_PYTHON scripts/checks/probe_reranker_device.py --out logs/rerank_device_probe.json || rc=1"
     # after `stop` the GPU process takes a few seconds to leave the compute-apps list: wait up to 60 s before reading it
-    job_run "validate_$e" 1500 "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT CAGE_DATASETS=$ds$POD_ENGINE_ENV && bash scripts/2_serving/$launcher start '$MODEL' && curl -sf $api/v1/models >/dev/null && echo VALIDATE_API_OK; $probe; $thinking; bash scripts/2_serving/$launcher stop; n=1; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do n=\$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . || true); [ \"\$n\" -eq 0 ] && break; sleep 2; done; echo COMPUTE_APPS=\$n; exit \$rc" "$LAND/logs/setup" || return 1
+    job_run "validate_$e" 1500 "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT CAGE_DATASETS=$ds$POD_ENGINE_ENV && bash scripts/2_serving/$launcher start '$MODEL' && curl -sf $api/v1/models >/dev/null && echo VALIDATE_API_OK; $probe; $thinking; bash scripts/2_serving/$launcher stop$rerank; n=1; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do n=\$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . || true); [ \"\$n\" -eq 0 ] && break; sleep 2; done; echo COMPUTE_APPS=\$n; exit \$rc" "$LAND/logs/setup" || return 1
     plan_only && continue
     grep -q "VALIDATE_API_OK" "$JOB_LOG" || { printf '  [FAIL] %s: /v1/models never answered\n' "$e"; return 1; }
     if [ "$e" = "vllm" ]; then
       grep -q "PREFLIGHT PASS" "$JOB_LOG" || { printf '  [FAIL] %s: preflight did not PASS\n' "$e"; return 1; }
+      grep -q "RERANK_DEVICE_OK" "$JOB_LOG" || { printf '  [FAIL] the reranker does not serve on the GPU what it serves on the CPU, or the probe failed (S0F-88 B-6):\n'; grep 'RERANK_DEVICE_FAILED' "$JOB_LOG" | sed 's/^/    /'; return 1; }
       if [ "$needs_lmcache" = "1" ]; then
         grep -q "LMCACHE_IMPORT_OK" "$JOB_LOG" || { printf '  [FAIL] %s: the lmcache module does not import in the pod venv, but the plan has executable vLLM retr-store (B8) cells whose relaunch sets the LMCache connector (S0F-57): install lmcache on the pod (setup_runpod.sh) or deregister B8 for this session, before the calibration stages bill\n' "$e"; return 1; }
+        # S0F-88 U2 (review H1): the pod must hold the largest LMCache CPU store
+        # the plan sizes (LMCACHE_STORE_RULE); the probe line is printed for the record.
+        { grep 'POD_MEMORY_' "$JOB_LOG" || true; } | tail -1 | sed 's/^/  /'
+        grep -q "POD_MEMORY_OK" "$JOB_LOG" || { printf '  [FAIL] %s: the memory left to the pod container (its cgroup limit minus its usage, with vLLM up) is below the %s GiB LMCache CPU store the plan sizes for its largest retr-store window, or the probe failed (S0F-88 U2)\n' "$e" "${store_gib:-0}"; return 1; }
       fi
     else
       grep -q "ENGINE_FLUSH_OK" "$JOB_LOG" || { printf '  [FAIL] %s: the cold-start endpoint POST /flush_cache?timeout=20 did not answer 200 (the scheduler never went fully idle within 20 s, or the endpoint is gone)\n' "$e"; return 1; }
       [ "$(grep -c '^METRIC_OK ' "$JOB_LOG")" -eq "$n_names" ] || { printf '  [FAIL] %s: live /metrics lacks a name the regime bridge or the cold-start check reads:\n' "$e"; grep 'METRIC_MISSING' "$JOB_LOG" | sed 's/^/    /'; return 1; }
       grep -q "POOL_RECORD_OK" "$JOB_LOG" || { printf '  [FAIL] %s: the launcher wrote no CURRENT.kvpool.json (ADR-0142 realized pool)\n' "$e"; return 1; }
+      grep -q "CACHE_REPORT_ON" "$JOB_LOG" || { printf '  [FAIL] %s: /server_info does not report enable_cache_report=true, so no row would carry a cached-token count (S0F-88 U7)\n' "$e"; return 1; }
     fi
     grep -q "THINKING_PIN_OK" "$JOB_LOG" || { printf '  [FAIL] %s: the thinking pin probe did not pass (S0F-59, ADR-0151): the served text carried the thinking marker or the probe request failed\n' "$e"; grep 'THINKING_PIN_FAILED' "$JOB_LOG" | sed 's/^/    /'; return 1; }
     grep -q "COMPUTE_APPS=0" "$JOB_LOG" || { printf '  [FAIL] %s: compute apps remain after stop\n' "$e"; return 1; }
   done
+  # Review 2026-10-13 (Part 8 option A1, items 29 and 32): the serving
+  # configurations the run stage would start for the first time 15 to 27
+  # pod-hours in are started ONCE here, each with one served request: SGLang
+  # at KV fp8_e4m3 (the launcher's realized-format gate runs), vLLM at KV fp8,
+  # vLLM with the LMCache connector at the plan's store size (the engine log
+  # must name the store), and the GPU reranker beside a running vLLM (item
+  # 29: nothing checked the two shared the GPU). Default pools: the format,
+  # the connector and the sharing are what is checked, not the budget.
+  if [ "${START_CHECK:-1}" = "1" ]; then
+    local sc="rc=0; stopall() { bash scripts/2_serving/manage_vllm_server.sh stop >/dev/null 2>&1 || true; bash scripts/2_serving/manage_sglang_server.sh stop >/dev/null 2>&1 || true; }"
+    sc="$sc; one() { name=\$1; backend=\$2; api=\$3; launcher=\$4; shift 4; env \"\$@\" bash scripts/2_serving/\$launcher restart '$MODEL' && $POD_PYTHON scripts/checks/probe_thinking_pin.py --backend \$backend --api-base \$api --model '$MODEL' --out logs/start_check_\$name.json && echo START_OK:\$name || { echo START_FAILED:\$name; rc=1; }; }"
+    local sglang_on=0 vllm_on=0 sgl_api vllm_api
+    for e in $ENGINES; do case "$e" in sglang) sglang_on=1 ;; vllm) vllm_on=1 ;; esac; done
+    sgl_api="$(engine_api sglang)"; vllm_api="$(engine_api vllm)"
+    if [ "$sglang_on" = "1" ]; then
+      sc="$sc; one sglang_fp8_e4m3 sglang $sgl_api manage_sglang_server.sh SGLANG_KV_CACHE_DTYPE=fp8_e4m3; stopall"
+    fi
+    if [ "$vllm_on" = "1" ]; then
+      sc="$sc; one vllm_fp8 vllm $vllm_api manage_vllm_server.sh VLLM_KV_CACHE_DTYPE=fp8; stopall"
+      if [ "$needs_lmcache" = "1" ]; then
+        sc="$sc; one vllm_lmcache vllm $vllm_api manage_vllm_server.sh VLLM_KV_TRANSFER_CONFIG='{\"kv_connector\":\"LMCacheConnectorV1\",\"kv_role\":\"kv_both\"}' LMCACHE_MAX_LOCAL_CPU_SIZE=${store_gib:-0}; { grep -lE \"'max_local_cpu_size': ${store_gib:-0}(\\.0)?,\" logs/vllm/vllm_*.log >/dev/null 2>&1 && echo START_OK:lmcache_store_${store_gib:-0}; } || { echo START_FAILED:lmcache_store_${store_gib:-0}; rc=1; }; stopall"
+      fi
+      # item 29: the reranker on the GPU while vLLM holds its default pool
+      sc="$sc; bash scripts/2_serving/manage_vllm_server.sh restart '$MODEL' && { $POD_PYTHON scripts/checks/probe_reranker_device.py --out logs/rerank_device_probe_beside_vllm.json && echo START_OK:rerank_beside_vllm || { echo START_FAILED:rerank_beside_vllm; rc=1; }; }; stopall"
+    fi
+    # the job exits 0 on purpose: the START_* markers carry each verdict and the
+    # check below names the failed configuration (a crashed job still fails here)
+    sc="$sc; n=1; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do n=\$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . || true); [ \"\$n\" -eq 0 ] && break; sleep 2; done; echo COMPUTE_APPS=\$n; echo START_CHECK_RC=\$rc; exit 0"
+    job_run start_check 2400 "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT$POD_ENGINE_ENV && $sc" "$LAND/logs/setup" || return 1
+    plan_only || { grep -E "START_(OK|FAILED):" "$JOB_LOG" | sed 's/^/  /'; }
+    if ! plan_only && grep -q "START_FAILED:" "$JOB_LOG"; then
+      printf '  [FAIL] a serving configuration the run stage would start for the first time did not start or serve (review 2026-10-13 A1); the launcher gate or the probe named it above\n'; return 1
+    fi
+    plan_only || grep -q "COMPUTE_APPS=0" "$JOB_LOG" || { printf '  [FAIL] start check: compute apps remain after stop\n'; return 1; }
+  else
+    say "stage 4 start check SKIPPED (START_CHECK=0 in the profile): the fp8 and LMCache starts and the GPU reranker beside vLLM first run in the run stage"
+  fi
   return 0
 }
 
 stage_calibrate() {
   pod_env
   local e launcher api out stamp
+  # Review 2026-10-13 item 3: per-engine resume. An engine whose calibration
+  # or ladder passed on THIS pod and build is not rerun when the stage is
+  # repeated after the other engine failed (a 7 to 9 h saving per resume).
+  local done_key; done_key="$(state get pod.id 2>/dev/null || true):$(state get build.sha 2>/dev/null || true)"
   for e in $CALIBRATE; do
     launcher="$(engine_launcher "$e")" || { printf '  [FAIL] unknown engine %s\n' "$e"; return 1; }
     api="$(engine_api "$e")"
     out="results/calibration/${EXP}_${e}.json"
+    if ! plan_only && [ "$(state get "calibration.cell_done.$e" 2>/dev/null || true)" = "$done_key" ] && [ -f "$EXTRAS/calibration/${EXP}_${e}.json" ]; then
+      say "calibrate_cell $e already passed on this pod and build ($done_key): skipped on this resume (review 2026-10-13 item 3)"
+      continue
+    fi
     job_run "calibrate_$e" 3600 "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT$POD_ENGINE_ENV && bash scripts/2_serving/$launcher start '$MODEL' && $POD_PYTHON scripts/3_run/calibrate_cell.py --backend $e --model '$MODEL' --api-base $api --manifest $CALIBRATION_MANIFEST --output $out --budget-fraction $CALIBRATION_BUDGET_FRACTION; rc=\$?; bash scripts/2_serving/$launcher stop; exit \$rc" "$LAND/logs/setup" || return 1
     run_step 0 "fetch calibration $e" -- pscp_from "$POD_REPO/$out" "$EXTRAS/calibration/${EXP}_${e}.json" || return 1
     plan_only && continue
-    run_step 0 "calibration $e: cal-v2 and floor-derived start" -- "$PY3" - "$EXTRAS/calibration/${EXP}_${e}.json" <<'PY' || return 1
+    run_step 0 "calibration $e: cal-v3 and floor-derived start" -- "$PY3" - "$EXTRAS/calibration/${EXP}_${e}.json" <<'PY' || return 1
 import json, sys
 d = json.load(open(sys.argv[1], encoding="utf-8"))
 pv = str(d.get("procedure_version", ""))
 src = d.get("start_qps_source")
 print(f"procedure_version={pv!r} start_qps_source={src!r} lambda_star={d.get('lambda_star')}")
-sys.exit(0 if pv.startswith("cal-v2") and src == "floor-service-rate" else 1)
+sys.exit(0 if pv.startswith("cal-v3") and src == "floor-service-rate" else 1)
 PY
+    state put "calibration.cell_done.$e" "$done_key"
   done
   stamp="$(date -u +%H%M%S)"
   plan_only || mkdir -p "$EXTRAS/calibration"
@@ -865,7 +981,7 @@ PY
   run_step 0 "scp floor table to the pod" -- pscp_to "$EXTRAS/calibration/floor_table_$stamp.json" "$POD_REPO/results/calibration/floor_table.json" || return 1
   # ADR-0154 (S0F-62): lambda* per budget rung, measured on the gold-fresh F2
   # workload under the plan's OWN relaunch for that rung (prefix OFF, the gold
-  # class budget), by the registered cal-v2 ladder through the runner. One job
+  # class budget), by the registered cal-v3 ladder through the runner. One job
   # per engine; the rungs are the session's budgeted rungs (the rehearsal's
   # collapsed ones under REHEARSAL_N) unless the profile names CALIBRATE_RUNGS.
   # The job starts and stops the engines itself (its relaunches ARE the plan's).
@@ -882,15 +998,32 @@ PY
   # (review MEDIUM 4); stage 12 pulls the whole rung-calibration tree.
   local rungs_root="results/rung-calibration/${RUN_ID}-$(date -u +%H%M%S)"
   plan_only || state put calibration.rungs_out_root "$rungs_root"
-  say "rung calibration (ADR-0154, ADR-0156): rungs $rungs per engine on the anchor and the smallest class, bound ${CALIBRATE_RUNGS_BOUND_S}s each, roots under $rungs_root"
+  # S0F-88 B-9 (owner ruling R5): RUNG_ALL_CLASSES=1 ladders every class
+  # between the two anchors at its own pressure rungs (no interpolation).
+  local allc=""; [ "${RUNG_ALL_CLASSES:-0}" = "1" ] && allc=" --all-classes"
+  # Review 2026-10-13 item 3 (S0F-77): LADDER_FAIL_FAST=1 stops a ladder at its
+  # first non-ESTIMATED rung; item 21: STEP_TIMEOUT_S bounds every window.
+  local ffast=""; [ "${LADDER_FAIL_FAST:-0}" = "1" ] && ffast=" --fail-fast"
+  local step_to=""; [ -z "${STEP_TIMEOUT_S:-}" ] || step_to=" CAGE_STEP_TIMEOUT_S=$STEP_TIMEOUT_S"
+  # Decision 5 (ADR-0169): the RULER instrument gets its own ladder on the
+  # anchor's budget whenever the session registers RULER cells on the engine
+  # (automatic in run_campaign.py); RULER_START_QPS, when set, replaces its
+  # floor window with an operator start (the remedy when the floor window
+  # reads too few unloaded rows).
+  local rstart=""; [ -z "${RULER_START_QPS:-}" ] || rstart=" --ruler-start-qps $RULER_START_QPS"
+  say "rung calibration (ADR-0154, ADR-0156, ADR-0169${allc:+, S0F-88 B-9 every class}): rungs $rungs per engine on the anchor, the RULER instrument (where registered) and the smallest class${allc:+ and every class between}, bound ${CALIBRATE_RUNGS_BOUND_S}s each, roots under $rungs_root"
   for e in $CALIBRATE; do
     out="results/calibration/rungs_${EXP}_${e}.json"
     local jrc=0
+    if ! plan_only && [ "$(state get "calibration.rungs_done.$e" 2>/dev/null || true)" = "$done_key" ] && [ -f "$EXTRAS/calibration/rungs_${EXP}_${e}.json" ]; then
+      say "rung calibration $e already passed on this pod and build ($done_key): skipped on this resume (review 2026-10-13 item 3)"
+      continue
+    fi
     # S0 attempt 2 (2026-10-10 01:00 UTC, ADR-0160): the ladder windows run the
     # runner in campaign mode, so the job carries the same seam env as the run
     # job (CAGE_PROVIDER, CAGE_HARDWARE, the poison strip); without them every
     # probe refused before its first request and all six rungs read PROBE_FAILED.
-    job_run "calibrate_rungs_$e" "$CALIBRATE_RUNGS_BOUND_S" "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT$POD_ENGINE_ENV && env $RUN_ENV_UNSET CAGE_PROVIDER=runpod CAGE_HARDWARE='$GPU_ID x $GPU_COUNT' $POD_PYTHON scripts/3_run/run_campaign.py calibrate-rungs --session $SESSION --engine $e --floor-table results/calibration/floor_table.json --calibration results/calibration/${EXP}_${e}.json --rungs $rungs$qm2$reh2 --seed $SEED --freeze-file $POD_FREEZE_FILE --out $out --out-root $rungs_root" "$LAND/logs/setup" || jrc=1
+    job_run "calibrate_rungs_$e" "$CALIBRATE_RUNGS_BOUND_S" "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT$POD_ENGINE_ENV && env $RUN_ENV_UNSET CAGE_PROVIDER=runpod CAGE_HARDWARE='$GPU_ID x $GPU_COUNT'$step_to $POD_PYTHON scripts/3_run/run_campaign.py calibrate-rungs --session $SESSION --engine $e --floor-table results/calibration/floor_table.json --calibration results/calibration/${EXP}_${e}.json --rungs $rungs$qm2$reh2$allc$ffast$rstart --seed $SEED --freeze-file $POD_FREEZE_FILE --out $out --out-root $rungs_root" "$LAND/logs/setup" || jrc=1
     if [ "$jrc" -ne 0 ]; then
       # calibrate-rungs exits 1 when a rung is not ESTIMATED and still writes
       # the artifact: fetch it so the labels are readable on the Mac (review LOW 10).
@@ -914,6 +1047,7 @@ if d.get("schema") != "cage-rung-calibration-v2" or not rungs or not classes or 
     print("  [FAIL] rung(s) not ESTIMATED: %s (ADR-0154, ADR-0156: the plan refuses them; LADDER_EXHAUSTED: raise the start rate or the rung is beyond the ladder ceiling; NONE_SUSTAINABLE: lower it, or on the smallest class the ladder is defective; RELAUNCH_FAILED / PROBE_FAILED: read logs/setup/calibrate_rungs_<engine>.log)" % (bad or d.get("schema")))
     sys.exit(1)
 PY
+    state put "calibration.rungs_done.$e" "$done_key"
   done
   return 0
 }
@@ -927,12 +1061,15 @@ stage_plan() {
   # (every arm, engine, hf cell, RULER task and rung; the axes collapsed; one
   # window per cell; every row class at REHEARSAL_N); empty = the registered plan.
   local reh=""; [ -z "${REHEARSAL_N:-}" ] || reh=" --rehearsal-n $REHEARSAL_N"
-  job_run plan 900 "cd $POD_REPO && $POD_PYTHON scripts/3_run/run_campaign.py plan --session $SESSION --floor-table results/calibration/floor_table.json --window-duration-s $WINDOW_DURATION_S --seed $SEED$qm$cal$reh --calibration-budget-fraction $CALIBRATION_BUDGET_FRACTION --freeze-file $POD_FREEZE_FILE --out results/calibration/plan_$RUN_ID.json" "$LAND/logs/setup" || return 1
+  # review 2026-10-13 A2: FRONT_LOAD=1 (S0) runs one segment of each first-contact kind first
+  local front=""; [ "${FRONT_LOAD:-0}" = "1" ] && front=" --front-load-first-contacts"
+  job_run plan 900 "cd $POD_REPO && $POD_PYTHON scripts/3_run/run_campaign.py plan --session $SESSION --floor-table results/calibration/floor_table.json --window-duration-s $WINDOW_DURATION_S --seed $SEED$qm$cal$reh --calibration-budget-fraction $CALIBRATION_BUDGET_FRACTION --freeze-file $POD_FREEZE_FILE$front --out results/calibration/plan_$RUN_ID.json" "$LAND/logs/setup" || return 1
   run_step 0 "fetch plan.json" -- pscp_from "$POD_REPO/results/calibration/plan_$RUN_ID.json" "$EXTRAS/plan.json" || return 1
   plan_only && return 0
-  run_step 0 "plan argv audit (S0F-26)" -- "$PY3" - "$EXTRAS/plan.json" <<'PY' || return 1
+  run_step 0 "plan argv audit (S0F-26) and run projection (S0F-88 B-5)" -- "$PY3" - "$EXTRAS/plan.json" "$HOURS" "${PRICE:-}" <<'PY' || return 1
 import json, sys
 plan = json.load(open(sys.argv[1], encoding="utf-8"))
+hours, price = float(sys.argv[2]), sys.argv[3].strip()
 steps = plan.get("steps", [])
 cells = [s for s in steps if s.get("kind") != "relaunch"]
 bad = []
@@ -962,6 +1099,21 @@ if ws.get("executable_pressure_cells"):
         print(f"  class {seq} tokens: {rec['cells']} cells, {rec['below_floor']} below floor, min {rec['min_s']:.3g} s")
     if ws["below_floor"]:
         print(f"  [WARN] {ws['below_floor']} pressure window(s) span less than the {ws['floor_s']:g} s warm-up transient at W = per_row_n.window_requests (S0F-68): their regime labels rest on a few sampler ticks; W is registered, raising it is the owner's decision")
+# S0F-88 B-5 (owner ruling R9): the measured projection against the run bound
+rp = plan.get("run_projection")
+if not isinstance(rp, dict):
+    bad.append("the plan carries no run_projection (S0F-88 B-5): re-plan with the current code")
+else:
+    cost = f", about {rp['total_h'] * float(price):.0f} USD at {price} USD/h" if price else ""
+    print(f"run projection (S0F-88 B-5): {rp['total_h']:.2f} h against the {hours:g} h bound{cost} "
+          f"(relaunch {rp['by_kind_s']['relaunch']:.0f} s, dry windows {rp['by_kind_s']['dry_window']:.0f} s, "
+          f"cells {rp['by_kind_s']['cell']:.0f} s; {rp['source']}; {rp['note']})")
+    if rp["unmeasured_steps"]:
+        bad.append(f"{len(rp['unmeasured_steps'])} plan step(s) have no measured duration (e.g. {rp['unmeasured_steps'][0]}): "
+                   "the run time cannot be projected; measure them or extend RUN_*_SECONDS with an ADR")
+    if rp["total_s"] > hours * 3600:
+        bad.append(f"the projected run ({rp['total_h']:.2f} h) exceeds HOURS={hours:g}: the job would be killed at the "
+                   "bound while still billing; raise HOURS in the profile (the seatbelt must cover it) or cut the plan")
 for b in bad: print("  [FAIL] " + b)
 sys.exit(1 if bad else 0)
 PY
@@ -980,7 +1132,8 @@ stage_run() {
   else
     printf '  [plan] monitor_pod.sh in the background: --pod %s --run-root %s --interval %s\n' "$POD_ID" "$POD_RUN_ROOT" "$MONITOR_INTERVAL_S"
   fi
-  run_step 0 "backup daemon start" -- pssh "cd $POD_REPO && CAGE_BACKUP_TARGET=$BACKUP_TARGET CAGE_BACKUP_INTERVAL=$BACKUP_INTERVAL_S bash scripts/5_observability/gcs_backup_daemon.sh start $BACKUP_RUN_REL && bash scripts/5_observability/gcs_backup_daemon.sh status $BACKUP_RUN_REL" || return 1
+  local arch=""; [ -z "${BACKUP_ARCHIVE_DIR:-}" ] || arch=" CAGE_BACKUP_ARCHIVE_DIR=$BACKUP_ARCHIVE_DIR CAGE_BACKUP_ARCHIVE_EVERY=${BACKUP_ARCHIVE_EVERY:-6}"
+  run_step 0 "backup daemon start" -- pssh "cd $POD_REPO && CAGE_BACKUP_TARGET=$BACKUP_TARGET CAGE_BACKUP_INTERVAL=$BACKUP_INTERVAL_S$arch bash scripts/5_observability/gcs_backup_daemon.sh start $BACKUP_RUN_REL && bash scripts/5_observability/gcs_backup_daemon.sh status $BACKUP_RUN_REL" || return 1
   plan_only || step_has "[gcs-backup] RUNNING (" || { printf '  [FAIL] backup daemon not RUNNING\n'; return 1; }
   # Blocked cells (a registered arm an engine's frozen launcher cannot serve,
   # e.g. retr-store on sglang) make run_campaign.py run REFUSE the whole plan
@@ -1002,7 +1155,18 @@ stage_run() {
     fi
   fi
   local name="run"
-  run_step 0 "job $name: submit" -- bash "$PODJOB" submit "$name" "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH$POD_ENGINE_ENV && env $RUN_ENV_UNSET CAGE_RUN_ROOT=$POD_RUN_ROOT VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT CAGE_PROVIDER=runpod CAGE_HARDWARE='$GPU_ID x $GPU_COUNT' $POD_PYTHON scripts/3_run/run_campaign.py run --plan results/calibration/plan_$RUN_ID.json --campaign-root $POD_RUN_ROOT --seal$partial" "$bound" || return 1
+  # Review 2026-10-13: item 21's step timeout and decision 10's dry-window
+  # telemetry rerun ride the run job when the profile sets them (S0 keys).
+  local run_to="" dry_rerun="" rr_rev=""
+  [ -z "${STEP_TIMEOUT_S:-}" ] || run_to=" CAGE_STEP_TIMEOUT_S=$STEP_TIMEOUT_S"
+  # review 2026-10-13 item 9: the frozen reranker revision (INSTRUMENT_REVISIONS.reranker)
+  # pins the GPU reranker at load, the way CAGE_*_REVISION pins the scoring instruments
+  rr_rev="$("$PY3" -c 'import json,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); print(((d.get("INSTRUMENT_REVISIONS") or {}).get("reranker") or {}).get("revision") or "")' "$FREEZE_FILE" 2>/dev/null || true)"
+  [ -z "$rr_rev" ] || run_to="$run_to CAGE_RERANKER_REVISION=$rr_rev"
+  [ "${DRY_TELEMETRY_RERUN:-0}" = "1" ] && dry_rerun=" --dry-window-telemetry-rerun"
+  # review 2026-10-13 B1: RUN_FAIL_FAST=infra|all (S0) stops the run at its first infrastructure failure
+  [ -z "${RUN_FAIL_FAST:-}" ] || dry_rerun="$dry_rerun --fail-fast $RUN_FAIL_FAST"
+  run_step 0 "job $name: submit" -- bash "$PODJOB" submit "$name" "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH$POD_ENGINE_ENV && env $RUN_ENV_UNSET CAGE_RUN_ROOT=$POD_RUN_ROOT VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT CAGE_PROVIDER=runpod CAGE_HARDWARE='$GPU_ID x $GPU_COUNT'$run_to $POD_PYTHON scripts/3_run/run_campaign.py run --plan results/calibration/plan_$RUN_ID.json --campaign-root $POD_RUN_ROOT --seal$partial$dry_rerun" "$bound" || return 1
   if plan_only; then
     printf '  [plan] %-28s expect DONE(0) or STOP FAILED(2); DRY WINDOW FAILED(3) fails the stage: bash %s wait run %s\n' "job run: wait" "$PODJOB" "$bound"
     return 0
@@ -1020,15 +1184,38 @@ stage_run() {
     elif grep -q "DRY WINDOW FAILED" "$JOB_LOG" 2>/dev/null && grep -q "FAILED(3)" "$EXTRAS/steps/run_wait.log"; then
       # ADR-0153: a dry window did not read IN_REGIME, so every pressure cell
       # of its (engine, demand class) was skipped with a sentinel: the tree is
-      # PARTIAL and the stage fails loudly; the owner decides what runs next.
-      printf '  [FAIL] run ended with exit 3 = DRY WINDOW FAILED (ADR-0153): the pressure cells of these serving configurations never ran; the data tree is partial:\n'
+      # PARTIAL. Decision 3 (2026-10-13): under PARTIAL_TREE_OK=1 (S0 only) the
+      # stage passes as PARTIAL and the tree is sealed, scored and analyzed;
+      # otherwise it fails loudly and the owner decides what runs next.
+      printf '  [%s] run ended with exit 3 = DRY WINDOW FAILED (ADR-0153): the pressure cells of these serving configurations never ran; the data tree is partial:\n' "$(partial_ok && echo PARTIAL || echo FAIL)"
       grep "DRY WINDOW FAILED" "$JOB_LOG" | head -12
       grep -q "STOP FAILED" "$JOB_LOG" 2>/dev/null && printf '  [FAIL] the same run also reports STOP FAILED (an engine may still hold the GPU)\n'
-      state note run "exit 3: DRY WINDOW FAILED (ADR-0153); pressure cells skipped, see logs/runner/run.log"
-      return 1
+      if partial_ok; then
+        state note run "exit 3: DRY WINDOW FAILED (ADR-0153); PARTIAL tree accepted (PARTIAL_TREE_OK=1, decision 3 of 2026-10-13, S0 only)"
+        state put run.partial "exit 3: dry window(s) failed; pressure cells skipped"
+        say "PARTIAL tree accepted on the profile's PARTIAL_TREE_OK=1: the failed dry windows stay recorded; seal, score and analysis run on what executed"
+      else
+        state note run "exit 3: DRY WINDOW FAILED (ADR-0153); pressure cells skipped, see logs/runner/run.log"
+        return 1
+      fi
+    elif partial_ok && grep -q "^\[run_campaign\] totals:" "$JOB_LOG" 2>/dev/null && grep -q "FAILED(1)" "$EXTRAS/steps/run_wait.log"; then
+      # Decision 3: exit 1 = the run finished (its totals line printed) with
+      # failed cells or failed relaunches; a crash prints no totals line and
+      # still fails below.
+      printf '  [PARTIAL] run ended with exit 1 = failed cell(s) or relaunch(es); the data tree is partial:\n'
+      grep "^\[run_campaign\] totals:" "$JOB_LOG" | tail -1
+      grep -E "^\s+\[ *(failed|skipped-launch-failed)\]" "$JOB_LOG" | head -12
+      state note run "exit 1: failed cell(s) or relaunch(es); PARTIAL tree accepted (PARTIAL_TREE_OK=1, decision 3 of 2026-10-13, S0 only)"
+      state put run.partial "exit 1: failed cell(s) or relaunch(es)"
+      say "PARTIAL tree accepted on the profile's PARTIAL_TREE_OK=1: the failed cells stay recorded (verify_results names them FAIL); seal, score and analysis run on what executed"
     else
       printf '  [FAIL] run ended %s (see %s)\n' "$(tail -n 1 "$EXTRAS/steps/run_wait.log")" "$JOB_LOG"; return 1
     fi
+  fi
+  if run_partial; then
+    # a PARTIAL tree carries sentinels by definition; every executed window still needs its regime.json
+    run_step 0 "every executed window has regime.json (PARTIAL tree: sentinels expected)" -- pssh "s=\$(find $POD_RUN_ROOT/cells -name '.STATUS-*' 2>/dev/null | wc -l | tr -d ' '); w=\$(find $POD_RUN_ROOT/cells -type d -name 'window_*' 2>/dev/null | wc -l | tr -d ' '); r=\$(find $POD_RUN_ROOT/cells -name regime.json 2>/dev/null | wc -l | tr -d ' '); echo sentinels=\$s windows=\$w regimes=\$r; [ \"\$w\" -gt 0 ] && [ \"\$w\" -eq \"\$r\" ]" || return 1
+    return 0
   fi
   run_step 0 "no failure sentinel, every window has regime.json" -- pssh "s=\$(find $POD_RUN_ROOT/cells -name '.STATUS-*' 2>/dev/null | wc -l | tr -d ' '); w=\$(find $POD_RUN_ROOT/cells -type d -name 'window_*' 2>/dev/null | wc -l | tr -d ' '); r=\$(find $POD_RUN_ROOT/cells -name regime.json 2>/dev/null | wc -l | tr -d ' '); echo sentinels=\$s windows=\$w regimes=\$r; [ \"\$s\" -eq 0 ] && [ \"\$w\" -gt 0 ] && [ \"\$w\" -eq \"\$r\" ]" || return 1
   return 0
@@ -1050,10 +1237,15 @@ stage_monitor() {
     tail -n 20 "$EXTRAS/monitor/monitor.out" 2>/dev/null | sed 's/^/    /'
     return 1
   fi
-  if [ -f "$EXTRAS/monitor/alerts.log" ] && grep -q "HARD" "$EXTRAS/monitor/alerts.log"; then
-    printf '  [FAIL] unacknowledged HARD alerts:\n'; grep "HARD" "$EXTRAS/monitor/alerts.log" | tail -n 10
+  # A PARTIAL tree (decision 3) carries failure sentinels by definition, so the
+  # monitor's "new failure sentinel" HARD lines are the recorded failures, not
+  # an unacknowledged alert; every other HARD line still fails the stage.
+  local hard_filter="cat"; run_partial && hard_filter="grep -v 'new failure sentinel'"
+  if [ -f "$EXTRAS/monitor/alerts.log" ] && grep "HARD" "$EXTRAS/monitor/alerts.log" | eval "$hard_filter" | grep -q "HARD"; then
+    printf '  [FAIL] unacknowledged HARD alerts:\n'; grep "HARD" "$EXTRAS/monitor/alerts.log" | eval "$hard_filter" | tail -n 10
     printf '  review them, then resume with --from seal\n'; return 1
   fi
+  run_partial && say "PARTIAL tree: $(grep -c 'new failure sentinel' "$EXTRAS/monitor/alerts.log" 2>/dev/null || echo 0) sentinel alert line(s) are the recorded failures (PARTIAL_TREE_OK=1)"
   state evidence monitor "$EXTRAS/monitor/status.json"
   return 0
 }
@@ -1061,6 +1253,17 @@ stage_monitor() {
 stage_seal() {
   pod_env
   if ! plan_only && pssh "test -f $POD_RUN_ROOT/ledger.json" 2>/dev/null; then say "already sealed (ledger.json present)"; return 0; fi
+  # S0F-88 audit (U9): run_campaign.py declines to seal a tree with failed or
+  # dry-failed cells (its --seal gate; --seal-partial is the explicit
+  # override), so this stage never seals after a failed run stage (a resume
+  # with --from seal). Blocked skips under SKIP_BLOCKED=1 stay sealable here
+  # (ADR-0144): the run stage passes with them.
+  local run_status; run_status="$(state status run)"
+  if ! plan_only && [ "$run_status" != "passed" ]; then
+    printf '  [FAIL] the run stage is %s, not passed: a tree with failed or dry-failed cells is never sealed by this stage (the run_campaign.py --seal gate); rerun the run stage, or seal by hand only on an explicit partial consent of the owner\n' "$run_status"
+    return 1
+  fi
+  run_partial && say "sealing a PARTIAL tree ($(state get run.partial)): the profile's PARTIAL_TREE_OK=1 is the recorded consent (decision 3 of 2026-10-13, S0 only); verify_results names every failed and skipped cell"
   job_run seal 600 "cd $POD_REPO && $POD_PYTHON scripts/3_run/seal_campaign_run.py $POD_RUN_ROOT" "$LAND/logs/runner" || return 1
   return 0
 }
@@ -1090,7 +1293,8 @@ stage_score() {
 stage_collect() {
   pod_env
   local backend; backend="$( [ "$BACKUP_SCHEME" = "file" ] && echo local || echo "$BACKUP_SCHEME")"
-  run_step 0 "backup daemon stop + marker check" -- pssh_once "cd $POD_REPO && t0=\$(date -u +%s); CAGE_BACKUP_TARGET=$BACKUP_TARGET bash scripts/5_observability/gcs_backup_daemon.sh stop $BACKUP_RUN_REL; m=\$(stat -c %Y .agent/last_sync_ok_$backend 2>/dev/null || echo 0); echo marker_mtime=\$m stop_started=\$t0; [ \"\$m\" -ge \"\$t0\" ]" || return 1
+  local arch2=""; [ -z "${BACKUP_ARCHIVE_DIR:-}" ] || arch2=" CAGE_BACKUP_ARCHIVE_DIR=$BACKUP_ARCHIVE_DIR"
+  run_step 0 "backup daemon stop + marker check" -- pssh_once "cd $POD_REPO && t0=\$(date -u +%s); CAGE_BACKUP_TARGET=$BACKUP_TARGET$arch2 bash scripts/5_observability/gcs_backup_daemon.sh stop $BACKUP_RUN_REL; m=\$(stat -c %Y .agent/last_sync_ok_$backend 2>/dev/null || echo 0); echo marker_mtime=\$m stop_started=\$t0; [ \"\$m\" -ge \"\$t0\" ]" || return 1
   local token="collect_${EXP}_$(date -u +%Y%m%d_%H%M%S)"
   job_run collect 1800 "cd $POD_REPO && CAGE_BACKUP_TARGET=$BACKUP_TARGET CAGE_COLLECT_TOKEN=$token bash scripts/5_observability/collect_logs.sh" "$LAND/logs/system" || return 1
   plan_only || grep -q "sentinel=COLLECT_OK_$token" "$JOB_LOG" || { printf '  [FAIL] collect_logs.sh wrote no COLLECT_OK_%s sentinel\n' "$token"; return 1; }
@@ -1117,16 +1321,28 @@ stage_pull() {
   if plan_only; then
     printf '  [plan] %-28s pscp_from %s/results/rung-calibration/. and every %s-dry-* sibling\n' "pull rung + dry evidence" "$POD_REPO" "$POD_RUN_ROOT"
   else
+    # review 2026-10-13 item 20: a dropped copy used to WARN and teardown could
+    # then delete the only copy; the pull fails the stage, and the regime.json
+    # count on the Mac must equal the pod's for every tree pulled
     mkdir -p "$LAND/run/rung-calibration"
+    local n_pod n_mac
     if pssh "test -d $POD_REPO/results/rung-calibration" >/dev/null 2>&1; then
-      pscp_from "$POD_REPO/results/rung-calibration/." "$LAND/run/rung-calibration/" || printf '  [WARN] rung-calibration windows not pulled\n'
+      pscp_from "$POD_REPO/results/rung-calibration/." "$LAND/run/rung-calibration/" || { printf '  [FAIL] rung-calibration windows not pulled (the ladder evidence behind every lambda*)\n'; return 1; }
+      n_pod="$(pssh "find $POD_REPO/results/rung-calibration -name regime.json 2>/dev/null | wc -l | tr -d ' '" 2>/dev/null || echo "?")"
+      n_mac="$(find "$LAND/run/rung-calibration" -name regime.json 2>/dev/null | wc -l | tr -d ' ')"
+      [ "$n_pod" = "$n_mac" ] || { printf '  [FAIL] rung-calibration pull incomplete: %s regime.json on the pod, %s on the Mac\n' "$n_pod" "$n_mac"; return 1; }
+      say "rung-calibration evidence pulled: $n_mac window(s) (count matches the pod)"
     else
       say "no rung-calibration tree on the pod (no ladder ran)"
     fi
-    local dry_root
+    local dry_root local_dry
     for dry_root in $(pssh "ls -d ${POD_RUN_ROOT}-dry-* 2>/dev/null" 2>/dev/null || true); do
-      mkdir -p "$(dirname "$RUN_LOCAL")/$(basename "$dry_root")"
-      pscp_from "$dry_root/." "$(dirname "$RUN_LOCAL")/$(basename "$dry_root")/" || printf '  [WARN] dry root %s not pulled\n' "$dry_root"
+      local_dry="$(dirname "$RUN_LOCAL")/$(basename "$dry_root")"
+      mkdir -p "$local_dry"
+      pscp_from "$dry_root/." "$local_dry/" || { printf '  [FAIL] dry root %s not pulled (the regime gate evidence)\n' "$dry_root"; return 1; }
+      n_pod="$(pssh "find $dry_root -name regime.json 2>/dev/null | wc -l | tr -d ' '" 2>/dev/null || echo "?")"
+      n_mac="$(find "$local_dry" -name regime.json 2>/dev/null | wc -l | tr -d ' ')"
+      [ "$n_pod" = "$n_mac" ] || { printf '  [FAIL] dry root %s pull incomplete: %s regime.json on the pod, %s on the Mac\n' "$dry_root" "$n_pod" "$n_mac"; return 1; }
     done
   fi
   return 0
@@ -1136,7 +1352,50 @@ stage_analyze() {
   pod_env
   local force=""
   [ -d "$RUN_LOCAL/index" ] && force="--force"
-  run_step 0 "verify_results" -- "$PY" "$SCRIPTS/4_analysis/verify_results.py" "$RUN_LOCAL" --out "$EXTRAS/verify_$(date -u +%H%M%S)" || return 1
+  # Review 2026-10-13 item 18 (decision 6): the regime labels of every pressure
+  # window, by engine and family, printed before anything is analyzed; with
+  # MIN_IN_REGIME_WINDOWS set (per engine), fewer IN_REGIME pressure windows
+  # fail the stage (attempt 4: 0 of 23 measured windows were IN_REGIME and
+  # every stage passed). Empty = report only.
+  run_step 0 "regime label table (item 18)" -- "$PY3" - "$RUN_LOCAL" "${MIN_IN_REGIME_WINDOWS:-}" <<'PY' || return 1
+import json, sys
+from collections import Counter
+from pathlib import Path
+root = Path(sys.argv[1]); need = sys.argv[2].strip()
+by_pair = {}
+for regime in sorted(root.glob("cells/*/window_*/regime.json")):
+    parts = regime.parent.parent.name.split("|")
+    if len(parts) < 7:
+        continue
+    engine, family = parts[4], parts[6]
+    try:
+        label = str(json.load(open(regime, encoding="utf-8")).get("label"))
+    except Exception:
+        label = "unreadable"
+    by_pair.setdefault((engine, family), Counter())[label] += 1
+print("regime labels per (engine, family): " + ("; ".join(
+    f"{e} {f}: " + ", ".join(f"{l}={n}" for l, n in sorted(c.items())) for (e, f), c in sorted(by_pair.items())) or "no window"))
+in_regime = {}
+for (e, f), c in by_pair.items():
+    if f in ("F2", "F3"):
+        in_regime[e] = in_regime.get(e, 0) + c.get("IN_REGIME", 0)
+print("IN_REGIME pressure windows per engine: " + (", ".join(f"{e}={n}" for e, n in sorted(in_regime.items())) or "none"))
+if need:
+    short = {e: n for e, n in in_regime.items() if n < int(need)}
+    engines = {e for (e, f) in by_pair}
+    short.update({e: 0 for e in engines if e not in in_regime and e != "hf"})
+    if short:
+        print(f"  [FAIL] MIN_IN_REGIME_WINDOWS={need}: engine(s) below it: {short} (decision 6, 2026-10-13)")
+        sys.exit(1)
+PY
+  # A PARTIAL tree (decision 3) verifies with FAIL findings on its failed cells
+  # (R15); the report is the deliverable, so rc 1 is expected there and noted.
+  local vexp=0; run_partial && vexp="0|1"
+  run_step "$vexp" "verify_results" -- "$PY" "$SCRIPTS/4_analysis/verify_results.py" "$RUN_LOCAL" --out "$EXTRAS/verify_$(date -u +%H%M%S)" || return 1
+  if run_partial && ! plan_only && ! step_has "[verify_results] OK"; then
+    say "verify_results reports FAIL findings on the PARTIAL tree (expected: the failed cells, R15); see the step log"
+    state note analyze "verify_results reported FAIL findings on the PARTIAL tree (PARTIAL_TREE_OK=1)"
+  fi
   # shellcheck disable=SC2086
   run_step 0 "organize_results" -- "$PY" "$SCRIPTS/4_analysis/organize_results.py" "$RUN_LOCAL" $force || return 1
   # The driver's one-look lock refuses a second run on the same root (review

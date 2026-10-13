@@ -1631,10 +1631,14 @@ def plot_quality_vs_rho_own(
     identity — §8.12 registers the curve per mechanism × engine, so cells
     are never pooled into one line). X = the pinned ρ_own bins in occupancy
     order (interval categories of a continuous axis, so a connecting line is
-    legitimate); each point annotated with its window count. Colors map
-    through ``ps.categorical_colors`` and FAIL LOUD past its 8-cell budget
-    (facet or regroup — never silently truncate). Y range is data-driven —
-    quality instruments are 0-1 but the join is metric-agnostic.
+    legitimate); each point annotated with its window count. Panels are
+    faceted per (engine, family) row x dataset column (S0F-88 item 15: S0
+    attempt 4's tree carried 10 cell identities and attempt 5 carries 23,
+    and one panel of them would exceed ``ps.categorical_colors``' 8-color
+    budget); a panel row whose cells still exceed the budget is split into
+    labeled parts, so nothing is truncated and nothing refuses. Colors are
+    assigned per panel row. Y range is data-driven: quality instruments are
+    0-1 but the join is metric-agnostic.
     """
     _require_columns(df, list(_RHO_CURVE_COLUMNS), "plot_quality_vs_rho_own")
     _one_metric(df, config.metric, "plot_quality_vs_rho_own")
@@ -1642,7 +1646,7 @@ def plot_quality_vs_rho_own(
 
     datasets = sorted(df[config.dataset_col].astype(str).unique())
     curve_keys = sorted(df["curve_key"].astype(str).unique())
-    colors = ps.categorical_colors(curve_keys, "plot_quality_vs_rho_own: cell")
+    panel_rows = _rho_panel_rows(curve_keys)
     bin_order = (
         df[["rho_bin", "rho_min"]]
         .groupby("rho_bin", observed=True)["rho_min"]
@@ -1653,58 +1657,85 @@ def plot_quality_vs_rho_own(
     n_panel = len(datasets)
     fig_w = min(ps.FULL_WIDTH_IN, 1.4 + 2.2 * n_panel)
     fig, axes = plt.subplots(
-        1, n_panel, figsize=(fig_w, 2.6), sharey=True, squeeze=False
+        len(panel_rows), n_panel, figsize=(fig_w, 2.6 * len(panel_rows)),
+        sharey=True, squeeze=False,
     )
-    for ax, ds in zip(axes[0], datasets):
-        panel = df[df[config.dataset_col].astype(str) == ds]
-        for key in curve_keys:
-            by_bin = panel[panel["curve_key"].astype(str) == key].set_index(
-                "rho_bin"
-            )
-            xs, ys, ns = [], [], []
-            for i, b in enumerate(bin_order):
-                if b not in by_bin.index:
-                    continue
-                row = by_bin.loc[b]
-                xs.append(i)
-                ys.append(float(row["mean_value"]))
-                ns.append(int(row["n_windows"]))
-            if not xs:
-                continue  # this cell has no windows on this dataset
-            ax.plot(
-                xs, ys, marker="o", ms=4.5, lw=1.1, color=colors[key],
-                zorder=3, label=key,
-            )
-            for x, y, n in zip(xs, ys, ns):
-                ax.annotate(
-                    f"n={n}", xy=(x, y), xytext=(0, 5),
-                    textcoords="offset points", ha="center", fontsize=6.5,
-                    color="0.3",
+    for row_axes, (row_label, row_keys) in zip(axes, panel_rows):
+        colors = ps.categorical_colors(row_keys, "plot_quality_vs_rho_own: cell")
+        seen: dict[str, Any] = {}
+        for ax, ds in zip(row_axes, datasets):
+            panel = df[df[config.dataset_col].astype(str) == ds]
+            for key in row_keys:
+                by_bin = panel[panel["curve_key"].astype(str) == key].set_index(
+                    "rho_bin"
                 )
-        ax.set_xticks(range(len(bin_order)))
-        ax.set_xticklabels(bin_order, rotation=45, ha="right", fontsize=7)
-        ax.set_title(str(ds))
-        ax.set_xlabel("ρ_own bin (own accounting, §8.8)")
-    axes[0][0].set_ylabel(f"mean {config.metric}\n(per-window means)")
-    # One figure-level legend (curves are color-consistent across panels);
-    # a key can be absent from the first panel, so collect over all of them.
-    seen: dict[str, Any] = {}
-    for ax in axes[0]:
-        for handle, label in zip(*ax.get_legend_handles_labels()):
-            seen.setdefault(label, handle)
-    fig.legend(
-        [seen[k] for k in curve_keys if k in seen],
-        [k for k in curve_keys if k in seen],
-        loc="upper left", bbox_to_anchor=(0.0, -0.02), fontsize=6,
-        ncol=1, frameon=False, title="cell (mechanism × engine)",
-        title_fontsize=6.5,
-    )
+                xs, ys, ns = [], [], []
+                for i, b in enumerate(bin_order):
+                    if b not in by_bin.index:
+                        continue
+                    row = by_bin.loc[b]
+                    xs.append(i)
+                    ys.append(float(row["mean_value"]))
+                    ns.append(int(row["n_windows"]))
+                if not xs:
+                    continue  # this cell has no windows on this dataset
+                ax.plot(
+                    xs, ys, marker="o", ms=4.5, lw=1.1, color=colors[key],
+                    zorder=3, label=key,
+                )
+                for x, y, n in zip(xs, ys, ns):
+                    ax.annotate(
+                        f"n={n}", xy=(x, y), xytext=(0, 5),
+                        textcoords="offset points", ha="center", fontsize=6.5,
+                        color="0.3",
+                    )
+            ax.set_xticks(range(len(bin_order)))
+            ax.set_xticklabels(bin_order, rotation=45, ha="right", fontsize=7)
+            ax.set_title(f"{ds}: {row_label}", fontsize=8)
+            ax.set_xlabel("ρ_own bin (own accounting, §8.8)")
+            for handle, label in zip(*ax.get_legend_handles_labels()):
+                seen.setdefault(label, handle)
+        row_axes[0].set_ylabel(f"mean {config.metric}\n(per-window means)")
+        # One legend per panel row, outside its last panel: colors are
+        # assigned per row, so a figure-level legend would be wrong.
+        row_axes[-1].legend(
+            [seen[k] for k in row_keys if k in seen],
+            [k for k in row_keys if k in seen],
+            loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=6,
+            frameon=False, title="cell (mechanism × engine)",
+            title_fontsize=6.5,
+        )
     if config.title:
-        fig.suptitle(config.title, y=1.06)
+        fig.suptitle(config.title, y=1.0 + 0.06 / len(panel_rows))
     fig.tight_layout()
     outpath = Path(outpath)
     ps.save_fig(fig, outpath)
     return outpath
+
+
+def _rho_panel_rows(curve_keys: Sequence[str]) -> list[tuple[str, list[str]]]:
+    """(row label, cell keys) per panel row of ``plot_quality_vs_rho_own``:
+    one row per (engine, family) of the §8.12 curve identity
+    ``arm|retriever|policy|topology|engine|model|family[|cb...]``, split into
+    parts of at most the palette's size. A key without the 7 axes refuses
+    (``FigureDataError``): it is not a curve identity."""
+    budget = len(ps.CATEGORICAL_PALETTE)
+    groups: dict[tuple[str, str], list[str]] = {}
+    for key in curve_keys:
+        parts = str(key).split("|")
+        if len(parts) < 7 or any(not part for part in parts[:7]):
+            raise FigureDataError(
+                f"plot_quality_vs_rho_own: curve_key {key!r} does not carry the "
+                "7 canonical axes (arm|retriever|policy|topology|engine|model|family)"
+            )
+        groups.setdefault((parts[4], parts[6]), []).append(str(key))
+    rows: list[tuple[str, list[str]]] = []
+    for (engine, family), keys in sorted(groups.items()):
+        chunks = [keys[i:i + budget] for i in range(0, len(keys), budget)]
+        for i, chunk in enumerate(chunks):
+            part = f" (part {i + 1}/{len(chunks)})" if len(chunks) > 1 else ""
+            rows.append((f"{engine} {family}{part}", chunk))
+    return rows
 
 
 def plot_quality_vs_evidence_position(

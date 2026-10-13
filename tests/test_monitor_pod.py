@@ -141,7 +141,9 @@ def test_healthy_tick_writes_status_and_log_and_no_alert(world: Dict[str, Path])
 
 
 def test_pod_not_running_is_a_hard_alert_with_the_portal_block(world: Dict[str, Path]) -> None:
-    proc = _tick(world, CAGE_TEST_RUNTIME="initializing")
+    # MON_BLIP_TICKS=1: HARD on the first tick (review 2026-10-13 item 16 made
+    # the default 5 ticks in a row; this test exercises the portal block)
+    proc = _tick(world, CAGE_TEST_RUNTIME="initializing", MON_BLIP_TICKS="1")
     assert proc.returncode == 0
     st = _status(world)
     assert [a["level"] for a in st["alerts"]] == ["HARD"]
@@ -203,6 +205,29 @@ def test_an_ssh_blip_does_not_fire_a_sentinel_alert_on_the_next_tick(world: Dict
     assert st["run"]["sentinels_baseline"] == 0
 
 
+def test_a_blip_is_soft_until_it_lasts_five_ticks_in_a_row(world: Dict[str, Path]) -> None:
+    # Review 2026-10-13 item 16: one failed ssh bundle or one RunPod read that
+    # is not "running" is a blip (ADR-0161's grace, now for the monitor); it is
+    # HARD only on the fifth tick in a row, and a healthy tick resets the count.
+    for n in range(1, 5):
+        _tick(world, CAGE_TEST_SSH_DOWN="1")
+        st = _status(world)
+        assert st["run"]["blips"] == n
+        assert [a["level"] for a in st["alerts"]] == ["SOFT"], st["alerts"]
+        assert f"({n} tick(s) in a row; HARD at 5)" in st["alerts"][0]["text"]
+    _tick(world, CAGE_TEST_SSH_DOWN="1")
+    st = _status(world)
+    assert st["run"]["blips"] == 5 and [a["level"] for a in st["alerts"]] == ["HARD"]
+    _tick(world)
+    st = _status(world)
+    assert st["run"]["blips"] == 0 and st["alerts"] == []
+    alerts = (world["out"] / "alerts.log").read_text(encoding="utf-8")
+    assert alerts.count(" SOFT ssh bundle failed") == 4 and alerts.count(" HARD ssh bundle failed") == 1
+    # a pod read that is not "running" counts the same way
+    _tick(world, CAGE_TEST_RUNTIME="initializing")
+    assert [a["level"] for a in _status(world)["alerts"]] == ["SOFT"]
+
+
 def test_the_loop_ends_when_the_parent_is_gone(world: Dict[str, Path]) -> None:
     # Review 2026-10-06, LOW 17: no orphan monitor after a killed master.
     env = {k: v for k, v in os.environ.items() if not k.startswith("CAGE_")}
@@ -240,7 +265,9 @@ def test_error_lines_are_deduplicated_across_ticks_and_tracebacks_are_soft(world
 
 
 def test_ssh_failure_is_hard_and_the_tick_still_lands(world: Dict[str, Path]) -> None:
-    proc = _tick(world, CAGE_TEST_SSH_DOWN="1")
+    # MON_BLIP_TICKS=1: HARD on the first failed bundle (review 2026-10-13 item
+    # 16 made the default 5 ticks in a row; this test checks the tick lands)
+    proc = _tick(world, CAGE_TEST_SSH_DOWN="1", MON_BLIP_TICKS="1")
     assert proc.returncode == 0
     st = _status(world)
     assert any("ssh bundle failed" in a["text"] and a["level"] == "HARD" for a in st["alerts"])

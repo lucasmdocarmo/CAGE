@@ -581,7 +581,8 @@ def _stub_lettucedetect(monkeypatch: pytest.MonkeyPatch) -> None:
     flags the whole answer iff it contains 'HALLUC'."""
 
     class _Tok:
-        def __call__(self, texts: list[str], add_special_tokens: bool = False):
+        # **kw mirrors the HF tokenizer call (Q-7 passes verbose=False).
+        def __call__(self, texts: list[str], add_special_tokens: bool = False, **kw: Any):
             return {"input_ids": [[1] * len(t.split()) for t in texts]}
 
     class _Cfg:

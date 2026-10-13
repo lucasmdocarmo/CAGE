@@ -25,8 +25,10 @@
 #     CAMPAIGN TELEMETRY, UNKNOWN_TELEMETRY, RELAUNCH FAILED, STOP FAILED
 #   - every 15th tick: nvidia-smi -q (Xid, ECC, throttle counters) to a file
 #
-# Alerts (HARD stops the master only with --stop-on-alert; the master's stage 8
-# fails on any HARD line): runtimeStatus not running; watchdog not ALIVE;
+# Alerts (a HARD alert ends this loop only with --stop-on-alert; the master
+# never passes that flag and only reads alerts.log, where its stage 8 fails on
+# any HARD line): runtimeStatus not running or an ssh failure, HARD after
+# MON_BLIP_TICKS ticks in a row (review 2026-10-13 item 16); watchdog not ALIVE;
 # seatbelt under --seatbelt-floor-min (60) whatever the job state, because the
 # seatbelt deletes the pod mid-score or mid-pull just the same (review
 # 2026-10-06, HIGH 4); balance under the floor; the job CRASHED; a NEW failure
@@ -245,8 +247,16 @@ if ssh_ok and not run_dir:
     verdict = "no cell written yet (the run root has no cells/ directory)"
 
 alerts = []
-if ssh_rc not in ("0",): alerts.append(("HARD", f"ssh bundle failed (rc={ssh_rc}); the pod did not answer"))
-if runtime != "running": alerts.append(("HARD", f"runtimeStatus={runtime} (desiredStatus={desired or '?'})"))
+# Review 2026-10-13 item 16: one failed ssh bundle or one RunPod read that is
+# not "running" is a blip (ADR-0161 gave pod_job.sh and the master the same
+# grace); it is HARD only after MON_BLIP_TICKS ticks in a row (5 x 120 s =
+# 10 min by default), SOFT before, and the count is carried in status.json.
+blip_ticks = int(os.environ.get("MON_BLIP_TICKS", "5"))
+blips = int((prev.get("run") or {}).get("blips", 0) or 0)
+blips = blips + 1 if (ssh_rc not in ("0",) or runtime != "running") else 0
+blip_level = "HARD" if blips >= blip_ticks else "SOFT"
+if ssh_rc not in ("0",): alerts.append((blip_level, f"ssh bundle failed (rc={ssh_rc}); the pod did not answer ({blips} tick(s) in a row; HARD at {blip_ticks})"))
+if runtime != "running": alerts.append((blip_level, f"runtimeStatus={runtime} (desiredStatus={desired or '?'}) ({blips} tick(s) in a row; HARD at {blip_ticks})"))
 if not wd_alive: alerts.append(("HARD", f"watchdog not ALIVE: {watchdog or 'no status line'}"))
 seatbelt_floor = float(os.environ.get("MON_SEATBELT_FLOOR", "60"))
 if seatbelt_min_left is not None and seatbelt_min_left < seatbelt_floor:
@@ -286,7 +296,7 @@ status = {
             "hours": hours, "cost_usd": cost, "gpu_count": gpu_count, "cost_per_hour_usd": rate,
             "cost_basis": cost_basis, "balance": balance, "balance_utc": balance_utc},
     "run": {"watch_rc": watch_rc, "watch_verdict": verdict, "run_dir": run_dir, "sentinels": sentinels,
-            "sentinels_baseline": baseline, "ssh_ok": ssh_ok,
+            "sentinels_baseline": baseline, "ssh_ok": ssh_ok, "blips": blips,
             "journal_age_s": journal_age, "windows": windows, "regime": kv(ssh, "REGIME")[:300],
             "gpu": gpu_raw, "gpu_util": gpu_util, "compute_apps": toint(kv(ssh, "COMPUTE_APPS"), -1),
             "job_status": job_status, "sync_ok_mtime": sync_ok, "sync_fail_mtime": sync_fail, "ssh_rc": ssh_rc},

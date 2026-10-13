@@ -158,7 +158,11 @@ class ContextCompressor:
         try:
             tokenizer = getattr(comp, "tokenizer", None)
             if tokenizer is not None:
-                return len(tokenizer(joined, add_special_tokens=False)["input_ids"])
+                # S0F-88 audit (U10): this call only counts tokens, and on S0
+                # attempt 4 it was the source of transformers' "sequence length
+                # is longer than the specified maximum" warning; the count is
+                # what B3a needs, so the warning is dropped (verbose=False).
+                return len(tokenizer(joined, add_special_tokens=False, verbose=False)["input_ids"])
         except Exception:
             pass
         return self._approx_tokens(texts)

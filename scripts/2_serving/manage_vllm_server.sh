@@ -428,7 +428,14 @@ PYEOF
     rm -f "$LOG_DIR/CURRENT.kvpool.json" "$LOG_DIR/CURRENT.pd.kvpool.json"
 
     echo "Starting vLLM server (logging to $log_file)..."
-    nohup vllm serve "$model" "${vllm_args[@]}" > "$log_file" 2>&1 &
+    # S0F-88 audit (U10): these six are this launcher's own inputs, already
+    # turned into flags above. vLLM reads every VLLM_* variable and logged an
+    # "unknown environment variable" warning for each at every start on S0
+    # attempt 4, so the server starts without them. VLLM_PORT and
+    # VLLM_SERVER_DEV_MODE are vLLM's own settings and stay.
+    nohup env -u VLLM_GPU_MEMORY_UTILIZATION -u VLLM_ENFORCE_EAGER -u VLLM_START_TIMEOUT \
+        -u VLLM_MAX_MODEL_LEN -u VLLM_KV_CACHE_DTYPE -u VLLM_KV_TRANSFER_CONFIG \
+        vllm serve "$model" "${vllm_args[@]}" > "$log_file" 2>&1 &
 
     local server_pid=$!
     printf '%s\n' "$server_pid" > "$PID_FILE"
@@ -450,6 +457,7 @@ PYEOF
                 # S0F-24 (ADR-0142): record the realized KV pool for gate (j);
                 # the serving-config JSON (CAGE_RUN_ROOT only) gets it too.
                 cage_kv_pool_capture --engine vllm --log "$log_file" --out "$LOG_DIR/CURRENT.kvpool.json" ${cfg_file:+--merge-into "$cfg_file"}
+                vllm_kv_dtype_realized "$log_file" || { stop_server; return 1; }
                 return 0
             fi
         fi
@@ -460,6 +468,20 @@ PYEOF
     
     echo -e "\n${RED}✗ Server failed to start within ${max_wait}s${NC}"
     echo "Check logs: $log_file"
+    return 1
+}
+
+vllm_kv_dtype_realized() {
+    # S0F-88 U8: vLLM 0.19.1 prints "kv_cache_dtype=<value>, " in its
+    # "Initializing a V1 LLM engine" config line (vllm/config/vllm.py:1693,
+    # v1/engine/core.py:104-109); an explicit value passes through unchanged,
+    # and its attention path reads "fp8" as E4M3 (flash_attn.py:154-158).
+    [ -n "${VLLM_KV_CACHE_DTYPE:-}" ] || return 0
+    if grep -qF -- "kv_cache_dtype=${VLLM_KV_CACHE_DTYPE}, " "$1" 2>/dev/null; then
+        echo "  KV cache dtype realized: ${VLLM_KV_CACHE_DTYPE} (S0F-88 U8)"
+        return 0
+    fi
+    echo -e "${RED}✗ VLLM_KV_CACHE_DTYPE=${VLLM_KV_CACHE_DTYPE} but the start log never printed 'kv_cache_dtype=${VLLM_KV_CACHE_DTYPE}, ' (S0F-88 U8)${NC}"
     return 1
 }
 

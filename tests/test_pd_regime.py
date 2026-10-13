@@ -358,10 +358,14 @@ class TestWriteWindowRegimeRouting:
         # Path 1: no budgets, untagged series — the pre-T2.3 document,
         # byte-identical: same key set (no "pd"), same pinned numbers.
         doc = _run_bridge(tmp_path, _LEGACY_RECORDS, "legacy")
+        # S0F-88 B-11: two additive keys record clause (a)'s rule and ceiling;
+        # Q-8: one more records the hold rule (null here, the writer default)
         assert set(doc) == {
             "schema_version", "t_start", "t_end", "telemetry_source",
             "attainment", "telemetry_ok", "inputs", "label", "refusal_reason",
+            "kv_ceiling", "clause_a_rule", "max_hold_s",
         }
+        assert doc["max_hold_s"] is None
         assert "pd" not in doc
         assert doc["telemetry_ok"] is True
         assert doc["inputs"]["rho_kv_time_avg"] == pytest.approx(0.7)

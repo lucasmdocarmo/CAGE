@@ -430,12 +430,20 @@ def _rung_calibrations(tmp_path: Path, rungs=(1.0,)) -> Dict[str, Path]:
 
     directory = tmp_path / "cal"
     directory.mkdir(exist_ok=True)
+    table = {f"{r:g}": {"r": r, "label": "ESTIMATED", "lambda_star_qps": 8.0 * r,
+                        "sustained_rate_qps": 8.0 * r, "first_unsustainable_qps": 10.4 * r,
+                        "steps": []} for r in rungs}
     doc = {"schema": rc.RUNG_CALIBRATION_SCHEMA, "procedure_version": PROCEDURE_VERSION,
            "confirmatory": False, "engine": "vllm", "model": "Qwen/Qwen3-14B", "session": "a",
-           "workload": {}, "ladder": {},
-           "rungs": {f"{r:g}": {"r": r, "label": "ESTIMATED", "lambda_star_qps": 8.0 * r,
-                                "sustained_rate_qps": 8.0 * r, "first_unsustainable_qps": 10.4 * r,
-                                "steps": []} for r in rungs}}
+           "workload": {}, "ladder": {}, "rungs": table,
+           # ADR-0169: the ruler grid's RULER cells need the instrument's own ladder
+           "classes": {str(rc.RULER_RATE_CLASS_TOKENS): {
+               "role": rc.RULER_ROLE, "arm": "gold-fresh", "baseline_id": "B1", "family": "F2",
+               "prefix_mode": "OFF", "seq_tokens": rc.RULER_RATE_CLASS_TOKENS, "demand_seq_tokens": 4779,
+               "dataset": "ruler", "ruler_task": "qa", "floor": None,
+               "rungs": {f"{r:g}": {"r": r, "label": "ESTIMATED", "lambda_star_qps": 0.5 * r,
+                                    "sustained_rate_qps": 0.5 * r, "first_unsustainable_qps": 0.65 * r,
+                                    "steps": []} for r in rungs}}}}
     path = directory / "rungs_vllm.json"
     path.write_text(json.dumps(doc), encoding="utf-8")
     return {"vllm": path}

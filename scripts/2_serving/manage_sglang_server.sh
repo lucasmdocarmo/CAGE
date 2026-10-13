@@ -286,6 +286,9 @@ start_server() {
         # no running-requests gauge, so every window served from it would
         # record cold_start.verified == False. Restart rather than reuse.
         [[ " $live_cmd " == *" --enable-metrics "* ]] || dials_match=false
+        # The per-request cached-token report (S0F-88 U7) is a reuse
+        # requirement for the same reason: without it no row carries a count.
+        [[ " $live_cmd " == *" --enable-cache-report "* ]] || dials_match=false
 
         if [ "$loaded_model" = "$model" ] && [ "$has_prefix_cache" = "$want_prefix_cache" ] \
            && [ "$dials_match" = "true" ] \
@@ -385,6 +388,25 @@ print(f"{raised:.3f}")
 PY
 }
 
+_sglang_kv_dtype_realized() {
+    # S0F-88 U8: SGLang 0.5.10.post1 logs "Using KV cache dtype: <torch dtype>"
+    # at start (model_runner.py:1948; fp8_e4m3 selects torch.float8_e4m3fn,
+    # :1927-1931), so a requested fp8 format is proven served before any window
+    # runs. Only the campaign's format has a verified pattern; another one is
+    # reported unchecked, never passed on a guess.
+    case "${SGLANG_KV_CACHE_DTYPE:-}" in
+        "") return 0 ;;
+        fp8_e4m3) ;;
+        *) echo "  (no verified realized-dtype pattern for SGLANG_KV_CACHE_DTYPE=${SGLANG_KV_CACHE_DTYPE}; not checked)"; return 0 ;;
+    esac
+    if grep -qF -- "Using KV cache dtype: torch.float8_e4m3fn" "$1" 2>/dev/null; then
+        echo "  KV cache dtype realized: torch.float8_e4m3fn (S0F-88 U8)"
+        return 0
+    fi
+    echo -e "${RED}✗ SGLANG_KV_CACHE_DTYPE=fp8_e4m3 but the start log never said 'Using KV cache dtype: torch.float8_e4m3fn' (S0F-88 U8)${NC}"
+    return 1
+}
+
 _sglang_launch_once() {
     # One launch of the composed argv, the readiness wait and the pool capture
     # (the body of start_server before ADR-0162); $1 model, $2 want_prefix_cache,
@@ -412,6 +434,12 @@ _sglang_launch_once() {
     # S0-23. Unconditional on purpose: never an env knob, never optional.
     # [VERIFY-LIVE at S0]: flag spelling per SGLang's documented server CLI.
     sglang_args+=( --enable-metrics )
+    # S0F-88 U7: the per-request cached-token count (usage.prompt_tokens_details
+    # .cached_tokens). S0 attempt 4 ran without it, so no SGLang row carried a
+    # count and the prefix arms could not be compared with vLLM's (which
+    # always passes --enable-prompt-tokens-details). Unconditional, like
+    # --enable-metrics; the stage 4 probe proves the count on the pod.
+    sglang_args+=( --enable-cache-report )
 
     # Token-capped KV budget (T2.1; CacheBudgetPlanner SGLang knob, derived
     # FROM the byte budget). Passed in addition to the fraction dial — the
@@ -453,7 +481,8 @@ _sglang_launch_once() {
     fi
 
     # Optional server-side KV-cache compression (compressed_cag analogue), e.g.
-    #   SGLANG_KV_CACHE_DTYPE=fp8_e5m2 ./scripts/2_serving/manage_sglang_server.sh restart <model>
+    #   SGLANG_KV_CACHE_DTYPE=fp8_e4m3 ./scripts/2_serving/manage_sglang_server.sh restart <model>
+    # (the campaign serves fp8 as E4M3 on both engines, S0F-88 U8)
     if [ -n "${SGLANG_KV_CACHE_DTYPE:-}" ]; then
         sglang_args+=( --kv-cache-dtype "${SGLANG_KV_CACHE_DTYPE}" )
         echo "KV-cache compression enabled: --kv-cache-dtype ${SGLANG_KV_CACHE_DTYPE}"
@@ -573,6 +602,7 @@ PYEOF
             # S0F-24 (ADR-0142): record the realized KV pool for gate (j);
             # the serving-config JSON (CAGE_RUN_ROOT only) gets it too.
             cage_kv_pool_capture --engine sglang --log "$log_file" --out "$LOG_DIR/CURRENT.kvpool.json" ${cfg_file:+--merge-into "$cfg_file"}
+            _sglang_kv_dtype_realized "$log_file" || { stop_server; return 1; }
             return 0
         fi
         sleep 2

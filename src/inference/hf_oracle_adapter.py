@@ -237,6 +237,37 @@ class HFOracleAdapter(InferenceEngine):
         pad = self.tokenizer.pad_token_id
         return pad if pad is not None else self.tokenizer.eos_token_id
 
+    def render_messages(self, messages: Sequence[Dict[str, str]]) -> str:
+        """The chat-template text the serving engines answer (W19 option A).
+
+        Q-3 (S0F-88, owner ruling R10): the oracle served the flattened
+        fallback prompt (ending "\\nAnswer:") while vLLM and SGLang rendered
+        the Qwen3 chat template with ``enable_thinking=False``; every oracle
+        prompt was 12 tokens shorter than the engines' for the same example,
+        and 52 of 300 S0 attempt 4 answers were a single space (the model
+        completed "Answer:" with a space and a newline, which the "\\n" stop
+        cut). Same kwargs as the serving payloads (vllm_adapter.py:107,
+        sglang_adapter.SGLANG_CHAT_TEMPLATE_KWARGS) and run_cag_reference.py;
+        templates without the variable ignore it. The rendered text already
+        carries the special tokens, so it is tokenized without adding more.
+        """
+        return self.tokenizer.apply_chat_template(
+            list(messages),
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+
+    def _served_prompt(self, request: InferenceRequest) -> Tuple[str, bool]:
+        """(text served, add_special_tokens): the rendered chat template when
+        the request carries messages (Q-3), else the raw prompt as given."""
+        # ``messages`` is not an InferenceRequest field: the runner attaches it
+        # in chat mode (the serving adapters read it the same way).
+        messages = getattr(request, "messages", None)
+        if isinstance(messages, list) and messages:
+            return self.render_messages(messages), False
+        return request.prompt, True
+
     def _validate_request(self, request: InferenceRequest) -> None:
         """Fail closed on requests the T=0 greedy oracle cannot honor
         (sampling temperature, truncate_prompt_tokens); stop lists are
@@ -383,9 +414,13 @@ class HFOracleAdapter(InferenceEngine):
         """
         self._validate_request(request)
         torch = self._torch
+        # Q-3 (W19 option A): rendered BEFORE the clock, outside the per-row
+        # error handling, so a tokenizer without a chat template fails the
+        # cell instead of becoming 50 error rows.
+        prompt_text, add_special = self._served_prompt(request)
 
         reuse = self._corpus_cache is not None
-        if reuse and not request.prompt.startswith(self._corpus_prefix_text or ""):
+        if reuse and not prompt_text.startswith(self._corpus_prefix_text or ""):
             raise ValueError(
                 "prompt does not extend the preloaded corpus prefix -- refusing "
                 "to serve against a mismatched KV cache (the CAG recipe requires "
@@ -418,7 +453,7 @@ class HFOracleAdapter(InferenceEngine):
                 # base_len ids must equal the prefilled corpus ids, or the
                 # cache does not match the input: refuse, never an error row.
                 full = self.tokenizer(
-                    request.prompt, return_tensors="pt",
+                    prompt_text, return_tensors="pt",
                     add_special_tokens=self._corpus_add_special_tokens,
                 ).to(self.device)
                 base_len = self._corpus_base_len
@@ -450,7 +485,9 @@ class HFOracleAdapter(InferenceEngine):
                 gen_kwargs["attention_mask"] = full.attention_mask
                 gen_kwargs["past_key_values"] = self._corpus_cache
             else:
-                enc = self.tokenizer(request.prompt, return_tensors="pt").to(self.device)
+                enc = self.tokenizer(
+                    prompt_text, return_tensors="pt", add_special_tokens=add_special
+                ).to(self.device)
                 prompt_len = int(enc.input_ids.shape[1])
                 prompt_tokens = prompt_len
                 gen_kwargs["input_ids"] = enc.input_ids
@@ -563,7 +600,9 @@ class HFOracleAdapter(InferenceEngine):
             "kv_usage_gauge": False,
             "flush_endpoint": None,  # in-process: clear_corpus_prefix()
             "kv_transfer_params": False,
-            "chat_template_thinking_pin": False,  # caller renders prompts (see run_cag_reference.py chat seams)
+            # Q-3 (W19 option A): request.messages are rendered here with
+            # enable_thinking=False, the serving engines' pin.
+            "chat_template_thinking_pin": True,
             "logprobs": False,
             "truncate_prompt_tokens": False,
             "corpus_prefix_reuse": True,  # the manual CAG recipe (chan2024cag)

@@ -85,6 +85,7 @@ __all__ = [
     "QUEUE_SHARE_MIN",
     "RegimeLabel",
     "RHO_KV_MIN",
+    "RHO_KV_REL_MIN",
     "UNPRESSURED",
     "SLOBaseline",
     "TPOT_SLO_MULTIPLIER",
@@ -111,6 +112,14 @@ TPOT_SLO_MULTIPLIER: float = 5.0
 
 # §6.1 in-regime thresholds.
 RHO_KV_MIN: float = 0.9
+#: S0F-88 B-11 (owner ruling R3, charter §6.1 amendment; owner choice
+#: 2026-10-12 "0.95 x ceiling"): with a measured fill ceiling for the
+#: window's (engine, demand class, r), clause (a) passes when the queued
+#: occupancy median reaches this fraction of it. SGLang keeps a decode
+#: reserve, so its queued fill tops out at 0.85 to 0.95 depending on the pool
+#: (vLLM reaches 0.95); a fixed 0.9 excluded SGLang's small pools by design.
+#: 0.95 x 0.95 = 0.90: on vLLM the relative rule equals the absolute one.
+RHO_KV_REL_MIN: float = 0.95
 ATTAINMENT_MIN: float = 0.9
 #: ADR-0153 clause (b): the share of in-window telemetry samples whose
 #: waiting-request gauge reads > 0 (vLLM ``num_requests_waiting``; SGLang
@@ -883,6 +892,8 @@ def classify_regime(
     attainment: float,
     queue_waiting_share: float,
     scarcity_events: int | None = None,
+    rho_kv_queued_median: float | None = None,
+    kv_ceiling: float | None = None,
 ) -> RegimeLabel:
     """§6.1 3-layer in-regime criterion for one cell (clause (b) per ADR-0153).
 
@@ -898,6 +909,12 @@ def classify_regime(
     provenance and validated when given; it never decides the label
     (ADR-0153: both engines gate admission, so a full pool evicts nothing).
     Thresholds are inclusive.
+
+    S0F-88 B-11 (owner ruling R3, charter §6.1 amendment): clause (a) reads
+    ``rho_kv_queued_median`` (the occupancy WHILE requests wait) when it is
+    given, against ``RHO_KV_REL_MIN`` x ``kv_ceiling`` when the window's
+    measured fill ceiling is given and against ``RHO_KV_MIN`` otherwise. A
+    caller passing neither keeps the time-average rule unchanged.
     """
     for name, value in (
         ("rho_kv", rho_kv),
@@ -915,9 +932,23 @@ def classify_regime(
         if float(value) > 1.0:
             raise GoodputError(f"{name}={value!r} must be within [0, 1]")
     _check_scarcity_events(scarcity_events)
+    for name, value in (("rho_kv_queued_median", rho_kv_queued_median), ("kv_ceiling", kv_ceiling)):
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0
+        ):
+            raise GoodputError(f"{name}={value!r} must be a number within [0, 1]")
+    if kv_ceiling is not None and float(kv_ceiling) <= 0.0:
+        raise GoodputError(f"kv_ceiling={kv_ceiling!r} must be > 0 (a fill ceiling of a served pool)")
     if float(attainment) < ATTAINMENT_MIN:
         return PAST_CLIFF
-    if float(rho_kv) < RHO_KV_MIN or float(queue_waiting_share) < QUEUE_SHARE_MIN:
+    if rho_kv_queued_median is None:
+        pool_full = float(rho_kv) >= RHO_KV_MIN
+    elif kv_ceiling is None:
+        pool_full = float(rho_kv_queued_median) >= RHO_KV_MIN
+    else:
+        pool_full = float(rho_kv_queued_median) >= RHO_KV_REL_MIN * float(kv_ceiling)
+    if not pool_full or float(queue_waiting_share) < QUEUE_SHARE_MIN:
         return UNPRESSURED
     return IN_REGIME
 
