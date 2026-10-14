@@ -1890,3 +1890,30 @@ class TestRulerLadder:
         odd["classes"]["16384"] = {**odd["classes"].pop(key), "seq_tokens": 16384}
         with pytest.raises(rc.PlanError, match="request shape is 16384 tokens"):
             _ruler_plan(tmp_path, odd, grid)
+
+    def test_ruler_ladder_windows_pin_the_dataset_manifests_hash(self, tmp_path):
+        """S0 attempt 5 (2026-10-14): the SGLang RULER floor window was refused in
+        campaign mode ("dataset_manifests_sha256 unresolvable"): a ladder window
+        is the first emitter of its root and RULER has no query manifest. The
+        RULER ladder windows now carry the sha256 of the F2 dataset's manifest,
+        the value the run's RULER cells inherit from the first Qasper cell."""
+        import hashlib
+
+        manifest = Path(__file__).resolve().parents[1] / "data" / "manifests" / "qasper_100x3_seed42.json"
+        grid = _tiny_grid(
+            f1_baselines=("B1",), f2_baselines=("B1",), f2_budgets=(1.0, 0.5), f2_rates=(0.85,),
+            f2_ruler_baselines=("B1",), f2_ruler_tasks=("niah_multikey",), window_requests=50,
+        )
+        world = FakeWorld(cap=6.0, ruler_cap=0.4)
+        doc = _calibrate(tmp_path, world, grid, query_manifests={"qasper": manifest})
+        assert doc["classes"][str(rc.RULER_RATE_CLASS_TOKENS)]["rungs"]["1"]["label"] == "ESTIMATED"
+        want = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        ruler_envs = [e for a, e in world.runner_calls() if a[a.index("--dataset") + 1] == "ruler"]
+        anchor_calls = [(a, e) for a, e in world.runner_calls() if a[a.index("--dataset") + 1] == "qasper"]
+        assert ruler_envs and all(e["CAGE_DATASET_MANIFESTS_SHA256"] == want for e in ruler_envs)
+        # the anchor's windows resolve the hash from their --query-manifest, as before
+        assert anchor_calls and all("--query-manifest" in a and "CAGE_DATASET_MANIFESTS_SHA256" not in e for a, e in anchor_calls)
+        # without a registered F2 manifest nothing is pinned (the runner refuses loudly, as before)
+        plain = FakeWorld(cap=6.0, ruler_cap=0.4)
+        _calibrate(tmp_path / "plain", plain, _ruler_grid())
+        assert all("CAGE_DATASET_MANIFESTS_SHA256" not in e for _a, e in plain.runner_calls())

@@ -9069,6 +9069,19 @@ def calibrate_rungs(
                 budget_plan=relaunch["budget_plan"],
                 ladder=True,
             )
+            if manifest_rec is None and cell.dataset == "ruler":
+                # ADR-0169 (S0 attempt 5, 2026-10-14): a ladder window is the FIRST
+                # emitter of its own run root, and campaign mode resolves the
+                # dataset-manifests hash from CAGE_QUERY_MANIFEST (RULER has none)
+                # or from CAGE_DATASET_MANIFESTS_SHA256, else refuses ("unresolvable",
+                # the SGLang RULER floor window). The run's RULER cells inherit the
+                # hash from the manifest.json the first Qasper cell wrote; the ladder
+                # pins the same value, the sha256 of the F2 dataset's query manifest.
+                f2_rec = manifests.get(grid.f2_dataset)
+                if f2_rec is not None:
+                    cell_step["env"]["CAGE_DATASET_MANIFESTS_SHA256"] = hashlib.sha256(
+                        Path(f2_rec["path"]).read_bytes()
+                    ).hexdigest()
             candidates: List[Tuple[float, str]] = []
             if previous_lambda is not None:
                 candidates.append((
