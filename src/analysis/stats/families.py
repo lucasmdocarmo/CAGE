@@ -128,6 +128,7 @@ REGISTERED_METRICS: frozenset[str] = frozenset(
         "context_relevance",
         "completeness_bertscore",
         "completeness_rouge_l",
+        "ruler_native_score",  # ADR-0170: the RULER instrument's native metric
         "predicate",
         "goodput_frac",
         "yield_frac",

@@ -43,7 +43,11 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 source "${REPO_ROOT}/scripts/lib/_common.sh"
 # shellcheck source=scripts/lib/transport.sh
 source "${REPO_ROOT}/scripts/lib/transport.sh"
+# The repo venv: .venv on the workstation, cage-env on a RunPod pod (the S0
+# attempt 5 pod suite failed two pull tests on the hard-coded .venv). Still
+# fail-closed below when neither exists.
 PY="${REPO_ROOT}/.venv/bin/python"
+[ -x "${PY}" ] || PY="${REPO_ROOT}/cage-env/bin/python"
 
 _verified=0
 on_exit() {

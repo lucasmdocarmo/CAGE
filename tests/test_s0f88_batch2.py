@@ -703,6 +703,10 @@ def test_a_capped_cell_draws_its_warmup_pool_without_a_name_error_review_c1(
 
     monkeypatch.setattr(runner, "get_loader", lambda *a, **k: _Loader())
     monkeypatch.setattr(runner, "ruler_token_counter", lambda model: (lambda t: len(t.split()), "fake", _Tok()))
+    # S0 attempt 5 stage 4: the pod runs the whole suite in ONE process, and an
+    # earlier test's Prometheus server already holds the metrics port
+    # ("Address already in use"); the layout harness stubs it, so does this test.
+    monkeypatch.setattr(runner, "start_http_server", lambda *a, **k: None)
     kw = tiw._run_experiment_kwargs(workload_mode="single", output_dir=str(tmp_path / "run"),
                                     warmup_pool_queries=3, request_cap_tokens=4096, num_queries=2)
     with pytest.raises(RuntimeError, match="not ready"):
