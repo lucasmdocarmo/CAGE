@@ -685,7 +685,17 @@ def test_a_capped_cell_draws_its_warmup_pool_without_a_name_error_review_c1(
     from src.data.loader import CAGExample
 
     runner = _load("run_experiment_s0f88_review_c1", SCRIPTS / "3_run" / "run_experiment.py")
-    for name in ("CAGE_QUERY_MANIFEST", "CAGE_CORPUS_PREFIX_BUDGET", "CAGE_CAMPAIGN_ROOT"):
+    # S0 attempt 5 stage 4 (the pod runs every file in ONE process): a previous
+    # test's main() exported its cell env (CAGE_CORPUS_RUNG=60 among them) into
+    # os.environ, so this cell read "--corpus-rung 60 must equal
+    # --corpus-prefix-budget 0"; clear the same list the layout harness clears.
+    for name in (
+        "CAGE_CAMPAIGN_ROOT", "CAGE_QUERY_MANIFEST", "CAGE_CELL_ARM", "CAGE_CELL_RETRIEVER",
+        "CAGE_CELL_POLICY", "CAGE_CELL_FAMILY", "CAGE_CELL_TOPOLOGY", "CAGE_CELL_BUDGET_R",
+        "CAGE_CELL_RATE_FRAC", "CAGE_CORPUS_PREFIX_BUDGET", "CAGE_CORPUS_RUNG",
+        "CAGE_CELL_CORPUS_BUDGET", "CAGE_ORDER_BY_CONTEXT", "CAGE_MANIFEST_TRIAL",
+        "VLLM_KV_CACHE_DTYPE", "CAGE_RULER_TASK",
+    ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("CAGE_LOG_ROOT", str(tmp_path / "logs"))
 
