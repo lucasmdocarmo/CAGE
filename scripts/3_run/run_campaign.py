@@ -1374,6 +1374,21 @@ LADDER_WINDOW_RETRIES: int = 1
 RULER_FLOOR_RATE_QPS: float = 0.1
 RULER_FLOOR_ARRIVALS: int = 12
 RULER_FLOOR_MIN_ROWS: int = 6
+#: S0 attempt 5 (2026-10-14, SGLang, measured): the registered 75 s probe window
+#: cannot certify any RULER rate. The served-in-window rule (cal-v3 B-2) loses
+#: every arrival of the window's last service time; a 32K request's latency is
+#: 5 to 12 s under light load (floor TTFT 2.15 s, 3 in flight at 0.2 rps) and
+#: about 35 s near capacity (14 in flight at 0.39 rps), so the 65 s kept window
+#: lost 2 of 11 arrivals at 0.2 rps (served 0.82) and 6 of 30 at 0.39 rps
+#: (served 0.80), both NONE_SUSTAINABLE although every request completed [V
+#: pod job log]. The gold class loses about 4 percent (3 s of 65). The RULER
+#: ladder therefore probes RULER_PROBE_WINDOW_S windows (the same 10 s trim):
+#: the tail loss falls to about 3 percent at light load, the gold class's
+#: share, and a rung near capacity still reads unsustainable (35 of 290 s).
+#: The RULER start is one chain step below its floor's single-stream rate
+#: (LADDER_CHAIN_DIVISOR): at the floor rate itself the engine already queued
+#: 14 requests. Every other class keeps the registered window and start.
+RULER_PROBE_WINDOW_S: float = 300.0
 #: S0F-88 U3 (owner decision 2026-10-12, "Pre-load, then measure"): before a
 #: pressure cell's W measured arrivals, the runner sends unmeasured requests
 #: from the window's disjoint warm-up pool at the SAME offered rate for this
@@ -8596,7 +8611,8 @@ def ladder_root(out_root: Path, session: str, engine: str, r: float, k: int, rol
 
 
 def _read_ladder_window(
-    root: Path, row_key: str, dataset: str, rate_qps: float, phase: str
+    root: Path, row_key: str, dataset: str, rate_qps: float, phase: str,
+    window_s: float = PROBE_WINDOW_S,
 ) -> Tuple[ProbeStep, Optional[str]]:
     """One probe window's ProbeStep from the runner's requests.jsonl, trimmed
     HERE at PROBE_WARMUP_S on the intended arrival (the runner refuses its own
@@ -8628,7 +8644,7 @@ def _read_ladder_window(
     if not kept:
         raise RunError(
             f"no arrivals in the post-warmup window at {rate_qps:.4g} qps ({path}): the "
-            f"{PROBE_WINDOW_S:g} s window is too short for this rate"
+            f"{window_s:g} s window is too short for this rate"
         )
     n_completed = sum(1 for row in kept if row.get("ok") is True)
     # B-2 (S0F-88, cal-v3): ok rows that FINISH inside the trimmed window,
@@ -8642,7 +8658,7 @@ def _read_ladder_window(
         ):
             return False
         offset = float(done) - (float(sched) - float(arr))
-        return PROBE_WARMUP_S <= offset < PROBE_WINDOW_S
+        return PROBE_WARMUP_S <= offset < window_s
 
     peak: Optional[int] = None
     try:
@@ -8656,10 +8672,11 @@ def _read_ladder_window(
         rate_qps=float(rate_qps),
         n_scheduled=len(kept),
         n_completed=n_completed,
-        throughput_rps=n_completed / (PROBE_WINDOW_S - PROBE_WARMUP_S),
+        throughput_rps=n_completed / (window_s - PROBE_WARMUP_S),
         phase=phase,
         n_served_in_window=sum(1 for row in rows if _served_in_window(row)),
         max_in_flight=peak,  # S0F-88 audit: B-1's cap read 1,005 here
+        window_s=float(window_s),  # ADR-0169: RULER probes RULER_PROBE_WINDOW_S
     )
     label: Optional[str] = None
     regime_path = window_dir / "regime.json"
@@ -9178,7 +9195,9 @@ def calibrate_rungs(
                             f"{exc} (runner exit {rc_floor}: the window was refused or crashed before "
                             "writing its rows; the runner's message is in the job log)"
                         ) from exc
-                    start_r = floor_start_qps(floor_r, max_tokens=LADDER_START_DECODE_TOKENS)
+                    # one chain step below the single-stream rate: at that rate
+                    # itself SGLang already queued 14 RULER requests (2026-10-14)
+                    start_r = floor_start_qps(floor_r, max_tokens=LADDER_START_DECODE_TOKENS) / LADDER_CHAIN_DIVISOR
                     ruler_floor_rec = {
                         "ttft_s": floor_r.ttft_s,
                         "tpot_s": floor_r.tpot_s,
@@ -9195,7 +9214,7 @@ def calibrate_rungs(
                         start_r,
                         f"{START_QPS_RULE}: floor_start_qps of the RULER floor window "
                         f"(ttft {floor_r.ttft_s:.3f} s, tpot {floor_r.tpot_s:.4f} s, {used} rows) at "
-                        f"{LADDER_START_DECODE_TOKENS} decode tokens",
+                        f"{LADDER_START_DECODE_TOKENS} decode tokens / {LADDER_CHAIN_DIVISOR:g}",
                     )
                     log(
                         f"[calibrate-rungs]   RULER floor: ttft={floor_r.ttft_s:.3f} s tpot={floor_r.tpot_s:.4f} s "
@@ -9214,14 +9233,18 @@ def calibrate_rungs(
                     )
                 argv = list(cell_step["argv"])
                 _set_flag(argv, "--rate", f"{rate:.6g}")
+                # ADR-0169: the RULER ladder probes longer windows (see
+                # RULER_PROBE_WINDOW_S); every other class the registered 75 s
+                window_s = RULER_PROBE_WINDOW_S if role == RULER_ROLE else PROBE_WINDOW_S
+                _set_flag(argv, "--duration-s", f"{window_s:g}")
                 argv += ["--campaign-root", str(root)]
                 env = dict(cell_step["env"])
                 env[LADDER_REPLAY_ENV] = "1"
-                log(f"[calibrate-rungs]   {phase} window: {rate:.4g} qps for {PROBE_WINDOW_S:g} s -> {root}")
+                log(f"[calibrate-rungs]   {phase} window: {rate:.4g} qps for {window_s:g} s -> {root}")
                 rc_win = exec_fn(argv, env)
                 try:
                     step, regime_label = _read_ladder_window(
-                        root, cell_step["row_key"], cell_step["dataset"], rate, phase
+                        root, cell_step["row_key"], cell_step["dataset"], rate, phase, window_s=window_s
                     )
                 except RunError as exc:
                     if rc_win == 0:
@@ -9389,6 +9412,7 @@ def calibrate_rungs(
                 "ruler_task": tmpl.ruler_task,
                 "floor": ruler_floor_rec,
                 "start_basis": None if ruler_first_start is None else ruler_first_start[1],
+                "ladder_window_s": RULER_PROBE_WINDOW_S,  # every other class: PROBE_WINDOW_S
                 "rungs": ruler_records,
                 "adr": RULER_RATE_ADR,
                 "note": (

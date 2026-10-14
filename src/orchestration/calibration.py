@@ -273,6 +273,13 @@ class ProbeStep:
     # S0F-88 audit: the window's peak requests in flight (the dispatcher's
     # max_in_flight_observed); attempt 4's client cap read 1,005 here.
     max_in_flight: Optional[int] = None
+    # ADR-0169 (S0 attempt 5, 2026-10-14): the window this step was measured
+    # over; the registered PROBE_WINDOW_S for every class but RULER, whose
+    # ladder probes longer windows (run_campaign.RULER_PROBE_WINDOW_S) because
+    # a request arriving in the window's last service time cannot finish inside
+    # it, and a 32K request's 5 to 12 s latency lost 18 percent of 11 arrivals
+    # at 75 s. Informational here: the sustainable verdict uses the ratios.
+    window_s: float = PROBE_WINDOW_S
 
     def __post_init__(self) -> None:
         _require_positive_finite("rate_qps", self.rate_qps)
@@ -331,7 +338,7 @@ class ProbeStep:
         send to last completion), a different span (S0F-88 audit)."""
         if self.n_served_in_window is None:
             return None
-        return self.n_served_in_window / (PROBE_WINDOW_S - PROBE_WARMUP_S)
+        return self.n_served_in_window / (self.window_s - PROBE_WARMUP_S)
 
     @property
     def sustainable(self) -> bool:
@@ -356,6 +363,7 @@ class ProbeStep:
             "served_in_window_rps": self.served_in_window_rps,
             "sustainable": self.sustainable,
             "max_in_flight": self.max_in_flight,
+            "window_s": self.window_s,
         }
 
 

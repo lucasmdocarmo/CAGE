@@ -1106,14 +1106,15 @@ class FakeWorld:
             ]
             (wdir / "requests.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
             return 0
-        n = max(1, round(rate * PROBE_WINDOW_S))
+        window_s = float(argv[argv.index("--duration-s") + 1])  # ADR-0169: RULER probes 300 s
+        n = max(1, round(rate * window_s))
         cap = self.cap_by_arm.get(env.get("CAGE_CELL_ARM", ""), self.cap)
         if dataset == "ruler" and self.ruler_cap is not None:
             cap = self.ruler_cap  # ADR-0169: the instrument's own capacity
         ok_share = min(1.0, cap / rate)
         # the runner's Jain trim drops the warmup rows; attainment over the
         # KEPT rows is exactly min(1, cap / rate) up to one row
-        kept = [i * PROBE_WINDOW_S / n for i in range(n) if i * PROBE_WINDOW_S / n >= PROBE_WARMUP_S]
+        kept = [i * window_s / n for i in range(n) if i * window_s / n >= PROBE_WARMUP_S]
         n_ok = round(len(kept) * ok_share)
         # S0F-88 B-2 (cal-v3): every real row carries the dispatcher clocks
         # (RequestRecord.to_row); an ok request completes at its arrival
@@ -1739,8 +1740,13 @@ class TestRulerLadder:
             FloorMeasurement(ttft_s=2.3, tpot_s=0.018, n_requests=12, statistic="median"),
             max_tokens=rc.LADDER_START_DECODE_TOKENS,
         )
-        assert ruler["rungs"]["1"]["start_qps"] == pytest.approx(expected_start)
+        assert ruler["rungs"]["1"]["start_qps"] == pytest.approx(expected_start / rc.LADDER_CHAIN_DIVISOR)
         assert "floor_start_qps of the RULER floor window" in ruler["rungs"]["1"]["start_basis"]
+        assert ruler["ladder_window_s"] == rc.RULER_PROBE_WINDOW_S == 300.0
+        for rec in ruler["rungs"].values():
+            assert all(step["window_s"] == rc.RULER_PROBE_WINDOW_S for step in rec["steps"])
+        for rec in doc["rungs"].values():
+            assert all(step["window_s"] == PROBE_WINDOW_S for step in rec["steps"])
         for key in ("1", "0.5"):
             rec = ruler["rungs"][key]
             assert rec["label"] == "ESTIMATED"
@@ -1767,7 +1773,9 @@ class TestRulerLadder:
         assert env[rc.LADDER_REPLAY_ENV] == "1" and env["CAGE_CELL_ARM"] == "gold-fresh"
         # every RULER ladder window is the RULER cell at the 75 s duration
         ruler_windows = [a for a, _e in world.runner_calls() if a[a.index("--dataset") + 1] == "ruler" and "--duration-s" in a]
-        assert ruler_windows and all("--ruler-task" in a and a[a.index("--duration-s") + 1] == f"{PROBE_WINDOW_S:g}" for a in ruler_windows)
+        assert ruler_windows and all("--ruler-task" in a and a[a.index("--duration-s") + 1] == f"{rc.RULER_PROBE_WINDOW_S:g}" for a in ruler_windows)
+        anchor_windows = [a for a, _e in world.runner_calls() if a[a.index("--dataset") + 1] == "qasper"]
+        assert anchor_windows and all(a[a.index("--duration-s") + 1] == f"{PROBE_WINDOW_S:g}" for a in anchor_windows)
         # order: the anchor's two rungs, then the RULER ladder's two rungs (four relaunches)
         verbs = world.verbs()
         assert verbs.count("restart") == 4
