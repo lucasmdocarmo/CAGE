@@ -1397,6 +1397,12 @@ PY
     state note analyze "verify_results reported FAIL findings on the PARTIAL tree (PARTIAL_TREE_OK=1)"
   fi
   # shellcheck disable=SC2086
+  # Spec Block A1 (2026-10-16): the section 6.1 currencies G and Y per window,
+  # unconditionally (the driver computes them only inside a registered window
+  # contrast, which needs two windows per side). Design input: the script's named
+  # refusal (rc 3, no calibration floors) is printed and does not fail the stage;
+  # rc 2 (a Python usage error or a missing script) fails it (review 2026-10-16).
+  run_step "0|3" "yield table (A1)" -- "$PY" "$SCRIPTS/4_analysis/yield_table.py" "$RUN_LOCAL" --calibration-dir "$EXTRAS/calibration" --scoring-run-id "$SCORING_RUN_ID" --out "$LAND/plots/yield_$(date -u +%H%M%S)" || return 1
   run_step 0 "organize_results" -- "$PY" "$SCRIPTS/4_analysis/organize_results.py" "$RUN_LOCAL" $force || return 1
   # The driver's one-look lock refuses a second run on the same root (review
   # 2026-10-06, MEDIUM 7): on --redo the stamp this master recorded is reused.

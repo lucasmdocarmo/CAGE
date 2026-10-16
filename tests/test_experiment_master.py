@@ -304,6 +304,17 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         (out / "panels_index.csv").write_text("cell,window\nk1,window_squad_v2-01\n", encoding="utf-8")
         print("panels", args); sys.exit(0)
         ''', exe=False)
+    # Spec Block A1 (2026-10-16): the fake stands in so that the master's "0|3"
+    # contract is exercised by a real exit 0, not by Python's exit 2 on a missing file.
+    _w(fake_scripts / "4_analysis" / "yield_table.py", r'''
+        import sys
+        from pathlib import Path
+        args = sys.argv[1:]
+        out = Path(args[args.index("--out") + 1]); out.mkdir(parents=True, exist_ok=True)
+        (out / "yield_table.csv").write_text("row_key,window_dir,goodput_frac\nk1,window_squad_v2-01,1.0\n", encoding="utf-8")
+        (out / "yield_summary.md").write_text("# yield\n", encoding="utf-8")
+        print("[yield_table] windows=1 records=1 skips=0", args); sys.exit(0)
+        ''', exe=False)
 
     # --- the fake pod repo (run by the fake ssh, locally) -------------------
     pr = pod_repo
@@ -702,6 +713,7 @@ def test_full_sequence_with_both_gos_lands_the_run(world: Dict[str, Path]) -> No
     assert (land / "plots" / "20261006-120000" / "stats.json").is_file()
     assert (land / "plots" / "20261006-120000" / "forest_ttft_ms.png").is_file()
     assert list((land / "plots").glob("panels_*/panels_index.csv"))
+    assert list((land / "plots").glob("yield_*/yield_table.csv"))   # Spec Block A1 step ran
     analysis = (land / "plots" / "analysis.txt").read_text(encoding="utf-8")
     assert "to be written by the main session after reading the run" in analysis
     assert f"run id: {rid}" in analysis and "MISSING" in analysis

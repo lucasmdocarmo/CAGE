@@ -432,3 +432,201 @@ def test_cli_mode_exclusivity(tmp_path: Path) -> None:
         td.main(["--campaign-root", str(tmp_path)])
     with pytest.raises(SystemExit):  # pilot lane must not take campaign flags
         td.main(["--results-dir", str(tmp_path), "--force"])
+
+
+# --------------------------------------------------------------------------- #
+# Spec Block A2 (2026-10-16): the corpus-budget rung in the group key and the
+# cross-arm lane (two arms on one engine, with the input-effect gate)
+# --------------------------------------------------------------------------- #
+
+
+def _spec_arm(arm: str, engine: str, *, cb: Optional[int] = None) -> CellSpec:
+    return CellSpec(
+        arm=arm,  # type: ignore[arg-type]
+        retriever="none",
+        policy="none",
+        topology="single",
+        engine=engine,  # type: ignore[arg-type]
+        model="qwen3-14b",
+        family="F1",
+        corpus_budget_tokens=cb,
+    )
+
+
+def _write_requests(cell_dir: Path, window_key: str, rows, prompt_tokens: Optional[float]) -> None:
+    """requests.jsonl beside qa_evidence.jsonl: the serving rows carry prompt_tokens
+    keyed by the same identity triple."""
+    lines = []
+    for r in rows:
+        rec = {"example_id": r["example_id"], "repeat_index": r["repeat_index"], "record_index": r["record_index"]}
+        if prompt_tokens is not None:
+            rec["prompt_tokens"] = prompt_tokens
+        lines.append(json.dumps(rec))
+    (cell_dir / f"window_{window_key}" / "requests.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _mk_cross_arm_tree(root: Path, *, cell_pt: Optional[float] = 2600.0, ref_pt: Optional[float] = 2600.0,
+                       ref_rows=None) -> Path:
+    """vllm serves corpus-comp (B10) and corpus-reuse (B3); sglang serves corpus-reuse
+    only, so the engine-pair lane has one eligible group and the cross-arm lane one slot."""
+    ref_rows = _HF_ROWS if ref_rows is None else ref_rows
+    cell = _mk_cell(root / "run-vllm", _spec_arm("corpus-comp", "vllm"), {"squad_v2-01": _SGLANG_ROWS})
+    _write_requests(cell, "squad_v2-01", _SGLANG_ROWS, cell_pt)
+    ref = _mk_cell(root / "run-vllm", _spec_arm("corpus-reuse", "vllm"), {"squad_v2-01": ref_rows})
+    _write_requests(ref, "squad_v2-01", ref_rows, ref_pt)
+    _mk_cell(root / "run-sglang", _spec_arm("corpus-reuse", "sglang"), {"squad_v2-01": _HF_ROWS})
+    return root
+
+
+PAIR = ("corpus-comp", "corpus-reuse")
+
+
+def test_corpus_budget_rung_separates_groups(tmp_path: Path) -> None:
+    # Two B12 budgets of one engine used to collide as an "ambiguous replicate" (S0:
+    # 3 groups skipped); the rung is a grid coordinate and must separate them.
+    for engine, rows in (("vllm", _VLLM_ROWS), ("sglang", _SGLANG_ROWS)):
+        for cb in (700, 1400):
+            _mk_cell(tmp_path / f"run-{engine}", _spec_arm("corpus-trunc", engine, cb=cb), {"squad_v2-01": rows})
+    result = td.compute_campaign_divergence(str(tmp_path))
+    assert result["counts"]["groups_compared"] == 2 and result["counts"]["groups_skipped"] == 0
+    (report,) = result["reports"]
+    assert sorted(g["corpus_budget_tokens"] for g in report["groups"]) == [700, 1400]
+    assert report["schema_version"] == 2
+
+
+def test_cross_arm_pair_hand_computed_same_inputs(tmp_path: Path) -> None:
+    _mk_cross_arm_tree(tmp_path)
+    result = td.compute_campaign_divergence(str(tmp_path), cross_arm_pairs=[PAIR])
+    assert result["counts"]["cross_arm_groups_compared"] == 1
+    assert result["counts"]["cross_arm_groups_skipped"] == 1  # the sglang slot: reference without its cell arm
+    (report,) = result["reports"]
+    cross = report["cross_arm"]
+    assert cross["pairs_registered"] == ["corpus-comp:corpus-reuse"]
+    (g,) = cross["groups"]
+    assert (g["cell_arm"], g["reference_arm"], g["engine"]) == ("corpus-comp", "corpus-reuse", "vllm")
+    # corpus-comp answered London./Barcelona where the reference answered London/Madrid:
+    # 2 of 4 raw divergent, q2 preserving (punctuation), q4 changing (EM flip vs gold).
+    assert g["n_compared"] == 4 and g["raw_divergent"] == 2 and g["agreement_rate"] == 0.5
+    assert g["answer_divergence"]["answer_changing"] == 1
+    assert g["answer_divergence"]["answer_preserving"] == 1
+    assert g["answer_divergence"]["classification_basis"] == ["gold"]
+    assert g["median_prompt_tokens"] == 2600.0 and g["reference_median_prompt_tokens"] == 2600.0
+    assert g["input_effect"] is False and g["label"] == td.CROSS_ARM_LABEL_SAME
+    # The engine-pair lane is untouched by the cross-arm request.
+    assert report["counts"]["groups_compared"] == 1
+
+
+def test_cross_arm_different_inputs_is_labeled_not_hidden(tmp_path: Path) -> None:
+    _mk_cross_arm_tree(tmp_path, cell_pt=1000.0, ref_pt=2600.0)
+    result = td.compute_campaign_divergence(str(tmp_path), cross_arm_pairs=[PAIR])
+    (g,) = result["reports"][0]["cross_arm"]["groups"]
+    assert g["input_effect"] is True and g["label"] == td.CROSS_ARM_LABEL_DIFFERENT
+    assert g["raw_divergent"] == 2  # the statistics are still reported, only the reading changes
+
+
+def test_cross_arm_without_prompt_tokens_is_unknown(tmp_path: Path) -> None:
+    _mk_cross_arm_tree(tmp_path, cell_pt=None)
+    result = td.compute_campaign_divergence(str(tmp_path), cross_arm_pairs=[PAIR])
+    (g,) = result["reports"][0]["cross_arm"]["groups"]
+    assert g["median_prompt_tokens"] is None and g["input_effect"] is None
+    assert g["label"] == td.CROSS_ARM_LABEL_UNKNOWN
+
+
+def test_cross_arm_mismatched_query_sets_is_labeled_skip(tmp_path: Path) -> None:
+    _mk_cross_arm_tree(tmp_path, ref_rows=_HF_ROWS[:3])  # q4 missing on the reference arm
+    result = td.compute_campaign_divergence(str(tmp_path), cross_arm_pairs=[PAIR])
+    assert result["counts"]["cross_arm_groups_compared"] == 0
+    (skip,) = [s for s in result["cross_arm_skips"] if "engine=vllm" in s["where"]]
+    assert "mismatched query sets across arms" in skip["reason"] and "q4" in skip["reason"]
+    assert result["reports"][0]["cross_arm"]["groups"] == []
+
+
+def test_cross_arm_registered_pair_without_match_refuses(tmp_path: Path) -> None:
+    _mk_cross_arm_tree(tmp_path)
+    with pytest.raises(td.CampaignDivergenceError) as exc_info:
+        td.compute_campaign_divergence(str(tmp_path), cross_arm_pairs=[("retr-fresh", "gold-fresh")])
+    assert "cross-arm pair retr-fresh:gold-fresh matched no group" in str(exc_info.value)
+
+
+def test_cli_cross_arm_writes_markdown_and_second_table(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    _mk_cross_arm_tree(tmp_path / "campaign")
+    out_dir = tmp_path / "reports"
+    rc = td.main(["--campaign-root", str(tmp_path / "campaign"), "--out", str(out_dir),
+                  "--cross-arm", "corpus-comp:corpus-reuse"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "cell:reference" in out and "corpus-comp:corpus-reuse" in out and "same" in out
+    report = json.loads((out_dir / "token_divergence__qwen3-14b__squad_v2.json").read_text(encoding="utf-8"))
+    assert report["cross_arm"]["counts"] == {"groups_compared": 1, "skips": 1}
+    md = (out_dir / "token_divergence_summary.md").read_text(encoding="utf-8")
+    assert "## Engine pairs, pooled across groups" in md
+    assert "## Cross-arm pairs on one engine (Spec Block A2), per group" in md
+    assert "| qwen3-14b | squad_v2 | corpus-comp:corpus-reuse | vllm | F1 |  | same | 4 | 50.00% |" in md
+    # The Markdown is part of the artifact set: alone, it still refuses a silent rewrite.
+    for p in out_dir.glob("token_divergence__*.json"):
+        p.unlink()
+    rc = td.main(["--campaign-root", str(tmp_path / "campaign"), "--out", str(out_dir),
+                  "--cross-arm", "corpus-comp:corpus-reuse"])
+    assert rc == 2 and "token_divergence_summary.md" in capsys.readouterr().err
+
+
+def test_cli_cross_arm_usage_errors(tmp_path: Path) -> None:
+    for argv in (
+        ["--campaign-root", str(tmp_path), "--out", str(tmp_path / "o"), "--cross-arm", "corpus-comp"],
+        ["--campaign-root", str(tmp_path), "--out", str(tmp_path / "o"), "--cross-arm", "a:a"],
+        ["--results-dir", str(tmp_path), "--cross-arm", "corpus-comp:corpus-reuse"],  # pilot lane
+    ):
+        with pytest.raises(SystemExit):
+            td.main(argv)
+
+
+# Review 2026-10-16 fixes
+
+
+def test_cross_arm_reference_without_its_cell_arm_is_a_labeled_skip(tmp_path: Path) -> None:
+    _mk_cross_arm_tree(tmp_path)  # sglang serves corpus-reuse only
+    result = td.compute_campaign_divergence(str(tmp_path), cross_arm_pairs=[PAIR])
+    assert result["counts"]["cross_arm_groups_compared"] == 1
+    (skip,) = result["cross_arm_skips"]
+    assert "cell arm 'corpus-comp' absent beside reference arm 'corpus-reuse'" in skip["reason"]
+    assert "engine=sglang" in skip["where"]
+
+
+def test_cross_arm_breakdown_counts_each_flip_on_its_own(tmp_path: Path) -> None:
+    # q2 'London.' vs 'London': EM, F1 and abstention unchanged; q4 Barcelona vs Madrid: EM and F1 flip.
+    _mk_cross_arm_tree(tmp_path)
+    result = td.compute_campaign_divergence(str(tmp_path), cross_arm_pairs=[PAIR])
+    (g,) = result["reports"][0]["cross_arm"]["groups"]
+    assert g["answer_change_breakdown"] == {"n_divergent": 2, "em_flip": 1, "f1_change": 1, "abstention_flip": 0, "basis": "gold"}
+
+
+def test_single_engine_tree_can_run_the_cross_arm_lane(tmp_path: Path) -> None:
+    cell = _mk_cell(tmp_path / "run-vllm", _spec_arm("corpus-comp", "vllm"), {"squad_v2-01": _SGLANG_ROWS})
+    _write_requests(cell, "squad_v2-01", _SGLANG_ROWS, 2600.0)
+    ref = _mk_cell(tmp_path / "run-vllm", _spec_arm("corpus-reuse", "vllm"), {"squad_v2-01": _HF_ROWS})
+    _write_requests(ref, "squad_v2-01", _HF_ROWS, 2600.0)
+    with pytest.raises(td.CampaignDivergenceError):
+        td.compute_campaign_divergence(str(tmp_path))  # the engine-pair lane alone still refuses
+    result = td.compute_campaign_divergence(str(tmp_path), cross_arm_pairs=[PAIR])
+    assert result["counts"]["groups_compared"] == 0 and result["counts"]["cross_arm_groups_compared"] == 1
+    with pytest.raises(td.CampaignDivergenceError) as exc_info:
+        td.compute_campaign_divergence(str(tmp_path), cross_arm_pairs=[("retr-fresh", "corpus-reuse")])
+    assert "matched no group" in str(exc_info.value)
+
+
+def test_duplicate_cross_arm_spec_is_a_usage_error(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit):
+        td.main(["--campaign-root", str(tmp_path), "--out", str(tmp_path / "o"),
+                 "--cross-arm", "corpus-comp:corpus-reuse", "--cross-arm", "corpus-comp:corpus-reuse"])
+
+
+def test_duplicate_prompt_tokens_triple_reads_unknown(tmp_path: Path) -> None:
+    _mk_cross_arm_tree(tmp_path)
+    req = tmp_path / "run-vllm" / "cells" / _spec_arm("corpus-comp", "vllm").to_row_key() / "window_squad_v2-01" / "requests.jsonl"
+    first = req.read_text(encoding="utf-8").splitlines()[0]
+    req.write_text(req.read_text(encoding="utf-8") + first + "\n", encoding="utf-8")  # q1 twice
+    result = td.compute_campaign_divergence(str(tmp_path), cross_arm_pairs=[PAIR])
+    (g,) = result["reports"][0]["cross_arm"]["groups"]
+    assert g["median_prompt_tokens"] == 2600.0  # the other three rows still carry a length
+    pt = td._load_prompt_tokens(req.parent)
+    assert ("q1", 0, None) not in pt and len(pt) == 3

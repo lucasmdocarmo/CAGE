@@ -58,6 +58,25 @@ zero eligible groups is a loud error naming what was searched; mismatched
 query sets across a group's engines and windows without generations are
 LABELED skips (never a silent intersection, never a fabricated row).
 
+CROSS-ARM lane (Spec Block A2, 2026-10-16; MyDocs/RunPod/S1_PARTS_AB_SPECS_2026-10-15.md):
+    python scripts/4_analysis/token_divergence.py --campaign-root <root> --out <dir> \
+        --cross-arm corpus-comp:corpus-reuse [--cross-arm CELL:REF ...]
+compares two ARMS on the SAME engine for every (model, dataset, engine, grid-point,
+replicate) both arms serve: the fp8 KV-cache arm (B10 corpus-comp) against its
+bf16 twin (B3 corpus-reuse) is the registered pair. The statistics are the same
+sec. 8.9 numbers (``_pair_stats``, cell arm on the a-side, reference arm on the
+b-side). Each cross-arm record carries the input-effect gate from the pilot lane
+(median prompt_tokens of the two sides within 5 percent, read from the windows'
+requests.jsonl): ``input_effect`` False labels the pair "same inputs", True labels
+it "different inputs" (the divergence then measures a prompt change, never the
+cache effect), None labels it "unknown" (no prompt_tokens on the rows). A
+registered pair that matches no group refuses loudly. The campaign lane also
+writes ``token_divergence_summary.md`` beside the JSON reports.
+
+Group key (both lanes): the corpus budget rung ``corpus_budget_tokens`` (ADR-0106,
+the ``cb<N>`` row-key coordinate of B12) is part of the grid point since 2026-10-16;
+before that two B12 budgets of one engine collided as an "ambiguous replicate".
+
 RAW divergence = exact string mismatch after strip() (most sensitive).
 NORMALIZED divergence = mismatch after lowercase + punctuation/article strip (whether the
     difference survives QA-style normalization, i.e. is a *meaningfully* different answer).
@@ -486,7 +505,9 @@ T0_CONTRACT = (
     "temperature=0.0); window artifacts carry no per-row sampling params"
 )
 
-_CAMPAIGN_SCHEMA_VERSION = 1
+#: 2 (2026-10-16): group records carry ``corpus_budget_tokens``; reports carry
+#: ``cross_arm`` when the lane is requested.
+_CAMPAIGN_SCHEMA_VERSION = 2
 
 
 class CampaignDivergenceError(RuntimeError):
@@ -537,6 +558,41 @@ class _WindowLoad(NamedTuple):
     n_error_rows: int
 
 
+def _load_prompt_tokens(window_dir: Path) -> Dict[Tuple[Any, Any, Any], float]:
+    """(example_id, repeat_index, record_index) -> prompt_tokens from the window's
+    requests.jsonl (the serving rows; qa_evidence.jsonl carries no prompt length).
+    Provenance for the cross-arm input-effect gate only: a missing file, an
+    unparseable line or a non-numeric value leaves the key out, and the gate then
+    reads None ("unknown"), never a fabricated length."""
+    path = window_dir / "requests.jsonl"
+    out: Dict[Tuple[Any, Any, Any], float] = {}
+    if not path.is_file():
+        return out
+    seen: set = set()
+    duplicated: set = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        key = (row.get("example_id"), row.get("repeat_index"), row.get("record_index"))
+        if key in seen:
+            duplicated.add(key)  # an ambiguous length is no length: the gate reads None
+            continue
+        seen.add(key)
+        pt = row.get("prompt_tokens")
+        if isinstance(pt, bool) or not isinstance(pt, (int, float)):
+            continue
+        out[key] = float(pt)
+    for key in duplicated:
+        out.pop(key, None)
+    return out
+
+
 def _load_window_generations(window_dir: Path, dataset: str) -> _WindowLoad:
     """Load a window's T=0 generations from qa_evidence.jsonl — the ONE §1
     generation-carrying window artifact (requests.jsonl carries serving rows,
@@ -563,6 +619,7 @@ def _load_window_generations(window_dir: Path, dataset: str) -> _WindowLoad:
             None, "no qa_evidence.jsonl — window carries no T=0 generations", 0
         )
     answers: Dict[Tuple[Any, Any, Any], _Row] = {}
+    prompt_tokens_by_key = _load_prompt_tokens(window_dir)
     n_error = 0
     for lineno, line in enumerate(
         ev_path.read_text(encoding="utf-8").splitlines(), start=1
@@ -611,7 +668,7 @@ def _load_window_generations(window_dir: Path, dataset: str) -> _WindowLoad:
         gold = row.get("reference_answer")
         answers[key] = _Row(
             answer=text,
-            prompt_tokens=None,  # qa_evidence carries no prompt_tokens; same-arm pairs share prompts by design
+            prompt_tokens=prompt_tokens_by_key.get(key),  # from requests.jsonl; None when absent
             reference_answer=gold if isinstance(gold, str) else None,
         )
     if not answers:
@@ -636,13 +693,14 @@ def compute_campaign_divergence(
     campaign_root: str,
     *,
     tokenizer: str = "whitespace",
+    cross_arm_pairs: Sequence[Tuple[str, str]] = (),
 ) -> Dict[str, object]:
     """Walk a RESULTS_LAYOUT-v2 campaign tree and compute the sec. 8.9
     statistics for every engine pair of every eligible group.
 
     A GROUP is one (model, dataset, arm, grid-point, replicate) where
     grid-point = the non-engine cell axes (retriever, policy, topology, family,
-    budget_r, rate_frac) and replicate = the §1 windows[] ``rep``. ELIGIBLE =
+    budget_r, rate_frac, corpus_budget_tokens) and replicate = the §1 windows[] ``rep``. ELIGIBLE =
     served by >=2 distinct engines with T=0 generations. Zero eligible groups
     raises CampaignDivergenceError naming everything searched. Layout-contract
     violations (unparseable cell.json, row-key round-trip mismatch, stray
@@ -763,6 +821,7 @@ def compute_campaign_divergence(
                     spec.family,
                     spec.budget_r,
                     spec.rate_frac,
+                    spec.corpus_budget_tokens,
                     entry["rep"],
                 )
                 groups.setdefault(group_key, []).append(
@@ -788,12 +847,12 @@ def compute_campaign_divergence(
     for group_key, members in sorted(
         groups.items(), key=lambda kv: tuple(str(x) for x in kv[0])
     ):
-        model, dataset, arm, retriever, policy, topology, family, budget_r, rate_frac, rep = group_key
+        model, dataset, arm, retriever, policy, topology, family, budget_r, rate_frac, cb, rep = group_key
         engines = sorted({m.engine for m in members})
         group_desc = (
             f"model={model} dataset={dataset} arm={arm} retriever={retriever} "
             f"policy={policy} topology={topology} family={family} "
-            f"budget_r={budget_r} rate_frac={rate_frac} rep={rep}"
+            f"budget_r={budget_r} rate_frac={rate_frac} corpus_budget_tokens={cb} rep={rep}"
         )
         if len(engines) < 2:
             n_single += 1
@@ -853,6 +912,7 @@ def compute_campaign_divergence(
             "family": family,
             "budget_r": budget_r,
             "rate_frac": rate_frac,
+            "corpus_budget_tokens": cb,
             "rep": rep,
             "n_queries": len(union),
             "engines": {
@@ -896,7 +956,7 @@ def compute_campaign_divergence(
             })
         group_records.setdefault((model, dataset), []).append(record)
 
-    if n_multi == 0:
+    if n_multi == 0 and not cross_arm_pairs:
         raise CampaignDivergenceError(
             f"no eligible engine-pair groups under {root}: searched "
             f"{len(run_roots)} run tree(s), {n_cells} cell(s), {n_windows} "
@@ -906,16 +966,26 @@ def compute_campaign_divergence(
             ">=2 engines with qa_evidence generations."
         )
 
+    cross_records, cross_skips = _cross_arm_records(
+        groups, cross_arm_pairs, root, tokenize, tok_label, quality
+    )
+    if n_multi == 0 and not cross_records:
+        raise CampaignDivergenceError(
+            f"no eligible engine-pair groups and no compared cross-arm group under {root}: searched "
+            f"{len(run_roots)} run tree(s), {n_cells} cell(s), {n_windows} window(s); "
+            f"{n_single} single-engine group(s); cross-arm skips: {len(cross_skips)}"
+        )
+
     # One report per (model, dataset) — every pairing touched (compared or
     # skipped) gets a report so labeled skips are carried into the artifact.
     touched = set(group_records) | {
         (str(s["model"]), str(s["dataset"])) for s in skips
-    }
+    } | set(cross_records) | {(str(s["model"]), str(s["dataset"])) for s in cross_skips}
     reports: List[Dict[str, object]] = []
     for model, dataset in sorted(touched):
         md_groups = group_records.get((model, dataset), [])
         md_skips = [s for s in skips if (str(s["model"]), str(s["dataset"])) == (model, dataset)]
-        reports.append({
+        report: Dict[str, object] = {
             "schema_version": _CAMPAIGN_SCHEMA_VERSION,
             "mode": "campaign-engine-pair",
             "campaign_root": str(root),
@@ -930,7 +1000,20 @@ def compute_campaign_divergence(
             },
             "groups": md_groups,
             "skips": md_skips,
-        })
+        }
+        if cross_arm_pairs:
+            md_cross = cross_records.get((model, dataset), [])
+            md_cross_skips = [
+                s for s in cross_skips if (str(s["model"]), str(s["dataset"])) == (model, dataset)
+            ]
+            report["cross_arm"] = {
+                "pairs_registered": [f"{a}:{b}" for a, b in cross_arm_pairs],
+                "input_effect_rule": CROSS_ARM_INPUT_RULE,
+                "counts": {"groups_compared": len(md_cross), "skips": len(md_cross_skips)},
+                "groups": md_cross,
+                "skips": md_cross_skips,
+            }
+        reports.append(report)
 
     return {
         "mode": "campaign-engine-pair",
@@ -947,18 +1030,240 @@ def compute_campaign_divergence(
             "groups_multi_engine": n_multi,
             "groups_compared": sum(len(g) for g in group_records.values()),
             "groups_skipped": n_group_skips,
+            "cross_arm_groups_compared": sum(len(g) for g in cross_records.values()),
+            "cross_arm_groups_skipped": len(cross_skips),
         },
         "reports": reports,
         "skips": skips,
+        "cross_arm_skips": cross_skips,
     }
+
+
+#: The pilot lane's input-effect gate, reused verbatim for the cross-arm lane.
+CROSS_ARM_INPUT_EFFECT_TOLERANCE = 0.05
+CROSS_ARM_INPUT_RULE = (
+    "input_effect = |median prompt_tokens(cell) - median prompt_tokens(reference)| "
+    f"> {CROSS_ARM_INPUT_EFFECT_TOLERANCE:g} x reference median, from the windows' requests.jsonl; "
+    "None when either side carries no prompt_tokens"
+)
+CROSS_ARM_LABEL_SAME = "same inputs: divergence is the serving-config effect"
+CROSS_ARM_LABEL_DIFFERENT = (
+    "different inputs: median prompt_tokens differ by more than the tolerance; "
+    "divergence measures a prompt change, not the cache effect"
+)
+CROSS_ARM_LABEL_UNKNOWN = (
+    "input effect unknown: no prompt_tokens on one side's rows; not readable as a cache effect"
+)
+
+
+def _answer_change_breakdown(
+    a: Dict[Tuple[Any, ...], _Row],
+    b: Dict[Tuple[Any, ...], _Row],
+    keys: Collection[Tuple[Any, ...]],
+    quality: Any,
+) -> Dict[str, Any]:
+    """Spec Block A2 OUTPUTS: over the raw-divergent pairs, how many flip EM, change F1
+    or flip the abstention flag, each counted on its own (a pair can count in several).
+    Same sanitizer and scorer as ``_classify_pair``; with gold the flips are against the
+    same gold, without gold EM and abstention are compared pairwise and F1 change is
+    not defined (None)."""
+    f1_fn = quality.QualityEvaluator.evaluate_f1_score
+    em_flip = f1_change = abst_flip = 0
+    n_divergent = 0
+    gold_basis = True
+    for k in keys:
+        a_text, b_text = a[k].answer, b[k].answer
+        if a_text.strip() == b_text.strip():
+            continue
+        n_divergent += 1
+        sa, sb = quality.sanitize_answer(a_text), quality.sanitize_answer(b_text)
+        gold = b[k].reference_answer if b[k].reference_answer is not None else a[k].reference_answer
+        if gold is not None:
+            ra, rb = f1_fn(None, sa, gold), f1_fn(None, sb, gold)
+            em_flip += int(ra["exact_match"] != rb["exact_match"])
+            f1_change += int(abs(ra["f1"] - rb["f1"]) > 1e-9)
+            abst_flip += int(ra["predicted_no_answer"] != rb["predicted_no_answer"])
+        else:
+            gold_basis = False
+            abst_a, abst_b = quality.is_no_answer_prediction(sa), quality.is_no_answer_prediction(sb)
+            abst_flip += int(abst_a != abst_b)
+            if not abst_a and not abst_b:
+                em_flip += int(f1_fn(None, sa, sb)["exact_match"] == 0.0)
+    return {
+        "n_divergent": n_divergent,
+        "em_flip": em_flip,
+        "f1_change": f1_change if gold_basis else None,
+        "abstention_flip": abst_flip,
+        "basis": "gold" if gold_basis else "pairwise",
+    }
+
+
+def _cross_arm_records(
+    groups: Dict[Tuple[Any, ...], List[_GroupMember]],
+    cross_arm_pairs: Sequence[Tuple[str, str]],
+    root: Path,
+    tokenize: Callable[[str], List[Any]],
+    tok_label: str,
+    quality: Any,
+) -> Tuple[Dict[Tuple[str, str], List[Dict[str, object]]], List[Dict[str, object]]]:
+    """Spec Block A2: for every registered (cell_arm, reference_arm) pair, compare
+    the two arms on the SAME engine for every (model, dataset, engine, grid-point,
+    replicate) both arms serve. Same fail-closed lanes as the engine-pair lane
+    (ambiguous replicate and mismatched query sets are labeled skips); a
+    registered pair that matches no group at all refuses loudly."""
+    records: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
+    skips: List[Dict[str, object]] = []
+    if not cross_arm_pairs:
+        return records, skips
+    # (model, dataset, retriever, policy, topology, family, budget_r, rate_frac, cb, rep, engine)
+    #   -> arm -> members
+    by_slot: Dict[Tuple[Any, ...], Dict[str, List[_GroupMember]]] = {}
+    for group_key, members in groups.items():
+        model, dataset, arm, retriever, policy, topology, family, budget_r, rate_frac, cb, rep = group_key
+        for m in members:
+            slot = (model, dataset, retriever, policy, topology, family, budget_r, rate_frac, cb, rep, m.engine)
+            by_slot.setdefault(slot, {}).setdefault(arm, []).append(m)
+    for cell_arm, ref_arm in cross_arm_pairs:
+        n_matched = 0
+        for slot in sorted(by_slot, key=lambda k: tuple(str(x) for x in k)):
+            arms = by_slot[slot]
+            model, dataset, retriever, policy, topology, family, budget_r, rate_frac, cb, rep, engine = slot
+            desc = (
+                f"cross-arm {cell_arm}:{ref_arm} model={model} dataset={dataset} engine={engine} "
+                f"retriever={retriever} policy={policy} topology={topology} family={family} "
+                f"budget_r={budget_r} rate_frac={rate_frac} corpus_budget_tokens={cb} rep={rep}"
+            )
+            if ref_arm in arms and cell_arm not in arms:
+                # The informative direction (review 2026-10-16 MEDIUM 2): the reference
+                # was served here but the cell arm was not, so the pair has no record.
+                skips.append({"model": model, "dataset": dataset, "where": desc, "reason": (
+                    f"cell arm {cell_arm!r} absent beside reference arm {ref_arm!r} on this engine slot"
+                )})
+                continue
+            if cell_arm not in arms or ref_arm not in arms:
+                continue
+            n_matched += 1
+            ambiguous = {a: ms for a, ms in arms.items() if a in (cell_arm, ref_arm) and len(ms) > 1}
+            if ambiguous:
+                detail = "; ".join(
+                    f"{a}: {len(ms)} windows ({', '.join(sorted(m.window_rel for m in ms))})"
+                    for a, ms in sorted(ambiguous.items())
+                )
+                skips.append({"model": model, "dataset": dataset, "where": desc, "reason": (
+                    "ambiguous replicate: an arm contributes multiple windows for one "
+                    f"(model, dataset, engine, grid-point, replicate); refusing to choose: {detail}"
+                )})
+                continue
+            cell = arms[cell_arm][0]
+            ref = arms[ref_arm][0]
+            cell_keys, ref_keys = set(cell.answers), set(ref.answers)
+            if cell_keys != ref_keys:
+                parts = []
+                for name, keys, other in ((cell_arm, cell_keys, ref_keys), (ref_arm, ref_keys, cell_keys)):
+                    missing = other - keys
+                    part = f"{name}: {len(keys)} key(s)"
+                    if missing:
+                        sample = ", ".join(_fmt_key(k) for k in sorted(missing, key=repr)[:3])
+                        part += f", missing {len(missing)} e.g. {sample}"
+                    parts.append(part)
+                skips.append({"model": model, "dataset": dataset, "where": desc, "reason": (
+                    "mismatched query sets across arms, refusing to silently intersect "
+                    "(fail-closed): " + "; ".join(parts)
+                )})
+                continue
+            stats = _pair_stats(cell.answers, ref.answers, cell_keys, tokenize, tok_label, quality)
+            breakdown = _answer_change_breakdown(cell.answers, ref.answers, cell_keys, quality)
+            cell_pts = [r.prompt_tokens for r in cell.answers.values() if r.prompt_tokens is not None]
+            ref_pts = [r.prompt_tokens for r in ref.answers.values() if r.prompt_tokens is not None]
+            cell_med = statistics.median(cell_pts) if cell_pts else None
+            ref_med = statistics.median(ref_pts) if ref_pts else None
+            input_effect: Optional[bool] = None
+            if cell_med is not None and ref_med is not None and ref_med > 0:
+                input_effect = abs(cell_med - ref_med) > CROSS_ARM_INPUT_EFFECT_TOLERANCE * ref_med
+            label = (
+                CROSS_ARM_LABEL_UNKNOWN if input_effect is None
+                else CROSS_ARM_LABEL_DIFFERENT if input_effect else CROSS_ARM_LABEL_SAME
+            )
+            records.setdefault((model, dataset), []).append({
+                "cell_arm": cell_arm,
+                "reference_arm": ref_arm,
+                "engine": engine,
+                "retriever": retriever,
+                "policy": policy,
+                "topology": topology,
+                "family": family,
+                "budget_r": budget_r,
+                "rate_frac": rate_frac,
+                "corpus_budget_tokens": cb,
+                "rep": rep,
+                "n_queries": len(cell_keys),
+                "windows": {
+                    cell_arm: {"run_root": "." if cell.run_root == root else str(cell.run_root.relative_to(root)),
+                               "window": cell.window_rel, "seed": cell.seed},
+                    ref_arm: {"run_root": "." if ref.run_root == root else str(ref.run_root.relative_to(root)),
+                              "window": ref.window_rel, "seed": ref.seed},
+                },
+                "median_prompt_tokens": cell_med,
+                "reference_median_prompt_tokens": ref_med,
+                "input_effect": input_effect,
+                "label": label,
+                "answer_change_breakdown": breakdown,
+                **stats,
+            })
+        if n_matched == 0:
+            raise CampaignDivergenceError(
+                f"cross-arm pair {cell_arm}:{ref_arm} matched no group under {root}: no "
+                "(model, dataset, engine, grid-point, replicate) is served by both arms "
+                f"(searched {len(by_slot)} engine slot(s)); a registered pair without data is a refusal, not a silence"
+            )
+    return records, skips
+
+
+def _pooled_engine_pairs(report: Dict[str, object]) -> List[Tuple[str, str, str, str, Dict[str, int]]]:
+    """(model, dataset, pair, kind, agg) pooled across groups. Pooled rates are
+    display-only recomputations from the emitted counts (never new measurements);
+    per-group numbers live in the JSON artifacts."""
+    pooled: Dict[Tuple[str, str, str], Dict[str, int]] = {}
+    for group in report["groups"]:
+        for pair in group["pairs"]:
+            key = (pair["engine_a"], pair["engine_b"], pair["label"])
+            agg = pooled.setdefault(key, {"groups": 0, "n": 0, "raw_div": 0, "changing": 0})
+            agg["groups"] += 1
+            agg["n"] += pair["n_compared"]
+            agg["raw_div"] += pair["raw_divergent"]
+            agg["changing"] += pair["answer_divergence"]["answer_changing"]
+    out = []
+    for (engine_a, engine_b, label), agg in sorted(pooled.items()):
+        kind = "oracle" if label == PAIR_LABEL_ORACLE else "substitute"
+        out.append((str(report["model"]), str(report["dataset"]), engine_a + "<->" + engine_b, kind, agg))
+    return out
+
+
+def _pooled_cross_arm(report: Dict[str, object]) -> List[Tuple[str, str, str, str, str, Dict[str, int]]]:
+    """(model, dataset, cell:ref, engine, input flag, agg) pooled across groups."""
+    cross = report.get("cross_arm")
+    if not isinstance(cross, dict):
+        return []
+    pooled: Dict[Tuple[str, str, str], Dict[str, int]] = {}
+    for g in cross["groups"]:
+        flag = "unknown" if g["input_effect"] is None else ("different" if g["input_effect"] else "same")
+        key = (f"{g['cell_arm']}:{g['reference_arm']}", g["engine"], flag)
+        agg = pooled.setdefault(key, {"groups": 0, "n": 0, "raw_div": 0, "changing": 0})
+        agg["groups"] += 1
+        agg["n"] += g["n_compared"]
+        agg["raw_div"] += g["raw_divergent"]
+        agg["changing"] += g["answer_divergence"]["answer_changing"]
+    return [
+        (str(report["model"]), str(report["dataset"]), pair, engine, flag, agg)
+        for (pair, engine, flag), agg in sorted(pooled.items())
+    ]
 
 
 def _print_campaign_summary(
     result: Dict[str, object], written: Dict[Tuple[str, str], Path]
 ) -> None:
-    """Stdout summary: per (model, dataset, pair) pooled across groups. Pooled
-    rates are display-only recomputations from the emitted counts (never new
-    measurements); per-group numbers live in the JSON artifacts."""
+    """Stdout summary: per (model, dataset, pair) pooled across groups; a second
+    table for the cross-arm lane when it ran."""
     counts = result["counts"]
     print(f"\n[divergence] campaign engine-pair T=0 comparison — {result['campaign_root']}")
     print(
@@ -973,27 +1278,32 @@ def _print_campaign_summary(
         f"{'groups':>7}{'n':>8}{'agree %':>9}{'ans-chg %':>11}"
     )
     for report in result["reports"]:
-        pooled: Dict[Tuple[str, str, str], Dict[str, int]] = {}
-        for group in report["groups"]:
-            for pair in group["pairs"]:
-                key = (pair["engine_a"], pair["engine_b"], pair["label"])
-                agg = pooled.setdefault(
-                    key, {"groups": 0, "n": 0, "raw_div": 0, "changing": 0}
-                )
-                agg["groups"] += 1
-                agg["n"] += pair["n_compared"]
-                agg["raw_div"] += pair["raw_divergent"]
-                agg["changing"] += pair["answer_divergence"]["answer_changing"]
-        for (engine_a, engine_b, label), agg in sorted(pooled.items()):
-            kind = "oracle" if label == PAIR_LABEL_ORACLE else "substitute"
+        for model, dataset, pair, kind, agg in _pooled_engine_pairs(report):
             print(
-                f"{report['model']:<18}{report['dataset']:<12}"
-                f"{engine_a + '<->' + engine_b:<22}{kind:<12}"
+                f"{model:<18}{dataset:<12}{pair:<22}{kind:<12}"
                 f"{agg['groups']:>7}{agg['n']:>8}"
                 f"{100 * (1 - agg['raw_div'] / agg['n']):>8.2f}%"
                 f"{100 * agg['changing'] / agg['n']:>10.2f}%"
             )
-    all_skips = result["skips"]
+    if any("cross_arm" in r for r in result["reports"]):
+        print(
+            f"[divergence] cross-arm lane (Spec Block A2): "
+            f"{counts['cross_arm_groups_compared']} group(s) compared, "
+            f"{counts['cross_arm_groups_skipped']} skipped"
+        )
+        print(
+            f"{'model':<18}{'dataset':<12}{'cell:reference':<26}{'engine':<9}{'inputs':<10}"
+            f"{'groups':>7}{'n':>8}{'agree %':>9}{'ans-chg %':>11}"
+        )
+        for report in result["reports"]:
+            for model, dataset, pair, engine, flag, agg in _pooled_cross_arm(report):
+                print(
+                    f"{model:<18}{dataset:<12}{pair:<26}{engine:<9}{flag:<10}"
+                    f"{agg['groups']:>7}{agg['n']:>8}"
+                    f"{100 * (1 - agg['raw_div'] / agg['n']):>8.2f}%"
+                    f"{100 * agg['changing'] / agg['n']:>10.2f}%"
+                )
+    all_skips = list(result["skips"]) + list(result.get("cross_arm_skips", []))
     if all_skips:
         print(f"[divergence] {len(all_skips)} labeled skip(s):")
         for s in all_skips:
@@ -1002,10 +1312,87 @@ def _print_campaign_summary(
         print(f"[divergence] -> {path}")
 
 
+def _campaign_summary_markdown(result: Dict[str, object]) -> str:
+    """The Markdown twin of the stdout summary (Spec Block A2 output), with the
+    per-group cross-arm rows that the pooled table hides."""
+    counts = result["counts"]
+    lines = [
+        "# Charter section 8.9 T=0 divergence (campaign lane)",
+        "",
+        f"- campaign root: `{result['campaign_root']}`",
+        f"- tokenizer: {result['tokenizer']}",
+        f"- {result['t0_contract']}",
+        f"- searched {counts['run_roots']} run tree(s), {counts['cells']} cell(s), {counts['windows_scanned']} window(s); "
+        f"engine-pair groups: {counts['groups_compared']} compared, {counts['groups_skipped']} skipped, "
+        f"{counts['groups_single_engine']} single-engine",
+        "",
+        "## Engine pairs, pooled across groups",
+        "",
+        "| model | dataset | pair | kind | groups | n | agreement | answer-changing |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for report in result["reports"]:
+        for model, dataset, pair, kind, agg in _pooled_engine_pairs(report):
+            lines.append(
+                f"| {model} | {dataset} | {pair} | {kind} | {agg['groups']} | {agg['n']} | "
+                f"{100 * (1 - agg['raw_div'] / agg['n']):.2f}% | {100 * agg['changing'] / agg['n']:.2f}% |"
+            )
+    if any("cross_arm" in r for r in result["reports"]):
+        lines += [
+            "",
+            "## Cross-arm pairs on one engine (Spec Block A2), per group",
+            "",
+            f"- {CROSS_ARM_INPUT_RULE}",
+            f"- {counts['cross_arm_groups_compared']} group(s) compared, {counts['cross_arm_groups_skipped']} skipped",
+            "",
+            "| model | dataset | cell:reference | engine | family | rung | inputs | n | agreement | token agreement | first divergence (median) | answer-changing | answer-preserving | median prompt tokens (cell / reference) |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        ]
+        for report in result["reports"]:
+            cross = report.get("cross_arm")
+            if not isinstance(cross, dict):
+                continue
+            for g in cross["groups"]:
+                flag = "unknown" if g["input_effect"] is None else ("different" if g["input_effect"] else "same")
+                rung = "" if g["budget_r"] is None else f"r{g['budget_r']:g}"
+                med = g["first_divergence"]["median_position"]
+                lines.append(
+                    f"| {report['model']} | {report['dataset']} | {g['cell_arm']}:{g['reference_arm']} | {g['engine']} | "
+                    f"{g['family']} | {rung} | {flag} | {g['n_compared']} | {100 * g['agreement_rate']:.2f}% | "
+                    f"{100 * g['token_agreement_rate']:.2f}% | {'' if med is None else med} | "
+                    f"{g['answer_divergence']['answer_changing']} | {g['answer_divergence']['answer_preserving']} | "
+                    f"{g['median_prompt_tokens']} / {g['reference_median_prompt_tokens']} |"
+                )
+    all_skips = list(result["skips"]) + list(result.get("cross_arm_skips", []))
+    if all_skips:
+        lines += ["", f"## Labeled skips ({len(all_skips)})", ""]
+        for s in all_skips:
+            lines.append(f"- [{s['model']}/{s['dataset']}] {s['where']}: {s['reason']}")
+    return "\n".join(lines) + "\n"
+
+
+def _parse_cross_arm(specs: Sequence[str]) -> List[Tuple[str, str]]:
+    """'CELL:REF' -> (cell_arm, reference_arm); malformed or self-paired is a usage error (ValueError)."""
+    pairs: List[Tuple[str, str]] = []
+    for spec in specs:
+        parts = spec.split(":")
+        if len(parts) != 2 or not parts[0] or not parts[1] or parts[0] == parts[1]:
+            raise ValueError(
+                f"--cross-arm {spec!r}: expected CELL_ARM:REFERENCE_ARM with two distinct, non-empty arm names"
+            )
+        if (parts[0], parts[1]) in pairs:
+            raise ValueError(f"--cross-arm {spec!r} given twice")
+        pairs.append((parts[0], parts[1]))
+    return pairs
+
+
+_CAMPAIGN_SUMMARY_MD = "token_divergence_summary.md"
+
+
 def _run_campaign_cli(args: argparse.Namespace) -> int:
     try:
         result = compute_campaign_divergence(
-            args.campaign_root, tokenizer=args.tokenizer
+            args.campaign_root, tokenizer=args.tokenizer, cross_arm_pairs=tuple(args.cross_arm_pairs)
         )
     except RuntimeError as exc:
         # CampaignDivergenceError, TokenizerUnavailableError, and the fail-closed
@@ -1019,7 +1406,8 @@ def _run_campaign_cli(args: argparse.Namespace) -> int:
         / f"token_divergence__{r['model']}__{r['dataset']}.json"
         for r in result["reports"]
     }
-    existing = sorted(str(p) for p in targets.values() if p.exists())
+    md_path = out_dir / _CAMPAIGN_SUMMARY_MD
+    existing = sorted(str(p) for p in list(targets.values()) + [md_path] if p.exists())
     if existing and not args.force:
         # Mirror of build_floor_table: a silently rewritten report cannot be
         # audited against the run that minted it.
@@ -1037,7 +1425,9 @@ def _run_campaign_cli(args: argparse.Namespace) -> int:
         path.write_text(
             json.dumps(report, indent=2, sort_keys=True), encoding="utf-8"
         )
+    md_path.write_text(_campaign_summary_markdown(result), encoding="utf-8")
     _print_campaign_summary(result, targets)
+    print(f"[divergence] -> {md_path}")
     return 0
 
 
@@ -1071,6 +1461,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "otherwise, mirroring build_floor_table).",
     )
     ap.add_argument(
+        "--cross-arm",
+        action="append",
+        default=[],
+        metavar="CELL_ARM:REFERENCE_ARM",
+        help="Campaign lane (Spec Block A2): compare two arms on the same engine for every "
+        "group both serve, e.g. corpus-comp:corpus-reuse (the fp8 KV cache against its bf16 twin). Repeatable.",
+    )
+    ap.add_argument(
         "--tokenizer",
         default="whitespace",
         help="Tokenizer for first-divergence positions: 'whitespace' (default) or an HF "
@@ -1088,9 +1486,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ap.error("--output belongs to the pilot lane; the campaign lane writes per-(model, dataset) reports under --out")
         if not args.out:
             ap.error("--campaign-root requires --out (directory for the per-(model, dataset) reports)")
+        try:
+            args.cross_arm_pairs = _parse_cross_arm(args.cross_arm)
+        except ValueError as exc:
+            ap.error(str(exc))
         return _run_campaign_cli(args)
-    if args.out or args.force:
-        ap.error("--out/--force belong to the campaign lane (--campaign-root)")
+    if args.out or args.force or args.cross_arm:
+        ap.error("--out/--force/--cross-arm belong to the campaign lane (--campaign-root)")
 
     try:
         summary = compute_divergence(args.results_dir, args.reference, tokenizer=args.tokenizer)
