@@ -717,12 +717,15 @@ SLO_FLOORS_ADR: str = "ADR-0117"
 #: - WINDOW_REQUESTS: loaded/window cells (F2, F3, RULER): the window's
 #:   question POOL (--num-queries), the ids the window cycles through. B3
 #:   (ADR-0172 item 5, owner 2026-10-16): 2,000 for SQuAD v2, lowered per
-#:   dataset by achievable_n (Qasper 500, RULER 300 prompts per task) so the
-#:   fast classes stay under REPLAY_FACTOR_MAX passes over their pool; the
+#:   dataset by SessionGrid.window_pool_n (Qasper 500, RULER 300 prompts per
+#:   task; ADR-0172 amendment 2026-10-17, owner decision E17 option (d): a
+#:   ceiling of the WINDOW class alone, so the unpressured Qasper classes keep
+#:   their registered n and their own achievable n is an A4 registration) so
+#:   the fast classes stay under REPLAY_FACTOR_MAX passes over their pool; the
 #:   window's --arrival-count is W = ceil(rate_frac x lambda* x D_class)
 #:   (window_shape), no longer the pool. Before B3 the pool was 200 and the
 #:   arrival count equal to it, which gave 2 to 13 s bursts on the fast
-#:   classes (S0F-68).
+#:   classes (S0F-68). achievable_n (A5) still lowers EVERY class of a dataset.
 N_PRIMARY: int = 2000
 N_SECONDARY: int = 800
 N_IDENTITY: int = 300
@@ -1868,6 +1871,13 @@ class SessionGrid:
     primary_engine: str = PRIMARY_ENGINE
     primary_baselines: Tuple[str, ...] = PRIMARY_BASELINES
     achievable_n: Mapping[str, int] = field(default_factory=dict)
+    # ADR-0172 amendment 2026-10-17 (E17 option (d)): the per-dataset pool
+    # ceiling of the WINDOW class alone (the ids a pressure window cycles,
+    # ADR-0172 item 1); never raises window_requests, never touches another
+    # class. Three trials drawn from a pool smaller than 3 x this value
+    # overlap between trials (the manifest builder records
+    # stats.trials_disjoint; the plan header carries it per manifest).
+    window_pool_n: Mapping[str, int] = field(default_factory=dict)
     # ADR-0155 demand classes: arm -> mean served sequence tokens (prompt +
     # output) the arm's byte budget is sized on, and the per-rung shapes of
     # the corpus-trunc ladder. Registered per session; the defaults are the
@@ -2001,6 +2011,29 @@ class SessionGrid:
                         f"achievable_n[{dataset!r}]={value} exceeds n_primary="
                         f"{self.n_primary}: the A5 branch only LOWERS a class n "
                         "for a dataset whose split cannot supply it"
+                    )
+        if not isinstance(self.window_pool_n, Mapping):
+            problems.append(
+                f"window_pool_n={self.window_pool_n!r} must be a mapping dataset -> pool "
+                f"({WINDOW_DESIGN_ADR} amendment E17)"
+            )
+        else:
+            grid_datasets = _grid_datasets(self)
+            for dataset, value in self.window_pool_n.items():
+                if dataset not in grid_datasets:
+                    problems.append(
+                        f"window_pool_n[{dataset!r}] names a dataset no cell of "
+                        f"this session carries (registered: {sorted(grid_datasets)})"
+                    )
+                if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                    problems.append(
+                        f"window_pool_n[{dataset!r}]={value!r} must be an integer >= 1"
+                    )
+                elif isinstance(self.window_requests, int) and value > self.window_requests:
+                    problems.append(
+                        f"window_pool_n[{dataset!r}]={value} exceeds window_requests="
+                        f"{self.window_requests}: the pool ceiling only LOWERS the window "
+                        f"class pool ({WINDOW_DESIGN_ADR} amendment E17)"
                     )
         for name in (
             "corpus_prefix_budget_tokens",
@@ -2236,11 +2269,22 @@ SESSION_GRIDS: Dict[str, SessionGrid] = {
         # B3 (ADR-0172 item 5): the per-dataset pools of the window cells.
         # Qasper's dev split has 1,005 questions (303 in-corpus at the
         # 2,800-token block budget on the 100x3 manifest), so its pool is 500
-        # per trial; RULER is generated, 300 prompts per task. Both lower the
-        # registered n for EVERY class of that dataset (DECISION.md A5: the
-        # dataset's split cannot supply the registered n). The manifests at
-        # these sizes are fix list item A4; stage 0 refuses until they exist.
-        achievable_n={"qasper": 500, "ruler": 300},
+        # per trial; RULER is generated, 300 prompts per task. ADR-0172
+        # amendment 2026-10-17 (E17 option (d)): these are WINDOW-class pool
+        # ceilings only; three Qasper trials of 500 overlap (the builder falls
+        # back to full-pool draws and records stats.trials_disjoint False), a
+        # reuse of the same kind as the replay a window records. The
+        # unpressured Qasper classes take Qasper's own achievable n (its whole
+        # in-corpus pool, the three trials overlapping and recorded; ADR-0173
+        # amendment 2026-10-17, the owner's (b) with (c)). Measured on the
+        # built artifact data/manifests/qasper_852x3_seed42_wr50.json (G4,
+        # 2026-10-17): 1,005 loaded, 100 excluded (their gold paragraphs
+        # alone exceed the 2,800-token block), pool 905, warm-up reserve 53
+        # (14 whole papers, requested 50), trial pool 852. Primary 2,000 ->
+        # 852, secondary 800 stays, window 500. Stage 0 refuses until the
+        # manifests exist.
+        achievable_n={"qasper": 852},
+        window_pool_n={"qasper": 500, "ruler": 300},
     ),
     # Session 'b' = charter §7.6 Group B (Llama-3.3-70B) + the Run-C-prime
     # DIST overlay (standing Plan-B scope, W4.6). Conservative pins where the
@@ -2834,6 +2878,7 @@ def rehearsal_grid(
         n_identity=n,
         window_requests=REHEARSAL_WINDOW_REQUESTS,
         achievable_n={},
+        window_pool_n={},
     )
 
 
@@ -3216,16 +3261,22 @@ def run_projection(steps: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
                     argv_ = step.get("argv") or []
                     preload = float(argv_[argv_.index("--open-loop-preload-s") + 1]) if "--open-loop-preload-s" in argv_ else 0.0
                     window_rec = step.get("window")
+                    # Audit 2026-10-17 (G26): the runner prepares its pool once
+                    # per TRIAL (window), and the S0 attempt 4 steps that
+                    # measured the prep served one window each, so the prep
+                    # cost is charged per window; at k = 3 the old arithmetic
+                    # under-counted it three times.
                     if isinstance(window_rec, dict):
                         # B3 (ADR-0172): the window is a duration, so only the
                         # preparation scales with the pool; each window costs
-                        # its pre-load, its duration and a tail of one class
-                        # latency bound (the last arrivals' service)
-                        secs = cost[0] * scale + windows * (
-                            preload + float(window_rec["duration_s"]) + float(window_rec["latency_bound_s"])
+                        # its preparation, its pre-load, its duration and a tail
+                        # of one class latency bound (the last arrivals' service)
+                        secs = windows * (
+                            cost[0] * scale
+                            + preload + float(window_rec["duration_s"]) + float(window_rec["latency_bound_s"])
                         )
                     else:
-                        secs = (cost[0] + cost[1] * windows) * scale + preload * windows
+                        secs = (cost[0] + cost[1]) * windows * scale + preload * windows
         if secs is None:
             unmeasured.append(f"{kind} {step.get('row_key') or step.get('engine')}")
             continue
@@ -3234,8 +3285,9 @@ def run_projection(steps: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     return {
         "finding": "S0F-88 B-5",
         "rule": (
-            "relaunch: mean per engine; dry window: mean per (engine, rerank); cell: prep + "
-            "windows x (window span + post-window), means per (engine, retriever), scaled linearly "
+            "relaunch: mean per engine; dry window: mean per (engine, rerank); cell: windows x "
+            "(prep + window span + post-window) (G26: the pool is prepared once per window), "
+            "means per (engine, retriever), scaled linearly "
             f"from {RUN_STEP_MEASURED_QUERIES} queries per window to the step's count (an upper bound "
             "above it), plus the pressure pre-load; blocked cells 0"
         ),
@@ -3805,9 +3857,12 @@ def class_n(
     n_identity: int,
     window_requests: int,
     achievable_n: Mapping[str, int],
+    window_pool_n: Optional[Mapping[str, int]] = None,
 ) -> int:
     """The registered n for a row class, LOWERED to the dataset's achievable
-    n when one is registered (A5); never raised by it."""
+    n when one is registered (A5); never raised by it. The window class is
+    further LOWERED to the dataset's ``window_pool_n`` (ADR-0172 amendment
+    2026-10-17, E17 option (d)), a ceiling the other classes never see."""
     table = {
         "primary": n_primary,
         "secondary": n_secondary,
@@ -3819,7 +3874,11 @@ def class_n(
     n = table[cls]
     ceiling = achievable_n.get(dataset)
     if ceiling is not None and ceiling < n:
-        return int(ceiling)
+        n = int(ceiling)
+    if cls == "window":
+        pool_ceiling = (window_pool_n or {}).get(dataset)
+        if pool_ceiling is not None and pool_ceiling < n:
+            n = int(pool_ceiling)
     return n
 
 
@@ -3834,6 +3893,45 @@ def cell_num_queries(grid: SessionGrid, cell: PlannedCell) -> Tuple[str, int]:
         n_identity=grid.n_identity,
         window_requests=grid.window_requests,
         achievable_n=grid.achievable_n,
+        window_pool_n=grid.window_pool_n,
+    )
+
+
+def _window_pool_caveat(grid: SessionGrid) -> Optional[str]:
+    """The header caveat naming every dataset whose window pool is capped
+    (ADR-0172 amendment 2026-10-17, E17 option (d))."""
+    if not grid.window_pool_n:
+        return None
+    capped = ", ".join(f"{ds}={n}" for ds, n in sorted(grid.window_pool_n.items()))
+    return (
+        f"window_pool_n caps the window-class pool for {capped} ({WINDOW_DESIGN_ADR} "
+        "amendment E17 option (d): the pool a pressure window cycles; the other "
+        "classes keep their registered n; trials drawn from a pool smaller than "
+        "replications x the cap overlap, recorded per manifest as trials_disjoint)"
+    )
+
+
+def _warmup_candidates_caveat(manifests: Mapping[str, Mapping[str, Any]]) -> Optional[str]:
+    """G4: the header caveat naming every registered manifest whose warm-up
+    candidate count the plan could only bound (``loaded_remainder``: the
+    runner's shared-paper and shared-paragraph filter still shrinks it; on the
+    852 Qasper artifact 153 loaded ids outside the trials leave 64 after the
+    filter, review 2026-10-17) or not judge (``unknown``). None when every
+    manifest carries a recorded reserve, or none is registered."""
+    inexact = {
+        ds: (rec.get("warmup_candidates") or {}).get("source", "unknown")
+        for ds, rec in sorted(manifests.items())
+        if (rec.get("warmup_candidates") or {}).get("source") != "reserve"
+    }
+    if not inexact:
+        return None
+    named = ", ".join(f"{ds} ({src})" for ds, src in inexact.items())
+    return (
+        f"warm-up candidates judged inexactly for {named}: loaded_remainder is an "
+        "upper bound the runner's ADR-0102 shared-context filter still shrinks and "
+        "unknown was not judged at all; rebuild these manifests with "
+        "build_query_manifest.py --warmup-reserve so the plan's count is the runner's "
+        "universe (G4, 2026-10-17)"
     )
 
 
@@ -4866,6 +4964,8 @@ def _stale_plan_problems(
                 n_identity=int(per_row_n["n_identity"]),
                 window_requests=int(per_row_n["window_requests"]),
                 achievable_n=dict(per_row_n.get("achievable_n") or {}),
+                # absent on a plan built before the E17 amendment: no window cap
+                window_pool_n=dict(per_row_n.get("window_pool_n") or {}),
             )
         except (KeyError, TypeError, ValueError, PlanError) as exc:
             problems.append(
@@ -5078,6 +5178,31 @@ def _stale_plan_problems(
                 "a manifest carrying the ladder)" + stale
             )
     return problems
+
+
+PASS_CEILING_BLOCK_PREFIX = "pass ceiling"
+
+
+def pass_ceiling_blocked_on(
+    spec: CellSpec,
+    dataset: str,
+    window: Mapping[str, Any],
+    pool: int,
+    offered_rate: float,
+    ceiling: int,
+) -> str:
+    """G24 (2026-10-17): the blocked_on text of a window cell whose arrivals
+    need more passes over its pool than the registered ceiling (B3,
+    ADR-0172); the cell is blocked with the shape it would need, the plan
+    stands (``counts.blocked`` counts it, the run skips it)."""
+    return (
+        f"{PASS_CEILING_BLOCK_PREFIX}: cell {spec.to_row_key()} needs {window['arrivals']} "
+        f"arrivals over a pool of {pool} ({window['passes']} passes) for its "
+        f"{window['duration_s']} s window at {offered_rate:.4g} rps, above the registered "
+        f"ceiling of {ceiling} passes ({WINDOW_DESIGN_ADR}); register a manifest with at "
+        f"least {math.ceil(window['arrivals'] / ceiling)} ids per trial for {dataset} "
+        "(SessionGrid.window_pool_n, fix list A4); the cell is blocked, the plan stands (G24)"
+    )
 
 
 def _cell_step(
@@ -5320,14 +5445,19 @@ def _cell_step(
                 and cell.blocked_on is None
                 and window["passes"] > replay_ceiling
             ):
-                raise PlanError(
-                    f"cell {spec.to_row_key()} needs {window['arrivals']} arrivals over a pool of "
-                    f"{num_queries} ({window['passes']} passes) for its {window['duration_s']} s "
-                    f"window at {offered_rate:.4g} rps, above the registered ceiling of "
-                    f"{replay_ceiling} passes ({WINDOW_DESIGN_ADR}); register a manifest with at "
-                    f"least {math.ceil(window['arrivals'] / replay_ceiling)} ids per trial for "
-                    f"{cell.dataset} (SessionGrid.achievable_n, fix list A4)"
+                # Audit 2026-10-17 (G24): the ceiling blocks the CELL, never the
+                # plan. Before, one class over it refused the whole stage 6
+                # plan after the ladders had billed; the blocked step records
+                # the shape it would need and the fix, and the run skips it.
+                cell = replace(
+                    cell,
+                    blocked_on=pass_ceiling_blocked_on(
+                        spec, cell.dataset, window, num_queries, offered_rate, replay_ceiling
+                    ),
                 )
+                # a blocked cell runs under no byte budget (Batch 2 W4: the
+                # plan validator refuses a budget record or env on one)
+                budget_plan = None
             window_arrivals = num_queries if window is None else int(window["arrivals"])
             argv += [
                 "--workload-mode",
@@ -5530,14 +5660,50 @@ def _register_query_manifests(
                     "a list of id strings; refusing to read it as empty"
                 )
             trial_sizes[str(trial_key)] = len(ids)
+        # ADR-0172 amendment 2026-10-17 (E17 option (d)): whether the builder
+        # could draw the trials without replacement across trials
+        # (manifest.stats.trials_disjoint); False means the trials overlap
+        # (a pool smaller than num_queries x num_trials), recorded here so the
+        # header shows which datasets replay across trials as well as inside
+        # a window; null when the manifest predates the flag.
+        stats = manifest.get("stats")
+        disjoint = stats.get("trials_disjoint") if isinstance(stats, dict) else None
         out[dataset] = {
             "path": str(path.resolve()),
             "sha256": hashlib.sha256(raw).hexdigest(),
             "block_budget": int(block_budget),
             "trunc_rungs": list(grid.corpus_trunc_budgets),
             "trial_sizes": trial_sizes,
+            "trials_disjoint": disjoint if isinstance(disjoint, bool) else None,
+            "warmup_candidates": _warmup_candidates_record(manifest, trials),
         }
     return out
+
+
+def _warmup_candidates_record(
+    manifest: Mapping[str, Any], trials: Mapping[str, Sequence[str]]
+) -> Dict[str, Any]:
+    """Audit 2026-10-17 (G4): how many pool questions the runner can draw its
+    warm-up (ADR-0102) and pre-load (ADR-0172 item 4) from.
+
+    ``source`` says what was counted: ``reserve`` (a v4 manifest's recorded
+    whole-group reserve, exactly the runner's candidate set), ``loaded_remainder``
+    (an older manifest: the loaded split, ``stats.source_examples_loaded``, minus
+    every trial id; the runner draws from the whole load, packed or not, so this
+    is an UPPER bound that its shared-paper and shared-paragraph filter still
+    shrinks: the auditors measured a median of 26 candidates at QASPER 3 x 500
+    against 1,005 loaded), or ``unknown`` (neither recorded; ``n`` None).
+    """
+    every_trial = {str(i) for ids in trials.values() for i in ids}
+    reserve = manifest.get("warmup_reserve")
+    if isinstance(reserve, dict) and isinstance(reserve.get("ids"), list) and reserve["ids"]:
+        ids = {str(i) for i in reserve["ids"]}
+        return {"n": len(ids - every_trial), "source": "reserve"}
+    stats = manifest.get("stats")
+    loaded = stats.get("source_examples_loaded") if isinstance(stats, dict) else None
+    if isinstance(loaded, int) and not isinstance(loaded, bool) and loaded > 0:
+        return {"n": max(0, loaded - len(every_trial)), "source": "loaded_remainder"}
+    return {"n": None, "source": "unknown"}
 
 
 def _check_manifest_coverage(
@@ -5550,7 +5716,8 @@ def _check_manifest_coverage(
     most demanding cell of its dataset registers as --num-queries (the
     runner measures the first n ids of trial t and refuses a shorter trial,
     so a shortfall is caught HERE, before any GPU spends). ``achievable_n``
-    is the ONLY way to lower the requirement (A5)."""
+    (A5, every class) and ``window_pool_n`` (the window class alone, ADR-0172
+    amendment E17) are the only ways to lower the requirement."""
     demand: Dict[str, Tuple[int, str, str]] = {}  # dataset -> (n, class, row_key)
     for cell in cells:
         cls, n = cell_num_queries(grid, cell)
@@ -5583,7 +5750,28 @@ def _check_manifest_coverage(
                     f"Rebuild with build_query_manifest.py --num-queries {n} "
                     f"--num-trials {grid.replications}, or register "
                     f"SessionGrid.achievable_n[{dataset!r}] (DECISION.md A5) if the "
-                    "split cannot supply it"
+                    "split cannot supply it (SessionGrid.window_pool_n caps the window "
+                    f"class alone, {WINDOW_DESIGN_ADR} amendment E17)"
+                )
+        # Audit 2026-10-17 (G4): the runner draws W_warm warm-ups (and the
+        # pre-load) from pool questions outside every trial; when the trials
+        # cover the pool nothing is left and every cell of the dataset refuses
+        # on the pod. Judged HERE from the manifest's recorded reserve (exact)
+        # or its pool remainder (an upper bound); a manifest recording neither
+        # cannot be judged and the runner's own refusal stands (recorded).
+        if WARMUP_POOL_QUERIES > 0:
+            cand = rec.get("warmup_candidates") or {}
+            n_cand = cand.get("n")
+            if n_cand is not None and n_cand < WARMUP_POOL_QUERIES:
+                raise PlanError(
+                    f"--query-manifest {dataset}: {rec['path']} leaves {n_cand} warm-up "
+                    f"candidate(s) outside every trial ({cand.get('source')}) but the "
+                    f"runner draws --warmup-pool-queries {WARMUP_POOL_QUERIES} per window "
+                    "(ADR-0102; the pre-load draws from the same candidates, ADR-0172 "
+                    "item 4): every cell of this dataset would refuse on the pod. Rebuild "
+                    f"with build_query_manifest.py --warmup-reserve {WARMUP_POOL_QUERIES} "
+                    "(or more; whole papers or paragraphs are set aside before the trial "
+                    "draws, G4) and lower the dataset's n to the trial pool it reports"
                 )
 
 
@@ -6809,8 +6997,11 @@ def build_plan(
         # ADR-0153: the first executable pressure cell of each (engine,
         # demand class) is preceded by that pair's dry window. Budgets sort
         # ascending, so this is the tightest r the class is carried at.
+        # G24 (review 2026-10-17 batch 3, MEDIUM 2): the STEP's blocked_on, not
+        # the cell's: _cell_step blocks a window over the pass ceiling itself,
+        # and a dry window must never precede a cell that will not run.
         if (
-            cell.blocked_on is None
+            cell_step["blocked_on"] is None
             and cell.spec.family in _PRESSURE_FAMILIES
             and cell_step["demand_class"] is not None
         ):
@@ -7041,7 +7232,12 @@ def build_plan(
             "drain_timeout_s": DRAIN_TIMEOUT_S,
             "replay_factor_max": REPLAY_FACTOR_MAX,
             "replay_ceiling_enforced": rehearsal is None,
-            "quality_rows": "first pass only (record_index <= first_pass_record_index_max)",
+            "quality_rows": (
+                "every arrival (ADR-0172 amendment 2026-10-17, E18: the scoring pass scores "
+                "identical inputs once per window and the replays inherit, recorded as "
+                "quality_source; the first pass record_index <= first_pass_record_index_max "
+                "stays an integrity record)"
+            ),
             "serving_rows": "every arrival",
         },
         # S0F-88 B-5: the measured projection the master compares with HOURS.
@@ -7087,12 +7283,20 @@ def build_plan(
             "primary_baselines": list(grid.primary_baselines),
             "achievable_n": dict(grid.achievable_n),
             "achievable_n_caveat": _achievable_n_caveat(grid),
+            # ADR-0172 amendment 2026-10-17 (E17 option (d)): the window-class
+            # pool ceiling per dataset, reviewable beside achievable_n.
+            "window_pool_n": dict(grid.window_pool_n),
+            "window_pool_caveat": _window_pool_caveat(grid),
             "cells_by_class": cells_by_class,
             "decision": PER_ROW_N_DECISION,
         },
         # ADR-0106 repair: the per-dataset query manifests this plan serves
         # (path + sha256 + what was validated); {} when none is registered.
         "query_manifests": manifests,
+        # G4 (review 2026-10-17 batch 2, MEDIUM 1): which manifests the warm-up
+        # candidate gate judged exactly (a recorded reserve) and which it could
+        # only bound or not judge at all, so the review sees the gap before a GO.
+        "warmup_candidates_caveat": _warmup_candidates_caveat(manifests),
         "front_loaded": front_loaded,  # review 2026-10-13 A2 (empty unless FRONT_LOAD)
         "counts": {
             "cells": len(cell_steps),

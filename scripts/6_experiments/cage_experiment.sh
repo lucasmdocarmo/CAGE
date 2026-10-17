@@ -1,5 +1,5 @@
 #!/bin/bash
-# Order:     THE master: stages 0 to 14 of one experiment on the Mac (preflight-mac, provision, ship, setup, validate, calibrate, plan, run, monitor, seal, score, collect, pull, analyze, teardown); it calls the existing stage scripts in order and never reimplements their checks
+# Order:     THE master: stages 0 to 14 of one experiment on the Mac (preflight-mac, provision, ship, setup, validate, calibrate, plan, run, monitor, seal, score, collect, pull, teardown, analyze); it calls the existing stage scripts in order and never reimplements their checks
 # Objective: Run one experiment profile end to end as numbered, resumable stages with a state file, detached pod jobs (pod_job.sh), a Mac-side pod monitor (monitor_pod.sh) and the experiments/<S>/<date>/ landing (ADR-0143)
 # Cloud:     runpod
 # =============================================================================
@@ -47,8 +47,15 @@ PY="${CAGE_MAC_PYTHON:-$PROJECT_DIR/.venv/bin/python}"
 PY3="$(command -v python3 || true)"
 [ -n "$PY3" ] || die "python3 is required on the Mac (state file, JSON parsing)"
 
-STAGES="preflight-mac provision ship setup validate calibrate plan run monitor seal score collect pull analyze teardown"
+# Audit 2026-10-17 (G18): teardown comes right after the verified pull; analyze
+# reads Mac files only and runs after it, so no pod hour is spent on Mac work
+# and an unexpected exit in the analysis never leaves a pod billing.
+STAGES="preflight-mac provision ship setup validate calibrate plan run monitor seal score collect pull teardown analyze"
 BILLABLE_STAGES="provision teardown"
+# Audit 2026-10-17 (G16): the stages whose bounds the seatbelt must cover and
+# whose entry checks the watchdog (ship through pull; teardown deletes the pod).
+POD_STAGES="ship setup validate calibrate plan run monitor seal score collect pull"
+pod_stage() { case " $POD_STAGES " in *" $1 "*) return 0 ;; esac; return 1; }
 
 usage() {
   sed -n '6,8p' "$0" >&2
@@ -144,27 +151,78 @@ SCORE_BOUND_MIN="${SCORE_BOUND_MIN:-180}"
 POD_READY_TIMEOUT_S="${CAGE_POD_READY_TIMEOUT_S:-900}"
 POD_READY_POLL_S="${CAGE_POD_READY_POLL_S:-15}"
 # Per-stage job bounds (seconds); the seatbelt must cover their sum plus the run.
-VALIDATE_BOUND_S=1500; CALIBRATE_BOUND_S=3600; PLAN_BOUND_S=900; COLLECT_BOUND_S=1800; PULL_MARGIN_MIN=60
+# Audit 2026-10-17 (G16): the pull margin was 60 min against S0 attempt 5's
+# measured pull of 68 min; the seal (600 s), the stage 4 start check (2,400 s)
+# and the readiness wait (POD_READY_TIMEOUT_S) were missing from the sum.
+VALIDATE_BOUND_S=1500; CALIBRATE_BOUND_S=3600; PLAN_BOUND_S=900; COLLECT_BOUND_S=1800; PULL_MARGIN_MIN=90
+SEAL_BOUND_S=600; START_CHECK_BOUND_S=2400
 # ADR-0154 / ADR-0156: the per-engine rung calibration job bound (profile key,
 # default in _common.env): up to PROBE_MAX_STEPS windows of 75 s plus a relaunch
 # per rung, for TWO classes (the anchor and the engine's smallest class).
 : "${CALIBRATE_RUNGS_BOUND_S:=18000}"
 
-seatbelt_minutes() { # "24h" | "90m" | "2d" -> minutes, or empty when malformed
+seatbelt_minutes() { # "24h" | "90m" -> minutes, or empty when malformed
+  # Audit 2026-10-17 (G30): "<n>d" is refused here; provision_pod.sh accepts h,
+  # m or a timestamp only, so a day form passed stage 0 and failed at stage 1.
   case "$1" in
     *h) printf '%s' "$(( ${1%h} * 60 ))" ;;
     *m) printf '%s' "${1%m}" ;;
-    *d) printf '%s' "$(( ${1%d} * 1440 ))" ;;
     *) return 1 ;;
   esac
 }
-seatbelt_need_minutes() { # the stage bounds the pod must survive, in minutes
-  local n_srv=0 n_cal=0 e
+stage_bound_minutes() { # G16: the pod-side bound of ONE stage, in minutes (one table for the seatbelt sum and the per-stage guard)
+  local n_srv=0 n_cal=0 e suite_min=0 start_min=0
   for e in $ENGINES; do [ "$e" = "hf" ] || n_srv=$((n_srv + 1)); done
   for e in $CALIBRATE; do n_cal=$((n_cal + 1)); done
-  # S0F-88 review L4: stage 4's load gate (600 s) and pod suite (1,800 s when SUITE_ON_POD=1) bill too
-  local suite_min=0; [ "${SUITE_ON_POD:-0}" = "1" ] && suite_min=30
-  printf '%s' "$(( SETUP_BOUND_MIN + 10 + suite_min + n_srv * VALIDATE_BOUND_S / 60 + n_cal * CALIBRATE_BOUND_S / 60 + n_cal * CALIBRATE_RUNGS_BOUND_S / 60 + PLAN_BOUND_S / 60 + HOURS * 60 + SCORE_BOUND_MIN + COLLECT_BOUND_S / 60 + PULL_MARGIN_MIN ))"
+  case "$1" in
+    setup)     printf '%s' "$SETUP_BOUND_MIN" ;;
+    validate)
+      # S0F-88 review L4: stage 4's load gate (600 s) and pod suite (1,800 s when
+      # SUITE_ON_POD=1) bill too; review 2026-10-13 A1: the start check (START_CHECK=1)
+      [ "${SUITE_ON_POD:-0}" = "1" ] && suite_min=30
+      [ "${START_CHECK:-1}" = "1" ] && start_min=$(( START_CHECK_BOUND_S / 60 ))
+      printf '%s' "$(( 10 + suite_min + n_srv * VALIDATE_BOUND_S / 60 + start_min ))" ;;
+    calibrate) printf '%s' "$(( n_cal * CALIBRATE_BOUND_S / 60 + n_cal * CALIBRATE_RUNGS_BOUND_S / 60 ))" ;;
+    plan)      printf '%s' "$(( PLAN_BOUND_S / 60 ))" ;;
+    run)       printf '%s' "$(( HOURS * 60 ))" ;;
+    seal)      printf '%s' "$(( SEAL_BOUND_S / 60 ))" ;;
+    score)     printf '%s' "$SCORE_BOUND_MIN" ;;
+    collect)   printf '%s' "$(( COLLECT_BOUND_S / 60 ))" ;;
+    pull)      printf '%s' "$PULL_MARGIN_MIN" ;;
+    *)         printf '%s' 0 ;;   # ship and monitor: minutes inside the neighbors' slack
+  esac
+}
+remaining_bound_minutes() { # G16: the pod-side bounds from stage $1 (inclusive) through pull
+  local total=0 s seen=0
+  for s in $POD_STAGES; do
+    [ "$s" = "$1" ] && seen=1
+    [ "$seen" -eq 1 ] || continue
+    total=$(( total + $(stage_bound_minutes "$s") ))
+  done
+  printf '%s' "$total"
+}
+seatbelt_need_minutes() { # the readiness wait plus every pod-side stage bound, in minutes
+  printf '%s' "$(( POD_READY_TIMEOUT_S / 60 + $(remaining_bound_minutes ship) ))"
+}
+watchdog_guard() { # G16: before a pod-side stage, the seatbelt is ALIVE and its deadline covers the remaining bounds
+  local out dl left need
+  out="$(bash "$SCRIPTS/runpod/pod_watchdog.sh" status "$POD_ID" 2>&1)" || true
+  if ! printf '%s\n' "$out" | grep -q "watchdog=ALIVE"; then
+    printf '  [FAIL] the seatbelt is not ALIVE for %s before stage %s (a Mac reboot or a disarm leaves the pod unguarded): re-arm it (bash %s/runpod/pod_watchdog.sh arm %s <deadline>) and resume\n' "$POD_ID" "$1" "$SCRIPTS" "$POD_ID"
+    printf '%s\n' "$out" | sed 's/^/    /'
+    return 1
+  fi
+  dl="$(printf '%s\n' "$out" | sed -nE 's/.*deadline=([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z).*/\1/p' | head -1)"
+  [ -n "$dl" ] || { say "watchdog ALIVE for $POD_ID (no deadline field in its status: the time left is not judged)"; state note "$1" "watchdog ALIVE, deadline not judged (no deadline field)"; return 0; }
+  left="$("$PY3" -c 'import sys, datetime; d = datetime.datetime.strptime(sys.argv[1], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc); print(int((d - datetime.datetime.now(datetime.timezone.utc)).total_seconds() // 60))' "$dl" 2>/dev/null || echo "")"
+  need="$(remaining_bound_minutes "$1")"
+  [ -n "$left" ] || state note "$1" "watchdog ALIVE, deadline $dl unparsed: the time left was not judged (review batch 4, L2)"
+  if [ -n "$left" ] && [ "$left" -lt "$need" ]; then
+    printf '  [FAIL] the seatbelt fires in %s min (deadline %s) but the stages from %s through pull need %s min (G16): re-arm the watchdog with a later deadline, then resume\n' "$left" "$dl" "$1" "$need"
+    return 1
+  fi
+  say "watchdog ALIVE for $POD_ID: ${left:-?} min left, the stages from $1 through pull need $need min"
+  return 0
 }
 pod_hours_bound() { # S0F-88 P-4: the pod bills through every stage bound, not the run (HOURS) alone
   awk -v m="$(seatbelt_need_minutes)" 'BEGIN { printf "%.1f", m / 60 }'
@@ -377,6 +435,43 @@ pscp_from() { # pscp_from <remote path> <local>; a remote DIRECTORY is given as 
   # shellcheck disable=SC2086
   ssh_retry scp -r -P "$POD_PORT" ${SSH_KEY:+-i "$SSH_KEY"} -o BatchMode=yes -o StrictHostKeyChecking=no "$POD_SSH:$1" "$2"; }
 
+TAKEOVER_STAGE=""   # G5: the stage recorded RUNNING when this master took over (--redo)
+job_attach_or_submit() {
+  # job_attach_or_submit <name> <remote command> <deadline_s>: audit 2026-10-17
+  # (G5). After a Mac crash or an ssh outage past the grace, the resume used to
+  # submit the job again: pod_job.sh refused a RUNNING one (the stage died) or,
+  # on a finished one, truncated its remote log and overwrote the fetched copy.
+  # With a local handle: RUNNING re-attaches (the wait below continues it);
+  # DONE(0) is reused when THIS stage is the one the master took over (its job
+  # finished while nobody watched); anything else, and a deliberate --redo of a
+  # passed stage, submits a fresh job as before.
+  local name="$1" cmd="$2" deadline="$3" prior="" dl_at left
+  JOB_WAIT_S="$deadline"
+  if ! plan_only && [ -f "$JOBS/$name.json" ]; then prior="$(bash "$PODJOB" status "$name" 2>/dev/null || true)"; fi
+  case "$prior" in
+    RUNNING)
+      # review 2026-10-17 batch 4 (M3): the wait that follows covers the time the
+      # handle's own deadline leaves, never the whole bound again
+      dl_at="$(sed -n 's/.*"deadline_at": "\([0-9TZ:-]*\)".*/\1/p' "$JOBS/$name.json" | head -1)"
+      left="$("$PY3" -c 'import sys, datetime; d = datetime.datetime.strptime(sys.argv[1], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc); print(max(60, int((d - datetime.datetime.now(datetime.timezone.utc)).total_seconds())))' "$dl_at" 2>/dev/null || echo "")"
+      [ -z "$left" ] || JOB_WAIT_S="$left"
+      say "job $name is RUNNING on the pod from the interrupted attempt: re-attaching, no second submit; waiting ${JOB_WAIT_S}s$( [ -n "$left" ] && printf ' (the handle deadline %s)' "$dl_at" || printf ' (the full bound: handle deadline unreadable)') (G5)"
+      state note "$CUR_STAGE" "job $name re-attached while RUNNING ($(utc), G5); wait ${JOB_WAIT_S}s"
+      return 0 ;;
+    UNREACHABLE)
+      # review 2026-10-17 batch 4 (M4): a blinking ssh endpoint must not get a
+      # second submit beside a job that may still be running
+      printf '  [FAIL] job %s has a local handle but the pod is UNREACHABLE: its state cannot be read, so nothing is submitted; retry when ssh answers (G5)\n' "$name"
+      return 1 ;;
+    DONE*)
+      if [ "$CUR_STAGE" = "$TAKEOVER_STAGE" ]; then
+        say "job $name finished DONE(0) during the interrupted attempt: its log is fetched, nothing is resubmitted (G5)"
+        state note "$CUR_STAGE" "job $name DONE(0) from the interrupted attempt reused ($(utc), G5)"
+        return 0
+      fi ;;
+  esac
+  run_step 0 "job $name: submit" -- bash "$PODJOB" submit "$name" "$cmd" "$deadline"
+}
 job_run() {
   # job_run <name> <deadline_s> <remote command> [logdir]: submit, wait, fetch
   # the log into logdir; the job's DONE(0) is the step's expected outcome.
@@ -384,8 +479,8 @@ job_run() {
   # submit starts a fresh remote log (review 2026-10-06, MEDIUM 8), so a
   # marker from an earlier attempt can never satisfy this one's check.
   local name="$1" deadline="$2" cmd="$3" logdir="${4:-$LAND/logs/runner}"
-  run_step 0 "job $name: submit" -- bash "$PODJOB" submit "$name" "$cmd" "$deadline" || return 1
-  if ! run_step 0 "job $name: wait" -- bash "$PODJOB" wait "$name" "$deadline"; then
+  job_attach_or_submit "$name" "$cmd" "$deadline" || return 1
+  if ! run_step 0 "job $name: wait" -- bash "$PODJOB" wait "$name" "$JOB_WAIT_S"; then
     bash "$PODJOB" tail "$name" 60 || true
     mkdir -p "$logdir/failed"
     bash "$PODJOB" fetch "$name" "$logdir/failed" >/dev/null 2>&1 && mv "$logdir/failed/$name.log" "$logdir/failed/${name}_$(date -u +%Y%m%dT%H%M%SZ).log" || true
@@ -488,12 +583,37 @@ stage_preflight_mac() {
   run_step 0 "account balance (before)" -- runpodctl user || return 1
   plan_only || { cp "$STEP_LOG" "$EXTRAS/ops/user_before.txt"; state put cost.balance_before_raw "$(grep -v '^#' "$STEP_LOG" | tr -d '\n' | cut -c1-400)"; }
   run_step 0 "clean room: pod list --all" -- runpodctl pod list --all || return 1
-  plan_only || { grep -v '^#' "$STEP_LOG" > "$EXTRAS/ops/pods_before.json"; json_only_ours "$EXTRAS/ops/pods_before.json" $(state get pod.id 2>/dev/null || true) || { printf '  [FAIL] clean room: pods exist before this experiment (see %s)\n' "$EXTRAS/ops/pods_before.json"; return 1; }; }
+  # Audit 2026-10-17 (G8): the A2 conductor pod, once recorded as state
+  # conductor.id, is this landing's own; the API key stays on the Mac and only
+  # the stage loop moves to the conductor (owner, "follow recommendations").
+  plan_only || { grep -v '^#' "$STEP_LOG" > "$EXTRAS/ops/pods_before.json"; json_only_ours "$EXTRAS/ops/pods_before.json" $(state get pod.id 2>/dev/null || true) $(state get conductor.id 2>/dev/null || true) || { printf '  [FAIL] clean room: pods exist before this experiment (see %s; this landing tolerates only its own pod and its recorded conductor, G8)\n' "$EXTRAS/ops/pods_before.json"; return 1; }; }
   run_step 0 "clean room: network-volume list" -- runpodctl network-volume list || return 1
   plan_only || { grep -v '^#' "$STEP_LOG" > "$EXTRAS/ops/volumes_before.json"; json_only_ours "$EXTRAS/ops/volumes_before.json" $(state get pod.volume_id 2>/dev/null || true) || { printf '  [FAIL] clean room: network volumes exist before this experiment (see %s)\n' "$EXTRAS/ops/volumes_before.json"; return 1; }; }
   if [ "${PARTIAL_TREE_OK:-0}" = "1" ] && [ -z "${REHEARSAL_N:-}" ]; then
     printf '  [FAIL] PARTIAL_TREE_OK=1 on a registered run (REHEARSAL_N empty): a partial tree is never sealed on a registered run (decision 3 of 2026-10-13, S0 only); unset it or set REHEARSAL_N\n'
     return 1
+  fi
+  # Audit 2026-10-17 (G14, G15): a registered profile (REHEARSAL_N empty) must
+  # carry the hang guards and the keys A5 names, and none of the S0-only keys;
+  # stage 0 refused PARTIAL_TREE_OK alone and let the rest pass silently.
+  if [ -z "${REHEARSAL_N:-}" ]; then
+    local reg_bad="" m
+    [ -n "${STEP_TIMEOUT_S:-}" ] || reg_bad="$reg_bad STEP_TIMEOUT_S=empty(G14: a hung step bills to the HOURS bound)"
+    [ "${LADDER_FAIL_FAST:-0}" = "1" ] || reg_bad="$reg_bad LADDER_FAIL_FAST=${LADDER_FAIL_FAST:-0}(G14: must be 1)"
+    [ "${FRONT_LOAD:-0}" = "0" ] || reg_bad="$reg_bad FRONT_LOAD=${FRONT_LOAD}(S0 key)"
+    [ -z "${RUN_FAIL_FAST:-}" ] || reg_bad="$reg_bad RUN_FAIL_FAST=${RUN_FAIL_FAST}(S0 key)"
+    [ "${DRY_TELEMETRY_RERUN:-0}" = "0" ] || reg_bad="$reg_bad DRY_TELEMETRY_RERUN=${DRY_TELEMETRY_RERUN}(S0 key)"
+    [ "${MAC_SUITE:-1}" = "1" ] || reg_bad="$reg_bad MAC_SUITE=${MAC_SUITE}(ADR-0145: never 0 on a registered run)"
+    case "${MAX_NULL_FRACTION:-}" in 1|1.0|1.00) reg_bad="$reg_bad MAX_NULL_FRACTION=${MAX_NULL_FRACTION}(the dry-run value; the registered bound must be stated)" ;; esac
+    [ -n "${BACKUP_ARCHIVE_DIR:-}" ] || reg_bad="$reg_bad BACKUP_ARCHIVE_DIR=empty(no tar archive of the run tree)"
+    [ "${CELL_STALL_MIN:-30}" -ge 60 ] || reg_bad="$reg_bad CELL_STALL_MIN=${CELL_STALL_MIN:-30}(S0 needed 60)"
+    for m in $MODEL $PREFETCH_MODELS_REQUIRED; do
+      case " $PREFETCH_MODELS " in *" $m "*) ;; *) reg_bad="$reg_bad PREFETCH_MODELS-lacks:$m" ;; esac
+    done
+    if [ -n "$reg_bad" ]; then
+      printf '  [FAIL] registered profile (REHEARSAL_N empty) carries S0-only or unset keys (G14, G15, 2026-10-17):%s\n' "$reg_bad"
+      return 1
+    fi
   fi
   # The Mac suite is the free gate. MAC_SUITE=0 skips that one step loudly when
   # the profile vouches for HEAD and says why (SUITE_ON_POD=1 keeps the suite
@@ -589,13 +709,52 @@ PY
 )" || { printf '  [FAIL] GPU_ID %s not found in runpodctl gpu list (check the profile spelling)\n' "$GPU_ID"; return 1; }
     state put siting.available_dcs "$dcs"
     say "datacenters with stock for $GPU_ID: ${dcs:-none listed}"
+    # Audit 2026-10-17 (G17): the balance must cover the whole pod bound at the
+    # list price plus the floor; the account is PREPAID and RunPod stops the pod
+    # at zero (its behavior at that instant is [?]), so the shortfall is judged
+    # here, before anything bills. The price is the CLI's for CLOUD_TYPE;
+    # PRICE_PER_HOUR_USD in the profile overrides it when the CLI lists none.
+    local price need_usd balance
+    price="${PRICE_PER_HOUR_USD:-}"
+    [ -n "$price" ] || price="$("$PY3" - "$EXTRAS/ops/gpu_list.json" "$GPU_ID" "$CLOUD_TYPE" <<'PY'
+import json, sys
+gpus = json.load(open(sys.argv[1], encoding="utf-8"))
+want, cloud = sys.argv[2], sys.argv[3].upper()
+key = "securePricePerHr" if cloud == "SECURE" else "communityPricePerHr"
+for g in gpus if isinstance(gpus, list) else gpus.get("gpus", []):
+    if g.get("gpuId") == want or g.get("id") == want:
+        p = g.get(key)
+        if isinstance(p, (int, float)) and p > 0:
+            print(p)
+        sys.exit(0)
+PY
+)"
+    balance="$("$PY3" - "$EXTRAS/ops/user_before.txt" <<'PY'
+import json, sys
+try:
+    # the file is the step log copy: the master's "# ..." header and footer lines wrap the CLI's JSON
+    body = "\n".join(l for l in open(sys.argv[1], encoding="utf-8").read().splitlines() if not l.startswith("#"))
+    doc = json.loads(body)
+except Exception:
+    sys.exit(0)
+for k in ("clientBalance", "balance", "currentBalance"):
+    if isinstance(doc, dict) and isinstance(doc.get(k), (int, float)):
+        print(doc[k]); break
+PY
+)"
+    [ -n "$price" ] || { printf '  [FAIL] no %s price for %s in runpodctl gpu list and PRICE_PER_HOUR_USD is unset: the balance cannot be judged against the pod bound (G17)\n' "$CLOUD_TYPE" "$GPU_ID"; return 1; }
+    [ -n "$balance" ] || { printf '  [FAIL] runpodctl user printed no balance field (clientBalance): the balance cannot be judged (G17); see %s\n' "$EXTRAS/ops/user_before.txt"; return 1; }
+    need_usd="$(awk -v h="$(pod_hours_bound)" -v p="$price" -v g="$GPU_COUNT" -v f="$BALANCE_FLOOR_USD" 'BEGIN { printf "%.2f", h * p * g + f }')"
+    state put cost.price_per_hour_list_usd "$price"; state put cost.balance_before_usd "$balance"; state put cost.pod_bound_need_usd "$need_usd"
+    say "balance $balance USD against $need_usd USD needed ($(pod_hours_bound) h x $price USD/h x $GPU_COUNT GPU + the $BALANCE_FLOOR_USD USD floor)"
+    run_step 0 "balance covers the pod bound plus the floor (G17)" -- awk -v b="$balance" -v n="$need_usd" 'BEGIN { exit (b + 0 >= n + 0) ? 0 : 1 }' || { printf '  [FAIL] balance %s USD is below the %s USD the pod bound needs (%s h x %s USD/h x %s GPU + %s USD floor): top up or cut HOURS (G17)\n' "$balance" "$need_usd" "$(pod_hours_bound)" "$price" "$GPU_COUNT" "$BALANCE_FLOOR_USD"; return 1; }
   fi
   # The seatbelt deletes the pod at its deadline whatever stage is running
   # (review 2026-10-06, HIGH 4): it must cover every pod-side bound, not the run alone.
   local seat_min need_min
-  seat_min="$(seatbelt_minutes "$SEATBELT")" || { printf '  [FAIL] SEATBELT=%s is not <n>h, <n>m or <n>d\n' "$SEATBELT"; return 1; }
+  seat_min="$(seatbelt_minutes "$SEATBELT")" || { printf '  [FAIL] SEATBELT=%s is not <n>h or <n>m (a day form is refused: provision_pod.sh accepts none, G30)\n' "$SEATBELT"; return 1; }
   need_min="$(seatbelt_need_minutes)"
-  say "seatbelt $SEATBELT = $seat_min min; the stage bounds need $need_min min (setup $SETUP_BOUND_MIN, validate, calibrate, calibrate-rungs $((CALIBRATE_RUNGS_BOUND_S / 60)) per engine, plan, run $((HOURS * 60)), score $SCORE_BOUND_MIN, collect, pull margin $PULL_MARGIN_MIN)"
+  say "seatbelt $SEATBELT = $seat_min min; the stage bounds need $need_min min (readiness $((POD_READY_TIMEOUT_S / 60)), setup $SETUP_BOUND_MIN, validate $(stage_bound_minutes validate), calibrate $(stage_bound_minutes calibrate) with calibrate-rungs $((CALIBRATE_RUNGS_BOUND_S / 60)) per engine, plan, run $((HOURS * 60)), seal, score $SCORE_BOUND_MIN, collect, pull margin $PULL_MARGIN_MIN)"
   run_step 0 "seatbelt covers the stage bounds" -- test "$seat_min" -ge "$need_min" || { printf '  [FAIL] SEATBELT=%s (%s min) is shorter than the %s min the stages need; raise SEATBELT in the profile\n' "$SEATBELT" "$seat_min" "$need_min"; return 1; }
   run_step 0 "provision plan print" -- bash "$SCRIPTS/runpod/provision_pod.sh" --gpu-id "$GPU_ID" --gpu-count "$GPU_COUNT" --disk-gb "$DISK_GB" --volume-gb "$VOLUME_GB" --cloud-type "$CLOUD_TYPE" --ports "$PORTS" --terminate-after "$SEATBELT" --hours "$(pod_hours_bound)" --purpose "$EXP $DATE" || return 1
   plan_only || step_has "PLAN ONLY" || { printf '  [FAIL] provision plan print lacks the PLAN ONLY line\n'; return 1; }
@@ -1117,7 +1276,34 @@ else:
 for b in bad: print("  [FAIL] " + b)
 sys.exit(1 if bad else 0)
 PY
+  # Audit 2026-10-17 (G7): the bytes the run writes, projected from the plan's
+  # arrivals, against the pod disk that holds the run root and its mirror (the
+  # container disk when POD_RESULTS_DIR is set, else the network volume), the
+  # archive when BACKUP_ARCHIVE_DIR is set, and the Mac's free space for the pull.
+  local copies=2 pod_gb="$VOLUME_GB" mac_free
+  [ -z "${BACKUP_ARCHIVE_DIR:-}" ] || copies=3
+  [ -z "$POD_RESULTS_DIR" ] || pod_gb="$DISK_GB"
+  mac_free="$(df -k "$LAND" 2>/dev/null | awk 'NR == 2 { print int($4 / 1048576) }')"
+  run_step 0 "disk projection (G7)" -- "$PY3" "$SCRIPT_DIR/disk_projection.py" "$EXTRAS/plan.json" --pod-gb "$pod_gb" --mac-free-gb "${mac_free:-0}" --copies "$copies" || return 1
   return 0
+}
+
+custody_copy() {
+  # Audit 2026-10-17 (G6): a registered run that fails at stage 7 used to leave
+  # its only copy on a billing pod (PARTIAL_TREE_OK is refused there, so seal,
+  # pull and teardown all refused). The pod's backup mirror of the UNSEALED
+  # tree is copied to the landing first, as non-confirmatory evidence; the
+  # owner may then tear the pod down by hand (teardown_pod.sh --force).
+  local dest="$LAND/run_unsealed/$RUN_ID"
+  mkdir -p "$dest"
+  say "custody (G6): copying the pod's mirror of the UNSEALED tree to $dest (non-confirmatory evidence; nothing here is sealed)"
+  if pscp_from "$POD_BACKUP_DIR/$BACKUP_RUN_REL/." "$dest/"; then
+    state note run "G6 custody: the unsealed tree was copied to $dest at $(utc); the pod may be torn down by hand (teardown_pod.sh --force) once the owner has read it"
+    say "custody copy landed: $dest"
+  else
+    state note run "G6 custody: the mirror copy FAILED at $(utc); the only copy is on the pod ($POD_BACKUP_DIR/$BACKUP_RUN_REL)"
+    say "custody copy FAILED: the only copy is still on the pod at $POD_BACKUP_DIR/$BACKUP_RUN_REL"
+  fi
 }
 
 stage_run() {
@@ -1166,18 +1352,23 @@ stage_run() {
   [ "${DRY_TELEMETRY_RERUN:-0}" = "1" ] && dry_rerun=" --dry-window-telemetry-rerun"
   # review 2026-10-13 B1: RUN_FAIL_FAST=infra|all (S0) stops the run at its first infrastructure failure
   [ -z "${RUN_FAIL_FAST:-}" ] || dry_rerun="$dry_rerun --fail-fast $RUN_FAIL_FAST"
-  run_step 0 "job $name: submit" -- bash "$PODJOB" submit "$name" "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH$POD_ENGINE_ENV && env $RUN_ENV_UNSET CAGE_RUN_ROOT=$POD_RUN_ROOT VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT CAGE_PROVIDER=runpod CAGE_HARDWARE='$GPU_ID x $GPU_COUNT'$run_to $POD_PYTHON scripts/3_run/run_campaign.py run --plan results/calibration/plan_$RUN_ID.json --campaign-root $POD_RUN_ROOT --seal$partial$dry_rerun" "$bound" || return 1
+  job_attach_or_submit "$name" "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH$POD_ENGINE_ENV && env $RUN_ENV_UNSET CAGE_RUN_ROOT=$POD_RUN_ROOT VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT CAGE_PROVIDER=runpod CAGE_HARDWARE='$GPU_ID x $GPU_COUNT'$run_to $POD_PYTHON scripts/3_run/run_campaign.py run --plan results/calibration/plan_$RUN_ID.json --campaign-root $POD_RUN_ROOT --seal$partial$dry_rerun" "$bound" || return 1
   if plan_only; then
     printf '  [plan] %-28s expect DONE(0) or STOP FAILED(2); DRY WINDOW FAILED(3) fails the stage: bash %s wait run %s\n' "job run: wait" "$PODJOB" "$bound"
     return 0
   fi
   local wrc=0
-  bash "$PODJOB" wait "$name" "$bound" | tee "$EXTRAS/steps/run_wait.log" || wrc="${PIPESTATUS[0]}"
+  bash "$PODJOB" wait "$name" "$JOB_WAIT_S" | tee "$EXTRAS/steps/run_wait.log" || wrc="${PIPESTATUS[0]}"
   bash "$PODJOB" fetch "$name" "$LAND/logs/runner" || true
   JOB_LOG="$LAND/logs/runner/run.log"
   if [ "$wrc" -eq 124 ]; then printf '  [FAIL] the run exceeded its %s h bound and is STILL RUNNING on the pod (see PORTAL ACTION)\n' "$HOURS"; return 1; fi
   if [ "$wrc" -ne 0 ]; then
     if grep -q "REFUSED:" "$JOB_LOG" 2>/dev/null; then printf '  [FAIL] run REFUSED:\n'; grep "REFUSED:" "$JOB_LOG" | head -3; return 1; fi
+    # G6: a run that FAILS on a registered profile gets its unsealed tree copied
+    # off the pod before the stage fails (the two failing branches below; a
+    # PARTIAL acceptance seals and pulls through the normal stages; exit 2,
+    # STOP FAILED only, passes with a complete tree and copies nothing: review
+    # 2026-10-17 batch 4, H1)
     if grep -q "STOP FAILED" "$JOB_LOG" 2>/dev/null && grep -q "FAILED(2)" "$EXTRAS/steps/run_wait.log"; then
       say "run finished with exit 2 = STOP FAILED only (data tree complete; the pod may still hold an engine)"
       state note run "exit 2: STOP FAILED (ADR-0139); data tree complete"
@@ -1196,6 +1387,7 @@ stage_run() {
         say "PARTIAL tree accepted on the profile's PARTIAL_TREE_OK=1: the failed dry windows stay recorded; seal, score and analysis run on what executed"
       else
         state note run "exit 3: DRY WINDOW FAILED (ADR-0153); pressure cells skipped, see logs/runner/run.log"
+        custody_copy
         return 1
       fi
     elif partial_ok && grep -q "^\[run_campaign\] totals:" "$JOB_LOG" 2>/dev/null && grep -q "FAILED(1)" "$EXTRAS/steps/run_wait.log"; then
@@ -1209,7 +1401,9 @@ stage_run() {
       state put run.partial "exit 1: failed cell(s) or relaunch(es)"
       say "PARTIAL tree accepted on the profile's PARTIAL_TREE_OK=1: the failed cells stay recorded (verify_results names them FAIL); seal, score and analysis run on what executed"
     else
-      printf '  [FAIL] run ended %s (see %s)\n' "$(tail -n 1 "$EXTRAS/steps/run_wait.log")" "$JOB_LOG"; return 1
+      printf '  [FAIL] run ended %s (see %s)\n' "$(tail -n 1 "$EXTRAS/steps/run_wait.log")" "$JOB_LOG"
+      custody_copy
+      return 1
     fi
   fi
   if run_partial; then
@@ -1277,16 +1471,19 @@ stage_score() {
       printf '  [FAIL] MAX_NULL_FRACTION is empty in the profile: build_predicate_table.py needs the registered bound stated (no silent default)\n'; return 1
     fi
   fi
-  local bound=$(( SCORE_BOUND_MIN * 60 )) force=""
+  local bound=$(( SCORE_BOUND_MIN * 60 )) force="" bsize=""
   # Scoring passes are append-only (a bug means a NEW SCORING_RUN_ID), so an
   # existing scoring/<id>/ is reused, and the derived predicate table is
   # rebuilt with --force on --redo (review 2026-10-06, MEDIUM 7).
   [ "$REDO" -eq 1 ] && force=" --force"
+  # G19 (2026-10-17): the profile's batch size reaches the pass (B13); the pass
+  # itself resumes a partial directory window by window after a kill.
+  [ -z "${SCORING_BATCH_SIZE:-}" ] || bsize=" --batch-size $SCORING_BATCH_SIZE"
   # Review 2026-10-10 (R2): the rescorer reads the freeze file too, so the four
   # instrument revisions are enforced at load (CAGE_*_REVISION) on the pod; (R3)
   # the rescorer builds its pass under a partial name and renames it only once
   # sealed, so the "exists: reused" branch here only ever meets a complete pass.
-  job_run score "$bound" "cd $POD_REPO && { [ -d $POD_RUN_ROOT/scoring/$SCORING_RUN_ID ] && echo 'scoring/$SCORING_RUN_ID exists: reused (append-only)' || $POD_PYTHON scripts/4_analysis/rescore_quality.py --run-root $POD_RUN_ROOT --full --device cuda --scoring-run-id $SCORING_RUN_ID --freeze-file $POD_FREEZE_FILE; } && $POD_PYTHON scripts/4_analysis/build_predicate_table.py $POD_RUN_ROOT --scoring-run-id $SCORING_RUN_ID --max-null-fraction $MAX_NULL_FRACTION --freeze-file $POD_FREEZE_FILE$force" "$LAND/logs/runner" || return 1
+  job_run score "$bound" "cd $POD_REPO && { [ -d $POD_RUN_ROOT/scoring/$SCORING_RUN_ID ] && echo 'scoring/$SCORING_RUN_ID exists: reused (append-only)' || $POD_PYTHON scripts/4_analysis/rescore_quality.py --run-root $POD_RUN_ROOT --full --device cuda --scoring-run-id $SCORING_RUN_ID --freeze-file $POD_FREEZE_FILE$bsize; } && $POD_PYTHON scripts/4_analysis/build_predicate_table.py $POD_RUN_ROOT --scoring-run-id $SCORING_RUN_ID --max-null-fraction $MAX_NULL_FRACTION --freeze-file $POD_FREEZE_FILE$force" "$LAND/logs/runner" || return 1
   return 0
 }
 
@@ -1353,41 +1550,14 @@ stage_analyze() {
   local force=""
   [ -d "$RUN_LOCAL/index" ] && force="--force"
   # Review 2026-10-13 item 18 (decision 6): the regime labels of every pressure
-  # window, by engine and family, printed before anything is analyzed; with
-  # MIN_IN_REGIME_WINDOWS set (per engine), fewer IN_REGIME pressure windows
-  # fail the stage (attempt 4: 0 of 23 measured windows were IN_REGIME and
-  # every stage passed). Empty = report only.
-  run_step 0 "regime label table (item 18)" -- "$PY3" - "$RUN_LOCAL" "${MIN_IN_REGIME_WINDOWS:-}" <<'PY' || return 1
-import json, sys
-from collections import Counter
-from pathlib import Path
-root = Path(sys.argv[1]); need = sys.argv[2].strip()
-by_pair = {}
-for regime in sorted(root.glob("cells/*/window_*/regime.json")):
-    parts = regime.parent.parent.name.split("|")
-    if len(parts) < 7:
-        continue
-    engine, family = parts[4], parts[6]
-    try:
-        label = str(json.load(open(regime, encoding="utf-8")).get("label"))
-    except Exception:
-        label = "unreadable"
-    by_pair.setdefault((engine, family), Counter())[label] += 1
-print("regime labels per (engine, family): " + ("; ".join(
-    f"{e} {f}: " + ", ".join(f"{l}={n}" for l, n in sorted(c.items())) for (e, f), c in sorted(by_pair.items())) or "no window"))
-in_regime = {}
-for (e, f), c in by_pair.items():
-    if f in ("F2", "F3"):
-        in_regime[e] = in_regime.get(e, 0) + c.get("IN_REGIME", 0)
-print("IN_REGIME pressure windows per engine: " + (", ".join(f"{e}={n}" for e, n in sorted(in_regime.items())) or "none"))
-if need:
-    short = {e: n for e, n in in_regime.items() if n < int(need)}
-    engines = {e for (e, f) in by_pair}
-    short.update({e: 0 for e in engines if e not in in_regime and e != "hf"})
-    if short:
-        print(f"  [FAIL] MIN_IN_REGIME_WINDOWS={need}: engine(s) below it: {short} (decision 6, 2026-10-13)")
-        sys.exit(1)
-PY
+  # window, by engine and family, printed before anything is analyzed. ADR-0173
+  # amendment E12 (2026-10-17, owner option (a); audit G31): with
+  # MIN_IN_REGIME_WINDOWS set, every (engine, arm, dataset, budget rung, rate
+  # rung >= 1.0) group needs that many windows labeled IN_REGIME and not
+  # transient, or the stage fails (attempt 4: 0 of 23 measured windows were
+  # IN_REGIME and every stage passed). Empty = report only. The rule lives in
+  # scripts/6_experiments/regime_gate.py (tested), no longer in a heredoc.
+  run_step 0 "regime label table (item 18, E12 rule)" -- "$PY3" "$SCRIPT_DIR/regime_gate.py" "$RUN_LOCAL" "${MIN_IN_REGIME_WINDOWS:-}" || return 1
   # A PARTIAL tree (decision 3) verifies with FAIL findings on its failed cells
   # (R15); the report is the deliverable, so rc 1 is expected there and noted.
   local vexp=0; run_partial && vexp="0|1"
@@ -1440,7 +1610,8 @@ stage_teardown() {
   fi
   run_step 0 "network volume delete" -- runpodctl network-volume delete "$VOL_ID" || return 1
   run_step 0 "listing: pod list --all" -- runpodctl pod list --all || return 1
-  plan_only || { grep -v '^#' "$STEP_LOG" > "$EXTRAS/ops/pods_after.json"; json_empty "$EXTRAS/ops/pods_after.json" || { printf '  [FAIL] pods STILL LISTED (STILL BILLING): %s\n' "$EXTRAS/ops/pods_after.json"; return 1; }; }
+  # G8: the recorded A2 conductor (if any) is the one pod this proof tolerates
+  plan_only || { grep -v '^#' "$STEP_LOG" > "$EXTRAS/ops/pods_after.json"; json_only_ours "$EXTRAS/ops/pods_after.json" $(state get conductor.id 2>/dev/null || true) || { printf '  [FAIL] pods STILL LISTED (STILL BILLING; only a recorded conductor.id is tolerated, G8): %s\n' "$EXTRAS/ops/pods_after.json"; return 1; }; }
   run_step 0 "listing: network-volume list" -- runpodctl network-volume list || return 1
   plan_only || { grep -v '^#' "$STEP_LOG" > "$EXTRAS/ops/volumes_after.json"; json_empty "$EXTRAS/ops/volumes_after.json" || { printf '  [FAIL] volumes STILL LISTED (STILL BILLING): %s\n' "$EXTRAS/ops/volumes_after.json"; return 1; }; }
   run_step 0 "cost report (--billing)" -- bash "$SCRIPTS/runpod/cost_report.sh" --billing || return 1
@@ -1464,6 +1635,16 @@ run_stage() {
   CUR_STAGE="$name"; STEP_N=0
   hr; say "stage $(stage_index "$name"): $name $( plan_only && printf '(plan)' )"
   plan_only || state begin "$name" 0
+  # G16: every pod-side stage starts by proving the seatbelt is alive and covers
+  # the bounds still ahead (stage 1 alone proved it before; a Mac reboot
+  # between stages left the pod unguarded for days on a long run)
+  if ! plan_only && pod_stage "$name"; then
+    pod_env
+    set +e; watchdog_guard "$name"; rc=$?; set -e
+    if [ "$rc" -ne 0 ]; then
+      state end "$name" "$rc"; say "stage $name FAILED (rc=$rc): the seatbelt check refused it"; portal_block; return 1
+    fi
+  fi
   set +e; "$fn"; rc=$?; set -e
   plan_only || state end "$name" "$rc"
   if [ "$rc" -ne 0 ]; then
@@ -1520,6 +1701,9 @@ if [ -f "$STATE" ]; then
   if [ -n "$running" ] && [ "$REDO" -ne 1 ]; then
     die "stage '$running' is recorded as RUNNING in $STATE (another master, or a crash); inspect, then pass --from $running --redo to take it over"
   fi
+  # G5: the stage this master takes over may have a pod job that ran on without
+  # it; job_attach_or_submit re-attaches to it instead of submitting a second one
+  TAKEOVER_STAGE="$running"
 else
   state init "$EXP" "$DATE"
 fi

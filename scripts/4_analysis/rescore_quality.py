@@ -98,6 +98,8 @@ SCORING_DIRNAME = "scoring"
 SCORING_MANIFEST_NAME = "scoring_manifest.json"
 QA_SCORES_NAME = "qa_scores.jsonl"
 QUALITY_JSON_NAME = "quality.json"
+#: G19 (2026-10-17): the configuration fingerprint a partial pass is resumed under
+PARTIAL_MANIFEST_NAME = "partial_manifest.json"
 
 #: Task #130 decision (a) — label-stripping layer (charter §9.8, audit H9).
 #: The per-run-root salt lives at scoring/<SALT_FILE_NAME> (OUTSIDE cells/,
@@ -201,6 +203,16 @@ def parse_args() -> argparse.Namespace:
                         "unblinded control bitwise. The scoring manifest records "
                         f"blinding mode {BLINDING_MODE_CONTROL!r}; never use for "
                         "a registered confirmatory pass.")
+    p.add_argument("--native-only-datasets", default=NATIVE_ONLY_DATASETS_DEFAULT,
+                   dest="native_only_datasets",
+                   help="ADR-0173 E6 (c): comma list of datasets whose windows are "
+                        "scored with the NATIVE instruments only (F1, EM, abstention; "
+                        "every model-backed column None) even under --full; the "
+                        "window directory name (window_<dataset>-<k>) names the "
+                        f"dataset. Default {NATIVE_ONLY_DATASETS_DEFAULT!r} (RULER's 32K "
+                        "contexts: grounding is scored later, off the pod). '' disables. "
+                        "Each score row carries scoring_scope; the scoring manifest "
+                        "records the set and the window count.")
     return p.parse_args()
 
 
@@ -222,6 +234,16 @@ _MODEL_FIELDS = [
     "completeness_bertscore", "completeness_rouge_l",
     "faithfulness_source", "grounding_source",
 ]
+
+#: ADR-0173 E6 (c), owner decision 2026-10-17: RULER windows are scored with the
+#: native instruments only in the S1 pass (grounding later, off the pod). The
+#: scope label rides every score row; the helpers live beside _build_evaluator.
+NATIVE_ONLY_DATASETS_DEFAULT = "ruler"
+SCOPE_NATIVE_ONLY = "native_only"
+SCOPE_FULL = "full"
+SCOPE_FAST = "fast"
+SCOPE_UNLABELED = "unlabeled"  # a direct _score_evidence_file caller that named no scope
+_WINDOW_DIR_RE = re.compile(r"^window_([a-z0-9_]+)-(\d+)$")  # = campaign_layout.WINDOW_DIR_RE
 
 #: quality.json aggregation allowlist (task #127, audit H11): ONLY score columns
 #: are aggregated. Provenance numerics riding in a score row (old_grounding_score,
@@ -712,6 +734,69 @@ def _apply_to_results_csv(trial_dir: Path, rows_out: list, full_mode: bool) -> i
 #: filled with "" (an empty reference would read as an unanswerable item).
 _V2_REQUIRED_KEYS: tuple[str, ...] = ("generated_answer", "reference_answer", "used_contexts")
 
+#: ADR-0172 amendment 2026-10-17 (owner decision E18, option (ii)): inside one
+#: evidence file (one window) identical scoring inputs are scored ONCE and
+#: every other row with the same inputs inherits that score. A measured
+#: pressure window replays its pool (ADR-0172 item 1), so at temperature 0 a
+#: replayed arrival that answers the same text costs no scoring, and a replay
+#: that answers differently under pressure is scored on its own: every
+#: arrival carries a verdict (the yield Y needs one per arrival) and the
+#: degradation under pressure is what gets measured. The key is the canonical
+#: JSON of EVERY input the scorer reads (example_id, repeat_index, question,
+#: contexts, generated answer, reference, all answers, is_impossible, the
+#: pre-compression originals), so two rows share a score only when the scorer
+#: would see the same request; a different repeat_index never inherits.
+#: ``quality_source`` on every score row: "scored", or
+#: "inherited:<record_index of the scored row>" ("inherited:none" when that row
+#: carries no index); a not-ok row records null. quality.json and the scoring
+#: manifest count ``n_quality_inherited``. Assumption, recorded: the scorer is
+#: deterministic on identical inputs, so an inherited score equals the score
+#: a second call would have produced [A, up to batching rounding].
+QUALITY_SOURCE_SCORED = "scored"
+QUALITY_SOURCE_INHERITED = "inherited"
+QUALITY_REPLAY_RULE = (
+    "ADR-0172 item 1 as amended 2026-10-17 (E18): every arrival is scored; inside one "
+    "window identical scoring inputs are scored once and the other rows inherit that "
+    "score (qa_scores.jsonl quality_source)"
+)
+
+
+def _original_contexts(rec: dict[str, Any]) -> list[Any] | None:
+    """The pre-compression documents of one evidence row (B3d), parsed from a
+    stringified list when an older run wrote one; None when absent."""
+    original_contexts = rec.get("original_contexts")
+    if isinstance(original_contexts, str):
+        try:
+            original_contexts = json.loads(original_contexts)
+        except json.JSONDecodeError:
+            original_contexts = [original_contexts]
+    return original_contexts if isinstance(original_contexts, list) else None
+
+
+def _scoring_input_key(r: dict[str, Any]) -> str:
+    """The E18 identity of one parsed record: a sha256 over every scorer input."""
+    rec = r["rec"]
+    return canonical_sha256(
+        {
+            "example_id": rec.get("example_id"),
+            "repeat_index": str(rec.get("repeat_index") or "0"),
+            "question": r["question"],
+            "contexts": [str(c) for c in r["contexts"]],
+            "generated": r["generated"],
+            "reference": r["reference"],
+            "all_answers": r["all_answers"],
+            "is_impossible": r["is_impossible"],
+            "original_contexts": _original_contexts(rec),
+        }
+    )
+
+
+def _quality_source_label(rep: dict[str, Any], row: dict[str, Any]) -> str:
+    if rep is row:
+        return QUALITY_SOURCE_SCORED
+    rep_index = rep["rec"].get("record_index")
+    return f"{QUALITY_SOURCE_INHERITED}:{'none' if rep_index is None else rep_index}"
+
 
 class EvidenceSchemaError(ValueError):
     """A v2 evidence row lacks a key the scorer would otherwise default."""
@@ -747,8 +832,16 @@ def _score_evidence_file(
     batch_size: int | None = None,
     allow_duplicates: bool = False,
     blinder: LabelBlinder | None = None,
+    scoring_scope: str | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """Score every record of one qa_evidence.jsonl; shared by both layouts.
+
+    ``scoring_scope`` (ADR-0173 E6): the label of the instrument set the caller
+    chose for this window (``native_only``, ``full`` or ``fast``), recorded on
+    every emitted row as ``scoring_scope``; the caller passes the matching
+    evaluator. A caller that passes none gets ``unlabeled`` on its rows
+    (review 2026-10-17 batch 2, LOW 2: a default of ``full`` would mislabel a
+    model-free pass), never a guessed scope.
 
     Returns ``(rows_out, n_duplicates_dropped)``. Duplicate
     (example_id, repeat_index, record_index) rows RAISE
@@ -791,7 +884,11 @@ def _score_evidence_file(
         if not line.strip():
             continue
         rec = json.loads(line)
-        if "ok" in rec:
+        # Review 2026-10-10 (R1): a COMPLETED v2 row must carry every key the
+        # scorer reads. Audit 2026-10-17 (G2): a not-ok row (a drain cut, a
+        # dispatch error) is a synthesized stub with no generation to evidence;
+        # it is never scored, so the check applies to completed rows only.
+        if "ok" in rec and not _row_not_ok(rec):
             missing = [k for k in _V2_REQUIRED_KEYS if k not in rec]
             if missing:
                 raise EvidenceSchemaError(
@@ -852,18 +949,34 @@ def _score_evidence_file(
     # the scorer; they are emitted unscored below, in file order.
     scored = [r for r in records if not _row_not_ok(r["rec"])]
 
-    # Phase 2: ONE scoring call for both modes (over the scorable rows only).
+    # E18 (ADR-0172 amendment 2026-10-17): one scoring call per DISTINCT
+    # scoring input; the first row (file order) with a given input is scored
+    # and every later row with the same input inherits its score, recorded.
+    representatives: dict[str, dict[str, Any]] = {}
+    for r in scored:
+        r["_key"] = _scoring_input_key(r)
+        representatives.setdefault(r["_key"], r)
+    to_score = list(representatives.values())
+
+    # Phase 2: ONE scoring call for both modes (over the distinct scorable inputs).
     metrics_list = evaluator.batch_evaluate(
-        [r["question"] for r in scored],
-        [r["contexts"] for r in scored],
-        [r["generated"] for r in scored],
-        [r["reference"] for r in scored],
-        all_answers=[r["all_answers"] for r in scored],
-        is_impossible=[r["is_impossible"] for r in scored],
+        [r["question"] for r in to_score],
+        [r["contexts"] for r in to_score],
+        [r["generated"] for r in to_score],
+        [r["reference"] for r in to_score],
+        all_answers=[r["all_answers"] for r in to_score],
+        is_impossible=[r["is_impossible"] for r in to_score],
         batched=batch_size is not None,
         nli_batch_size=batch_size if batch_size is not None else 32,
-    ) if scored else []
-    metrics_iter = iter(metrics_list)
+    ) if to_score else []
+    if len(metrics_list) != len(to_score):
+        raise RuntimeError(
+            f"{ev_path}: the evaluator returned {len(metrics_list)} metric records for "
+            f"{len(to_score)} scored inputs; refusing to assign scores by position"
+        )
+    metrics_by_key = {r["_key"]: m for r, m in zip(to_score, metrics_list)}
+    #: B3d dual-source scores, computed once per distinct input (E18)
+    source_scores_by_key: dict[str, tuple[Any, Any]] = {}
 
     rows_out: list[dict[str, Any]] = []
     for r in records:
@@ -872,12 +985,15 @@ def _score_evidence_file(
         reference = r["reference"]
         question = r["question"]
         not_ok = _row_not_ok(rec)
+        quality_source: str | None = None
         if not_ok:
             metrics = _unscored_metrics()
             sanitized = None
             abstained = False
         else:
-            metrics = next(metrics_iter).to_dict()
+            key = r["_key"]
+            metrics = metrics_by_key[key].to_dict()
+            quality_source = _quality_source_label(representatives[key], r)
             # B4: abstention is judged on the SANITIZED text ("A: I don't know." must
             # count), matching evaluate()'s internal gate. sanitized_answer also lands
             # in metrics via QualityMetrics.to_dict(); generated_answer stays raw.
@@ -890,26 +1006,25 @@ def _score_evidence_file(
         # served-context scores. Separates "the answer contradicts the source" from
         # "compression destroyed the evidence the answer relied on". Columns are
         # ALWAYS emitted; empty when the field is absent, the row abstained, or the
-        # metric models are off (fast mode).
+        # metric models are off (fast mode). Scored once per distinct input (E18).
         faithfulness_source = None
         grounding_source = None
-        original_contexts = rec.get("original_contexts")
-        if isinstance(original_contexts, str):
-            try:
-                original_contexts = json.loads(original_contexts)
-            except json.JSONDecodeError:
-                original_contexts = [original_contexts]
+        original_contexts = _original_contexts(rec)
         if (
             not not_ok
             and isinstance(original_contexts, list)
             and any(c and str(c).strip() for c in original_contexts)
             and not abstained
         ):
-            src_ctx = [str(c) for c in original_contexts if c and str(c).strip()]
-            faith_src = evaluator.evaluate_faithfulness(sanitized, src_ctx)
-            faithfulness_source = faith_src.get("faithfulness")
-            halluc_src = evaluator.evaluate_hallucination(question, src_ctx, sanitized)
-            grounding_source = halluc_src.get("grounding_score")
+            if r["_key"] not in source_scores_by_key:
+                src_ctx = [str(c) for c in original_contexts if c and str(c).strip()]
+                faith_src = evaluator.evaluate_faithfulness(sanitized, src_ctx)
+                halluc_src = evaluator.evaluate_hallucination(question, src_ctx, sanitized)
+                source_scores_by_key[r["_key"]] = (
+                    faith_src.get("faithfulness"),
+                    halluc_src.get("grounding_score"),
+                )
+            faithfulness_source, grounding_source = source_scores_by_key[r["_key"]]
 
         old_g = rec.get("grounding_score")
         old_g = None if old_g in (None, "", "None") else float(old_g)
@@ -937,6 +1052,10 @@ def _score_evidence_file(
             "not_ok": not_ok,
             "error": rec.get("error") if not_ok else None,
             "empty_generation": rec.get("empty_generation") if not_ok else None,
+            # E18 (ADR-0172 amendment): where this row's scores came from.
+            "quality_source": quality_source,
+            # E6 (ADR-0173): which instrument set scored this window.
+            "scoring_scope": scoring_scope if scoring_scope is not None else SCOPE_UNLABELED,
             "old_grounding_score": old_g,
             **metrics,
             # B3d: scores vs the PRE-compression originals ("" when unavailable).
@@ -957,6 +1076,41 @@ def _build_evaluator(args: argparse.Namespace) -> Any:
         use_bertscore=args.full,
         use_rouge=args.full,
         use_lettucedetect=args.full,
+        device=args.device,
+    )
+
+
+def _native_only_set(args: argparse.Namespace) -> frozenset[str]:
+    raw = getattr(args, "native_only_datasets", NATIVE_ONLY_DATASETS_DEFAULT)
+    if raw is None:
+        raw = NATIVE_ONLY_DATASETS_DEFAULT
+    return frozenset(part.strip() for part in str(raw).split(",") if part.strip())
+
+
+def _window_dataset(ev_path: Path) -> str | None:
+    """The dataset a v2 window directory names (``window_<dataset>-<k>``), else None."""
+    m = _WINDOW_DIR_RE.match(ev_path.parent.name)
+    return m.group(1) if m else None
+
+
+def _scoring_scope(ev_path: Path, args: argparse.Namespace, native_set: frozenset[str]) -> str:
+    """E6: which instruments score this window's rows (recorded on every row)."""
+    if _window_dataset(ev_path) in native_set:
+        return SCOPE_NATIVE_ONLY
+    return SCOPE_FULL if getattr(args, "full", False) else SCOPE_FAST
+
+
+def _build_native_evaluator(args: argparse.Namespace) -> Any:
+    """E6: the model-free evaluator (F1, EM, abstention): what --full would be without
+    its four model-backed instruments; the model columns come back None."""
+    from src.evaluation.quality import QualityEvaluator
+
+    return QualityEvaluator(
+        use_nli=False,
+        use_embeddings=False,
+        use_bertscore=False,
+        use_rouge=False,
+        use_lettucedetect=False,
         device=args.device,
     )
 
@@ -1067,6 +1221,16 @@ def _instrument_models(evaluator: Any) -> dict[str, Any]:
     return models
 
 
+def _n_quality_inherited(rows_out: list[dict[str, Any]]) -> int:
+    """Rows whose quality came from another row's scoring call (E18)."""
+    return sum(
+        1
+        for r in rows_out
+        if isinstance(r.get("quality_source"), str)
+        and r["quality_source"].startswith(QUALITY_SOURCE_INHERITED)
+    )
+
+
 def _quality_aggregate(
     rows_out: list[dict[str, Any]], n_duplicates_dropped: int = 0
 ) -> dict[str, Any]:
@@ -1081,6 +1245,7 @@ def _quality_aggregate(
     """
     n_abstained = sum(1 for r in rows_out if r.get("abstained"))
     n_not_ok = sum(1 for r in rows_out if r.get("not_ok"))
+    n_inherited = _n_quality_inherited(rows_out)
     metrics: dict[str, dict[str, Any]] = {}
     for key in sorted(_QUALITY_AGG_KEYS):
         values = [
@@ -1100,6 +1265,9 @@ def _quality_aggregate(
         "n_not_ok": n_not_ok,
         # §9.10: keep-last dedup losses are persisted here, not stdout-only.
         "n_duplicates_dropped": n_duplicates_dropped,
+        # E18 (ADR-0172 amendment): rows whose scores were inherited from the
+        # scored row with identical inputs (replayed arrivals, same answer).
+        "n_quality_inherited": n_inherited,
         # Back-compat convenience view (scored keys only, same allowlist —
         # provenance numerics no longer fold in); "metrics" with its explicit
         # n / n_none denominators is the authoritative form.
@@ -1237,50 +1405,123 @@ def run_scoring_tree(root: Path, scoring_run_id: str, args: argparse.Namespace) 
     total_abstained = 0
     total_not_ok = 0
     total_duplicates_dropped = 0
+    total_inherited = 0
 
     # Review 2026-10-10 (R3): the pass is built under a partial name and
     # renamed to scoring/<id>/ only after its own ledger is written, so a
     # crash or a killed job never leaves a directory the master reads as a
-    # completed pass ("exists: reused"). A leftover partial directory is an
-    # unsealed fragment by construction and is removed.
+    # completed pass ("exists: reused"). Audit 2026-10-17 (G19): a leftover
+    # partial directory is RESUMED, window by window: a window whose
+    # qa_scores.jsonl and quality.json both exist was written whole (the
+    # quality file lands after the scores) and is reused; everything else is
+    # scored again. Before, the fragment was removed and a killed 31 h pass
+    # restarted from zero.
     work_dir = root / SCORING_DIRNAME / f".{scoring_run_id}.partial"
+    n_windows_resumed = 0
+    # Review 2026-10-17 batch 4 (M2): the fragment is resumed only when the
+    # attempt that wrote it ran the same configuration; its fingerprint is
+    # written before the first window. A fragment without one predates G19
+    # and is removed (the pre-G19 rule); a mismatch refuses, never mixes.
+    fingerprint = {
+        "scoring_run_id": scoring_run_id,
+        "mode": "full" if args.full else "fast",
+        "batch_size": batch_size,
+        "native_only_datasets": sorted(_native_only_set(args)),
+        "revision_pins": revision_pins.get("pins"),
+        "blinding": BLINDING_MODE_STRIPPED if blinder is not None else BLINDING_MODE_CONTROL,
+        "code": _git_provenance(),
+    }
+    partial_manifest = work_dir / PARTIAL_MANIFEST_NAME
     if work_dir.exists():
-        print(f"[rescore] removing the unsealed partial pass left by an earlier attempt: {work_dir}")
-        shutil.rmtree(work_dir)
-    work_dir.mkdir(parents=True)
+        if not partial_manifest.is_file():
+            print(f"[rescore] removing an unsealed partial pass without a fingerprint (older code): {work_dir}")
+            shutil.rmtree(work_dir)
+        else:
+            try:
+                earlier = json.loads(partial_manifest.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                print(f"ERROR: {partial_manifest} is unreadable ({exc}); remove the partial pass by hand to start over", file=sys.stderr)
+                return 2
+            differing = sorted(k for k in fingerprint if earlier.get(k) != fingerprint[k])
+            if differing:
+                print(f"ERROR: the partial pass {work_dir} was written under another configuration "
+                      f"({differing} differ); a resume would mix two scoring configurations under one id: "
+                      "finish it with the original configuration or remove it by hand and start over (G19)",
+                      file=sys.stderr)
+                return 2
+            print(f"[rescore] resuming the unsealed partial pass left by an earlier attempt: {work_dir} (G19)")
+    work_dir.mkdir(parents=True, exist_ok=True)
+    if not partial_manifest.is_file():
+        partial_manifest.write_text(json.dumps(fingerprint, indent=2, default=str) + "\n", encoding="utf-8")
+    written.append(partial_manifest)  # sealed with the pass: the fingerprint it was written under
+    # ADR-0173 E6 (c): windows of the native-only datasets (RULER) are scored by
+    # the model-free evaluator, built once on first use; every other window by
+    # the pass's own evaluator.
+    native_set = _native_only_set(args)
+    native_evaluator: Any = None
+    n_native_only_windows = 0
     for ev_path in evidence_files:
-        rows_out, n_dup = _score_evidence_file(
-            ev_path, evaluator, batch_size=batch_size,
-            allow_duplicates=allow_duplicates, blinder=blinder,
-        )
-        # Task #130 (a): the unblind join — output artifacts carry REAL
-        # labels; the join is bijective and checked (loud failure).
-        if blinder is not None:
-            rows_out = unblind_score_rows(rows_out, blinder)
+        scope = _scoring_scope(ev_path, args, native_set)
         rel_window = ev_path.parent.relative_to(root)  # cells/<row_key>/window_<k>
         out_window = work_dir / rel_window
-        out_window.mkdir(parents=True, exist_ok=True)
-
         scores_path = out_window / QA_SCORES_NAME
-        with scores_path.open("w", encoding="utf-8") as fh:
-            for row in rows_out:
-                fh.write(json.dumps(row, default=_json_default) + "\n")
-        written.append(scores_path)
-
         quality_path = out_window / QUALITY_JSON_NAME
-        quality_path.write_text(
-            json.dumps(
-                _quality_aggregate(rows_out, n_duplicates_dropped=n_dup), indent=2
+        resumed = None
+        if scores_path.is_file() and quality_path.is_file():
+            # G19: a window the interrupted attempt wrote whole (unblinded rows
+            # already on disk); its counts come back from its own files. A
+            # file the kill left unparseable is scored again (review M1).
+            try:
+                resumed = (
+                    [json.loads(line) for line in scores_path.read_text(encoding="utf-8").splitlines() if line.strip()],
+                    int(json.loads(quality_path.read_text(encoding="utf-8")).get("n_duplicates_dropped", 0)),
+                )
+            except (OSError, ValueError):
+                print(f"[rescore] {rel_window}: the partial pass left unreadable files; scored again (G19)")
+                resumed = None
+        if resumed is not None:
+            rows_out, n_dup = resumed
+            if scope == SCOPE_NATIVE_ONLY:
+                n_native_only_windows += 1
+            n_windows_resumed += 1
+            written.extend([scores_path, quality_path])
+        else:
+            if scope == SCOPE_NATIVE_ONLY:
+                if native_evaluator is None:
+                    native_evaluator = _build_native_evaluator(args)
+                n_native_only_windows += 1
+            rows_out, n_dup = _score_evidence_file(
+                ev_path, native_evaluator if scope == SCOPE_NATIVE_ONLY else evaluator,
+                batch_size=batch_size, allow_duplicates=allow_duplicates, blinder=blinder,
+                scoring_scope=scope,
             )
-            + "\n",
-            encoding="utf-8",
-        )
-        written.append(quality_path)
+            # Task #130 (a): the unblind join: output artifacts carry REAL
+            # labels; the join is bijective and checked (loud failure).
+            if blinder is not None:
+                rows_out = unblind_score_rows(rows_out, blinder)
+            out_window.mkdir(parents=True, exist_ok=True)
+            with scores_path.open("w", encoding="utf-8") as fh:
+                for row in rows_out:
+                    fh.write(json.dumps(row, default=_json_default) + "\n")
+            written.append(scores_path)
+            # written AFTER the scores and atomically (tmp + replace): both files
+            # present and parseable means the window is whole (G19, review M1)
+            tmp_quality = quality_path.with_suffix(".json.tmp")
+            tmp_quality.write_text(
+                json.dumps(
+                    _quality_aggregate(rows_out, n_duplicates_dropped=n_dup), indent=2
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            os.replace(tmp_quality, quality_path)
+            written.append(quality_path)
 
         total_rows += len(rows_out)
         total_abstained += sum(1 for r in rows_out if r.get("abstained"))
         total_not_ok += sum(1 for r in rows_out if r.get("not_ok"))
         total_duplicates_dropped += n_dup
+        total_inherited += _n_quality_inherited(rows_out)
 
     # Task #130 (a): seal this pass's token->label map and stamp the
     # "blinding" section the #112 prereg text cites.
@@ -1311,6 +1552,14 @@ def run_scoring_tree(root: Path, scoring_run_id: str, args: argparse.Namespace) 
         "mode": "full" if args.full else "fast",
         "device": args.device,
         "batch_size": batch_size,  # None = sequential (historical) path
+        # ADR-0173 E6 (c): the datasets scored natively in this pass and how many
+        # windows that covered (their model columns are None by design, not by
+        # instrument failure; grounding for them is a later pass off the pod).
+        "native_only_datasets": sorted(native_set),
+        "n_windows_native_only": n_native_only_windows,
+        # the row label those windows carry; instrument_models/instrument_revisions
+        # below describe the pass evaluator, which never touched them
+        "native_only_scope": SCOPE_NATIVE_ONLY,
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "quality_module": "src.evaluation.quality.QualityEvaluator",
         # D8 §8.1 drift audit (review §4.8): EVERY scoring pass — fast included —
@@ -1332,12 +1581,19 @@ def run_scoring_tree(root: Path, scoring_run_id: str, args: argparse.Namespace) 
         "raw_run_id": raw_run_id,
         "raw_run_ledger_entries_sha256": entries_sha256,
         "n_evidence_files": len(evidence_files),
+        # G19 (2026-10-17): windows reused from an interrupted attempt's partial
+        # directory (0 on a pass that ran whole)
+        "n_windows_resumed": n_windows_resumed,
         "n_rows": total_rows,
         # Review 2026-10-10 (R1): serving failures the pass never scored.
         "n_not_ok": total_not_ok,
         # Task #127 duplicate accounting (§9.10: countable from artifacts).
         "allow_duplicates": allow_duplicates,
         "n_duplicates_dropped": total_duplicates_dropped,
+        # E18 (ADR-0172 amendment 2026-10-17): the replay scoring rule this
+        # pass applied and how many rows inherited a score under it.
+        "quality_replay_rule": QUALITY_REPLAY_RULE,
+        "n_quality_inherited": total_inherited,
         # Task #130 decision (a) — §9.8 label stripping (cited by #112 prereg).
         "blinding": blinding_section,
         **_git_provenance(),
@@ -1360,7 +1616,8 @@ def run_scoring_tree(root: Path, scoring_run_id: str, args: argparse.Namespace) 
     mode = "FULL" if args.full else "FAST (model-free metrics + abstention short-circuit)"
     print(f"SCORING_TREE_DONE  id={scoring_run_id}  mode={mode}  "
           f"files={len(evidence_files)}  rows={total_rows}  "
-          f"abstained={total_abstained}  not_ok={total_not_ok}")
+          f"abstained={total_abstained}  not_ok={total_not_ok}  "
+          f"inherited={total_inherited}")
     print(f"  tree   : {scoring_dir}")
     print(f"  sealed : {scoring_dir / 'ledger.json'}")
     return 0
@@ -1424,12 +1681,18 @@ def main() -> int:
     total_duplicates_dropped = 0
     newly_na_grounding = 0  # abstained rows the ORIGINAL run had scored with a grounding number
     per_cell: dict[str, list[int]] = {}
+    native_set = _native_only_set(args)  # E6: same rule as the scoring tree
+    native_evaluator: Any = None
 
     for ev_path in evidence_files:
+        scope = _scoring_scope(ev_path, args, native_set)
+        if scope == SCOPE_NATIVE_ONLY and native_evaluator is None:
+            native_evaluator = _build_native_evaluator(args)
         try:
             rows_out, n_dup = _score_evidence_file(
-                ev_path, evaluator, batch_size=batch_size,
-                allow_duplicates=allow_duplicates, blinder=blinder,
+                ev_path, native_evaluator if scope == SCOPE_NATIVE_ONLY else evaluator,
+                batch_size=batch_size, allow_duplicates=allow_duplicates, blinder=blinder,
+                scoring_scope=scope,
             )
         except DuplicateEvidenceError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)

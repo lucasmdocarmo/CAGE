@@ -891,12 +891,39 @@ def test_a_crashed_pass_leaves_no_sealed_directory_and_a_retry_succeeds(
     assert not (run / "scoring" / "s12-crash").exists()
     partial = run / "scoring" / ".s12-crash.partial"
     assert partial.is_dir() and not (partial / "ledger.json").exists()
-    # the retry removes the fragment and seals a complete pass under the id
-    monkeypatch.setattr(rq, "_score_evidence_file", real)
+    # G19 (2026-10-17): the retry RESUMES the fragment (the first window was
+    # written whole: scores and quality present), scores the rest and seals a
+    # complete pass under the id; nothing is scored twice
+    (done_window,) = sorted(p.parent for p in partial.glob("cells/*/window_*/quality.json"))
+    before = (done_window / rq.QA_SCORES_NAME).read_bytes()
+    monkeypatch.setattr(rq, "_score_evidence_file", boom)
+    calls["n"] = 0  # the one remaining window is call 1; a second call would raise
     assert rq.run_scoring_tree(run, "s12-crash", _args()) == 0
+    assert calls["n"] == 1
     assert not partial.exists()
     sdir = run / "scoring" / "s12-crash"
     assert verify_ledger(sdir / "ledger.json", sdir) == []
+    assert (sdir / done_window.relative_to(partial) / rq.QA_SCORES_NAME).read_bytes() == before
+    man = json.loads((sdir / rq.SCORING_MANIFEST_NAME).read_text(encoding="utf-8"))
+    assert man["n_windows_resumed"] == 1 and man["n_evidence_files"] == 2 and man["n_rows"] == 2 * len(EVIDENCE_ROWS)
+    assert (sdir / rq.PARTIAL_MANIFEST_NAME).is_file()  # the fingerprint rides the sealed pass
+    # review batch 4 (M2): a fragment written under another configuration refuses the resume
+    monkeypatch.setattr(rq, "_score_evidence_file", boom)
+    calls["n"] = 0
+    with pytest.raises(RuntimeError, match="OOM"):
+        rq.run_scoring_tree(run, "s14-mix", _args())
+    assert rq.run_scoring_tree(run, "s14-mix", _args(batch_size=2)) == 2
+    assert (run / "scoring" / ".s14-mix.partial").is_dir() and not (run / "scoring" / "s14-mix").exists()
+    # (M1) an unparseable quality.json from a kill mid-write is scored again, never a crash
+    frag = run / "scoring" / ".s14-mix.partial"
+    (done,) = sorted(p for p in frag.glob("cells/*/window_*/quality.json"))
+    done.write_text("{truncated", encoding="utf-8")
+    monkeypatch.setattr(rq, "_score_evidence_file", real)
+    assert rq.run_scoring_tree(run, "s14-mix", _args()) == 0
+    assert json.loads((run / "scoring" / "s14-mix" / rq.SCORING_MANIFEST_NAME).read_text(encoding="utf-8"))["n_windows_resumed"] == 0
+    # a pass that ran whole records zero resumed windows
+    assert rq.run_scoring_tree(run, "s13-whole", _args()) == 0
+    assert json.loads((run / "scoring" / "s13-whole" / rq.SCORING_MANIFEST_NAME).read_text(encoding="utf-8"))["n_windows_resumed"] == 0
 
 
 def _freeze(tmp_path: Path, drop: str | None = None) -> Path:

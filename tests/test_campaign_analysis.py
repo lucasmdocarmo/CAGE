@@ -73,6 +73,9 @@ MODEL = "qwen3-14b"
 #: registered layout: pressure legs compute on qasper and are labeled skips
 #: on squad_v2 (every fixture cell is still written on BOTH datasets).
 DATASETS = ["squad_v2", "qasper"]
+#: the run's registered roster (manifest.json 'datasets'): the served two plus
+#: musique, registered and never served (G3: the confirmatory map's domain)
+REGISTERED_DATASETS = ["squad_v2", "qasper", "musique"]
 PRESSURE = "qasper"
 CELL_BASELINES = ["B1", "B3", "B6"]  # B6 vs B3 = the default headline contrast #4
 WINDOWS_PER_DATASET = 2
@@ -177,6 +180,11 @@ def _build_run_tree(
         "dataset_manifests_sha256": "0" * 64,
         "cellspec_schema_version": 1,
         "created_utc": "2026-08-02T14:00:00Z",
+        # the registered roster the producer writes from CAGE_CAMPAIGN_DATASETS
+        # (campaign_session._manifest_extra); the confirmatory family map
+        # compiles over it (audit 2026-10-17, G3): musique is registered and
+        # never served here, so it is a missing leg; hotpotqa is unregistered
+        "datasets": REGISTERED_DATASETS,
     }
     (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
@@ -1909,16 +1917,18 @@ def test_confirmatory_registered_set_fails_on_missing_predicate_leg(
         d for d in gate["set_decisions"] if d["endpoint"] == "contrast-4"
     )
     assert decision["passed"] is False
-    # C1: the look compiles over the FULL registered roster, so the two
-    # datasets this run never served (hotpotqa, musique) are missing legs on
-    # BOTH metrics, beside the unbuilt predicate legs of the served datasets.
-    absent = sorted(rca.KNOWN_DATASETS - set(DATASETS))
-    assert absent == ["hotpotqa", "musique"]
+    # C1 as amended by G3 (audit 2026-10-17): the look compiles over the run's
+    # REGISTERED roster (manifest 'datasets'), not the catalog, so the
+    # registered dataset this run never served (musique) is a missing leg on
+    # BOTH metrics, beside the unbuilt predicate legs of the served datasets;
+    # hotpotqa, unregistered, is no leg at all (Stage 1 stages no HotpotQA).
+    absent = sorted(set(REGISTERED_DATASETS) - set(DATASETS))
+    assert absent == ["musique"]
     assert decision["missing_legs"] == sorted(
-        [f"{ds}|predicate" for ds in rca.KNOWN_DATASETS]
+        [f"{ds}|predicate" for ds in REGISTERED_DATASETS]
         + [f"{ds}|ttft_ms" for ds in absent]
     )
-    assert stats["family_map"]["datasets"] == sorted(rca.KNOWN_DATASETS)
+    assert stats["family_map"]["datasets"] == sorted(REGISTERED_DATASETS)
     assert stats["family_map"]["run_datasets"] == sorted(DATASETS)
     assert any(
         "build_predicate_table.py" in r for r in decision["missing_leg_reasons"]

@@ -1486,6 +1486,11 @@ class CampaignCellSession:
                         "error": row.get("error"),
                         "empty_generation": False,
                         "arrival_s": row.get("arrival_s"),
+                        # audit 2026-10-17 (G2): the ADR-0114 labels ride the stub
+                        # so the Qasper predicate's per-row label check holds on
+                        # a drain-cut or dispatch-failed arrival too
+                        "answer_type": row.get("answer_type"),
+                        "is_impossible": row.get("is_impossible"),
                         "synthesized": "dispatch-stub (no generation to evidence)",
                     }
                 )

@@ -57,7 +57,9 @@ def landing(tmp_path: Path) -> Path:
     (run / "index" / "coverage_report.md").write_text("# coverage\nMISSING: B3 vllm\nMISSING: B5 sglang\n", encoding="utf-8")
     stamp = run / "analysis" / "20261006-120000"
     stamp.mkdir(parents=True)
-    (stamp / "stats.json").write_text(json.dumps({"mode": "DESIGN-INPUT-ONLY",
+    # G34 (2026-10-17): the driver's key is mode_stamp (the writer read "mode" and
+    # printed "see stats.json" on every real tree)
+    (stamp / "stats.json").write_text(json.dumps({"mode_stamp": "DESIGN-INPUT-ONLY",
         "contrasts": [{"id": 4, "metric": "ttft_ms", "n": 50, "estimate": -12.5}, {"id": 1, "metric": "ttft_ms", "n": 50}],
         "figures": [{"kind": "forest", "file": "forest_ttft_ms.png"}, {"kind": "wlt", "file": "wlt_ttft_ms.png"}]}), encoding="utf-8")
     (stamp / "summary.md").write_text("# summary\ncontrast 4: ttft_ms, estimate -12.5\n", encoding="utf-8")

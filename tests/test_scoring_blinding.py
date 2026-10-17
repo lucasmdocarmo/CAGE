@@ -369,8 +369,10 @@ class TestRescoreTreeBlinding:
         assert rq.main() == 0
         blinded_csv = (ev.parent / "results_rescored.csv").read_bytes()
 
+        # E6: the legacy pass labels its rows by scope (fast here); the control
+        # states the same scope so the comparison stays about blinding alone
         control_rows, n_dup = rq._score_evidence_file(
-            ev, _fast_evaluator(), blinder=None
+            ev, _fast_evaluator(), blinder=None, scoring_scope=rq.SCOPE_FAST
         )
         assert n_dup == 0
         control_path = tmp_path / "control.csv"

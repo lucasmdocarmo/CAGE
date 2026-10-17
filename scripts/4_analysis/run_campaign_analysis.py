@@ -316,6 +316,16 @@ REGISTERED_MARGINS_PATH: Path = (
 #: confirmatory look below it must explicitly accept a later rung
 #: (``--accept-step-down``) and the acceptance is recorded in stats.json.
 ADR0086_REALIZED_N_LADDER: tuple[int, ...] = (2000, 1600, 1200)
+#: ADR-0086's own-achievable-n branch, registered per dataset (ADR-0173
+#: amendment 2026-10-17; audit G9): a dataset whose split cannot supply the
+#: registered n registers its own achievable n, and that n is its realized-n
+#: floor (power restated at it). Qasper: 852, the trial pool of the built
+#: manifest data/manifests/qasper_852x3_seed42_wr50.json (1,005 loaded, 100
+#: excluded at the 2,800-token block, 53 reserved for the warm-up by whole
+#: papers; G4, 2026-10-17), the three trials overlapping and recorded. Must
+#: equal run_campaign.SESSION_GRIDS['a'].achievable_n. A dataset absent here
+#: takes the ladder.
+ADR0086_OWN_ACHIEVABLE_N: Mapping[str, int] = {"qasper": 852}
 
 #: G14: the registered resampling seeds, passed EXPLICITLY to the §9.5
 #: primitives (registration lives in the driver, not in primitive defaults)
@@ -538,27 +548,29 @@ HIGHER_IS_BETTER: dict[str, bool] = {
 
 DEFAULT_METRICS: tuple[str, ...] = ("ttft_ms",)
 
-#: B3 (ADR-0172 item 1, owner 2026-10-16): a measured pressure window cycles
-#: its pool, so one window holds several arrivals of one example. Serving
-#: results are confirmatory on every arrival; quality results on the FIRST
-#: PASS only. ``record_index`` is the dispatcher's arrival ordinal and the
-#: pool cycles modulo its size (run_experiment.dispatch_open_loop), so the
-#: first pass is record_index < n_unique, with n_unique the distinct
-#: example_ids among the window's indexed rows. On a replayed row the loader
-#: keeps the serving fields and drops the quality columns below and the
-#: section 8.11 degradation labels (counted in
-#: frame.attrs["replay_quality_rows_dropped"]). The derived bound is checked
-#: against the runner's record (metrics.json
+#: B3 (ADR-0172 item 1, owner 2026-10-16; amended 2026-10-17, owner decision
+#: E18 option (ii)): a measured pressure window cycles its pool, so one window
+#: holds several arrivals of one example. Serving results are confirmatory on
+#: every arrival, and so are the quality results: the scoring pass
+#: (rescore_quality.py) scores identical scoring inputs once per window and
+#: the replayed arrivals inherit that score with their provenance
+#: (qa_scores.jsonl quality_source), so every arrival carries a verdict and
+#: the yield Y is defined for every arrival. The loader therefore keeps the
+#: quality columns and the section 8.11 degradation labels of every row.
+#: ``record_index`` is the dispatcher's arrival ordinal and the pool cycles
+#: modulo its size (run_experiment.dispatch_open_loop), so the first pass is
+#: record_index < n_unique, with n_unique the distinct example_ids among the
+#: window's indexed rows; the bound derived from the rows is checked against
+#: the runner's record (metrics.json
 #: workload.open_loop.replay.first_pass_record_index_max) when the window
-#: carries one; a disagreement refuses. Rows without an index (closed loop)
-#: are never replays.
-QUALITY_FIRST_PASS_COLUMNS: frozenset[str] = (
-    frozenset(k for k, higher in HIGHER_IS_BETTER.items() if higher)
-    - {"goodput_frac", "yield_frac"}
-) | frozenset(CONDITIONED_QUALITY_METRICS) | frozenset({PREDICATE_METRIC})
-QUALITY_FIRST_PASS_RULE = (
-    "ADR-0172 item 1: quality columns and degradation labels from the first pass "
-    "only (record_index < n_unique distinct example_ids of the window); serving "
+#: carries one, as an integrity check of the two artifacts (a disagreement
+#: refuses), and the windows that replayed are counted in
+#: frame.attrs["replay_windows"]. Rows without an index (closed loop) are
+#: never replays.
+QUALITY_REPLAY_RULE = (
+    "ADR-0172 item 1 as amended 2026-10-17 (E18): quality columns and degradation "
+    "labels from every arrival (the scoring pass scores identical inputs once per "
+    "window and the replays inherit, qa_scores.jsonl quality_source); serving "
     "columns from every arrival"
 )
 WINDOW_METRICS_NAME = "metrics.json"
@@ -1099,12 +1111,12 @@ def load_per_query(
     carries a ``deg_*`` field REFUSES (label columns must never be shadowed
     by producer data).
 
-    B3 (ADR-0172 item 1): a replayed row (record_index past the window's
-    first pass, ``first_pass_record_index_max``) keeps its serving fields
-    and loses its quality columns (``QUALITY_FIRST_PASS_COLUMNS``) and its
-    degradation labels; the drops are counted in
-    ``frame.attrs['replay_quality_rows_dropped']`` and the windows that
-    replayed in ``frame.attrs['replay_windows']``.
+    B3 (ADR-0172 item 1, amended 2026-10-17 E18): a replayed row (record_index
+    past the window's first pass, ``first_pass_record_index_max``) keeps its
+    serving fields AND its quality columns and degradation labels (the
+    scoring pass scored or inherited them, ``QUALITY_REPLAY_RULE``); the
+    windows that replayed are counted in ``frame.attrs['replay_windows']``
+    and the first-pass bound is cross-checked against the runner's record.
     """
     wanted = set(row_keys)
     selection = index[index["row_key"].isin(wanted)]
@@ -1113,7 +1125,6 @@ def load_per_query(
     rows: list[dict[str, Any]] = []
     bool_coerced: set[str] = set()
     error_timing_dropped = 0
-    replay_quality_dropped = 0
     replay_windows = 0
     label_reasons: dict[str, dict[str, int]] = {}
     for rec in selection.itertuples(index=False):
@@ -1122,8 +1133,6 @@ def load_per_query(
         #: (example_id, record_index) -> the trial's raw record merged across
         #: artifacts — the classify_request input (W4.10).
         trial_raw: dict[tuple[str, Any], dict[str, Any]] = {}
-        #: the replayed trials: no degradation label (ADR-0172 item 1)
-        replayed_keys: set[tuple[str, Any]] = set()
         n_unjoined = 0
         artifact_paths = [window_dir / name for name in _PER_QUERY_ARTIFACTS]
         if predicate_root is not None:
@@ -1135,6 +1144,8 @@ def load_per_query(
         requests_records = next(
             (records for path, records in loaded if path.name == _PER_QUERY_ARTIFACTS[0]), []
         )
+        # ADR-0172 item 1 (E18): the two artifacts must agree on the first
+        # pass (integrity); the replayed rows then join like any other
         first_pass_max = first_pass_record_index_max(requests_records, window_dir)
         if first_pass_max is not None and any(
             ri is not None and ri > first_pass_max
@@ -1167,14 +1178,6 @@ def load_per_query(
                         "is minted by the loader's classifiers (W4.10), "
                         "never by a producer artifact"
                     )
-                record_index = _record_index_of(obj)
-                replayed = (
-                    first_pass_max is not None
-                    and record_index is not None
-                    and record_index > first_pass_max
-                )
-                if replayed:
-                    replayed_keys.add(dup_key)
                 trial_raw.setdefault(dup_key, {}).update(obj)
                 bucket = merged.setdefault(example_id, {})
                 error_row = obj.get("ok") is False
@@ -1184,11 +1187,6 @@ def load_per_query(
                         # 0.0 stamp is a placeholder, never a measurement)
                         if value is not None:
                             error_timing_dropped += 1
-                        continue
-                    if replayed and field_name in QUALITY_FIRST_PASS_COLUMNS:
-                        # ADR-0172 item 1: quality from the first pass only
-                        if value is not None:
-                            replay_quality_dropped += 1
                         continue
                     if isinstance(value, bool):
                         # true/false -> 1.0/0.0, noted — never dropped (G11).
@@ -1208,8 +1206,6 @@ def load_per_query(
         # per-example mean buckets, unjudgeable ones stay absent with their
         # counted NAMED reason (absence is never a 0.0 label).
         for (example_id, _record_index), raw in trial_raw.items():
-            if (example_id, _record_index) in replayed_keys:
-                continue  # ADR-0172 item 1: labels from the first pass only
             bucket = merged[example_id]
             for label_name, result in classify_request(raw).items():
                 column = degradation_column_of(label_name)
@@ -1233,8 +1229,7 @@ def load_per_query(
     frame = pd.DataFrame(rows)
     frame.attrs["bool_coerced_fields"] = sorted(bool_coerced)
     frame.attrs["error_row_timing_dropped"] = error_timing_dropped
-    frame.attrs["quality_first_pass_rule"] = QUALITY_FIRST_PASS_RULE
-    frame.attrs["replay_quality_rows_dropped"] = replay_quality_dropped
+    frame.attrs["quality_replay_rule"] = QUALITY_REPLAY_RULE
     frame.attrs["replay_windows"] = replay_windows
     frame.attrs["degradation_reasons"] = {
         column: dict(sorted(counts.items()))
@@ -2652,18 +2647,56 @@ class FamilyContext:
         )
 
 
+def _registered_roster(manifest_path: Path) -> list[str] | None:
+    """G3: the run manifest's registered dataset roster (``datasets``, written
+    by campaign_session._manifest_extra from CAGE_CAMPAIGN_DATASETS).
+
+    None when the manifest or the key is absent (an S0-era tree; the
+    confirmatory mode then refuses, the exploratory mode compiles over what
+    is present). A present but malformed value refuses naming the defect
+    (review 2026-10-17, batch 1 LOW 5): reading it as absent would blame the
+    wrong thing.
+    """
+    if not manifest_path.is_file():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise AnalysisError(f"{manifest_path}: invalid JSON: {exc}") from exc
+    roster_raw = manifest.get("datasets") if isinstance(manifest, Mapping) else None
+    if roster_raw is None:
+        return None
+    if not (
+        isinstance(roster_raw, list)
+        and roster_raw
+        and all(isinstance(d, str) and d for d in roster_raw)
+    ):
+        raise AnalysisError(
+            f"{manifest_path}: 'datasets' must be a non-empty list of dataset names, "
+            f"got {roster_raw!r} (G3: the confirmatory family map compiles over it)"
+        )
+    return list(roster_raw)
+
+
 def build_family_context(
     index: pd.DataFrame, metrics: Sequence[str], alpha: float,
     *, confirmatory: bool = False,
+    registered_datasets: Sequence[str] | None = None,
 ) -> FamilyContext | None:
     """Compile ``families.compile_family_map`` for this run's group/datasets.
 
     Returns None (a labeled absence recorded in stats.json) when the run has
     no charter family-map dataset at all — confirmatory mode refuses on that.
-    C1 (2026-10-10): the confirmatory look compiles over the FULL registered
-    roster (``families.KNOWN_DATASETS``), so a run missing a registered
-    dataset fails the headline set on the absent legs instead of compiling a
-    smaller table that passes on what is present (the G5 shrink one level up).
+    C1 (2026-10-10): the confirmatory look compiles over the registered
+    roster, not over what happens to be present, so a run missing a
+    registered dataset fails the headline set on the absent legs instead of
+    compiling a smaller table that passes on what is present (the G5 shrink
+    one level up). Audit 2026-10-17 (G3): that roster is the RUN'S registered
+    dataset list (the run manifest's ``datasets``, written from
+    CAGE_CAMPAIGN_DATASETS at the first emission), never the catalog
+    ``families.KNOWN_DATASETS``: Stage 1 registers three datasets and stages
+    no HotpotQA, so the catalog would fail the headline by construction. A
+    confirmatory look without the roster refuses.
     """
     model = str(index["model"].iloc[0])
     group = GROUP_OF_MODEL.get(model)
@@ -2675,7 +2708,22 @@ def build_family_context(
     run_datasets = tuple(sorted(set(index["dataset"].unique()) & KNOWN_DATASETS))
     if not run_datasets:
         return None
-    datasets = tuple(sorted(KNOWN_DATASETS)) if confirmatory else run_datasets
+    if confirmatory:
+        if not registered_datasets:
+            raise AnalysisError(
+                "confirmatory refusal (§9.3, G3): the run manifest carries no registered "
+                "dataset roster ('datasets'); the family map compiles over the registered "
+                "roster, never over the catalog or over what is present"
+            )
+        unknown = sorted(set(registered_datasets) - KNOWN_DATASETS)
+        if unknown:
+            raise AnalysisError(
+                f"confirmatory refusal (§9.3, G3): registered dataset(s) {unknown} are not "
+                f"in the family map catalog {sorted(KNOWN_DATASETS)}"
+            )
+        datasets = tuple(sorted(set(registered_datasets)))
+    else:
+        datasets = run_datasets
     try:
         table = compile_family_map(datasets, metrics=tuple(metrics), alpha=alpha)
     except FamilyMapError as exc:
@@ -4290,13 +4338,22 @@ def compute_truth_tax(
             )
         )
     if not primaries:
-        raise AnalysisError(
-            "contrast #14 (truth_tax): no computable cross-engine leg — "
-            + (
-                "; ".join(s["reason"] for s in section["skipped"])
-                or "no F2 window pair matched"
-            )
+        # Audit 2026-10-17 (G32): an empty contrast is a reported absence, not
+        # a crash of the whole analysis stage. The chain reads the missing
+        # endpoint (INCOMPLETE CHAIN, run_gatekeeping's missing_primary_endpoints)
+        # and the section names why no leg was computable. The pre-predicate
+        # refusals above (missing table, missing producer) stay refusals.
+        reason = (
+            "; ".join(s["reason"] for s in section["skipped"])
+            or "no F2 window pair matched"
         )
+        section["missing_endpoint"] = {
+            "endpoint": _primary_endpoint(14),
+            "reason": f"no computable cross-engine leg: {reason}",
+            "rule": "G32 (2026-10-17): recorded as a missing endpoint, never a stage abort",
+        }
+        print(f"[truth-tax] contrast #14 has no computable cross-engine leg; recorded as "
+              f"a missing endpoint ({reason})")
     ladder_metrics = {
         window: metrics
         for window, metrics in tt_cache.items()
@@ -4394,10 +4451,15 @@ def check_realized_n(
             realized = row.get("realized_n")
             if realized is None:
                 continue
-            if int(realized) < floor:
+            # G9: a dataset with its own registered achievable n is judged
+            # against that n (ADR-0086 branch), the others against the ladder
+            own = ADR0086_OWN_ACHIEVABLE_N.get(str(row["dataset"]))
+            dataset_floor = min(floor, int(own)) if own is not None else floor
+            if int(realized) < dataset_floor:
+                basis = f"own achievable n={own}" if own is not None else f"floor={floor}"
                 violations.append(
                     f"contrast #{entry['contrast_id']} × {entry['metric']} × "
-                    f"{row['dataset']}: realized n={realized} < floor={floor}"
+                    f"{row['dataset']}: realized n={realized} < {basis}"
                 )
     if violations:
         detail = "\n".join(f"  {v}" for v in violations)
@@ -4413,6 +4475,7 @@ def check_realized_n(
         "ladder": list(ladder),
         "floor": floor,
         "step_down_accepted": accepted_step_down,
+        "own_achievable_n": dict(ADR0086_OWN_ACHIEVABLE_N),
     }
 
 
@@ -5927,15 +5990,16 @@ def run_conditioned_curves_pass(
             count_evidence(f"{requests_path} missing — no per-request rows")
             continue
         requests = _read_jsonl(requests_path)
-        # ADR-0172 item 1: quality from the first pass of a replayed window
+        # ADR-0172 item 1 as amended (E18): every arrival carries quality; the
+        # first-pass bound is an integrity check and the replays are counted
         first_pass_max = first_pass_record_index_max(requests, window_dir)
 
         def _replayed(obj: Mapping[str, Any], _bound: int | None = first_pass_max) -> bool:
             ri = _record_index_of(obj)
             return _bound is not None and ri is not None and ri > _bound
 
-        quality_rows = [row for row in requests if not _replayed(row)]
-        n_replayed = len(requests) - len(quality_rows)
+        quality_rows = requests
+        n_replayed = sum(1 for row in requests if _replayed(row))
 
         # --- quality | rho_own: the window's OWN pressure coordinate -------
         own_path = (
@@ -6023,7 +6087,7 @@ def run_conditioned_curves_pass(
                     "metric": metric,
                     "value": float(np.mean(values)),
                     "n": len(values),
-                    "n_replayed_excluded": n_replayed,
+                    "n_replayed_arrivals": n_replayed,
                     "task": window_task,
                 }
             )
@@ -6058,11 +6122,6 @@ def run_conditioned_curves_pass(
                 seen_keys.add(dup_key)
                 trial_raw.setdefault(dup_key, {}).update(obj)
         for _key, raw_trial in trial_raw.items():
-            if _replayed(raw_trial):
-                count_evidence(
-                    "replayed arrival: quality joins the first pass only (ADR-0172 item 1)"
-                )
-                continue
             used = raw_trial.get("used_contexts")
             n_contexts = len(used) if isinstance(used, list) else None
             bin_label, bin_reason = evidence_position_bin(
@@ -6182,7 +6241,7 @@ def run_conditioned_curves_pass(
                 "carries |task=<task> (ADR-0170: per task, never the mean)"
             ),
             "bin_edges": list(RHO_OWN_BIN_EDGES),
-            "replay_rule": QUALITY_FIRST_PASS_RULE,
+            "replay_rule": QUALITY_REPLAY_RULE,
             "windows": rho_rows,
             "curve": (
                 rho_curve.to_dict("records") if rho_curve is not None else []
@@ -6417,8 +6476,12 @@ def run_analysis(
         ]
         window_contrasts = [c for c in computable if c.unit == "window"]
 
+        # G3: the registered roster of this run (manifest.json 'datasets',
+        # campaign_session._manifest_extra), the confirmatory map's domain
+        registered_roster = _registered_roster(run_dir / "manifest.json")
         family_ctx = build_family_context(
-            index, metrics, alpha, confirmatory=(mode == "confirmatory")
+            index, metrics, alpha, confirmatory=(mode == "confirmatory"),
+            registered_datasets=registered_roster,
         )
         if mode == "confirmatory" and family_ctx is None:
             raise AnalysisError(

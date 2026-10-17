@@ -614,10 +614,9 @@ def test_pass_joins_replayed_rows_with_distinct_record_index(
     # Replay rows that DO carry the disambiguating record_index are
     # legitimate distinct trials (H3 by design): the file is accepted and the
     # cross-file requests⋈qa_evidence merge on the shared key stays intact
-    # (the baseline 4 joined trials). B3 (ADR-0172 item 1, 2026-10-16):
-    # quality joins the FIRST PASS only, so of the two e003 trials the one
-    # with record_index 0 joins and the replay (record_index 1, past the
-    # window's one distinct indexed example) is counted under its named skip.
+    # (the baseline 4 joined trials). B3 (ADR-0172 item 1, 2026-10-16) first
+    # joined the FIRST PASS only; the E18 amendment (2026-10-17) scores or
+    # inherits a verdict for every arrival, so both e003 trials join.
     run_dir, index, analysis_dir = _pass_fixture(tmp_path)
     requests_path = (
         run_dir / "cells/cellF2/window_squad_v2-01" / "requests.jsonl"
@@ -637,9 +636,6 @@ def test_pass_joins_replayed_rows_with_distinct_record_index(
     )
     assert document is not None
     evidence = document["quality_vs_evidence_position"]
-    # 2 windows × (e001 first + e002 absent) + the first-pass e003 trial;
-    # the replayed e003 trial is a counted, named skip (ADR-0172 item 1).
-    assert evidence["n_trials_joined"] == 5
-    assert evidence["skipped_trials"][
-        "replayed arrival: quality joins the first pass only (ADR-0172 item 1)"
-    ] == 1
+    # 2 windows × (e001 first + e002 absent) + both e003 trials (E18).
+    assert evidence["n_trials_joined"] == 6
+    assert not any("replayed arrival" in reason for reason in evidence["skipped_trials"])

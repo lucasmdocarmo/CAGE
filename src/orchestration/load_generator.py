@@ -852,8 +852,10 @@ def replay_record(
         "first_pass_record_index_max": min(n_arrivals, n_unique_requests) - 1,
         "authorized_max": authorized_max,
         "rule": (
-            "serving metrics on every arrival; quality on the first pass only "
-            "(record_index <= first_pass_record_index_max)"
+            "serving metrics on every arrival; quality on every arrival, the scoring "
+            "pass scoring identical inputs once per window and the replays inheriting "
+            "(ADR-0172 amendment 2026-10-17, E18); first_pass_record_index_max is the "
+            "integrity record of the first pass (record_index <= it)"
         ),
         "adr": "ADR-0172",
     }

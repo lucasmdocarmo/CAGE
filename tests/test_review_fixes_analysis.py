@@ -152,6 +152,8 @@ def _build_run_tree(tmp_path: Path) -> Path:
         "dataset_manifests_sha256": "0" * 64,
         "cellspec_schema_version": 1,
         "created_utc": "2026-08-04T09:00:00Z",
+        # the registered roster the producer writes (G3: the confirmatory map's domain)
+        "datasets": [DATASET],
     }
     (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 

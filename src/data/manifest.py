@@ -62,7 +62,87 @@ from src.data.overlap import (  # re-exported: consumers import from either modu
 
 # v2 (2026-09-02): + top-level "overlap" (measured, both modes)
 # v3 (2026-09-16, ADR-0106): + top-level "trunc_rungs" (B12 ladder; {} when none)
-MANIFEST_VERSION = 3
+# v4 (2026-10-17, audit G4): + top-level "warmup_reserve" (whole context groups set
+#     aside before the trial draws for the ADR-0102 warm-up and the ADR-0172 pre-load;
+#     ids [] when none requested) and stats.warmup_reserve_n / stats.trial_pool_size
+MANIFEST_VERSION = 4
+
+
+def _reserve_group_key(example: Any) -> tuple:
+    """The unit the warm-up reserve is drawn in: a whole source document when
+    the loader records one (QASPER's ``paper_id``: the runner's warm-up filter
+    refuses any candidate sharing a paper with the measured set), else the
+    selected context tuple (SQuAD's paragraph, MuSiQue's gold set)."""
+    paper = (getattr(example, "metadata", None) or {}).get("paper_id")
+    if paper:
+        return ("paper", str(paper))
+    return ("context", _ctx_key(example))
+
+
+def draw_warmup_reserve(
+    examples: Sequence[Any],
+    pool_ids: Sequence[str],
+    requested: int,
+    *,
+    seed: int,
+) -> Dict[str, Any]:
+    """Audit 2026-10-17 (G4): set aside whole context groups of the in-corpus
+    pool for the warm-up and the pre-load, BEFORE the trial draws.
+
+    The runner draws its cold-start warm-up (ADR-0102) and its pre-load
+    (ADR-0172 item 4) from pool questions no trial measures, filtered by
+    shared paper or paragraph. When the trials cover the pool (QASPER at
+    its whole split, MuSiQue at 3 x 800) nothing is left and the cell
+    refuses on the pod after the plan passed. Reserving whole groups here
+    keeps every reserved question disjoint from every trial by id AND by
+    group, so the runner's filter excludes none of them.
+
+    Deterministic: the groups are visited in pool (pack) order, shuffled by
+    ``random.Random(seed)``, and taken whole until at least ``requested``
+    questions are reserved; the reserve therefore holds ``requested`` or a
+    few more, never fewer. ``requested`` 0 reserves nothing.
+    """
+    if isinstance(requested, bool) or not isinstance(requested, int) or requested < 0:
+        raise ManifestError(f"warmup_reserve must be an int >= 0, got {requested!r}")
+    if requested > len(pool_ids):
+        raise ManifestError(
+            f"warmup_reserve ({requested}) exceeds the in-corpus pool ({len(pool_ids)})"
+        )
+    by_id = {ex.id: ex for ex in examples}
+    groups: Dict[tuple, List[str]] = {}
+    order: List[tuple] = []
+    for ex_id in pool_ids:
+        key = _reserve_group_key(by_id[ex_id])
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(ex_id)
+    reserved: List[str] = []
+    n_groups = 0
+    if requested > 0:
+        rng = random.Random(seed)
+        rng.shuffle(order)
+        for key in order:
+            if len(reserved) >= requested:
+                break
+            reserved.extend(groups[key])
+            n_groups += 1
+    kinds = {key[0] for key in groups}
+    return {
+        "requested": requested,
+        "ids": reserved,
+        "n": len(reserved),
+        "n_groups": n_groups,
+        "group_key": "paper_id" if kinds == {"paper"} else (
+            "context" if kinds == {"context"} else "mixed"
+        ),
+        "seed": seed,
+        "rule": (
+            "whole groups (paper_id when the loader records one, else the selected "
+            "context tuple) in seeded-shuffled pack order until >= requested; drawn "
+            "before the trial draws, so no reserved id is in any trial (G4, 2026-10-17)"
+        ),
+    }
 
 
 class ManifestError(ValueError):
@@ -87,8 +167,16 @@ def build_manifest(
     overlap_tolerance: float = 0.05,
     overlap_group_size: int = 4,
     trunc_budgets: Tuple[int, ...] = (),
+    warmup_reserve: int = 0,
 ) -> Dict[str, Any]:
     """Build the manifest dict from loader examples (.id/.question/.context/.answer).
+
+    ``warmup_reserve`` (audit 2026-10-17, G4): the number of in-corpus questions
+    to set aside, by whole context groups, for the runner's warm-up and pre-load
+    before the trial draws (``draw_warmup_reserve``); the trials are drawn from
+    the pool minus the reserve, and ``num_queries`` must fit that reduced pool
+    (the refusal names the achievable n). 0 reserves nothing and reproduces the
+    v3 trial draws exactly.
 
     ``context_selector``, if given, maps each example to the paragraph list that is
     actually shared-corpus material (default: ``example.context`` unchanged -- the
@@ -224,20 +312,29 @@ def build_manifest(
         enforce_overlap_target(overlap, dataset=dataset)
 
     pool_ids = list(question_to_block)  # insertion order = deterministic
-    if len(pool_ids) < num_queries:
+    # G4: the warm-up reserve comes out first, by whole groups; its seed stream
+    # (seed + num_trials) is distinct from every trial draw (seed .. seed + T - 1).
+    reserve = draw_warmup_reserve(
+        examples, pool_ids, warmup_reserve, seed=seed + num_trials
+    )
+    reserved_ids = set(reserve["ids"])
+    trial_pool = [i for i in pool_ids if i not in reserved_ids]
+    if len(trial_pool) < num_queries:
         raise ManifestError(
-            f"in-corpus pool ({len(pool_ids)}) < num_queries ({num_queries}); "
-            f"raise block_budget, load more examples, or lower N"
+            f"in-corpus pool for the trials ({len(trial_pool)} = pool {len(pool_ids)} "
+            f"minus warm-up reserve {len(reserved_ids)}) < num_queries ({num_queries}); "
+            f"the achievable n at this reserve is {len(trial_pool)}: raise block_budget, "
+            "load more examples, lower the reserve, or lower N"
         )
 
     # Per-trial draws: without replacement ACROSS trials while the pool allows, so
     # trials stay independent; falls back to full-pool sampling (flagged) otherwise.
     trials: Dict[str, List[str]] = {}
-    disjoint = len(pool_ids) >= num_queries * num_trials
-    available = list(pool_ids)
+    disjoint = len(trial_pool) >= num_queries * num_trials
+    available = list(trial_pool)
     for t in range(1, num_trials + 1):
         rng_t = random.Random(seed + t - 1)
-        source = available if disjoint else pool_ids
+        source = available if disjoint else trial_pool
         picked = rng_t.sample(source, num_queries)
         trials[str(t)] = picked
         if disjoint:
@@ -262,6 +359,7 @@ def build_manifest(
         "trials": trials,
         "overlap": overlap,
         "trunc_rungs": trunc_rungs,
+        "warmup_reserve": reserve,
         "stats": {
             "source_examples_loaded": n_loaded,
             "pool_size": len(pool_ids),
@@ -269,6 +367,8 @@ def build_manifest(
             "examples_excluded": len(excluded),
             "exclusion_rate": (len(excluded) / n_loaded) if n_loaded else 0.0,
             "trials_disjoint": disjoint,
+            "warmup_reserve_n": len(reserved_ids),
+            "trial_pool_size": len(trial_pool),
         },
     }
 

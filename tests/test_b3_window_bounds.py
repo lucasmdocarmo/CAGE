@@ -413,17 +413,25 @@ def _window_cells(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [s for s in _cells(plan) if s["family"] in ("F2", "F3")]
 
 
-def test_an_executable_window_above_the_ceiling_refuses_naming_the_manifest_size(floor_table, stub) -> None:
+def test_an_executable_window_above_the_ceiling_blocks_the_cell_naming_the_manifest_size(floor_table, stub, tmp_path) -> None:
     # Fixture: lambda* 8.0 x r = 12 at r = 1.5; vllm floors (0.12, 0.02):
     # L = 26.8 s, D = 97 s; W = ceil(1.2 x 12 x 97) = 1397. A 20-id pool needs
-    # 70 passes (above 15): refused, naming the pool that would fit (ceil(1397
-    # / 15) = 94 ids per trial). A 100-id pool needs 14 passes and builds.
-    with pytest.raises(rc.PlanError) as exc:
-        _stub_plan(_f2_grid(f2_budgets=(1.5,), f2_rates=(1.2,), achievable_n={"qasper": 20}), floor_table, stub.cmd)
-    msg = str(exc.value)
+    # 70 passes (above 15): the CELL is blocked (audit 2026-10-17, G24: before,
+    # the whole plan refused after the ladders had billed), naming the pool
+    # that would fit (ceil(1397 / 15) = 94 ids per trial). A 100-id pool needs
+    # 14 passes and runs.
+    blocked_plan = _stub_plan(_f2_grid(f2_budgets=(1.5,), f2_rates=(1.2,), achievable_n={"qasper": 20}), floor_table, stub.cmd)
+    (blocked,) = _window_cells(blocked_plan)
+    msg = blocked["blocked_on"]
+    assert msg.startswith(rc.PASS_CEILING_BLOCK_PREFIX)
     assert "needs 1397 arrivals over a pool of 20 (70 passes) for its 97 s window" in msg
     assert "above the registered ceiling of 15 passes (ADR-0172)" in msg
     assert "at least 94 ids per trial for qasper" in msg
+    assert blocked["window"]["passes"] == 70 and blocked_plan["counts"]["blocked"] >= 1
+    # the blocked plan loads (the stale-plan ceiling check skips a blocked cell)
+    out = tmp_path / "blocked.json"
+    out.write_text(json.dumps(blocked_plan), encoding="utf-8")
+    rc.load_plan(out)
     plan = _stub_plan(_f2_grid(f2_budgets=(1.5,), f2_rates=(1.2,), achievable_n={"qasper": 100}), floor_table, stub.cmd)
     (window,) = _window_cells(plan)
     assert window["window"]["arrivals"] == 1397 and window["window"]["passes"] == 14
@@ -579,9 +587,11 @@ def test_the_projection_charges_each_window_its_duration_and_tail(floor_table, s
     cost = rc.RUN_CELL_SECONDS[("vllm", "none")]
     windows = window["windows"]
     rec = window["window"]
-    # preparation scales with the pool (2000 / 50 = 40 x); each window costs
+    # preparation scales with the pool (2000 / 50 = 40 x) and is paid once per
+    # window (G26, 2026-10-17: the runner prepares per trial); each window costs
     # its 30 s pre-load, its 97 s duration and a 26.8 s tail
-    want = cost[0] * (2000 / rc.RUN_STEP_MEASURED_QUERIES) + windows * (30.0 + rec["duration_s"] + rec["latency_bound_s"])
+    want = windows * (cost[0] * (2000 / rc.RUN_STEP_MEASURED_QUERIES) + 30.0 + rec["duration_s"] + rec["latency_bound_s"])
+    assert windows == 3
     assert rc.run_projection([window])["by_kind_s"]["cell"] == pytest.approx(want, abs=0.06)
     # the pre-B3 arithmetic charged the pool's scale on the per-window cost too
     old = (cost[0] + cost[1] * windows) * (2000 / rc.RUN_STEP_MEASURED_QUERIES) + 30.0 * windows
@@ -603,7 +613,12 @@ def test_the_header_registers_the_window_design(floor_table, stub) -> None:
         "drain_timeout_s": 300.0,
         "replay_factor_max": 15,
         "replay_ceiling_enforced": True,
-        "quality_rows": "first pass only (record_index <= first_pass_record_index_max)",
+        "quality_rows": (
+            "every arrival (ADR-0172 amendment 2026-10-17, E18: the scoring pass scores "
+            "identical inputs once per window and the replays inherit, recorded as "
+            "quality_source; the first pass record_index <= first_pass_record_index_max "
+            "stays an integrity record)"
+        ),
         "serving_rows": "every arrival",
     }
     ws = plan["window_spans"]

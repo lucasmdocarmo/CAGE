@@ -2950,12 +2950,17 @@ class TestQueryManifestRegistration:
                 answer=f"a{i}",
                 metadata={},
             )
-            for i in range(40)
+            for i in range(60)
         ]
+        # G4 (2026-10-17): the real artifact carries a warm-up reserve at least
+        # the registered W_warm (WARMUP_POOL_QUERIES); the planner refuses one
+        # that leaves fewer candidates (its own test in test_s1_audit_batch2).
         manifest = build_manifest(
             pool, num_queries=8, num_trials=3, seed=7, block_budget=2800,
             dataset="squad_v2", trunc_budgets=(1000, 500),
+            warmup_reserve=rc.WARMUP_POOL_QUERIES,
         )
+        assert manifest["stats"]["warmup_reserve_n"] >= rc.WARMUP_POOL_QUERIES
         path = tmp_path / "squad_v2.json"
         path.write_text(json.dumps(manifest), encoding="utf-8")
         floor = rc.load_floor_table(floor_table)
@@ -3161,14 +3166,22 @@ def _n_of_class(cls: str) -> int:
     return {"primary": 2000, "secondary": 800, "identity": 300, "window": 2000}[cls]
 
 
-#: B3 (ADR-0172 item 5): session a registers the S1 manifest sizes Qasper
-#: 500 and RULER 300 per trial as achievable_n; session b registers none.
-_ACHIEVABLE_N_A = {"qasper": 500, "ruler": 300}
+#: B3 (ADR-0172 item 5) as amended 2026-10-17 (E17 option (d)): session a
+#: registers the S1 window pools Qasper 500 and RULER 300 per trial as
+#: window_pool_n (the window class alone); achievable_n carries Qasper's own
+#: achievable n, 852 (ADR-0173 amendment: the whole in-corpus pool minus the
+#: G4 warm-up reserve, measured on qasper_852x3_seed42_wr50.json, trials
+#: overlapping and recorded); session b registers none.
+_ACHIEVABLE_N_A: Dict[str, int] = {"qasper": 852}
+_WINDOW_POOL_N_A = {"qasper": 500, "ruler": 300}
 
 
 def _expected_n(grid: "rc.SessionGrid", step: Dict[str, Any]) -> int:
     base = _n_of_class(step["row_class"])
-    return min(base, dict(grid.achievable_n).get(step["dataset"], base))
+    n = min(base, dict(grid.achievable_n).get(step["dataset"], base))
+    if step["row_class"] == "window":
+        n = min(n, dict(grid.window_pool_n).get(step["dataset"], n))
+    return n
 
 
 class TestPerRowN:
@@ -3189,9 +3202,11 @@ class TestPerRowN:
             assert grid.window_requests == 2000
             assert grid.primary_engine == "vllm"
             assert grid.primary_baselines == ("B3", "B6")
-            # Qasper's achievable n is an OWNER registration (A5); ADR-0172
-            # item 5 registers the S1 manifest sizes on session a only.
+            # Qasper's achievable n is an OWNER registration (A5, open at A4);
+            # ADR-0172 item 5 as amended (E17 d) registers the S1 window pools
+            # on session a only, as window_pool_n.
             assert dict(grid.achievable_n) == (_ACHIEVABLE_N_A if grid.session == "a" else {})
+            assert dict(grid.window_pool_n) == (_WINDOW_POOL_N_A if grid.session == "a" else {})
 
     def test_classifier_table_every_family_engine_baseline(self, plan_a, plan_b):
         # Every (family x engine x baseline) cell of both sessions lands in
@@ -3242,10 +3257,13 @@ class TestPerRowN:
                 assert _argv_value(s, "--num-queries") == str(n), s["row_key"]
                 # The window pool: the open-loop generator draws from the
                 # measured set and may cycle it (B3, ADR-0172); the pool IS
-                # the registered --num-queries, lowered by achievable_n.
+                # the registered --num-queries, lowered by achievable_n and,
+                # for the window class alone, by window_pool_n (E17 d).
                 if s["family"] in ("F2", "F3"):
                     assert s["num_queries"] == min(
-                        rc.WINDOW_REQUESTS, dict(grid.achievable_n).get(s["dataset"], rc.WINDOW_REQUESTS)
+                        rc.WINDOW_REQUESTS,
+                        dict(grid.achievable_n).get(s["dataset"], rc.WINDOW_REQUESTS),
+                        dict(grid.window_pool_n).get(s["dataset"], rc.WINDOW_REQUESTS),
                     )
 
     def test_plan_header_records_the_constants(self, plan_a, plan_b):
@@ -3259,10 +3277,16 @@ class TestPerRowN:
             assert head["primary_baselines"] == ["B3", "B6"]
             if plan["session"] == "a":
                 assert head["achievable_n"] == _ACHIEVABLE_N_A
-                assert "qasper" in head["achievable_n_caveat"]
+                assert "qasper=852" in head["achievable_n_caveat"]
             else:
                 assert head["achievable_n"] == {}
                 assert head["achievable_n_caveat"] is None
+            if plan["session"] == "a":
+                assert head["window_pool_n"] == _WINDOW_POOL_N_A
+                assert "qasper=500" in head["window_pool_caveat"] and "E17" in head["window_pool_caveat"]
+            else:
+                assert head["window_pool_n"] == {}
+                assert head["window_pool_caveat"] is None
             assert "power_decision_2026-08-07" in head["decision"]
 
     def test_counts_unchanged_by_per_row_n(self, plan_a, plan_b):
@@ -3348,6 +3372,10 @@ class TestPerRowN:
             for s in _cells(plan):
                 base = _n_of_class(s["row_class"])
                 want = min(base, 900) if s["dataset"] == "qasper" else base
+                if s["row_class"] == "window":
+                    # E17 (d): the window pool is further capped by window_pool_n
+                    # (qasper 500, ruler 300), untouched by the achievable_n override
+                    want = min(want, _WINDOW_POOL_N_A.get(s["dataset"], want))
                 assert s["num_queries"] == want, s["row_key"]
                 assert _argv_value(s, "--num-queries") == str(want)
             lowered = [s for s in _cells(plan) if s["dataset"] == "qasper" and s["row_class"] == "primary"]
@@ -3369,10 +3397,12 @@ class TestPerRowN:
             assert plan["query_manifests"]["qasper"]["trial_sizes"]["1"] == 900
         finally:
             rc.SESSION_GRIDS = orig
-        # Outside the override the anchor grid registers Qasper at 500
-        # (ADR-0172 item 5): a 400-id manifest refuses against n=500.
+        # Outside the override the anchor grid caps the Qasper WINDOW pool at
+        # 500 (ADR-0172 item 5 as amended, E17 d) and registers Qasper's own
+        # achievable n, 852, for the unpressured cells (ADR-0173 amendment, G4):
+        # a 400-id manifest refuses against n=852.
         m400 = _write_manifest(tmp_path, "qasper", ids_per_trial=400, name="m400.json")
-        with pytest.raises(rc.PlanError, match=r"qasper.*trial 1.*400.*n=500"):
+        with pytest.raises(rc.PlanError, match=r"qasper.*trial 1.*400.*n=852"):
             rc.build_plan("a", floor, window_duration_s=300.0, query_manifests={"qasper": m400})
         # Counts are untouched by the override.
         assert plan["counts"]["cells"] == 868

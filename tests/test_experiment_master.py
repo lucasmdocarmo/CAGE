@@ -27,8 +27,14 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXPDIR = REPO_ROOT / "scripts" / "6_experiments"
 MASTER = EXPDIR / "cage_experiment.sh"
+# G18 (2026-10-17): teardown right after the verified pull; analyze (Mac only) last
 STAGES = ["preflight-mac", "provision", "ship", "setup", "validate", "calibrate", "plan", "run",
-          "monitor", "seal", "score", "collect", "pull", "analyze", "teardown"]
+          "monitor", "seal", "score", "collect", "pull", "teardown", "analyze"]
+#: G15: every registered profile prefetches the served model and these (the
+#: retriever, the reranker, the compressor, the four scoring instruments)
+PREFETCH_FULL = ("Qwen/Qwen3-14B intfloat/e5-large-v2 BAAI/bge-reranker-large "
+                 "microsoft/llmlingua-2-xlm-roberta-large-meetingbank KRLabsOrg/lettucedect-base-modernbert-en-v1 "
+                 "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli sentence-transformers/all-MiniLM-L6-v2 roberta-base")
 DATE = "2026-10-06"
 # The child shells that source the shipped profiles get PATH only. Under the
 # master the whole profile is exported (set -a), so an inherited EXP made the
@@ -537,8 +543,11 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         SETUP_BOUND_MIN=1
         CALIBRATE_RUNGS_BOUND_S=9000
         DC_PREFS="EU-RO-1 US-NE-1"
-        PREFETCH_MODELS="Qwen/Qwen3-14B"
         MAX_NULL_FRACTION=0.2
+        STEP_TIMEOUT_S=5400
+        LADDER_FAIL_FAST=1
+        BACKUP_ARCHIVE_DIR=/workspace/backup-archives
+        CELL_STALL_MIN=60
         MONITOR_INTERVAL_S=1
         POD_REPO={pr}
         POD_BACKUP_DIR={backup}
@@ -610,7 +619,7 @@ def test_plan_mode_prints_every_stage_and_runs_nothing(world: Dict[str, Path]) -
     world["profile"] = empty
     proc = _master(world, "--plan")
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "[plan] NOTE: MAX_NULL_FRACTION is empty" in proc.stdout and "stage 14: teardown (plan)" in proc.stdout
+    assert "[plan] NOTE: MAX_NULL_FRACTION is empty" in proc.stdout and "stage 13: teardown (plan)" in proc.stdout
     assert _calls(world) == []
 
 
@@ -681,7 +690,7 @@ def test_full_sequence_with_both_gos_lands_the_run(world: Dict[str, Path]) -> No
     # P-1 (S0F-88): stage 4 runs the live-load gate as its own pod job
     # review 2026-10-13 A1: the stage 4 start check is one more pod job after the engine probes
     assert names == ["setup", "load_gate", "validate_vllm", "start_check", "calibrate_vllm", "calibrate_rungs_vllm", "plan", "run", "score", "collect"]
-    assert any("setup_runpod CHARTER_DATASETS=squad_v2 musique qasper PREFETCH_MODELS=Qwen/Qwen3-14B" in c for c in calls), \
+    assert any(f"setup_runpod CHARTER_DATASETS=squad_v2 musique qasper PREFETCH_MODELS={PREFETCH_FULL}" in c for c in calls), \
         [c for c in calls if "setup" in c.lower()]
     assert any("preflight Qwen/Qwen3-14B http://localhost:8000 BACKENDS=vllm" in c for c in calls), \
         [c for c in calls if "preflight" in c]
@@ -732,7 +741,7 @@ def test_resume_skips_passed_stages_and_redo_repeats_one(world: Dict[str, Path])
     assert len(_calls(world)) == n_calls                    # nothing ran again
     proc = _master(world, "--only", "analyze", "--redo")
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "stage 13: analyze" in proc.stdout and "stage 12: pull" not in proc.stdout
+    assert "stage 14: analyze" in proc.stdout and "stage 12: pull" not in proc.stdout  # G18: analyze last
     # the driver's one-look lock: the recorded stamp is reused, the driver is not re-run
     assert "reusing analysis stamp 20261006-120000" in proc.stdout
     assert _state(world)["stages"]["analyze"]["status"] == "passed"
@@ -746,10 +755,10 @@ def test_resume_skips_passed_stages_and_redo_repeats_one(world: Dict[str, Path])
 def test_only_refuses_when_the_predecessor_has_not_passed(world: Dict[str, Path]) -> None:
     proc = _master(world, "--only", "teardown", "--yes", "teardown")
     assert proc.returncode == 1
-    assert "predecessor 'analyze' has not passed" in proc.stderr
+    assert "predecessor 'pull' has not passed" in proc.stderr  # G18: teardown follows the pull
     # --redo never waives the predecessor rule, and a bare --redo is refused
     proc = _master(world, "--only", "teardown", "--redo", "--yes", "teardown")
-    assert proc.returncode == 1 and "predecessor 'analyze' has not passed" in proc.stderr
+    assert proc.returncode == 1 and "predecessor 'pull' has not passed" in proc.stderr
     proc = _master(world, "--redo")
     assert proc.returncode == 1 and "--redo needs --from" in proc.stderr
 
@@ -842,8 +851,9 @@ def test_short_seatbelt_fails_stage_0_before_anything_bills(world: Dict[str, Pat
     world["profile"] = short
     proc = _master(world)
     assert proc.returncode == 1
-    # 1 + 10 (S0F-88 load gate) + 25 + 60 + 150 (ADR-0154 rung calibration, 9,000 s) + 15 + 60 + 180 + 30 + 60
-    assert "SEATBELT=2h (120 min) is shorter than the 591 min the stages need" in proc.stdout
+    # readiness 0 (5 s) + setup 1 + validate (10 load gate + 25 + 40 start check) + calibrate (60 + 150, ADR-0154
+    # rung calibration 9,000 s) + plan 15 + run 60 + seal 10 + score 180 + collect 30 + pull margin 90 (G16)
+    assert "SEATBELT=2h (120 min) is shorter than the 671 min the stages need" in proc.stdout
     assert not any("provision_pod" in c for c in _calls(world))
 
 
@@ -852,18 +862,21 @@ def test_shipped_profiles_cover_their_stage_bounds_and_name_registered_models() 
     cb = importlib.import_module("src.orchestration.cache_budget")
     for p in sorted((EXPDIR / "profiles").glob("S*.env")):
         proc = subprocess.run(["bash", "-c", f'set -a; source "{EXPDIR}/profiles/_common.env"; source "{p}"; '
-                               'printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" "$MODEL_SLUG" "$SEATBELT" "$HOURS" "$SETUP_BOUND_MIN" "$ENGINES" "$CALIBRATE" "${SCORE_BOUND_MIN:-180}" "$CALIBRATE_RUNGS_BOUND_S" "$FLOOR_AVG_SEQ_TOKENS" "${SUITE_ON_POD:-0}"'],
+                               'printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" "$MODEL_SLUG" "$SEATBELT" "$HOURS" "$SETUP_BOUND_MIN" "$ENGINES" "$CALIBRATE" "${SCORE_BOUND_MIN:-180}" "$CALIBRATE_RUNGS_BOUND_S" "$FLOOR_AVG_SEQ_TOKENS" "${SUITE_ON_POD:-0}" "${START_CHECK:-1}"'],
                               capture_output=True, text=True, env=PROFILE_ENV)
-        slug, seatbelt, hours, setup_min, engines, calibrate, score_min, rungs_bound_s, floor_tokens, suite_on_pod = proc.stdout.split("|")
+        slug, seatbelt, hours, setup_min, engines, calibrate, score_min, rungs_bound_s, floor_tokens, suite_on_pod, start_check = proc.stdout.split("|")
         assert slug in cb.MODEL_KV, f"{p.name}: MODEL_SLUG={slug} is not in cache_budget.MODEL_KV {sorted(cb.MODEL_KV)}"
         # ADR-0155: every shipped profile sizes the floor table on the anchor shape
         assert floor_tokens == "4779", f"{p.name}: FLOOR_AVG_SEQ_TOKENS={floor_tokens} is not the registered anchor shape"
         n_srv = len([e for e in engines.split() if e != "hf"]); n_cal = len(calibrate.split())
-        # S0F-88 review L4: plus the stage 4 load gate (10 min) and the pod suite (30 min when SUITE_ON_POD=1)
-        need = (int(setup_min) + 10 + (30 if suite_on_pod == "1" else 0) + n_srv * 25 + n_cal * 60
-                + n_cal * int(rungs_bound_s) // 60 + 15 + int(hours) * 60 + int(score_min) + 30 + 60)
-        unit = seatbelt[-1]; n = int(seatbelt[:-1])
-        have = n * 60 if unit == "h" else n if unit == "m" else n * 1440
+        # S0F-88 review L4: plus the stage 4 load gate (10 min) and the pod suite (30 min when SUITE_ON_POD=1);
+        # G16 (2026-10-17): plus the readiness wait (900 s), the start check (2,400 s), the seal (600 s) and a
+        # 90 min pull margin (S0 attempt 5 pulled in 68 min)
+        need = (15 + int(setup_min) + 10 + (30 if suite_on_pod == "1" else 0) + n_srv * 25 + (40 if start_check == "1" else 0)
+                + n_cal * 60 + n_cal * int(rungs_bound_s) // 60 + 15 + int(hours) * 60 + 10 + int(score_min) + 30 + 90)
+        unit = seatbelt[-1]; n = int(seatbelt.split()[0][:-1])
+        assert unit in ("h", "m"), f"{p.name}: SEATBELT={seatbelt} must be <n>h or <n>m (G30)"
+        have = n * 60 if unit == "h" else n
         assert have >= need, f"{p.name}: SEATBELT={seatbelt} ({have} min) < {need} min needed"
 
 
@@ -901,9 +914,9 @@ def test_the_plan_stage_refuses_a_run_projected_past_hours_and_prices_the_whole_
     assert "run projection (S0F-88 B-5): 1.50 h against the 1 h bound" in proc.stdout
     assert "the projected run (1.50 h) exceeds HOURS=1" in proc.stdout
     assert _state(world)["stages"]["plan"]["status"] == "failed"
-    # S0F-88 P-4: the cost estimate covers every stage bound (591 min), not HOURS alone
+    # S0F-88 P-4: the cost estimate covers every stage bound (671 min with the G16 terms), not HOURS alone
     provision = [c for c in _calls(world) if "provision_pod" in c]
-    assert provision and all("--hours 9.8 " in c for c in provision)
+    assert provision and all("--hours 11.2 " in c for c in provision)
 
 
 def test_the_plan_stage_refuses_a_step_without_a_measured_duration_b5(world: Dict[str, Path]) -> None:
@@ -927,6 +940,8 @@ def test_run_exit_2_with_stop_failed_only_is_accepted_and_noted(world: Dict[str,
     st = _state(world)
     assert st["stages"]["run"]["status"] == "passed"
     assert any("STOP FAILED" in n for n in st["stages"]["run"]["notes"])
+    # review 2026-10-17 batch 4 (H1): a passing run copies no unsealed tree
+    assert "custody (G6)" not in proc.stdout and not any("run_unsealed" in c for c in _calls(world))
 
 
 def test_rung_calibration_job_feeds_the_plan(world: Dict[str, Path]) -> None:
@@ -1094,7 +1109,8 @@ def test_stage_5_resumes_per_engine_and_carries_the_fail_fast_and_timeout_knobs(
     # timeout and the dry-window rerun flag, when the profile sets them.
     prof = tmp_path / "S1_knobs.env"
     prof.write_text(world["profile"].read_text(encoding="utf-8").replace('ENGINES="vllm hf"', 'ENGINES="vllm sglang hf"').replace('CALIBRATE="vllm"', 'CALIBRATE="vllm sglang"')
-                    + "\nLADDER_FAIL_FAST=1\nSTEP_TIMEOUT_S=5400\nDRY_TELEMETRY_RERUN=1\nSEATBELT=72h\n", encoding="utf-8")
+                    + "\nLADDER_FAIL_FAST=1\nSTEP_TIMEOUT_S=5400\nDRY_TELEMETRY_RERUN=1\nSEATBELT=72h\nREHEARSAL_N=50\n", encoding="utf-8")
+    # (G15: DRY_TELEMETRY_RERUN is an S0 key, so this profile is a rehearsal)
     world["profile"] = prof
     proc = _master(world, "--yes", "provision", "--to", "calibrate", CAGE_TEST_RUNGS_FAIL="1", CAGE_TEST_RUNGS_FAIL_ENGINE="sglang")
     assert proc.returncode == 1, proc.stdout[-4000:]
@@ -1152,7 +1168,8 @@ def test_the_run_job_strips_an_exported_kv_ceiling_pin(world: Dict[str, Path]) -
 def test_the_front_load_and_run_fail_fast_keys_reach_the_plan_and_run_jobs(world: Dict[str, Path], tmp_path: Path) -> None:
     # Review 2026-10-13 A2 and B1: S0 profile keys, carried as flags
     prof = tmp_path / "S1_speed.env"
-    prof.write_text(world["profile"].read_text(encoding="utf-8") + "\nFRONT_LOAD=1\nRUN_FAIL_FAST=infra\n", encoding="utf-8")
+    # G15: both are S0 keys, refused on a registered profile, so this one is a rehearsal
+    prof.write_text(world["profile"].read_text(encoding="utf-8") + "\nFRONT_LOAD=1\nRUN_FAIL_FAST=infra\nREHEARSAL_N=50\n", encoding="utf-8")
     world["profile"] = prof
     proc = _master(world, "--yes", "provision", "--to", "run")
     assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-1500:]
@@ -1301,7 +1318,8 @@ def test_mac_suite_zero_skips_only_the_suite_loudly_and_records_it(world: Dict[s
     gate = lambda calls: sum(1 for c in calls if c.startswith("run_tests") and "test_load_gate_p1" in c)
     assert suite(_calls(world)) == 1 and gate(_calls(world)) == 1
     skip = tmp_path / "S1_nosuite.env"
-    skip.write_text(world["profile"].read_text(encoding="utf-8") + "\nMAC_SUITE=0\n", encoding="utf-8")
+    # G15 / ADR-0145: MAC_SUITE=0 is refused on a registered profile, so this one is a rehearsal
+    skip.write_text(world["profile"].read_text(encoding="utf-8") + "\nMAC_SUITE=0\nREHEARSAL_N=50\n", encoding="utf-8")
     world["profile"] = skip
     proc = _master(world, "--plan")
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -1622,3 +1640,149 @@ def test_write_analysis_header_and_profiles_are_plain() -> None:
         proc = subprocess.run(["bash", "-c", f'set -a; source "{EXPDIR}/profiles/_common.env"; source "{p}"; printf "%s" "$EXP"'],
                               capture_output=True, text=True, env=PROFILE_ENV)
         assert proc.returncode == 0 and proc.stdout == (p.stem if p.stem != "_common" else ""), p.name
+
+
+# ---------------------------------------------------------------------------
+# 6. audit 2026-10-17, the shells batch (G5, G6, G8, G14 to G18, G30)
+# ---------------------------------------------------------------------------
+
+
+def test_registered_profile_s0_keys_and_unset_guards_are_refused_at_stage_0_g14_g15(world: Dict[str, Path], tmp_path: Path) -> None:
+    bad = tmp_path / "S1_reg.env"
+    bad.write_text(world["profile"].read_text(encoding="utf-8").replace("STEP_TIMEOUT_S=5400", "STEP_TIMEOUT_S=")
+                   + "\nMAX_NULL_FRACTION=1.0\nFRONT_LOAD=1\nPREFETCH_MODELS=\"Qwen/Qwen3-14B\"\n", encoding="utf-8")
+    world["profile"] = bad
+    proc = _master(world)
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "registered profile (REHEARSAL_N empty) carries S0-only or unset keys (G14, G15" in proc.stdout
+    for frag in ("STEP_TIMEOUT_S=empty", "MAX_NULL_FRACTION=1.0", "FRONT_LOAD=1", "PREFETCH_MODELS-lacks:intfloat/e5-large-v2"):
+        assert frag in proc.stdout, frag
+    assert not any("provision_pod" in c for c in _calls(world))
+    # the same keys are legal on a rehearsal (S0): stage 0 passes and stops before the GO
+    reh = tmp_path / "S1_reh.env"
+    reh.write_text(bad.read_text(encoding="utf-8") + "\nREHEARSAL_N=50\n", encoding="utf-8")
+    world["profile"] = reh
+    assert _master(world).returncode == 10
+
+
+def test_a_day_seatbelt_is_refused_at_stage_0_g30(world: Dict[str, Path], tmp_path: Path) -> None:
+    prof = tmp_path / "S1_days.env"
+    prof.write_text(world["profile"].read_text(encoding="utf-8").replace("SEATBELT=12h", "SEATBELT=2d"), encoding="utf-8")
+    world["profile"] = prof
+    proc = _master(world)
+    assert proc.returncode == 1 and "SEATBELT=2d is not <n>h or <n>m" in proc.stdout
+    assert not any("provision_pod" in c for c in _calls(world))
+
+
+def test_a_balance_below_the_pod_bound_fails_stage_0_g17(world: Dict[str, Path], tmp_path: Path) -> None:
+    # the fake account holds 324.5 USD; 100 run hours at the 3.49 USD list price plus the 50 USD floor exceed it
+    prof = tmp_path / "S1_poor.env"
+    prof.write_text(world["profile"].read_text(encoding="utf-8").replace("HOURS=1\n", "HOURS=100\n").replace("SEATBELT=12h", "SEATBELT=200h"), encoding="utf-8")
+    world["profile"] = prof
+    proc = _master(world)
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "balance 324.5 USD is below the" in proc.stdout and "the pod bound needs" in proc.stdout
+    assert not any("provision_pod" in c and "--yes" in c for c in _calls(world))
+    # the passing path records the figures
+    world["profile"] = world["tmp"] / "S1.env"
+    assert _master(world).returncode == 10
+    st = _state(world)
+    assert st["cost"]["balance_before_usd"] == "324.5" and st["cost"]["price_per_hour_list_usd"] == "3.49"
+    assert float(st["cost"]["pod_bound_need_usd"]) < 324.5
+
+
+def test_the_seatbelt_guard_refuses_a_pod_stage_when_the_deadline_is_short_g16(world: Dict[str, Path]) -> None:
+    # the fake watchdog reports a deadline 30 min away: ship refuses before anything is copied to the pod
+    _w(world["scripts"] / "runpod" / "pod_watchdog.sh",
+       "#!/bin/bash\necho \"pod_watchdog $*\" >> \"$CAGE_TEST_LOG\"\n"
+       "dl=$(python3 -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=30)).strftime(\"%Y-%m-%dT%H:%M:%SZ\"))')\n"
+       "echo \"pod=$2 watchdog=ALIVE pid=1 deadline=$dl log=/dev/null\"\n")
+    proc = _master(world, "--yes", "provision")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "the seatbelt fires in" in proc.stdout and "through pull need" in proc.stdout and "re-arm the watchdog" in proc.stdout
+    st = _state(world)
+    assert st["stages"]["provision"]["status"] == "passed" and st["stages"]["ship"]["status"] == "failed"
+    assert not any(c.startswith("scp") and "cage_repo.tar.gz" in c for c in _calls(world))
+    # a dead watchdog refuses too, naming the re-arm command
+    _w(world["scripts"] / "runpod" / "pod_watchdog.sh", "#!/bin/bash\necho \"pod=$2 watchdog=DEAD pid=? deadline=? log=/dev/null\"\n")
+    proc = _master(world, "--from", "ship", "--redo")
+    assert proc.returncode == 1 and "the seatbelt is not ALIVE for pod123 before stage ship" in proc.stdout
+
+
+def test_a_resume_reuses_the_job_that_finished_while_the_master_was_gone_g5(world: Dict[str, Path]) -> None:
+    assert _master(world, "--yes", "provision", "--to", "ship").returncode == 0
+    land = world["exp_root"] / "S1" / DATE
+    state_path = land / "extras" / "state.json"
+    st = json.loads(state_path.read_text(encoding="utf-8"))
+    # the master died during setup; its job ran on and finished DONE(0) on the pod
+    st["stages"]["setup"] = {"status": "running", "rc": None, "expected_rc": 0, "started_utc": "2026-10-06T10:00:00Z",
+                             "ended_utc": None, "evidence": [], "notes": []}
+    state_path.write_text(json.dumps(st), encoding="utf-8")
+    remote = world["home"] / ".cage_jobs"; remote.mkdir(exist_ok=True)
+    (remote / "setup.cmd").write_text("bash scripts/runpod/setup_runpod.sh\n", encoding="utf-8")
+    log_lines = ["[cage]   all charter datasets staged: squad_v2 musique qasper"]
+    log_lines += [f"[cage]   {m}: cached" for m in PREFETCH_FULL.split()]
+    log_lines += ["[cage]   pynvml OK", "[cage]   cage_stats.api import OK", "[cage]  RunPod bootstrap complete."]
+    (remote / "setup.log").write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+    (remote / "setup.status").write_text("0\n", encoding="utf-8")
+    (land / "extras" / "jobs" / "setup.json").write_text(json.dumps({
+        "id": "setup", "mode": "pod-ssh", "host": "root@pod.test", "port": "2222", "handle": "pid:424242",
+        "remote_log": "~/.cage_jobs/setup.log", "remote_status": "~/.cage_jobs/setup.status",
+        "submitted_at": "2026-10-06T10:00:00Z", "deadline_s": 60, "billable": True}), encoding="utf-8")
+    submits = lambda: sum(1 for c in _calls(world) if "base64 -d" in c and "setup.cmd" in c)
+    before = submits()
+    proc = _master(world, "--from", "setup", "--redo", "--to", "setup")
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-1500:]
+    assert "job setup finished DONE(0) during the interrupted attempt" in proc.stdout
+    assert submits() == before                       # no second submit
+    assert (land / "logs" / "setup" / "setup.log").read_text(encoding="utf-8").endswith("RunPod bootstrap complete.\n")
+    st = _state(world)
+    assert st["stages"]["setup"]["status"] == "passed" and any("G5" in n for n in st["stages"]["setup"]["notes"])
+    # a deliberate --redo of a PASSED stage still submits a fresh job (the takeover rule is for the interrupted stage only)
+    proc = _master(world, "--only", "setup", "--redo")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    assert submits() == before + 1
+    # review batch 4 (M4): a handle whose pod is UNREACHABLE never gets a second submit
+    (world["home"] / ".ssh_fail").write_text("9", encoding="utf-8")
+    proc = _master(world, "--only", "setup", "--redo")
+    assert proc.returncode == 1 and "the pod is UNREACHABLE: its state cannot be read, so nothing is submitted" in proc.stdout
+    assert submits() == before + 1
+    (world["home"] / ".ssh_fail").write_text("0", encoding="utf-8")
+
+
+def test_a_failed_registered_run_copies_the_unsealed_tree_off_the_pod_first_g6(world: Dict[str, Path]) -> None:
+    proc = _master(world, "--yes", "provision", CAGE_TEST_RUN_CRASH="1")
+    assert proc.returncode == 1
+    assert "custody (G6): copying the pod's mirror of the UNSEALED tree" in proc.stdout
+    calls = _calls(world)
+    assert any(c.startswith("scp") and "run_unsealed" in c for c in calls), [c for c in calls if c.startswith("scp")][-3:]
+    st = _state(world)
+    assert st["stages"]["run"]["status"] == "failed" and any("G6 custody" in n for n in st["stages"]["run"]["notes"])
+
+
+def test_the_scoring_batch_size_reaches_the_pass_only_when_the_profile_sets_it_g19(world: Dict[str, Path], tmp_path: Path) -> None:
+    proc = _master(world, "--yes", "provision", "--to", "score")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    cmd = (world["home"] / ".cage_jobs" / "score.cmd").read_text(encoding="utf-8")
+    assert "--batch-size" not in cmd            # empty = the sequential path
+    prof = tmp_path / "S1_batched.env"
+    prof.write_text(world["profile"].read_text(encoding="utf-8") + "\nSCORING_BATCH_SIZE=32\n", encoding="utf-8")
+    world["profile"] = prof
+    proc = _master(world, "--only", "score", "--redo")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    cmd = (world["home"] / ".cage_jobs" / "score.cmd").read_text(encoding="utf-8")
+    assert "--freeze-file MyDocs/registration/freeze_resolutions.json --batch-size 32; }" in cmd
+
+
+def test_a_recorded_conductor_pod_passes_the_clean_room_and_the_zero_proof_g8(world: Dict[str, Path]) -> None:
+    # without the record a listed pod is a clean-room refusal ...
+    proc = _master(world, CAGE_TEST_PODS='[{"id": "cond1"}]')
+    assert proc.returncode == 1 and "clean room: pods exist before this experiment" in proc.stdout
+    # ... with it, stage 0 and the stage 13 zero proof tolerate exactly that pod
+    state_path = world["exp_root"] / "S1" / DATE / "extras" / "state.json"
+    st = json.loads(state_path.read_text(encoding="utf-8"))
+    st["conductor"] = {"id": "cond1"}
+    state_path.write_text(json.dumps(st), encoding="utf-8")
+    proc = _master(world, "--yes", "provision", "--yes", "teardown", CAGE_TEST_PODS='[{"id": "cond1"}]')
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-1500:]
+    assert _state(world)["stages"]["teardown"]["status"] == "passed"

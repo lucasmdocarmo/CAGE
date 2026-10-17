@@ -4,7 +4,8 @@ Objective: compute the section 6.1 currencies G (goodput) and Y (serving yield) 
            window of a campaign run root, unconditionally, from the request rows, the
            section 8.5 predicate table and the calibration floors; one record or one
            named skip per window, never a silent absence.
-Cloud:     local (the Mac or the conductor); reads the pulled landing only.
+Cloud:     local
+           (the Mac or the conductor; reads the pulled landing only)
 
 Why this exists (S0 attempt 5, MyDocs/RunPod/S0_ATTEMPT5_REPORT_2026-10-15.md section 6):
 the analysis driver evaluates G and Y only inside a registered window contrast, which
@@ -47,8 +48,10 @@ Rules carried from the code it calls (read 2026-10-16, cited by line):
 B3 (ADR-0172, owner 2026-10-16), added 2026-10-16 night:
 - Verdicts are keyed by the #127 identity triple (example_id, repeat_index,
   record_index), the driver's key (run_campaign_analysis._predicate_join_key): a
-  replayed arrival (ADR-0172 item 1) never inherits another arrival's verdict; a
-  completed arrival without its own verdict makes the window a named skip (the
+  replayed arrival (ADR-0172 item 1) reads its OWN verdict row, the one the
+  scoring pass scored or inherited for it (E18 amendment 2026-10-17, recorded
+  as quality_source), never another arrival's row by example_id; a completed
+  arrival without its own verdict makes the window a named skip (the
   evaluator refuses a NaN veridical on a completed row). Before this the map was
   keyed by (example_id, repeat_index) and the last row won.
 - Item 6 i: time-resolved goodput. The window's arrivals (arrival_s, the intended
@@ -233,8 +236,9 @@ def _identity(rec: Dict[str, Any]) -> Tuple[str, str, Any]:
 
 def _predicate_map(path: Path) -> Dict[Tuple[str, str, Any], bool]:
     """identity triple -> predicate verdict; a null verdict is left out. B3
-    (ADR-0172 item 1): keyed by record_index too, so a replayed arrival never
-    reads another arrival's verdict."""
+    (ADR-0172 item 1): keyed by record_index too, so a replayed arrival reads
+    the verdict row the scoring pass wrote for IT (scored or inherited, E18),
+    never another arrival's row."""
     out: Dict[Tuple[str, str, Any], bool] = {}
     for rec in _read_jsonl(path):
         verdict = rec.get("predicate")
@@ -613,7 +617,7 @@ def write_outputs(rows: List[Dict[str, Any]], out_dir: Path, *, run_root: Path) 
         "rows with a scheduled clock are graded from the intended arrival (W16), the others from the send",
         "- RULER windows carry G only (outside the section 8.5 predicate universe)",
         "- duration_s is the writer's dispatch span (duration_basis column); rates divide by it, fractions use n_issued",
-        f"- verdicts joined by (example_id, repeat_index, record_index): a replayed arrival never inherits a verdict ({WINDOW_DESIGN_ADR})",
+        f"- verdicts joined by (example_id, repeat_index, record_index): each arrival reads its own verdict row, scored or inherited by the scoring pass ({WINDOW_DESIGN_ADR} as amended 2026-10-17, E18)",
         f"- time-resolved goodput ({WINDOW_DESIGN_ADR} 6 i): {SLICE_S:g} s slices in `{slices_path.name}` ({n_slice_rows} slice row(s) over {len(sliced)} window(s)); "
         f"time_to_breach_s = end of the first slice whose running goodput is below {BREACH_GOODPUT:g} ({len(breached)} window(s) breached); "
         "queue_growth_rps = least squares slope of the waiting gauge over the regime window",

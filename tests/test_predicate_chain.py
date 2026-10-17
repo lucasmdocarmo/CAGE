@@ -612,9 +612,12 @@ def test_missing_verdict_column_entirely_refuses() -> None:
 
 
 def test_null_fraction_bound_refuses_the_window() -> None:
+    # G22 (2026-10-17): the bound judges the COMPLETED rows, so the nulls here
+    # are missing verdicts on ok rows (two of three); not-ok rows are nulled by
+    # design and excluded from the bound (tests/test_s1_audit_batch3.py).
     joined = join_window_rows(
-        [_evidence_row(0, ok=False), _evidence_row(1, ok=False), _evidence_row(2)],
-        [_score_row(0), _score_row(1), _score_row(2)],
+        [_evidence_row(0), _evidence_row(1), _evidence_row(2)],
+        [_score_row(0, exact_match=None), _score_row(1, exact_match=None), _score_row(2)],
         window="w",
     )
     with pytest.raises(PredicateError, match="max_null_fraction"):
@@ -1147,11 +1150,20 @@ def test_out_of_regime_windows_are_excluded_and_counted(tmp_path: Path) -> None:
         "--max-null-fraction", "0.5",
     ]) == 0
     assert org.main([str(run_dir)]) == 0
-    with pytest.raises(rca.AnalysisError, match="no computable cross-engine leg"):
-        rca.run_analysis(
-            run_dir, contrast_ids=[14], metrics=["ttft_ms"],
-            mode="design-input",
-        )
+    # G32 (2026-10-17): no computable leg is a RECORDED missing endpoint, never a
+    # stage abort (before, the raise lost the whole analysis stage)
+    result = rca.run_analysis(
+        run_dir, contrast_ids=[14], metrics=["ttft_ms"],
+        mode="design-input",
+    )
+    stats = json.loads(result.stats_path.read_text(encoding="utf-8"))
+    missing = stats["truth_tax"]["missing_endpoint"]
+    assert missing["endpoint"] == rca.chain_endpoint(14)
+    assert missing["reason"].startswith("no computable cross-engine leg")
+    # #14 was the only contrast requested, so no primary exists and the chain
+    # records itself as skipped (a run with #4 computed records #14 as a
+    # missing primary endpoint instead; run_gatekeeping)
+    assert "no primary-tier contrast was computed" in stats["gatekeeping"]["skipped"]
 
 
 def test_multiple_predicate_tables_refuse_without_flag(predicate_run: Path) -> None:

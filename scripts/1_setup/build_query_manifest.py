@@ -86,9 +86,17 @@ def main() -> int:
                         "rung budgets, each < --block-budget (default '1400,700'; "
                         "'' disables). The manifest then serves every corpus-trunc "
                         "rung; a rung >= the block budget REFUSES.")
+    p.add_argument("--warmup-reserve", type=int, default=0, dest="warmup_reserve",
+                   help="Audit 2026-10-17 (G4): in-corpus questions set aside, by "
+                        "WHOLE context groups (QASPER papers, else paragraphs), for "
+                        "the runner's warm-up and pre-load BEFORE the trial draws; "
+                        "the trials come from the pool minus the reserve. The plan "
+                        "refuses a manifest with fewer candidates than its registered "
+                        "warm-up size. Default 0 (none). The default filename gains "
+                        "_wr<n> when > 0.")
     p.add_argument("--out", default=None,
                    help="Default: data/manifests/<dataset>_<N>x<T>_seed<seed>"
-                        "[_ov<target>].json")
+                        "[_ov<target>][_wr<reserve>].json")
     args = p.parse_args()
     trunc_budgets = parse_trunc_budgets(args.trunc_budgets)
 
@@ -120,14 +128,17 @@ def main() -> int:
         overlap_tolerance=args.overlap_tolerance,
         overlap_group_size=args.overlap_group_size,
         trunc_budgets=trunc_budgets,
+        warmup_reserve=args.warmup_reserve,
     )
 
     # An engineered store is a DIFFERENT artifact than the natural manifest for
     # the same (dataset, N, T, seed): tag the default filename so they never collide.
+    # So is a manifest with a warm-up reserve (its trials are drawn from a smaller pool).
     ov_tag = f"_ov{args.overlap_target:g}" if args.overlap_target is not None else ""
+    wr_tag = f"_wr{args.warmup_reserve}" if args.warmup_reserve > 0 else ""
     out = Path(args.out) if args.out else (
         REPO_ROOT / "data" / "manifests"
-        / f"{args.dataset}_{args.num_queries}x{args.num_trials}_seed{args.seed}{ov_tag}.json"
+        / f"{args.dataset}_{args.num_queries}x{args.num_trials}_seed{args.seed}{ov_tag}{wr_tag}.json"
     )
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(manifest, indent=1), encoding="utf-8")
@@ -139,6 +150,10 @@ def main() -> int:
     print(f"  blocks={s['n_blocks']} pool={s['pool_size']} loaded={s['source_examples_loaded']} "
           f"excluded={s['examples_excluded']} ({s['exclusion_rate']:.1%}) "
           f"trials_disjoint={s['trials_disjoint']}")
+    wr = manifest["warmup_reserve"]
+    print(f"  warmup_reserve requested={wr['requested']} reserved={wr['n']} "
+          f"groups={wr['n_groups']} key={wr['group_key']} "
+          f"trial_pool={s['trial_pool_size']} (the achievable n at this reserve)")
     ov = manifest["overlap"]
     m = ov["measured"]
     frac = m["mean_pairwise_shared_fraction"]

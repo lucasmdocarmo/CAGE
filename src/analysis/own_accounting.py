@@ -36,9 +36,14 @@ Fail-closed doctrine: an empty requests list refuses (absence of rows is not
 zero occupancy); any required field absent/None on a request that must be
 classified refuses, NAMING the field and the request (skip-and-underestimate
 is the exact bug class this replaces); unknown model/kv_dtype propagates
-``cache_budget.CacheBudgetError``. The ONE legal exclusion is a
-``dropped_by_cap`` row: it was never sent, provably held zero engine bytes,
-and is counted (``n_dropped_excluded``), never silent. Conversely a window
+``cache_budget.CacheBudgetError``. The legal exclusions are counted, never
+silent: a ``dropped_by_cap`` row (never sent, provably zero engine bytes;
+``n_dropped_excluded``) and, since the audit of 2026-10-17 (G11), an error
+row (``ok`` False) whose engine answer carried no ``prompt_tokens`` and that
+the runner could not stand in for (``n_error_excluded``); the occupancy leg
+integrates such a row with its ``prompt_tokens_prepared`` when the runner
+stamped it and the send and completion stamps exist, the reuse leg excludes
+it (a stub carries no served prompt and no group). Conversely a window
 whose recorded intervals simply do not overlap the bounds yields an HONEST
 ρ_own = 0.0 — that zero is affirmative accounting over known intervals, not
 a default for missing data.
@@ -76,6 +81,12 @@ _SEND_FIELD = "actual_send_ts"
 _FIRST_TOKEN_FIELD = "first_token_ts"
 _COMPLETION_FIELD = "completion_ts"
 _PROMPT_TOKENS_FIELD = "prompt_tokens"
+#: audit 2026-10-17 (G11): the prepared prompt length the runner stamps on a
+#: row whose engine answer carried no usage (an error row: a drain cut, a
+#: timeout, a dispatch failure); the request DID hold its prompt's KV while
+#: in flight, so its interval counts with this length when present.
+_PROMPT_TOKENS_PREPARED_FIELD = "prompt_tokens_prepared"
+_OK_FIELD = "ok"
 _COMPLETION_TOKENS_FIELD = "num_tokens"
 _DROPPED_FIELD = "dropped_by_cap"
 _GROUP_FIELD = "group_id"
@@ -181,6 +192,7 @@ def _parse_in_flight(
         )
     flights: list[_InFlight] = []
     n_dropped = 0
+    n_error_excluded = 0
     for i, row in enumerate(requests):
         if not isinstance(row, Mapping):
             raise OwnAccountingError(
@@ -189,6 +201,30 @@ def _parse_in_flight(
         if row.get(_DROPPED_FIELD):
             n_dropped += 1
             continue
+        if row.get(_OK_FIELD) is False and row.get(_PROMPT_TOKENS_FIELD) is None:
+            # audit 2026-10-17 (G11): an error row carries no usage from the
+            # engine; S0 certified all 51 pressure windows only because no row
+            # errored, and a past-cliff window on S1 has cuts by design. The
+            # runner's prepared length stands in when stamped; a row without
+            # it is a COUNTED exclusion, never a refusal of the window.
+            # Review 2026-10-17 (batch 1, HIGH 2): the runner's stub row has no
+            # num_tokens key and a cut that never left the in-flight cap has no
+            # send stamp; neither may turn the stand-in into a refusal. No
+            # send or no completion stamp: the interval is unknown, counted
+            # exclusion. Absent num_tokens: zero decoded tokens.
+            prepared = row.get(_PROMPT_TOKENS_PREPARED_FIELD)
+            if (
+                prepared is None
+                or row.get(_SEND_FIELD) is None
+                or row.get(_COMPLETION_FIELD) is None
+            ):
+                n_error_excluded += 1
+                continue
+            row = {
+                **row,
+                _PROMPT_TOKENS_FIELD: prepared,
+                _COMPLETION_TOKENS_FIELD: row.get(_COMPLETION_TOKENS_FIELD) or 0,
+            }
         send = _require_number(row, _SEND_FIELD, i)
         end = _require_number(row, _COMPLETION_FIELD, i)
         if end < send:
@@ -216,7 +252,7 @@ def _parse_in_flight(
                 completion_tokens=completion,
             )
         )
-    return flights, n_dropped
+    return flights, n_dropped, n_error_excluded
 
 
 def _row_token_seconds(f: _InFlight, a: float, b: float) -> float:
@@ -316,6 +352,8 @@ class OwnOccupancyWindow:
     n_requests: int
     n_in_flight: int
     n_dropped_excluded: int
+    #: G11: error rows with neither an engine usage count nor a prepared length
+    n_error_excluded: int
     series: tuple[dict[str, float], ...]
 
     def to_dict(self) -> dict[str, Any]:
@@ -381,7 +419,7 @@ def compute_own_occupancy(
             f"window_end_s={w1!r} must be > window_start_s={w0!r}"
         )
 
-    flights, n_dropped = _parse_in_flight(requests)
+    flights, n_dropped, n_error_excluded = _parse_in_flight(requests)
     # floor() mirrors cache_budget.demand_bytes — the ONE bytes-per-token
     # arithmetic, applied identically on both sides of the referee.
     kv_per_token = math.floor(mk.kv_bytes_per_token * factor)
@@ -448,6 +486,7 @@ def compute_own_occupancy(
         n_requests=len(requests),
         n_in_flight=len(in_flight),
         n_dropped_excluded=n_dropped,
+        n_error_excluded=n_error_excluded,
         series=tuple(series),
     )
 
@@ -466,7 +505,7 @@ def window_bounds_from_requests(
     same field requirements as :func:`compute_own_occupancy`; zero-width or
     all-dropped input refuses.
     """
-    flights, _ = _parse_in_flight(requests)
+    flights, _dropped, _error_excluded = _parse_in_flight(requests)
     if not flights:
         raise OwnAccountingError(
             "every request row is dropped_by_cap — no sent request, no "
@@ -551,6 +590,10 @@ class OwnReuseWindow:
     total_prompt_tokens: int
     total_shared_prefix_tokens: int
     n_requests: int
+    #: audit 2026-10-17 (G11, review MEDIUM 3): the same counted exclusions as
+    #: the occupancy leg; a dropped or error row never refuses the window
+    n_dropped_excluded: int
+    n_error_excluded: int
     cached_tokens_corroboration: dict[str, Any]
     per_request: tuple[dict[str, Any], ...]
 
@@ -614,11 +657,23 @@ def compute_own_reuse(
     cached_prompt_reported = 0
     cached_tokens_reported = 0
     n_cached_reported = 0
+    n_dropped = 0
+    n_error_excluded = 0
     for i, row in enumerate(requests):
         if not isinstance(row, Mapping):
             raise OwnAccountingError(
                 f"request row {i} is not a mapping ({type(row).__name__})"
             )
+        if row.get(_DROPPED_FIELD):
+            n_dropped += 1
+            continue
+        if row.get(_OK_FIELD) is False and row.get(_PROMPT_TOKENS_FIELD) is None:
+            # G11 (review MEDIUM 3): an error row without engine usage is a
+            # counted exclusion of the reuse leg, mirroring the occupancy leg;
+            # the stub carries no served prompt and no group to join the
+            # manifest through, so no stand-in applies here.
+            n_error_excluded += 1
+            continue
         prompt = _require_count(row, _PROMPT_TOKENS_FIELD, i)
         if prompt < 1:
             raise OwnAccountingError(
@@ -693,6 +748,12 @@ def compute_own_reuse(
             }
         )
 
+    if not per_request:
+        raise OwnAccountingError(
+            f"every request row was excluded ({n_dropped} dropped by the cap, "
+            f"{n_error_excluded} error rows without usage): no served prompt "
+            "remains to certify reuse (fail closed)"
+        )
     corroboration = {
         "n_reported": n_cached_reported,
         "n_missing": len(per_request) - n_cached_reported,
@@ -709,6 +770,8 @@ def compute_own_reuse(
         total_prompt_tokens=total_prompt,
         total_shared_prefix_tokens=total_prefix,
         n_requests=len(per_request),
+        n_dropped_excluded=n_dropped,
+        n_error_excluded=n_error_excluded,
         cached_tokens_corroboration=corroboration,
         per_request=tuple(per_request),
     )

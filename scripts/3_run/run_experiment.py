@@ -1522,7 +1522,11 @@ def served_prompt_tokens(
 
 
 def check_prepared_covers_arrivals(
-    *, n_prepared: int, n_arrivals: Optional[int], dropped_ids: Sequence[str]
+    *,
+    n_prepared: int,
+    n_arrivals: Optional[int],
+    dropped_ids: Sequence[str],
+    replay_authorized: bool = False,
 ) -> None:
     """Under ``--arrival-count`` every scheduled arrival needs its own
     prepared request (the V3 contract: arrivals == the prepared pool). A
@@ -1530,11 +1534,32 @@ def check_prepared_covers_arrivals(
     would otherwise reach the replay guard, whose message diagnoses replay
     and suggests the non-confirmatory label; this names the dropped ids
     instead and refuses before the first send (review of Batch 1 V3, F3).
-    Duration mode (``n_arrivals`` None) is untouched."""
-    if n_arrivals is None or n_prepared >= n_arrivals:
+    Duration mode (``n_arrivals`` None) is untouched.
+
+    ADR-0172 item 1 (audit 2026-10-17, G1): a plan that authorizes replay
+    (``--window-replay-max``) schedules W arrivals over a smaller pool on
+    purpose, so the pool-covers-arrivals rule does not apply; what still
+    refuses is a measured example that failed to prepare, because the pool
+    must be the whole trial. The pass ceiling is enforced by
+    ``ensure_no_measured_replay`` at dispatch.
+    """
+    if n_arrivals is None:
+        return
+    if replay_authorized:
+        if not dropped_ids:
+            return
+    elif n_prepared >= n_arrivals:
         return
     shown = ", ".join(str(i) for i in list(dropped_ids)[:10])
     more = f" (+{len(dropped_ids) - 10} more)" if len(dropped_ids) > 10 else ""
+    if replay_authorized:
+        raise LoadGeneratorError(
+            "prepared_requests",
+            n_prepared,
+            f"{len(dropped_ids)} measured example(s) failed to prepare ({shown}{more}); "
+            f"the replayed window would cycle a pool of {n_prepared} instead of the whole "
+            "trial, so the cell refuses before the first send (Batch 1 V3; ADR-0172)",
+        )
     raise LoadGeneratorError(
         "prepared_requests",
         n_prepared,
@@ -1799,7 +1824,8 @@ def select_manifest_prefix(
             "per-row N): the runner measures the first n ids of the trial and "
             "refuses a shorter one; rebuild the manifest with "
             f"build_query_manifest.py --num-queries >= {num_queries} or lower "
-            "the registered n (SessionGrid.achievable_n, DECISION.md A5)"
+            "the registered n (SessionGrid.achievable_n, DECISION.md A5; for a "
+            "window cell SessionGrid.window_pool_n, ADR-0172 amendment E17)"
         )
     try:
         selected = select_examples(manifest, trial, examples)
@@ -2305,6 +2331,35 @@ def write_json_atomic(path: Any, payload: Any) -> None:
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)
+
+
+def adapter_request_timeout_s(
+    drain_timeout_s: Optional[float],
+    *,
+    rate_qps: Optional[float],
+    num_arrivals: Optional[int],
+    duration_s: Optional[float],
+) -> Optional[float]:
+    """Audit 2026-10-17 (G28): the adapters' per-request timeout under a drain.
+
+    The drain (B3, ADR-0172 item 3) fires ``drain_timeout_s`` after the LAST
+    arrival; a request sent at the start of a D_class window is then open for
+    D_class + drain seconds before the drain cuts it. With the adapter timeout
+    equal to the drain alone, that request timed out in the adapter first and
+    was recorded as an adapter error, so ``drain.n_cut`` and the "drain
+    timeout" label missed it. The timeout is therefore drain + window span:
+    ``duration_s`` in duration mode, ``num_arrivals / rate_qps`` in count
+    mode, 0 when neither is known. None when no drain is set (the adapters'
+    own default stands, pre-B3 behavior).
+    """
+    if drain_timeout_s is None:
+        return None
+    span = 0.0
+    if duration_s is not None:
+        span = float(duration_s)
+    elif num_arrivals and rate_qps:
+        span = float(num_arrivals) / float(rate_qps)
+    return float(drain_timeout_s) + span
 
 
 def adapter_timeout_kwargs(request_timeout_s: Optional[float]) -> Dict[str, Any]:
@@ -3066,9 +3121,23 @@ def run_experiment(
         _every_trial_ids: set = {
             str(i) for ids in (_manifest.get("trials") or {}).values() for i in ids
         }
-        _warmup_candidates: List[CAGExample] = [
-            ex for ex in pool if ex.id not in _every_trial_ids
-        ]
+        # Audit 2026-10-17 (G4): a v4 manifest records the whole-group reserve
+        # the builder set aside for this purpose; the candidates are then
+        # exactly the reserve (never a trial id), so the plan's count of them
+        # is the runner's universe. A manifest without a reserve keeps the
+        # pool remainder.
+        _reserve_ids: set = {
+            str(i) for i in ((_manifest.get("warmup_reserve") or {}).get("ids") or [])
+        }
+        if _reserve_ids:
+            _warmup_candidates: List[CAGExample] = [
+                ex for ex in pool
+                if ex.id in _reserve_ids and ex.id not in _every_trial_ids
+            ]
+            print(f"MANIFEST warm-up reserve: {len(_warmup_candidates)} candidates "
+                  f"(the manifest's warmup_reserve, G4)")
+        else:
+            _warmup_candidates = [ex for ex in pool if ex.id not in _every_trial_ids]
     else:
         # ADR-0102 (repair 2026-09-16): the measured set is the UNCHANGED
         # pre-ADR load, max_examples=num_queries (on QASPER that bounds
@@ -3221,6 +3290,29 @@ def run_experiment(
     _judged_on_prepared = _serves_retrieved and context_source != "gold"
     _warmup_cap_record: Optional[Dict[str, Any]] = None
     _warmup_fits: Optional[Callable[[CAGExample], bool]] = None
+    _cap_tokenizer: Any = None
+
+    def _prepared_prompt_tokens(meta: Dict[str, Any]) -> Optional[int]:
+        """Audit 2026-10-17 (G11): the prepared prompt length of a row whose
+        engine answer carried no usage (an error row: a drain cut, a timeout,
+        a dispatch failure), counted with the request cap's tokenizer and the
+        served prompt rule, so the own-accounting referee can integrate the
+        request's KV interval instead of dropping the window. None without a
+        tokenizer (the cap's tokenizer exists only when a request cap AND a
+        warm-up pool or a pre-load are registered; every S1 window cell has
+        both) or on a counting failure: a count, never a refusal."""
+        if _cap_tokenizer is None:
+            return None
+        try:
+            return int(
+                served_prompt_tokens(
+                    meta["question"], meta["used_contexts"],
+                    tokenizer=_cap_tokenizer, prompt_mode=_prompt_mode,
+                )
+            )
+        except Exception:  # noqa: BLE001 -- a provenance count, never a refusal
+            return None
+
     # L5: a capped pre-load is checked too, with or without a warm-up pool
     if request_cap_tokens is not None and (warmup_pool_queries > 0 or open_loop_preload_s > 0):
         if isinstance(request_cap_tokens, bool) or not isinstance(request_cap_tokens, int) or request_cap_tokens < 1:
@@ -3618,7 +3710,14 @@ def run_experiment(
     # so every path without a drain keeps the pre-B3 call byte-identical)
     _engine_kwargs: Dict[str, Any] = {"backend": backend, "use_offline": use_offline}
     if open_loop_drain_timeout_s is not None:
-        _engine_kwargs["request_timeout_s"] = open_loop_drain_timeout_s
+        # Audit 2026-10-17 (G28): the adapter must never cut a request before
+        # the drain does, so its timeout is the drain plus the window span
+        _engine_kwargs["request_timeout_s"] = adapter_request_timeout_s(
+            open_loop_drain_timeout_s,
+            rate_qps=open_loop_rate_qps,
+            num_arrivals=open_loop_num_arrivals,
+            duration_s=open_loop_duration_s,
+        )
     engine = setup_inference_engine(model, baseline_config, **_engine_kwargs)
     # S0F-88 U7: an SGLang null cached-token block reads as 0 only once the
     # server's cache report is verified on (GET /server_info). Review L1: a
@@ -4126,6 +4225,10 @@ def run_experiment(
             ),
             "num_tokens": response.num_tokens,
             "prompt_tokens": response.prompt_tokens,
+            # G11: the prepared length stands in for the absent usage of an error row
+            "prompt_tokens_prepared": (
+                _prepared_prompt_tokens(meta) if response.prompt_tokens is None else None
+            ),
             "cached_prompt_tokens": response.cached_prompt_tokens,
             "cached_prompt_ratio": cached_ratio,
             "mean_token_logprob": mean_token_logprob,
@@ -4586,6 +4689,8 @@ def run_experiment(
             n_prepared=len(prepared),
             n_arrivals=open_loop_num_arrivals,
             dropped_ids=dropped_prepare_ids,
+            # ADR-0172 (G1): an authorized replay schedules W over a smaller pool
+            replay_authorized=open_loop_replay_max is not None,
         )
 
         # S0F-88 U3: the steady-state pre-load, prepared before the clock like
@@ -4689,6 +4794,17 @@ def run_experiment(
                     "workload_mode": workload_mode,
                     "error": record.error
                     or ("dropped_by_cap" if record.dropped_by_cap else "no_response"),
+                    # G11: the prepared length (a cut request held its prompt's KV)
+                    "prompt_tokens_prepared": _prepared_prompt_tokens(meta),
+                    # G2: the ADR-0114 labels ride the stub for the predicate's check.
+                    # They live on the loader's example metadata (the completed-row
+                    # path reads the same dict), never on the prepare_example meta.
+                    "answer_type": (
+                        example.metadata if isinstance(example.metadata, dict) else {}
+                    ).get("answer_type"),
+                    "is_impossible": (
+                        example.metadata if isinstance(example.metadata, dict) else {}
+                    ).get("is_impossible"),
                 }
                 merge_open_loop_row(stub_row, record)
                 results.append(stub_row)
@@ -5567,6 +5683,9 @@ def run_experiment(
                         # B3 (ADR-0172): the bounds as requested; the applied
                         # drain and replay records ride to_manifest() above
                         "drain_timeout_s_requested": open_loop_drain_timeout_s,
+                        # G28 (2026-10-17): the adapters' request timeout, drain
+                        # plus the window span, so the cut accounting is auditable
+                        "adapter_request_timeout_s": _engine_kwargs.get("request_timeout_s"),
                         "replay_max_requested": open_loop_replay_max,
                         "max_in_flight": open_loop_max_in_flight,
                         # B-1: the client's open-file limits (every in-flight

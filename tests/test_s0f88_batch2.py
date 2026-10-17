@@ -630,7 +630,8 @@ def test_the_run_projection_sums_the_measured_table_and_lists_what_it_cannot_pro
         _step("vllm", "none", blocked="no launcher"),  # never runs, costs nothing
     ]
     rp = rc.run_projection(steps)
-    expect = 254.8 + 55.0 + (378.1 + 208.4) + (70.6 + 2 * 49.2) + 735.5 + 189.6
+    # G26 (2026-10-17): the prep is paid once per window (2 x 70.6 on the two-window step)
+    expect = 254.8 + 55.0 + (378.1 + 208.4) + 2 * (70.6 + 49.2) + 735.5 + 189.6
     assert rp["total_s"] == pytest.approx(expect, abs=0.2) and rp["unmeasured_steps"] == []
     # another query count scales linearly (an upper bound); an unmeasured
     # (engine, retriever) or engine is listed, never guessed

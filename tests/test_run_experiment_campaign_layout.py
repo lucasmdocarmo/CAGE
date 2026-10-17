@@ -212,7 +212,9 @@ def _run_cell(
     monkeypatch.setattr(
         runner,
         "setup_inference_engine",
-        lambda model, cfg, *, backend, use_offline=False, strict=True: engine_factory(model),
+        # **adapter_kwargs: the B3 drain (--drain-timeout-s) reaches the adapters as
+        # request_timeout_s through this seam (ADR-0172); the stub ignores it
+        lambda model, cfg, *, backend, use_offline=False, strict=True, **adapter_kwargs: engine_factory(model),
     )
     monkeypatch.setattr(runner, "get_loader", lambda ds, split=None, seed=0: loader_factory(ds))
     monkeypatch.setattr(runner, "start_http_server", lambda *a, **k: None)

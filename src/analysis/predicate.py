@@ -180,9 +180,11 @@ class PredicateConfig:
     """Explicit predicate configuration — no silent defaults on owned knobs.
 
     ``max_null_fraction`` is the per-window sanity bound on the fraction of
-    ``predicate = None`` rows: breaching it refuses the whole build (a run
-    whose predicate is mostly unscoreable must not quietly feed Y). It has NO
-    default — the caller states the bound.
+    ``predicate = None`` rows among the rows the serving side completed
+    (``ok`` rows; audit 2026-10-17, G22: not-ok rows are nulled by design and
+    excluded from the bound, the all-rows share stays reported): breaching it
+    refuses the whole build (a run whose predicate is mostly unscoreable must
+    not quietly feed Y). It has NO default: the caller states the bound.
 
     ``qasper_tau`` is the Instrument-A groundedness threshold for the Qasper
     branch. The registered value (τ* = 0.9955156950672646, rule
@@ -550,14 +552,24 @@ def compute_window_predicate(
     summary["verdict_column"] = column
     # ADR-0114: the per-clause column table (None on the single-column branch).
     summary["clause_columns"] = None if span_qa else dict(QASPER_CLAUSE_COLUMNS)
-    if summary["n_rows"] and summary["null_fraction"] > float(config.max_null_fraction):
+    # Audit 2026-10-17 (G22): the sanity bound judges the SCORING chain, so it
+    # reads the null share among the rows the serving side completed. A not-ok
+    # row (a drain cut, a dispatch error) is nulled by design and is serving
+    # data in its own right (attainment, D6 section 6.1); a past-cliff window
+    # whose error share exceeds the bound must not delete the predicate table.
+    # ``null_fraction`` (every row) stays reported beside it.
+    n_ok_rows = summary["n_rows"] - n_not_ok
+    n_null_ok = summary["n_null"] - n_not_ok
+    summary["n_ok_rows"] = n_ok_rows
+    summary["null_fraction_ok_rows"] = (n_null_ok / n_ok_rows) if n_ok_rows else 0.0
+    if n_ok_rows and summary["null_fraction_ok_rows"] > float(config.max_null_fraction):
         raise PredicateError(
-            f"{window}: predicate null fraction "
-            f"{summary['null_fraction']:.3f} ({summary['n_null']}/"
-            f"{summary['n_rows']}: {n_not_ok} not-ok nulled, "
-            f"{n_missing_verdict} missing verdict) breaches the configured "
-            f"sanity bound max_null_fraction={float(config.max_null_fraction)} "
-            "— a run whose predicate is mostly unscoreable must not feed Y; "
+            f"{window}: predicate null fraction among the completed rows "
+            f"{summary['null_fraction_ok_rows']:.3f} ({n_null_ok}/{n_ok_rows}: "
+            f"{n_missing_verdict} missing verdict; {n_not_ok} not-ok rows nulled "
+            "by design and excluded from the bound, G22) breaches the configured "
+            f"sanity bound max_null_fraction={float(config.max_null_fraction)}: "
+            "a run whose predicate is mostly unscoreable must not feed Y; "
             "fix the chain or re-state the bound deliberately"
         )
     return rows_out, summary

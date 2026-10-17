@@ -196,20 +196,24 @@ _INSTANCE_FIELD = "instance"
 #: (ADR-0172 item 6 ii, 2026-10-16).
 _REGIME_SCHEMA_VERSION = 2
 
-#: B17 (ADR-0172 item 6 ii, owner 2026-10-16): the stationarity label written
-#: beside the regime label. The second third of the measured span is compared
-#: with the third third on two signals: the KV occupancy time average
-#: (telemetry, certified per third by the same machinery as the whole window)
-#: and the median TTFT of the completed arrivals (requests.jsonl; the W16
-#: clock, ttft_from_scheduled_ms when finite else ttft_ms; a row's third is its
-#: arrival_s offset over the dispatch span, the span the window bounds cover).
-#: Both relative differences within STATIONARITY_BAND -> "stationary"; either
-#: outside -> "transient" (the analysis excludes transient windows from the
-#: in-regime aggregates); a third that cannot be certified, or that holds
-#: fewer than STATIONARITY_MIN_ROWS completed arrivals, -> "unknown" with the
-#: reasons (absence is evidence of neither). STATIONARITY_MIN_ROWS is this
-#: module's choice, recorded in every document: a median over one or two
-#: rows is one row's value.
+#: B17 (ADR-0172 item 6 ii, owner 2026-10-16; amended 2026-10-17, owner
+#: decision E19 option (b)): the stationarity label written beside the regime
+#: label. The second third of the measured span is compared with the third
+#: third. The LABEL reads one signal: the KV occupancy time average
+#: (telemetry, certified per third by the same machinery as the whole
+#: window); within STATIONARITY_BAND -> "stationary"; outside -> "transient"
+#: (the analysis excludes transient windows from the in-regime aggregates); a
+#: third that cannot be certified -> "unknown" with the reason (absence is
+#: evidence of neither). The median TTFT of the completed arrivals
+#: (requests.jsonl; the W16 clock, ttft_from_scheduled_ms when finite else
+#: ttft_ms; a row's third is its arrival_s offset over the span) is RECORDED
+#: with its relative difference and never labels: a queue that grows at
+#: lambda* is a rising TTFT by construction, and the registered 10 percent
+#: TTFT band read 105 of the 138 in-regime S0 windows transient (fresh review
+#: 2026-10-16). A third with fewer than STATIONARITY_MIN_ROWS completed
+#: arrivals records no TTFT median and the reason under ttft_ms.
+#: STATIONARITY_MIN_ROWS is this module's choice, recorded in every document:
+#: a median over one or two rows is one row's value.
 STATIONARITY_BAND: float = 0.10
 STATIONARITY_MIN_ROWS: int = 3
 STATIONARITY_ADR = "ADR-0172"
@@ -219,12 +223,15 @@ STATIONARITY_UNKNOWN = "unknown"
 _STATIONARITY_TTFT_FIELDS: tuple[str, ...] = ("ttft_from_scheduled_ms", "ttft_ms")
 _STATIONARITY_RULE = (
     "second vs third third of the span from t_start to the last arrival (the "
-    "window bounds when the rows carry no arrival_s): the KV occupancy time average "
-    "(telemetry) and the median TTFT of the completed arrivals (requests.jsonl, "
-    "W16 clock, placed by arrival_s over the span) both within the band -> "
-    "stationary; either outside -> transient; an uncertified third or fewer "
-    "than min_rows completed arrivals in a third -> unknown; a ratio against a "
-    "zero third third is written null"
+    "window bounds when the rows carry no arrival_s): the label reads the KV "
+    "occupancy time average (telemetry) alone: both thirds certified and within "
+    "the band -> stationary; outside -> transient; an uncertified third -> unknown. "
+    "The median TTFT of the completed arrivals (requests.jsonl, W16 clock, placed "
+    "by arrival_s over the span) is recorded with its relative difference and "
+    "never labels (ADR-0172 amendment 2026-10-17, E19: a queue growing at lambda* "
+    "is a rising TTFT by construction); fewer than min_rows completed arrivals in "
+    "a third -> no TTFT median, reason under ttft_ms; a ratio against a zero third "
+    "third is written null"
 )
 
 
@@ -1147,13 +1154,15 @@ def stationarity_record(
     t_end: float,
     certify: Callable[[float, float], float],
 ) -> dict[str, Any]:
-    """B17 (ADR-0172 item 6 ii): the stationarity record of one window.
+    """B17 (ADR-0172 item 6 ii; E19 amendment 2026-10-17): the stationarity
+    record of one window.
 
     ``certify(lo, hi)`` returns the KV occupancy time average over [lo, hi) on
     the telemetry clock or raises ``RegimeInputError`` (the window's own
     certification machinery, so a third is held to the same coverage and
-    sample rules as the whole window). The TTFT medians come from the
-    window's requests.jsonl. Pure on its inputs; never raises for a
+    sample rules as the whole window); the label reads that signal alone.
+    The TTFT medians come from the window's requests.jsonl and are recorded
+    beside it, never labeling. Pure on its inputs; never raises for a
     telemetry refusal (recorded as unknown with the reason).
     """
     window_dir = Path(window_dir)
@@ -1173,7 +1182,19 @@ def stationarity_record(
         "second": (float(t_start) + span / 3.0, float(t_start) + 2.0 * span / 3.0),
         "third": (float(t_start) + 2.0 * span / 3.0, float(t_start) + span),
     }
-    reasons: list[str] = list(ttft_reasons)
+    # the label's reasons: the KV signal only (E19 amendment); the TTFT side
+    # keeps its own reasons under ttft_ms, recorded, never labeling
+    reasons: list[str] = []
+    ttft_notes: list[str] = list(ttft_reasons)
+    if not arrivals:
+        # fresh review 2026-10-17 (MEDIUM 1): without arrival_s rows the thirds
+        # can only sit over the window bounds, which hold the service tail and
+        # the drain where the pool empties by construction; a KV label there
+        # would read an artifact's absence as a transient. Recorded, no label.
+        reasons.append(
+            "no arrival_s rows: the thirds would cover the window bounds (service tail "
+            "and drain included), so the KV signal cannot label"
+        )
     kv: dict[str, float | None] = {}
     for name, (lo, hi) in bounds.items():
         try:
@@ -1187,7 +1208,7 @@ def stationarity_record(
     if not ttft_reasons:
         for name, values in samples.items():
             if len(values) < STATIONARITY_MIN_ROWS:
-                reasons.append(
+                ttft_notes.append(
                     f"{len(values)} completed arrival(s) in the {name} third, fewer than "
                     f"{STATIONARITY_MIN_ROWS}: no TTFT median"
                 )
@@ -1203,9 +1224,9 @@ def stationarity_record(
         if ttft["second"] is not None and ttft["third"] is not None
         else None
     )
-    if reasons or rel_kv is None or rel_ttft is None:
+    if reasons or rel_kv is None:
         label = STATIONARITY_UNKNOWN
-    elif rel_kv <= STATIONARITY_BAND and rel_ttft <= STATIONARITY_BAND:
+    elif rel_kv <= STATIONARITY_BAND:
         label = STATIONARITY_STATIONARY
     else:
         label = STATIONARITY_TRANSIENT
@@ -1228,6 +1249,8 @@ def stationarity_record(
             "relative_difference": _finite_number(rel_ttft),
             "n_second": counts["second"],
             "n_third": counts["third"],
+            # recorded, never labeling (E19 amendment)
+            "reasons": ttft_notes,
         },
         "reasons": reasons,
     }

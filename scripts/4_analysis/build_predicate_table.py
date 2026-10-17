@@ -412,6 +412,13 @@ def build_predicate_table(
     totals["null_fraction"] = (
         totals["n_null"] / totals["n_rows"] if totals["n_rows"] else 0.0
     )
+    # G22 (2026-10-17): the share the per-window bound judges, over the
+    # completed rows (the not-ok rows are nulled by design, see predicate.py).
+    _n_ok = totals["n_rows"] - totals["n_not_ok_nulled"]
+    totals["n_ok_rows"] = _n_ok
+    totals["null_fraction_ok_rows"] = (
+        (totals["n_null"] - totals["n_not_ok_nulled"]) / _n_ok if _n_ok else 0.0
+    )
     manifest = {
         "schema_version": PREDICATE_SCHEMA_VERSION,
         "scoring_run_id": scoring_run_id,

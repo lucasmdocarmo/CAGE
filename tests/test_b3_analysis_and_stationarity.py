@@ -124,7 +124,9 @@ def test_stationarity_constants_and_record_shape(tmp_path: Path) -> None:
     }
     assert st["span_s"] == 90.0 and st["span_basis"] == "window bounds"  # last arrival at the bound
     assert set(st["kv"]) == {"second", "third", "relative_difference"}
-    assert set(st["ttft_ms"]) == {"second", "third", "relative_difference", "n_second", "n_third"}
+    assert set(st["ttft_ms"]) == {"second", "third", "relative_difference", "n_second", "n_third", "reasons"}
+    assert st["ttft_ms"]["reasons"] == []
+    assert "never labels" in st["rule"] and "E19" in st["rule"]
 
 
 def test_a_steady_window_reads_stationary(tmp_path: Path) -> None:
@@ -144,32 +146,37 @@ def test_a_kv_ramp_between_the_thirds_reads_transient(tmp_path: Path) -> None:
     assert st["ttft_ms"]["relative_difference"] == pytest.approx(5.0 / 105.0)
 
 
-def test_a_ttft_drift_between_the_thirds_reads_transient(tmp_path: Path) -> None:
+def test_a_ttft_drift_between_the_thirds_is_recorded_and_never_labels(tmp_path: Path) -> None:
+    # E19 amendment (owner 2026-10-17, option (b)): a queue growing at lambda*
+    # is a rising TTFT by construction (105 of 138 in-regime S0 windows read
+    # transient under the TTFT band); the drift is recorded, the label is KV's
     st = _dense_window(tmp_path, ttft=(100.0, 100.0, 150.0))["stationarity"]
-    assert st["label"] == "transient"
+    assert st["label"] == "stationary" and st["reasons"] == []
     assert st["ttft_ms"]["relative_difference"] == pytest.approx(50.0 / 150.0)
+    assert st["ttft_ms"]["second"] == 100.0 and st["ttft_ms"]["third"] == 150.0
     assert st["kv"]["relative_difference"] == pytest.approx(0.0)
 
 
-def test_the_band_is_inclusive(tmp_path: Path) -> None:
-    # 110 vs 100 is exactly 0.10: stationary; 111 vs 100 is 0.11: transient
-    assert _dense_window(tmp_path / "a", ttft=(100.0, 110.0, 100.0))["stationarity"]["label"] == "stationary"
-    assert _dense_window(tmp_path / "b", ttft=(100.0, 111.0, 100.0))["stationarity"]["label"] == "transient"
+def test_the_band_applies_to_the_kv_signal(tmp_path: Path) -> None:
+    # 0.85 vs 0.9 is 0.056: stationary; 0.75 vs 0.9 is 0.167: transient
+    assert _dense_window(tmp_path / "a", kv=(0.5, 0.85, 0.9))["stationarity"]["label"] == "stationary"
+    assert _dense_window(tmp_path / "b", kv=(0.5, 0.75, 0.9))["stationarity"]["label"] == "transient"
 
 
-def test_too_few_completed_arrivals_in_a_third_read_unknown(tmp_path: Path) -> None:
+def test_too_few_completed_arrivals_in_a_third_record_no_ttft_median(tmp_path: Path) -> None:
     st = _dense_window(tmp_path, rows_per_third=(10, 10, 2))["stationarity"]
-    assert st["label"] == "unknown"
+    # the label is KV's; the TTFT side records its own reason, never the label's
+    assert st["label"] == "stationary" and st["reasons"] == []
     assert st["ttft_ms"]["third"] is None and st["ttft_ms"]["n_third"] == 2
-    assert st["ttft_ms"]["second"] == 100.0
-    assert any("2 completed arrival(s) in the third third, fewer than 3" in r for r in st["reasons"])
-    # the KV side still reads: absence on one signal never fabricates the label
+    assert st["ttft_ms"]["second"] == 100.0 and st["ttft_ms"]["relative_difference"] is None
+    assert any("2 completed arrival(s) in the third third, fewer than 3" in r for r in st["ttft_ms"]["reasons"])
     assert st["kv"]["relative_difference"] == pytest.approx(0.0)
 
 
 def test_failed_arrivals_do_not_count_toward_a_median(tmp_path: Path) -> None:
     st = _dense_window(tmp_path, ok_per_third=(True, True, False))["stationarity"]
-    assert st["label"] == "unknown" and st["ttft_ms"]["n_third"] == 0
+    assert st["label"] == "stationary" and st["ttft_ms"]["n_third"] == 0
+    assert st["ttft_ms"]["third"] is None and st["ttft_ms"]["reasons"]
 
 
 def test_an_uncertified_third_reads_unknown_with_the_reason(tmp_path: Path) -> None:
@@ -221,7 +228,10 @@ def test_stationarity_record_is_pure_on_its_certifier(tmp_path: Path) -> None:
 
     rec = cl.stationarity_record(tmp_path, t_start=30.0, t_end=120.0, certify=certify)
     assert calls == [(60.0, 90.0), (90.0, 120.0)]
-    assert rec["label"] == "unknown"  # no completed arrivals: no TTFT medians
+    # fresh review 2026-10-17 (MEDIUM 1): with no arrival rows the thirds cover
+    # the window bounds, drain included, so the KV signal records but never labels
+    assert rec["label"] == "unknown" and any(r.startswith("no arrival_s rows") for r in rec["reasons"])
+    assert rec["ttft_ms"]["second"] is None and len(rec["ttft_ms"]["reasons"]) == 2
     assert rec["kv"]["second"] == 0.9 and rec["kv"]["relative_difference"] == 0.0
 
 
@@ -311,20 +321,23 @@ def test_first_pass_bound_is_derived_and_cross_checked(tmp_path: Path) -> None:
         rca.first_pass_record_index_max(rows, run_dir / "cells" / KEY / "window_qasper-01")
     run_dir, _ = _replayed_run(tmp_path / "none", recorded_bound=None)  # a pre-B3 window
     assert rca.first_pass_record_index_max(rows, run_dir / "cells" / KEY / "window_qasper-01") == 2
-    assert {"f1_score", "grounding_score", "predicate", "exact_match", "ruler_native_score"} <= rca.QUALITY_FIRST_PASS_COLUMNS
-    assert not {"ttft_ms", "tpot_ms", "latency_ms", "goodput_frac"} & rca.QUALITY_FIRST_PASS_COLUMNS
+    assert "E18" in rca.QUALITY_REPLAY_RULE and "every arrival" in rca.QUALITY_REPLAY_RULE
+    assert not hasattr(rca, "QUALITY_FIRST_PASS_COLUMNS")  # the first-pass drop is gone (E18)
 
 
-def test_loader_keeps_every_arrival_for_serving_and_the_first_pass_for_quality(tmp_path: Path) -> None:
+def test_loader_keeps_every_arrival_for_serving_and_for_quality(tmp_path: Path) -> None:
+    # E18 (ADR-0172 amendment 2026-10-17): the scoring pass gives every
+    # arrival a verdict (scored or inherited), so the loader averages the
+    # quality of both passes like the serving columns
     run_dir, index = _replayed_run(tmp_path)
     frame = rca.load_per_query(run_dir, index, {KEY})
     assert len(frame) == 3
     assert frame["ttft_ms"].tolist() == pytest.approx([200.0, 200.0, 200.0])  # both passes
-    assert frame["f1_score"].tolist() == [1.0, 1.0, 1.0]  # first pass only
-    assert frame["grounding_score"].tolist() == [1.0, 1.0, 1.0]
-    assert frame.attrs["replay_quality_rows_dropped"] == 6  # 3 f1 + 3 grounding
+    assert frame["f1_score"].tolist() == pytest.approx([0.5, 0.5, 0.5])  # both passes
+    assert frame["grounding_score"].tolist() == pytest.approx([0.5, 0.5, 0.5])
+    assert "replay_quality_rows_dropped" not in frame.attrs
     assert frame.attrs["replay_windows"] == 1
-    assert frame.attrs["quality_first_pass_rule"] == rca.QUALITY_FIRST_PASS_RULE
+    assert frame.attrs["quality_replay_rule"] == rca.QUALITY_REPLAY_RULE
 
 
 def test_loader_refuses_a_replay_record_that_contradicts_the_rows(tmp_path: Path) -> None:
@@ -333,21 +346,27 @@ def test_loader_refuses_a_replay_record_that_contradicts_the_rows(tmp_path: Path
         rca.load_per_query(run_dir, index, {KEY})
 
 
-def test_a_single_pass_window_drops_nothing(tmp_path: Path) -> None:
+def test_a_single_pass_window_counts_no_replay(tmp_path: Path) -> None:
     run_dir, index = _replayed_run(tmp_path, recorded_bound=2, passes=1)
     frame = rca.load_per_query(run_dir, index, {KEY})
-    assert frame.attrs["replay_quality_rows_dropped"] == 0 and frame.attrs["replay_windows"] == 0
+    assert frame.attrs["replay_windows"] == 0
     assert frame["f1_score"].tolist() == [1.0, 1.0, 1.0] and frame["ttft_ms"].tolist() == [100.0, 100.0, 100.0]
 
 
-def test_conditioned_curves_skip_replayed_trials_by_name(tmp_path: Path) -> None:
+def test_conditioned_curves_join_replayed_trials(tmp_path: Path) -> None:
+    # E18: a replayed arrival is a trial with its own (inherited or scored)
+    # verdict, so the curves join it; nothing is skipped under the old reason
     run_dir, index = _replayed_run(tmp_path)
     analysis_dir = tmp_path / "analysis"
     analysis_dir.mkdir()
     doc = rca.run_conditioned_curves_pass(run_dir, index, analysis_dir, "DESIGN-INPUT-ONLY", blinding_active=False)
     assert doc is not None
-    assert doc["quality_vs_evidence_position"]["skipped_trials"][REPLAY_REASON] == 3
-    assert doc["quality_vs_rho_own"]["replay_rule"] == rca.QUALITY_FIRST_PASS_RULE
+    skipped = doc["quality_vs_evidence_position"]["skipped_trials"]
+    assert REPLAY_REASON not in skipped
+    # this fixture's rows carry no gold position, so all 6 trials (both passes)
+    # reach the position bin and are skipped there, none as a replay
+    assert sum(skipped.values()) == 6
+    assert doc["quality_vs_rho_own"]["replay_rule"] == rca.QUALITY_REPLAY_RULE
     # the rho leg skips for want of own_accounting (no artifact in this run) on
     # the metric the request rows carry; grounding rides the evidence file here
     skips = {s["metric"]: s["reason"] for s in doc["quality_vs_rho_own"]["skips"]}

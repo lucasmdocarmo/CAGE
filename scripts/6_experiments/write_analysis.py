@@ -123,7 +123,9 @@ def section_header(landing: Path, run_root: Path, state: Dict[str, Any], out: Li
     if stamp is not None:
         stats = _read_json(stamp / "stats.json") or {}
         figures = stats.get("figures", []) if isinstance(stats, dict) else []
-        mode = stats.get("mode") or stats.get("analysis_mode") or "see stats.json"
+        # G34 (2026-10-17): the driver writes ``mode_stamp`` (DESIGN-INPUT-ONLY or
+        # CONFIRMATORY, run_campaign_analysis); the older keys stay as fallbacks.
+        mode = stats.get("mode_stamp") or stats.get("mode") or stats.get("analysis_mode") or "see stats.json"
         out.append(f"analysis: stamp {stamp.name}, mode {mode}, {len(figures)} figure record(s) (source: {_rel(stamp / 'stats.json', landing)})")
     else:
         out.append("analysis: absent (no analysis/<stamp>/stats.json)")

@@ -5,7 +5,8 @@ Objective: from the per-query paired F1 differences of the fp8 KV-cache arm (B10
            queries S1's fp8 cell needs to detect a mean F1 difference of 0.01, 0.02 and 0.05 at
            alpha 0.05 two-sided and power 0.80, and say whether the registered n ladder
            {2,000, 1,600, 1,200} covers it. Design input for the S1 registration only.
-Cloud:     local (the Mac or the conductor); reads a pulled landing's scoring pass only.
+Cloud:     local
+           (the Mac or the conductor; reads a pulled landing's scoring pass only)
 
 Methods, each named in the output (section 9.6: power is simulation-based; the registered
 per-query test is the paired Wilcoxon with Pratt zero handling, section 9.4):
