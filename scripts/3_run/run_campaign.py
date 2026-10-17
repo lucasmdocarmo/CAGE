@@ -714,16 +714,19 @@ SLO_FLOORS_ADR: str = "ADR-0117"
 #:   the pinned primary engine, family F1): 2,000 paired queries per dataset.
 #: - N_SECONDARY: secondary-only per-query F1 cells (MDE 0.10 at alpha/12): 800.
 #: - N_IDENTITY: TTFT-only, HF-oracle and T=0 identity cells: 300.
-#: - WINDOW_REQUESTS: loaded/window cells (F2, F3, RULER): W = 200 requests
-#:   per window; --num-queries IS the window pool size AND, since V3, the
-#:   window's --arrival-count (one arrival per prepared request: the open-loop
-#:   generator's replay guard refuses a schedule longer than the pool unless
-#:   CAGE_ALLOW_REPLAY=1 labels the run non-confirmatory, so a duration-bound
-#:   window at a real rate never ran).
+#: - WINDOW_REQUESTS: loaded/window cells (F2, F3, RULER): the window's
+#:   question POOL (--num-queries), the ids the window cycles through. B3
+#:   (ADR-0172 item 5, owner 2026-10-16): 2,000 for SQuAD v2, lowered per
+#:   dataset by achievable_n (Qasper 500, RULER 300 prompts per task) so the
+#:   fast classes stay under REPLAY_FACTOR_MAX passes over their pool; the
+#:   window's --arrival-count is W = ceil(rate_frac x lambda* x D_class)
+#:   (window_shape), no longer the pool. Before B3 the pool was 200 and the
+#:   arrival count equal to it, which gave 2 to 13 s bursts on the fast
+#:   classes (S0F-68).
 N_PRIMARY: int = 2000
 N_SECONDARY: int = 800
 N_IDENTITY: int = 300
-WINDOW_REQUESTS: int = 200
+WINDOW_REQUESTS: int = 2000
 #: A1: the primary predicate cells are pinned to ONE engine per group (the
 #: charter primary engine, vLLM) and to the #4 contrast pair B3 (corpus-reuse)
 #: vs B6 (retr-reuse ranked).
@@ -1444,7 +1447,161 @@ TELEMETRY_SAMPLE_INTERVAL_S: float = 0.25
 WINDOW_SPAN_FLOOR_S: float = PROBE_WARMUP_S
 WINDOW_SPAN_FINDING = "S0F-68"
 
+#: B3 (ADR-0172, owner 2026-10-16): a measured pressure window is a DURATION
+#: of arrivals, no longer a count of questions. D_class = PROBE_WARMUP_S (the
+#: transient) + WINDOW_REGIME_S (in regime) + L_class, where L_class is the
+#: section 6.1 SLO latency bound of the class at floor service
+#: (TTFT_SLO_MULTIPLIER x floor TTFT + TPOT_SLO_MULTIPLIER x floor TPOT x
+#: max_tokens): the time the last arrival needs to finish inside the window.
+#: On the S0 floors: 86 s for the Qasper classes, 106 s (vLLM) and 110 s
+#: (SGLang) for RULER. Arrivals W = ceil(rate_frac x lambda* x D_class). The
+#: pool (--num-queries) stays the registered per-row N, so a fast class
+#: replays its pool inside the window: the plan authorizes the runner up to
+#: REPLAY_FACTOR_MAX passes (serving metrics confirmatory on every arrival,
+#: quality on the first pass only) and refuses an executable window above
+#: it; a dress rehearsal (ADR-0144, never data) records the passes without
+#: refusing. DRAIN_TIMEOUT_S is the adapters' 300 s request timeout made
+#: explicit: the dispatcher cuts whatever is still open that long after the
+#: last arrival (recorded ok False) and the adapters take the same number.
+#: S0's worst completed latency was 139 s and the recorded 3 x L bound (46 s)
+#: sat 1.4 s above an in-regime window's tail at 1.05 lambda*
+#: [V MyDocs/RunPod/B3_WINDOW_DECISION_2026-10-16.md, Table 3].
+WINDOW_REGIME_S: float = 60.0
+DRAIN_TIMEOUT_S: float = 300.0
+REPLAY_FACTOR_MAX: int = 15
+#: The runner's --max-tokens default (scripts/3_run/run_experiment.py), the
+#: output length every non-RULER cell generates to; RULER cells carry
+#: RULER_OUTPUT_TOKENS on their argv.
+WINDOW_MAX_TOKENS: int = 256
+WINDOW_DESIGN_ADR = "ADR-0172"
+
 _PRESSURE_FAMILIES = frozenset({"F2", "F3"})
+
+
+def class_floor_latency_bound_s(floor_ttft_s: float, floor_tpot_s: float, max_tokens: int) -> float:
+    """L_class (ADR-0172 item 2): the section 6.1 relative SLO latency bound
+    at floor service, TTFT_SLO_MULTIPLIER x floor TTFT + TPOT_SLO_MULTIPLIER
+    x floor TPOT x max_tokens, read from goodput.py's two multipliers (the
+    one threshold source). Seconds."""
+    from src.analysis.goodput import TPOT_SLO_MULTIPLIER, TTFT_SLO_MULTIPLIER
+
+    for name, value in (("floor_ttft_s", floor_ttft_s), ("floor_tpot_s", floor_tpot_s)):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise PlanError(f"{name}={value!r} must be a finite number > 0 ({WINDOW_DESIGN_ADR})")
+    if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 1:
+        raise PlanError(f"max_tokens={max_tokens!r} must be an integer >= 1 ({WINDOW_DESIGN_ADR})")
+    return TTFT_SLO_MULTIPLIER * float(floor_ttft_s) + TPOT_SLO_MULTIPLIER * float(floor_tpot_s) * int(max_tokens)
+
+
+def window_shape(
+    *,
+    rate_frac: float,
+    lambda_star: float,
+    floor_ttft_s: float,
+    floor_tpot_s: float,
+    max_tokens: int,
+    pool: int,
+    floor_source: str,
+) -> Dict[str, Any]:
+    """The B3 window of one pressure cell (ADR-0172 items 1 to 3). Pure.
+
+    ``duration_s`` = ceil(PROBE_WARMUP_S + WINDOW_REGIME_S + L_class);
+    ``arrivals`` = ceil(rate_frac x lambda* x duration_s); ``passes`` =
+    ceil(arrivals / pool), 1 when the pool is never repeated. The record
+    carries every input, so load_plan re-derives it from the record alone.
+    """
+    for name, value in (("rate_frac", rate_frac), ("lambda_star", lambda_star)):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise PlanError(f"{name}={value!r} must be a finite number > 0 ({WINDOW_DESIGN_ADR})")
+    if isinstance(pool, bool) or not isinstance(pool, int) or pool < 1:
+        raise PlanError(f"pool={pool!r} must be an integer >= 1 ({WINDOW_DESIGN_ADR})")
+    latency_bound = class_floor_latency_bound_s(floor_ttft_s, floor_tpot_s, max_tokens)
+    duration = int(math.ceil(PROBE_WARMUP_S + WINDOW_REGIME_S + latency_bound))
+    arrivals = int(math.ceil(float(rate_frac) * float(lambda_star) * duration))
+    return {
+        "adr": WINDOW_DESIGN_ADR,
+        "rule": (
+            "duration_s = ceil(warmup_s + regime_s + latency_bound_s); arrivals = "
+            "ceil(rate_frac x lambda_star_rps x duration_s); passes = ceil(arrivals / pool)"
+        ),
+        "warmup_s": float(PROBE_WARMUP_S),
+        "regime_s": WINDOW_REGIME_S,
+        "floor_ttft_s": float(floor_ttft_s),
+        "floor_tpot_s": float(floor_tpot_s),
+        "floor_source": floor_source,
+        "max_tokens": int(max_tokens),
+        "latency_bound_s": latency_bound,
+        "duration_s": duration,
+        "arrivals": arrivals,
+        "pool": int(pool),
+        "passes": max(1, math.ceil(arrivals / int(pool))),
+        "replay_max": REPLAY_FACTOR_MAX,
+        "drain_timeout_s": DRAIN_TIMEOUT_S,
+    }
+
+
+def _window_shape_for(
+    spec: "CellSpec",
+    cell: "PlannedCell",
+    lambda_star: float,
+    pool: int,
+    slo_floors_env: Optional[str],
+    lambda_source: Optional[Mapping[str, Any]],
+    *,
+    blocked: bool,
+) -> Optional[Dict[str, Any]]:
+    """The window record of one pressure cell from the floor its class is
+    sized on: the engine floor of the manifest pin (ADR-0117) for the Qasper
+    classes, the RULER ladder's own floor for RULER (ADR-0169, ADR-0171 item
+    6). An executable cell without its floor refuses; a blocked cell (it
+    never runs) records None."""
+    floors = json.loads(slo_floors_env) if slo_floors_env else {}
+    engine_floor = floors.get(spec.engine) if isinstance(floors, dict) else None
+    if cell.dataset == "ruler":
+        floor: Any = (lambda_source or {}).get("ruler_floor")
+        source = "RULER ladder floor (rung calibration ruler_floor; ADR-0169, ADR-0171 item 6)"
+        max_tokens = RULER_OUTPUT_TOKENS
+        if not isinstance(floor, Mapping):
+            # an operator-started RULER ladder records no floor window; the
+            # engine floor stands in and the record says so (the window then
+            # sends about 20 s fewer arrivals than the instrument's own
+            # floor would size, never fewer than the transient plus 60 s)
+            floor = engine_floor
+            source = (
+                f"manifest slo_floors[{spec.engine}] (ADR-0117); the RULER ladder floor "
+                "is absent (operator start)"
+            )
+    else:
+        floor = engine_floor
+        source = f"manifest slo_floors[{spec.engine}] (ADR-0117)"
+        max_tokens = WINDOW_MAX_TOKENS
+    if not isinstance(floor, Mapping) or floor.get("ttft_s") is None or floor.get("tpot_s") is None:
+        if blocked:
+            return None
+        raise PlanError(
+            f"cell {spec.to_row_key()} is executable but has no {source} to size its "
+            f"window: D_class needs the class floor's ttft_s and tpot_s ({WINDOW_DESIGN_ADR})"
+        )
+    assert spec.rate_frac is not None
+    return window_shape(
+        rate_frac=float(spec.rate_frac),
+        lambda_star=float(lambda_star),
+        floor_ttft_s=float(floor["ttft_s"]),
+        floor_tpot_s=float(floor["tpot_s"]),
+        max_tokens=max_tokens,
+        pool=int(pool),
+        floor_source=source,
+    )
 
 
 class PlanError(ValueError):
@@ -2076,6 +2233,14 @@ SESSION_GRIDS: Dict[str, SessionGrid] = {
         corpus_prefix_budget_tokens=2800,
         corpus_trunc_budgets=(1400, 700),
         retr_trunc_kept_docs=1,
+        # B3 (ADR-0172 item 5): the per-dataset pools of the window cells.
+        # Qasper's dev split has 1,005 questions (303 in-corpus at the
+        # 2,800-token block budget on the 100x3 manifest), so its pool is 500
+        # per trial; RULER is generated, 300 prompts per task. Both lower the
+        # registered n for EVERY class of that dataset (DECISION.md A5: the
+        # dataset's split cannot supply the registered n). The manifests at
+        # these sizes are fix list item A4; stage 0 refuses until they exist.
+        achievable_n={"qasper": 500, "ruler": 300},
     ),
     # Session 'b' = charter §7.6 Group B (Llama-3.3-70B) + the Run-C-prime
     # DIST overlay (standing Plan-B scope, W4.6). Conservative pins where the
@@ -3050,7 +3215,17 @@ def run_projection(steps: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
                         scaled += 1
                     argv_ = step.get("argv") or []
                     preload = float(argv_[argv_.index("--open-loop-preload-s") + 1]) if "--open-loop-preload-s" in argv_ else 0.0
-                    secs = (cost[0] + cost[1] * windows) * scale + preload * windows
+                    window_rec = step.get("window")
+                    if isinstance(window_rec, dict):
+                        # B3 (ADR-0172): the window is a duration, so only the
+                        # preparation scales with the pool; each window costs
+                        # its pre-load, its duration and a tail of one class
+                        # latency bound (the last arrivals' service)
+                        secs = cost[0] * scale + windows * (
+                            preload + float(window_rec["duration_s"]) + float(window_rec["latency_bound_s"])
+                        )
+                    else:
+                        secs = (cost[0] + cost[1] * windows) * scale + preload * windows
         if secs is None:
             unmeasured.append(f"{kind} {step.get('row_key') or step.get('engine')}")
             continue
@@ -3096,7 +3271,21 @@ def window_span_summary(cell_steps: Sequence[Mapping[str, Any]]) -> Dict[str, An
     return {
         "finding": WINDOW_SPAN_FINDING,
         "adr": TWO_ANCHOR_ADR,
-        "rule": "span_s = num_queries / offered_rate_rps (V3: W arrivals, one per prepared request)",
+        "rule": (
+            "span_s = window_arrivals / offered_rate_rps (B3, ADR-0172: W = ceil(rate_frac x "
+            "lambda* x D_class), so the span is the class duration rounded up by the ceil)"
+        ),
+        "durations_s": sorted({
+            int(s["window"]["duration_s"]) for s in cell_steps
+            if s.get("family") in _PRESSURE_FAMILIES and s.get("blocked_on") is None
+            and isinstance(s.get("window"), dict)
+        }),
+        "passes_max": max(
+            (int(s["window"]["passes"]) for s in cell_steps
+             if s.get("family") in _PRESSURE_FAMILIES and s.get("blocked_on") is None
+             and isinstance(s.get("window"), dict)),
+            default=None,
+        ),
         "floor_s": WINDOW_SPAN_FLOOR_S,
         "floor_basis": "PROBE_WARMUP_S, the registered warm-up transient: a shorter window is all ramp",
         "sampler_interval_s": TELEMETRY_SAMPLE_INTERVAL_S,
@@ -3107,9 +3296,10 @@ def window_span_summary(cell_steps: Sequence[Mapping[str, Any]]) -> Dict[str, An
         "max_s": values[-1] if values else None,
         "by_class": dict(sorted(by_class.items(), key=lambda kv: -int(kv[0]))),
         "note": (
-            "a count, never a refusal: W is the registered per-row N (DECISION.md A1); "
-            "the dry window (75 s) is the live regime proof per serving configuration; "
-            "raising W, or a duration bound with replay, is the owner's decision"
+            "a count, never a refusal: since ADR-0172 the span is the registered class "
+            "duration (warm-up transient + 60 s in regime + the class latency bound), so no "
+            "window sits below the floor by construction; the dry window (75 s) stays the "
+            "live regime proof per serving configuration"
         ),
     }
 
@@ -4245,6 +4435,7 @@ def _stale_plan_problems(
     per_row_n: Optional[Mapping[str, Any]] = None,
     retrieval: Optional[Mapping[str, Any]] = None,
     slo_floors_env: Any = _UNCHECKED,
+    rehearsal: bool = False,
 ) -> List[str]:
     """load_plan's fail-closed per-cell check against EVERY stale plan shape
     today's ADRs fail-close against (v4; one clause per ADR). A stale plan
@@ -4463,17 +4654,80 @@ def _stale_plan_problems(
                     f"{label}: pressure cell {row!r} carries --rate {got_rate!r}, the offered "
                     f"rate is {want_offered:.6g} ({RUNG_CALIBRATION_ADR})" + stale
                 )
+            # B3 (ADR-0172): the window record re-derives from its own inputs
+            # and the cell's rate; an executable cell needs one, and its
+            # passes stay under the ceiling on a registered (non-rehearsal) plan.
+            window = step.get("window")
+            got_n = step.get("num_queries")
+            if step.get("blocked_on") is None and not isinstance(window, dict):
+                problems.append(
+                    f"{label}: pressure cell {row!r} carries no window record "
+                    f"({WINDOW_DESIGN_ADR}: D_class, arrivals and passes)" + stale
+                )
+            elif isinstance(window, dict) and isinstance(got_n, int) and not isinstance(got_n, bool):
+                try:
+                    want_window = window_shape(
+                        rate_frac=float(spec.rate_frac or 0.0),
+                        lambda_star=float(lambda_star),
+                        floor_ttft_s=window.get("floor_ttft_s"),
+                        floor_tpot_s=window.get("floor_tpot_s"),
+                        max_tokens=window.get("max_tokens"),
+                        pool=got_n,
+                        floor_source=str(window.get("floor_source")),
+                    )
+                except PlanError as exc:
+                    problems.append(f"{label}: pressure cell {row!r} window record is malformed: {exc}" + stale)
+                else:
+                    if want_window != window:
+                        problems.append(
+                            f"{label}: pressure cell {row!r} window record does not re-derive: "
+                            f"recorded duration {window.get('duration_s')!r} s, {window.get('arrivals')!r} "
+                            f"arrivals, {window.get('passes')!r} passes; derived {want_window['duration_s']} s, "
+                            f"{want_window['arrivals']} arrivals, {want_window['passes']} passes "
+                            f"({WINDOW_DESIGN_ADR})" + stale
+                        )
+                    if step.get("window_arrivals") != want_window["arrivals"]:
+                        problems.append(
+                            f"{label}: pressure cell {row!r} window_arrivals={step.get('window_arrivals')!r} "
+                            f"!= the window's {want_window['arrivals']} ({WINDOW_DESIGN_ADR})" + stale
+                        )
+                    # Fresh review 2026-10-16 (MEDIUM): a record sized on the
+                    # manifest floor must carry the plan's own floor pin, never a
+                    # floor of its own (a plan built on older floors would load)
+                    if isinstance(slo_floors_env, str) and str(window.get("floor_source", "")).startswith(
+                        "manifest slo_floors"
+                    ):
+                        pinned = (json.loads(slo_floors_env) or {}).get(spec.engine) or {}
+                        if (pinned.get("ttft_s"), pinned.get("tpot_s")) != (
+                            window.get("floor_ttft_s"), window.get("floor_tpot_s")
+                        ):
+                            problems.append(
+                                f"{label}: pressure cell {row!r} window record floors "
+                                f"({window.get('floor_ttft_s')!r}, {window.get('floor_tpot_s')!r}) differ from "
+                                f"the plan's {SLO_FLOORS_ENV} pin for {spec.engine} "
+                                f"({pinned.get('ttft_s')!r}, {pinned.get('tpot_s')!r}) ({WINDOW_DESIGN_ADR})" + stale
+                            )
+                    if (
+                        not rehearsal
+                        and step.get("blocked_on") is None
+                        and want_window["passes"] > REPLAY_FACTOR_MAX
+                    ):
+                        problems.append(
+                            f"{label}: pressure cell {row!r} needs {want_window['passes']} passes over "
+                            f"its pool of {got_n}, above the registered ceiling of {REPLAY_FACTOR_MAX} "
+                            f"({WINDOW_DESIGN_ADR})" + stale
+                        )
             # ADR-0156 / S0F-68: every pressure cell records W / offered rate
             # and its floor verdict (a blocked cell on its labeled rate too),
-            # so both are re-derived here.
+            # so both are re-derived here (W = window_arrivals since B3).
             got_span = step.get("window_span_s_expected")
-            got_n = step.get("num_queries")
-            if isinstance(got_n, int) and not isinstance(got_n, bool) and want_offered > 0:
-                want_span = got_n / want_offered
+            got_w = step.get("window_arrivals")
+            if isinstance(got_w, int) and not isinstance(got_w, bool) and want_offered > 0:
+                want_span = got_w / want_offered
                 if not isinstance(got_span, (int, float)) or isinstance(got_span, bool) or not math.isclose(float(got_span), want_span, rel_tol=1e-6):
                     problems.append(
                         f"{label}: pressure cell {row!r} window_span_s_expected={got_span!r} != "
-                        f"num_queries / offered rate = {want_span:.4g} s ({WINDOW_SPAN_FINDING})" + stale
+                        f"window_arrivals / offered rate = {want_span:.4g} s ({WINDOW_SPAN_FINDING})" + stale
                     )
                 if step.get("window_span_below_floor") is not bool(want_span < WINDOW_SPAN_FLOOR_S):
                     problems.append(
@@ -4528,20 +4782,32 @@ def _stale_plan_problems(
                 f"({WINDOW_BOUND_FINDING}: W requests issued per window, one per "
                 "prepared request)" + stale
             )
-        elif got_arrivals != str(step.get("num_queries")):
+        elif got_arrivals != str(step.get("window_arrivals")):
             problems.append(
                 f"{label}: window cell {row!r} carries --arrival-count "
-                f"{got_arrivals!r} but its pool (--num-queries) is "
-                f"{step.get('num_queries')!r} ({WINDOW_BOUND_FINDING}: arrivals "
-                "beyond the pool replay; fewer under-measure the window)" + stale
+                f"{got_arrivals!r} but its window needs {step.get('window_arrivals')!r} "
+                f"arrivals ({WINDOW_DESIGN_ADR}: W = ceil(rate_frac x lambda* x D_class); "
+                f"the pool (--num-queries) is {step.get('num_queries')!r})" + stale
             )
+        # B3 (ADR-0172 items 1 and 3): every window cell carries the replay
+        # authorization and the drain bound at their registered values.
+        for flag, want in (
+            ("--window-replay-max", str(REPLAY_FACTOR_MAX)),
+            ("--drain-timeout-s", f"{DRAIN_TIMEOUT_S:g}"),
+        ):
+            got = _argv_flag_value(argv, flag)
+            if got != want:
+                problems.append(
+                    f"{label}: window cell {row!r} carries {flag} {got!r}, the registered "
+                    f"value is {want!r} ({WINDOW_DESIGN_ADR})" + stale
+                )
     else:
-        for flag in ("--arrival-count", "--duration-s"):
+        for flag in ("--arrival-count", "--duration-s", "--window-replay-max", "--drain-timeout-s"):
             if flag in argv:
                 problems.append(
                     f"{label}: cell {row!r} (family {spec.family!r}) carries {flag} "
-                    f"({WINDOW_BOUND_FINDING}: the window bound rides window cells "
-                    "only)" + stale
+                    f"({WINDOW_BOUND_FINDING}, {WINDOW_DESIGN_ADR}: the window bounds ride "
+                    "window cells only)" + stale
                 )
     # S0F-88 U3: every pressure cell carries the registered steady-state
     # pre-load before its measured arrivals; no other cell carries one.
@@ -4827,12 +5093,15 @@ def _cell_step(
     budget_plan: Optional[Dict[str, Any]] = None,
     rungs: Optional[Mapping[str, "RungCalibration"]] = None,
     ladder: bool = False,
+    replay_ceiling: Optional[int] = REPLAY_FACTOR_MAX,
 ) -> Dict[str, Any]:
     """One cell step. ``rungs`` maps engine -> its RungCalibration (ADR-0154):
     an executable pressure cell offers rate_frac x lambda*(engine, r) from it,
     scaled to its demand class (ADR-0155); ``ladder=True`` builds the
     calibrate-rungs ladder cell instead (rate and arrivals are placeholders
-    the ladder sets per step, so no lambda* is needed)."""
+    the ladder sets per step, so no lambda* is needed). ``replay_ceiling``
+    (B3, ADR-0172): the most passes over its pool an executable window may
+    need; None records the passes without refusing (a dress rehearsal)."""
     spec = cell.spec
     argv = list(runner_cmd) + [
         "--baseline",
@@ -4922,6 +5191,9 @@ def _cell_step(
         )
     offered_rate: Optional[float] = None
     window_span: Optional[float] = None
+    # B3 (ADR-0172): the window record and its arrival count (pressure cells)
+    window: Optional[Dict[str, Any]] = None
+    window_arrivals: Optional[int] = None
     lambda_star: Optional[float] = None
     lambda_source: Optional[Dict[str, Any]] = None
     rate_basis: Optional[str] = None
@@ -5031,11 +5303,32 @@ def _cell_step(
                         ),
                     }
             offered_rate = spec.rate_frac * lambda_star
-            # V3: the window is W arrivals, one per prepared request (the
-            # --num-queries above), never a duration: the open-loop generator's
-            # replay guard refuses a schedule longer than the pool, and a
-            # duration-bound window at a real rate always was. The pre-costed
-            # window_duration_s stays in the header as the cost estimate only.
+            # B3 (ADR-0172): the window is D_class seconds of arrivals at the
+            # offered rate (window_shape), still bounded by --arrival-count
+            # (V3: the count form keeps the pre-load path); the pool stays
+            # --num-queries and the plan authorizes the runner to replay it up
+            # to REPLAY_FACTOR_MAX passes, recorded. An executable window
+            # above the ceiling refuses; a blocked cell records the shape it
+            # would need (None when its floor is unavailable, it never runs).
+            window = _window_shape_for(
+                spec, cell, lambda_star, num_queries, slo_floors_env, lambda_source,
+                blocked=cell.blocked_on is not None,
+            )
+            if (
+                window is not None
+                and replay_ceiling is not None
+                and cell.blocked_on is None
+                and window["passes"] > replay_ceiling
+            ):
+                raise PlanError(
+                    f"cell {spec.to_row_key()} needs {window['arrivals']} arrivals over a pool of "
+                    f"{num_queries} ({window['passes']} passes) for its {window['duration_s']} s "
+                    f"window at {offered_rate:.4g} rps, above the registered ceiling of "
+                    f"{replay_ceiling} passes ({WINDOW_DESIGN_ADR}); register a manifest with at "
+                    f"least {math.ceil(window['arrivals'] / replay_ceiling)} ids per trial for "
+                    f"{cell.dataset} (SessionGrid.achievable_n, fix list A4)"
+                )
+            window_arrivals = num_queries if window is None else int(window["arrivals"])
             argv += [
                 "--workload-mode",
                 "open_loop",
@@ -5045,11 +5338,17 @@ def _cell_step(
                 "--open-loop-preload-s",
                 f"{PRESSURE_PRELOAD_S:g}",
                 "--arrival-count",
-                str(num_queries),
+                str(window_arrivals),
+                # B3 (ADR-0172 items 1 and 3): the replay authorization and the drain
+                "--window-replay-max",
+                str(REPLAY_FACTOR_MAX),
+                "--drain-timeout-s",
+                f"{DRAIN_TIMEOUT_S:g}",
             ]
-            # ADR-0156 / S0F-68: the span this W-arrival window is expected to
-            # cover at its offered rate, recorded beside the floor verdict.
-            window_span = num_queries / offered_rate
+            # ADR-0156 / S0F-68: the span this window is expected to cover at
+            # its offered rate (the class duration, rounded up by the ceil of
+            # the arrivals), recorded beside the floor verdict.
+            window_span = window_arrivals / offered_rate
     env = _cell_identity_env(spec)
     if lambda_source is not None and lambda_source.get("kv_ceiling") is not None:
         # S0F-88 B-11: campaign_session reads it for regime clause (a);
@@ -5142,6 +5441,11 @@ def _cell_step(
         # whether it sits below WINDOW_SPAN_FLOOR_S (null when no span).
         "window_span_s_expected": window_span,
         "window_span_below_floor": None if window_span is None else bool(window_span < WINDOW_SPAN_FLOOR_S),
+        # B3 (ADR-0172): the duration window of a pressure cell (window_shape)
+        # and its arrival count (null elsewhere; null on a blocked cell whose
+        # floor is unavailable).
+        "window": window,
+        "window_arrivals": window_arrivals,
         # ADR-0155: the demand class (served sequence tokens) of a budgeted cell.
         "demand_class": demand_class,
         # Batch 2 W4: the record of the relaunch this cell runs under (the
@@ -6196,6 +6500,11 @@ def _dry_window_step(cell_step: Mapping[str, Any], spec: CellSpec) -> Dict[str, 
     # bound is a WINDOW CELL contract; the dry window is a gate, never data.
     at = argv.index("--arrival-count")
     del argv[at:at + 2]
+    if "--window-replay-max" in argv:
+        # B3 (ADR-0172): the pass ceiling is a window cell's contract; the
+        # gate replays under CAGE_ALLOW_REPLAY=1 as before (the drain stays)
+        at = argv.index("--window-replay-max")
+        del argv[at:at + 2]
     if "--open-loop-preload-s" in argv:
         # S0F-88 U3: the gate is a 75 s replayed window; the pre-load serves
         # the W-arrival cells only
@@ -6493,6 +6802,9 @@ def build_plan(
             slo_floors_env=slo_floors_env,
             budget_plan=budget_plan,
             rungs=rung_table,
+            # B3: a dress rehearsal (ADR-0144) is never data, so it records
+            # the passes over its small pool without the ceiling's refusal
+            replay_ceiling=REPLAY_FACTOR_MAX if rehearsal is None else None,
         )
         # ADR-0153: the first executable pressure cell of each (engine,
         # demand class) is preceded by that pair's dry window. Budgets sort
@@ -6714,6 +7026,24 @@ def build_plan(
         # windows (W / offered rate) against the registered floor; a count the
         # operator reads before the GO, never a refusal (W is registered).
         "window_spans": window_spans,
+        # B3 (ADR-0172): the registered window design every pressure cell's
+        # ``window`` record is derived from (window_shape).
+        "window_design": {
+            "adr": WINDOW_DESIGN_ADR,
+            "warmup_s": float(PROBE_WARMUP_S),
+            "regime_s": WINDOW_REGIME_S,
+            "latency_bound_rule": (
+                "TTFT_SLO_MULTIPLIER x floor TTFT + TPOT_SLO_MULTIPLIER x floor TPOT x max_tokens "
+                "(goodput.py), the engine floor of the manifest, the RULER ladder floor for RULER"
+            ),
+            "max_tokens": WINDOW_MAX_TOKENS,
+            "ruler_max_tokens": RULER_OUTPUT_TOKENS,
+            "drain_timeout_s": DRAIN_TIMEOUT_S,
+            "replay_factor_max": REPLAY_FACTOR_MAX,
+            "replay_ceiling_enforced": rehearsal is None,
+            "quality_rows": "first pass only (record_index <= first_pass_record_index_max)",
+            "serving_rows": "every arrival",
+        },
         # S0F-88 B-5: the measured projection the master compares with HOURS.
         "run_projection": run_projection(steps),
         # §6.4 anchor fine grid registration (null on non-anchor sessions).
@@ -7377,6 +7707,18 @@ def load_plan(path: Path) -> Dict[str, Any]:
                     f"{label}: dry window runs in duration mode for {DRY_WINDOW_DURATION_S:g} s "
                     f"(no --arrival-count, no warm-up flag) ({DRY_WINDOW_ADR})"
                 )
+            # B3 (ADR-0172 item 3; fresh review 2026-10-16 LOW): the dry window
+            # keeps the drain bound and never carries the pass ceiling
+            if isinstance(step["argv"], list) and (
+                _argv_flag_value(step["argv"], "--drain-timeout-s") != f"{DRAIN_TIMEOUT_S:g}"
+                or "--window-replay-max" in step["argv"]
+            ):
+                problems.append(
+                    f"{label}: dry window carries --drain-timeout-s "
+                    f"{_argv_flag_value(step['argv'], '--drain-timeout-s')!r} (registered "
+                    f"{DRAIN_TIMEOUT_S:g}) or the pass ceiling, which rides window cells only "
+                    f"({WINDOW_DESIGN_ADR})"
+                )
             if isinstance(step["env"], dict) and step["env"].get(LADDER_REPLAY_ENV) != "1":
                 problems.append(
                     f"{label}: dry window carries no {LADDER_REPLAY_ENV}=1 (its duration window "
@@ -7421,6 +7763,8 @@ def load_plan(path: Path) -> Dict[str, Any]:
                     per_row_n=per_row_n,
                     retrieval=retrieval_knobs,
                     slo_floors_env=slo_floors_env,
+                    # B3: a dress rehearsal records its passes without the ceiling
+                    rehearsal=plan.get("rehearsal") is not None,
                 )
             )
     if problems:

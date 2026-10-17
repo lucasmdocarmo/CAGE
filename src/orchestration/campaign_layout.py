@@ -47,6 +47,7 @@ import json
 import math
 import os
 import re
+import statistics
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -80,10 +81,13 @@ __all__ = [
     "QA_EVIDENCE_EXEMPT_DATASETS",
     "RUN_ID_RE",
     "SESSIONS",
+    "STATIONARITY_BAND",
+    "STATIONARITY_MIN_ROWS",
     "WINDOW_DIR_RE",
     "WindowHandle",
     "load_telemetry_series",
     "seal_run",
+    "stationarity_record",
     "write_manifest",
     "write_window_regime",
 ]
@@ -188,8 +192,40 @@ _INSTANCE_FIELD = "instance"
 #: top-level ``max_hold_s`` (Q-8; when a number, ``inputs.coverage`` counts a
 #: sample's hold only up to it), ``kv_ceiling``/``clause_a_rule`` on a
 #: refused window too (null rule), and ``inputs.longest_hold_s`` and
-#: ``inputs.hold_excess_s`` (review L9).
+#: ``inputs.hold_excess_s`` (review L9), and the B17 ``stationarity`` record
+#: (ADR-0172 item 6 ii, 2026-10-16).
 _REGIME_SCHEMA_VERSION = 2
+
+#: B17 (ADR-0172 item 6 ii, owner 2026-10-16): the stationarity label written
+#: beside the regime label. The second third of the measured span is compared
+#: with the third third on two signals: the KV occupancy time average
+#: (telemetry, certified per third by the same machinery as the whole window)
+#: and the median TTFT of the completed arrivals (requests.jsonl; the W16
+#: clock, ttft_from_scheduled_ms when finite else ttft_ms; a row's third is its
+#: arrival_s offset over the dispatch span, the span the window bounds cover).
+#: Both relative differences within STATIONARITY_BAND -> "stationary"; either
+#: outside -> "transient" (the analysis excludes transient windows from the
+#: in-regime aggregates); a third that cannot be certified, or that holds
+#: fewer than STATIONARITY_MIN_ROWS completed arrivals, -> "unknown" with the
+#: reasons (absence is evidence of neither). STATIONARITY_MIN_ROWS is this
+#: module's choice, recorded in every document: a median over one or two
+#: rows is one row's value.
+STATIONARITY_BAND: float = 0.10
+STATIONARITY_MIN_ROWS: int = 3
+STATIONARITY_ADR = "ADR-0172"
+STATIONARITY_STATIONARY = "stationary"
+STATIONARITY_TRANSIENT = "transient"
+STATIONARITY_UNKNOWN = "unknown"
+_STATIONARITY_TTFT_FIELDS: tuple[str, ...] = ("ttft_from_scheduled_ms", "ttft_ms")
+_STATIONARITY_RULE = (
+    "second vs third third of the span from t_start to the last arrival (the "
+    "window bounds when the rows carry no arrival_s): the KV occupancy time average "
+    "(telemetry) and the median TTFT of the completed arrivals (requests.jsonl, "
+    "W16 clock, placed by arrival_s over the span) both within the band -> "
+    "stationary; either outside -> transient; an uncertified third or fewer "
+    "than min_rows completed arrivals in a third -> unknown; a ratio against a "
+    "zero third third is written null"
+)
 
 
 class CampaignLayoutError(RuntimeError):
@@ -1043,6 +1079,160 @@ def _clause_a_record(queued_median: float | None, kv_ceiling: float | None) -> d
     return {"kv_ceiling": kv_ceiling, "clause_a_rule": rule}
 
 
+def _finite_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(float(value)) else None
+
+
+def _relative_difference(second: float, third: float) -> float:
+    """|second - third| / |third|; inf when only the third third reads zero."""
+    if third == 0.0:
+        return 0.0 if second == 0.0 else math.inf
+    return abs(second - third) / abs(third)
+
+
+def _read_arrivals(window_dir: Path) -> tuple[list[tuple[float, float | None]], list[str]]:
+    """(arrival_s, TTFT ms on the W16 clock or None) per row of requests.jsonl
+    that carries a finite ``arrival_s``; the TTFT is kept for completed rows
+    only. The reasons name an absent file. A corrupt row is a writer bug and
+    raises."""
+    path = window_dir / "requests.jsonl"
+    if not path.is_file():
+        return [], ["requests.jsonl absent: no TTFT medians"]
+    out: list[tuple[float, float | None]] = []
+    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise CampaignLayoutError(f"{path.name}:{lineno}: invalid JSON: {exc}") from exc
+        if not isinstance(row, dict):
+            continue
+        arrival = _finite_number(row.get("arrival_s"))
+        if arrival is None:
+            continue
+        ttft: float | None = None
+        if row.get("ok") is True:
+            ttft = next(
+                (v for v in (_finite_number(row.get(f)) for f in _STATIONARITY_TTFT_FIELDS) if v is not None),
+                None,
+            )
+        out.append((arrival, ttft))
+    return out, []
+
+
+def _completed_ttft_by_third(
+    arrivals: list[tuple[float, float | None]], span: float
+) -> dict[str, list[float]]:
+    """TTFT (ms) of the completed arrivals in the second and third thirds of
+    ``span``, placed by their arrival offset; the end of the span belongs to
+    the third third."""
+    samples: dict[str, list[float]] = {"second": [], "third": []}
+    bounds = {"second": (span / 3.0, 2.0 * span / 3.0), "third": (2.0 * span / 3.0, span)}
+    for arrival, ttft in arrivals:
+        if ttft is None:
+            continue
+        for name, (lo, hi) in bounds.items():
+            if lo <= arrival < hi or (name == "third" and arrival == hi):
+                samples[name].append(ttft)
+    return samples
+
+
+def stationarity_record(
+    window_dir: Path,
+    *,
+    t_start: float,
+    t_end: float,
+    certify: Callable[[float, float], float],
+) -> dict[str, Any]:
+    """B17 (ADR-0172 item 6 ii): the stationarity record of one window.
+
+    ``certify(lo, hi)`` returns the KV occupancy time average over [lo, hi) on
+    the telemetry clock or raises ``RegimeInputError`` (the window's own
+    certification machinery, so a third is held to the same coverage and
+    sample rules as the whole window). The TTFT medians come from the
+    window's requests.jsonl. Pure on its inputs; never raises for a
+    telemetry refusal (recorded as unknown with the reason).
+    """
+    window_dir = Path(window_dir)
+    window_span = float(t_end) - float(t_start)
+    arrivals, ttft_reasons = _read_arrivals(window_dir)
+    # The span under test ends at the LAST ARRIVAL when the rows carry one:
+    # the window bounds also hold the service tail after the last arrival
+    # (and, since ADR-0172, up to the 300 s drain), during which the queue
+    # empties by construction; a third placed there would read every window
+    # transient. Without arrivals (closed loop) the window bounds stand.
+    last_arrival = max((a for a, _ in arrivals), default=None)
+    if last_arrival is not None and 0.0 < last_arrival < window_span:
+        span, span_basis = float(last_arrival), "last arrival_s"
+    else:
+        span, span_basis = window_span, "window bounds"
+    bounds = {
+        "second": (float(t_start) + span / 3.0, float(t_start) + 2.0 * span / 3.0),
+        "third": (float(t_start) + 2.0 * span / 3.0, float(t_start) + span),
+    }
+    reasons: list[str] = list(ttft_reasons)
+    kv: dict[str, float | None] = {}
+    for name, (lo, hi) in bounds.items():
+        try:
+            kv[name] = float(certify(lo, hi))
+        except RegimeInputError as exc:
+            kv[name] = None
+            reasons.append(f"KV occupancy of the {name} third not certified: {exc}")
+    samples = _completed_ttft_by_third(arrivals, span)
+    ttft: dict[str, float | None] = {"second": None, "third": None}
+    counts = {name: len(values) for name, values in samples.items()}
+    if not ttft_reasons:
+        for name, values in samples.items():
+            if len(values) < STATIONARITY_MIN_ROWS:
+                reasons.append(
+                    f"{len(values)} completed arrival(s) in the {name} third, fewer than "
+                    f"{STATIONARITY_MIN_ROWS}: no TTFT median"
+                )
+            else:
+                ttft[name] = float(statistics.median(values))
+    rel_kv = (
+        _relative_difference(kv["second"], kv["third"])
+        if kv["second"] is not None and kv["third"] is not None
+        else None
+    )
+    rel_ttft = (
+        _relative_difference(ttft["second"], ttft["third"])
+        if ttft["second"] is not None and ttft["third"] is not None
+        else None
+    )
+    if reasons or rel_kv is None or rel_ttft is None:
+        label = STATIONARITY_UNKNOWN
+    elif rel_kv <= STATIONARITY_BAND and rel_ttft <= STATIONARITY_BAND:
+        label = STATIONARITY_STATIONARY
+    else:
+        label = STATIONARITY_TRANSIENT
+    return {
+        "adr": STATIONARITY_ADR,
+        "rule": _STATIONARITY_RULE,
+        "band": STATIONARITY_BAND,
+        "min_rows": STATIONARITY_MIN_ROWS,
+        "label": label,
+        "span_s": span,
+        "span_basis": span_basis,
+        "kv": {
+            "second": kv["second"],
+            "third": kv["third"],
+            "relative_difference": _finite_number(rel_kv),
+        },
+        "ttft_ms": {
+            "second": ttft["second"],
+            "third": ttft["third"],
+            "relative_difference": _finite_number(rel_ttft),
+            "n_second": counts["second"],
+            "n_third": counts["third"],
+        },
+        "reasons": reasons,
+    }
+
+
 def write_window_regime(
     window_dir: Path,
     *,
@@ -1215,6 +1405,16 @@ def write_window_regime(
                 **_clause_a_record(inputs.rho_kv_queued_median, kv_ceiling),
             }
         )
+    # B17 (ADR-0172 item 6 ii): the thirds are certified by the same rules
+    document["stationarity"] = stationarity_record(
+        window_dir,
+        t_start=float(t_start),
+        t_end=float(t_end),
+        certify=lambda lo, hi: compute_window_regime_inputs(
+            samples, lo, hi, min_samples=min_samples, min_coverage=min_coverage,
+            max_hold_s=max_hold_s,
+        ).rho_kv_time_avg,
+    )
     return _atomic_write_json(window_dir / "regime.json", document)
 
 
@@ -1373,4 +1573,14 @@ def _write_pd_window_regime(
                 },
             }
         )
+    # B17 (ADR-0172 item 6 ii): the thirds pooled by the same summed-pool lane
+    document["stationarity"] = stationarity_record(
+        window_dir,
+        t_start=t_start,
+        t_end=t_end,
+        certify=lambda lo, hi: compute_pd_window_regime_inputs(
+            series_by_role, lo, hi, budgets_by_role=budgets, min_samples=min_samples,
+            min_coverage=min_coverage, max_hold_s=max_hold_s,
+        ).rho_kv_time_avg,
+    )
     return _atomic_write_json(window_dir / "regime.json", document)

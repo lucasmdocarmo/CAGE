@@ -666,7 +666,11 @@ def test_the_s0_rehearsal_plan_projects_inside_its_hours_bound_b5(tmp_path: Path
     hours = float(next(line for line in profile.splitlines() if line.startswith("HOURS=")).split("=")[1])
     # 100-arrival pressure windows plus the 30 s pre-load (S0F-88 U3)
     assert rp["scaled_steps"] == 51
-    assert rp["total_h"] == pytest.approx(15.67, abs=0.01) and rp["total_s"] < hours * 3600
+    # B3 (ADR-0172, 2026-10-16): a window cell is charged its preparation scaled
+    # by the pool plus, per window, the pre-load, the class duration and one
+    # latency bound; before B3 the per-window cost scaled with the pool too and
+    # this plan projected 15.67 h.
+    assert rp["total_h"] == pytest.approx(14.23, abs=0.01) and rp["total_s"] < hours * 3600
 
 
 # --------------------------------------------------------------------------- #

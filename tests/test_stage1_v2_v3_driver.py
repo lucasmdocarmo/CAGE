@@ -547,33 +547,55 @@ def test_v3_constant() -> None:
     assert rc.WINDOW_BOUND_FINDING == "Batch 1 V3"
 
 
-def test_window_cells_are_bounded_by_arrival_count_equal_to_their_pool(tmp_path, stub) -> None:
+def test_window_cells_are_bounded_by_the_arrival_count_of_their_window_record(tmp_path, stub) -> None:
+    # B3 (ADR-0172): W = ceil(rate_frac x lambda* x D_class) arrivals against
+    # a pool of --num-queries; the two are no longer equal. Fixture: rate 0.85,
+    # lambda* 8.0 at r = 1.0, floors (0.1 s, 0.01 s), max_tokens 256:
+    # L = 10 x 0.1 + 5 x 0.01 x 256 = 13.8 s; D = ceil(10 + 60 + 13.8) = 84 s;
+    # W = ceil(0.85 x 8.0 x 84) = 572.
     plan = _plan_for(_f2_grid(), _floor_table(tmp_path), stub.cmd)
     windows = [s for s in _cells(plan) if s["row_class"] == "window"]
     others = [s for s in _cells(plan) if s["row_class"] != "window"]
     assert len(windows) == 1 and len(others) == 1
-    argv = windows[0]["argv"]
+    step = windows[0]
+    argv = step["argv"]
     assert _argv_value(argv, "--workload-mode") == "open_loop"
     assert _argv_value(argv, "--rate") is not None
-    assert _argv_value(argv, "--arrival-count") == _argv_value(argv, "--num-queries") == str(rc.WINDOW_REQUESTS)
+    assert step["window"]["duration_s"] == 84
+    assert step["window"]["arrivals"] == 572 == step["window_arrivals"]
+    assert _argv_value(argv, "--arrival-count") == "572"
+    assert _argv_value(argv, "--num-queries") == str(rc.WINDOW_REQUESTS) == str(step["window"]["pool"])
+    assert step["window"]["passes"] == 1  # 572 arrivals never wrap a 2000-id pool
+    assert _argv_value(argv, "--window-replay-max") == str(rc.REPLAY_FACTOR_MAX)
+    assert _argv_value(argv, "--drain-timeout-s") == f"{rc.DRAIN_TIMEOUT_S:g}"
     assert "--duration-s" not in argv
-    for step in others:
-        assert "--arrival-count" not in step["argv"] and "--duration-s" not in step["argv"]
+    for other in others:
+        for flag in ("--arrival-count", "--duration-s", "--window-replay-max", "--drain-timeout-s"):
+            assert flag not in other["argv"], flag
+        assert other["window"] is None
 
 
-def test_achievable_n_lowers_the_arrival_count_with_the_pool(tmp_path, stub) -> None:
+def test_achievable_n_lowers_the_pool_and_the_window_cycles_it(tmp_path, stub) -> None:
+    # The pool follows achievable_n; the arrivals follow the class duration,
+    # so the window cycles its 50 ids: passes = ceil(572 / 50) = 12 <= 15.
     plan = _plan_for(_f2_grid(achievable_n={"qasper": 50}), _floor_table(tmp_path), stub.cmd)
     window = next(s for s in _cells(plan) if s["row_class"] == "window")
     assert _argv_value(window["argv"], "--num-queries") == "50"
-    assert _argv_value(window["argv"], "--arrival-count") == "50"
+    assert _argv_value(window["argv"], "--arrival-count") == "572"
+    assert window["window"]["pool"] == 50 and window["window"]["passes"] == 12
 
 
-def test_ruler_window_steps_carry_the_same_bound(tmp_path, stub) -> None:
+def test_ruler_window_steps_carry_their_own_bound_from_the_engine_floor(tmp_path, stub) -> None:
+    # RULER: lambda* 0.5 at r = 1.0. This fixture registers no RULER ladder
+    # floor, so the shape falls back to the engine floor and names the gap.
+    # D = 84 s as above; W = ceil(0.85 x 0.5 x 84) = 36.
     grid = _f2_grid(f2_ruler_baselines=("B1",), f2_ruler_tasks=("qa",))
     plan = _plan_for(grid, _floor_table(tmp_path), stub.cmd)
     ruler = [s for s in _cells(plan) if s["dataset"] == "ruler"]
     assert len(ruler) == 1
-    assert _argv_value(ruler[0]["argv"], "--arrival-count") == str(rc.WINDOW_REQUESTS)
+    assert ruler[0]["window"]["arrivals"] == 36 == ruler[0]["window_arrivals"]
+    assert _argv_value(ruler[0]["argv"], "--arrival-count") == "36"
+    assert "operator start" in ruler[0]["window"]["floor_source"]
     assert "--duration-s" not in ruler[0]["argv"]
 
 
@@ -585,18 +607,21 @@ def test_the_header_records_the_window_bound_and_keeps_the_duration_estimate(tmp
     assert plan["window_duration_s"] == 60.0  # the pre-costed estimate stays recorded
 
 
-def test_the_arrivals_equal_the_pool_so_the_replay_guard_never_fires() -> None:
-    # The runner's own guard (src/orchestration/load_generator.py): W arrivals
-    # against W prepared requests is no replay, with no env override.
-    schedule = generate_arrival_schedule(1.7, seed=42, n_requests=rc.WINDOW_REQUESTS)
-    assert schedule.n_arrivals == rc.WINDOW_REQUESTS
+def test_the_replay_guard_accepts_the_authorized_passes_and_refuses_above() -> None:
+    # The runner's own guard (src/orchestration/load_generator.py) under
+    # ADR-0172: W arrivals within the pool is no replay; W above the pool is
+    # accepted up to REPLAY_FACTOR_MAX passes when the plan authorizes it, and
+    # refused beyond that, naming the count; unauthorized replay still refuses.
+    schedule = generate_arrival_schedule(1.7, seed=42, n_requests=572)
+    assert schedule.n_arrivals == 572
     assert ensure_no_measured_replay(schedule, rc.WINDOW_REQUESTS) is False
-    # ... while the old duration form at the same rate refuses on the first
-    # window longer than the pool (the finding).
-    long = generate_arrival_schedule(1.7, seed=42, duration_s=300.0)
-    assert long.n_arrivals > rc.WINDOW_REQUESTS
+    assert ensure_no_measured_replay(
+        schedule, 50, allow_replay=True, max_passes=rc.REPLAY_FACTOR_MAX
+    ) is True  # ceil(572 / 50) = 12 passes
     with pytest.raises(LoadGeneratorError, match="replay"):
-        ensure_no_measured_replay(long, rc.WINDOW_REQUESTS)
+        ensure_no_measured_replay(schedule, 50)
+    with pytest.raises(LoadGeneratorError, match="16 times, above the authorized maximum of 15"):
+        ensure_no_measured_replay(schedule, 36, allow_replay=True, max_passes=rc.REPLAY_FACTOR_MAX)
 
 
 def test_the_runner_takes_exactly_one_of_duration_and_arrival_count() -> None:
@@ -615,12 +640,12 @@ class TestLoadPlanV3:
         with pytest.raises(rc.RunError, match="duration-s.*Batch 1 V3"):
             rc.load_plan(_write_plan(tmp_path, broken))
 
-    def test_an_arrival_count_that_differs_from_the_pool_refuses(self, tmp_path, stub) -> None:
+    def test_an_arrival_count_that_differs_from_its_window_refuses(self, tmp_path, stub) -> None:
         plan = _plan_for(_f2_grid(), _floor_table(tmp_path), stub.cmd)
         broken = json.loads(json.dumps(plan))
         window = next(s for s in _cells(broken) if s["row_class"] == "window")
         window["argv"][window["argv"].index("--arrival-count") + 1] = "199"
-        with pytest.raises(rc.RunError, match="arrival-count.*199.*Batch 1 V3"):
+        with pytest.raises(rc.RunError, match="arrival-count.*199.*needs 572 arrivals.*ADR-0172"):
             rc.load_plan(_write_plan(tmp_path, broken))
 
     def test_a_window_cell_without_a_bound_refuses(self, tmp_path, stub) -> None:

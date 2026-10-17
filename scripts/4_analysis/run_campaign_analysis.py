@@ -538,6 +538,34 @@ HIGHER_IS_BETTER: dict[str, bool] = {
 
 DEFAULT_METRICS: tuple[str, ...] = ("ttft_ms",)
 
+#: B3 (ADR-0172 item 1, owner 2026-10-16): a measured pressure window cycles
+#: its pool, so one window holds several arrivals of one example. Serving
+#: results are confirmatory on every arrival; quality results on the FIRST
+#: PASS only. ``record_index`` is the dispatcher's arrival ordinal and the
+#: pool cycles modulo its size (run_experiment.dispatch_open_loop), so the
+#: first pass is record_index < n_unique, with n_unique the distinct
+#: example_ids among the window's indexed rows. On a replayed row the loader
+#: keeps the serving fields and drops the quality columns below and the
+#: section 8.11 degradation labels (counted in
+#: frame.attrs["replay_quality_rows_dropped"]). The derived bound is checked
+#: against the runner's record (metrics.json
+#: workload.open_loop.replay.first_pass_record_index_max) when the window
+#: carries one; a disagreement refuses. Rows without an index (closed loop)
+#: are never replays.
+QUALITY_FIRST_PASS_COLUMNS: frozenset[str] = (
+    frozenset(k for k, higher in HIGHER_IS_BETTER.items() if higher)
+    - {"goodput_frac", "yield_frac"}
+) | frozenset(CONDITIONED_QUALITY_METRICS) | frozenset({PREDICATE_METRIC})
+QUALITY_FIRST_PASS_RULE = (
+    "ADR-0172 item 1: quality columns and degradation labels from the first pass "
+    "only (record_index < n_unique distinct example_ids of the window); serving "
+    "columns from every arrival"
+)
+WINDOW_METRICS_NAME = "metrics.json"
+_REPLAY_RECORD_PATH: tuple[str, ...] = (
+    "workload", "open_loop", "replay", "first_pass_record_index_max",
+)
+
 CONTRAST_BY_ID: dict[int, Contrast] = {c.id: c for c in CONTRASTS}
 
 #: The two per-query artifacts the v2 loader joins (RESULTS_LAYOUT §1). The
@@ -972,6 +1000,63 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def _record_index_of(obj: Mapping[str, Any]) -> int | None:
+    value = obj.get("record_index")
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def first_pass_record_index_max(
+    requests: Sequence[Mapping[str, Any]], window_dir: Path | None = None
+) -> int | None:
+    """The last first-pass ``record_index`` of one window (ADR-0172 item 1),
+    or None for a window whose rows carry no index (closed loop: no replay).
+
+    Derived from the rows: n_unique distinct example_ids among the indexed
+    rows, bound n_unique - 1 (the dispatcher cycles the pool modulo its
+    size, so arrival i serves prepared request i mod n_unique). With
+    ``window_dir`` the window's metrics.json is read and a recorded
+    ``workload.open_loop.replay.first_pass_record_index_max`` must agree: the
+    two artifacts describe one dispatch, a disagreement refuses; an absent
+    record (a pre-B3 window) is accepted on the derived value.
+    """
+    indexed = [r for r in requests if _record_index_of(r) is not None]
+    if not indexed:
+        return None
+    ids = {
+        r["example_id"] for r in indexed
+        if isinstance(r.get("example_id"), str) and r.get("example_id")
+    }
+    if not ids:
+        return None
+    derived = len(ids) - 1
+    if window_dir is not None:
+        metrics_path = Path(window_dir) / WINDOW_METRICS_NAME
+        if metrics_path.is_file():
+            try:
+                node: Any = json.loads(metrics_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise AnalysisError(f"{metrics_path}: invalid JSON: {exc}") from exc
+            for key in _REPLAY_RECORD_PATH:
+                node = node.get(key) if isinstance(node, Mapping) else None
+            if node is not None:
+                if isinstance(node, bool) or not isinstance(node, int):
+                    raise AnalysisError(
+                        f"{metrics_path}: {'.'.join(_REPLAY_RECORD_PATH)}={node!r} is not "
+                        "an integer (ADR-0172 replay record)"
+                    )
+                if node != derived:
+                    raise AnalysisError(
+                        f"{metrics_path}: recorded first_pass_record_index_max={node} "
+                        f"disagrees with requests.jsonl ({len(ids)} distinct example_ids "
+                        f"among {len(indexed)} indexed rows -> {derived}); the runner's "
+                        "replay record and the rows describe different dispatches "
+                        "(ADR-0172 item 1)"
+                    )
+    return derived
+
+
 def load_per_query(
     run_dir: Path,
     index: pd.DataFrame,
@@ -1013,6 +1098,13 @@ def load_per_query(
     {reason: count}), never coerced to a value. A raw row that already
     carries a ``deg_*`` field REFUSES (label columns must never be shadowed
     by producer data).
+
+    B3 (ADR-0172 item 1): a replayed row (record_index past the window's
+    first pass, ``first_pass_record_index_max``) keeps its serving fields
+    and loses its quality columns (``QUALITY_FIRST_PASS_COLUMNS``) and its
+    degradation labels; the drops are counted in
+    ``frame.attrs['replay_quality_rows_dropped']`` and the windows that
+    replayed in ``frame.attrs['replay_windows']``.
     """
     wanted = set(row_keys)
     selection = index[index["row_key"].isin(wanted)]
@@ -1021,6 +1113,8 @@ def load_per_query(
     rows: list[dict[str, Any]] = []
     bool_coerced: set[str] = set()
     error_timing_dropped = 0
+    replay_quality_dropped = 0
+    replay_windows = 0
     label_reasons: dict[str, dict[str, int]] = {}
     for rec in selection.itertuples(index=False):
         window_dir = run_dir / str(rec.window_dir)
@@ -1028,17 +1122,28 @@ def load_per_query(
         #: (example_id, record_index) -> the trial's raw record merged across
         #: artifacts — the classify_request input (W4.10).
         trial_raw: dict[tuple[str, Any], dict[str, Any]] = {}
+        #: the replayed trials: no degradation label (ADR-0172 item 1)
+        replayed_keys: set[tuple[str, Any]] = set()
         n_unjoined = 0
         artifact_paths = [window_dir / name for name in _PER_QUERY_ARTIFACTS]
         if predicate_root is not None:
             artifact_paths.append(
                 predicate_root / str(rec.window_dir) / PREDICATE_ROWS_NAME
             )
-        for path in artifact_paths:
-            if not path.is_file():
-                continue  # qa_evidence is dataset-exempt for load donors (§1)
+        # qa_evidence is dataset-exempt for load donors (§1): absent files skip
+        loaded = [(path, _read_jsonl(path)) for path in artifact_paths if path.is_file()]
+        requests_records = next(
+            (records for path, records in loaded if path.name == _PER_QUERY_ARTIFACTS[0]), []
+        )
+        first_pass_max = first_pass_record_index_max(requests_records, window_dir)
+        if first_pass_max is not None and any(
+            ri is not None and ri > first_pass_max
+            for ri in (_record_index_of(r) for r in requests_records)
+        ):
+            replay_windows += 1
+        for path, records in loaded:
             seen_keys: set[tuple[str, Any]] = set()
-            for obj in _read_jsonl(path):
+            for obj in records:
                 example_id = obj.get("example_id")
                 if not isinstance(example_id, str) or not example_id:
                     n_unjoined += 1
@@ -1062,6 +1167,14 @@ def load_per_query(
                         "is minted by the loader's classifiers (W4.10), "
                         "never by a producer artifact"
                     )
+                record_index = _record_index_of(obj)
+                replayed = (
+                    first_pass_max is not None
+                    and record_index is not None
+                    and record_index > first_pass_max
+                )
+                if replayed:
+                    replayed_keys.add(dup_key)
                 trial_raw.setdefault(dup_key, {}).update(obj)
                 bucket = merged.setdefault(example_id, {})
                 error_row = obj.get("ok") is False
@@ -1071,6 +1184,11 @@ def load_per_query(
                         # 0.0 stamp is a placeholder, never a measurement)
                         if value is not None:
                             error_timing_dropped += 1
+                        continue
+                    if replayed and field_name in QUALITY_FIRST_PASS_COLUMNS:
+                        # ADR-0172 item 1: quality from the first pass only
+                        if value is not None:
+                            replay_quality_dropped += 1
                         continue
                     if isinstance(value, bool):
                         # true/false -> 1.0/0.0, noted — never dropped (G11).
@@ -1090,6 +1208,8 @@ def load_per_query(
         # per-example mean buckets, unjudgeable ones stay absent with their
         # counted NAMED reason (absence is never a 0.0 label).
         for (example_id, _record_index), raw in trial_raw.items():
+            if (example_id, _record_index) in replayed_keys:
+                continue  # ADR-0172 item 1: labels from the first pass only
             bucket = merged[example_id]
             for label_name, result in classify_request(raw).items():
                 column = degradation_column_of(label_name)
@@ -1113,6 +1233,9 @@ def load_per_query(
     frame = pd.DataFrame(rows)
     frame.attrs["bool_coerced_fields"] = sorted(bool_coerced)
     frame.attrs["error_row_timing_dropped"] = error_timing_dropped
+    frame.attrs["quality_first_pass_rule"] = QUALITY_FIRST_PASS_RULE
+    frame.attrs["replay_quality_rows_dropped"] = replay_quality_dropped
+    frame.attrs["replay_windows"] = replay_windows
     frame.attrs["degradation_reasons"] = {
         column: dict(sorted(counts.items()))
         for column, counts in sorted(label_reasons.items())
@@ -3768,6 +3891,15 @@ def _window_truth_tax(
     label = regime.get("label")
     if label != IN_REGIME:
         return None, f"regime label {label!r} (population = in-regime cells, §9.2)", None
+    # B17 (ADR-0172 item 6 ii): a window whose second and third thirds
+    # disagree is transient and leaves the in-regime aggregates; an absent or
+    # unknown stationarity record is not evidence of transience.
+    stationarity = regime.get("stationarity")
+    if isinstance(stationarity, Mapping) and stationarity.get("label") == "transient":
+        return None, (
+            "stationarity label 'transient' (ADR-0172 item 6 ii: the second and third "
+            "thirds of the span disagree; excluded from the in-regime aggregates)"
+        ), None
 
     engine = str(rec.engine)
     floor = floors.get(engine)
@@ -5795,6 +5927,15 @@ def run_conditioned_curves_pass(
             count_evidence(f"{requests_path} missing — no per-request rows")
             continue
         requests = _read_jsonl(requests_path)
+        # ADR-0172 item 1: quality from the first pass of a replayed window
+        first_pass_max = first_pass_record_index_max(requests, window_dir)
+
+        def _replayed(obj: Mapping[str, Any], _bound: int | None = first_pass_max) -> bool:
+            ri = _record_index_of(obj)
+            return _bound is not None and ri is not None and ri > _bound
+
+        quality_rows = [row for row in requests if not _replayed(row)]
+        n_replayed = len(requests) - len(quality_rows)
 
         # --- quality | rho_own: the window's OWN pressure coordinate -------
         own_path = (
@@ -5849,7 +5990,7 @@ def run_conditioned_curves_pass(
         for metric in window_metrics:
             values = [
                 float(row[metric])
-                for row in requests
+                for row in quality_rows
                 if isinstance(row.get(metric), (int, float))
                 and not isinstance(row.get(metric), bool)
                 and math.isfinite(float(row[metric]))
@@ -5882,6 +6023,7 @@ def run_conditioned_curves_pass(
                     "metric": metric,
                     "value": float(np.mean(values)),
                     "n": len(values),
+                    "n_replayed_excluded": n_replayed,
                     "task": window_task,
                 }
             )
@@ -5916,6 +6058,11 @@ def run_conditioned_curves_pass(
                 seen_keys.add(dup_key)
                 trial_raw.setdefault(dup_key, {}).update(obj)
         for _key, raw_trial in trial_raw.items():
+            if _replayed(raw_trial):
+                count_evidence(
+                    "replayed arrival: quality joins the first pass only (ADR-0172 item 1)"
+                )
+                continue
             used = raw_trial.get("used_contexts")
             n_contexts = len(used) if isinstance(used, list) else None
             bin_label, bin_reason = evidence_position_bin(
@@ -6035,6 +6182,7 @@ def run_conditioned_curves_pass(
                 "carries |task=<task> (ADR-0170: per task, never the mean)"
             ),
             "bin_edges": list(RHO_OWN_BIN_EDGES),
+            "replay_rule": QUALITY_FIRST_PASS_RULE,
             "windows": rho_rows,
             "curve": (
                 rho_curve.to_dict("records") if rho_curve is not None else []

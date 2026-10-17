@@ -55,10 +55,13 @@ def _write_calibration(cal_dir: Path, *, with_ruler: bool = True, engine: str = 
 def _row(i: int, *, ttft_ms, tpot_ms, ok=True, num_tokens=20, scheduled=True, engine=ENGINE,
          mode="open_loop", scheduled_ms=None, error=None):
     """One request row. ``scheduled`` True copies ttft_ms into ttft_from_scheduled_ms;
-    ``scheduled_ms`` sets that clock explicitly; ``mode`` is the row's workload_mode."""
+    ``scheduled_ms`` sets that clock explicitly; ``mode`` is the row's workload_mode.
+    ``record_index`` is the dispatcher's arrival ordinal on an open-loop row and None
+    on a closed-loop row, as the runner stamps it (run_experiment.py evidence stamp)."""
     rec = {
         "example_id": f"ex{i}",
         "repeat_index": "0",
+        "record_index": i if mode == "open_loop" else None,
         "ok": ok,
         "error": error,
         "ttft_ms": ttft_ms,
@@ -111,7 +114,12 @@ def _window(
         pdir.mkdir(parents=True, exist_ok=True)
         with open(pdir / "predicate.jsonl", "w", encoding="utf-8") as fh:
             for i, verdict in enumerate(predicates):
-                fh.write(json.dumps({"example_id": f"ex{i}", "repeat_index": "0", "record_index": i, "predicate": verdict}) + "\n")
+                # the #127 identity triple of the row it scores (B3: the join is keyed by it)
+                row = rows[i] if i < len(rows) else {}
+                fh.write(json.dumps({
+                    "example_id": row.get("example_id", f"ex{i}"), "repeat_index": "0",
+                    "record_index": row.get("record_index"), "predicate": verdict,
+                }) + "\n")
 
 
 KEY_F2 = f"gold-fresh|none|none|single|{ENGINE}|qwen3-14b|F2|r0.75|lam1.05"

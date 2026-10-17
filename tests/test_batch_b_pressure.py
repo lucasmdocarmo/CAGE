@@ -579,7 +579,7 @@ class TestLoadPlanBatchB:
         plan = self._copy(plan_a)
         cell = next(s for s in _cells(plan) if s["family"] == "F2" and s["blocked_on"] is None)
         cell["window_span_s_expected"] = cell["window_span_s_expected"] * 2
-        with pytest.raises(rc.RunError, match="window_span_s_expected=.* != num_queries / offered rate"):
+        with pytest.raises(rc.RunError, match="window_span_s_expected=.* != window_arrivals / offered rate"):
             rc.load_plan(_dump(tmp_path, plan, "span.json"))
         plan = self._copy(plan_a)
         cell = next(s for s in _cells(plan) if s["family"] == "F2" and s["blocked_on"] is None)
@@ -675,11 +675,16 @@ class TestWindowSpans:
     def test_every_pressure_cell_records_w_over_rate_and_the_floor_verdict(self, plan_a):
         executable = _pressure_cells(plan_a)
         for s in executable:
-            assert s["window_span_s_expected"] == pytest.approx(s["num_queries"] / s["offered_rate_rps"])
+            # B3 (ADR-0172): the span is the window's arrivals over its rate
+            assert s["window_arrivals"] == s["window"]["arrivals"]
+            assert s["window_span_s_expected"] == pytest.approx(s["window_arrivals"] / s["offered_rate_rps"])
             assert s["window_span_below_floor"] is (s["window_span_s_expected"] < rc.WINDOW_SPAN_FLOOR_S)
         for s in _pressure_cells(plan_a, executable=False):
-            # a blocked cell records the same arithmetic on its labeled rate
-            assert s["window_span_s_expected"] == pytest.approx(s["num_queries"] / s["offered_rate_rps"])
+            # a blocked cell records the shape its engine floor allows (None
+            # only without a floor) and the same arithmetic on its labeled rate
+            want_w = s["num_queries"] if s["window"] is None else s["window"]["arrivals"]
+            assert s["window_arrivals"] == want_w
+            assert s["window_span_s_expected"] == pytest.approx(s["window_arrivals"] / s["offered_rate_rps"])
         for s in _cells(plan_a):
             if s["family"] not in PRESSURE:
                 assert s["window_span_s_expected"] is None and s["window_span_below_floor"] is None
@@ -694,22 +699,34 @@ class TestWindowSpans:
         assert ws["executable_pressure_cells"] == len(executable) == len(spans)
         assert ws["min_s"] == pytest.approx(spans[0]) and ws["max_s"] == pytest.approx(spans[-1])
         assert ws["median_s"] == pytest.approx(statistics.median(spans))  # Fable LOW 8: the true median
-        assert ws["below_floor"] == sum(1 for v in spans if v < 10.0)
-        # W = 200 at rate_frac x (8 x r): the gold class at r = 1.5, 1.2 x 12 = 14.4 rps
-        # spans 13.9 s; the smallest class (4 x the rate) spans 3.5 s and is below
+        assert ws["below_floor"] == sum(1 for v in spans if v < 10.0) == 0
+        # B3 (ADR-0172): W = ceil(rate_frac x lambda* x D_class), so every span
+        # is D_class up to the ceiling's rounding (D <= span < D + 1 / rate):
+        # no window sits below the 10 s floor by construction. Fixture floors:
+        # vllm (0.12, 0.02) -> L = 1.2 + 25.6 = 26.8 s -> D = ceil(96.8) = 97 s;
+        # sglang (0.15, 0.025) -> L = 1.5 + 32 = 33.5 s -> D = ceil(103.5) = 104 s;
+        # RULER on its ladder floor (2.3, 0.018), both engines -> L = 23 + 23.04
+        # = 46.04 s -> D = ceil(116.04) = 117 s.
+        assert ws["durations_s"] == [97, 104, 117]
+        for s in executable:
+            d = s["window"]["duration_s"]
+            if s["dataset"] == "ruler":
+                assert d == 117 and s["window"]["floor_ttft_s"] == 2.3, s["row_key"]
+            else:
+                assert d == (97 if s["cellspec"]["engine"] == "vllm" else 104), s["row_key"]
+            assert d <= s["window_span_s_expected"] < d + 1 / s["offered_rate_rps"], s["row_key"]
+        assert ws["passes_max"] == max(s["window"]["passes"] for s in executable) <= rc.REPLAY_FACTOR_MAX
         assert set(ws["by_class"]) == {"4779", "2336", "1127", "1126", "702", "348"}
         assert list(ws["by_class"]) == ["4779", "2336", "1127", "1126", "702", "348"]  # largest first
-        # the small class offers 4 x the anchor's rate, so its windows are the shortest;
-        # per class the count below the floor is exactly the cells whose span is under it
+        # per class the count below the floor is exactly the cells whose span
+        # is under it, which is none since the duration design
         for seq, rec in ws["by_class"].items():
             mine = [s for s in executable if s["demand_class"]["seq_tokens"] == int(seq)]
             assert rec["cells"] == len(mine)
-            assert rec["below_floor"] == sum(1 for s in mine if s["window_span_s_expected"] < 10.0)
+            assert rec["below_floor"] == sum(1 for s in mine if s["window_span_s_expected"] < 10.0) == 0
             assert rec["min_s"] == pytest.approx(min(s["window_span_s_expected"] for s in mine))
-        assert ws["by_class"]["348"]["below_floor"] > 0 and ws["by_class"]["348"]["min_s"] < ws["by_class"]["4779"]["min_s"]
-        assert ws["by_class"]["4779"]["min_s"] == pytest.approx(200 / (1.2 * _RUNG_LAMBDA * 1.5))
         assert sum(c["cells"] for c in ws["by_class"].values()) == len(executable)
-        assert "never a refusal" in ws["note"]
+        assert "never a refusal" in ws["note"] and "ADR-0172" in ws["rule"]
 
     def test_summary_of_no_pressure_cells(self):
         ws = rc.window_span_summary([])
@@ -725,8 +742,9 @@ class TestWindowSpans:
             argv += ["--rung-calibration", f"{engine}={path}"]
         assert rc.main(argv) == 0
         text = capsys.readouterr().out
-        assert "window spans (S0F-68):" in text and "below the 10 s floor" in text
-        assert "WARNING: those windows are shorter than the registered warm-up transient" in text
+        assert "window spans (S0F-68):" in text and "0 below the 10 s floor" in text
+        # B3 (ADR-0172): no span sits below the warm-up transient any more
+        assert "WARNING: those windows are shorter than the registered warm-up transient" not in text
 
 
 # ---------------------------------------------------------------------------

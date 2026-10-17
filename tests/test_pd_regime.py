@@ -359,12 +359,14 @@ class TestWriteWindowRegimeRouting:
         # byte-identical: same key set (no "pd"), same pinned numbers.
         doc = _run_bridge(tmp_path, _LEGACY_RECORDS, "legacy")
         # S0F-88 B-11: two additive keys record clause (a)'s rule and ceiling;
-        # Q-8: one more records the hold rule (null here, the writer default)
+        # Q-8: one more records the hold rule (null here, the writer default);
+        # B17 (ADR-0172 6 ii): one more records the stationarity label
         assert set(doc) == {
             "schema_version", "t_start", "t_end", "telemetry_source",
             "attainment", "telemetry_ok", "inputs", "label", "refusal_reason",
-            "kv_ceiling", "clause_a_rule", "max_hold_s",
+            "kv_ceiling", "clause_a_rule", "max_hold_s", "stationarity",
         }
+        assert doc["stationarity"]["label"] == "unknown"  # 3 samples, no requests.jsonl
         assert doc["max_hold_s"] is None
         assert "pd" not in doc
         assert doc["telemetry_ok"] is True

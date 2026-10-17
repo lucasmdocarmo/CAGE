@@ -55,6 +55,7 @@ from src.orchestration.load_generator import (
     generate_arrival_schedule,
     is_connect_error,
     raise_open_file_limit,
+    replay_record,
     trim_to_measurement_window,
 )
 from src.evaluation.quality import (
@@ -2028,6 +2029,7 @@ def setup_inference_engine(
     backend: str,
     use_offline: bool = False,
     strict: bool = True,
+    request_timeout_s: Optional[float] = None,
 ) -> InferenceEngine:
     """Setup inference engine based on backend.
 
@@ -2037,6 +2039,8 @@ def setup_inference_engine(
         backend: Backend to use (vllm, sglang, lmdeploy, hf-oracle, gemini, ollama)
         use_offline: Use offline/in-process engine (vllm only)
         strict: If True, fail if model doesn't match server's loaded model
+        request_timeout_s: B3 (ADR-0172 item 3): the server adapters' per-request
+            timeout, the plan's drain bound; None keeps each adapter's default
 
     Returns:
         Configured inference engine
@@ -2060,7 +2064,7 @@ def setup_inference_engine(
             # forwarded: VLLMAdapter pins its own verified kwargs (ADR-0007),
             # so an operator setting CAGE_VLLM_CHAT_TEMPLATE_KWARGS gets a
             # loud refusal rather than a silently-dropped pin.
-            vllm_extras = _adapter_env_extras("VLLM")
+            vllm_extras = {**_adapter_env_extras("VLLM"), **adapter_timeout_kwargs(request_timeout_s)}
             if "chat_template_kwargs" in vllm_extras:
                 raise ValueError(
                     "CAGE_VLLM_CHAT_TEMPLATE_KWARGS is not supported: "
@@ -2117,7 +2121,7 @@ def setup_inference_engine(
         engine = adapter_cls(
             model_name=model_name,
             api_base=resolved_api_base,
-            **_adapter_env_extras(env_key),
+            **{**_adapter_env_extras(env_key), **adapter_timeout_kwargs(request_timeout_s)},
         )
         # Same strict served-model validation as the vLLM branch (both adapters
         # expose the OpenAI /v1/models surface via OpenAIChatAdapter).
@@ -2303,6 +2307,56 @@ def write_json_atomic(path: Any, payload: Any) -> None:
     os.replace(tmp, path)
 
 
+def adapter_timeout_kwargs(request_timeout_s: Optional[float]) -> Dict[str, Any]:
+    """B3 (ADR-0172 item 3): the adapter's per-request timeout taken from the
+    plan's drain bound, so one number rules the dispatcher and the client;
+    ``{}`` when no bound was given (the adapters' own 300 s default stands).
+    The adapters take whole seconds, so the bound is rounded up."""
+    if request_timeout_s is None:
+        return {}
+    return {"timeout": int(math.ceil(float(request_timeout_s)))}
+
+
+def validate_open_loop_window_bounds(
+    *,
+    workload_mode: str,
+    drain_timeout_s: Optional[float],
+    replay_max: Optional[int],
+) -> None:
+    """B3 (ADR-0172): the two window bounds the plan passes, checked before
+    any dataset or engine work. The drain bound is a finite number of seconds
+    > 0; the replay authorization is an integer number of passes >= 1; both
+    ride open-loop windows only (a closed-loop cell given either is a
+    mis-built argv, refused)."""
+    if drain_timeout_s is not None:
+        if (
+            isinstance(drain_timeout_s, bool)
+            or not isinstance(drain_timeout_s, (int, float))
+            or not math.isfinite(drain_timeout_s)
+            or drain_timeout_s <= 0
+        ):
+            raise LoadGeneratorError(
+                "open_loop_drain_timeout_s", drain_timeout_s,
+                "must be a finite number of seconds > 0 (ADR-0172 DRAIN_TIMEOUT_S)",
+            )
+        if workload_mode != "open_loop":
+            raise LoadGeneratorError(
+                "open_loop_drain_timeout_s", drain_timeout_s,
+                f"the drain bound rides open-loop windows only (workload_mode={workload_mode!r})",
+            )
+    if replay_max is not None:
+        if isinstance(replay_max, bool) or not isinstance(replay_max, int) or replay_max < 1:
+            raise LoadGeneratorError(
+                "open_loop_replay_max", replay_max,
+                "must be an integer number of passes >= 1 (ADR-0172 REPLAY_FACTOR_MAX)",
+            )
+        if workload_mode != "open_loop":
+            raise LoadGeneratorError(
+                "open_loop_replay_max", replay_max,
+                f"the replay authorization rides open-loop windows only (workload_mode={workload_mode!r})",
+            )
+
+
 def dispatch_open_loop(
     engine: Any,
     requests: List[InferenceRequest],
@@ -2316,8 +2370,17 @@ def dispatch_open_loop(
     distribution: str = "poisson",
     on_first_send: Optional[Callable[[], None]] = None,
     preload_requests: Optional[List[InferenceRequest]] = None,
+    drain_timeout_s: Optional[float] = None,
+    replay_max: Optional[int] = None,
 ) -> Tuple[List[RequestRecord], DispatchReport]:
     """Run one open-loop dispatch pass over prepared requests (charter D6 §6.1).
+
+    ``drain_timeout_s`` and ``replay_max`` (B3, ADR-0172): the drain bound the
+    dispatcher applies after the last arrival (cut requests are error rows),
+    and the plan's authorization to replay the prepared pool up to that many
+    passes inside a measured window (recorded under ``report.replay``;
+    without it the E4 replay pin stands unless CAGE_ALLOW_REPLAY=1 labels
+    the run non-confirmatory, the ladder's path).
 
     ``preload_requests`` (S0F-88 U3, owner decision 2026-10-12): distinct
     unmeasured requests sent FIRST at the same rate, each once, so the queue
@@ -2391,9 +2454,17 @@ def dispatch_open_loop(
     replay = ensure_no_measured_replay(
         schedule,
         len(requests),
-        allow_replay=os.environ.get("CAGE_ALLOW_REPLAY") == "1",
+        allow_replay=os.environ.get("CAGE_ALLOW_REPLAY") == "1" or replay_max is not None,
+        max_passes=replay_max,
     )
-    if replay:
+    replay_info = replay_record(schedule.n_arrivals, len(requests), authorized_max=replay_max)
+    if replay and replay_max is not None:
+        print(
+            f"[open-loop] replay authorized by the plan (ADR-0172): {schedule.n_arrivals} "
+            f"arrivals over {len(requests)} unique request(s), {replay_info['passes']} pass(es) "
+            f"of at most {replay_max}; serving metrics on every arrival, quality on the first pass"
+        )
+    elif replay:
         print(
             f"[open-loop] WARNING: CAGE_ALLOW_REPLAY=1 — schedule of "
             f"{schedule.n_arrivals} arrivals REPLAYS the {len(requests)} unique "
@@ -2431,7 +2502,11 @@ def dispatch_open_loop(
             requests[(i - n_pre) % len(requests)], on_first_token=on_first_token
         )
 
-    report = asyncio.run(dispatcher.run(run_schedule, _send))
+    report = asyncio.run(dispatcher.run(run_schedule, _send, drain_timeout_s=drain_timeout_s))
+
+    def _n_cut(records: List[RequestRecord]) -> int:
+        return sum(1 for r in records if r.error is not None and r.error.startswith("drain timeout"))
+
     if n_pre:
         pre_records = [r for r in report.records if r.index < n_pre]
         refused = [r for r in pre_records if is_connect_error(r.error) or is_connect_error(r.result_error)]
@@ -2447,6 +2522,7 @@ def dispatch_open_loop(
         for r in measured:
             r.index -= n_pre
             r.scheduled_offset_s -= shift
+        pre_unique = len({p.request_id for p in pre})
         report = DispatchReport(
             schedule=schedule,
             run_start_ts=report.run_start_ts + shift,
@@ -2460,8 +2536,15 @@ def dispatch_open_loop(
                 "n_errors": sum(1 for r in pre_records if not r.completed),
                 "seed": seed + 1,
                 "finding": "S0F-88 U3",
+                # B3 (ADR-0172 item 4): a pre-load may replay its candidates
+                "n_unique": pre_unique,
+                "passes": max(1, math.ceil(n_pre / pre_unique)) if pre_unique else None,
+                "n_cut": _n_cut(pre_records),
             },
+            # the drain count is the measured arrivals' own
+            drain=None if report.drain is None else {**report.drain, "n_cut": _n_cut(measured)},
         )
+    report.replay = replay_info
     if warmup_s > 0:
         kept = trim_to_measurement_window(report.records, warmup_s=warmup_s)
     else:
@@ -2515,6 +2598,11 @@ def run_experiment(
     open_loop_warmup_s: float = 0.0,
     open_loop_preload_s: float = 0.0,
     open_loop_max_in_flight: Optional[int] = None,
+    # B3 (ADR-0172): the drain bound after the last arrival (also the
+    # adapter's request timeout) and the plan's replay authorization, the
+    # maximum passes over the prepared pool; None = not set (pilot paths).
+    open_loop_drain_timeout_s: Optional[float] = None,
+    open_loop_replay_max: Optional[int] = None,
     # Routing migration
     routing_switch_at: Optional[int],
     # Sharding simulation
@@ -2707,6 +2795,13 @@ def run_experiment(
                 "workload_mode=open_loop requires exactly one of --duration-s "
                 "or --arrival-count",
             )
+    # B3 (ADR-0172): the drain bound and the replay authorization, same
+    # fail-closed slot, before any dataset or engine work.
+    validate_open_loop_window_bounds(
+        workload_mode=workload_mode,
+        drain_timeout_s=open_loop_drain_timeout_s,
+        replay_max=open_loop_replay_max,
+    )
 
     print("=" * 70)
     print("CAGE Experiment")
@@ -3518,8 +3613,13 @@ def run_experiment(
         time.sleep(_settle_ms_cfg / 1000.0)
         return (time.monotonic() - _t0) * 1000.0
 
-    # Setup inference engine
-    engine = setup_inference_engine(model, baseline_config, backend=backend, use_offline=use_offline)
+    # Setup inference engine (B3: the drain bound is also the adapter's
+    # request timeout, so one plan number rules both; passed only when set,
+    # so every path without a drain keeps the pre-B3 call byte-identical)
+    _engine_kwargs: Dict[str, Any] = {"backend": backend, "use_offline": use_offline}
+    if open_loop_drain_timeout_s is not None:
+        _engine_kwargs["request_timeout_s"] = open_loop_drain_timeout_s
+    engine = setup_inference_engine(model, baseline_config, **_engine_kwargs)
     # S0F-88 U7: an SGLang null cached-token block reads as 0 only once the
     # server's cache report is verified on (GET /server_info). Review L1: a
     # campaign window refuses without it, since its zero-cached rows would read
@@ -4500,16 +4600,24 @@ def run_experiment(
                 seed=seed,
                 trial=warmup_pool_trial,
                 fits=_draw_fits,
+                # B3 (ADR-0172 item 4): under a replay authorization the
+                # pre-load cycles its candidates instead of running short
+                allow_replay=open_loop_replay_max is not None,
             )
+            # each distinct candidate is prepared once; a repeat reuses it
+            _prepared_pre: Dict[str, Optional[InferenceRequest]] = {}
             for ex in pool:
-                try:
-                    _meta, _req = build_open_loop_request(ex)
-                except Exception as _ex:  # one candidate, never the window
-                    print(f"[open-loop] pre-load prepare failed for {ex.id}: {_ex}; skipping")
-                    continue
-                if not _prepared_request_fits(_meta, ex.id):  # L5, item 25: excluded, the pre-load runs shorter
-                    continue
-                preload_requests.append(_req)
+                if ex.id not in _prepared_pre:
+                    try:
+                        _meta, _req = build_open_loop_request(ex)
+                    except Exception as _ex:  # one candidate, never the window
+                        print(f"[open-loop] pre-load prepare failed for {ex.id}: {_ex}; skipping")
+                        _prepared_pre[ex.id] = None
+                        continue
+                    # L5, item 25: a request over the cap is excluded, the pre-load runs shorter
+                    _prepared_pre[ex.id] = _req if _prepared_request_fits(_meta, ex.id) else None
+                if _prepared_pre[ex.id] is not None:
+                    preload_requests.append(_prepared_pre[ex.id])
             if not preload_requests:
                 raise LoadGeneratorError(
                     "open_loop_preload_s",
@@ -4541,6 +4649,8 @@ def run_experiment(
             max_in_flight=open_loop_max_in_flight,
             on_first_send=lambda: first_send_ts.append(time.time()),
             preload_requests=preload_requests or None,
+            drain_timeout_s=open_loop_drain_timeout_s,
+            replay_max=open_loop_replay_max,
         )
         if first_send_ts:
             measured_window_t_start = first_send_ts[0]
@@ -5454,6 +5564,10 @@ def run_experiment(
                         **open_loop_report.to_manifest(),
                         "warmup_s": open_loop_warmup_s,
                         "preload_s_requested": open_loop_preload_s,  # S0F-88 U3
+                        # B3 (ADR-0172): the bounds as requested; the applied
+                        # drain and replay records ride to_manifest() above
+                        "drain_timeout_s_requested": open_loop_drain_timeout_s,
+                        "replay_max_requested": open_loop_replay_max,
                         "max_in_flight": open_loop_max_in_flight,
                         # B-1: the client's open-file limits (every in-flight
                         # request holds one socket).
@@ -5841,6 +5955,7 @@ def draw_preload_pool(
     seed: int,
     trial: int,
     fits: Optional[Callable[[CAGExample], bool]] = None,
+    allow_replay: bool = False,
 ) -> List[CAGExample]:
     """S0F-88 U3: up to ``n_max`` examples DISJOINT from the measured set for
     the steady-state pre-load, each served once (never replayed: a replayed
@@ -5848,7 +5963,13 @@ def draw_preload_pool(
     pool less than real traffic). Seeded like ``draw_warmup_pool`` on its own
     key; ``fits`` is the same request-cap filter (Q-4). Returns fewer than
     ``n_max`` when fewer disjoint candidates fit, and the pre-load then runs
-    shorter (its span is recorded)."""
+    shorter (its span is recorded).
+
+    ``allow_replay`` (B3, ADR-0172 item 4): when the plan authorizes replay
+    for the window, a pre-load that would run short cycles its drawn
+    candidates in the same seeded order until ``n_max`` requests are listed
+    (on S0 the fast classes drew 532 candidates and ran 8 to 22 s of their
+    30 s). The caller records the pass count beside the pre-load."""
     import random as _random
 
     if n_max <= 0:
@@ -5864,6 +5985,10 @@ def draw_preload_pool(
             chosen.append(ex)
             if len(chosen) == n_max:
                 break
+    if allow_replay and chosen and len(chosen) < n_max:
+        distinct = list(chosen)
+        while len(chosen) < n_max:
+            chosen.append(distinct[(len(chosen) - len(distinct)) % len(distinct)])
     return chosen
 
 
@@ -6449,6 +6574,26 @@ def main():
         help="Open-loop client-side SAFETY cap on concurrent in-flight requests; "
              "cap-affected arrivals are flagged (delayed_by_cap), never silently gated",
     )
+    parser.add_argument(
+        "--drain-timeout-s",
+        type=float,
+        default=None,
+        help="B3 (ADR-0172): seconds after the LAST open-loop arrival before every "
+             "request still open is cancelled and recorded ok False with the error "
+             "'drain timeout after N s'; also the server adapters' per-request "
+             "timeout. The campaign driver passes DRAIN_TIMEOUT_S on every window "
+             "cell. Unset = wait for every completion (the adapters' 300 s stands)",
+    )
+    parser.add_argument(
+        "--window-replay-max",
+        type=int,
+        default=None,
+        help="B3 (ADR-0172): the plan's authorization to replay the prepared pool "
+             "inside a measured window, up to this many passes (recorded under "
+             "open_loop.replay; serving metrics on every arrival, quality on the "
+             "first pass). Unset = the E4 replay pin stands (CAGE_ALLOW_REPLAY=1 "
+             "is the ladder's non-confirmatory path)",
+    )
 
     # Prompt / context truncation
     parser.add_argument(
@@ -6771,6 +6916,8 @@ def main():
             open_loop_warmup_s=args.open_loop_warmup_s,
             open_loop_preload_s=args.open_loop_preload_s,
             open_loop_max_in_flight=args.max_in_flight,
+            open_loop_drain_timeout_s=args.drain_timeout_s,
+            open_loop_replay_max=args.window_replay_max,
             routing_switch_at=args.routing_switch_at,
             reranker_model=reranker_model,
             reranker_device=args.reranker_device,
@@ -6900,6 +7047,8 @@ def main():
                 open_loop_warmup_s=args.open_loop_warmup_s,
                 open_loop_preload_s=args.open_loop_preload_s,
                 open_loop_max_in_flight=args.max_in_flight,
+                open_loop_drain_timeout_s=args.drain_timeout_s,
+                open_loop_replay_max=args.window_replay_max,
                 routing_switch_at=args.routing_switch_at,
                 reranker_model=reranker_model,
                 reranker_device=args.reranker_device,

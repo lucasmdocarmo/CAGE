@@ -990,12 +990,22 @@ class TestCellSteps:
             argv = s["argv"]
             if s["family"] in ("F2", "F3"):
                 assert "--workload-mode" in argv and "open_loop" in argv
-                # Batch 1 V3 (2026-10-05): the window is W arrivals (one per
-                # prepared request), never a duration; the runner's replay
-                # guard refused every duration-bound window at a real rate.
+                # Batch 1 V3 (2026-10-05): the window is W arrivals, never a
+                # duration. B3 (ADR-0172, 2026-10-16): W = ceil(rate_frac x
+                # lambda* x D_class) from the step's window record, against a
+                # pool of --num-queries it may cycle up to REPLAY_FACTOR_MAX
+                # times; a blocked cell records the shape its floor allows,
+                # or its pool when no floor exists.
                 assert "--rate" in argv and "--arrival-count" in argv
                 assert "--duration-s" not in argv
-                assert argv[argv.index("--arrival-count") + 1] == str(s["num_queries"])
+                assert argv[argv.index("--arrival-count") + 1] == str(s["window_arrivals"])
+                if s["blocked_on"] is None:
+                    assert s["window_arrivals"] == s["window"]["arrivals"]
+                    assert argv[argv.index("--window-replay-max") + 1] == str(rc.REPLAY_FACTOR_MAX)
+                    assert argv[argv.index("--drain-timeout-s") + 1] == f"{rc.DRAIN_TIMEOUT_S:g}"
+                else:
+                    want_w = s["num_queries"] if s["window"] is None else s["window"]["arrivals"]
+                    assert s["window_arrivals"] == want_w
                 lam = s["lambda_star_rps"]
                 frac = s["cellspec"]["rate_frac"]
                 assert s["offered_rate_rps"] == pytest.approx(lam * frac)
@@ -3148,7 +3158,17 @@ def _expected_class(step: Dict[str, Any], grid: Any) -> str:
 
 
 def _n_of_class(cls: str) -> int:
-    return {"primary": 2000, "secondary": 800, "identity": 300, "window": 200}[cls]
+    return {"primary": 2000, "secondary": 800, "identity": 300, "window": 2000}[cls]
+
+
+#: B3 (ADR-0172 item 5): session a registers the S1 manifest sizes Qasper
+#: 500 and RULER 300 per trial as achievable_n; session b registers none.
+_ACHIEVABLE_N_A = {"qasper": 500, "ruler": 300}
+
+
+def _expected_n(grid: "rc.SessionGrid", step: Dict[str, Any]) -> int:
+    base = _n_of_class(step["row_class"])
+    return min(base, dict(grid.achievable_n).get(step["dataset"], base))
 
 
 class TestPerRowN:
@@ -3158,7 +3178,7 @@ class TestPerRowN:
         assert rc.N_PRIMARY == 2000
         assert rc.N_SECONDARY == 800
         assert rc.N_IDENTITY == 300
-        assert rc.WINDOW_REQUESTS == 200
+        assert rc.WINDOW_REQUESTS == 2000  # B3 (ADR-0172): the pool is the class n
         assert rc.PRIMARY_ENGINE == "vllm"
         assert rc.PRIMARY_BASELINES == ("B3", "B6")
         assert set(rc.ROW_CLASSES) == {"primary", "secondary", "identity", "window"}
@@ -3166,12 +3186,12 @@ class TestPerRowN:
             assert grid.n_primary == 2000
             assert grid.n_secondary == 800
             assert grid.n_identity == 300
-            assert grid.window_requests == 200
+            assert grid.window_requests == 2000
             assert grid.primary_engine == "vllm"
             assert grid.primary_baselines == ("B3", "B6")
-            # Qasper's achievable n is an OWNER registration (A5): not
-            # fabricated here, so the anchor grids register none.
-            assert dict(grid.achievable_n) == {}
+            # Qasper's achievable n is an OWNER registration (A5); ADR-0172
+            # item 5 registers the S1 manifest sizes on session a only.
+            assert dict(grid.achievable_n) == (_ACHIEVABLE_N_A if grid.session == "a" else {})
 
     def test_classifier_table_every_family_engine_baseline(self, plan_a, plan_b):
         # Every (family x engine x baseline) cell of both sessions lands in
@@ -3215,14 +3235,18 @@ class TestPerRowN:
 
     def test_every_cell_carries_num_queries_for_its_class(self, plan_a, plan_b):
         for plan in (plan_a, plan_b):
+            grid = rc.SESSION_GRIDS[plan["session"]]
             for s in _cells(plan):
-                n = _n_of_class(s["row_class"])
+                n = _expected_n(grid, s)
                 assert s["num_queries"] == n, s["row_key"]
                 assert _argv_value(s, "--num-queries") == str(n), s["row_key"]
                 # The window pool: the open-loop generator draws from the
-                # measured set, so W IS the registered --num-queries.
+                # measured set and may cycle it (B3, ADR-0172); the pool IS
+                # the registered --num-queries, lowered by achievable_n.
                 if s["family"] in ("F2", "F3"):
-                    assert s["num_queries"] == rc.WINDOW_REQUESTS
+                    assert s["num_queries"] == min(
+                        rc.WINDOW_REQUESTS, dict(grid.achievable_n).get(s["dataset"], rc.WINDOW_REQUESTS)
+                    )
 
     def test_plan_header_records_the_constants(self, plan_a, plan_b):
         for plan in (plan_a, plan_b):
@@ -3230,11 +3254,15 @@ class TestPerRowN:
             assert head["n_primary"] == 2000
             assert head["n_secondary"] == 800
             assert head["n_identity"] == 300
-            assert head["window_requests"] == 200
+            assert head["window_requests"] == 2000
             assert head["primary_engine"] == "vllm"
             assert head["primary_baselines"] == ["B3", "B6"]
-            assert head["achievable_n"] == {}
-            assert head["achievable_n_caveat"] is None
+            if plan["session"] == "a":
+                assert head["achievable_n"] == _ACHIEVABLE_N_A
+                assert "qasper" in head["achievable_n_caveat"]
+            else:
+                assert head["achievable_n"] == {}
+                assert head["achievable_n_caveat"] is None
             assert "power_decision_2026-08-07" in head["decision"]
 
     def test_counts_unchanged_by_per_row_n(self, plan_a, plan_b):
@@ -3341,8 +3369,11 @@ class TestPerRowN:
             assert plan["query_manifests"]["qasper"]["trial_sizes"]["1"] == 900
         finally:
             rc.SESSION_GRIDS = orig
-        with pytest.raises(rc.PlanError, match=r"qasper.*trial 1.*900.*n=2000"):
-            rc.build_plan("a", floor, window_duration_s=300.0, query_manifests={"qasper": m900})
+        # Outside the override the anchor grid registers Qasper at 500
+        # (ADR-0172 item 5): a 400-id manifest refuses against n=500.
+        m400 = _write_manifest(tmp_path, "qasper", ids_per_trial=400, name="m400.json")
+        with pytest.raises(rc.PlanError, match=r"qasper.*trial 1.*400.*n=500"):
+            rc.build_plan("a", floor, window_duration_s=300.0, query_manifests={"qasper": m400})
         # Counts are untouched by the override.
         assert plan["counts"]["cells"] == 868
 

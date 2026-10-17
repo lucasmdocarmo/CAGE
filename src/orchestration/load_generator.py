@@ -70,6 +70,7 @@ __all__ = [
     "DispatchReport",
     "OpenLoopDispatcher",
     "ensure_no_measured_replay",
+    "replay_record",
     "trim_to_measurement_window",
     "CONNECT_ERROR_RE",
     "is_connect_error",
@@ -500,6 +501,12 @@ class DispatchReport:
     # S0F-88 U3: the steady-state pre-load that preceded the measured
     # arrivals (counts and span; its rows are never kept), None when none ran
     preload: Optional[Dict[str, Any]] = None
+    # B3 (ADR-0172 item 3): the drain bound the run applied and how many
+    # requests it cut; None when the run waited for every completion.
+    drain: Optional[Dict[str, Any]] = None
+    # B3 (ADR-0172 item 1): how the schedule covered the unique request pool
+    # (``replay_record``); None when the caller recorded none.
+    replay: Optional[Dict[str, Any]] = None
 
     @property
     def n_scheduled(self) -> int:
@@ -568,6 +575,8 @@ class DispatchReport:
             "served_rps": self.served_rps,
             "served_tokens_per_second": self.served_tokens_per_second,
             "preload": None if self.preload is None else dict(self.preload),
+            "drain": None if self.drain is None else dict(self.drain),
+            "replay": None if self.replay is None else dict(self.replay),
         }
 
 
@@ -629,7 +638,13 @@ class OpenLoopDispatcher:
         self._clock = clock
         self._sleep = sleep
 
-    async def run(self, schedule: ArrivalSchedule, send: AsyncSendFn) -> DispatchReport:
+    async def run(
+        self,
+        schedule: ArrivalSchedule,
+        send: AsyncSendFn,
+        *,
+        drain_timeout_s: Optional[float] = None,
+    ) -> DispatchReport:
         """Dispatch every request in ``schedule`` through ``send`` open-loop.
 
         ``send(i)`` performs the actual issue for schedule index ``i``. A send
@@ -641,11 +656,22 @@ class OpenLoopDispatcher:
         Exceptions raised by ``send`` are captured per-record (``error``) and
         counted — a failed request is data (it counts against D6 §6.1
         attainment), not a run abort.
+
+        ``drain_timeout_s`` (B3, ADR-0172 item 3) bounds the wait after the
+        LAST arrival: a request still open that long after it is cancelled
+        and recorded with the error ``"drain timeout after <s> s"``, its
+        completion clocked at the cut, so the window ends and attainment
+        counts the cut request as not completed. ``None`` (the default)
+        waits for every completion, the pre-B3 behavior; the adapters' own
+        request timeout is then the only bound. The bound and the count of
+        cut requests ride ``DispatchReport.drain``.
         """
         if not isinstance(schedule, ArrivalSchedule):
             raise LoadGeneratorError("schedule", schedule, "must be an ArrivalSchedule")
         if not callable(send):
             raise LoadGeneratorError("send", send, "must be an async callable")
+        if drain_timeout_s is not None:
+            _require_positive_finite("drain_timeout_s", drain_timeout_s)
         send_accepts_hook = self._send_accepts_hook(send)
 
         state = _RunState()
@@ -675,8 +701,35 @@ class OpenLoopDispatcher:
                 )
             )
 
-        if tasks:
+        n_cut = 0
+        if tasks and drain_timeout_s is None:
             await asyncio.gather(*tasks)
+        elif tasks:
+            # B3 (ADR-0172 item 3): the drain clock starts at the last
+            # arrival; whatever is still open when it runs out is cancelled
+            # and recorded as a cut request, never waited for.
+            _done, pending = await asyncio.wait(tasks, timeout=float(drain_timeout_s))
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            now = self._clock()
+            for record in report.records:
+                if record.completion_ts is not None or record.dropped_by_cap:
+                    continue
+                record.error = f"drain timeout after {float(drain_timeout_s):g} s"
+                record.completion_ts = now
+                record.latency_from_scheduled_ms = (now - record.scheduled_ts) * 1000.0
+                if record.actual_send_ts is not None:
+                    record.latency_from_send_ms = (now - record.actual_send_ts) * 1000.0
+                n_cut += 1
+        if drain_timeout_s is not None:
+            report.drain = {
+                "timeout_s": float(drain_timeout_s),
+                "n_cut": n_cut,
+                "rule": "cancelled this long after the last arrival; recorded ok False",
+                "adr": "ADR-0172",
+            }
 
         report.dropped_or_delayed = state.dropped_or_delayed
         report.max_in_flight_observed = state.max_in_flight_observed
@@ -767,11 +820,51 @@ class OpenLoopDispatcher:
                 semaphore.release()
 
 
+def replay_record(
+    n_arrivals: int, n_unique_requests: int, *, authorized_max: Optional[int] = None
+) -> Dict[str, Any]:
+    """How a schedule covers its unique request pool (B3, ADR-0172 item 1).
+
+    ``passes`` is ``ceil(n_arrivals / n_unique_requests)``: 1 when no request
+    is asked twice. ``first_pass_record_index_max`` names the last schedule
+    index of the first pass, so a reader keeps quality rows with
+    ``record_index <= first_pass_record_index_max`` (each unique request
+    once) and serving rows from every arrival. ``authorized_max`` is the
+    plan's ceiling on passes (None when the caller authorized none).
+    """
+    for name, value in (("n_arrivals", n_arrivals), ("n_unique_requests", n_unique_requests)):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise LoadGeneratorError(name, value, "must be an int")
+    if n_unique_requests <= 0:
+        raise LoadGeneratorError("n_unique_requests", n_unique_requests, "must be > 0")
+    if n_arrivals < 0:
+        raise LoadGeneratorError("n_arrivals", n_arrivals, "must be >= 0")
+    if authorized_max is not None and (
+        not isinstance(authorized_max, int) or isinstance(authorized_max, bool) or authorized_max < 1
+    ):
+        raise LoadGeneratorError("authorized_max", authorized_max, "must be an int >= 1 or None")
+    passes = max(1, math.ceil(n_arrivals / n_unique_requests))
+    return {
+        "n_unique": n_unique_requests,
+        "n_arrivals": n_arrivals,
+        "passes": passes,
+        "replayed_arrivals": max(0, n_arrivals - n_unique_requests),
+        "first_pass_record_index_max": min(n_arrivals, n_unique_requests) - 1,
+        "authorized_max": authorized_max,
+        "rule": (
+            "serving metrics on every arrival; quality on the first pass only "
+            "(record_index <= first_pass_record_index_max)"
+        ),
+        "adr": "ADR-0172",
+    }
+
+
 def ensure_no_measured_replay(
     schedule: ArrivalSchedule,
     n_unique_requests: int,
     *,
     allow_replay: bool = False,
+    max_passes: Optional[int] = None,
 ) -> bool:
     """E4 replay pin (code-assertion walkthrough 2026-08-12): measured windows
     never replay a request unless the operator EXPLICITLY labels the run.
@@ -787,6 +880,11 @@ def ensure_no_measured_replay(
     ``allow_replay`` says the caller accepted it (the caller must label the
     run non-confirmatory and warn loudly); otherwise raises the typed
     fail-closed error.
+
+    B3 (ADR-0172 item 1): a plan may authorize replay inside a measured
+    window up to ``max_passes`` passes over the pool (serving metrics stay
+    confirmatory on every arrival, quality on the first pass only); a
+    schedule needing more passes refuses, naming the count.
     """
     if not isinstance(schedule, ArrivalSchedule):
         raise LoadGeneratorError("schedule", schedule, "must be an ArrivalSchedule")
@@ -811,6 +909,18 @@ def ensure_no_measured_replay(
             f"window / raise the manifest size, or set CAGE_ALLOW_REPLAY=1 to "
             f"accept replay for a NON-confirmatory, labeled run",
         )
+    if max_passes is not None:
+        if not isinstance(max_passes, int) or isinstance(max_passes, bool) or max_passes < 1:
+            raise LoadGeneratorError("max_passes", max_passes, "must be an int >= 1 or None")
+        passes = math.ceil(schedule.n_arrivals / n_unique_requests)
+        if passes > max_passes:
+            raise LoadGeneratorError(
+                "n_arrivals",
+                schedule.n_arrivals,
+                f"schedule replays the {n_unique_requests} unique prepared request(s) "
+                f"{passes} times, above the authorized maximum of {max_passes} passes "
+                f"(ADR-0172 REPLAY_FACTOR_MAX); raise the manifest size for this class",
+            )
     return True
 
 

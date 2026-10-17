@@ -334,7 +334,7 @@ def test_the_preload_pool_is_distinct_disjoint_and_capped_u3() -> None:
     assert [c.id for c in again] == ids  # deterministic
 
 
-def test_rehearsal_pressure_cells_carry_the_preload_and_100_arrivals_u3(tmp_path: Path) -> None:
+def test_rehearsal_pressure_cells_carry_the_preload_and_their_window_arrivals_u3(tmp_path: Path) -> None:
     floor = tmp_path / "ft.json"
     floor.write_text(json.dumps(_floor_table_doc()), encoding="utf-8")
     cal = _write_calibrations(tmp_path / "cal", ("vllm", "sglang"))
@@ -351,11 +351,18 @@ def test_rehearsal_pressure_cells_carry_the_preload_and_100_arrivals_u3(tmp_path
             assert ("--open-loop-preload-s" in argv) is pressure
             if pressure:
                 assert argv[argv.index("--open-loop-preload-s") + 1] == "30"
-                assert step["num_queries"] == 100 and argv[argv.index("--arrival-count") + 1] == "100"
+                # B3 (ADR-0172): the arrivals follow the class duration, the
+                # pool the manifest; a rehearsal records the passes, never refuses.
+                assert step["num_queries"] == 100 == step["window"]["pool"]
+                assert argv[argv.index("--arrival-count") + 1] == str(step["window_arrivals"])
+                assert step["window_arrivals"] == step["window"]["arrivals"]
+                assert step["window"]["passes"] == math.ceil(step["window_arrivals"] / 100)
             else:
                 assert step["num_queries"] == 50
+                assert step["window"] is None
         if step["kind"] == "dry_window":
             assert "--open-loop-preload-s" not in step["argv"]
+    assert plan["window_design"]["replay_ceiling_enforced"] is False
     rc.load_plan(_dump(tmp_path, plan, "plan.json"))
     cell = next(s for s in plan["steps"] if s["kind"] == "cell" and s["family"] == "F2")
     at = cell["argv"].index("--open-loop-preload-s")
