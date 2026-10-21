@@ -16,8 +16,14 @@ Pinned here:
    has the digest the live test compares against.
 2. LIVE, opt-in (``CAGE_HF_LIVE=1``, marker ``integration``): the real
    ``datasets`` library loads the validation split through the pinned route
-   and the rebuilt 50x3 manifest hashes to the tracked digest. This is the
-   acceptance check; setup_runpod.sh runs it on every pod after staging.
+   and the rebuilt 50x3 manifest carries the tracked file's data sections
+   (trials, blocks, question_to_block, overlap, rungs, budgets, stats). This
+   is the acceptance check; setup_runpod.sh runs it on every pod after staging.
+   The comparison is on the data, not the bytes: the v4 builder (2026-10-17,
+   audit G4) adds ``manifest_version`` 4, the ``warmup_reserve`` section and
+   stats.warmup_reserve_n / stats.trial_pool_size to the v3 file S0 registered,
+   and S1 setup 2026-10-21 refused on that byte difference alone (ADR-0175
+   amendment 2026-10-21).
 """
 from __future__ import annotations
 
@@ -163,8 +169,18 @@ def test_live_hub_route_reproduces_the_50x3_manifest_digest() -> None:
         dataset="qasper", split=loader.split, context_selector=gold_only,
         trunc_budgets=(1400, 700),
     )
-    rebuilt = json.dumps(manifest, indent=1).encode("utf-8")
-    assert hashlib.sha256(rebuilt).hexdigest() == MANIFEST_SHA256, (
+    tracked = json.loads(MANIFEST.read_text(encoding="utf-8"))
+    # The v4 format fields (2026-10-17, audit G4) that the v3 tracked file lacks;
+    # everything else the Hub route must reproduce byte for byte.
+    format_keys = {"manifest_version", "warmup_reserve", "stats"}
+    new_stats = {"warmup_reserve_n", "trial_pool_size"}
+
+    def data(m):
+        return {k: v for k, v in m.items() if k not in format_keys}
+
+    assert data(manifest) == data(tracked), (
         f"the pinned Hub route no longer reproduces {MANIFEST.name}: "
         f"{manifest['stats']}"
     )
+    assert {k: v for k, v in manifest["stats"].items() if k not in new_stats} == tracked["stats"]
+    assert manifest["stats"]["warmup_reserve_n"] == 0, "the S0 manifest reserves no warmup questions"
