@@ -206,6 +206,11 @@ get_server_radix_mode() {
     return 0
 }
 
+#: A11 item 3 (owner 2026-10-20): the exit code of a refused pool (the
+#: planned --max-total-tokens did not fit even after the retry); the campaign
+#: driver stops the run on it, never only the segment.
+POOL_REFUSED_EXIT=75
+
 start_server() {
     local model="$1"
     local want_prefix_cache=true
@@ -315,16 +320,32 @@ start_server() {
     # ever runs under a pool below its plan. A start that never gets ready
     # returns its failure as before (its cause is unknown; a blind retry would
     # spend another full timeout on a guess).
-    local attempt=1 rc=0 raised
+    local attempt=1 rc=0 raised memo_key="" memo=""
+    # A11 item 6 (owner 2026-10-21): a capped start begins at the fraction that
+    # held the same pool before on this pod (S0: the 1.25 anchor came up 5.4%
+    # short at the default in 9 of 9 starts, about 103 s per retry); never below
+    # the default, and the check and the one retry below are unchanged.
+    if [ -n "${CAGE_SGLANG_MAX_TOTAL_TOKENS:-}" ]; then
+        memo_key="$(_sglang_memo_key "$model" "$want_prefix_cache")"
+        memo="$(_sglang_memo_get "$memo_key")"
+        if [ -n "$memo" ] && awk -v m="$memo" -v f="$mem_fraction" 'BEGIN { exit !(m + 0 > f + 0) }'; then
+            echo "  starting at --mem-fraction-static $memo, the fraction that held this pool before (A11 item 6)"
+            mem_fraction="$memo"
+        fi
+    fi
     while :; do
         rc=0; _sglang_launch_once "$model" "$want_prefix_cache" "$mem_fraction" || rc=$?
         [ "$rc" -eq 0 ] || return "$rc"
         [ -n "${CAGE_SGLANG_MAX_TOTAL_TOKENS:-}" ] || return 0
-        _sglang_pool_covers_cap && return 0
+        if _sglang_pool_covers_cap; then
+            # only a pool proven by a realized record is remembered
+            [ -z "${SGLANG_REALIZED_TOKENS:-}" ] || _sglang_memo_put "$memo_key" "$mem_fraction" || true
+            return 0
+        fi
         if [ "$attempt" -ge 2 ]; then
             echo -e "${RED}✗ KV pool still short of --max-total-tokens ${CAGE_SGLANG_MAX_TOTAL_TOKENS} at --mem-fraction-static $mem_fraction (realized ${SGLANG_REALIZED_TOKENS:-none} tokens): refusing to serve a smaller pool than planned (ADR-0162)${NC}"
             stop_server
-            return 1
+            return "$POOL_REFUSED_EXIT"
         fi
         # Review 2026-10-10 (MEDIUM 2, LOW 3): a failed computation, or one that
         # lands on the fraction already tried, must not leave the short server
@@ -333,13 +354,39 @@ start_server() {
         if [ -z "$raised" ] || [ "$raised" = "$(printf '%.3f' "$mem_fraction")" ]; then
             echo -e "${RED}✗ KV pool short of --max-total-tokens ${CAGE_SGLANG_MAX_TOTAL_TOKENS} at --mem-fraction-static $mem_fraction (realized ${SGLANG_REALIZED_TOKENS:-none} tokens) and no higher fraction is available (CAGE_SGLANG_MEM_FRACTION_MAX=${CAGE_SGLANG_MEM_FRACTION_MAX:-0.95}): refusing to serve a smaller pool than planned (ADR-0162)${NC}"
             stop_server
-            return 1
+            return "$POOL_REFUSED_EXIT"
         fi
         echo -e "${YELLOW}KV pool short of --max-total-tokens ${CAGE_SGLANG_MAX_TOTAL_TOKENS} at --mem-fraction-static $mem_fraction (realized ${SGLANG_REALIZED_TOKENS:-none} tokens); restarting once at $raised (ADR-0162)${NC}"
         stop_server
         mem_fraction="$raised"
         attempt=2
     done
+}
+
+#: A11 item 6: the fraction that held each capped pool, one "key<TAB>fraction" line per pool
+SGLANG_FRACTION_MEMO="$LOG_DIR/fraction_memo.tsv"
+
+_sglang_memo_key() {
+    # Every launch input the realized pool depends on [A: the radix flag is
+    # included for safety, not because it is known to move the pool].
+    printf '%s|%s|%s|%s|%s|%s|%s|%s' "$1" "${CAGE_SGLANG_MAX_TOTAL_TOKENS:-}" "${CAGE_SGLANG_TP:-1}" \
+        "${SGLANG_KV_CACHE_DTYPE:-auto}" "${VLLM_MAX_MODEL_LEN:-}" "${CAGE_SGLANG_DISABLE_PIECEWISE_CUDA_GRAPH:-0}" \
+        "$2" "$(cage_gpu_total_mib 2>/dev/null || echo unknown)"
+}
+
+_sglang_memo_get() {
+    # The remembered fraction for key $1, when it is a fraction in (0, 1]; else nothing
+    [ -f "$SGLANG_FRACTION_MEMO" ] || return 0
+    awk -F'\t' -v k="$1" '$1 == k && $2 ~ /^[0-9]*\.?[0-9]+$/ && $2 + 0 > 0 && $2 + 0 <= 1 { f = $2 } END { if (f != "") print f }' \
+        "$SGLANG_FRACTION_MEMO" 2>/dev/null || true
+}
+
+_sglang_memo_put() {
+    # Replace key $1's line with fraction $2 (write a temp file, then rename)
+    mkdir -p "$LOG_DIR"
+    local tmp="$SGLANG_FRACTION_MEMO.tmp.$$"
+    { [ -f "$SGLANG_FRACTION_MEMO" ] && awk -F'\t' -v k="$1" '$1 != k' "$SGLANG_FRACTION_MEMO"; printf '%s\t%s\n' "$1" "$2"; } > "$tmp" \
+        && mv -f "$tmp" "$SGLANG_FRACTION_MEMO"
 }
 
 _sglang_pool_covers_cap() {
@@ -424,6 +471,8 @@ _sglang_launch_once() {
     sglang_args+=( --mem-fraction-static "$mem_fraction" )
     # Uniform context length (vLLM --max-model-len analogue).
     sglang_args+=( --context-length "${VLLM_MAX_MODEL_LEN}" )
+    # A10: the pinned revision (offline, from the prefetched snapshot) when set
+    [ -n "${CAGE_MODEL_REVISION:-}" ] && sglang_args+=( --revision "$CAGE_MODEL_REVISION" )
     # Prometheus exposure (S0-23 smoke item A14; ADR-0102 cold start per
     # window). The campaign driver's strict reset reads the running-requests
     # gauge sglang:num_running_reqs from GET /metrics before every

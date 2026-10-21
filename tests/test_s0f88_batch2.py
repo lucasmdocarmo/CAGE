@@ -552,7 +552,7 @@ def _relaunch(per_rank: int, *, r: float = 1.5, pools: Any = None) -> Dict[str, 
 
 def test_a_pool_above_the_memory_left_after_the_weights_is_an_overrun_b7() -> None:
     free = rc.FREE_BYTES_AFTER_WEIGHTS[("qwen3-14b", _H100)]
-    assert free == int(50.98 * 1024 ** 3)  # SGLang "avail mem=50.98 GB" (GiB) on S0 [V]
+    assert free == int(45.58 * 1024 ** 3)  # A11 item 5: the largest pool S0 attempt 5 realized [V]
     assert rc.pool_ceiling_overruns([_relaunch(48_936_960_000, r=1.25)], _H100) == []  # started in S0
     (over,) = rc.pool_ceiling_overruns([_relaunch(58_724_352_000)], _H100)  # the r=1.5 anchor
     assert (over["pool_bytes"], over["free_bytes"], over["budget_r"]) == (58_724_352_000, free, 1.5)
@@ -577,7 +577,7 @@ def test_stage_0_refuses_the_s1_anchor_at_r1p5_on_one_h100_and_passes_s0_b7() ->
     assert sorted((o["engine"], o["seq_tokens"], o["budget_r"]) for o in s1["pool_ceiling_overruns"]) == [
         ("sglang", 4779, 1.5), ("vllm", 4779, 1.5),
     ]
-    assert any("exceed the memory the GPU has left after the weights" in p for p in s1["problems"])
+    assert any("exceed the largest pool the GPU is known to hold" in p for p in s1["problems"])
     assert rc.preflight_registration_check("a", **kw)["pool_ceiling_overruns"] == []  # no GPU id, no check
     master = (SCRIPTS / "6_experiments" / "cage_experiment.sh").read_text(encoding="utf-8")
     assert '"$FLOOR_CONCURRENCY" "$GPU_ID" <<\'PY\'' in master and "gpu_id=gpu_id)" in master
@@ -671,7 +671,12 @@ def test_the_s0_rehearsal_plan_projects_inside_its_hours_bound_b5(tmp_path: Path
     # by the pool plus, per window, the pre-load, the class duration and one
     # latency bound; before B3 the per-window cost scaled with the pool too and
     # this plan projected 15.67 h.
-    assert rp["total_h"] == pytest.approx(14.23, abs=0.01) and rp["total_s"] < hours * 3600
+    # A9 item 3 (2026-10-20): plus 5.0 s per distinct compressed request, each
+    # (dataset, trial) pool once: Qasper trial 1 at 970 (100 measured plus the
+    # largest pre-load, 870) and SQuAD v2 trial 1 at 50 (the F1 cell)
+    assert rp["compression_s"] == pytest.approx(5.0 * (970 + 50))
+    assert rp["total_h"] == pytest.approx(14.23 + rp["compression_s"] / 3600, abs=0.01)
+    assert rp["total_s"] < hours * 3600
 
 
 # --------------------------------------------------------------------------- #
@@ -837,3 +842,22 @@ def test_a_prefix_on_only_class_is_laddered_with_the_cache_off_option_a(tmp_path
         assert "--no-prefix-cache" in rung["relaunch"]["argv"]
     # the class's own cell keeps the prefix cache ON
     assert rc._serving_config(on_only[0], grid)[1] is False and rc._ladder_config(on_only[0], grid)[1] is True
+
+
+def test_the_projection_charges_each_distinct_compressed_pool_once_a9() -> None:
+    def step(dataset, rate, windows=3, arm="retr-comp"):
+        return {
+            "kind": "cell", "row_key": f"{arm}-{dataset}-{rate}", "dataset": dataset, "num_queries": 100,
+            "windows": windows, "offered_rate_rps": rate, "blocked_on": None,
+            "argv": ["--open-loop-preload-s", "30"],
+            "cellspec": {"engine": "vllm", "retriever": "rerank", "topology": "single", "arm": arm},
+            "window": {"duration_s": 86.0, "latency_bound_s": 10.0},
+        }
+    one = rc.run_projection([step("qasper", 2.0)])
+    assert one["compression_s"] == pytest.approx(5.0 * 3 * (100 + 60))  # three trials, 100 + 60 pre-load each
+    # the same pools at another rate cost only the larger pre-load's extra requests
+    two = rc.run_projection([step("qasper", 2.0), step("qasper", 3.0)])
+    assert two["compression_s"] == pytest.approx(one["compression_s"] + 5.0 * 3 * 30)
+    # another dataset is another pool; a non-compression arm is never charged
+    three = rc.run_projection([step("qasper", 2.0), step("squad_v2", 2.0), step("qasper", 9.0, arm="retr-fresh")])
+    assert three["compression_s"] == pytest.approx(2 * one["compression_s"])

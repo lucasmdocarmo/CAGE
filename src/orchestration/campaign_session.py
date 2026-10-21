@@ -1170,7 +1170,7 @@ class CampaignCellSession:
         path = self.window_dir(ordinal) / WINDOW_METRICS_NAME
         return json.loads(path.read_text(encoding="utf-8"))
 
-    def reset_incomplete_windows(self) -> list[int]:
+    def reset_incomplete_windows(self, only: Optional[int] = None) -> list[int]:
         """Remove half-written windows (dir and/or windows[] entry) for THIS
         dataset's trial ordinals so re-emission cannot collide (resume path).
 
@@ -1202,7 +1202,9 @@ class CampaignCellSession:
                 meta = loaded
         windows = meta.get("windows") if isinstance(meta, dict) else None
         changed = False
-        for ordinal in range(1, self.num_trials + 1):
+        # B1 (review 2026-10-20 L2): a --trial-index run resets its own window
+        # only; another trial's half-written window is that trial step's to redo
+        for ordinal in ([only] if only is not None else range(1, self.num_trials + 1)):
             if self.window_complete(ordinal):
                 continue
             wdir = self.window_dir(ordinal)

@@ -87,6 +87,14 @@ MODEL_KV: dict[str, ModelKV] = {
     "qwen3-8b-fp8": ModelKV(147_456, "2*36*8*128*2"),
 }
 
+#: A11 (owner 2026-10-20): the two-sided tolerance of the realized pool, in
+#: tokens, against the plan; the campaign driver checks it after every
+#: relaunch and a miss stops the run. 0.5 percent sits above the largest S0
+#: gap, 0.077 percent (vLLM rounds to 16-token blocks) [V S0 attempt 5
+#: serving configs]. Bytes are not compared: vLLM prints its pool in GiB to
+#: two decimals, about 0.6 percent of a 4,350-token pool [D].
+POOL_TOKEN_TOLERANCE: float = 0.005
+
 _ENGINES = ("vllm", "sglang", "lmdeploy", "hf")
 _TOPOLOGIES = ("single", "tp", "pd")
 
@@ -148,7 +156,7 @@ class EngineArgs:
 
 @dataclass(frozen=True)
 class BudgetPlan:
-    """The planned budget: what was requested, what gate (j) must observe."""
+    """The planned budget: what was requested, what the realized pool is checked against."""
 
     model: str
     engine: str
@@ -259,7 +267,8 @@ def plan_budget(
     if engine == "vllm":
         verify_live.append(
             "vllm --kv-cache-memory-bytes: per-rank vs whole-pool semantics at the "
-            "pinned version [VERIFY-LIVE at S0]; gate (j) closes on the startup log"
+            "pinned version [VERIFY-LIVE at S0]; the campaign driver compares the "
+            "realized pool tokens with the plan after every relaunch (A11)"
         )
         if pools is None:
             args.append(EngineArgs(
@@ -313,7 +322,8 @@ def plan_budget(
                 ))
         verify_live.append(
             "sglang --max-total-tokens -> realized pool bytes at the pinned version "
-            "[VERIFY-LIVE at S0]; gate (j) closes on the startup log"
+            "[VERIFY-LIVE at S0]; the campaign driver compares the realized pool "
+            "tokens with the plan after every relaunch (A11)"
         )
     elif engine == "lmdeploy":
         if free_bytes_after_weights is None:
@@ -356,10 +366,13 @@ def plan_budget(
         pools_bytes=pools,
         engine_args=tuple(args),
         verify_live=tuple(verify_live),
+        # A11 item 2 (owner 2026-10-20): what is checked, never a claim that
+        # it was; the per-relaunch result rides each window's metrics.json
         gate_j={
             "expected_bytes_total": realized_total,
-            "tolerance_env": "CAGE_ISO_BYTES_TOL (default 0.05)",
-            "evidence": "engine startup logs pinned via CAGE_ISO_BYTES_LOGS",
+            "expected_tokens_total": tokens_total,
+            "tolerance_tokens": POOL_TOKEN_TOLERANCE,
+            "check": "run_campaign realized_pool_check after every relaunch (single topology)",
         },
     )
 

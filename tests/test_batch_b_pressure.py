@@ -1050,6 +1050,22 @@ def test_front_load_puts_one_segment_of_each_first_contact_kind_first_a2():
     assert moved2 == [] and [s["kind"] for s in plain] == ["cell", "relaunch", "cell"]
 
 
+def _write_pool_record(env) -> None:
+    """The realized pool a budgeted restart leaves (tokens = the plan's)."""
+    import os as _os
+
+    engine = "sglang" if "SGLANG_PORT" in env else "vllm"
+    if env.get("CAGE_SGLANG_MAX_TOTAL_TOKENS"):
+        tokens = int(env["CAGE_SGLANG_MAX_TOTAL_TOKENS"])
+    elif env.get("CAGE_KV_BUDGET_BYTES"):
+        tokens = int(env["CAGE_KV_BUDGET_BYTES"]) // (81920 if env.get("VLLM_KV_CACHE_DTYPE") == "fp8" else 163840)
+    else:
+        return
+    pool_dir = Path(_os.environ["CAGE_LOG_ROOT"]) / engine
+    pool_dir.mkdir(parents=True, exist_ok=True)
+    (pool_dir / "CURRENT.kvpool.json").write_text(json.dumps({"engine": engine, "tokens": tokens}), encoding="utf-8")
+
+
 class FakeWorld:
     """An in-process ``exec_fn``: launcher verbs return ``relaunch_rc``; a
     runner invocation writes a window whose attainment is min(1, cap / rate)
@@ -1084,6 +1100,8 @@ class FakeWorld:
         argv = list(argv)
         self.calls.append((argv, dict(env)))
         if "--campaign-root" not in argv:
+            if "restart" in argv and self.relaunch_rc == 0:
+                _write_pool_record(env)  # A11: the record the real launchers' capture writes
             return self.relaunch_rc if "restart" in argv else 0
         if "--open-loop-warmup-s" in argv and argv[argv.index("--open-loop-warmup-s") + 1] != "0":
             # the real runner refuses the Jain trim in campaign mode (ADR-0055
@@ -1943,3 +1961,194 @@ class TestRulerLadder:
         plain = FakeWorld(cap=6.0, ruler_cap=0.4)
         _calibrate(tmp_path / "plain", plain, _ruler_grid())
         assert all("CAGE_DATASET_MANIFESTS_SHA256" not in e for _a, e in plain.runner_calls())
+
+
+# --------------------------------------------------------------------------- #
+# A11 (owner 2026-10-20): the realized pool against the plan after a relaunch
+# --------------------------------------------------------------------------- #
+
+
+class TestRealizedPoolA11:
+    def test_a_pool_within_tolerance_runs_and_rides_every_budgeted_window(self, tmp_path, floor_table, stub):
+        plan = _stub_plan(_pressure_grid(), floor_table, stub.cmd)
+        assert rc.run_plan(plan, _run_root(tmp_path)) == 0
+        pressure = [c for c in stub.calls() if c["env"].get("CAGE_CELL_FAMILY") == "F2"]
+        assert pressure
+        for call in pressure:
+            pool = json.loads(call["env"]["CAGE_REALIZED_POOL_JSON"])
+            assert pool["ok"] is True and pool["gap"] == 0.0 and pool["tolerance"] == 0.005
+            assert pool["realized_tokens"] == pool["planned_tokens"]
+        f1 = [c for c in _cell_calls(stub) if c["env"]["CAGE_CELL_FAMILY"] == "F1"]
+        assert f1 and all("CAGE_REALIZED_POOL_JSON" not in c["env"] for c in f1)  # budget-free
+
+    @pytest.mark.parametrize("skew, ok", [(1.004, True), (0.996, True), (1.006, False), (0.994, False)])
+    def test_the_tolerance_is_two_sided_and_a_miss_stops_the_run(
+        self, tmp_path, floor_table, stub, monkeypatch, skew, ok
+    ):
+        plan = _stub_plan(_pressure_grid(), floor_table, stub.cmd)
+        monkeypatch.setenv("STUB_KV_POOL_SKEW", str(skew))
+        code = rc.run_plan(plan, _run_root(tmp_path))
+        pressure = [c for c in _cell_calls(stub) if c["env"]["CAGE_CELL_FAMILY"] == "F2"]
+        if ok:
+            assert code == 0 and pressure
+        else:
+            # fail_fast is "off": the pool refusal stops the run anyway
+            assert code == 1 and pressure == [] and _dry_calls(stub) == []
+
+    def test_a_missing_pool_record_stops_the_run(self, tmp_path, floor_table, stub, monkeypatch, capsys):
+        plan = _stub_plan(_pressure_grid(), floor_table, stub.cmd)
+        monkeypatch.setenv("STUB_KV_POOL", "none")
+        assert rc.run_plan(plan, _run_root(tmp_path)) == 1
+        assert [c for c in _cell_calls(stub) if c["env"]["CAGE_CELL_FAMILY"] == "F2"] == []
+        assert "POOL REFUSED (A11)" in capsys.readouterr().out
+
+    def test_the_budget_plan_states_the_check_never_a_verification(self, tmp_path, floor_table, stub):
+        plan = _stub_plan(_pressure_grid(), floor_table, stub.cmd)
+        records = [s["budget_plan"] for s in plan["steps"] if s["kind"] == "relaunch" and s.get("budget_plan")]
+        assert records
+        for record in records:
+            assert record["gate_j"]["tolerance_tokens"] == 0.005
+            assert record["gate_j"]["expected_tokens_total"] == record["budget_tokens_total"]
+            assert not any("gate (j) closes" in v for v in record["verify_live"])
+
+
+def test_every_runner_step_shares_one_compression_memo_per_run_outside_the_tree_a14(
+    tmp_path, floor_table, stub, monkeypatch
+):
+    plan = _stub_plan(_pressure_grid(), floor_table, stub.cmd)
+    root = _run_root(tmp_path)
+    assert rc.run_plan(plan, root) == 0
+    runner_calls = [c for c in stub.calls() if "--campaign-root" in c["argv"]]
+    memos = {c["env"]["CAGE_COMPRESSION_CACHE_DIR"] for c in runner_calls}
+    assert len(runner_calls) >= 3 and memos == {str(rc.compression_memo_dir(root))}
+    memo = Path(memos.pop())
+    assert memo.name == root.name and memo.parent.name == "compression_memo"
+    assert root not in memo.parents  # a cache, never sealed data
+
+
+class TestBudgetStopRun2:
+    """ADR-0175 item 1: the registered budget stop (a deadline, never a result)."""
+
+    def test_a_far_deadline_changes_nothing(self, tmp_path, floor_table, stub):
+        plan = _stub_plan(_pressure_grid(), floor_table, stub.cmd)
+        import time as _time
+        assert rc.run_plan(plan, _run_root(tmp_path), stop_at=_time.time() + 10 * 86400) == 0
+
+    def test_a_passed_deadline_starts_nothing_and_exits_4(self, tmp_path, floor_table, stub, capsys):
+        plan = _stub_plan(_pressure_grid(), floor_table, stub.cmd)
+        import time as _time
+        code = rc.run_plan(plan, _run_root(tmp_path), stop_at=_time.time() - 1)
+        assert code == rc.EXIT_BUDGET_STOPPED == 4
+        assert _cell_calls(stub) == [] and _dry_calls(stub) == []
+        assert not [c for c in stub.calls() if c["argv"][:1] == ["restart"]]
+        assert "BUDGET STOP (ADR-0175)" in capsys.readouterr().out
+
+    def test_the_stop_falls_between_steps_by_their_projection(self, tmp_path, floor_table, stub, monkeypatch):
+        plan = _stub_plan(_pressure_grid(), floor_table, stub.cmd)
+        monkeypatch.setattr(rc, "run_projection", lambda steps: {"total_s": 10.0})
+        # a clock that advances 10 s per executed launcher or runner call
+        clock = {"t": 1_000_000.0}
+        real_exec = rc._exec
+
+        def _timed_exec(argv, env):
+            if argv[-1:] != ["stop"]:
+                clock["t"] += 10.0
+            return real_exec(argv, env)
+
+        monkeypatch.setattr(rc, "_exec", _timed_exec)
+        monkeypatch.setattr(rc.time, "time", lambda: clock["t"])
+        executed = [s for s in plan["steps"] if not s.get("blocked_on")]
+        assert len(executed) >= 4
+        # room for two 10 s steps, not three
+        root = _run_root(tmp_path)
+        code = rc.run_plan(plan, root, stop_at=clock["t"] + 25.0)
+        assert code == 4
+        started = [c for c in stub.calls() if c["argv"][:1] == ["restart"] or "--campaign-root" in c["argv"]]
+        steps = plan["steps"]
+        second = next(i for i, s in enumerate(steps) if s["kind"] == "relaunch" and i > 0)
+        first_segment = [s for s in steps[:second] if not s.get("blocked_on")]
+        # the whole first segment ran (restart, dry window, cell), nothing of the next
+        assert len(started) == len(first_segment) == 3
+        # review 2026-10-20 H1: every cell the stop left unrun says so (a SKIP to the organizer)
+        unrun = [s for s in steps[second:] if s["kind"] == "cell" and not s["blocked_on"]]
+        assert unrun and all("reason=budget-stop" in _sentinel(root, s) for s in unrun)
+
+
+class TestA16ClassFloorStart:
+    """A16 (owner 2026-10-20): on a block session each non-anchor class's
+    first rung starts from its own class floor (B4), and the anchor's
+    confirming window at its deciding rate is recorded only."""
+
+    def _run(self, tmp_path, world):
+        from test_run_campaign import _calibration_doc
+
+        from dataclasses import replace as _dc_replace
+
+        grid = _dc_replace(
+            _two_class_grid(),
+            blocks=(rc.PressurePoint("K5", ("B1", "B11"), ("vllm",), (1.0, 0.5), (rc.Load("own", 0.85),)),),
+            floor_budget_r=1.0,
+        )
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        floor = tmp_path / "ft.json"
+        floor.write_text(json.dumps(_floor_table_doc()), encoding="utf-8")
+        doc = _calibration_doc("vllm", budget_fraction=1.0)
+        doc["class_floors"] = {"348": {"ttft_s": 0.02, "tpot_s": 0.005, "n_requests": 30}}
+        cal = tmp_path / "cal_vllm.json"
+        cal.write_text(json.dumps(doc), encoding="utf-8")
+        orig = rc.SESSION_GRIDS
+        rc.SESSION_GRIDS = {grid.session: grid}
+        try:
+            return rc.calibrate_rungs(
+                "a", "vllm", rc.load_floor_table(floor), calibration=cal, out_root=tmp_path / "out",
+                runner_cmd=("runner",), launcher_cmds={"vllm": ("launch",)},
+                exec_fn=world, log=lambda _m: None,
+            )
+        finally:
+            rc.SESSION_GRIDS = orig
+
+    def test_the_small_class_starts_from_its_own_floor_and_the_anchor_confirms(self, tmp_path):
+        doc = self._run(tmp_path, FakeWorld(cap=6.0))
+        small = next(c for c in doc["classes"].values() if c["role"] == "smallest")
+        own = floor_start_qps(FloorMeasurement(ttft_s=0.02, tpot_s=0.005, n_requests=30, statistic="median"),
+                              max_tokens=rc.LADDER_START_DECODE_TOKENS)
+        first = small["rungs"]["1"]
+        assert first["start_qps"] == pytest.approx(own) and first["start_basis"].startswith("A16")
+        assert not small["rungs"]["0.5"]["start_basis"].startswith("A16")  # later rungs keep the chain rule
+        for key, rec in doc["rungs"].items():  # the anchor's rungs
+            confirm = rec["confirm"]
+            assert confirm["rule"].startswith("A16") and isinstance(confirm["sustainable"], bool)
+            assert confirm["rate_qps"] == pytest.approx(rec["lambda_star_qps"])
+            assert confirm["root"] not in {s["root"] for s in rec["steps"]}  # never in the decision
+        assert all(r.get("confirm") is None for r in small["rungs"].values())
+
+
+def test_a_launcher_pool_refusal_stops_the_run_m2(tmp_path, floor_table, stub, monkeypatch, capsys):
+    """A11 item 3 (review 2026-10-20 M2): exit 75 from a relaunch stops the run
+    even with fail_fast off; an ordinary relaunch failure does not."""
+    plan = _stub_plan(_pressure_grid(), floor_table, stub.cmd)
+    real = rc._exec
+    monkeypatch.setattr(rc, "_exec", lambda argv, env: rc.POOL_REFUSED_EXIT if "restart" in argv else real(argv, env))
+    assert rc.run_plan(plan, _run_root(tmp_path)) == 1
+    assert "POOL REFUSED (A11)" in capsys.readouterr().out
+    assert [c for c in stub.calls() if "--campaign-root" in c["argv"]] == []
+
+
+def test_the_budget_stop_keeps_earlier_sentinels_and_complete_cells_review_2026_10_21_m3(tmp_path, floor_table, stub, monkeypatch):
+    plan = _stub_plan(_pressure_grid(), floor_table, stub.cmd)
+    steps = plan["steps"]
+    second = next(i for i, s in enumerate(steps) if s["kind"] == "relaunch" and i > 0)
+    unrun = [s for s in steps[second:] if s["kind"] == "cell" and not s["blocked_on"]]
+    assert len(unrun) >= 2
+    root = _run_root(tmp_path)
+    # an earlier attempt failed the first unrun cell; its reason must survive the stop
+    rc._write_failed_sentinel(root, unrun[0]["row_key"], unrun[0]["dataset"], "runner-exit-1", rc._window_range(unrun[0])[0])
+    # and the second unrun cell is complete on disk from that attempt
+    real_complete = rc._segment_step_complete
+    monkeypatch.setattr(rc, "_segment_step_complete",
+                        lambda r, d, s: s is unrun[1] or s.get("row_key") == unrun[1]["row_key"] and s.get("kind") == "cell" or real_complete(r, d, s))
+    monkeypatch.setattr(rc, "run_projection", lambda steps: {"total_s": 10.0})
+    code = rc.run_plan(plan, root, stop_at=rc.time.time() - 1)
+    assert code == 4
+    assert "reason=runner-exit-1" in _sentinel(root, unrun[0])
+    assert _sentinel(root, unrun[1]) == ""  # a complete cell gets no sentinel beside its windows

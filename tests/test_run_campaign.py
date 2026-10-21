@@ -492,6 +492,24 @@ if marker and marker in " ".join(sys.argv[1:]):
 argv = sys.argv[1:]
 def _flag(name):
     return argv[argv.index(name) + 1] if name in argv else None
+# A11: a budgeted restart leaves the realized pool record the real launchers'
+# cage_kv_pool_capture writes (tokens = the plan's, Qwen3-14B 163,840 B per
+# bf16 token); STUB_KV_POOL=none writes none, STUB_KV_POOL_SKEW scales it.
+if argv[:1] == ["restart"] and os.environ.get("STUB_KV_POOL", "") != "none":
+    engine = "sglang" if "SGLANG_PORT" in os.environ else "vllm"
+    if os.environ.get("CAGE_SGLANG_MAX_TOTAL_TOKENS"):
+        tokens = int(os.environ["CAGE_SGLANG_MAX_TOTAL_TOKENS"])
+    elif os.environ.get("CAGE_KV_BUDGET_BYTES"):
+        per_token = 81920 if os.environ.get("VLLM_KV_CACHE_DTYPE") == "fp8" else 163840
+        tokens = int(os.environ["CAGE_KV_BUDGET_BYTES"]) // per_token
+    else:
+        tokens = None
+    if tokens is not None:
+        tokens = int(tokens * float(os.environ.get("STUB_KV_POOL_SKEW", "1")))
+        pool_dir = os.path.join(os.environ["CAGE_LOG_ROOT"], engine)
+        os.makedirs(pool_dir, exist_ok=True)
+        with open(os.path.join(pool_dir, "CURRENT.kvpool.json"), "w", encoding="utf-8") as fh:
+            json.dump({"engine": engine, "tokens": tokens, "bytes": None}, fh)
 root = _flag("--campaign-root")
 # The real runner refuses a Jain warm-up trim in campaign mode (ADR-0055
 # amendment 2026-09-19); the stub mirrors the refusal so a plan that carries
@@ -3205,8 +3223,9 @@ class TestPerRowN:
             # Qasper's achievable n is an OWNER registration (A5, open at A4);
             # ADR-0172 item 5 as amended (E17 d) registers the S1 window pools
             # on session a only, as window_pool_n.
-            assert dict(grid.achievable_n) == (_ACHIEVABLE_N_A if grid.session == "a" else {})
-            assert dict(grid.window_pool_n) == (_WINDOW_POOL_N_A if grid.session == "a" else {})
+            # ADR-0175: s1 (Run 2) serves session a's registrations through its blocks
+            assert dict(grid.achievable_n) == (_ACHIEVABLE_N_A if grid.session in ("a", "s1") else {})
+            assert dict(grid.window_pool_n) == (_WINDOW_POOL_N_A if grid.session in ("a", "s1") else {})
 
     def test_classifier_table_every_family_engine_baseline(self, plan_a, plan_b):
         # Every (family x engine x baseline) cell of both sessions lands in
@@ -5261,3 +5280,255 @@ class TestW4ReviewFixesTestsLens:
             m = re.search(r'engine_id:\s*str\s*=\s*"([^"]+)"', text)
             assert m, rel
             assert m.group(1) in ENGINE_OF_BACKEND, (rel, m.group(1))
+
+
+# --------------------------------------------------------------------------- #
+# A14 (ADR-0174 amendment 2026-10-20): the preparation helpers on the GPU
+# --------------------------------------------------------------------------- #
+
+
+def _flag(argv: List[str], flag: str) -> Optional[str]:
+    return argv[argv.index(flag) + 1] if flag in argv else None
+
+
+class TestHelpersOnGpuA14:
+    """A14 (ADR-0174 amendment 2026-10-20): S1's session s1 only; session a's
+    plans stay as they were (review 2026-10-20 L9)."""
+
+    def test_retrieval_cells_encode_and_compression_cells_compress_on_the_gpu(self, floor_table, tmp_path):
+        cells = _s1_cells(_s1_plan(floor_table, tmp_path))
+        assert any(s["cellspec"]["retriever"] != "none" for s in cells)
+        for s in cells:
+            enc, comp = _flag(s["argv"], "--encoder-device"), _flag(s["argv"], "--compressor-device")
+            assert enc == ("cuda" if s["cellspec"]["retriever"] != "none" else None), s["row_key"]
+            assert comp == ("cuda" if s["cellspec"]["arm"] == "retr-comp" else None), s["row_key"]
+        assert any(s["cellspec"]["arm"] == "retr-comp" for s in cells)
+
+    def test_dry_windows_inherit_the_cell_flags(self, floor_table, tmp_path):
+        dry = [s for s in _s1_plan(floor_table, tmp_path)["steps"] if s["kind"] == "dry_window"]
+        assert dry and all(
+            (_flag(s["argv"], "--encoder-device") == "cuda") == ("--retriever" in s["argv"]) for s in dry
+        )
+
+    def test_only_unpressured_relaunches_lower_the_engine_memory_share(self, floor_table, tmp_path):
+        relaunches = _relaunches(_s1_plan(floor_table, tmp_path))
+        free = [s for s in relaunches if s["budget_r"] is None]
+        budgeted = [s for s in relaunches if s["budget_r"] is not None]
+        assert free and budgeted
+        assert all(s["env"].get("VLLM_GPU_MEMORY_UTILIZATION") == "0.86" for s in free)
+        assert all("VLLM_GPU_MEMORY_UTILIZATION" not in s["env"] for s in budgeted)
+
+    def test_session_a_keeps_its_cpu_helpers_and_default_share(self, plan_a):
+        assert not any("--encoder-device" in s["argv"] or "--compressor-device" in s["argv"] for s in _cells(plan_a))
+        assert all("VLLM_GPU_MEMORY_UTILIZATION" not in s["env"] for s in _relaunches(plan_a))
+
+
+# --------------------------------------------------------------------------- #
+# ADR-0175 (C4, Run 2): session s1, registered blocks with borrowed loads
+# --------------------------------------------------------------------------- #
+
+#: fractions that coincide with no grid fraction (a coincidence merges cells,
+#: tested on its own below)
+_S1_FRONTIER = {"vllm": {0.5: 0.8, 0.25: 0.75}, "sglang": {0.5: 0.82, 0.25: 0.78}}
+
+
+def _s1_plan(floor_table: Path, tmp_path: Path, **overrides: Any) -> Dict[str, Any]:
+    cal = _write_calibrations(tmp_path / "cal_s1", ("vllm", "sglang"), budget_fraction=1.25)
+    # B4: every s1 class's floor on both engines (review 2026-10-20 L11 refuses without)
+    classes = rc.session_demand_classes(rc.get_session_grid("s1"))
+    for engine, path in cal.items():
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        doc["class_floors"] = {str(c): {"ttft_s": 0.05 + c / 40000.0, "tpot_s": 0.011, "n_requests": 30} for c in classes}
+        path.write_text(json.dumps(doc), encoding="utf-8")
+    kwargs: Dict[str, Any] = dict(
+        window_duration_s=300.0, calibrations=cal,
+        rung_calibrations=_rungs_for(cal, "s1"), frontier_loads=_S1_FRONTIER,
+    )
+    kwargs.update(overrides)
+    return rc.build_plan("s1", rc.load_floor_table(floor_table), **kwargs)
+
+
+def _s1_cells(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """One step per cell (B1 splits each executable cell into trial steps)."""
+    return [s for s in _cells(plan) if (s.get("trial_index") or 1) == 1]
+
+
+class TestSessionS1Run2:
+    def test_the_blocks_enumerate_the_registered_windows(self):
+        grid = rc.get_session_grid("s1")
+        cells = [c for c in rc.enumerate_cells(grid) if c.block]
+        windows: Dict[str, int] = {}
+        for c in cells:
+            if not c.blocked_on:
+                windows[c.block] = windows.get(c.block, 0) + (c.windows or grid.replications)
+        assert {b: windows[b] for b in ("K1", "K2", "K3", "K4", "K5", "K6", "K7", "K8", "K9")} == {
+            "K1": 192, "K2": 72, "K3": 30, "K4": 12, "K5": 120, "K6": 27, "K7": 54, "K8": 81, "K9": 108,
+        }
+        assert all(c.windows == 12 for c in cells if c.block == "K1")
+        assert all(c.spec.budget_r != 1.5 for c in cells)  # rung 1.5 is dropped
+        assert grid.floor_budget_r == 1.25 and rc.get_session_grid("a").floor_budget_r == 1.5
+
+    def test_a_plan_without_the_frontier_loads_refuses_at_the_pause(self, floor_table, tmp_path):
+        with pytest.raises(rc.PlanError, match="review pause"):
+            _s1_plan(floor_table, tmp_path, frontier_loads=None)
+
+    def test_borrowed_loads_offer_the_same_absolute_rates(self, floor_table, tmp_path):
+        plan = _s1_plan(floor_table, tmp_path)
+        cells = [s for s in _s1_cells(plan) if s.get("block") and not s["blocked_on"]]
+        k1 = [s for s in cells if s["block"] == "K1"]
+        assert k1 and all(s["cell_windows"] == 12 for s in k1)
+        constrained = {
+            (s["cellspec"]["engine"], s["baseline"], s["cellspec"]["budget_r"]): s
+            for s in k1 if s["cellspec"]["budget_r"] in (0.5, 0.25)
+        }
+        for (engine, baseline, r), s in constrained.items():
+            src = s["rate_source"]
+            assert src["kind"] == "frontier" and src["frac"] == _S1_FRONTIER[engine][r]
+            assert s["cellspec"]["rate_frac"] == float(f"{_S1_FRONTIER[engine][r]:.4g}")
+        controls = [s for s in k1 if s["cellspec"]["budget_r"] == 1.25]
+        assert len(controls) == len(constrained)
+        for s in controls:
+            src = s["rate_source"]
+            twin = constrained[(s["cellspec"]["engine"], s["baseline"], src["r"])]
+            # the control window offers the constrained twin's absolute rate
+            assert s["offered_rate_rps"] == pytest.approx(twin["offered_rate_rps"], rel=2e-4)
+        k2: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
+        for s in cells:
+            if s["block"] == "K2":
+                key = (s["baseline"], s["cellspec"]["budget_r"], s["rate_source"]["frac"])
+                k2.setdefault(key, []).append(s)
+        assert len(k2) == 2 * 3 * 2
+        for pair in k2.values():
+            # the same-workload block: both engines at the same absolute rate
+            assert sorted(s["cellspec"]["engine"] for s in pair) == ["sglang", "vllm"]
+            assert pair[0]["offered_rate_rps"] == pytest.approx(pair[1]["offered_rate_rps"], rel=2e-4)
+            assert {s["rate_source"]["engine"] for s in pair} == {pair[0]["rate_source"]["engine"]}
+
+    def test_a_malformed_point_refuses_at_registration(self):
+        bad = rc.PressurePoint("K1", ("B1",), ("vllm",), (0.5,), (rc.Load("own", 0.85),), dataset="ruler")
+        with pytest.raises(rc.PlanError, match="name their tasks"):
+            _dc_replace(rc.get_session_grid("s1"), blocks=(bad,))
+        with pytest.raises(rc.PlanError, match="fraction > 0"):
+            rc.Load("slower", None)
+        with pytest.raises(rc.PlanError, match="takes no fraction"):
+            rc.Load("frontier", 0.9)
+
+    def test_a_borrowed_load_equal_to_an_earlier_point_merges_into_it(self, floor_table, tmp_path):
+        """SGLang's frontier at r=0.25 equal to K2's 0.7 of the slower (tied)
+        engine: one condition, kept in K1 with its twelve windows."""
+        frontier = {"vllm": {0.5: 0.8, 0.25: 0.75}, "sglang": {0.5: 0.82, 0.25: 0.7}}
+        plan = _s1_plan(floor_table, tmp_path, frontier_loads=frontier)
+        same = [
+            s for s in _s1_cells(plan)
+            if s["baseline"] == "B1" and s["dataset"] == "qasper" and s["cellspec"]["engine"] == "sglang"
+            and s["cellspec"]["budget_r"] == 0.25 and s["cellspec"]["rate_frac"] == 0.7
+        ]
+        assert len(same) == 1 and same[0]["block"] == "K1" and same[0]["cell_windows"] == 12
+
+    def test_the_run_follows_value_order(self, floor_table, tmp_path):
+        plan = _s1_plan(floor_table, tmp_path)
+        order = [s.get("block") for s in plan["steps"] if s["kind"] == "cell" and not s["blocked_on"]]
+        ranks = [0 if b is None else 1 + rc.BLOCK_ORDER.index(b) for b in order]
+        assert ranks == sorted(ranks) and order[0] is None and "K1" in order
+        assert plan["counts"]["relaunches"] > 0
+
+    def test_replicates_run_round_robin_inside_each_segment(self, floor_table, tmp_path):
+        plan = _s1_plan(floor_table, tmp_path)
+        segments: List[List[Dict[str, Any]]] = [[]]
+        for s in plan["steps"]:
+            if s["kind"] == "relaunch":
+                segments.append([])
+            elif s["kind"] == "cell" and s.get("trial_index"):
+                segments[-1].append(s)
+        checked = 0
+        for seg in segments:
+            if not seg:
+                continue
+            keys = [(s["row_key"], s["dataset"], s["window_ordinal_base"]) for s in seg]
+            first = [k for k, s in zip(keys, seg) if s["trial_index"] == 1]
+            for k, s in zip(keys, seg):
+                assert s["argv"][s["argv"].index("--num-trials") + 1] == str(s["cell_windows"])
+                assert s["argv"][s["argv"].index("--trial-index") + 1] == str(s["trial_index"])
+                assert s["windows"] == 1
+            # every cell of the segment serves trials 1..k, each exactly once
+            for k in first:
+                trials = sorted(s["trial_index"] for kk, s in zip(keys, seg) if kk == k)
+                assert trials == list(range(1, len(trials) + 1))
+            # trial 2 runs in reverse order of trial 1 among the cells that have it
+            two = [k for k, s in zip(keys, seg) if s["trial_index"] == 2]
+            assert two == [k for k in first[::-1] if k in two]
+            # trials never interleave: all of trial t before trial t + 1
+            order = [s["trial_index"] for s in seg]
+            assert order == sorted(order)
+            checked += 1
+        assert checked > 0
+
+    def test_k1_needs_the_12_trial_question_set(self, floor_table, tmp_path):
+        """ADR-0175: K1 serves 12 windows, one manifest trial each; the
+        registered 12-trial Qasper set covers it and the 3-trial set refuses."""
+        twelve = REPO_ROOT / "data" / "manifests" / "qasper_852x12_seed42_wr50.json"
+        plan = _s1_plan(floor_table, tmp_path, query_manifests={"qasper": twelve})
+        assert any(s.get("block") == "K1" for s in _s1_cells(plan))
+        three = REPO_ROOT / "data" / "manifests" / "qasper_852x3_seed42_wr50.json"
+        with pytest.raises(rc.PlanError, match="serves 12 windows"):
+            _s1_plan(floor_table, tmp_path / "three", query_manifests={"qasper": three})
+
+
+    def test_a_plan_without_every_class_floor_refuses(self, floor_table, tmp_path):
+        cal = _write_calibrations(tmp_path / "bare", ("vllm", "sglang"), budget_fraction=1.25)
+        with pytest.raises(rc.PlanError, match="class floor"):
+            rc.build_plan("s1", rc.load_floor_table(floor_table), window_duration_s=300.0, calibrations=cal,
+                          rung_calibrations=_rungs_for(cal, "s1"), frontier_loads=_S1_FRONTIER)
+
+    def test_the_header_carries_the_class_targets_and_the_per_trial_compression(self, floor_table, tmp_path):
+        plan = _s1_plan(floor_table, tmp_path)
+        targets = plan["class_first_token_targets_s"]
+        assert targets["4779"] == pytest.approx(10 * (0.05 + 4779 / 40000.0))
+        assert plan["frontier_loads"]["vllm"] == {"0.5": 0.8, "0.25": 0.75}
+        # M1: a trial step charges its own trial's pool, so the sum equals the whole-cell charge
+        comp = [s for s in _cells(plan) if s["cellspec"]["arm"] == "retr-comp" and not s["blocked_on"]]
+        assert comp and plan["run_projection"]["compression_s"] > 0
+        whole = rc.run_projection([dict(s, windows=s["cell_windows"], trial_index=None) for s in comp
+                                   if s["trial_index"] == 1])["compression_s"]
+        assert plan["run_projection"]["compression_s"] == pytest.approx(whole)
+        assert set(plan["run_projection"]["by_block_s"]) >= {"K1", "L6"}
+
+    def test_the_loader_refuses_a_trial_step_that_disagrees_with_its_argv(self, floor_table, tmp_path):
+        plan = _s1_plan(floor_table, tmp_path)
+        bad = json.loads(json.dumps(plan))
+        step = next(s for s in bad["steps"] if s["kind"] == "cell" and s.get("trial_index") == 2)
+        step["trial_index"] = 3
+        path = tmp_path / "bad.json"
+        path.write_text(json.dumps(bad), encoding="utf-8")
+        with pytest.raises(rc.RunError, match="trial step 3 disagrees"):
+            rc.load_plan(path)
+
+    def test_no_rehearsal_and_no_borrowed_load_on_a_blocked_cell(self):
+        grid = rc.get_session_grid("s1")
+        with pytest.raises(rc.PlanError, match="block-registered"):
+            rc.rehearsal_grid(grid, n=50, datasets=frozenset({"qasper"}))
+        with pytest.raises(rc.PlanError, match="is blocked"):
+            blocked = [c for c in rc.enumerate_cells(grid) if c.blocked_on][:1]
+            rc.resolve_block_loads(grid, [_dc_replace(blocked[0], load=rc.Load("slower", 0.7))], {}, 4779, None)
+
+    def test_a_malformed_frontier_file_refuses_cleanly(self, tmp_path):
+        bad = tmp_path / "f.json"
+        bad.write_text("{not json", encoding="utf-8")
+        with pytest.raises(rc.PlanError, match="unreadable frontier file"):
+            rc.load_frontier_loads(bad)
+        bad.write_text(json.dumps({"schema": rc.FRONTIER_SCHEMA, "loads": {"vllm": {"0.5": 0}}}), encoding="utf-8")
+        with pytest.raises(rc.PlanError, match="finite and > 0"):
+            rc.load_frontier_loads(bad)
+
+
+def test_last_block_cuts_every_later_block_and_keeps_the_rest_owner_2026_10_21(floor_table, tmp_path) -> None:
+    # owner 2026-10-21 ("Through L5"): L6 leaves the plan, the core and L1 to L5 stay
+    full = _s1_cells(_s1_plan(floor_table, tmp_path / "full"))
+    cut = _s1_cells(_s1_plan(floor_table, tmp_path / "cut", last_block="L5"))
+    blocks_full = {s.get("block") for s in full}
+    blocks_cut = {s.get("block") for s in cut}
+    assert "L6" in blocks_full and "L6" not in blocks_cut
+    assert blocks_cut == blocks_full - {"L6"}
+    assert [s["row_key"] for s in full if s.get("block") != "L6"] == [s["row_key"] for s in cut]
+    with pytest.raises(rc.PlanError, match="last-block"):
+        _s1_plan(floor_table, tmp_path / "bad", last_block="L9")

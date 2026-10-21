@@ -28,18 +28,34 @@ Design:
   end-to-end latency story, not free).
 - Rate knob: CAGE_COMPRESSION_RATE (fraction of tokens to KEEP, default 0.5) overrides the
   per-baseline `target_ratio` so multi-rate sweeps are an env/config knob, no code edits.
+- A14 (ADR-0174 amendment 2026-10-20): off the CPU the weights load in float32, the CPU's
+  precision (llmlingua 0.2.2 prompt_compressor.py:139-144 loads "auto" on device "cuda");
+  CAGE_COMPRESSOR_REVISION pins the HF commit; CAGE_COMPRESSION_CACHE_DIR keeps one memo
+  file per distinct input, so each passage set is compressed once per run; release()
+  drops the weights before a measured window and the next compress() reloads them.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 # Default fraction of tokens to KEEP (0.5 = 2x compression) when neither the
 # CAGE_COMPRESSION_RATE env var nor an explicit target_ratio is provided.
 DEFAULT_COMPRESSION_RATE = 0.5
+
+#: A14 item 2: the run-level memo folder (the driver sets it per run). Unset = no memo.
+COMPRESSION_CACHE_ENV = "CAGE_COMPRESSION_CACHE_DIR"
+#: A14 item 8: the HF commit the compressor loads at (freeze slot
+#: INSTRUMENT_REVISIONS.compressor). Unset = the repo's current head.
+COMPRESSOR_REVISION_ENV = "CAGE_COMPRESSOR_REVISION"
+#: B3a operating point, shared by the call and the memo key.
+FORCE_TOKENS = ["\n", "?"]
 
 
 @dataclass
@@ -54,6 +70,9 @@ class CompressionStats:
     # compression was not attempted (pass-through/disabled). Compression latency is part
     # of the compressed_rag arm's end-to-end serving cost and must reach results.csv.
     compression_latency_ms: Optional[float] = None
+    # A14 item 2: True when the memo served this input (compression_latency_ms is then
+    # the original computation's time), False when computed, None when no memo is set.
+    cache_hit: Optional[bool] = None
 
     @property
     def compression_ratio(self) -> float:
@@ -70,6 +89,7 @@ class CompressionStats:
             "compression_applied": self.applied,
             "compression_note": self.note,
             "compression_latency_ms": self.compression_latency_ms,
+            "compression_cache_hit": self.cache_hit,
         }
 
 
@@ -98,6 +118,9 @@ class ContextCompressor:
         # redundant with the strict default.)
         _allow_noop = os.getenv("CAGE_ALLOW_NO_COMPRESSION", "").strip().lower() in {"1", "true", "yes"}
         self._strict = (not _allow_noop) and (self._disabled_reason is None)
+        self.revision: Optional[str] = (os.getenv(COMPRESSOR_REVISION_ENV) or "").strip() or None
+        _cache = (os.getenv(COMPRESSION_CACHE_ENV) or "").strip()
+        self.cache_dir: Optional[Path] = Path(_cache) if _cache else None
 
     @property
     def compressor(self):
@@ -105,10 +128,21 @@ class ContextCompressor:
             try:
                 from llmlingua import PromptCompressor  # type: ignore
                 model_name, use_v2 = self._MODELS.get(self.method, self._MODELS["llmlingua2"])
+                # A14 items 5 and 8: model_config reaches AutoConfig, AutoTokenizer and
+                # from_pretrained (llmlingua 0.2.2 prompt_compressor.py:116-149); it is
+                # passed only when it carries a key, so the CPU unpinned call is S0's.
+                model_config: Dict[str, Any] = {}
+                if self.revision:
+                    model_config["revision"] = self.revision
+                if self.device != "cpu":
+                    import torch  # type: ignore
+
+                    model_config["torch_dtype"] = torch.float32
                 self._compressor = PromptCompressor(
                     model_name=model_name,
                     use_llmlingua2=use_v2,
                     device_map=self.device,
+                    **({"model_config": model_config} if model_config else {}),
                 )
             except Exception as e:  # missing package or model
                 self._disabled_reason = str(e)
@@ -120,6 +154,73 @@ class ContextCompressor:
                     raise RuntimeError(f"CAGE_REQUIRE_COMPRESSION=1 but {msg}") from e
                 print(f"Warning: {msg}")
         return self._compressor
+
+    def release(self) -> bool:
+        """A14 item 6: drop the loaded weights (True when there were any); the next
+        compress() reloads them on the same device."""
+        released = self._compressor is not None
+        self._compressor = None
+        return released
+
+    def _memo_key(self, docs: List[str], question: str, rate: float) -> str:
+        """sha256 over every input the compressed text depends on (A14 item 2)."""
+        model_name, use_v2 = self._MODELS.get(self.method, self._MODELS["llmlingua2"])
+        try:
+            from importlib.metadata import version
+
+            library = version("llmlingua")
+        except Exception:  # noqa: BLE001 -- an unversioned install keys as None
+            library = None
+        payload = {
+            "method": self.method,
+            "model": model_name,
+            "revision": self.revision,
+            "llmlingua": library,
+            "device": self.device,
+            "dtype": "float32",  # the CPU default and the forced precision elsewhere
+            "rate": rate,
+            "use_context_level_filter": False,
+            "force_tokens": FORCE_TOKENS,
+            # LLMLingua-2 ignores the question (module docstring), so it is no input there
+            "question": None if use_v2 else question,
+            "contexts": docs,
+        }
+        blob = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        return hashlib.sha256(blob).hexdigest()
+
+    def _memo_get(self, key: str) -> Optional[Dict[str, Any]]:
+        """The stored record for ``key``, or None (absent, or unreadable and recomputed)."""
+        path = self.cache_dir / f"{key}.json"
+        if not path.exists():
+            return None
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            docs = record["compressed_docs"]
+            if record.get("key") != key or not isinstance(docs, list) or not all(
+                isinstance(d, str) for d in docs
+            ):
+                raise ValueError("malformed memo record")
+            return record
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print(f"Warning: compression memo {path} unreadable ({exc}); recomputing.")
+            return None
+
+    def _memo_put(self, key: str, docs: List[str], latency_ms: float) -> None:
+        """Atomic write (tmp file + os.replace); a failed write costs time, never data."""
+        path = self.cache_dir / f"{key}.json"
+        tmp = self.cache_dir / f".{key}.{os.getpid()}.tmp"
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(
+                json.dumps(
+                    {"key": key, "compressed_docs": docs, "compression_latency_ms": latency_ms},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            os.replace(tmp, path)
+        except OSError as exc:
+            print(f"Warning: compression memo write to {path} failed ({exc}); serving the computed text.")
 
     @staticmethod
     def _approx_tokens(texts: List[str]) -> int:
@@ -191,6 +292,21 @@ class ContextCompressor:
                 self.method, rate, 0, 0, applied=False, note="empty context"
             )
 
+        # a disabled compressor passes the originals through, memo or not
+        memo_key = (
+            self._memo_key(nonempty, question, rate)
+            if self.cache_dir is not None and self._disabled_reason is None
+            else None
+        )
+        if memo_key is not None:
+            hit = self._memo_get(memo_key)
+            if hit is not None:
+                docs = list(hit["compressed_docs"])
+                return docs, CompressionStats(
+                    self.method, rate, original_tokens, self._approx_tokens(docs), applied=True,
+                    compression_latency_ms=hit.get("compression_latency_ms"), cache_hit=True,
+                )
+
         comp = self.compressor
         if comp is None:
             if self._strict:
@@ -220,15 +336,18 @@ class ContextCompressor:
                 rate=rate,                # fraction of tokens to keep
                 target_token=target_token,  # anchors the ratio in actual tokens
                 use_context_level_filter=False,  # token-level only (B3a)
-                force_tokens=["\n", "?"],
+                force_tokens=FORCE_TOKENS,
             )
             latency_ms = (time.perf_counter() - _t0) * 1000.0
             compressed_text = result.get("compressed_prompt", "") if isinstance(result, dict) else str(result)
             compressed_docs = [compressed_text] if compressed_text else nonempty
             compressed_tokens = self._approx_tokens(compressed_docs)
+            if memo_key is not None:
+                self._memo_put(memo_key, compressed_docs, latency_ms)
             return compressed_docs, CompressionStats(
                 self.method, rate, original_tokens, compressed_tokens, applied=True,
                 compression_latency_ms=latency_ms,
+                cache_hit=False if memo_key is not None else None,
             )
         except Exception as e:
             if self._strict:

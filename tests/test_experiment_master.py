@@ -163,7 +163,7 @@ def world(tmp_path: Path) -> Dict[str, Path]:
     _w(b / "git", "#!/bin/bash\ncase \"$*\" in *\"rev-parse HEAD\"*) echo \"${CAGE_TEST_HEAD_SHA:-${CAGE_TEST_SHA:-0123456789abcdef0123456789abcdef01234567}}\" ;; *) exit 1 ;; esac\n")
     # /metrics answers with the live names of 2026-10-07 (S0F-37), /server_info
     # with SGLang's launch arguments (S0F-88 U7); everything else is a silent 200
-    _w(b / "curl", "#!/bin/bash\ncase \"$*\" in *\"/metrics\"*) printf 'sglang:token_usage 0.1\\nsglang:num_retracted_reqs 0\\nsglang:num_running_reqs 0\\nsglang:num_queue_reqs 0\\nvllm:kv_cache_usage_perc 0.1\\n' ;; *\"/server_info\"*) printf '{\"version\":\"0.5.10.post1\",\"enable_cache_report\":%s}\\n' \"${CAGE_TEST_CACHE_REPORT:-true}\" ;; esac\nexit 0\n")
+    _w(b / "curl", "#!/bin/bash\ncase \"$*\" in *\"/metrics\"*) printf 'sglang:token_usage 0.1\\nsglang:num_retracted_reqs 0\\n# TYPE sglang:num_retracted_requests_total counter\\nsglang:num_running_reqs 0\\nsglang:num_queue_reqs 0\\nvllm:kv_cache_usage_perc 0.1\\n' ;; *\"/server_info\"*) printf '{\"version\":\"0.5.10.post1\",\"enable_cache_report\":%s}\\n' \"${CAGE_TEST_CACHE_REPORT:-true}\" ;; esac\nexit 0\n")
     _w(b / "nvidia-smi", r'''
         #!/bin/bash
         case "$*" in
@@ -253,8 +253,17 @@ def world(tmp_path: Path) -> Dict[str, Path]:
                 problems.append(f"FLOOR_AVG_SEQ_TOKENS={floor_avg_seq_tokens} but session {session!r} registers 4779 served tokens for the anchor arm 'gold-fresh' (ADR-0155)")
             if os.environ.get("CAGE_TEST_PREFLIGHT_PROBLEMS"):
                 problems.append(os.environ["CAGE_TEST_PREFLIGHT_PROBLEMS"])
+            # A11 item 4: the largest planned pool per engine, on request
+            largest = {} if os.environ.get("CAGE_TEST_LARGEST_POOL") != "1" else {
+                "vllm": {"planned_tokens": 298687, "planned_bytes": 48936960000,
+                         "env": {"CAGE_KV_BUDGET_BYTES": "48936960000", "VLLM_MAX_MODEL_LEN": "32768"}}}
+            # review 2026-10-21 H1: the largest pool a GPU-helper cell plans, on request
+            helpers = {} if os.environ.get("CAGE_TEST_HELPER_POOL") != "1" else {
+                "sglang": {"planned_tokens": 70437, "planned_bytes": 11540480000,
+                           "env": {"CAGE_SGLANG_MAX_TOTAL_TOKENS": "70437", "VLLM_MAX_MODEL_LEN": "8192"}}}
             return {"session": session, "anchor_seq_tokens": 4779, "cells": 3, "executable_cells": 3,
-                    "needs_lmcache": os.environ.get("CAGE_TEST_NEEDS_LMCACHE") == "1", "problems": problems}
+                    "needs_lmcache": os.environ.get("CAGE_TEST_NEEDS_LMCACHE") == "1", "largest_pools": largest,
+                    "largest_helper_pools": helpers, "problems": problems}
         if __name__ == "__main__":
             a = sys.argv[1:]
             if a and a[0] == "rungs":  # ADR-0154: stage 5 lists the budgeted rungs on the Mac
@@ -399,6 +408,12 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         print("RERANK_DEVICE_OK queries=50 identical=50 max_abs_score_diff=1e-06" if ok else "RERANK_DEVICE_FAILED reason=test")
         sys.exit(0 if ok else 1)
         ''', exe=False)
+    # A14: the compressor and dense-encoder device probes, beside the reranker probe
+    for name, marker in (("probe_compressor_device.py", "COMPRESS_DEVICE_OK"), ("probe_encoder_device.py", "ENCODER_DEVICE_OK")):
+        _w(pr / "scripts" / "checks" / name, f'print("{marker} queries=50 identical=50")\n', exe=False)
+    # A14: the compressor and dense-encoder device probes beside the reranker probe
+    for name, marker in (("probe_compressor_device.py", "COMPRESSOR_DEVICE_OK"), ("probe_encoder_device.py", "ENCODER_DEVICE_OK")):
+        _w(pr / "scripts" / "checks" / name, f'print("{marker} queries=50 identical=50")\n', exe=False)
     _w(pr / "scripts" / "3_run" / "calibrate_cell.py", r'''
         import json, sys
         from pathlib import Path
@@ -412,6 +427,12 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         a = sys.argv[1:]
         if a[0] == "rungs":
             print("1 0.5"); sys.exit(0)
+        if a[0] == "pool-check":  # A11 item 4
+            with open(os.environ["CAGE_TEST_LOG"], "a", encoding="utf-8") as fh:
+                fh.write("pool_check " + " ".join(a[1:]) + "\n")
+            ok = os.environ.get("CAGE_TEST_POOL_CHECK_RC", "0") != "1"
+            print("LARGEST_POOL_OK engine=vllm realized_tokens=298687" if ok else "LARGEST_POOL_FAILED engine=vllm reason=test")
+            sys.exit(0 if ok else 1)
         if a[0] == "calibrate-rungs":
             # ADR-0160 (S0 attempt 2): the ladder windows run the campaign seam, which
             # refuses without the provider and hardware env (campaign_session.py)
@@ -1477,6 +1498,31 @@ def test_validate_runs_the_preflight_on_vllm_only_and_engine_probes_on_sglang(wo
     assert _state(world)["stages"]["validate"]["status"] == "passed"
 
 
+def test_validate_starts_at_the_largest_planned_pool_and_checks_it_a11_item4(world: Dict[str, Path]) -> None:
+    # A11 item 4 (owner 2026-10-21): stage 0's largest pool rides the stage 4 start,
+    # and the relaunch rule checks it before calibration bills
+    proc = _master(world, "--yes", "provision", "--to", "validate", CAGE_TEST_LARGEST_POOL="1")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    cmd = (world["home"] / ".cage_jobs" / "validate_vllm.cmd").read_text(encoding="utf-8")
+    assert "env CAGE_KV_BUDGET_BYTES=48936960000 VLLM_MAX_MODEL_LEN=32768 bash scripts/2_serving/manage_vllm_server.sh start" in cmd
+    assert cmd.index("pool-check --engine vllm --planned-tokens 298687 --planned-bytes 48936960000") < cmd.index("manage_vllm_server.sh stop")
+    assert any(c.startswith("pool_check --engine vllm --planned-tokens 298687") for c in _calls(world))
+    assert "LARGEST_POOL_OK engine=vllm" in proc.stdout
+    # a pool outside the rule fails stage 4, and nothing calibrates
+    proc = _master(world, "--only", "validate", "--redo", CAGE_TEST_LARGEST_POOL="1", CAGE_TEST_POOL_CHECK_RC="1")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "LARGEST_POOL_FAILED engine=vllm reason=test" in proc.stdout and "stage validate FAILED" in proc.stdout
+    assert not (world["home"] / ".cage_jobs" / "calibrate_vllm.cmd").exists()
+
+
+def test_validate_skips_the_largest_pool_start_when_the_plan_has_none_a11_item4(world: Dict[str, Path]) -> None:
+    proc = _master(world, "--yes", "provision", "--to", "validate")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    cmd = (world["home"] / ".cage_jobs" / "validate_vllm.cmd").read_text(encoding="utf-8")
+    assert "pool-check" not in cmd and "env bash scripts/2_serving/manage_vllm_server.sh start" in cmd
+    assert "no budgeted single-GPU pool in the plan; the largest-pool start is skipped (A11 item 4)" in proc.stdout
+
+
 def test_validate_fails_when_the_thinking_pin_probe_fails(world: Dict[str, Path]) -> None:
     # S0F-59 (ADR-0151): the served text still carries the thinking marker (the
     # 2026-10-08 landing's SGLang shape): stage 4 fails and names the probe.
@@ -1771,7 +1817,8 @@ def test_the_scoring_batch_size_reaches_the_pass_only_when_the_profile_sets_it_g
     proc = _master(world, "--only", "score", "--redo")
     assert proc.returncode == 0, proc.stdout[-3000:]
     cmd = (world["home"] / ".cage_jobs" / "score.cmd").read_text(encoding="utf-8")
-    assert "--freeze-file MyDocs/registration/freeze_resolutions.json --batch-size 32; }" in cmd
+    # A15 (2026-10-21): the run-level score cache sits between the freeze file and the batch size
+    assert re.search(r"--freeze-file MyDocs/registration/freeze_resolutions\.json --score-cache-dir logs/score_cache/\S+ --batch-size 32; \}", cmd), cmd[-600:]
 
 
 def test_a_recorded_conductor_pod_passes_the_clean_room_and_the_zero_proof_g8(world: Dict[str, Path]) -> None:
@@ -1786,3 +1833,48 @@ def test_a_recorded_conductor_pod_passes_the_clean_room_and_the_zero_proof_g8(wo
     proc = _master(world, "--yes", "provision", "--yes", "teardown", CAGE_TEST_PODS='[{"id": "cond1"}]')
     assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-1500:]
     assert _state(world)["stages"]["teardown"]["status"] == "passed"
+
+
+def test_the_plan_job_carries_the_profiles_last_block_owner_2026_10_21(world: Dict[str, Path]) -> None:
+    proc = _master(world, "--yes", "provision", "--to", "plan", LAST_BLOCK="L5")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    plan_cmd = (world["home"] / ".cage_jobs" / "plan.cmd").read_text(encoding="utf-8")
+    assert " --last-block L5 --out results/calibration/plan_" in plan_cmd
+
+
+def test_the_budget_deadline_is_fixed_at_the_first_submit_review_2026_10_21_m1(world: Dict[str, Path]) -> None:
+    proc = _master(world, "--yes", "provision", "--to", "run", RUN_BUDGET_HOURS="5")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    epoch = _state(world)["run"]["stop_at_epoch"]
+    assert f"--stop-at-epoch {epoch}" in (world["home"] / ".cage_jobs" / "run.cmd").read_text(encoding="utf-8")
+    # a resubmit (here, a redone run stage) keeps the first deadline, never re-arms the cap
+    proc = _master(world, "--only", "run", "--redo", RUN_BUDGET_HOURS="5")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    assert f"--stop-at-epoch {epoch}" in (world["home"] / ".cage_jobs" / "run.cmd").read_text(encoding="utf-8")
+
+
+def test_a_pinned_profile_without_a_served_model_revision_is_refused_review_2026_10_21_l2(world: Dict[str, Path], tmp_path: Path) -> None:
+    pinned = tmp_path / "S1_pin.env"
+    pinned.write_text(world["profile"].read_text(encoding="utf-8") + "\nPIN_MODEL_REVISION=1\n", encoding="utf-8")
+    world["profile"] = pinned
+    proc = _master(world)  # the world freeze file has no served_model slot
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "PIN_MODEL_REVISION=1-but-no-served_model-revision-for-" in proc.stdout
+    assert not any("provision_pod" in c for c in _calls(world))
+
+
+def test_validate_runs_the_helpers_beside_sglang_at_the_largest_helper_pool_review_2026_10_21_h1(world: Dict[str, Path], tmp_path: Path) -> None:
+    two = tmp_path / "S1_two.env"
+    two.write_text(world["profile"].read_text(encoding="utf-8").replace('ENGINES="vllm hf"', 'ENGINES="vllm sglang hf"'), encoding="utf-8")
+    world["profile"] = two
+    proc = _master(world, "--yes", "provision", "--to", "validate", CAGE_TEST_HELPER_POOL="1")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    cmd = (world["home"] / ".cage_jobs" / "validate_sglang.cmd").read_text(encoding="utf-8")
+    second = cmd.index("env CAGE_SGLANG_MAX_TOTAL_TOKENS=70437 VLLM_MAX_MODEL_LEN=8192 bash scripts/2_serving/manage_sglang_server.sh start")
+    first_stop = cmd.index("manage_sglang_server.sh stop")
+    assert first_stop < second  # the second start follows the first stop
+    for probe in ("pool-check --engine sglang --planned-tokens 70437", "probe_reranker_device.py", "probe_compressor_device.py", "probe_encoder_device.py"):
+        assert second < cmd.index(probe, second) < cmd.rindex("manage_sglang_server.sh stop"), probe
+    assert "the GPU helpers fit beside SGLang at the largest helper-cell pool (70437 tokens)" in proc.stdout
+    assert "RETRACTION_COUNTER_DECLARED" in (world["exp_root"] / "S1" / DATE / "logs" / "setup" / "validate_sglang.log").read_text(encoding="utf-8")
+    assert "env CAGE_SGLANG_MAX_TOTAL_TOKENS=70437" not in (world["home"] / ".cage_jobs" / "validate_vllm.cmd").read_text(encoding="utf-8")

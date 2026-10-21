@@ -280,3 +280,52 @@ def test_dataclass_replace_keeps_the_pool_validation() -> None:
     grid = rc.SESSION_GRIDS["a"]
     with pytest.raises(rc.PlanError, match="window_pool_n"):
         dataclasses.replace(grid, window_pool_n={"qasper": -1})
+
+
+# --------------------------------------------------------------------------- #
+# A15 (owner 2026-10-20): the run-level score cache across windows and resumes
+# --------------------------------------------------------------------------- #
+
+
+def test_a_second_window_reuses_the_run_cache_and_scores_match(tmp_path: Path) -> None:
+    cache = rq.ScoreCache(tmp_path / "cache", fingerprint="setup-1")
+    first_ev = _write_evidence(tmp_path / "w1" / "qa_evidence.jsonl", REPLAYED_WINDOW)
+    second_ev = _write_evidence(tmp_path / "w2" / "qa_evidence.jsonl", REPLAYED_WINDOW)
+    plain, _ = rq._score_evidence_file(second_ev, _CountingEvaluator())  # no cache: the reference
+    evaluator = _CountingEvaluator()
+    rq._score_evidence_file(first_ev, evaluator, cache=cache)
+    rows, _ = rq._score_evidence_file(second_ev, evaluator, cache=cache)
+    assert evaluator.scored == [["blue", "green", "red"]]  # the second window called the model for nothing
+    assert [r["quality_source"] for r in rows] == ["inherited:run-cache", "inherited:run-cache", "inherited:0", "inherited:run-cache"]
+    for got, want in zip(rows, plain):
+        assert got["exact_match"] == want["exact_match"] and got["f1_score"] == want["f1_score"]
+
+
+def test_the_cache_never_crosses_a_setup_or_trusts_a_damaged_record(tmp_path: Path) -> None:
+    ev = _write_evidence(tmp_path / "w" / "qa_evidence.jsonl", REPLAYED_WINDOW)
+    rq._score_evidence_file(ev, _CountingEvaluator(), cache=rq.ScoreCache(tmp_path / "c", "setup-1"))
+    other = _CountingEvaluator()
+    rq._score_evidence_file(ev, other, cache=rq.ScoreCache(tmp_path / "c", "setup-2"))
+    assert other.scored == [["blue", "green", "red"]]  # another setup scores again
+    for path in (tmp_path / "c").glob("*.json"):
+        path.write_text('{"key": "forged", "value": {}}', encoding="utf-8")
+    again = _CountingEvaluator()
+    rq._score_evidence_file(ev, again, cache=rq.ScoreCache(tmp_path / "c", "setup-1"))
+    assert again.scored == [["blue", "green", "red"]]  # a record whose key does not echo is recomputed
+
+
+def test_a_new_scoring_pass_never_inherits_the_old_pass_review_2026_10_21_m4(tmp_path, monkeypatch) -> None:
+    import argparse
+
+    def fp(run_id, checker=None):
+        if checker is None:
+            monkeypatch.delenv("CAGE_CLAIM_CHECKER", raising=False)
+        else:
+            monkeypatch.setenv("CAGE_CLAIM_CHECKER", checker)
+        d = tmp_path / f"c_{run_id}_{checker}"
+        args = argparse.Namespace(score_cache_dir=str(d), full=True, device="cuda", freeze_file=None,
+                                  native_only_datasets=None, scoring_run_id=run_id)
+        return rq._score_cache(args, 32).fingerprint
+
+    assert fp("full-cuda-1") != fp("full-cuda-2")  # the remedy for a scorer bug is a new id
+    assert fp("full-cuda-1") != fp("full-cuda-1", checker="minicheck")  # env-driven scorer setting

@@ -141,6 +141,9 @@ def parse_args() -> argparse.Namespace:
                    help="Load the full metric stack (LettuceDetect/NLI/BERTScore). "
                         "Default is fast mode: model-free metrics + abstention short-circuit only.")
     p.add_argument("--device", default="cpu", help="Device for --full mode (cpu|cuda).")
+    p.add_argument("--score-cache-dir", default=None, dest="score_cache_dir",
+                   help="A15: the run-level score cache folder (one score per distinct "
+                        "input across windows and resumes); unset = no cache")
     p.add_argument("--out-name", default="results_rescored.csv",
                    help="Output CSV filename written next to each qa_evidence.jsonl "
                         "(legacy layout only).")
@@ -826,6 +829,88 @@ def _unscored_metrics() -> dict[str, Any]:
     return out
 
 
+class _CachedMetrics:
+    """A cached metric record standing in for QualityMetrics (only to_dict is read)."""
+
+    def __init__(self, record: dict[str, Any]) -> None:
+        self._record = dict(record)
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(self._record)
+
+
+class ScoreCache:
+    """A15 (owner 2026-10-20): one score per distinct scoring input for the
+    whole run, reused across windows and resumes. The key is the E18 input
+    hash plus the scoring setup (``fingerprint``: mode, device, batch size,
+    instrument pins, native-only datasets) and the window's scope, so a score
+    never crosses a setup. Each record echoes its key (a mismatch or a
+    damaged file is recomputed, never trusted); writes are atomic. Scores are
+    identical with the cache on or off: a hit returns the stored output of
+    the identical computation."""
+
+    def __init__(self, directory: Path, fingerprint: str) -> None:
+        self.directory = Path(directory)
+        self.fingerprint = fingerprint
+        self.hits = 0
+        self.misses = 0
+
+    def _key(self, kind: str, input_key: str, scope: str | None) -> str:
+        blob = json.dumps([self.fingerprint, scope, kind, input_key]).encode("utf-8")
+        return hashlib.sha256(blob).hexdigest()
+
+    def get(self, kind: str, input_key: str, scope: str | None) -> Any:
+        key = self._key(kind, input_key, scope)
+        path = self.directory / f"{key}.json"
+        if not path.is_file():
+            self.misses += 1
+            return None
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if record.get("key") != key or "value" not in record:
+                raise ValueError("key echo mismatch")
+        except (OSError, ValueError) as exc:
+            print(f"[rescore] score cache {path} unreadable ({exc}); scoring again (A15)")
+            self.misses += 1
+            return None
+        self.hits += 1
+        return record["value"]
+
+    def put(self, kind: str, input_key: str, scope: str | None, value: Any) -> None:
+        key = self._key(kind, input_key, scope)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        tmp = self.directory / f".{key}.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps({"key": key, "value": value}), encoding="utf-8")
+        os.replace(tmp, self.directory / f"{key}.json")
+
+
+_SCORE_CACHES: dict[str, ScoreCache] = {}
+
+
+def _score_cache(args: argparse.Namespace, batch_size: int | None) -> ScoreCache | None:
+    """A15: the run's one cache (None without --score-cache-dir); its
+    fingerprint is every setup input a score depends on beyond the row."""
+    directory = getattr(args, "score_cache_dir", None)
+    if not directory:
+        return None
+    freeze = getattr(args, "freeze_file", None)
+    fingerprint = json.dumps({
+        "full": bool(getattr(args, "full", False)),
+        "device": getattr(args, "device", None),
+        "batch_size": batch_size,
+        "freeze_sha256": hashlib.sha256(Path(freeze).read_bytes()).hexdigest() if freeze else None,
+        "native_only": getattr(args, "native_only_datasets", None),
+        # review 2026-10-21 M4: a new scoring pass (the remedy for a scorer bug)
+        # never inherits the old pass's scores, nor across env-driven scorer settings
+        "scoring_run_id": getattr(args, "scoring_run_id", None),
+        "scorer_env": {k: v for k, v in sorted(os.environ.items())
+                       if k == "CAGE_CLAIM_CHECKER" or (k.startswith("CAGE_") and k.endswith("_REVISION"))},
+    }, sort_keys=True)
+    if directory not in _SCORE_CACHES:
+        _SCORE_CACHES[directory] = ScoreCache(Path(directory), fingerprint)
+    return _SCORE_CACHES[directory]
+
+
 def _score_evidence_file(
     ev_path: Path,
     evaluator: Any,
@@ -833,6 +918,7 @@ def _score_evidence_file(
     allow_duplicates: bool = False,
     blinder: LabelBlinder | None = None,
     scoring_scope: str | None = None,
+    cache: ScoreCache | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """Score every record of one qa_evidence.jsonl; shared by both layouts.
 
@@ -956,7 +1042,14 @@ def _score_evidence_file(
     for r in scored:
         r["_key"] = _scoring_input_key(r)
         representatives.setdefault(r["_key"], r)
-    to_score = list(representatives.values())
+    # A15: an input the run already scored (another window, a resume) reuses it
+    cached_metrics: dict[str, Any] = {}
+    if cache is not None:
+        for key in representatives:
+            hit = cache.get("metrics", key, scoring_scope)
+            if hit is not None:
+                cached_metrics[key] = _CachedMetrics(hit)
+    to_score = [r for k, r in representatives.items() if k not in cached_metrics]
 
     # Phase 2: ONE scoring call for both modes (over the distinct scorable inputs).
     metrics_list = evaluator.batch_evaluate(
@@ -975,6 +1068,10 @@ def _score_evidence_file(
             f"{len(to_score)} scored inputs; refusing to assign scores by position"
         )
     metrics_by_key = {r["_key"]: m for r, m in zip(to_score, metrics_list)}
+    if cache is not None:
+        for key, m in metrics_by_key.items():
+            cache.put("metrics", key, scoring_scope, m.to_dict())
+    metrics_by_key.update(cached_metrics)
     #: B3d dual-source scores, computed once per distinct input (E18)
     source_scores_by_key: dict[str, tuple[Any, Any]] = {}
 
@@ -994,6 +1091,8 @@ def _score_evidence_file(
             key = r["_key"]
             metrics = metrics_by_key[key].to_dict()
             quality_source = _quality_source_label(representatives[key], r)
+            if key in cached_metrics and quality_source == QUALITY_SOURCE_SCORED:
+                quality_source = f"{QUALITY_SOURCE_INHERITED}:run-cache"  # A15
             # B4: abstention is judged on the SANITIZED text ("A: I don't know." must
             # count), matching evaluate()'s internal gate. sanitized_answer also lands
             # in metrics via QualityMetrics.to_dict(); generated_answer stays raw.
@@ -1016,6 +1115,10 @@ def _score_evidence_file(
             and any(c and str(c).strip() for c in original_contexts)
             and not abstained
         ):
+            if r["_key"] not in source_scores_by_key and cache is not None:
+                hit = cache.get("source", r["_key"], scoring_scope)
+                if hit is not None:
+                    source_scores_by_key[r["_key"]] = tuple(hit)
             if r["_key"] not in source_scores_by_key:
                 src_ctx = [str(c) for c in original_contexts if c and str(c).strip()]
                 faith_src = evaluator.evaluate_faithfulness(sanitized, src_ctx)
@@ -1024,6 +1127,8 @@ def _score_evidence_file(
                     faith_src.get("faithfulness"),
                     halluc_src.get("grounding_score"),
                 )
+                if cache is not None:
+                    cache.put("source", r["_key"], scoring_scope, list(source_scores_by_key[r["_key"]]))
             faithfulness_source, grounding_source = source_scores_by_key[r["_key"]]
 
         old_g = rec.get("grounding_score")
@@ -1493,7 +1598,7 @@ def run_scoring_tree(root: Path, scoring_run_id: str, args: argparse.Namespace) 
             rows_out, n_dup = _score_evidence_file(
                 ev_path, native_evaluator if scope == SCOPE_NATIVE_ONLY else evaluator,
                 batch_size=batch_size, allow_duplicates=allow_duplicates, blinder=blinder,
-                scoring_scope=scope,
+                scoring_scope=scope, cache=_score_cache(args, batch_size),
             )
             # Task #130 (a): the unblind join: output artifacts carry REAL
             # labels; the join is bijective and checked (loud failure).
@@ -1692,7 +1797,7 @@ def main() -> int:
             rows_out, n_dup = _score_evidence_file(
                 ev_path, native_evaluator if scope == SCOPE_NATIVE_ONLY else evaluator,
                 batch_size=batch_size, allow_duplicates=allow_duplicates, blinder=blinder,
-                scoring_scope=scope,
+                scoring_scope=scope, cache=_score_cache(args, batch_size),
             )
         except DuplicateEvidenceError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)

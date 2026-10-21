@@ -46,8 +46,10 @@ class AAResult:
 
     @property
     def approximates_nominal(self) -> bool:
-        """True iff the exact CI for the FP rate covers the nominal α."""
-        return self.ci_low <= self.alpha <= self.ci_high
+        """A6 (owner 2026-10-20): one-sided. True unless the false-positive rate
+        is significantly ABOVE the nominal α (the exact CI's lower bound above
+        it); a conservative test passes, since it never inflates the error."""
+        return self.ci_low <= self.alpha
 
 
 @dataclass(frozen=True)
@@ -251,6 +253,90 @@ def aa_split_half(
         ci_low=ci_low,
         ci_high=ci_high,
     )
+
+
+def aa_repeat_pairs(
+    first: Sequence[float] | np.ndarray,
+    second: Sequence[float] | np.ndarray,
+    test_fn: TestFn,
+    n_resamples: int,
+    seed: int,
+    *,
+    alpha: float = 0.05,
+) -> AAResult:
+    """A6 A/A on repeats: ``first[i]`` and ``second[i]`` are ONE question's
+    outcomes in two repeated windows of the same arm (no real effect exists).
+    Each resample draws the questions with replacement, keeps the pairs, and
+    runs the paired ``test_fn`` (the McNemar path for the binary predicate);
+    the rejection rate carries an exact binomial CI."""
+    if n_resamples < 1:
+        raise CalibrationError(f"n_resamples must be >= 1, got {n_resamples}")
+    if not 0.0 < alpha < 1.0:
+        raise CalibrationError(f"alpha must be in (0, 1), got {alpha}")
+    a = _as_1d_float(first, min_n=4)
+    b = _as_1d_float(second, min_n=4)
+    if a.size != b.size:
+        raise CalibrationError(f"paired repeats differ in length ({a.size} vs {b.size})")
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, a.size, size=(n_resamples, a.size))
+    rejections = sum(
+        _check_p(test_fn(a[idx[i]], b[idx[i]]), f"A/A repeat resample {i}") < alpha
+        for i in range(n_resamples)
+    )
+    ci_low, ci_high = _rejection_ci(rejections, n_resamples)
+    return AAResult(
+        n_splits=n_resamples, alpha=alpha, n_rejections=rejections,
+        fp_rate=rejections / n_resamples, ci_low=ci_low, ci_high=ci_high,
+    )
+
+
+def recover_power_repeat_pairs(
+    first: Sequence[float] | np.ndarray,
+    second: Sequence[float] | np.ndarray,
+    test_fn: TestFn,
+    shift: float,
+    n_resamples: int,
+    seed: int,
+    *,
+    alpha: float = 0.05,
+) -> tuple[InjectionResult, int]:
+    """A6 power injection on repeats (owner 2026-10-21): each resample draws
+    the questions with replacement (pairs kept, as ``aa_repeat_pairs``), then
+    flips round(shift x n) of the second window's 0-outcomes to 1, so the
+    accepted share rises by ``shift`` (absolute) and every rejection is a true
+    positive. Returns the result (``effect_size`` = the absolute shift, no
+    target power: none is registered) and the number of resamples with too few
+    0-outcomes, whose flips were capped at the zeros available."""
+    if n_resamples < 1:
+        raise CalibrationError(f"n_resamples must be >= 1, got {n_resamples}")
+    if not 0.0 < alpha < 1.0:
+        raise CalibrationError(f"alpha must be in (0, 1), got {alpha}")
+    if not 0.0 < shift <= 1.0:
+        raise CalibrationError(f"shift is an absolute share in (0, 1], got {shift!r}")
+    a = _as_1d_float(first, min_n=4)
+    b = _as_1d_float(second, min_n=4)
+    if a.size != b.size:
+        raise CalibrationError(f"paired repeats differ in length ({a.size} vs {b.size})")
+    if not (np.isin(a, (0.0, 1.0)).all() and np.isin(b, (0.0, 1.0)).all()):
+        raise CalibrationError("the repeat-pair injection requires binary 0/1 outcomes")
+    rng = np.random.default_rng(seed)
+    n_flip = max(1, int(round(shift * a.size)))
+    rejections = capped = 0
+    for i in range(n_resamples):
+        idx = rng.integers(0, a.size, size=a.size)
+        injected = b[idx].copy()
+        zeros = np.flatnonzero(injected == 0.0)
+        k = min(n_flip, zeros.size)
+        capped += k < n_flip
+        if k:
+            injected[rng.choice(zeros, size=k, replace=False)] = 1.0
+        rejections += _check_p(test_fn(a[idx], injected), f"injection resample {i}") < alpha
+    ci_low, ci_high = _rejection_ci(rejections, n_resamples)
+    return InjectionResult(
+        effect_size=float(shift), kind="flip", n_splits=n_resamples, alpha=alpha,
+        n_rejections=rejections, power=rejections / n_resamples,
+        ci_low=ci_low, ci_high=ci_high, target_power=None,
+    ), capped
 
 
 def inject_effect(

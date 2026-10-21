@@ -167,6 +167,13 @@ def load_resolutions(path: Path, repo_root: Path) -> Dict[str, str]:
                 missing.append(f"{name} -> {src}")
             else:
                 resolved[name] = src.read_text(encoding="utf-8").rstrip("\n")
+        elif value is not None and not (isinstance(value, dict) and "source_file" in value):
+            # ADR-0175 item 7: the freeze file's structured values (QASPER_TAU,
+            # TAU_BAND, INSTRUMENT_REVISIONS) embed as canonical JSON
+            try:
+                resolved[name] = json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False)
+            except ValueError:
+                bad.append(f"{name!r} (a non-finite number cannot be registered: {value!r})")
         else:
             bad.append(
                 f"{name!r} (value must be a string or "

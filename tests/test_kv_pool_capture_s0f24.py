@@ -837,6 +837,47 @@ def test_sglang_launcher_raises_the_fraction_once_when_the_cap_exceeds_the_pool(
     assert f"--mem-fraction-static {m.group(1)}" in proc.stdout
 
 
+def test_sglang_launcher_starts_at_the_fraction_that_held_the_pool_a11_item6(stub_bin: Path, tmp_path: Path) -> None:
+    # A11 item 6 (owner 2026-10-21): the second capped start at the same pool
+    # begins at the fraction that held it, so it pays no failed start and retry.
+    log_root = tmp_path / "logroot"
+    python_stub = _fraction_aware_sglang(stub_bin)
+    env = dict(
+        SGLANG_START_TIMEOUT="10", CAGE_SGLANG_PYTHON=str(python_stub),
+        CAGE_SGLANG_MAX_TOTAL_TOKENS="298687",
+        CAGE_TEST_SHORT_LINES=_sg_log(282583) + SGLANG_READY_LINE,
+        CAGE_TEST_FULL_LINES=_sg_log(300000) + SGLANG_READY_LINE,
+        CAGE_TEST_READY_WHEN_LOGGED="KV Cache is allocated",
+    )
+
+    def launch(*args: str, **extra: str) -> subprocess.CompletedProcess:
+        proc = _run_launcher("manage_sglang_server.sh", stub_bin, log_root, *args, **{**env, **extra})
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return proc
+
+    first = launch("start", "fake/test-model")
+    held = re.search(r"restarting once at (0\.\d+) \(ADR-0162\)", first.stdout).group(1)
+    memo = log_root / "sglang" / "fraction_memo.tsv"
+    lines = memo.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1 and lines[0].endswith("\t" + held) and "|298687|" in lines[0]
+    launch("stop")
+    second = launch("start", "fake/test-model")
+    assert f"starting at --mem-fraction-static {held}, the fraction that held this pool before (A11 item 6)" in second.stdout
+    assert "restarting once" not in second.stdout
+    assert second.stdout.count("Server ready with model: fake/test-model") == 1
+    assert memo.read_text(encoding="utf-8").splitlines() == lines  # rewritten in place, not appended
+    # another pool is another key: the default start and the one retry run as before
+    launch("stop")
+    third = launch("start", "fake/test-model", CAGE_SGLANG_MAX_TOTAL_TOKENS="298000")
+    assert "A11 item 6" not in third.stdout and "restarting once" in third.stdout
+    assert len(memo.read_text(encoding="utf-8").splitlines()) == 2
+    # a remembered value that is not a fraction in (0, 1] is never used
+    launch("stop")
+    memo.write_text(lines[0].rsplit("\t", 1)[0] + "\t1.7\n", encoding="utf-8")
+    fourth = launch("start", "fake/test-model")
+    assert "A11 item 6" not in fourth.stdout and "restarting once" in fourth.stdout
+
+
 def test_sglang_launcher_refuses_when_the_raised_fraction_is_still_short(stub_bin: Path, tmp_path: Path) -> None:
     log_root = tmp_path / "logroot"
     python_stub = _fraction_aware_sglang(stub_bin)
@@ -848,7 +889,7 @@ def test_sglang_launcher_refuses_when_the_raised_fraction_is_still_short(stub_bi
         CAGE_TEST_FULL_LINES=_sg_log(290000) + SGLANG_READY_LINE,
         CAGE_TEST_READY_WHEN_LOGGED="KV Cache is allocated",
     )
-    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert proc.returncode == 75, proc.stdout + proc.stderr  # A11 item 3: POOL_REFUSED_EXIT
     assert "KV pool still short of --max-total-tokens 298687" in proc.stdout
     assert "refusing to serve a smaller pool than planned" in proc.stdout
     assert proc.stdout.count("Server stopped") == 2
@@ -869,7 +910,7 @@ def test_sglang_launcher_refuses_at_once_when_no_higher_fraction_exists(stub_bin
         CAGE_TEST_FULL_LINES=_sg_log(282583) + SGLANG_READY_LINE,
         CAGE_TEST_READY_WHEN_LOGGED="KV Cache is allocated",
     )
-    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert proc.returncode == 75, proc.stdout + proc.stderr  # A11 item 3: POOL_REFUSED_EXIT
     assert "no higher fraction is available" in proc.stdout
     assert "restarting once" not in proc.stdout
     assert proc.stdout.count("Server args:") == 1 and proc.stdout.count("Server stopped") == 1

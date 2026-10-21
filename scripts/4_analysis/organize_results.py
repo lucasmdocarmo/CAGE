@@ -98,8 +98,8 @@ _ARTIFACT_SEP = ";"
 #: never diverge (the pilot "synced to a bucket that didn't exist" bug class).
 RUN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,40}$")
 
-#: §1 session vocabulary (RUNBOOK §1.1).
-SESSIONS: frozenset[str] = frozenset({"a", "b", "cd-act1", "cd-act2"})
+#: §1 session vocabulary (RUNBOOK §1.1); "s1" is the Run 2 session (ADR-0175).
+SESSIONS: frozenset[str] = frozenset({"a", "b", "cd-act1", "cd-act2", "s1"})
 
 #: §6 scoring-tree contract (offline quality passes; validated, never indexed).
 SCORING_DIRNAME = "scoring"
@@ -508,7 +508,8 @@ def dry_window_skip_reasons(cell_dir: Path) -> list[str] | None:
     is the FAIL case of that function (owner ruling R15).
     """
     reasons = sentinel_only_reasons(cell_dir)
-    if reasons is None or not all(r.split(": ", 1)[1].startswith("dry-window-") for r in reasons):
+    # ADR-0175: a cell the registered budget stop left unrun is a SKIP too
+    if reasons is None or not all(r.split(": ", 1)[1].startswith(("dry-window-", "budget-stop")) for r in reasons):
         return None
     return reasons
 

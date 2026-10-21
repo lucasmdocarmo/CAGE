@@ -71,6 +71,7 @@ from src.orchestration.ir import (
     IRDocument,
     IRHit,
     build_corpus_from_contexts,
+    corpus_doc_ids_sha1,
     ensure_ir_index,
     ensure_bm25_index,
     default_index_dir,
@@ -1595,6 +1596,8 @@ class DenseRetrieval:
     cached: bool
     reranked: bool
     pool_size: Optional[int]
+    # A9 item 1: the cross-encoder's share of the retrieval step (None when no rerank ran)
+    rerank_ms: Optional[float] = None
 
 
 def resolve_rerank_pool(
@@ -1718,14 +1721,19 @@ def dense_retrieve(
             )
 
     reranked = False
+    rerank_ms: Optional[float] = None
     if reranker is not None and hits:
+        _t0 = time.perf_counter()
         hits = list(reranker.rerank(question, hits, ir_index))
+        rerank_ms = (time.perf_counter() - _t0) * 1000.0
         reranked = True
 
     if pool is not None:
         hits = hits[:top_k]
 
-    return DenseRetrieval(hits=hits, cached=cached, reranked=reranked, pool_size=pool)
+    return DenseRetrieval(
+        hits=hits, cached=cached, reranked=reranked, pool_size=pool, rerank_ms=rerank_ms
+    )
 
 
 def derive_corpus_prompt_prefix(build_prompt: Any) -> str:
@@ -2665,6 +2673,11 @@ def run_experiment(
     # Reranker
     reranker_model: Optional[str],
     reranker_device: str,
+    # A14 (ADR-0174 amendment 2026-10-20): where the dense encoder and the
+    # text compressor run; campaign cells pin cuda (preparation only, before
+    # every measured window). The CPU default keeps every other caller as it was.
+    encoder_device: str = "cpu",
+    compressor_device: str = "cpu",
     # ADR-0104 rerank pool: retrieve a dense candidate POOL of this many
     # hits, rerank it whole with the cross-encoder, serve top_k. None (the
     # default) = legacy behavior, rerank exactly the top_k hits. A pool
@@ -3472,17 +3485,13 @@ def run_experiment(
     ir_index = None
     bm25_index = None
     corpus_docs = None
+    ir_index_record: Optional[Dict[str, Any]] = None
     if baseline_config.use_faiss or context_source == "retrieved":
         if retriever == "dense":
             print("\nBuilding/loading IR index (FAISS)...")
         else:
             print(f"\nBuilding/loading IR index(es) for retriever={retriever}...")
         base_dir = Path(baseline_config.ir_index_dir)
-        index_dir = default_index_dir(
-            base_dir=base_dir,
-            dataset_name=dataset,
-            embedding_model=baseline_config.embedding_model,
-        )
         corpus_docs = build_corpus_from_contexts(base_examples, dataset_name=dataset)
         # Decision 3B (approved pre-run package, 2026-07-16): widen the retrieval corpus
         # with a deterministic distractor pool so retrieval is a real search problem, not
@@ -3526,6 +3535,15 @@ def run_experiment(
                 f"(requested {_n_distractors}, gold excluded, content-deduped)"
             )
         print(f"IR corpus documents: {len(corpus_docs)}")
+        # A14 item 3: one index folder per document set (the corpus content
+        # hash), computed after the distractors join the corpus.
+        _corpus_sha1 = corpus_doc_ids_sha1(corpus_docs)
+        index_dir = default_index_dir(
+            base_dir=base_dir,
+            dataset_name=dataset,
+            embedding_model=baseline_config.embedding_model,
+            corpus_sha1=_corpus_sha1,
+        )
         # Dense (FAISS) leg: the pre-existing default, also required by
         # hybrid-rrf. A bm25-only run skips the embedding-model load entirely.
         if retriever in {"dense", "hybrid-rrf"}:
@@ -3534,10 +3552,21 @@ def run_experiment(
                 documents=corpus_docs,
                 embedding_model=baseline_config.embedding_model,
                 rebuild=bool(baseline_config.ir_rebuild),
-                device="cpu",
+                device=encoder_device,
                 embedding_revision=embedding_revision,
             )
-            print(f"IR index ready at: {index_dir}")
+            # A9 item 2: the index this cell served, built here or loaded, once
+            _build_s = getattr(ir_index, "build_s", None)
+            ir_index_record = {
+                "dir": str(index_dir),
+                "corpus_sha1": _corpus_sha1,
+                "num_documents": len(corpus_docs),
+                "built": _build_s is not None,
+                "build_s": _build_s,
+                "device": encoder_device,
+            }
+            print(f"IR index ready at: {index_dir}"
+                  + (f" (built in {_build_s:.1f} s on {encoder_device})" if _build_s is not None else " (loaded)"))
         # Lexical (BM25) leg over the SAME chunk store (charter sec. 7.2;
         # Robertson & Zaragoza 2009 [robertson2009bm25]).
         if retriever in {"bm25", "hybrid-rrf"}:
@@ -3586,7 +3615,7 @@ def run_experiment(
     context_compressor = None
     if baseline_config.compress_method:
         from src.orchestration.compression import ContextCompressor
-        context_compressor = ContextCompressor(method=baseline_config.compress_method, device="cpu")
+        context_compressor = ContextCompressor(method=baseline_config.compress_method, device=compressor_device)
         print(f"Text compression enabled: {baseline_config.compress_method} "
               f"(keep ratio {baseline_config.compress_target_ratio})")
 
@@ -3841,6 +3870,13 @@ def run_experiment(
                 print(f"[routing] Failed to reshuffle replicas: {e}")
 
     def prepare_example(example: CAGExample) -> Dict[str, Any]:
+        # A9 item 1 (owner 2026-10-20): this request's preparation span, all of
+        # it before the window clock; retrieval_ms is the whole retrieval step
+        # and rerank_ms its cross-encoder share (dense path; None elsewhere).
+        prep_start_ts = time.time()
+        _prep_t0 = time.perf_counter()
+        retrieval_ms: Optional[float] = None
+        rerank_ms: Optional[float] = None
         question = example.question
         baseline_mode = baseline_config.baseline_type.value
         used_contexts: List[str] = list(example.context or [])
@@ -3873,6 +3909,7 @@ def run_experiment(
             # Stage-tagged BM25 / hybrid-RRF retrieval (charter sec. 7.2 /
             # sec. 8.2). The redis/hybrid retrieval-cache baselines were
             # refused up front, so no cache read/write happens on this path.
+            _ret_t0 = time.perf_counter()
             hits, _stage = stage_tagged_retrieve(
                 question,
                 retriever=retriever,
@@ -3889,6 +3926,7 @@ def run_experiment(
             retrieval_top1_score = hits[0].score if hits else 0.0
             retrieved_docs = bm25_index.resolve_hits(hits)
             used_contexts = [d.text for d in retrieved_docs]
+            retrieval_ms = (time.perf_counter() - _ret_t0) * 1000.0
 
             gold_doc_ids = _gold_ids
             retrieval_hit = retrieval_hit_rate(
@@ -3909,6 +3947,7 @@ def run_experiment(
 
             # Dense path: search (pool or top_k), optional Redis retrieval
             # cache, rerank, serve (ADR-0104 ordering lives in dense_retrieve).
+            _ret_t0 = time.perf_counter()
             _dense = dense_retrieve(
                 question,
                 ir_index=ir_index,
@@ -3931,6 +3970,8 @@ def run_experiment(
 
             retrieved_docs = ir_index.resolve_hits(hits)
             used_contexts = [d.text for d in retrieved_docs]
+            retrieval_ms = (time.perf_counter() - _ret_t0) * 1000.0
+            rerank_ms = _dense.rerank_ms
 
             gold_doc_ids = _gold_ids
             retrieval_hit = retrieval_hit_rate(
@@ -3989,6 +4030,11 @@ def run_experiment(
                 evidence_version = "v1"
                 used_contexts = _fresh
 
+        # A8 item 2 (owner 2026-10-20): a capped configuration (retr-trunc)
+        # keeps its uncapped documents as the source side of served-versus-
+        # source scoring; a cap that removes nothing gives a zero difference.
+        _capped = bool((max_context_chars or 0) > 0 or (max_context_docs or 0) > 0)
+        original_contexts: Optional[List[str]] = list(used_contexts) if _capped else None
         # Apply context caps before compression so the reported compression ratio is
         # measured against the context actually served, not a pre-truncation superset.
         if max_context_chars is not None and max_context_chars > 0:
@@ -4009,13 +4055,19 @@ def run_experiment(
                 gold_position_in_prompt = _pos
                 break
 
+        # A8 item 2: a corpus truncation rung (corpus-trunc) keeps the full
+        # block of the same block id, the documents the rung cut.
+        if _meta.get("corpus_rung") is not None and _manifest is not None:
+            original_contexts = [_manifest["blocks"][_meta["corpus_block"]]["text"]]
+
         # Text compression (compressed_rag): compress the already-capped context.
         # The PRE-compression served docs are preserved as original_contexts -- the
-        # qa_evidence.jsonl contract field the offline scorer reads for compression arms.
+        # qa_evidence.jsonl contract field the offline scorer reads for compression arms
+        # (under a cap as well, the uncapped documents above stay the source).
         compression_stats = None
-        original_contexts: Optional[List[str]] = None
         if context_compressor is not None:
-            original_contexts = list(used_contexts)
+            if original_contexts is None:
+                original_contexts = list(used_contexts)
             used_contexts, cstats = context_compressor.compress(
                 used_contexts, question=question,
                 target_ratio=baseline_config.compress_target_ratio,
@@ -4043,7 +4095,16 @@ def run_experiment(
             "compression_stats": compression_stats,
             "evidence_version": evidence_version,
             "served_from_cache": served_from_cache,
+            "prep_start_ts": prep_start_ts,
+            "prep_end_ts": time.time(),
+            "prep_ms": (time.perf_counter() - _prep_t0) * 1000.0,
+            "retrieval_ms": retrieval_ms,
+            "rerank_ms": rerank_ms,
         }
+
+    def _prep_timing(meta: Dict[str, Any]) -> Dict[str, Any]:
+        """A9 item 1: the preparation columns every row carries, stubs included."""
+        return {k: meta.get(k) for k in ("prep_start_ts", "prep_end_ts", "prep_ms", "retrieval_ms", "rerank_ms")}
 
     def record_result(
         example: CAGExample,
@@ -4274,6 +4335,10 @@ def run_experiment(
             # Audit fix B3b (2026-07-16): per-query compression CPU time -- LLMLingua-2's own
             # speedup claims INCLUDE it, so e2e comparisons must be able to add it back.
             "compression_latency_ms": (meta.get("compression_stats") or {}).get("compression_latency_ms"),
+            # A14 item 2: True when the run memo served this input (the latency
+            # above is then the original computation's); None without a memo.
+            "compression_cache_hit": (meta.get("compression_stats") or {}).get("compression_cache_hit"),
+            **_prep_timing(meta),
             **_quality_row,
             **_ruler_row,  # ADR-0170: RULER rows only
         }
@@ -4327,8 +4392,10 @@ def run_experiment(
                 "generated_answer": response.generated_text,
                 "used_contexts": used_contexts,
                 # CONTRACT field (pre-run package task 6): for compression arms this is
-                # the PRE-compression served docs (list[str]); None for the other arms.
-                # The offline scorer (rescore_quality.py) consumes this exact field name.
+                # the PRE-compression served docs (list[str]); A8 (2026-10-20) adds the
+                # uncapped docs of a capped arm and the full block of a corpus rung;
+                # None for the other arms. The offline scorer (rescore_quality.py)
+                # consumes this exact field name.
                 "original_contexts": meta.get("original_contexts"),
                 "mean_token_logprob": mean_token_logprob,
                 "sum_token_logprob": sum_token_logprob,
@@ -4383,6 +4450,29 @@ def run_experiment(
             append_evidence_row(
                 os.path.join(output_dir, "qa_evidence.jsonl"), _evidence, evidence_failures
             )
+
+    # A14 item 6 / A9 item 4 (owner 2026-10-20): the GPU-resident preparation
+    # models leave the GPU once the measured set is prepared, before its first
+    # send; each reloads lazily on its own device if anything prepares again.
+    # Helpers on the CPU stay (they hold no GPU memory).
+    prep_helpers_released: List[str] = []
+
+    def release_prep_helpers() -> None:
+        for name, helper, device in (
+            ("encoder", ir_index, encoder_device),
+            ("compressor", context_compressor, compressor_device),
+            ("reranker", reranker, reranker_device),
+        ):
+            if helper is not None and str(device).startswith("cuda") and helper.release():
+                prep_helpers_released.append(name)
+        if prep_helpers_released:
+            import gc
+
+            import torch
+
+            gc.collect()
+            torch.cuda.empty_cache()  # returns the freed blocks to the driver, so the engine process can use them
+            print(f"[prep] released {', '.join(prep_helpers_released)} from the GPU before the measured window (A14)")
 
     def execute_work_units(
         units: List[List[CAGExample]],
@@ -4459,6 +4549,8 @@ def run_experiment(
                 requests_u.append(request)
                 kept_u.append(example)
             prepared_units.append((kept_u, metas_u, requests_u))
+        if collect_results:
+            release_prep_helpers()
 
         for unit_index, unit in enumerate(units):
             batch_id += 1
@@ -4730,6 +4822,7 @@ def run_experiment(
                     "no pre-load request could be drawn or prepared (S0F-88 U3): the "
                     "window would start without its registered steady-state load",
                 )
+        release_prep_helpers()
         print(
             f"Open-loop dispatch: rate={open_loop_rate_qps} qps, "
             f"duration_s={open_loop_duration_s}, n_arrivals={open_loop_num_arrivals}, "
@@ -4805,6 +4898,7 @@ def run_experiment(
                     "is_impossible": (
                         example.metadata if isinstance(example.metadata, dict) else {}
                     ).get("is_impossible"),
+                    **_prep_timing(meta),
                 }
                 merge_open_loop_row(stub_row, record)
                 results.append(stub_row)
@@ -5663,6 +5757,30 @@ def run_experiment(
             # B-6 (S0F-88): where the cross-encoder ran (campaign rerank cells
             # pin cuda since R8); None when no reranker served the cell.
             "reranker_device": reranker_device if reranker is not None else None,
+            # A14 (ADR-0174 amendment 2026-10-20): where the encoder and the
+            # compressor ran, the compressor's pinned commit and run memo, and
+            # which GPU helpers left the GPU before the window (A9 item 4).
+            "encoder_device": encoder_device if ir_index is not None else None,
+            "compressor_device": compressor_device if context_compressor is not None else None,
+            "compressor_revision": getattr(context_compressor, "revision", None),
+            "compression_cache_dir": (
+                str(context_compressor.cache_dir)
+                if context_compressor is not None and context_compressor.cache_dir is not None
+                else None
+            ),
+            "prep_helpers_released": list(prep_helpers_released),
+            # A9 item 2: the dense index served, built here or loaded (None without one).
+            "ir_index": ir_index_record,
+            # A10 (owner 2026-10-20): the served model's pinned revision this
+            # window ran at (None off a pinned profile)
+            "model_revision": (os.environ.get("CAGE_MODEL_REVISION") or "").strip() or None,
+            # A11 item 2: the campaign driver's realized-pool check of the
+            # relaunch this window served under (None off the campaign path,
+            # budget-free or not single-GPU).
+            "realized_pool": (
+                json.loads(os.environ["CAGE_REALIZED_POOL_JSON"])
+                if os.environ.get("CAGE_REALIZED_POOL_JSON") else None
+            ),
         },
         "workload": {
             "repeat_queries": repeat_queries,
@@ -6796,6 +6914,18 @@ def main():
         help="Device for reranker model (e.g., cpu or cuda)",
     )
     parser.add_argument(
+        "--encoder-device",
+        default="cpu",
+        help="A14: device for the dense encoder (index build and query encoding); "
+             "campaign retrieval cells pass cuda.",
+    )
+    parser.add_argument(
+        "--compressor-device",
+        default="cpu",
+        help="A14: device for the text compressor (float32 on any device); "
+             "campaign compression cells pass cuda.",
+    )
+    parser.add_argument(
         "--rerank-pool",
         type=int,
         default=None,
@@ -6894,6 +7024,14 @@ def main():
         help="Number of independent trials to run (for statistical rigor, use >=3)",
     )
     parser.add_argument(
+        "--trial-index",
+        type=int,
+        default=None,
+        help="B1 (owner 2026-10-20, round-robin replicates): run trial K of --num-trials "
+             "alone (its manifest trial, seed, warm-up draw and window ordinal); campaign "
+             "mode only. Unset = every trial in order.",
+    )
+    parser.add_argument(
         "--warmup-queries",
         type=int,
         default=0,
@@ -6914,6 +7052,8 @@ def main():
     )
 
     args = parser.parse_args()
+    if args.trial_index is not None and not 1 <= args.trial_index <= args.num_trials:
+        parser.error(f"--trial-index {args.trial_index} must lie in 1..--num-trials {args.num_trials}")
     # S0F-17: the retriever/baseline refusal runs HERE, before the campaign
     # activation below, before the per-window resume SKIP inside _run_trials
     # and before its strict cache flush (the first engine contact), so a
@@ -7040,6 +7180,8 @@ def main():
             routing_switch_at=args.routing_switch_at,
             reranker_model=reranker_model,
             reranker_device=args.reranker_device,
+            encoder_device=args.encoder_device,
+            compressor_device=args.compressor_device,
             rerank_pool=args.rerank_pool,
             truncate_prompt_tokens=args.truncate_prompt_tokens,
             max_context_chars=args.max_context_chars,
@@ -7063,6 +7205,8 @@ def main():
 
     def _run_trials(top_k_value: int) -> None:
         """Run multiple trials and aggregate results."""
+        if args.trial_index is not None and campaign_session is None:
+            raise SystemExit("--trial-index runs one window of a campaign cell (B1); the pilot path refuses it")
         if args.num_trials == 1 and campaign_session is None:
             # Single trial - run normally (pilot path). Campaign mode always
             # takes the trial loop below so trial 1 gets its per-window resume
@@ -7083,9 +7227,12 @@ def main():
             # ordinal collisions; complete windows stay untouched and are
             # SKIPPED below — re-invoking on a half-written cell completes it
             # without re-serving (or duplicating) a single row.
-            campaign_session.reset_incomplete_windows()
+            campaign_session.reset_incomplete_windows(only=args.trial_index)
 
-        for trial in range(1, args.num_trials + 1):
+        trials: Sequence[int] = (
+            [args.trial_index] if args.trial_index is not None else range(1, args.num_trials + 1)
+        )
+        for trial in trials:
             print(f"\n--- Trial {trial}/{args.num_trials} (seed={args.seed + trial - 1}) ---\n")
             # Manifest mode reads the trial's pre-drawn query ids by trial NUMBER (the
             # seed offset stays for generation-side reproducibility).
@@ -7171,6 +7318,8 @@ def main():
                 routing_switch_at=args.routing_switch_at,
                 reranker_model=reranker_model,
                 reranker_device=args.reranker_device,
+                encoder_device=args.encoder_device,
+                compressor_device=args.compressor_device,
                 rerank_pool=args.rerank_pool,
                 truncate_prompt_tokens=args.truncate_prompt_tokens,
                 max_context_chars=args.max_context_chars,

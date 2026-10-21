@@ -293,6 +293,8 @@ start_server() {
     # source the config still serves the uniform regime -- the old 8192/0.92 fallbacks
     # silently diverged on manual restarts (2026-07-15 audit, serving-uniformity gap).
     vllm_args+=( --max-model-len "${VLLM_MAX_MODEL_LEN:-4096}" )
+    # A10: the pinned revision (offline, from the prefetched snapshot) when set
+    [ -n "${CAGE_MODEL_REVISION:-}" ] && vllm_args+=( --revision "$CAGE_MODEL_REVISION" )
     vllm_args+=( --gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION:-0.90}" )
 
     # Bytes-denominated KV budget (T2.1; CacheBudgetPlanner primary vLLM knob).

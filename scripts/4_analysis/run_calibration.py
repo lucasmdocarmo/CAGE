@@ -122,7 +122,8 @@ class CalibrationCLIError(RuntimeError):
 
 def wilcoxon_p(a: np.ndarray, b: np.ndarray) -> float:
     """The campaign's continuous paired-test path (§9.4), as a TestFn."""
-    return float(paired_wilcoxon(a, b, alternative="two-sided").p_value)
+    # A6 (owner 2026-10-20): the registered zero method, as the analysis uses
+    return float(paired_wilcoxon(a, b, alternative="two-sided", zero_method="pratt").p_value)
 
 
 def mcnemar_p(a: np.ndarray, b: np.ndarray) -> float:
@@ -560,7 +561,94 @@ def self_check(report_path: Path) -> dict[str, Any]:
     return rca.check_calibration(loaded, Path(report_path))
 
 
+def campaign_repeat_pairs(predicate_root: Path) -> dict[str, tuple[list[float], list[float]]]:
+    """A6: per (cell, dataset), the binary predicate of each question in the
+    cell's first two windows, paired by example_id (first record of each id,
+    null verdicts dropped). ``predicate_root`` is <run>/predicate/<scoring id>."""
+    out: dict[str, tuple[list[float], list[float]]] = {}
+    for cell in sorted((Path(predicate_root) / "cells").iterdir()):
+        windows: dict[str, list[Path]] = {}
+        for w in sorted(cell.glob("window_*")):
+            windows.setdefault(w.name.rsplit("-", 1)[0], []).append(w)
+        for prefix, ws in windows.items():
+            if len(ws) < 2:
+                continue
+            def _rows(w: Path) -> dict[str, float]:
+                got: dict[str, float] = {}
+                for line in (w / "predicate.jsonl").read_text(encoding="utf-8").splitlines():
+                    r = json.loads(line) if line.strip() else {}
+                    if isinstance(r.get("predicate"), bool) and r.get("example_id") not in got:
+                        got[r["example_id"]] = float(r["predicate"])
+                return got
+            one, two = _rows(ws[0]), _rows(ws[1])
+            common = sorted(set(one) & set(two))
+            if len(common) >= 4:
+                out[f"{cell.name} {prefix}"] = ([one[k] for k in common], [two[k] for k in common])
+    return out
+
+
+def registered_binary_margin(freeze_file: Path) -> float:
+    """The registered binary_predicate margin (the freeze file's
+    REGISTERED_MARGINS.source_file, repo-relative), the A6 injection size."""
+    freeze = json.loads(Path(freeze_file).read_text(encoding="utf-8"))
+    source = _REPO_ROOT / freeze["REGISTERED_MARGINS"]["source_file"]
+    return float(json.loads(source.read_text(encoding="utf-8"))["binary_predicate"])
+
+
+def campaign_aa_report(
+    predicate_root: Path, *, alpha: float, n_resamples: int, seed: int, injection_shift: float | None = None
+) -> dict[str, Any]:
+    """A6 (owner 2026-10-20): the A/A of every repeated arm of an S1 run on the
+    McNemar path; the report passes only when every arm passes the one-sided
+    rule. With ``injection_shift`` (owner 2026-10-21: the registered
+    binary_predicate margin), each arm also reports the power to detect that
+    absolute rise of the accepted share; power is reported, never gated (no
+    target power is registered)."""
+    from src.analysis.stats.calibration import aa_repeat_pairs, recover_power_repeat_pairs
+
+    arms: dict[str, Any] = {}
+    for name, (a, b) in campaign_repeat_pairs(predicate_root).items():
+        res = aa_repeat_pairs(np.asarray(a), np.asarray(b), mcnemar_p, n_resamples, seed, alpha=alpha)
+        arms[name] = {"n_pairs": len(a), "fp_rate": res.fp_rate, "ci_low": res.ci_low,
+                      "ci_high": res.ci_high, "pass": res.approximates_nominal}
+        if injection_shift is not None:
+            inj, capped = recover_power_repeat_pairs(
+                np.asarray(a), np.asarray(b), mcnemar_p, injection_shift, n_resamples, seed, alpha=alpha)
+            arms[name]["injection"] = {"shift": inj.effect_size, "power": inj.power, "ci_low": inj.ci_low,
+                                       "ci_high": inj.ci_high, "n_capped": capped}
+    injections = (
+        "pending: no freeze file given, so the registered binary_predicate margin is unread"
+        if injection_shift is None else
+        f"run: the accepted share raised by {injection_shift:g} (registered binary_predicate margin); reported, not gated"
+    )
+    return {"schema": "cage-aa-repeats-v1", "alpha": alpha, "n_resamples": n_resamples, "seed": seed,
+            "rule": "one-sided: fails only when the false-positive rate is significantly above alpha",
+            "injections": injections,
+            "arms": arms, "pass": bool(arms) and all(v["pass"] for v in arms.values())}
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    if "--campaign-root" in argv:
+        # A6: the S1 mode, on the pod after the scoring stage
+        p = argparse.ArgumentParser(description="A6 A/A on an S1 run's repeated arms (McNemar path).")
+        p.add_argument("--campaign-root", type=Path, required=True)
+        p.add_argument("--scoring-run-id", required=True)
+        p.add_argument("--out", type=Path, required=True)
+        p.add_argument("--alpha", type=float, default=0.05)
+        p.add_argument("--resamples", type=int, default=1000)
+        p.add_argument("--seed", type=int, default=DEFAULT_SEED)
+        p.add_argument("--freeze-file", type=Path, default=None,
+                       help="the freeze file; its registered binary_predicate margin sizes the power injection")
+        a = p.parse_args(argv)
+        report = campaign_aa_report(a.campaign_root / "predicate" / a.scoring_run_id,
+                                    alpha=a.alpha, n_resamples=a.resamples, seed=a.seed,
+                                    injection_shift=registered_binary_margin(a.freeze_file) if a.freeze_file else None)
+        a.out.parent.mkdir(parents=True, exist_ok=True)
+        a.out.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        print(f"[run_calibration] A/A on {len(report['arms'])} repeated arm(s): {'PASS' if report['pass'] else 'FAIL'} -> {a.out}")
+        return 0 if report["pass"] else 1
     parser = argparse.ArgumentParser(
         description=(
             "§9.7 A/A + effect-injection calibration on the pilot archive "

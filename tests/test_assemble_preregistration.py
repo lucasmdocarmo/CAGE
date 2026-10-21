@@ -135,10 +135,37 @@ def test_missing_source_file_resolution_refuses(
 def test_malformed_resolution_value_refuses(
     workdir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    rc = _run(workdir, {**HAPPY, "QASPER_TAU": 0.83})  # number, not string
+    # ADR-0175 item 7: a number now renders (next test); a null is a hole
+    rc = _run(workdir, {**HAPPY, "QASPER_TAU": None})
     err = capsys.readouterr().err
     assert rc == 2
     assert "malformed resolutions" in err and "QASPER_TAU" in err
+    rc = _run(workdir, {**HAPPY, "QASPER_TAU": {"source_file": "embedded.md", "note": "x"}})
+    assert rc == 2 and "malformed resolutions" in capsys.readouterr().err
+
+
+def test_structured_freeze_values_render_as_canonical_json_adr0175(tmp_path: Path) -> None:
+    # the freeze file holds a float tau and objects; they embed deterministically
+    import json
+
+    path = tmp_path / "r.json"
+    path.write_text(json.dumps({"QASPER_TAU": 0.83, "TAU_BAND": {"b": 2, "a": 1}, "OK": True}), encoding="utf-8")
+    assert ap.load_resolutions(path, tmp_path) == {"QASPER_TAU": "0.83", "TAU_BAND": '{"a": 1, "b": 2}', "OK": "true"}
+    path.write_text('{"QASPER_TAU": NaN}', encoding="utf-8")
+    with pytest.raises(ap.AssemblyRefusal, match="non-finite"):
+        ap.load_resolutions(path, tmp_path)
+
+
+def test_the_live_freeze_file_assembles_adr0175() -> None:
+    # the registered draft resolves from the current freeze file (it refused before)
+    freeze = REPO_ROOT / "MyDocs" / "registration" / "freeze_resolutions.json"
+    skeleton = REPO_ROOT / ap.DEFAULT_SKELETON
+    if not (freeze.is_file() and skeleton.is_file()):
+        pytest.skip("the registration drafts live in MyDocs (not in every checkout)")
+    # FREEZE_SHA stays pending until the owner's freeze commit and refuses by design
+    resolutions = {**ap.load_resolutions(freeze, REPO_ROOT), "FREEZE_SHA": SHA_OK}
+    text = ap.assemble_text(skeleton.read_text(encoding="utf-8"), resolutions, REPO_ROOT)
+    assert '"served_model"' in text and resolutions["QASPER_TAU"] in text
 
 
 def test_freeze_sha_grammar_refuses(

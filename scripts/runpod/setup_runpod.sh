@@ -458,10 +458,24 @@ if [ "${SKIP_MODEL_PREFETCH:-0}" != "1" ]; then
   for _m in ${PREFETCH_MODELS}; do
     _ok=0
     for _a in 1 2 3 4 5 6; do
-      if python - "$_m" <<'PY'
+      if python - "$_m" "${PREFETCH_REVISIONS:-}" <<'PY'
 import sys
 from huggingface_hub import snapshot_download
-snapshot_download(sys.argv[1], max_workers=8)
+# A10: each model at its pinned revision when the master passed one
+import os
+pins = dict(item.split("=", 1) for item in sys.argv[2].split() if "=" in item)
+snap = snapshot_download(sys.argv[1], max_workers=8, **({"revision": pins[sys.argv[1]]} if sys.argv[1] in pins else {}))
+if sys.argv[1] in pins:
+    # Review 2026-10-21 C1: a download at a commit SHA records no refs/main
+    # (huggingface_hub _snapshot_download writes a ref only for a branch or
+    # tag), and under HF_HUB_OFFLINE=1 every load that names no revision
+    # resolves "main" through refs/main and fails. Writing refs/main = the pin
+    # makes "main" MEAN the pin on this pod (the instrument_b_runner pattern).
+    refs = os.path.join(os.path.dirname(os.path.dirname(snap)), "refs")
+    os.makedirs(refs, exist_ok=True)
+    with open(os.path.join(refs, "main"), "w", encoding="utf-8") as fh:
+        fh.write(pins[sys.argv[1]])
+    print(f"[cage]   {sys.argv[1]}: refs/main -> {pins[sys.argv[1]]} (offline loads resolve the pin)")
 PY
       then _ok=1; break; fi
       echo "[cage]   ${_m}: download attempt ${_a} stalled/failed; resuming in 5s..."; sleep 5
@@ -474,6 +488,20 @@ PY
   done
 else
   echo "[cage] [4b/5] model prefetch SKIPPED (SKIP_MODEL_PREFETCH=1)"
+fi
+# A10 (owner 2026-10-20): the served model's pin against the Hub's head; a newer
+# revision stops setup (the owner decides; the run never switches on its own)
+if [ -n "${CAGE_HUB_CHECK_MODEL:-}" ]; then
+  python - "${CAGE_HUB_CHECK_MODEL}" <<'PY' || die "A10: the served model's Hub head differs from its pin (HUB_NEWER above)"
+import sys
+from huggingface_hub import HfApi
+model, pinned = sys.argv[1].split("=", 1)
+head = HfApi().model_info(model).sha
+print(f"[cage] A10 hub check {model}: pinned {pinned}, hub head {head}")
+if head != pinned:
+    print(f"HUB_NEWER {model}: the Hub head {head} differs from the pin {pinned}")
+    sys.exit(1)
+PY
 fi
 
 # 5. Verify the telemetry stack the campaign depends on (standard verify step,

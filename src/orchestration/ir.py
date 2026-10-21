@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -162,6 +163,8 @@ class FaissIRIndex:
         # index under the CAGE_ALLOW_STALE_INDEX opt-in. Fresh and rebuilt indices
         # never set it.
         self.stale_index_opt_in: bool = False
+        # A9 item 2: seconds the last build() took; None for a loaded index.
+        self.build_s: Optional[float] = None
 
         self._st_model = None
         self._faiss = None
@@ -209,6 +212,7 @@ class FaissIRIndex:
         Slabs bound peak memory and produce an identical index (same vectors,
         same insertion order).
         """
+        _t0 = time.perf_counter()
         self._ensure_deps()
         if not documents:
             raise ValueError("No documents provided to build IR index")
@@ -238,6 +242,14 @@ class FaissIRIndex:
             index.add(embeddings)
 
         self._index = index
+        self.build_s = time.perf_counter() - _t0
+
+    def release(self) -> bool:
+        """A14 item 6: drop the encoder weights (True when loaded); the FAISS index
+        and documents stay, and the next search() reloads the encoder on its device."""
+        released = self._st_model is not None
+        self._st_model = None
+        return released
 
     def search(self, query: str, *, top_k: int = 5) -> List[IRHit]:
         """Search for the top_k most similar documents to the query."""
@@ -293,6 +305,9 @@ class FaissIRIndex:
             # Backlog A5: the encoder revision this index was embedded at (null
             # when unpinned); load/ensure_ir_index check it against the pin.
             "embedding_revision": self.embedding_revision,
+            # A14: the device the passages were embedded on; ensure_ir_index
+            # rebuilds when a run encodes its queries on another one.
+            "embedding_device": self.device,
         }
         (directory / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
@@ -639,8 +654,6 @@ class CrossEncoderReranker:
     """
 
     def __init__(self, model_name: str, *, device: str = "cpu") -> None:
-        from sentence_transformers import CrossEncoder
-
         self.model_name = model_name
         self.device = device
         # review 2026-10-13 item 9: the frozen HF revision (freeze_resolutions
@@ -649,8 +662,7 @@ class CrossEncoderReranker:
         # record the repo's current head (sentence-transformers 5.7.0 accepts
         # ``revision`` [V inspect.signature]).
         self.revision: Optional[str] = (os.environ.get("CAGE_RERANKER_REVISION") or "").strip() or None
-        # the keyword is passed only when pinned: an unpinned load is the call it always was
-        self._model = CrossEncoder(model_name, device=device, **({"revision": self.revision} if self.revision else {}))
+        self._model = self._load()
         self._tokenizer = getattr(self._model, "tokenizer", None)
         self.max_length: Optional[int] = _reranker_input_cap(self._model, self._tokenizer)
         self.scored_pairs: int = 0
@@ -659,6 +671,21 @@ class CrossEncoderReranker:
         self.truncated_pairs: Optional[int] = (
             0 if (self._tokenizer is not None and self.max_length) else None
         )
+
+    def _load(self) -> Any:
+        from sentence_transformers import CrossEncoder
+
+        # the keyword is passed only when pinned: an unpinned load is the call it always was
+        return CrossEncoder(
+            self.model_name, device=self.device, **({"revision": self.revision} if self.revision else {})
+        )
+
+    def release(self) -> bool:
+        """A14 item 6 / A9 item 4: drop the weights (True when loaded); the pair
+        counters and the CPU tokenizer stay, and the next rerank() reloads."""
+        released = self._model is not None
+        self._model = None
+        return released
 
     def _count_truncated(self, pairs: Sequence[Tuple[str, str]]) -> None:
         """Count the pairs longer than the model's input cap (one untruncated
@@ -687,6 +714,8 @@ class CrossEncoderReranker:
 
         pairs = [(query, d.text) for d in docs]
         self._count_truncated(pairs)
+        if self._model is None:
+            self._model = self._load()
         scores = self._model.predict(pairs)
 
         scored = []
@@ -946,9 +975,17 @@ def default_index_dir(
     base_dir: Path,
     dataset_name: str,
     embedding_model: str,
+    corpus_sha1: Optional[str] = None,
 ) -> Path:
+    """The persisted index folder. A14 item 3 (ADR-0174 amendment 2026-10-20):
+    with ``corpus_sha1`` (``corpus_doc_ids_sha1`` of the corpus) each document
+    set gets its own folder, so windows over different corpora stop rebuilding
+    one shared index; 12 hex characters name it and the full hash in meta.json
+    still guards the content (a prefix collision costs a rebuild, never a
+    wrong index). Without it the name is the legacy per-dataset one."""
     safe_model = embedding_model.replace("/", "_")
-    return base_dir / f"ir_{dataset_name}_{safe_model}"
+    suffix = f"_{corpus_sha1[:12]}" if corpus_sha1 else ""
+    return base_dir / f"ir_{dataset_name}_{safe_model}{suffix}"
 
 
 def default_bm25_index_dir(
@@ -1023,6 +1060,17 @@ def ensure_ir_index(
                     f"[ir] index at {index_dir} was built at embedding_revision="
                     f"{_meta.get('embedding_revision')!r}, the pin is "
                     f"{embedding_revision!r}; rebuilding at the pin (backlog A5)."
+                )
+                stale = True
+            # A14: an unstamped index reads as "cpu", the device every
+            # persisted index had before the stamp (the runner, its only
+            # persisting caller, passed device="cpu" until 2026-10-20).
+            _stored_device = _meta.get("embedding_device", "cpu")
+            if not stale and _stored_device != device:
+                print(
+                    f"[ir] index at {index_dir} was embedded on {_stored_device!r}, "
+                    f"this run encodes queries on {device!r}; rebuilding so passages "
+                    f"and queries share one device (A14)."
                 )
                 stale = True
         except Exception:

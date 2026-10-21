@@ -105,7 +105,8 @@ RUN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,40}$")
 CAMPAIGN_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 
 #: MUST equal organize_results.SESSIONS (§1 session vocabulary, RUNBOOK §1.1).
-SESSIONS: frozenset[str] = frozenset({"a", "b", "cd-act1", "cd-act2"})
+#: "s1" (ADR-0175, 2026-10-20): the Run 2 session, registered blocks K1 to L6.
+SESSIONS: frozenset[str] = frozenset({"a", "b", "cd-act1", "cd-act2", "s1"})
 
 #: MUST equal organize_results.DATASET_IDS (§1 — the only legal window-name
 #: datasets).

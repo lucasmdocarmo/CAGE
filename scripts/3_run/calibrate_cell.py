@@ -136,6 +136,111 @@ def build_requests(manifest_path: str) -> List[Any]:
     return requests
 
 
+#: B4 option 3 (owner 2026-10-20, "One start, cut prompts"): one floor per
+#: demand class on the same start as the engine floor, in the measured request
+#: shape (the runner's chat messages, stop newline). The prompts are the
+#: manifest's blocks cut, in the served model's tokens, so the rendered chat
+#: prompt is about the class's served length [A: a single request's latency
+#: depends on its length, not on the pool or the text]. Each class's
+#: first-token target is 10 times the mean of the two engines' floors.
+CLASS_FLOOR_QUESTION = "What does this passage say?"
+CLASS_FLOOR_STOP = ["\n"]
+CLASS_FLOOR_SHAPE = "chat messages (format_qa_messages), stop newline"
+
+
+def build_class_requests(manifest_path: str, seq_tokens: int, tokenizer: Any) -> tuple:
+    """FLOOR_N_REQUESTS chat requests whose rendered prompt is about
+    ``seq_tokens`` tokens, one distinct manifest block each; returns
+    (requests, rendered prompt tokens of the first)."""
+    from src.inference.engine import InferenceRequest
+    from src.utils.prompting import format_qa_messages, messages_to_fallback_prompt
+
+    blocks = [b["text"] for b in json.loads(Path(manifest_path).read_text(encoding="utf-8"))["blocks"]]
+    if len(blocks) < FLOOR_N_REQUESTS:
+        raise CalibrationError("class_floor_blocks", len(blocks), f"need {FLOOR_N_REQUESTS} distinct blocks")
+
+    def _rendered(messages: List[dict]) -> int:
+        # the adapters render Qwen3 chat with thinking off (review 2026-10-20 L10)
+        return len(tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True, enable_thinking=False
+        ))
+
+    # the template's tokens around a one-token context (its document label included)
+    probe = tokenizer.decode(tokenizer.encode(blocks[0], add_special_tokens=False)[:1])
+    overhead = _rendered(format_qa_messages(CLASS_FLOOR_QUESTION, [probe])) - 1
+    keep = max(1, int(seq_tokens) - overhead)
+    requests: List[Any] = []
+    first_tokens = 0
+    for i, text in enumerate(blocks[:FLOOR_N_REQUESTS]):
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        if not ids:
+            raise CalibrationError("class_floor_block", i, "a manifest block encodes to zero tokens")
+        while len(ids) < keep:  # a short block repeats itself up to the class length
+            ids = ids + ids
+        context = tokenizer.decode(ids[:keep])
+        messages = format_qa_messages(CLASS_FLOOR_QUESTION, [context])
+        if i == 0:
+            first_tokens = _rendered(messages)
+        request = InferenceRequest(
+            prompt=messages_to_fallback_prompt(messages),
+            max_tokens=CAL_MAX_TOKENS,
+            temperature=0.0,
+            top_p=0.95,
+            request_id=f"cal-class-{seq_tokens}-{i}",
+            stop=list(CLASS_FLOOR_STOP),
+        )
+        request.messages = messages  # the chat path, as the runner sends it
+        requests.append(request)
+    return requests, first_tokens
+
+
+async def measure_class_floors(
+    adapter: Any, manifest_path: str, classes: Sequence[int], tokenizer: Any
+) -> dict:
+    """B4: {str(seq_tokens): record} for every class, each over
+    FLOOR_N_REQUESTS cold sequential requests. The first-token target needs
+    TTFT only, so a one-token answer (the newline stop) still counts; TPOT is
+    the median over the answers of two or more tokens (None when none)."""
+    import statistics
+
+    flush = getattr(adapter, "flush_cache", None)
+    if not callable(flush):
+        raise CalibrationError("flush_cache", None, "class floors need a cold engine (S0F-88 B-13)")
+    out: dict = {}
+    for seq_tokens in classes:
+        requests, prompt_tokens = build_class_requests(manifest_path, seq_tokens, tokenizer)
+        ttft: List[float] = []
+        tpot: List[float] = []
+        for i, request in enumerate(requests):
+            await _flush_cold(flush)
+            response = await adapter.async_stream_generate(request)
+            if response.error or response.num_tokens < 1:
+                raise CalibrationError(
+                    "class_floor_request", response.error or response.num_tokens,
+                    f"class {seq_tokens} request {i} failed (drop-nothing)",
+                )
+            cached = getattr(response, "cached_prompt_tokens", None)
+            if isinstance(cached, int) and not isinstance(cached, bool) and cached > 0:
+                raise CalibrationError(
+                    "class_floor_cached_tokens", cached,
+                    f"class {seq_tokens} request {i} reused cached tokens after the flush (S0F-88 B-13)",
+                )
+            ttft.append(float(response.ttft_ms) / 1000.0)
+            if response.num_tokens >= 2:
+                tpot.append((float(response.total_time_ms) - float(response.ttft_ms)) / (response.num_tokens - 1) / 1000.0)
+        out[str(int(seq_tokens))] = {
+            "ttft_s": statistics.median(ttft),
+            "tpot_s": statistics.median(tpot) if tpot else None,
+            "n_requests": len(ttft),
+            "n_tpot": len(tpot),
+            "prompt_tokens": prompt_tokens,
+            "shape": CLASS_FLOOR_SHAPE,
+        }
+        print(f"[calibrate] class floor {seq_tokens}: ttft={out[str(int(seq_tokens))]['ttft_s']:.4f}s "
+              f"({len(ttft)} requests, prompt {prompt_tokens} tokens)")
+    return out
+
+
 #: S0F-88 review L1: the cold floor flushes right after a streamed request
 #: ends, and an engine that still counts it may refuse the flush. The flush is
 #: retried every FLOOR_FLUSH_POLL_S up to the runner's own quiescence bound
@@ -390,6 +495,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         required=True,
         help="KV-budget fraction identifying the cell, in (0, 1]",
     )
+    parser.add_argument(
+        "--class-floors",
+        default=None,
+        help="B4 (owner 2026-10-20): comma-separated demand classes (served tokens) to "
+             "measure a floor for, in the measured request shape, on this same start "
+             "(the driver's 'classes' subcommand prints the session's list)",
+    )
     return parser.parse_args(argv)
 
 
@@ -416,6 +528,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"({floor.statistic} of {floor.n_requests})"
     )
 
+    # B4 (review 2026-10-20 L10): the class floors run on the same start right
+    # after the engine floor, before the ladder, so a class failure costs no ladder
+    class_floors = None
+    if args.class_floors:
+        import os
+
+        from transformers import AutoTokenizer  # pod venv; the served model's own tokenizer
+
+        classes = [int(c) for c in args.class_floors.split(",") if c.strip()]
+        revision = (os.environ.get("CAGE_MODEL_REVISION") or "").strip() or None  # A10 pin
+        tokenizer = AutoTokenizer.from_pretrained(args.model, **({"revision": revision} if revision else {}))
+        class_floors = asyncio.run(measure_class_floors(adapter, args.manifest, classes, tokenizer))
+
     # ADR-0122: the first rung comes from the floor unless the operator gave one.
     if args.start_qps is None:
         start_qps = floor_start_qps(floor, max_tokens=CAL_MAX_TOKENS)
@@ -441,11 +566,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         start_qps_source=start_source,
         open_file_limit=open_file_limit,
     )
+    doc = calibration.to_manifest()
+    if class_floors is not None:
+        doc["class_floors"] = class_floors
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(
-        json.dumps(calibration.to_manifest(), indent=2) + "\n", encoding="utf-8"
-    )
+    out_path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
     print(f"[calibrate] wrote {out_path}")
 
     if estimate.label != "ESTIMATED":
