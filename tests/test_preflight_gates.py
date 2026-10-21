@@ -1359,9 +1359,10 @@ def test_datasets_gate_honors_runner_dataset_fallback(
 # ---------------------------------------------------------------------------
 
 # Any full SHA serves the parse fixtures below; kept equal to the live pin
-# (requirements.txt, bumped 2026-10-08 for ADR-0148 Batch C) so a reader is
-# not misled by a retired commit.
-_PIN_SHA = "51bb9ac471ad52fcd5c555ee4f6d76a25ba79a50"
+# (requirements.txt, bumped 2026-10-21 for the A7 counter-first retraction
+# mapping and its declared-empty counter fix) so a reader is not misled by a
+# retired commit.
+_PIN_SHA = "40431df971b0be6e71babe442c5d240c713f9428"
 
 
 def test_preflight_declares_pin_parity_gate() -> None:

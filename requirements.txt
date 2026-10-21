@@ -186,5 +186,8 @@ pytest-asyncio>=0.21.0
 # 2026-10-08 (ADR-0148 Batch C review fixes LOW 3 and LOW 4): bumped afa82328 -> 51bb9ac4:
 # the api refuses a backward clock step between its two polls; the session request
 # count starts at the first tick that carries the counter.
-cage-stats @ git+https://github.com/lucasmdocarmo/cage-stats.git@51bb9ac471ad52fcd5c555ee4f6d76a25ba79a50
+# 2026-10-21 (A7 and its review): bumped 51bb9ac4 -> 40431df9: SGLang retraction
+# maps counter-first (sglang:num_retracted_requests_total), and a declared
+# counter with no sample yet reads 0 instead of absent.
+cage-stats @ git+https://github.com/lucasmdocarmo/cage-stats.git@40431df971b0be6e71babe442c5d240c713f9428
 # Local dev alternative (no install): set CAGE_STATS_HOME=/Users/lucasmariano/cage-stats
