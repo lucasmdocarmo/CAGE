@@ -199,7 +199,8 @@ stage_bound_minutes() { # G16: the pod-side bound of ONE stage, in minutes (one 
       # SUITE_ON_POD=1) bill too; review 2026-10-13 A1: the start check (START_CHECK=1)
       [ "${SUITE_ON_POD:-0}" = "1" ] && suite_min=30
       [ "${START_CHECK:-1}" = "1" ] && start_min=$(( START_CHECK_BOUND_S / 60 ))
-      printf '%s' "$(( 10 + suite_min + n_srv * VALIDATE_BOUND_S / 60 + start_min ))" ;;
+      # S1 audit 2026-10-23: the load gate (600 s) and the offline dataset probe (600 s)
+      printf '%s' "$(( 20 + suite_min + n_srv * VALIDATE_BOUND_S / 60 + start_min ))" ;;
     calibrate) printf '%s' "$(( n_cal * CALIBRATE_BOUND_S / 60 + n_cal * CALIBRATE_RUNGS_BOUND_S / 60 ))" ;;
     plan)      printf '%s' "$(( PLAN_BOUND_S / 60 ))" ;;
     run)       printf '%s' "$(( HOURS * 60 ))" ;;
@@ -454,6 +455,7 @@ pscp_from() { # pscp_from <remote path> <local>; a remote DIRECTORY is given as 
   ssh_retry scp -r -P "$POD_PORT" ${SSH_KEY:+-i "$SSH_KEY"} -o BatchMode=yes -o StrictHostKeyChecking=no "$POD_SSH:$1" "$2"; }
 
 TAKEOVER_STAGE=""   # G5: the stage recorded RUNNING when this master took over (--redo)
+TAKEOVER_STARTED="" # review 2026-10-23 M5: that stage's started_utc, so only a job handle submitted during it is reused
 job_attach_or_submit() {
   # job_attach_or_submit <name> <remote command> <deadline_s>: audit 2026-10-17
   # (G5). After a Mac crash or an ssh outage past the grace, the resume used to
@@ -481,12 +483,20 @@ job_attach_or_submit() {
       # second submit beside a job that may still be running
       printf '  [FAIL] job %s has a local handle but the pod is UNREACHABLE: its state cannot be read, so nothing is submitted; retry when ssh answers (G5)\n' "$name"
       return 1 ;;
-    DONE*)
-      if [ "$CUR_STAGE" = "$TAKEOVER_STAGE" ]; then
-        say "job $name finished DONE(0) during the interrupted attempt: its log is fetched, nothing is resubmitted (G5)"
-        state note "$CUR_STAGE" "job $name DONE(0) from the interrupted attempt reused ($(utc), G5)"
+    DONE*|FAILED*|KILLED|CRASHED)
+      # S1 audit 2026-10-23 (HIGH 2): a run that ended with exit 4 (budget stop)
+      # or 2 (stop failed) while the master was gone used to be resubmitted here,
+      # which truncated its log on the pod and refused the reseal; any finished
+      # job of the taken-over stage is reused, and the wait below judges its exit
+      # review 2026-10-23 M5: a handle older than the interrupted attempt (a stage
+      # that failed earlier and was redone) is not that attempt's job: resubmitted
+      local sub_at; sub_at="$(sed -n 's/.*"submitted_at": "\([0-9TZ:-]*\)".*/\1/p' "$JOBS/$name.json" | head -1)"
+      if [ "$CUR_STAGE" = "$TAKEOVER_STAGE" ] && { [ -z "$TAKEOVER_STARTED" ] || [ -z "$sub_at" ] || [ "$sub_at" \> "$TAKEOVER_STARTED" ] || [ "$sub_at" = "$TAKEOVER_STARTED" ]; }; then
+        say "job $name finished $prior during the interrupted attempt: its log is fetched, nothing is resubmitted (G5); the wait judges that exit"
+        state note "$CUR_STAGE" "job $name $prior from the interrupted attempt reused ($(utc), G5)"
         return 0
-      fi ;;
+      fi
+      [ "$CUR_STAGE" != "$TAKEOVER_STAGE" ] || say "job $name's handle (submitted $sub_at) predates the interrupted attempt ($TAKEOVER_STARTED): a fresh job is submitted (review 2026-10-23 M5)" ;;
   esac
   run_step 0 "job $name: submit" -- bash "$PODJOB" submit "$name" "$cmd" "$deadline"
 }
@@ -1040,6 +1050,16 @@ stage_validate() {
   # hotpotqa, scbench and sharegpt, which this profile never stages); the
   # experiment's own CHARTER_DATASETS, the set stage 3 staged, is the request.
   local ds; ds="$(printf '%s' "$CHARTER_DATASETS" | tr ' ' ',')"
+  # S1 audit 2026-10-23 (MEDIUM 4): the run job loads every dataset offline
+  # (HF_HUB_OFFLINE=1 rides POD_ENGINE_ENV under A10) and S0 ran online, so the
+  # loader opens each dataset once here, under the run job's own env, before any
+  # engine bills; the probe refuses an online pass when the pin is on.
+  local req_off=""; [ -n "$MODEL_REVISION" ] && req_off=" --require-offline"
+  job_run datasets_offline 600 "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH$POD_ENGINE_ENV && env $RUN_ENV_UNSET $POD_PYTHON scripts/checks/probe_datasets_offline.py --datasets $ds --max-examples 3$req_off --out logs/datasets_offline_probe.json" "$LAND/logs/setup" || return 1
+  if ! plan_only; then
+    grep -q "DATASETS_OFFLINE_OK" "$JOB_LOG" || { printf '  [FAIL] a charter dataset does not load through the runner loader under the run job env (S1 audit 2026-10-23):\n'; grep "DATASETS_OFFLINE_FAILED" "$JOB_LOG" | sed 's/^/    /'; return 1; }
+    grep "DATASETS_OFFLINE_OK" "$JOB_LOG" | tail -1 | sed 's/^/  /'
+  fi
   local e launcher api
   for e in $(server_engines); do
     launcher="$(engine_launcher "$e")" || { printf '  [FAIL] unknown engine %s\n' "$e"; return 1; }
@@ -1225,7 +1245,18 @@ stage_calibrate() {
     fi
     # B4 (owner 2026-10-20, "One start, cut prompts"): every demand class's floor on this start
     local cls=""; [ "${CLASS_FLOORS:-0}" = "1" ] && cls=" --class-floors $("$PY" "$SCRIPTS/3_run/run_campaign.py" classes --session "$SESSION")"
-    job_run "calibrate_$e" 3600 "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT$POD_ENGINE_ENV && bash scripts/2_serving/$launcher start '$MODEL' && $POD_PYTHON scripts/3_run/calibrate_cell.py --backend $e --model '$MODEL' --api-base $api --manifest $CALIBRATION_MANIFEST --output $out --budget-fraction $CALIBRATION_BUDGET_FRACTION$cls; rc=\$?; bash scripts/2_serving/$launcher stop; exit \$rc" "$LAND/logs/setup" || return 1
+    # S1 audit 2026-10-23 (CRITICAL 1): the launcher's default context is 4,096
+    # tokens and the anchor class floor prompt is 4,779, so this start runs at the
+    # registered largest pool (stage 0's record, the stage 4 start that passed
+    # live: VLLM_MAX_MODEL_LEN at the session cap plus the anchor pool). With
+    # class floors on and no record, the job would fail 15 min in: refused here.
+    local cal_env=""; cal_env="$(state get "registration.largest_pool.$e.env" 2>/dev/null | tr ',' ' ' || true)"
+    [ -z "$cal_env" ] || cal_env=" $cal_env"
+    if ! plan_only && [ -n "$cls" ] && [ -z "$cal_env" ]; then
+      printf '  [FAIL] %s: CLASS_FLOORS=1 but stage 0 recorded no largest pool for this engine (registration.largest_pool.%s.env): the class floor prompts (up to the anchor class) exceed the launcher default context (S1 audit 2026-10-23)\n' "$e" "$e"
+      return 1
+    fi
+    job_run "calibrate_$e" 3600 "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT$POD_ENGINE_ENV && env$cal_env bash scripts/2_serving/$launcher start '$MODEL' && $POD_PYTHON scripts/3_run/calibrate_cell.py --backend $e --model '$MODEL' --api-base $api --manifest $CALIBRATION_MANIFEST --output $out --budget-fraction $CALIBRATION_BUDGET_FRACTION$cls; rc=\$?; bash scripts/2_serving/$launcher stop; exit \$rc" "$LAND/logs/setup" || return 1
     run_step 0 "fetch calibration $e" -- pscp_from "$POD_REPO/$out" "$EXTRAS/calibration/${EXP}_${e}.json" || return 1
     plan_only && continue
     run_step 0 "calibration $e: cal-v3 and floor-derived start" -- "$PY3" - "$EXTRAS/calibration/${EXP}_${e}.json" <<'PY' || return 1
@@ -1489,9 +1520,15 @@ stage_run() {
   [ "${DRY_TELEMETRY_RERUN:-0}" = "1" ] && dry_rerun="$dry_rerun --dry-window-telemetry-rerun"
   # review 2026-10-13 B1: RUN_FAIL_FAST=infra|all (S0) stops the run at its first infrastructure failure
   [ -z "${RUN_FAIL_FAST:-}" ] || dry_rerun="$dry_rerun --fail-fast $RUN_FAIL_FAST"
-  job_attach_or_submit "$name" "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH$POD_ENGINE_ENV && env $RUN_ENV_UNSET CAGE_RUN_ROOT=$POD_RUN_ROOT VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT CAGE_PROVIDER=runpod CAGE_HARDWARE='$GPU_ID x $GPU_COUNT'$run_to $POD_PYTHON scripts/3_run/run_campaign.py run --plan results/calibration/plan_$RUN_ID.json --campaign-root $POD_RUN_ROOT --seal$partial$dry_rerun" "$bound" || return 1
+  # S1 audit 2026-10-23 (MEDIUM 2) and review M3: the dataset roster the sealed
+  # manifest records (G3: the confirmatory look refuses without it) is the plan's
+  # own cell datasets (a session a plan carries RULER cells the charter roster
+  # would refuse); the charter roster stands in when the plan names none
+  local roster; roster="$("$PY3" -c 'import json,sys; p=json.load(open(sys.argv[1], encoding="utf-8")); print(" ".join(sorted({str(s["dataset"]) for s in p.get("steps", []) if s.get("kind") == "cell" and s.get("dataset")})))' "$EXTRAS/plan.json" 2>/dev/null || true)"
+  [ -n "$roster" ] || roster="$CHARTER_DATASETS"
+  job_attach_or_submit "$name" "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH$POD_ENGINE_ENV && env $RUN_ENV_UNSET CAGE_RUN_ROOT=$POD_RUN_ROOT VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT CAGE_PROVIDER=runpod CAGE_HARDWARE='$GPU_ID x $GPU_COUNT' CAGE_CAMPAIGN_DATASETS='$roster'$run_to $POD_PYTHON scripts/3_run/run_campaign.py run --plan results/calibration/plan_$RUN_ID.json --campaign-root $POD_RUN_ROOT --seal$partial$dry_rerun" "$bound" || return 1
   if plan_only; then
-    printf '  [plan] %-28s expect DONE(0) or STOP FAILED(2); DRY WINDOW FAILED(3) fails the stage: bash %s wait run %s\n' "job run: wait" "$PODJOB" "$bound"
+    printf '  [plan] %-28s expect DONE(0), STOP FAILED(2) or BUDGET STOP(4); DRY WINDOW FAILED(3) fails the stage: bash %s wait run %s\n' "job run: wait" "$PODJOB" "$bound"
     return 0
   fi
   local wrc=0
@@ -1514,6 +1551,20 @@ stage_run() {
       # its tree and every unrun cell carries a budget-stop sentinel (a SKIP)
       say "run ended with exit 4 = BUDGET STOP (ADR-0175): the registered deadline cut the remaining steps"
       grep "BUDGET STOP" "$JOB_LOG" | head -2
+      # S1 audit 2026-10-23 (MEDIUM 3): exit 4 rides over a failed dry window (the
+      # runner says so and skips its own seal); on a registered profile that is
+      # the exit 3 outcome, never a PARTIAL acceptance that stage 9 would seal
+      if grep -q "(budget stop) also carries" "$JOB_LOG" 2>/dev/null && grep -q "failed dry windows" "$JOB_LOG" 2>/dev/null; then
+        printf '  [%s] the budget stop also carries failed dry windows (ADR-0153): the pressure cells of those serving configurations never ran and the runner skipped its seal:\n' "$(partial_ok && echo PARTIAL || echo FAIL)"
+        grep "DRY WINDOW FAILED\|also carries" "$JOB_LOG" | head -12
+        if ! partial_ok; then
+          state note run "exit 4: BUDGET STOP with failed dry windows (ADR-0153); pressure cells skipped, see logs/runner/run.log"
+          custody_copy
+          return 1
+        fi
+        state note run "exit 4: BUDGET STOP with failed dry windows; PARTIAL tree accepted (PARTIAL_TREE_OK=1, S0 only)"
+      fi
+      grep -q "failed engine stop" "$JOB_LOG" 2>/dev/null && printf '  [FAIL] the same run also reports a failed engine stop (an engine may still hold the GPU)\n'
       state note run "exit 4: BUDGET STOP (ADR-0175); the unrun cells carry budget-stop sentinels"
       state put run.partial "exit 4: budget stop (registered deadline)"
     elif grep -q "DRY WINDOW FAILED" "$JOB_LOG" 2>/dev/null && grep -q "FAILED(3)" "$EXTRAS/steps/run_wait.log"; then
@@ -1649,7 +1700,7 @@ stage_score() {
   # instrument revisions are enforced at load (CAGE_*_REVISION) on the pod; (R3)
   # the rescorer builds its pass under a partial name and renames it only once
   # sealed, so the "exists: reused" branch here only ever meets a complete pass.
-  job_run score "$bound" "cd $POD_REPO && { [ -d $POD_RUN_ROOT/scoring/$SCORING_RUN_ID ] && echo 'scoring/$SCORING_RUN_ID exists: reused (append-only)' || $POD_PYTHON scripts/4_analysis/rescore_quality.py --run-root $POD_RUN_ROOT --full --device cuda --scoring-run-id $SCORING_RUN_ID --freeze-file $POD_FREEZE_FILE --score-cache-dir logs/score_cache/$RUN_ID$bsize; } && $POD_PYTHON scripts/4_analysis/build_predicate_table.py $POD_RUN_ROOT --scoring-run-id $SCORING_RUN_ID --max-null-fraction $MAX_NULL_FRACTION --freeze-file $POD_FREEZE_FILE$force && { $POD_PYTHON scripts/4_analysis/run_calibration.py --campaign-root $POD_RUN_ROOT --scoring-run-id $SCORING_RUN_ID --out $POD_RUN_ROOT/../aa_repeats_$RUN_ID.json --freeze-file $POD_FREEZE_FILE || echo 'A6 A/A FAILED: the confirmatory look is blocked (the report says why)'; }" "$LAND/logs/runner" || return 1
+  job_run score "$bound" "cd $POD_REPO && { [ -d $POD_RUN_ROOT/scoring/$SCORING_RUN_ID ] && echo 'scoring/$SCORING_RUN_ID exists: reused (append-only)' || $POD_PYTHON scripts/4_analysis/rescore_quality.py --run-root $POD_RUN_ROOT --full --device cuda --scoring-run-id $SCORING_RUN_ID --freeze-file $POD_FREEZE_FILE --score-cache-dir results/score_cache/$RUN_ID$bsize; } && $POD_PYTHON scripts/4_analysis/build_predicate_table.py $POD_RUN_ROOT --scoring-run-id $SCORING_RUN_ID --max-null-fraction $MAX_NULL_FRACTION --freeze-file $POD_FREEZE_FILE$force && { $POD_PYTHON scripts/4_analysis/run_calibration.py --campaign-root $POD_RUN_ROOT --scoring-run-id $SCORING_RUN_ID --out $POD_RUN_ROOT/../aa_repeats_$RUN_ID.json --freeze-file $POD_FREEZE_FILE || echo 'A6 A/A FAILED: the confirmatory look is blocked (the report says why)'; }" "$LAND/logs/runner" || return 1
   return 0
 }
 
@@ -1898,6 +1949,7 @@ if [ -f "$STATE" ]; then
   # G5: the stage this master takes over may have a pod job that ran on without
   # it; job_attach_or_submit re-attaches to it instead of submitting a second one
   TAKEOVER_STAGE="$running"
+  [ -z "$running" ] || TAKEOVER_STARTED="$(state get "stages.$running.started_utc" 2>/dev/null || true)"
 else
   state init "$EXP" "$DATE"
 fi

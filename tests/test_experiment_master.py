@@ -271,7 +271,9 @@ def world(tmp_path: Path) -> Dict[str, Path]:
             a = sys.argv[1:]
             if a and a[0] == "rungs":  # ADR-0154: stage 5 lists the budgeted rungs on the Mac
                 print("1 0.5"); sys.exit(0)
-            print("REFUSED: fake Mac planner knows only 'rungs'", file=sys.stderr); sys.exit(2)
+            if a and a[0] == "classes":  # B4: the demand classes the class floors run on
+                print("348,4779"); sys.exit(0)
+            print("REFUSED: fake Mac planner knows only 'rungs' and 'classes'", file=sys.stderr); sys.exit(2)
         ''', exe=False)
     _w(fake_scripts / "4_analysis" / "build_floor_table.py", r'''
         import json, sys
@@ -395,6 +397,19 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         print(f"THINKING_PIN_OK backend={backend} num_tokens=3" if ok else f"THINKING_PIN_FAILED backend={backend} reason=test")
         sys.exit(0 if ok else 1)
         ''', exe=False)
+    # S1 audit 2026-10-23 (MEDIUM 4): the offline dataset probe, before any engine starts
+    _w(pr / "scripts" / "checks" / "probe_datasets_offline.py", r'''
+        import json, os, sys
+        from pathlib import Path
+        a = sys.argv[1:]
+        out = Path(a[a.index("--out") + 1]); out.parent.mkdir(parents=True, exist_ok=True)
+        ok = os.environ.get("CAGE_TEST_DATASETS_OFFLINE_RC", "0") != "1"
+        with open(os.environ["CAGE_TEST_LOG"], "a", encoding="utf-8") as fh:
+            fh.write(f"datasets_offline {a[a.index('--datasets') + 1]} require_offline={'--require-offline' in a} HF_HUB_OFFLINE={os.environ.get('HF_HUB_OFFLINE', '')}\n")
+        out.write_text(json.dumps({"ok": ok}), encoding="utf-8")
+        print("DATASETS_OFFLINE_OK hf_hub_offline=1 loaded=squad_v2=3,musique=3,qasper=3" if ok else "DATASETS_OFFLINE_FAILED reason=dataset musique did not load: FileNotFoundError")
+        sys.exit(0 if ok else 1)
+        ''', exe=False)
     # S0F-88 U2 (review H1): the pod memory probe on the LMCache path
     _w(pr / "scripts" / "checks" / "probe_pod_memory.py", r'''
         import os, sys
@@ -481,8 +496,8 @@ def world(tmp_path: Path) -> Dict[str, Path]:
             plan = {"schema": "cage-campaign-plan-v6", "session": a[a.index("--session") + 1], "argv": a,
                     "steps": [{"kind": "relaunch", "engine": "vllm", "argv": ["manage_vllm_server.sh", "start"]},
                               # cell steps carry engine/topology inside cellspec (the real plan shape; gap triage 2026-10-09 L2)
-                              {"kind": "cell", "cellspec": {"engine": "vllm", "topology": "single"}, "row_key": "k1", "argv": ["run_experiment.py", "--vllm-telemetry"]},
-                              {"kind": "cell", "cellspec": {"engine": "hf", "topology": "single"}, "row_key": "k2", "argv": ["run_cag_reference.py"]}],
+                              {"kind": "cell", "cellspec": {"engine": "vllm", "topology": "single"}, "row_key": "k1", "dataset": "squad_v2", "argv": ["run_experiment.py", "--vllm-telemetry"]},
+                              {"kind": "cell", "cellspec": {"engine": "hf", "topology": "single"}, "row_key": "k2", "dataset": "ruler", "argv": ["run_cag_reference.py"]}],
                     "blocked_row_keys": ["k9"] if os.environ.get("CAGE_TEST_BLOCKED") else []}
             # S0F-88 B-5: the measured run projection the plan stage compares with HOURS
             total = float(os.environ.get("CAGE_TEST_PROJECTION_S", "1200"))
@@ -521,6 +536,16 @@ def world(tmp_path: Path) -> Dict[str, Path]:
             if os.environ.get("CAGE_TEST_RUN_CRASH"):
                 print("Traceback (most recent call last):\n  boom", file=sys.stderr)
                 sys.exit(1)
+            if os.environ.get("CAGE_TEST_RUN_BUDGET_STOP"):
+                print("[run_campaign] BUDGET STOP (ADR-0175): the segment at step 7 projects 9000 s and would end 120 s past the deadline; the remaining steps are not run")
+                if os.environ.get("CAGE_TEST_RUN_BUDGET_STOP_DRY"):
+                    print("[run_campaign] DRY WINDOW FAILED: engine=vllm class=4779 tokens r=0.5 rate=2.85 rps expected IN_REGIME, label='UNPRESSURED'")
+                    print("[run_campaign] --seal SKIPPED: run has failures and/or blocked-skipped cells and --seal-partial was not given (a seal marks the tree done)")
+                    print("[run_campaign] exit 4 (budget stop) also carries failed dry windows (review 2026-10-20 L7)")
+                elif "--seal" in a:
+                    (root / "ledger.json").write_text("{}", encoding="utf-8")
+                print("[run_campaign] totals: {'ok': 60, 'skipped-budget-stop': 40}")
+                sys.exit(4)
             if os.environ.get("CAGE_TEST_RUN_STOP_FAILED"):
                 print("[run_campaign] STOP FAILED (exit 1, timeout): launcher=vllm")
                 if "--seal" in a: (root / "ledger.json").write_text("{}", encoding="utf-8")
@@ -730,7 +755,7 @@ def test_full_sequence_with_both_gos_lands_the_run(world: Dict[str, Path]) -> No
             names.append(n)
     # P-1 (S0F-88): stage 4 runs the live-load gate as its own pod job
     # review 2026-10-13 A1: the stage 4 start check is one more pod job after the engine probes
-    assert names == ["setup", "load_gate", "validate_vllm", "start_check", "calibrate_vllm", "calibrate_rungs_vllm", "plan", "run", "score", "collect"]
+    assert names == ["setup", "load_gate", "datasets_offline", "validate_vllm", "start_check", "calibrate_vllm", "calibrate_rungs_vllm", "plan", "run", "score", "collect"]
     assert any(f"setup_runpod CHARTER_DATASETS=squad_v2 musique qasper PREFETCH_MODELS={PREFETCH_FULL}" in c for c in calls), \
         [c for c in calls if "setup" in c.lower()]
     assert any("preflight Qwen/Qwen3-14B http://localhost:8000 BACKENDS=vllm" in c for c in calls), \
@@ -892,9 +917,9 @@ def test_short_seatbelt_fails_stage_0_before_anything_bills(world: Dict[str, Pat
     world["profile"] = short
     proc = _master(world)
     assert proc.returncode == 1
-    # readiness 0 (5 s) + setup 1 + validate (10 load gate + 25 + 40 start check) + calibrate (60 + 150, ADR-0154
+    # readiness 0 (5 s) + setup 1 + validate (20: load gate + offline dataset probe, + 25 + 40 start check) + calibrate (60 + 150, ADR-0154
     # rung calibration 9,000 s) + plan 15 + run 60 + seal 10 + score 180 + collect 30 + pull margin 90 (G16)
-    assert "SEATBELT=2h (120 min) is shorter than the 671 min the stages need" in proc.stdout
+    assert "SEATBELT=2h (120 min) is shorter than the 681 min the stages need" in proc.stdout
     assert not any("provision_pod" in c for c in _calls(world))
 
 
@@ -910,10 +935,10 @@ def test_shipped_profiles_cover_their_stage_bounds_and_name_registered_models() 
         # ADR-0155: every shipped profile sizes the floor table on the anchor shape
         assert floor_tokens == "4779", f"{p.name}: FLOOR_AVG_SEQ_TOKENS={floor_tokens} is not the registered anchor shape"
         n_srv = len([e for e in engines.split() if e != "hf"]); n_cal = len(calibrate.split())
-        # S0F-88 review L4: plus the stage 4 load gate (10 min) and the pod suite (30 min when SUITE_ON_POD=1);
+        # S0F-88 review L4: plus the stage 4 load gate and the offline dataset probe (20 min) and the pod suite (30 min when SUITE_ON_POD=1);
         # G16 (2026-10-17): plus the readiness wait (900 s), the start check (2,400 s), the seal (600 s) and a
         # the profile's pull margin (ADR-0176 Group C; the common default 90 = S0 attempt 5's 68 min)
-        need = (15 + int(setup_min) + 10 + (30 if suite_on_pod == "1" else 0) + n_srv * 25 + (40 if start_check == "1" else 0)
+        need = (15 + int(setup_min) + 20 + (30 if suite_on_pod == "1" else 0) + n_srv * 25 + (40 if start_check == "1" else 0)
                 + n_cal * 60 + n_cal * int(rungs_bound_s) // 60 + 15 + int(hours) * 60 + 10 + int(score_min) + 30 + int(pull_min))
         unit = seatbelt[-1]; n = int(seatbelt.split()[0][:-1])
         assert unit in ("h", "m"), f"{p.name}: SEATBELT={seatbelt} must be <n>h or <n>m (G30)"
@@ -955,9 +980,9 @@ def test_the_plan_stage_refuses_a_run_projected_past_hours_and_prices_the_whole_
     assert "run projection (S0F-88 B-5): 1.50 h against the 1 h bound" in proc.stdout
     assert "the projected run (1.50 h) exceeds HOURS=1" in proc.stdout
     assert _state(world)["stages"]["plan"]["status"] == "failed"
-    # S0F-88 P-4: the cost estimate covers every stage bound (671 min with the G16 terms), not HOURS alone
+    # S0F-88 P-4: the cost estimate covers every stage bound (681 min with the G16 terms), not HOURS alone
     provision = [c for c in _calls(world) if "provision_pod" in c]
-    assert provision and all("--hours 11.2 " in c for c in provision)
+    assert provision and all("--hours 11.3 " in c for c in provision)
 
 
 def test_the_plan_stage_refuses_a_step_without_a_measured_duration_b5(world: Dict[str, Path]) -> None:
@@ -1845,9 +1870,129 @@ def test_the_scoring_batch_size_reaches_the_pass_only_when_the_profile_sets_it_g
     proc = _master(world, "--only", "score", "--redo")
     assert proc.returncode == 0, proc.stdout[-3000:]
     cmd = (world["home"] / ".cage_jobs" / "score.cmd").read_text(encoding="utf-8")
-    # A15 (2026-10-21): the run-level score cache sits between the freeze file and the batch size
-    assert re.search(r"--freeze-file MyDocs/registration/freeze_resolutions\.json --score-cache-dir logs/score_cache/\S+ --batch-size 32; \}", cmd), cmd[-600:]
+    # A15 (2026-10-21): the run-level score cache sits between the freeze file and the batch size;
+    # S1 audit 2026-10-23 (H1): under results/, which no stage copies file by file (logs/ is)
+    assert re.search(r"--freeze-file MyDocs/registration/freeze_resolutions\.json --score-cache-dir results/score_cache/\S+ --batch-size 32; \}", cmd), cmd[-600:]
+    assert "logs/score_cache" not in cmd
 
+
+# ---------------------------------------------------------------------------
+# S1 audit 2026-10-23: the fixes the three readers found before the S1 relaunch
+# ---------------------------------------------------------------------------
+
+def test_calibrate_starts_each_engine_at_the_registered_largest_pool_s1_audit_c1(world: Dict[str, Path]) -> None:
+    """CRITICAL 1: the class floor prompts reach the anchor class (4,779 tokens) and
+    the launcher default context is 4,096; the start carries stage 0's record."""
+    proc = _master(world, "--yes", "provision", "--to", "calibrate", CAGE_TEST_LARGEST_POOL="1")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    cmd = (world["home"] / ".cage_jobs" / "calibrate_vllm.cmd").read_text(encoding="utf-8")
+    assert "env CAGE_KV_BUDGET_BYTES=48936960000 VLLM_MAX_MODEL_LEN=32768 bash scripts/2_serving/manage_vllm_server.sh start" in cmd
+    assert cmd.index("VLLM_MAX_MODEL_LEN=32768") < cmd.index("calibrate_cell.py")
+
+
+def test_class_floors_without_a_recorded_largest_pool_refuse_stage_5_s1_audit_c1(world: Dict[str, Path], tmp_path: Path) -> None:
+    prof = tmp_path / "S1_floors.env"
+    prof.write_text(world["profile"].read_text(encoding="utf-8") + "\nCLASS_FLOORS=1\n", encoding="utf-8")
+    world["profile"] = prof
+    proc = _master(world, "--yes", "provision", "--to", "calibrate")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "CLASS_FLOORS=1 but stage 0 recorded no largest pool for this engine" in proc.stdout
+    assert not (world["home"] / ".cage_jobs" / "calibrate_vllm.cmd").exists()
+    # with the record, the same profile starts at the pool and passes the class floors on
+    proc = _master(world, "--from", "calibrate", "--redo", "--to", "calibrate", CAGE_TEST_LARGEST_POOL="1")
+    assert proc.returncode == 1  # stage 0 was not redone, so the record is still absent: refused again, nothing submitted
+    assert not (world["home"] / ".cage_jobs" / "calibrate_vllm.cmd").exists()
+
+
+def test_a_budget_stop_passes_as_partial_but_not_over_failed_dry_windows_s1_audit_m3(world: Dict[str, Path]) -> None:
+    proc = _master(world, "--yes", "provision", "--to", "run", CAGE_TEST_RUN_BUDGET_STOP="1")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert "exit 4 = BUDGET STOP (ADR-0175)" in proc.stdout
+    st = _state(world)
+    assert st["stages"]["run"]["status"] == "passed" and st["run"]["partial"].startswith("exit 4")
+    # the same exit over failed dry windows is the exit 3 outcome on a registered profile
+    proc = _master(world, "--from", "run", "--redo", "--to", "run", CAGE_TEST_RUN_BUDGET_STOP="1", CAGE_TEST_RUN_BUDGET_STOP_DRY="1")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "[FAIL] the budget stop also carries failed dry windows (ADR-0153)" in proc.stdout
+    assert "custody (G6): copying the pod's mirror of the UNSEALED tree" in proc.stdout
+    st = _state(world)
+    assert st["stages"]["run"]["status"] == "failed"
+    assert any("BUDGET STOP with failed dry windows" in n for n in st["stages"]["run"]["notes"])
+
+
+def test_a_takeover_resume_reuses_a_run_that_ended_with_exit_4_s1_audit_h2(world: Dict[str, Path]) -> None:
+    """HIGH 2: a run that ended (here a budget stop) while the master was gone is
+    never resubmitted: a resubmit truncates its log and the reseal is refused."""
+    proc = _master(world, "--yes", "provision", "--to", "run", CAGE_TEST_RUN_BUDGET_STOP="1")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    land = world["exp_root"] / "S1" / DATE
+    state_path = land / "extras" / "state.json"
+    st = json.loads(state_path.read_text(encoding="utf-8"))
+    st["stages"]["run"]["status"] = "running"; st["stages"]["run"]["rc"] = None
+    st["run"].pop("partial", None)
+    state_path.write_text(json.dumps(st), encoding="utf-8")
+    submits = lambda: sum(1 for c in _calls(world) if "base64 -d" in c and "run.cmd" in c)
+    before = submits()
+    proc = _master(world, "--from", "run", "--redo", "--to", "run", CAGE_TEST_RUN_BUDGET_STOP="1")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert "job run finished FAILED(4) during the interrupted attempt: its log is fetched, nothing is resubmitted" in proc.stdout
+    assert submits() == before
+    st = _state(world)
+    assert st["stages"]["run"]["status"] == "passed" and st["run"]["partial"].startswith("exit 4")
+    # review 2026-10-23 M5: a handle submitted BEFORE the interrupted attempt started is
+    # an older attempt's job, never reused: the stage submits afresh
+    st = json.loads(state_path.read_text(encoding="utf-8"))
+    st["stages"]["run"]["status"] = "running"; st["stages"]["run"]["rc"] = None
+    st["stages"]["run"]["started_utc"] = "2099-01-01T00:00:00Z"
+    st["run"].pop("partial", None)
+    state_path.write_text(json.dumps(st), encoding="utf-8")
+    proc = _master(world, "--from", "run", "--redo", "--to", "run", CAGE_TEST_RUN_BUDGET_STOP="1")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert "predates the interrupted attempt (2099-01-01T00:00:00Z): a fresh job is submitted" in proc.stdout
+    assert submits() == before + 1
+
+
+def test_the_run_job_declares_the_dataset_roster_for_the_sealed_manifest_s1_audit_m2(world: Dict[str, Path]) -> None:
+    proc = _master(world, "--yes", "provision", "--to", "run")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    cmd = (world["home"] / ".cage_jobs" / "run.cmd").read_text(encoding="utf-8")
+    # review 2026-10-23 M3: the roster is the plan's own cell datasets (the fake plan
+    # carries a RULER cell the charter roster would refuse), sorted
+    assert "CAGE_CAMPAIGN_DATASETS='ruler squad_v2'" in cmd
+    assert cmd.index("CAGE_CAMPAIGN_DATASETS=") < cmd.index("run_campaign.py run")
+
+def test_stage_4_loads_every_charter_dataset_offline_before_any_engine_starts_s1_audit_m4(world: Dict[str, Path]) -> None:
+    proc = _master(world, "--yes", "provision", "--to", "validate")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    calls = _calls(world)
+    probe = [c for c in calls if c.startswith("datasets_offline ")]
+    assert probe == ["datasets_offline squad_v2,musique,qasper require_offline=False HF_HUB_OFFLINE="]  # the world pins no revision
+    # the probe runs after the load gate and before the first engine start
+    order = [c for c in calls if c.startswith("datasets_offline ") or c.startswith("launcher ")]
+    assert order and order[0] == probe[0]  # before the first launcher start of stage 4
+    assert "DATASETS_OFFLINE_OK hf_hub_offline=1 loaded=squad_v2=3,musique=3,qasper=3" in proc.stdout
+    # a dataset that does not load fails stage 4 before any engine bills
+    proc = _master(world, "--from", "validate", "--redo", "--to", "validate", CAGE_TEST_DATASETS_OFFLINE_RC="1")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    # the probe exits 1, so the job wait fails first (the marker gate is the second layer)
+    assert "[FAIL] job datasets_offline: wait: rc=1" in proc.stdout
+    assert "DATASETS_OFFLINE_FAILED reason=dataset musique did not load" in proc.stdout
+    assert _state(world)["stages"]["validate"]["status"] == "failed"
+    assert not [c for c in _calls(world) if c.startswith("launcher ")][len([c for c in calls if c.startswith("launcher ")]):]  # no engine started on the failed attempt
+
+
+def test_a_pinned_profile_requires_the_offline_load_s1_audit_m4(world: Dict[str, Path], tmp_path: Path) -> None:
+    pinned = tmp_path / "S1_pin_off.env"
+    pinned.write_text(world["profile"].read_text(encoding="utf-8") + "\nPIN_MODEL_REVISION=1\n", encoding="utf-8")
+    world["profile"] = pinned
+    freeze_path = world["tmp"] / "freeze_resolutions.json"
+    freeze = json.loads(freeze_path.read_text(encoding="utf-8"))
+    freeze.setdefault("INSTRUMENT_REVISIONS", {})["served_model"] = {"model": "Qwen/Qwen3-14B", "revision": "abc123"}
+    freeze_path.write_text(json.dumps(freeze), encoding="utf-8")
+    proc = _master(world, "--yes", "provision", "--to", "validate")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    probe = [c for c in _calls(world) if c.startswith("datasets_offline ")]
+    assert probe == ["datasets_offline squad_v2,musique,qasper require_offline=True HF_HUB_OFFLINE=1"]
 
 def test_a_recorded_conductor_pod_passes_the_clean_room_and_the_zero_proof_g8(world: Dict[str, Path]) -> None:
     # without the record a listed pod is a clean-room refusal ...
@@ -2076,13 +2221,13 @@ def test_the_pull_brings_the_aa_report_when_present_and_notes_its_absence(world:
 
 
 def test_the_pull_margin_is_read_from_the_profile_in_the_seatbelt_sum(world: Dict[str, Path], tmp_path: Path) -> None:
-    # the world profile: 671 min with the default 90; a 300 min margin adds 210
+    # the world profile: 681 min with the default 90; a 300 min margin adds 210
     prof = tmp_path / "S1_pull.env"
     prof.write_text(world["profile"].read_text(encoding="utf-8").replace("SEATBELT=12h", "SEATBELT=2h") + "\nPULL_MARGIN_MIN=300\n", encoding="utf-8")
     world["profile"] = prof
     proc = _master(world)
     assert proc.returncode == 1
-    assert "SEATBELT=2h (120 min) is shorter than the 881 min the stages need" in proc.stdout
+    assert "SEATBELT=2h (120 min) is shorter than the 891 min the stages need" in proc.stdout
     assert "pull margin 300" in proc.stdout
 
 

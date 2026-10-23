@@ -197,5 +197,9 @@ pytest-asyncio>=0.21.0
 # 2026-10-21 (A7 and its review): bumped 51bb9ac4 -> 40431df9: SGLang retraction
 # maps counter-first (sglang:num_retracted_requests_total), and a declared
 # counter with no sample yet reads 0 instead of absent.
-cage-stats @ git+https://github.com/lucasmdocarmo/cage-stats.git@40431df971b0be6e71babe442c5d240c713f9428
+# 2026-10-23 (S1 validate stop 2, live pod): bumped 40431df9 -> c9c20c6d: SGLang
+# 0.5.10.post1 creates the retraction counter only at its first retraction
+# (multiprocess metrics), so the dialect reads the sampled retraction gauge
+# with no counter as 0; neither present stays absent.
+cage-stats @ git+https://github.com/lucasmdocarmo/cage-stats.git@c9c20c6dad08ec173e04864dc93906a1bc1df248
 # Local dev alternative (no install): set CAGE_STATS_HOME=/Users/lucasmariano/cage-stats

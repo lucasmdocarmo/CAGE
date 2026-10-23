@@ -223,6 +223,23 @@ echo "[cage] [1/5] creating venv cage-env with ${PYBIN} under ${CAGE_VENV_ROOT}.
 link_venv cage-env || die "cage-env could not be linked at the repo root (see the warning above)"
 # shellcheck disable=SC1091
 source cage-env/bin/activate
+# S1 audit 2026-10-23: the environment lock. Each pip step below runs under the
+# constraints file that names exactly what S0 attempt 5's pod resolved at that
+# step (requirements.lock.gpu.vllm-step.txt for the venv tooling and the vLLM
+# step, requirements.lock.gpu.txt for the requirements step and the openai
+# reconcile), so a fresh pod no longer drifts with PyPI between launches (45
+# packages had moved in nine days; one failed stage 4). PIP_CONSTRAINT is pip's
+# own environment form of --constraint. A missing lock file leaves the step
+# unconstrained with a [cage] WARNING line, which stage 3 of the master turns
+# into a failed setup (the locks ship in the tarball; a run without them is a
+# deliberate, recorded deviation, never a silent one).
+_lock_vllm_step="$PWD/requirements.lock.gpu.vllm-step.txt"
+_lock_final="$PWD/requirements.lock.gpu.txt"
+if [ -f "$_lock_vllm_step" ]; then
+  export PIP_CONSTRAINT="$_lock_vllm_step"; echo "[cage]   pip constraints (venv tooling and the vLLM step): $_lock_vllm_step"
+else
+  echo "[cage]   WARNING: no $_lock_vllm_step: the vLLM step resolves against today's PyPI (unlocked)"
+fi
 pip install --upgrade pip setuptools wheel
 
 # 2. Official pinned vLLM GPU wheel (provides `vllm serve`) plus the NIXL pair for the
@@ -234,12 +251,19 @@ pip install "vllm==${VLLM_VERSION}" "nixl==${NIXL_VERSION}" "nixl-cu12==${NIXL_V
 # 3. CAGE requirements (the repo's pinned manifest: cage-stats, pynvml,
 #    datasets, transformers, FAISS, the metric stack, ...).
 echo "[cage] [3/5] installing CAGE requirements..."
+if [ -f "$_lock_final" ]; then
+  export PIP_CONSTRAINT="$_lock_final"; echo "[cage]   pip constraints (the requirements step, the final cage-env state): $_lock_final"
+else
+  unset PIP_CONSTRAINT; echo "[cage]   WARNING: no $_lock_final: the requirements step resolves against today's PyPI (unlocked)"
+fi
 pip install -r requirements.txt
 
 # 3b. vLLM (>=0.11) needs openai>=2, but lettucedetect pins openai==1.66.3 —
 #     same reconcile as the GCP port (see setup_gpu_cloud.sh [3b] for history).
 echo "[cage] [3b] reconciling openai for vLLM ${VLLM_VERSION}..."
 pip install -U "openai>=2.0"
+# the engine venvs below carry their own lock as an explicit -c (install_engine_venv)
+unset PIP_CONSTRAINT
 
 # 3d. LMCache (S0F-57, ADR-0158): the KV-connector package of the retr-store arm
 #     (B8; the relaunch sets VLLM_KV_TRANSFER_CONFIG LMCacheConnectorV1). Opt-in per
@@ -383,14 +407,18 @@ if [ "${SKIP_ENGINE_INSTALL:-0}" != "1" ]; then
     fi
   fi
   if "$SGLANG_PYBIN" -m venv --help >/dev/null 2>&1; then
-    if ENGINE_PYBIN="$SGLANG_PYBIN" install_engine_venv sglang-env "SGLang ${SGLANG_VERSION}" "sglang==${SGLANG_VERSION}"; then
+    # S1 audit 2026-10-23: the sglang-env lock (the set S0 attempt 5 resolved), when present
+    _lock_sglang=(); [ ! -f "$PWD/requirements.lock.sglang-env.txt" ] || _lock_sglang=(-c "$PWD/requirements.lock.sglang-env.txt")
+    [ "${#_lock_sglang[@]}" -gt 0 ] || echo "[cage]   WARNING: no requirements.lock.sglang-env.txt: sglang-env resolves against today's PyPI (unlocked)"
+    if ENGINE_PYBIN="$SGLANG_PYBIN" install_engine_venv sglang-env "SGLang ${SGLANG_VERSION}" ${_lock_sglang[@]+"${_lock_sglang[@]}"} "sglang==${SGLANG_VERSION}"; then
       echo "[cage]   sglang: $(sglang-env/bin/python3 -c 'import sglang, sys; print(sglang.__version__, "on CPython", sys.version.split()[0])' 2>&1 | tail -1)"
     fi
   else
     warn "SGLang ${SGLANG_VERSION} SKIPPED: no CPython ${SGLANG_PYTHON_VERSION} with a venv module in this container (ADR-0120); its launcher refuses to start until sglang-env exists"
   fi
+  _lock_lmdeploy=(); [ ! -f "$PWD/requirements.lock.lmdeploy-env.txt" ] || _lock_lmdeploy=(-c "$PWD/requirements.lock.lmdeploy-env.txt")
   if install_engine_venv lmdeploy-env "LMDeploy ${LMDEPLOY_VERSION} + torch ${LMDEPLOY_TORCH_VERSION}" \
-       "torch==${LMDEPLOY_TORCH_VERSION}" "lmdeploy==${LMDEPLOY_VERSION}"; then
+       ${_lock_lmdeploy[@]+"${_lock_lmdeploy[@]}"} "torch==${LMDEPLOY_TORCH_VERSION}" "lmdeploy==${LMDEPLOY_VERSION}"; then
     echo "[cage]   lmdeploy: $(lmdeploy-env/bin/python3 -c 'import lmdeploy; print(lmdeploy.__version__)' 2>&1 | tail -1)"
   fi
 else

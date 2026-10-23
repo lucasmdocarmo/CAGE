@@ -933,13 +933,44 @@ def test_warmup_pool_refuses_when_every_candidate_shares_a_measured_context(
 def test_warmup_context_keys_fingerprint_paragraphs_and_paper_ids() -> None:
     examples = _PaperLoader("qasper").load(max_examples=2)
     keys = runner.warmup_context_keys(examples)
-    # 2 papers x 2 distinct paragraphs + 2 paper ids.
-    assert len(keys) == 6
+    # 2 papers x the LEADING paragraph + 2 paper ids (S1 audit 2026-10-23: the
+    # leading paragraph is the cacheable prefix; the paper id names the rest).
+    assert len(keys) == 4
     assert "paper:p00" in keys and "paper:p01" in keys
     plain = _PoolLoader("squad_v2").load(max_examples=3)
     assert len(runner.warmup_context_keys(plain)) == 3
     assert runner.warmup_context_keys([]) == set()
 
+
+
+def test_warmup_keys_are_the_leading_paragraph_so_shared_distractors_do_not_exclude_s1_2026_10_23() -> None:
+    """S1 audit 2026-10-23 (CRITICAL 2): MuSiQue-shaped examples, 20 paragraphs
+    each, distractors shared across the split, gold sets disjoint."""
+    shared = [f"Shared distractor paragraph {d}." for d in range(16)]
+
+    def ex(i: int, lead: str) -> CAGExample:
+        gold = [f"Gold {i} paragraph {g}." for g in range(4)]
+        # the leading paragraph first, then the rest of the gold set and the shared distractors
+        ctx = [lead] + [g for g in gold if g != lead] + shared
+        return CAGExample(id=f"musique-q{i:03d}", question=f"q{i}?", context=ctx[:20], answer="a",
+                          metadata={"dataset": "musique", "supporting_titles": gold})
+
+    measured = [ex(i, f"Gold {i} paragraph 0.") for i in range(5)]
+    keys = runner.warmup_context_keys(measured)
+    assert keys == {runner.stable_text_id(f"Gold {i} paragraph 0.") for i in range(5)}
+    # a candidate that shares every distractor but leads with its own paragraph is disjoint
+    own = ex(9, "Gold 9 paragraph 0.")
+    # a candidate whose LEADING paragraph is a measured leading paragraph is excluded
+    same_lead = ex(8, "Gold 0 paragraph 0.")
+    # a candidate that carries a measured gold paragraph in a non-leading slot is disjoint (no shared prefix)
+    inner = CAGExample(id="musique-q007", question="q7?", answer="a", metadata={"dataset": "musique"},
+                       context=["Gold 7 paragraph 0.", "Gold 1 paragraph 0."] + shared)
+    split = runner.partition_warmup_candidates([own, same_lead, inner], measured_ids={m.id for m in measured},
+                                               measured_context_keys=keys)
+    assert [c.id for c in split.disjoint] == ["musique-q009", "musique-q007"]
+    assert split.excluded_by_context == 1 and split.excluded_by_id == 0
+    # an empty leading slot is skipped, never a key
+    assert runner.warmup_context_keys([CAGExample(id="x", question="?", context=["", "Lead."], answer="a", metadata={})]) == {runner.stable_text_id("Lead.")}
 
 def test_draw_warmup_pool_refuses_context_overlap_and_partitions() -> None:
     pool = _SharedParagraphLoader("squad_v2").load()

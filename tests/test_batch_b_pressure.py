@@ -2045,7 +2045,9 @@ class TestBudgetStopRun2:
 
     def test_the_stop_falls_between_steps_by_their_projection(self, tmp_path, floor_table, stub, monkeypatch):
         plan = _stub_plan(_pressure_grid(), floor_table, stub.cmd)
-        monkeypatch.setattr(rc, "run_projection", lambda steps: {"total_s": 10.0})
+        # 10 s per relaunch segment: the check projects plan prefixes and subtracts
+        # (S1 audit 2026-10-23 M2), so the stub grows by one segment per relaunch
+        monkeypatch.setattr(rc, "run_projection", lambda steps: {"total_s": 10.0 * (1 + sum(1 for s in steps if s.get("kind") == "relaunch"))})
         # a clock that advances 10 s per executed launcher or runner call
         clock = {"t": 1_000_000.0}
         real_exec = rc._exec
@@ -2072,6 +2074,87 @@ class TestBudgetStopRun2:
         # review 2026-10-20 H1: every cell the stop left unrun says so (a SKIP to the organizer)
         unrun = [s for s in steps[second:] if s["kind"] == "cell" and not s["blocked_on"]]
         assert unrun and all("reason=budget-stop" in _sentinel(root, s) for s in unrun)
+
+
+    def test_compression_paid_by_an_earlier_segment_is_not_charged_again_s1_audit_m2(
+        self, tmp_path, floor_table, stub, monkeypatch
+    ):
+        """S1 audit 2026-10-23 (MEDIUM 2): two retr-comp segments on one pool.
+        Projected one segment at a time, the second pays the pool's compression
+        again; the check now projects plan prefixes and subtracts."""
+        grid = _tiny_grid(f1_baselines=("B9",), f2_baselines=("B9",), f2_budgets=(1.0, 0.5), f2_rates=(0.85,))
+        plan = _stub_plan(grid, floor_table, stub.cmd)
+        steps = plan["steps"]
+        starts = [i for i, s in enumerate(steps) if s["kind"] == "relaunch"]
+        segments = [steps[a:b] for a, b in zip(starts, starts[1:] + [len(steps)])]
+        assert len(segments) >= 2
+        whole = rc.run_projection(steps)
+        per_segment = sum(rc.run_projection(seg)["total_s"] for seg in segments)
+        assert whole["compression_s"] > 0
+        # the per-segment sum pays a qasper pool's compression more than once
+        assert per_segment > whole["total_s"] + 1.0
+        # the clock advances by each segment's TRUE cost (the prefix difference) as
+        # its relaunch starts, so the last segment is judged against what the earlier
+        # ones really took; judged alone it would re-pay the pool's compression
+        increments = [
+            rc.run_projection(steps[:b])["total_s"] - rc.run_projection(steps[:a])["total_s"]
+            for a, b in zip(starts, starts[1:] + [len(steps)])
+        ]
+        assert abs(sum(increments) - whole["total_s"]) < 1e-6
+        clock = {"t": 1_000_000.0}
+        real_exec = rc._exec
+
+        def _timed_exec(argv, env):
+            if "restart" in argv:  # the launcher argv carries the stub path first
+                clock["t"] += increments.pop(0)
+            return real_exec(argv, env)
+
+        monkeypatch.setattr(rc, "_exec", _timed_exec)
+        monkeypatch.setattr(rc.time, "time", lambda: clock["t"])
+        root = _run_root(tmp_path)
+        # room for the whole plan as projected once, not for the double-charged sum
+        code = rc.run_plan(plan, root, stop_at=clock["t"] + whole["total_s"] + 1.0)
+        assert code == 0, code
+        assert increments == []  # every segment started
+        unrun = [s for s in steps if s["kind"] == "cell" and not s.get("blocked_on") and "budget-stop" in _sentinel(root, s)]
+        assert unrun == []
+
+
+    def test_a_segment_a_failed_relaunch_skipped_pays_no_compression_in_the_prefix_review_m4(
+        self, tmp_path, floor_table, stub
+    ):
+        """Review 2026-10-23 M4: only prefix steps that ran stay in the prefix,
+        so the compression of a pool a skipped segment never prepared is
+        charged to the first segment that serves it."""
+        import shutil
+
+        grid = _tiny_grid(f1_baselines=("B9",), f2_baselines=("B9",), f2_budgets=(1.0, 0.5), f2_rates=(0.85,))
+        plan = _stub_plan(grid, floor_table, stub.cmd)
+        steps = plan["steps"]
+        starts = [i for i, s in enumerate(steps) if s["kind"] == "relaunch"]
+        assert len(starts) >= 3  # two qasper F2 segments on one pool, then the squad_v2 F1 segment
+        a, b, c = starts[0], starts[1], starts[2]
+        assert {s["dataset"] for s in steps[a:c] if s["kind"] != "relaunch"} == {"qasper"}
+        root = _run_root(tmp_path)
+        assert rc.run_plan(plan, root) == 0  # every prefix step ran
+        dry_root = rc.dry_window_root(root, plan)
+        shared = rc.budget_segment_seconds(steps, b, c, root, dry_root)
+        alone = rc.run_projection(steps[b:c])["total_s"]
+        assert shared < alone  # the earlier segment paid the pool's compression
+        # now the earlier segment never ran, as after a failed relaunch: its cells
+        # carry the relaunch-failed sentinel and its dry window has no attempt
+        for s in steps[a:b]:
+            if s["kind"] == "cell":
+                base_, _exp = rc._window_range(s)
+                rc._write_failed_sentinel(root, s["row_key"], s["dataset"], "relaunch-failed", base_)
+            if s["kind"] == "dry_window":
+                shutil.rmtree(dry_root / "cells" / s["row_key"], ignore_errors=True)
+        charged = rc.budget_segment_seconds(steps, b, c, root, dry_root)
+        assert charged > shared
+        # nothing before it prepared the qasper pool any more: the whole pool is charged here
+        assert charged == pytest.approx(alone, abs=1e-6)
+        # the first call site: the lead segment is the prefix from nothing
+        assert rc.budget_segment_seconds(steps, 0, starts[0], root, dry_root) == pytest.approx(rc.run_projection(steps[:starts[0]])["total_s"])
 
 
 class TestA16ClassFloorStart:

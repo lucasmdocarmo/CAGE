@@ -78,7 +78,8 @@ def test_setup_creates_engine_venvs_from_the_canonical_interpreter_deleting_noth
     assert '"$venv/bin/pip" install --no-cache-dir "$@"' in code, (
         "install through the venv's own pip and without a pip cache; cage-env stays active"
     )
-    assert 'install_engine_venv sglang-env "SGLang ${SGLANG_VERSION}" "sglang==${SGLANG_VERSION}"' in code
+    # S1 audit 2026-10-23: the sglang-env lock rides between the label and the pin as an explicit -c
+    assert 'install_engine_venv sglang-env "SGLang ${SGLANG_VERSION}" ${_lock_sglang[@]+"${_lock_sglang[@]}"} "sglang==${SGLANG_VERSION}"' in code
     assert '"torch==${LMDEPLOY_TORCH_VERSION}" "lmdeploy==${LMDEPLOY_VERSION}"' in code
     assert "rm -rf" not in code.split("install_engine_venv()")[1].split("# 4.")[0], (
         "the engine step deletes nothing: reruns reuse the venv and pip completes the install"

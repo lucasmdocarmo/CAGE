@@ -6069,19 +6069,33 @@ def verify_answerability_labels(examples: Sequence[CAGExample]) -> int:
 
 
 def warmup_context_keys(examples: List[CAGExample]) -> Set[str]:
-    """ADR-0102: fingerprints of the SERVED context of ``examples``.
+    """ADR-0102: fingerprints of the SERVED context prefix of ``examples``.
 
-    One ``stable_text_id`` per non-empty context paragraph (the same doc-id
-    hashing the IR corpus uses) plus ``paper:<paper_id>`` when the loader
-    groups questions by source document (QASPER). Computed on the RAW loader
-    examples, before any corpus-block transform, so it names the gold
-    paragraphs a warm-up request would share with a measured prompt.
+    One ``stable_text_id`` of the LEADING non-empty context paragraph (the
+    same doc-id hashing the IR corpus uses) plus ``paper:<paper_id>`` when the
+    loader groups questions by source document (QASPER). Computed on the RAW
+    loader examples, before any corpus-block transform.
+
+    S1 audit 2026-10-23 (CRITICAL 2): the rule was every paragraph. A MuSiQue
+    question carries 20 paragraphs, 16 of them distractors drawn from a pool
+    the split shares, so at n = 2,000 none of the 50 reserve questions passed
+    and every MuSiQue cell refused its warm-up draw (reproduced on the Mac).
+    The leading paragraph is the exact rule for cache warmth: the prompt puts
+    the context blocks first and the question last (src/utils/prompting.py),
+    and both engines reuse a cached prefix only from the start of the prompt
+    (SGLang's radix tree is walked from its root, radix_cache.py; vLLM hashes
+    every KV block with the hash of the blocks before it, design/prefix_caching),
+    so two requests whose leading paragraphs differ share no cacheable prefix
+    past the system message. For a one-paragraph context (SQuAD v2) and for a
+    paper-grouped loader (QASPER, the paper id names every same-paper
+    candidate) the excluded set is the one the old rule gave.
     """
     keys: Set[str] = set()
     for ex in examples:
         for paragraph in (ex.context or []):
             if paragraph:
                 keys.add(stable_text_id(paragraph))
+                break
         paper = (ex.metadata or {}).get("paper_id")
         if paper:
             keys.add(f"paper:{paper}")

@@ -8848,6 +8848,34 @@ def _dry_window_dir(dry_root: Path, step: Mapping[str, Any], ordinal: int) -> Pa
     return Path(dry_root) / "cells" / step["row_key"] / f"window_{step['dataset']}-{ordinal:02d}"
 
 
+def budget_segment_seconds(
+    steps: Sequence[Mapping[str, Any]], index: int, end: int, campaign_root: Path, dry_root: Path
+) -> float:
+    """S1 audit 2026-10-23 (MEDIUM 2, review M4): the seconds the steps
+    [index, end) add to the plan prefix before them, under run_projection's
+    one-charge compression memo. A prefix step that never ran is left out: a
+    cell carrying a failure sentinel (a failed relaunch writes
+    "relaunch-failed" for every cell of its segment, 9514) and a dry window
+    with no attempt on disk (the same relaunch never ran it, so nothing
+    prepared its pool). The first segment that serves that pool is then the
+    one charged for its compression. A cell that ran and failed is left out
+    too, which over-charges the next segment: the conservative side. The
+    segment itself is charged whole (an upper bound on a resume)."""
+    def _ran(s: Mapping[str, Any]) -> bool:
+        if s.get("kind") == "relaunch" or s.get("blocked_on") is not None:
+            return True
+        if s.get("kind") == "dry_window":
+            return bool(_dry_attempt_ordinals(dry_root, s))
+        base_, _exp = _window_range(s)
+        return not _sentinel_path(campaign_root, s["row_key"], s["dataset"], base_).exists()
+
+    before = [s for s in steps[:index] if _ran(s)]
+    return (
+        float(run_projection(before + list(steps[index:end]))["total_s"])
+        - float(run_projection(before)["total_s"])
+    )
+
+
 def _window_range(step: Mapping[str, Any]) -> Tuple[int, int]:
     """(count base, expected windows) of a cell step: the cell's whole
     ordinal range, or the one ordinal of a B1 trial step (round-robin
@@ -9189,11 +9217,18 @@ def run_plan(
         """Review 2026-10-20 H1: checked once per relaunch segment, on the
         whole segment's projection, so a started segment serves every trial
         of its cells; a stop records every executable cell it leaves unrun
-        (sentinel reason budget-stop, a SKIP to the organizer)."""
+        (sentinel reason budget-stop, a SKIP to the organizer).
+
+        S1 audit 2026-10-23 (MEDIUM 2): the segment is projected as the
+        difference of two plan prefixes, never on its own, so the compression
+        a retr-comp pool already paid in an earlier segment (the run memo,
+        A14) is charged once; projected alone, the last vLLM F1 segment of
+        the S1 plan read 10.6 h for 7.3 h of new work and the stop cut cells
+        the deadline held."""
         nonlocal budget_stop
         if stop_at is None:
             return False
-        need = float(run_projection(list(seg))["total_s"])
+        need = budget_segment_seconds(steps, index, index + len(seg), campaign_root, dry_root)
         now = time.time()
         if now + need <= stop_at:
             return False
