@@ -1795,8 +1795,11 @@ def _grid_datasets(grid: "SessionGrid") -> FrozenSet[str]:
 #: ADR-0175 (C4, Run 2; owner 2026-10-20): the blocks of a block-registered
 #: session, in run order (value order: the core K1 to K9, then breadth L1 to
 #: L6; L6 is the optional tail). MyDocs/RunPod/S1_BATCH2B_SPEC_2026-10-20.md.
+#: ADR-0176 (owner 2026-10-22): P1, the S1 pressure table (every strategy on
+#: both engines at the constrained rungs), runs right after K1; K2 to K9 and
+#: L1 to L6 keep their names for S2. MyDocs/RunPod/S1_PLAN_2026-10-22.md.
 BLOCK_ORDER: Tuple[str, ...] = (
-    "K1", "K2", "K3", "K4", "K5", "K6", "K7", "K8", "K9",
+    "K1", "P1", "K2", "K3", "K4", "K5", "K6", "K7", "K8", "K9",
     "L1", "L2", "L3", "L4", "L5", "L6",
 )
 LOAD_KINDS: Tuple[str, ...] = ("own", "slower", "frontier")
@@ -2489,12 +2492,15 @@ SESSION_GRIDS: Dict[str, SessionGrid] = {
 
 #: ADR-0175 (C4, Run 2; owner 2026-10-20 "ok go with run 2"; the Batch 2b
 #: spec MyDocs/RunPod/S1_BATCH2B_SPEC_2026-10-20.md lists every point and
-#: each [A] choice). D1 rates; rung 1.5 dropped, 1.25 the control rung.
-S1_RECOMPUTE_RATES: Tuple[float, ...] = (0.5, 0.7, 0.85, 1.0, 1.2)
-S1_REUSE_RATES: Tuple[float, ...] = (0.85, 1.0, 1.2)
+#: each [A] choice). Rung 1.5 dropped, 1.25 the control rung.
+#: ADR-0176 (owner 2026-10-22, MyDocs/RunPod/S1_PLAN_2026-10-22.md): S1 keeps
+#: K1 as registered and adds P1, the pressure table, at the constrained rungs
+#: and these two own loads; the sweep rungs and the D1 rate ladders go to S2
+#: with K2 to K9 and L1 to L6.
 S1_CONTROL_R: float = 1.25
 S1_CONSTRAINED_RUNGS: Tuple[float, ...] = (0.5, 0.25)
-S1_SWEEP_RUNGS: Tuple[float, ...] = (1.0, 0.5, 0.25)
+S1_PRESSURE_RATES: Tuple[float, ...] = (0.7, 0.85)
+S1_PRESSURE_WINDOWS: int = 2
 
 
 def _own(*fracs: float) -> Tuple[Load, ...]:
@@ -2510,46 +2516,55 @@ _S1_BLOCKS: Tuple[PressurePoint, ...] = (
     PressurePoint("K1", ("B1", "B3"), _BOTH, S1_CONSTRAINED_RUNGS, (_FRONTIER,), windows=12),
     PressurePoint("K1", ("B1", "B3"), _BOTH, (S1_CONTROL_R,),
                   tuple(Load("frontier", source_r=r) for r in S1_CONSTRAINED_RUNGS), windows=12),
-    PressurePoint("K2", ("B1", "B3"), _BOTH, S1_SWEEP_RUNGS, (Load("slower", 0.7), Load("slower", 0.85))),
-    PressurePoint("K3", ("B7", "B8", "B9", "B10", "B11"), ("vllm",), S1_CONSTRAINED_RUNGS, _own(0.85)),
-    PressurePoint("K4", ("B3",), _BOTH, S1_CONSTRAINED_RUNGS, (_FRONTIER,), dataset="squad_v2"),
-    PressurePoint("K5", ("B1",), _BOTH, (S1_CONTROL_R,) + S1_SWEEP_RUNGS, _own(*S1_RECOMPUTE_RATES)),
-    PressurePoint("K6", ("B6",), ("vllm",), S1_SWEEP_RUNGS, _own(0.85, 1.0, 1.2)),
-    PressurePoint("K7", ("B3",), _BOTH, S1_SWEEP_RUNGS, _own(*S1_REUSE_RATES)),
-    PressurePoint("K8", ("B4", "B12"), ("vllm",), S1_SWEEP_RUNGS, _own(*S1_REUSE_RATES)),
-    PressurePoint("K9", ("B1",), _BOTH, S1_SWEEP_RUNGS, _own(0.85, 1.0, 1.2),
-                  dataset="ruler", ruler_tasks=RULER_F2_TASKS[:2]),
-    # breadth, in value order
-    PressurePoint("L1", ("B1",), _BOTH, (0.375,), _own(*S1_RECOMPUTE_RATES)),
-    PressurePoint("L2", _ALL_BASELINES, _BOTH, (0.25,), _own(0.7, 0.85)),
-    PressurePoint("L3", ("B1",), _BOTH, (S1_CONTROL_R,) + S1_SWEEP_RUNGS, _own(0.95, 1.05)),
-    PressurePoint("L4", ("B1",), _BOTH, S1_CONSTRAINED_RUNGS, _own(1.0),
-                  dataset="ruler", ruler_tasks=RULER_F2_TASKS[2:]),
-    PressurePoint("L5", _ALL_BASELINES, _BOTH, (0.5,), _own(0.7, 0.85)),
-    # L6, the optional tail: the rest of session a's coded pressure grid
-    # without rung 1.5 and 0.75 (S1 calibrates neither) [A]
-    # (review 2026-10-20 L5: the D6 rates on 1.0, 0.5, 0.25 and the fine rates
-    # only on 1.25 and 0.375, as session a codes them)
-    PressurePoint("L6", _ordered(FRESH_SET), _BOTH, S1_SWEEP_RUNGS, _own(*FULL_RATE_FRACTIONS)),
-    PressurePoint("L6", _ordered(FRESH_SET), _BOTH, (S1_CONTROL_R, 0.375), _own(*ANCHOR_FINE_RATE_FRACTIONS)),
-    PressurePoint("L6", _ordered(REUSE_SET), _BOTH, S1_SWEEP_RUNGS, _own(*REDUCED_RATE_FRACTIONS)),
-    PressurePoint("L6", ("B1",), _BOTH, S1_SWEEP_RUNGS, _own(*FULL_RATE_FRACTIONS),
-                  dataset="ruler", ruler_tasks=RULER_F2_TASKS),
-    PressurePoint("L6", ("B1",), _BOTH, (S1_CONTROL_R, 0.375), _own(*ANCHOR_FINE_RATE_FRACTIONS),
-                  dataset="ruler", ruler_tasks=RULER_F2_TASKS),
+    # P1 (ADR-0176): the pressure table, every strategy on both engines at
+    # the constrained rungs and two own loads, two windows each, no separate
+    # control (the owner removed it 2026-10-22: K1 carries the control rung).
+    # Owner 2026-10-23: B8 (the retrieval store) leaves P1 for S2, so the table
+    # is symmetric across engines (SGLang has no store connector; B8 stays in
+    # the no-pressure table on vLLM, blocked on SGLang as before).
+    PressurePoint("P1", tuple(b for b in _ALL_BASELINES if b != "B8"), _BOTH, S1_CONSTRAINED_RUNGS,
+                  _own(*S1_PRESSURE_RATES), windows=S1_PRESSURE_WINDOWS),
+    # Owner 2026-10-23: the cache-reuse pair under pressure on the short-context
+    # workload too (B3 corpus-reuse, B4 prefix cache), inside P1 so the cells
+    # interleave with the Qasper ones by serving configuration (no second
+    # relaunch); the SQuAD v2 window pool is 800, the secondary n. Arrivals per
+    # window are rate x class duration: 199 to 517 on the TEST fixture's ladder;
+    # projected from S0 attempt 5's measured ladders (class 2336 at r 0.5: 9.1
+    # rps, D 86 s) 548 to 670 at loads 0.7 and 0.85, so the pool repeats no
+    # question with about 20 percent of headroom; a window exceeds 800 only if
+    # the class lambda* reaches 10.9 rps at load 0.85 (review 2026-10-23 M1).
+    # Sized in the 2026-10-23 session: +32 windows, +7 h under the linear rule.
+    PressurePoint("P1", ("B3", "B4"), _BOTH, S1_CONSTRAINED_RUNGS, _own(*S1_PRESSURE_RATES),
+                  dataset="squad_v2", windows=S1_PRESSURE_WINDOWS),
 )
 SESSION_GRIDS["s1"] = replace(
     SESSION_GRIDS["a"],
     session="s1",
+    # ADR-0176: the unpressured table once (one trial) on the three datasets
+    # the plan keeps (HotpotQA goes to S2), with session a's hf oracle slice
+    # on the same datasets (B1 and B6 on SQuAD v2 and Qasper, B3 on all three)
+    replications=1,
+    # owner 2026-10-23: B8 (the retrieval store, vLLM only) leaves S1 whole, for
+    # S2: no LMCache cell, no store install, nothing blocked on either engine
+    f1_baselines=tuple(b for b in _ALL_BASELINES if b != "B8"),
+    f1_datasets=("squad_v2", "musique", "qasper"),
+    hf_oracle_cells=(
+        ("B1", ("squad_v2", "qasper")),
+        ("B3", ("squad_v2", "musique", "qasper")),
+        ("B6", ("squad_v2", "qasper")),
+    ),
     # the union of the blocks' coordinates, read by the ladders (budgeted_rungs)
     # and the header; enumeration reads the blocks
-    f2_budgets=(S1_CONTROL_R, 1.0, 0.5, 0.375, 0.25),
-    f2_rates=tuple(sorted(set(S1_RECOMPUTE_RATES) | set(FULL_RATE_FRACTIONS))),
+    f2_budgets=(S1_CONTROL_R,) + S1_CONSTRAINED_RUNGS,
+    f2_rates=S1_PRESSURE_RATES,
     f2_fine_budgets=(),
     f2_fine_rates=(),
-    f3_budgets=(S1_CONTROL_R, 1.0, 0.5, 0.25),
-    f3_rates=tuple(sorted(set(S1_RECOMPUTE_RATES) | set(REDUCED_RATE_FRACTIONS) | {0.7})),
+    f3_budgets=(S1_CONTROL_R,) + S1_CONSTRAINED_RUNGS,
+    f3_rates=S1_PRESSURE_RATES,
     blocks=_S1_BLOCKS,
+    # the pressure window pools (E17): Qasper as session a; SQuAD v2 at the
+    # secondary n (owner 2026-10-23); no RULER cell on s1
+    window_pool_n={"qasper": 500, "squad_v2": 800},
     floor_budget_r=S1_CONTROL_R,
     helpers_on_gpu=True,
 )
@@ -3466,11 +3481,16 @@ def _json_norm(value: Any) -> Any:
 #: relaunch pool captures) [V session scratchpad durations/durations.json].
 #: Means, because a total is n x mean: over the 140 executed steps the table
 #: reproduces the measured 35,563 s exactly [V]. A cell costs its prep plus
-#: windows x (window span + post-window time). The rerank rows ran the CPU
-#: reranker; B-6 moved it to the GPU, so they are an upper bound until a run
-#: re-measures them [D].
+#: windows x (window span + post-window time). The relaunch and dry-window
+#: rows keep attempt 4; the dry rerank rows ran the CPU reranker (B-6 moved
+#: it to the GPU), so they are an upper bound until a run re-measures them [D].
+#: ADR-0176 Group A (2026-10-22): the CELL rows are re-measured on S0 attempt
+#: 5 (2026-10-14, GPU reranker, landing experiments/S0/2026-10-14_0016), see
+#: RUN_CELL_SECONDS.
 RUN_STEP_SECONDS_SOURCE = (
-    "S0 attempt 4 (landing experiments/S0/2026-10-11_0056), means over 140 executed steps"
+    "relaunch and dry-window rows: S0 attempt 4 (landing experiments/S0/2026-10-11_0056), "
+    "means over 140 executed steps; cell rows: S0 attempt 5 (landing "
+    "experiments/S0/2026-10-14_0016), medians over the F1 windows at 50 queries"
 )
 #: Every S0 attempt 4 cell and dry window served 50 queries in one window [V
 #: its plan.json]. Prep (retrieval per query) and window time grow with the
@@ -3484,13 +3504,25 @@ RUN_DRY_WINDOW_SECONDS: Dict[Tuple[str, bool], float] = {
     ("sglang", False): 189.6, ("sglang", True): 773.3,
     ("vllm", False): 226.9, ("vllm", True): 735.5,
 }
-#: (engine, retriever) -> (prep seconds, seconds per window)
+#: (engine, retriever) -> (prep seconds, seconds per window), S0 attempt 5
+#: (2026-10-14, one H100, Qwen3-14B, GPU reranker; every F1 cell served 50
+#: queries in one window [V its extras/plan.json]). Per group, over the F1
+#: windows: the window is the median of metrics.json serve seconds; the prep
+#: is the median over windows of (wall-clock gap to the previous window's
+#: metrics.json minus this window's serve), so a gap that also spans a
+#: relaunch or a first contact lands in the tail the median drops [V
+#: session scratchpad s0a5_windows.json, 433 windows]. Windows per group: hf
+#: none 4 (prep over 3), hf rerank 2, sglang none 14, sglang rerank 8, vllm
+#: none 14, vllm dense 2, vllm rerank 10. SGLang dense has two windows and
+#: the first (Qasper, gap 703 s) carries the run's first dense-retrieval
+#: contact, so its prep is the second window's [D]. The hf rerank prep ran
+#: the CPU reranker (S1 serves the helpers on the GPU, A14): an upper bound.
 RUN_CELL_SECONDS: Dict[Tuple[str, str], Tuple[float, float]] = {
-    ("hf", "none"): (47.7, 29.3), ("hf", "rerank"): (200.1, 331.4),
-    ("sglang", "none"): (70.6, 49.2), ("sglang", "dense"): (90.1, 30.5),
-    ("sglang", "rerank"): (227.5, 366.4),
-    ("vllm", "none"): (21.8, 65.8), ("vllm", "dense"): (89.8, 18.2),
-    ("vllm", "rerank"): (378.1, 208.4),
+    ("hf", "none"): (31.2, 36.6), ("hf", "rerank"): (509.3, 45.2),
+    ("sglang", "none"): (39.9, 17.2), ("sglang", "dense"): (42.6, 32.2),
+    ("sglang", "rerank"): (73.0, 35.1),
+    ("vllm", "none"): (40.8, 17.4), ("vllm", "dense"): (43.1, 33.4),
+    ("vllm", "rerank"): (52.9, 34.1),
 }
 #: A9 item 3 (owner 2026-10-20): text compression per prepared request,
 #: charged on top of the retr-comp cell's rerank row (which pools every
@@ -3623,7 +3655,10 @@ def run_projection(steps: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         "compression_s": round(compression_s, 1),
         "by_block_s": {k: round(v, 1) for k, v in by_block.items()},
         "compression_s_per_request": RUN_COMPRESSION_S_PER_REQUEST,
-        "note": "the rerank rows ran the CPU reranker (B-6 moved it to the GPU): an upper bound",
+        "note": (
+            "cell rows: S0 attempt 5 medians (GPU reranker); relaunch and dry-window rows: "
+            "S0 attempt 4 means, the dry rerank rows with the CPU reranker (an upper bound)"
+        ),
     }
 
 
@@ -7468,12 +7503,17 @@ def build_plan(
             )
     if grid.blocks:
         # ADR-0175: borrowed loads resolve against the measured lambda*; the
-        # run follows value order: the cells outside every block (hf and the
-        # unpressured F1 cells, which every claim compares against) first,
-        # then K1 to L6, each block in the usual serving order [A: F1 first]
+        # run follows value order. ADR-0176 (owner 2026-10-22): the hf oracle
+        # slice first (no engine to launch), then the blocks in BLOCK_ORDER
+        # (K1, then P1), then the engine-served unpressured F1 cells last,
+        # each group in the usual serving order.
         cells = sorted(
             resolve_block_loads(grid, cells, rung_table, anchor_tokens, frontier_loads),
-            key=lambda c: (0 if c.block is None else 1 + BLOCK_ORDER.index(c.block), _sort_key(c, grid)),
+            key=lambda c: (
+                0 if c.spec.engine == "hf"
+                else (1 + len(BLOCK_ORDER) if c.block is None else 1 + BLOCK_ORDER.index(c.block)),
+                _sort_key(c, grid),
+            ),
         )
     if last_block is not None:
         if not grid.blocks or last_block not in BLOCK_ORDER:

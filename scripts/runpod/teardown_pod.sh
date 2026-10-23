@@ -156,9 +156,10 @@ bash "$SCRIPT_DIR/pod_watchdog.sh" disarm "$POD_ID" 2>&1 | sed 's/^/    /' \
   || echo "    WARNING: pod_watchdog.sh disarm failed; a live watchdog exits by itself once it sees the pod gone" >&2
 
 # --- [5/5] prove $0 (READ-ONLY listings; this step deletes NOTHING) ----------
-# Clean-room rule (MyDocs/runpod-cli-reference.md §6): a surviving network
-# volume still bills storage — the $0 verdict needs the pod listing pod-free
-# AND the network-volume listing empty. Both listings are report-only.
+# The $0 verdict is ZERO PODS. Owner rule 2026-10-22 (ADR-0176 Group B): no
+# script deletes a network volume; the run tree stays on it until the Mac-side
+# S3 pull, and the owner deletes it by hand, if ever. A listed volume is
+# reported with its storage bill, never a failure. Both listings are report-only.
 echo "[5/5] confirming \$0 (read-only pod + network-volume listings) ..."
 if command -v runpodctl >/dev/null 2>&1; then
   LISTING="$(runpodctl pod list --all 2>&1)"
@@ -175,10 +176,10 @@ fi
 NV_TRIM="$(printf '%s' "$NV_LISTING" | tr -d '[:space:]')"
 if [ -n "$NV_TRIM" ] && [ "$NV_TRIM" != "[]" ] && [ "$NV_TRIM" != "null" ]; then
   printf '%s\n' "$NV_LISTING" | head -10
-  echo "[teardown_pod] WARNING: the network-volume listing above is NOT empty — surviving volumes bill storage (STILL BILLING; clean-room violation). After verifying the local pull, delete them ('runpodctl network-volume delete <id>' or the console), then re-run the listings. (If those lines are an empty table header, verify in the console and re-check.)" >&2
-  exit 1
+  echo "  -- network volume(s) listed: KEPT by design (owner rule 2026-10-22: no script deletes a volume; the run tree stays on it until the S3 pull). Storage is STILL BILLING until the owner deletes it by hand."
+else
+  echo "  -- network-volume listing empty: no surviving volumes"
 fi
-echo "  -- network-volume listing empty — no surviving volumes"
 echo "  -- NOTE (read-only reminder): saved templates bill separately and are NOT"
 echo "     touched here — list/delete them via the RunPod console after the local"
 echo "     pull is verified, per the clean-room-per-run discipline."

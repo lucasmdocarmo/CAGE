@@ -199,6 +199,8 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         [ -z "${CAGE_TEST_PROVISION_RC:-}" ] || exit "$CAGE_TEST_PROVISION_RC"
         case " $* " in
           *" --yes "*)
+            # ADR-0176 Group B: a datacenter that refuses the pod (the volume was created)
+            [ -z "${CAGE_TEST_PROVISION_YES_RC:-}" ] || { echo "[cage] no stock for the pod in this datacenter"; exit "$CAGE_TEST_PROVISION_YES_RC"; }
             echo '{"id": "pod123"}'
             printf '{"ts_utc":"2026-10-06T10:00:00Z","pod_id":"pod123","price_per_hour_usd": 3.49,"event":"create"}\n' >> "$CAGE_POD_LEDGER"
             [ -z "${CAGE_TEST_NO_SEATBELT:-}" ] || echo "[cage] WARNING: SEATBELT NOT ARMED: pod_watchdog.sh arm failed"
@@ -214,8 +216,9 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         echo "[1/5] final on-pod sync"; echo "[2/5] verified pull"; echo "SAFE TO TEARDOWN"; echo "[3/5] confirm ceremony"
         echo "[4/5] deleting pod $1 ... (cost-stopping action)"
         echo "[5/5] confirming \$0 (read-only pod + network-volume listings) ..."
-        echo "[teardown_pod] WARNING: the network-volume listing above is NOT empty" >&2
-        exit "${CAGE_TEST_TEARDOWN_RC:-1}"
+        echo "  -- network volume(s) listed: KEPT by design (owner rule 2026-10-22)"
+        echo "TEARDOWN_COMPLETE pod=$1"
+        exit "${CAGE_TEST_TEARDOWN_RC:-0}"
         ''')
     _w(fake_scripts / "runpod" / "cost_report.sh", "#!/bin/bash\necho \"cost_report $*\" >> \"$CAGE_TEST_LOG\"; echo 'POD_ID  HOURS  COST'; echo 'pod123 1.0 3.49'; exit 0\n")
     _w(fake_scripts / "5_observability" / "pull_run.sh", r'''
@@ -414,6 +417,23 @@ def world(tmp_path: Path) -> Dict[str, Path]:
     # A14: the compressor and dense-encoder device probes beside the reranker probe
     for name, marker in (("probe_compressor_device.py", "COMPRESSOR_DEVICE_OK"), ("probe_encoder_device.py", "ENCODER_DEVICE_OK")):
         _w(pr / "scripts" / "checks" / name, f'print("{marker} queries=50 identical=50")\n', exe=False)
+    # ADR-0176 Group D: the stage 10 scoring batch probe; CAGE_TEST_SCORING_PROBE
+    # selects its verdict (OK default, FAILED, or CRASH for no verdict line)
+    _w(pr / "scripts" / "checks" / "probe_scoring_batch.py", r'''
+        import json, os, sys
+        from pathlib import Path
+        a = sys.argv[1:]
+        with open(os.environ["CAGE_TEST_LOG"], "a", encoding="utf-8") as fh:
+            fh.write("scoring_probe " + " ".join(a) + "\n")
+        verdict = os.environ.get("CAGE_TEST_SCORING_PROBE", "OK")
+        if verdict == "CRASH":
+            print("Traceback: boom", file=sys.stderr); sys.exit(1)
+        out = Path(a[a.index("--out") + 1]); out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({"ok": verdict == "OK"}), encoding="utf-8")
+        if verdict == "OK":
+            print("SCORING_BATCH_OK rows=50 batch_size=%s row_by_row_s_per_row=0.3100 batched_s_per_row=0.1000 speedup=3.10 window=cells/k1/window_squad_v2-01" % a[a.index("--batch-size") + 1]); sys.exit(0)
+        print("SCORING_BATCH_FAILED rows=50 batch_size=32 reason=1 of 50 rows differ; first: row 3 (e3) field faithfulness: 0.5 row by row vs 0.6 batched"); sys.exit(1)
+        ''', exe=False)
     _w(pr / "scripts" / "3_run" / "calibrate_cell.py", r'''
         import json, sys
         from pathlib import Path
@@ -717,7 +737,7 @@ def test_full_sequence_with_both_gos_lands_the_run(world: Dict[str, Path]) -> No
         [c for c in calls if "preflight" in c]
     assert any("teardown_pod pod123" in c and "ASSUME_YES=1" in c and "SSH=root@pod.test" in c for c in calls), \
         [c for c in calls if "teardown" in c]
-    assert calls.index(next(c for c in calls if "network-volume delete vol123" in c)) > calls.index(next(c for c in calls if "teardown_pod" in c))
+    assert not any("network-volume delete" in c for c in calls)  # owner rule 2026-10-22: the volume is never deleted
     assert calls[-1].startswith("runpodctl user")
     # every ssh/scp went to the host the state file holds, never to the placeholder
     assert not any("<user@host>" in c for c in calls), [c[:120] for c in calls if "<user@host>" in c][:5]
@@ -883,18 +903,18 @@ def test_shipped_profiles_cover_their_stage_bounds_and_name_registered_models() 
     cb = importlib.import_module("src.orchestration.cache_budget")
     for p in sorted((EXPDIR / "profiles").glob("S*.env")):
         proc = subprocess.run(["bash", "-c", f'set -a; source "{EXPDIR}/profiles/_common.env"; source "{p}"; '
-                               'printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" "$MODEL_SLUG" "$SEATBELT" "$HOURS" "$SETUP_BOUND_MIN" "$ENGINES" "$CALIBRATE" "${SCORE_BOUND_MIN:-180}" "$CALIBRATE_RUNGS_BOUND_S" "$FLOOR_AVG_SEQ_TOKENS" "${SUITE_ON_POD:-0}" "${START_CHECK:-1}"'],
+                               'printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" "$MODEL_SLUG" "$SEATBELT" "$HOURS" "$SETUP_BOUND_MIN" "$ENGINES" "$CALIBRATE" "${SCORE_BOUND_MIN:-180}" "$CALIBRATE_RUNGS_BOUND_S" "$FLOOR_AVG_SEQ_TOKENS" "${SUITE_ON_POD:-0}" "${START_CHECK:-1}" "${PULL_MARGIN_MIN:-90}"'],
                               capture_output=True, text=True, env=PROFILE_ENV)
-        slug, seatbelt, hours, setup_min, engines, calibrate, score_min, rungs_bound_s, floor_tokens, suite_on_pod, start_check = proc.stdout.split("|")
+        slug, seatbelt, hours, setup_min, engines, calibrate, score_min, rungs_bound_s, floor_tokens, suite_on_pod, start_check, pull_min = proc.stdout.split("|")
         assert slug in cb.MODEL_KV, f"{p.name}: MODEL_SLUG={slug} is not in cache_budget.MODEL_KV {sorted(cb.MODEL_KV)}"
         # ADR-0155: every shipped profile sizes the floor table on the anchor shape
         assert floor_tokens == "4779", f"{p.name}: FLOOR_AVG_SEQ_TOKENS={floor_tokens} is not the registered anchor shape"
         n_srv = len([e for e in engines.split() if e != "hf"]); n_cal = len(calibrate.split())
         # S0F-88 review L4: plus the stage 4 load gate (10 min) and the pod suite (30 min when SUITE_ON_POD=1);
         # G16 (2026-10-17): plus the readiness wait (900 s), the start check (2,400 s), the seal (600 s) and a
-        # 90 min pull margin (S0 attempt 5 pulled in 68 min)
+        # the profile's pull margin (ADR-0176 Group C; the common default 90 = S0 attempt 5's 68 min)
         need = (15 + int(setup_min) + 10 + (30 if suite_on_pod == "1" else 0) + n_srv * 25 + (40 if start_check == "1" else 0)
-                + n_cal * 60 + n_cal * int(rungs_bound_s) // 60 + 15 + int(hours) * 60 + 10 + int(score_min) + 30 + 90)
+                + n_cal * 60 + n_cal * int(rungs_bound_s) // 60 + 15 + int(hours) * 60 + 10 + int(score_min) + 30 + int(pull_min))
         unit = seatbelt[-1]; n = int(seatbelt.split()[0][:-1])
         assert unit in ("h", "m"), f"{p.name}: SEATBELT={seatbelt} must be <n>h or <n>m (G30)"
         have = n * 60 if unit == "h" else n
@@ -947,10 +967,10 @@ def test_the_plan_stage_refuses_a_step_without_a_measured_duration_b5(world: Dic
 
 
 def test_an_unexpected_teardown_exit_code_fails_stage_14(world: Dict[str, Path]) -> None:
-    # expected "0|1": a 2 (the delete itself failed) fails the stage, nothing is swept
+    # expected 0: a 2 (the delete itself failed) fails the stage, nothing is swept
     proc = _master(world, "--yes", "provision", "--yes", "teardown", CAGE_TEST_TEARDOWN_RC="2")
     assert proc.returncode == 1
-    assert "rc=2, expected 0|1" in proc.stdout
+    assert "rc=2, expected 0 (log:" in proc.stdout  # review 2026-10-22 M2: HEAD printed "expected 0|1"
     assert not any("network-volume delete" in c for c in _calls(world))
     assert _state(world)["stages"]["teardown"]["status"] == "failed"
 
@@ -1319,10 +1339,18 @@ def test_a_missing_manifest_fails_stage_0_before_anything_bills(world: Dict[str,
     assert not any("provision_pod" in c for c in _calls(world))
 
 
-def test_clean_room_violation_fails_stage_0(world: Dict[str, Path]) -> None:
+def test_clean_room_pods_refuse_and_a_kept_volume_is_noted_at_stage_0(world: Dict[str, Path]) -> None:
+    # owner rule 2026-10-22 (ADR-0176 Group B): a volume kept from an earlier run
+    # is a note at stage 0, never a refusal; a foreign pod still refuses
     proc = _master(world, CAGE_TEST_VOLUMES='[{"id": "leftover"}]')
-    assert proc.returncode == 1
-    assert "clean room: network volumes exist" in proc.stdout
+    assert proc.returncode == 10, proc.stdout[-2500:]
+    assert "NOTE: network volume(s) exist before this experiment" in proc.stdout
+    assert "clean room: network volumes exist" not in proc.stdout
+    st = _state(world)
+    assert st["stages"]["preflight-mac"]["status"] == "passed"
+    assert any("kept, billing storage" in n for n in st["stages"]["preflight-mac"]["notes"])
+    proc = _master(world, "--only", "preflight-mac", "--redo", CAGE_TEST_PODS='[{"id": "stranger"}]')
+    assert proc.returncode == 1 and "clean room: pods exist before this experiment" in proc.stdout
 
 
 def test_dirty_build_fails_stage_0(world: Dict[str, Path]) -> None:
@@ -1878,3 +1906,207 @@ def test_validate_runs_the_helpers_beside_sglang_at_the_largest_helper_pool_revi
     assert "the GPU helpers fit beside SGLang at the largest helper-cell pool (70437 tokens)" in proc.stdout
     assert "RETRACTION_COUNTER_DECLARED" in (world["exp_root"] / "S1" / DATE / "logs" / "setup" / "validate_sglang.log").read_text(encoding="utf-8")
     assert "env CAGE_SGLANG_MAX_TOTAL_TOKENS=70437" not in (world["home"] / ".cage_jobs" / "validate_vllm.cmd").read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# 7. ADR-0176 Group B (owner 2026-10-22): the volume is never deleted, the
+#    teardown deletes the pod only, the S1 profile matches the approved plan
+# ---------------------------------------------------------------------------
+
+
+def test_teardown_deletes_the_pod_only_and_records_the_kept_volume(world: Dict[str, Path]) -> None:
+    proc = _master(world, "--yes", "provision", "--yes", "teardown", CAGE_TEST_VOLUMES='[{"id": "vol123"}]')
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-1500:]
+    calls = _calls(world)
+    assert not any("network-volume delete" in c for c in calls)
+    assert any("teardown_pod pod123" in c for c in calls)
+    assert "network volume(s) vol123 KEPT with the run tree (owner rule 2026-10-22)" in proc.stdout
+    assert "volumes STILL LISTED" not in proc.stdout
+    st = _state(world)
+    assert st["stages"]["teardown"]["status"] == "passed" and st["pod"]["volume_kept"] == "vol123"
+    assert st["cost"]["true_zero_utc"]  # the zero proof is zero pods
+
+
+def test_a_refused_pod_keeps_the_volume_and_the_resume_reuses_it(world: Dict[str, Path]) -> None:
+    proc = _master(world, "--yes", "provision", CAGE_TEST_PROVISION_YES_RC="3")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "volume vol123 is KEPT there (never deleted by a script" in proc.stdout
+    assert "PORTAL ACTION" in proc.stdout and "(KEPT: never deleted by a script, owner rule 2026-10-22)" in proc.stdout
+    calls = _calls(world)
+    assert not any("network-volume delete" in c for c in calls)
+    assert sum(1 for c in calls if "network-volume create" in c) == 1
+    st = _state(world)
+    assert st["pod"]["volume_id"] == "vol123" and st["pod"]["dc"] == "US-NE-1" and not st["pod"].get("id")
+    assert st["stages"]["provision"]["status"] == "failed"
+    proc = _master(world, "--from", "provision", "--yes", "provision", "--to", "provision", CAGE_TEST_VOLUMES='[{"id": "vol123"}]')
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert "volume vol123 in US-NE-1 is already recorded (kept after a refused pod): reused" in proc.stdout
+    calls = _calls(world)
+    assert sum(1 for c in calls if "network-volume create" in c) == 1          # no second volume
+    pods = [c for c in calls if "provision_pod" in c and "--yes" in c]
+    assert len(pods) == 2 and "--data-center-ids US-NE-1 --network-volume-id vol123" in pods[-1]
+    st = _state(world)
+    assert st["pod"]["id"] == "pod123" and st["stages"]["provision"]["status"] == "passed"
+
+
+def test_a_recorded_volume_deleted_by_hand_is_not_reused(world: Dict[str, Path]) -> None:
+    # review 2026-10-22 M1: the owner deleted the kept volume in the console; the
+    # resume sees it unlisted, clears the record and creates a new one
+    proc = _master(world, "--yes", "provision", CAGE_TEST_PROVISION_YES_RC="3")
+    assert proc.returncode == 1 and _state(world)["pod"]["volume_id"] == "vol123"
+    proc = _master(world, "--from", "provision", "--yes", "provision", "--to", "provision")  # the fake listing is empty
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert "recorded volume vol123 is no longer listed (deleted by hand): the record is cleared" in proc.stdout
+    assert sum(1 for c in _calls(world) if "network-volume create" in c) == 2
+    assert not any("network-volume delete" in c for c in _calls(world))
+    st = _state(world)
+    assert st["pod"]["id"] == "pod123" and st["pod"]["volume_id"] == "vol123" and st["pod"]["dc"] == "US-NE-1"
+
+
+def test_the_real_teardown_script_keeps_a_listed_volume_and_exits_0(world: Dict[str, Path], tmp_path: Path) -> None:
+    # the shipped teardown_pod.sh against the fake runpodctl: --force skips the
+    # pull gate loudly (no pod here); the pod delete runs, the volume listing is
+    # read-only and a listed volume is a note, never a delete and never exit 1
+    real = REPO_ROOT / "scripts" / "runpod" / "teardown_pod.sh"
+    env = _env(world, CAGE_ASSUME_YES="1", CAGE_TEST_VOLUMES='[{"id": "vol123"}]')
+    env.pop("CAGE_POD_SSH", None)
+    proc = subprocess.run(["bash", str(real), "pod123", f"file://{tmp_path}/absent", str(tmp_path / "dest"), "--force"],
+                          capture_output=True, text=True, env=env, timeout=120, cwd=str(REPO_ROOT))
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-2000:]
+    assert "network volume(s) listed: KEPT by design" in proc.stdout and "TEARDOWN_COMPLETE" in proc.stdout
+    calls = _calls(world)
+    assert "runpodctl pod delete pod123" in calls and "runpodctl network-volume list" in calls
+    assert not any("network-volume delete" in c for c in calls)
+    # a pod still listed after the delete is still a failure
+    proc = subprocess.run(["bash", str(real), "pod123", f"file://{tmp_path}/absent", str(tmp_path / "dest2"), "--force"],
+                          capture_output=True, text=True, env=_env(world, CAGE_ASSUME_YES="1", CAGE_TEST_PODS='[{"id": "pod123"}]'),
+                          timeout=120, cwd=str(REPO_ROOT))
+    assert proc.returncode == 1 and "still appears in the listing" in proc.stderr
+
+
+def test_the_shipped_s1_profile_matches_adr0176() -> None:
+    keys = ("LAST_BLOCK", "MIN_IN_REGIME_WINDOWS", "CHARTER_DATASETS", "RUN_BUDGET_HOURS", "SCORE_BOUND_MIN",
+            "CALIBRATE_RUNGS_BOUND_S", "SEATBELT", "HOURS", "SESSION", "PULL_MARGIN_MIN", "QUERY_MANIFESTS",
+            "INSTALL_LMCACHE", "SKIP_BLOCKED")
+    fmt = "|".join("${%s:-}" % k for k in keys)
+    proc = subprocess.run(["bash", "-c", f'set -a; source "{EXPDIR}/profiles/_common.env"; source "{EXPDIR}/profiles/S1.env"; printf "%s" "{fmt}"'],
+                          capture_output=True, text=True, env=PROFILE_ENV)
+    assert proc.returncode == 0, proc.stderr
+    got = dict(zip(keys, proc.stdout.split("|")))
+    assert got == {"LAST_BLOCK": "", "MIN_IN_REGIME_WINDOWS": "", "CHARTER_DATASETS": "squad_v2 musique qasper",
+                   "RUN_BUDGET_HOURS": "115", "SCORE_BOUND_MIN": "1200", "CALIBRATE_RUNGS_BOUND_S": "18000",
+                   "SEATBELT": "164h", "HOURS": "120", "SESSION": "s1", "PULL_MARGIN_MIN": "300",
+                   # Group E (2026-10-23): the three registered question files, one per S1 dataset
+                   "QUERY_MANIFESTS": "squad_v2=data/manifests/squad_v2_2000x3_seed42_wr50.json "
+                                      "qasper=data/manifests/qasper_852x12_seed42_wr50.json "
+                                      "musique=data/manifests/musique_2000x1_seed42_wr50.json",
+                   # B8 left S1 whole on 2026-10-23: no LMCache install, no blocked cell to skip
+                   "INSTALL_LMCACHE": "0", "SKIP_BLOCKED": "0"}
+    for item in got["QUERY_MANIFESTS"].split():
+        assert (REPO_ROOT / item.split("=", 1)[1]).is_file(), item
+    body = (EXPDIR / "profiles" / "S1.env").read_text(encoding="utf-8")
+    assert "hotpotqa" not in body.split("# ADR-0176: the three datasets")[1].splitlines()[0]
+    assert "L5" not in [l for l in body.splitlines() if l.startswith("LAST_BLOCK=")][0]
+
+
+# ---------------------------------------------------------------------------
+# 8. ADR-0176 Group C (owner 2026-10-22, option 2): the ssh pull before the pod
+#    delete also brings the A/A report, and the pull margin is a profile key
+# ---------------------------------------------------------------------------
+
+
+def test_the_pull_brings_the_aa_report_when_present_and_notes_its_absence(world: Dict[str, Path]) -> None:
+    # absent: the fake score job has no run_calibration.py, so the A6 line prints and nothing is written
+    proc = _master(world, "--yes", "provision", "--to", "pull")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert "no A/A report beside the run root" in proc.stdout
+    st = _state(world)
+    assert st["pull"]["aa_report"] == "absent"
+    rid = st["run_id"]
+    land = world["exp_root"] / "S1" / DATE
+    assert not (land / "extras" / f"aa_repeats_{rid}.json").exists()
+    # present: the report beside the run root on the pod is pulled into the extras
+    (world["pod_repo"] / "results" / "camp1" / "a" / f"aa_repeats_{rid}.json").write_text('{"aa": "ok"}', encoding="utf-8")
+    proc = _master(world, "--only", "pull", "--redo")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert (land / "extras" / f"aa_repeats_{rid}.json").read_text(encoding="utf-8") == '{"aa": "ok"}'
+    assert _state(world)["pull"]["aa_report"].endswith(f"aa_repeats_{rid}.json")
+    assert any("aa_repeats" in c and c.startswith("scp") for c in _calls(world))
+
+
+def test_the_pull_margin_is_read_from_the_profile_in_the_seatbelt_sum(world: Dict[str, Path], tmp_path: Path) -> None:
+    # the world profile: 671 min with the default 90; a 300 min margin adds 210
+    prof = tmp_path / "S1_pull.env"
+    prof.write_text(world["profile"].read_text(encoding="utf-8").replace("SEATBELT=12h", "SEATBELT=2h") + "\nPULL_MARGIN_MIN=300\n", encoding="utf-8")
+    world["profile"] = prof
+    proc = _master(world)
+    assert proc.returncode == 1
+    assert "SEATBELT=2h (120 min) is shorter than the 881 min the stages need" in proc.stdout
+    assert "pull margin 300" in proc.stdout
+
+
+def test_a_dead_channel_during_the_aa_probe_fails_the_pull_instead_of_recording_absent(world: Dict[str, Path]) -> None:
+    # review 2026-10-22 M1: ssh rc 255 three times is not "no such file"
+    proc = _master(world, "--yes", "provision", "--to", "collect")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    rid = _state(world)["run_id"]
+    (world["pod_repo"] / "results" / "camp1" / "a" / f"aa_repeats_{rid}.json").write_text('{"aa": "ok"}', encoding="utf-8")
+    (world["home"] / ".ssh_fail").write_text("3\n", encoding="utf-8")
+    proc = _master(world, "--from", "pull", "--to", "pull", CAGE_SSH_RETRY_S="0")
+    (world["home"] / ".ssh_fail").write_text("0\n", encoding="utf-8")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "did not reach the pod (ssh rc=255)" in proc.stdout
+    st = _state(world)
+    assert st["stages"]["pull"]["status"] == "failed" and "aa_report" not in st.get("pull", {})
+
+
+# ---------------------------------------------------------------------------
+# 9. ADR-0176 Group D (owner 2026-10-22, step 1): the batched scoring path is
+#    used only after the stage 10 probe proves it on 50 real answers
+# ---------------------------------------------------------------------------
+
+
+def _batched_profile(world: Dict[str, Path], tmp_path: Path) -> None:
+    prof = tmp_path / "S1_batched.env"
+    prof.write_text(world["profile"].read_text(encoding="utf-8") + "\nSCORING_BATCH_SIZE=32\n", encoding="utf-8")
+    world["profile"] = prof
+
+
+def test_the_scoring_probe_passes_and_the_pass_runs_batched(world: Dict[str, Path], tmp_path: Path) -> None:
+    _batched_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "score")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    calls = _calls(world)
+    probe = [c for c in calls if c.startswith("scoring_probe ")]
+    assert len(probe) == 1 and "--batch-size 32 --rows 50 --device cuda --freeze-file MyDocs/registration/freeze_resolutions.json" in probe[0]
+    cmd = (world["home"] / ".cage_jobs" / "score.cmd").read_text(encoding="utf-8")
+    assert "--batch-size 32" in cmd
+    names = [n for n in re.findall(r"\.cage_jobs/([A-Za-z0-9_.-]+)\.cmd", world["log"].read_text(encoding="utf-8"))]
+    assert names.index("score_probe") < names.index("score")
+    st = _state(world)
+    assert st["scoring"]["batch_proof"].startswith("SCORING_BATCH_OK rows=50 batch_size=32")
+    assert "scoring runs batched at 32 (the proof passed)" in proc.stdout
+
+
+@pytest.mark.parametrize("verdict", ["FAILED", "CRASH"])
+def test_a_failed_or_crashed_scoring_probe_runs_the_pass_row_by_row(world: Dict[str, Path], tmp_path: Path, verdict: str) -> None:
+    _batched_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "score", CAGE_TEST_SCORING_PROBE=verdict)
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    cmd = (world["home"] / ".cage_jobs" / "score.cmd").read_text(encoding="utf-8")
+    assert "--batch-size" not in cmd
+    assert "the pass runs row by row" in proc.stdout
+    st = _state(world)
+    assert st["stages"]["score"]["status"] == "passed"
+    assert st["scoring"]["batch_proof"].startswith("SCORING_BATCH_FAILED")
+    if verdict == "CRASH":
+        assert "no verdict line" in st["scoring"]["batch_proof"]
+    assert any("batched scoring NOT used" in n for n in st["stages"]["score"]["notes"])
+
+
+def test_without_a_batch_size_no_probe_runs(world: Dict[str, Path]) -> None:
+    proc = _master(world, "--yes", "provision", "--to", "score")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    assert not any(c.startswith("scoring_probe ") for c in _calls(world))
+    assert not (world["home"] / ".cage_jobs" / "score_probe.cmd").exists()
+    assert "scoring" not in _state(world)

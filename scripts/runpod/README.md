@@ -15,7 +15,7 @@ never the retired v1 verbs (`get pod`/`remove pod`); the REST fallback targets
 | `setup_runpod.sh` | **stage 1, ON the pod** | Container-shaped bootstrap (root, no systemd): canonical CPython env, charter dataset roster, model prefetch. Run it from the shipped repo tarball (`scripts/ops/package_repo.sh`). | runpod |
 | `pod_status.sh` | **alongside 2–5** (watch loop) | READ-ONLY monitor: `pod list --all` + per-pod `pod get`, joined with the ledger → uptime + estimated spend; **exits nonzero when any pod's known age exceeds `--max-age-hours` (default 24)** — the runaway-cost alarm. | runpod |
 | `cost_report.sh` | **alongside / after any stage** | OFFLINE cost table from the ledger's create/delete pairs (open pods flagged LIVE/BILLING; malformed lines refused loudly by line number). `--billing` adds `runpodctl billing pods` + `runpodctl billing network-volume`: the account **authority** (the bare `billing` verb is a command group that only prints help). | runpod |
-| `teardown_pod.sh` | **after 5** (closes the lifecycle) | Fail-closed $0 teardown: final on-pod sync → **verified pull gate** (`pull_run.sh` must print `SAFE TO TEARDOWN`) → confirm ceremony → `pod delete` (appends the ledger `delete` event) → read-only $0 proof: `pod list --all` pod-free AND `network-volume list` empty. | runpod |
+| `teardown_pod.sh` | **after 5** (closes the lifecycle) | Fail-closed $0 teardown: final on-pod sync → **verified pull gate** (`pull_run.sh` must print `SAFE TO TEARDOWN`) → confirm ceremony → `pod delete` (appends the ledger `delete` event) → read-only $0 proof: `pod list --all` pod-free; `network-volume list` is reported (a listed volume is kept by design: owner rule 2026-10-22, no script deletes a volume). | runpod |
 
 ## Observability story (what watches a run, and from where)
 
@@ -74,5 +74,6 @@ line number rather than skipping them.
   and awake for the run, `pod_status.sh --max-age-hours` loops as the alarm, and the
   console is the last stop. `--no-terminate-after` exists but warns LOUDLY; then
   `teardown_pod.sh` is the only stop.
-- **$0 means proven $0**: `pod delete` + `pod list --all` pod-free + `network-volume list`
-  empty (a surviving volume is a clean-room violation), after the ledger-verified pull.
+- **$0 means zero pods**: `pod delete` + `pod list --all` pod-free; `network-volume list` is
+  reported, never acted on (owner rule 2026-10-22: no script deletes a network volume; the
+  run tree stays on it until the S3 pull and the owner deletes it by hand, if ever).

@@ -3225,7 +3225,8 @@ class TestPerRowN:
             # on session a only, as window_pool_n.
             # ADR-0175: s1 (Run 2) serves session a's registrations through its blocks
             assert dict(grid.achievable_n) == (_ACHIEVABLE_N_A if grid.session in ("a", "s1") else {})
-            assert dict(grid.window_pool_n) == (_WINDOW_POOL_N_A if grid.session in ("a", "s1") else {})
+            # s1 (owner 2026-10-23): Qasper as session a, SQuAD v2 at the secondary n, no RULER
+            assert dict(grid.window_pool_n) == {"a": _WINDOW_POOL_N_A, "s1": {"qasper": 500, "squad_v2": 800}}.get(grid.session, {})
 
     def test_classifier_table_every_family_engine_baseline(self, plan_a, plan_b):
         # Every (family x engine x baseline) cell of both sessions lands in
@@ -5361,11 +5362,17 @@ class TestSessionS1Run2:
         for c in cells:
             if not c.blocked_on:
                 windows[c.block] = windows.get(c.block, 0) + (c.windows or grid.replications)
-        assert {b: windows[b] for b in ("K1", "K2", "K3", "K4", "K5", "K6", "K7", "K8", "K9")} == {
-            "K1": 192, "K2": 72, "K3": 30, "K4": 12, "K5": 120, "K6": 27, "K7": 54, "K8": 81, "K9": 108,
-        }
+        # ADR-0176 (2026-10-22): K1 as registered; P1 the pressure table, 11
+        # strategies (B12 as its two corpus rungs; B8 left for S2 on 2026-10-23)
+        # x 2 engines x 2 rungs x 2 loads = 96 cells, 2 windows each; K2 to L6 go to S2
+        # owner 2026-10-23: plus B3 and B4 on SQuAD v2 inside P1 (16 cells, 32 windows)
+        assert windows == {"K1": 192, "P1": 224}
         assert all(c.windows == 12 for c in cells if c.block == "K1")
-        assert all(c.spec.budget_r != 1.5 for c in cells)  # rung 1.5 is dropped
+        assert all(c.windows == 2 and c.dataset in ("qasper", "squad_v2") for c in cells if c.block == "P1")
+        assert sum(1 for c in cells if c.block == "P1" and c.dataset == "squad_v2") == 16
+        assert all(c.spec.budget_r in (1.25, 0.5, 0.25) for c in cells)  # 1.5, 1.0 and 0.375 are dropped
+        assert not any(c.dataset == "ruler" for c in cells)
+        assert grid.replications == 1
         assert grid.floor_budget_r == 1.25 and rc.get_session_grid("a").floor_budget_r == 1.5
 
     def test_a_plan_without_the_frontier_loads_refuses_at_the_pause(self, floor_table, tmp_path):
@@ -5392,17 +5399,12 @@ class TestSessionS1Run2:
             twin = constrained[(s["cellspec"]["engine"], s["baseline"], src["r"])]
             # the control window offers the constrained twin's absolute rate
             assert s["offered_rate_rps"] == pytest.approx(twin["offered_rate_rps"], rel=2e-4)
-        k2: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
-        for s in cells:
-            if s["block"] == "K2":
-                key = (s["baseline"], s["cellspec"]["budget_r"], s["rate_source"]["frac"])
-                k2.setdefault(key, []).append(s)
-        assert len(k2) == 2 * 3 * 2
-        for pair in k2.values():
-            # the same-workload block: both engines at the same absolute rate
-            assert sorted(s["cellspec"]["engine"] for s in pair) == ["sglang", "vllm"]
-            assert pair[0]["offered_rate_rps"] == pytest.approx(pair[1]["offered_rate_rps"], rel=2e-4)
-            assert {s["rate_source"]["engine"] for s in pair} == {pair[0]["rate_source"]["engine"]}
+        # ADR-0176: P1 offers its own loads (no borrowed rate), two windows
+        p1 = [s for s in cells if s["block"] == "P1"]
+        assert p1 and all(s["cell_windows"] == 2 and s["rate_source"] is None for s in p1)
+        assert {(s["cellspec"]["budget_r"], s["cellspec"]["rate_frac"]) for s in p1} == {
+            (0.5, 0.7), (0.5, 0.85), (0.25, 0.7), (0.25, 0.85),
+        }
 
     def test_a_malformed_point_refuses_at_registration(self):
         bad = rc.PressurePoint("K1", ("B1",), ("vllm",), (0.5,), (rc.Load("own", 0.85),), dataset="ruler")
@@ -5414,8 +5416,8 @@ class TestSessionS1Run2:
             rc.Load("frontier", 0.9)
 
     def test_a_borrowed_load_equal_to_an_earlier_point_merges_into_it(self, floor_table, tmp_path):
-        """SGLang's frontier at r=0.25 equal to K2's 0.7 of the slower (tied)
-        engine: one condition, kept in K1 with its twelve windows."""
+        """SGLang's frontier at r=0.25 equal to P1's own load 0.7 on the same
+        cell: one condition, kept in K1 with its twelve windows."""
         frontier = {"vllm": {0.5: 0.8, 0.25: 0.75}, "sglang": {0.5: 0.82, 0.25: 0.7}}
         plan = _s1_plan(floor_table, tmp_path, frontier_loads=frontier)
         same = [
@@ -5426,10 +5428,16 @@ class TestSessionS1Run2:
         assert len(same) == 1 and same[0]["block"] == "K1" and same[0]["cell_windows"] == 12
 
     def test_the_run_follows_value_order(self, floor_table, tmp_path):
+        # ADR-0176 (owner 2026-10-22): the hf oracle slice first, then K1,
+        # then P1, then the engine-served unpressured F1 cells
         plan = _s1_plan(floor_table, tmp_path)
-        order = [s.get("block") for s in plan["steps"] if s["kind"] == "cell" and not s["blocked_on"]]
-        ranks = [0 if b is None else 1 + rc.BLOCK_ORDER.index(b) for b in order]
-        assert ranks == sorted(ranks) and order[0] is None and "K1" in order
+        groups: List[str] = []
+        for s in plan["steps"]:
+            if s["kind"] == "cell" and not s["blocked_on"]:
+                g = "hf" if s["cellspec"]["engine"] == "hf" else (s.get("block") or "F1")
+                if not groups or groups[-1] != g:
+                    groups.append(g)
+        assert groups == ["hf", "K1", "P1", "F1"]
         assert plan["counts"]["relaunches"] > 0
 
     def test_replicates_run_round_robin_inside_each_segment(self, floor_table, tmp_path):
@@ -5491,7 +5499,7 @@ class TestSessionS1Run2:
         whole = rc.run_projection([dict(s, windows=s["cell_windows"], trial_index=None) for s in comp
                                    if s["trial_index"] == 1])["compression_s"]
         assert plan["run_projection"]["compression_s"] == pytest.approx(whole)
-        assert set(plan["run_projection"]["by_block_s"]) >= {"K1", "L6"}
+        assert set(plan["run_projection"]["by_block_s"]) >= {"K1", "P1"}
 
     def test_the_loader_refuses_a_trial_step_that_disagrees_with_its_argv(self, floor_table, tmp_path):
         plan = _s1_plan(floor_table, tmp_path)
@@ -5508,8 +5516,9 @@ class TestSessionS1Run2:
         with pytest.raises(rc.PlanError, match="block-registered"):
             rc.rehearsal_grid(grid, n=50, datasets=frozenset({"qasper"}))
         with pytest.raises(rc.PlanError, match="is blocked"):
-            blocked = [c for c in rc.enumerate_cells(grid) if c.blocked_on][:1]
-            rc.resolve_block_loads(grid, [_dc_replace(blocked[0], load=rc.Load("slower", 0.7))], {}, 4779, None)
+            # no cell of s1 is launch-blocked since 2026-10-23: a block cell marked blocked by hand
+            cell = next(c for c in rc.enumerate_cells(grid) if c.block)
+            rc.resolve_block_loads(grid, [_dc_replace(cell, blocked_on="no launcher", load=rc.Load("slower", 0.7))], {}, 4779, None)
 
     def test_a_malformed_frontier_file_refuses_cleanly(self, tmp_path):
         bad = tmp_path / "f.json"
@@ -5522,13 +5531,132 @@ class TestSessionS1Run2:
 
 
 def test_last_block_cuts_every_later_block_and_keeps_the_rest_owner_2026_10_21(floor_table, tmp_path) -> None:
-    # owner 2026-10-21 ("Through L5"): L6 leaves the plan, the core and L1 to L5 stay
+    # owner 2026-10-21 ("Through L5"), re-pinned on ADR-0176's blocks: --last-block K1
+    # drops P1; the hf slice, K1 and the unpressured F1 cells stay in their order
     full = _s1_cells(_s1_plan(floor_table, tmp_path / "full"))
-    cut = _s1_cells(_s1_plan(floor_table, tmp_path / "cut", last_block="L5"))
-    blocks_full = {s.get("block") for s in full}
-    blocks_cut = {s.get("block") for s in cut}
-    assert "L6" in blocks_full and "L6" not in blocks_cut
-    assert blocks_cut == blocks_full - {"L6"}
-    assert [s["row_key"] for s in full if s.get("block") != "L6"] == [s["row_key"] for s in cut]
+    cut = _s1_cells(_s1_plan(floor_table, tmp_path / "cut", last_block="K1"))
+    assert {s.get("block") for s in full} == {None, "K1", "P1"}
+    assert {s.get("block") for s in cut} == {None, "K1"}
+    assert [s["row_key"] for s in full if s.get("block") != "P1"] == [s["row_key"] for s in cut]
     with pytest.raises(rc.PlanError, match="last-block"):
         _s1_plan(floor_table, tmp_path / "bad", last_block="L9")
+
+
+class TestSessionS1ScopeResetAdr0176:
+    """ADR-0176 (owner 2026-10-22, MyDocs/RunPod/S1_PLAN_2026-10-22.md): the
+    S1 grid is K1 as registered plus P1, the pressure table, with the
+    unpressured F1 table once on three datasets and session a's hf slice."""
+
+    def test_the_ladders_calibrate_three_rungs_and_no_ruler(self):
+        grid = rc.get_session_grid("s1")
+        assert rc.budgeted_rungs(grid) == (1.25, 0.5, 0.25)
+        assert rc.ruler_pressure_class(grid, "vllm") is None and rc.ruler_pressure_class(grid, "sglang") is None
+        assert grid.f1_datasets == ("squad_v2", "musique", "qasper")
+        assert grid.f2_rates == grid.f3_rates == (0.7, 0.85)
+        assert grid.f2_budgets == grid.f3_budgets == (1.25, 0.5, 0.25)
+        assert rc.BLOCK_ORDER.index("P1") == rc.BLOCK_ORDER.index("K1") + 1
+        assert grid.window_pool_n == {"qasper": 500, "squad_v2": 800}
+
+    def test_p1_is_the_full_pressure_table_with_b8_blocked_on_sglang(self):
+        grid = rc.get_session_grid("s1")
+        p1 = [c for c in rc.enumerate_cells(grid) if c.block == "P1"]
+        coords = {(c.baseline_id, c.spec.engine, c.spec.budget_r, c.spec.rate_frac) for c in p1}
+        assert coords == {
+            (b, e, r, f) for b in rc.BASELINES if b != "B8" for e in ("vllm", "sglang") for r in (0.5, 0.25) for f in (0.7, 0.85)
+        }
+        assert len(p1) == 96 + 16  # B12 enumerates its two corpus rungs; B8 is S2's; plus the SQuAD v2 pair
+        assert not any(c.blocked_on for c in p1)  # a symmetric table: nothing blocked (owner 2026-10-23)
+        assert all(c.load == rc.Load("own", c.spec.rate_frac) for c in p1)
+        squad = [c for c in p1 if c.dataset == "squad_v2"]
+        assert {(c.baseline_id, c.spec.engine, c.spec.budget_r, c.spec.rate_frac) for c in squad} == {
+            (b, e, r, f) for b in ("B3", "B4") for e in ("vllm", "sglang") for r in (0.5, 0.25) for f in (0.7, 0.85)
+        }
+        assert len(squad) == 16 and not any(c.blocked_on for c in squad)
+
+    def test_a_slower_load_resolves_to_one_absolute_rate_on_both_engines(self, floor_table, tmp_path):
+        # review 2026-10-22 L1: K2 left S1, so the "slower" branch of
+        # resolve_block_loads keeps a direct pin (S2 registers it again)
+        grid = rc.get_session_grid("s1")
+        plan = _s1_plan(floor_table, tmp_path)
+        rungs = {e: rc.load_rung_calibration(Path(plan["rung_calibration"]["artifacts"][e]["path"])) for e in ("vllm", "sglang")}
+        anchor = plan["demand_classes"]["anchor_seq_tokens"]
+        cells = [
+            _dc_replace(c, load=rc.Load("slower", 0.7), block="K2")
+            for c in rc.enumerate_cells(grid)
+            if c.block == "P1" and c.baseline_id == "B1" and c.spec.budget_r == 0.5 and c.spec.rate_frac == 0.7
+        ]
+        assert len(cells) == 2
+        out = rc.resolve_block_loads(grid, cells, rungs, anchor, None)
+        lams = {e: rc._class_lambda(rungs, grid, cells[0], e, 0.5, anchor) for e in ("sglang", "vllm")}
+        slower = min(sorted(lams), key=lambda e: lams[e])  # a tie breaks toward the first engine name
+        for c in out:
+            assert c.rate_source["kind"] == "slower" and c.rate_source["engine"] == slower
+            assert c.rate_source["offered_rate_rps"] == pytest.approx(0.7 * lams[slower])
+            assert c.spec.rate_frac == pytest.approx(0.7 * lams[slower] / lams[c.spec.engine], rel=1e-5)
+
+    def test_f1_runs_once_on_three_datasets_with_the_hf_slice(self, floor_table, tmp_path):
+        plan = _s1_plan(floor_table, tmp_path)
+        f1 = [s for s in _s1_cells(plan) if s.get("block") is None]
+        assert {s["dataset"] for s in f1} == {"squad_v2", "musique", "qasper"}
+        # one window per cell: the B1 trial split leaves exactly trial 1
+        assert all(s["windows"] == 1 and s.get("cell_windows", 1) == 1 for s in f1)
+        assert not any(s.get("block") is None and (s.get("trial_index") or 1) > 1 for s in _cells(plan))
+        assert sorted((s["baseline"], s["dataset"]) for s in f1 if s["cellspec"]["engine"] == "hf") == [
+            ("B1", "qasper"), ("B1", "squad_v2"), ("B3", "musique"), ("B3", "qasper"), ("B3", "squad_v2"),
+            ("B6", "qasper"), ("B6", "squad_v2"),
+        ]
+        # owner 2026-10-23: B8 left S1 whole (S2); without manifests the fixture
+        # blocks only B12's corpus rungs, nothing is launch-blocked on either engine
+        assert {s["baseline"] for s in _cells(plan) if s["blocked_on"]} <= {"B12"}
+        assert not any(s["baseline"] == "B8" for s in _cells(plan))
+        assert rc.get_session_grid("s1").f1_baselines == tuple(b for b in rc._ALL_BASELINES if b != "B8")
+        assert plan["rung_calibration"]["required_rungs"] == {"sglang": [1.25, 0.5, 0.25], "vllm": [1.25, 0.5, 0.25]}
+        assert not any(s["dataset"] == "ruler" for s in _cells(plan))
+        # 2026-10-23: plus the SQuAD v2 pair (32 windows), minus B8 under pressure (16)
+        # ... minus B8's six no-pressure windows (three per engine, the SGLang ones blocked), gone with it
+        assert plan["counts"]["windows"] == 485 + 32 - 16 - 6 and plan["counts"]["dry_windows"] == 19 - 1
+
+    def test_the_musique_manifest_covers_the_f1_cells_and_the_hf_prefix(self, floor_table, tmp_path):
+        """Group E (owner 2026-10-23): one trial of 2,000 ids (the primary n; the
+        secondary 800 and the hf 300 are prefixes) with a 50-question warm-up
+        reserve from the 2,417-question split; the plan registers it beside the other two."""
+        import hashlib
+        path = REPO_ROOT / "data" / "manifests" / "musique_2000x1_seed42_wr50.json"
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        assert doc["dataset"] == "musique" and doc["num_trials"] == 1 and len(doc["trials"]["1"]) == 2000
+        assert doc["warmup_reserve"]["n"] == 50 and doc["stats"]["source_examples_loaded"] == 2417
+        assert hashlib.sha256(path.read_bytes()).hexdigest().startswith("438b577f")  # the registered file, not a rebuild
+        manifests = {
+            "qasper": REPO_ROOT / "data" / "manifests" / "qasper_852x12_seed42_wr50.json",
+            "squad_v2": REPO_ROOT / "data" / "manifests" / "squad_v2_2000x3_seed42_wr50.json",
+            "musique": path,
+        }
+        plan = _s1_plan(floor_table, tmp_path, query_manifests=manifests)
+        assert plan["query_manifests"]["musique"]["trial_sizes"] == {"1": 2000}
+        musique = [s for s in _s1_cells(plan) if s["dataset"] == "musique" and not s["blocked_on"]]
+        assert musique and {s["num_queries"] for s in musique} == {2000, 800, 300}
+        assert {s["baseline"] for s in musique if s["num_queries"] == 2000} == {"B3", "B6"}  # the primary pair on vLLM
+        assert all(s["num_queries"] == 300 for s in musique if s["cellspec"]["engine"] == "hf")
+        # B12's corpus rungs unblock with the file; nothing on MuSiQue is blocked (B8 left S1 on 2026-10-23)
+        assert not any(s["dataset"] == "musique" and s["blocked_on"] for s in _s1_cells(plan))
+        assert any(s["baseline"] == "B12" for s in musique)
+
+    def test_the_squad_v2_pressure_pair_draws_an_800_pool_and_adds_no_relaunch(self, floor_table, tmp_path):
+        # owner 2026-10-23: B3 and B4 on SQuAD v2 under pressure, pool 800 (the
+        # secondary n), interleaved with the Qasper cells (65 relaunches, as before)
+        manifests = {
+            "qasper": REPO_ROOT / "data" / "manifests" / "qasper_852x12_seed42_wr50.json",
+            "squad_v2": REPO_ROOT / "data" / "manifests" / "squad_v2_2000x3_seed42_wr50.json",
+        }
+        plan = _s1_plan(floor_table, tmp_path, query_manifests=manifests)
+        squad = [s for s in _s1_cells(plan) if s.get("block") == "P1" and s["dataset"] == "squad_v2"]
+        assert len(squad) == 16 and all(s["num_queries"] == 800 and s["cell_windows"] == 2 for s in squad)
+        assert {s["baseline"] for s in squad} == {"B3", "B4"} and {s["cellspec"]["engine"] for s in squad} == {"vllm", "sglang"}
+        # the fixture ladder's arrivals (review 2026-10-23 M1: the pod's, projected
+        # from S0 attempt 5, are 548 to 670 at r 0.5, still under the 800 pool)
+        assert all(199 <= s["window"]["arrivals"] <= 517 <= 800 for s in squad)
+        assert all(s["window"]["passes"] == 1 for s in squad)  # no replay inside the pool
+        qasper = [s for s in _s1_cells(plan) if s.get("block") == "P1" and s["dataset"] == "qasper"]
+        assert all(s["num_queries"] == 500 for s in qasper)
+        # B8 (the LMCache connector) left S1 on 2026-10-23: its three relaunches and one dry window with it
+        assert plan["counts"]["relaunches"] == 62 and plan["counts"]["dry_windows"] == 22

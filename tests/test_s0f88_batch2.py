@@ -631,7 +631,9 @@ def test_the_run_projection_sums_the_measured_table_and_lists_what_it_cannot_pro
     ]
     rp = rc.run_projection(steps)
     # G26 (2026-10-17): the prep is paid once per window (2 x 70.6 on the two-window step)
-    expect = 254.8 + 55.0 + (378.1 + 208.4) + 2 * (70.6 + 49.2) + 735.5 + 189.6
+    # ADR-0176 Group A (2026-10-22): the cell rows are S0 attempt 5's (see
+    # test_the_cell_rows_are_the_s0_attempt_5_medians_adr0176 below)
+    expect = 254.8 + 55.0 + (52.9 + 34.1) + 2 * (39.9 + 17.2) + 735.5 + 189.6
     assert rp["total_s"] == pytest.approx(expect, abs=0.2) and rp["unmeasured_steps"] == []
     # another query count scales linearly (an upper bound); an unmeasured
     # (engine, retriever) or engine is listed, never guessed
@@ -639,12 +641,34 @@ def test_the_run_projection_sums_the_measured_table_and_lists_what_it_cannot_pro
         _step("vllm", "none", n=200, key="big"), _step("hf", "dense", key="x"),
         {"kind": "relaunch", "engine": "lmdeploy"},
     ])
-    assert odd["total_s"] == pytest.approx((21.8 + 65.8) * 4, abs=0.2) and odd["scaled_steps"] == 1
+    assert odd["total_s"] == pytest.approx((40.8 + 17.4) * 4, abs=0.2) and odd["scaled_steps"] == 1
     assert len(odd["unmeasured_steps"]) == 2
     # the U3 pre-load adds its seconds per window
     pre = _step("vllm", "none")
     pre["argv"] = ["--open-loop-preload-s", "30"]
-    assert rc.run_projection([pre])["total_s"] == pytest.approx(21.8 + 65.8 + 30.0, abs=0.2)
+    assert rc.run_projection([pre])["total_s"] == pytest.approx(40.8 + 17.4 + 30.0, abs=0.2)
+
+
+def test_the_cell_rows_are_the_s0_attempt_5_medians_adr0176() -> None:
+    """ADR-0176 Group A (2026-10-22): the cell rows come from S0 attempt 5 (GPU
+    reranker), medians over its F1 windows at 50 queries: the window is the
+    metrics.json serve seconds, the prep the wall-clock gap to the previous
+    window minus the serve [V session scratchpad s0a5_windows.json]; the
+    relaunch and dry-window rows stay attempt 4's means. On attempt 5's own
+    plan (extras/plan.json) the table projects 9.47 h (the old rows 17.35 h);
+    the run root's windows span 12.0 h from the first to the last metrics.json
+    mtime, and 16.1 h from the run job's submit (extras/jobs/run.json), so the
+    table is no upper bound on that run [V review 2026-10-22 M2].
+    """
+    assert rc.RUN_CELL_SECONDS == {
+        ("hf", "none"): (31.2, 36.6), ("hf", "rerank"): (509.3, 45.2),
+        ("sglang", "none"): (39.9, 17.2), ("sglang", "dense"): (42.6, 32.2),
+        ("sglang", "rerank"): (73.0, 35.1),
+        ("vllm", "none"): (40.8, 17.4), ("vllm", "dense"): (43.1, 33.4),
+        ("vllm", "rerank"): (52.9, 34.1),
+    }
+    assert rc.RUN_RELAUNCH_SECONDS == {"sglang": 254.8, "vllm": 55.0}
+    assert "attempt 5" in rc.RUN_STEP_SECONDS_SOURCE and "attempt 4" in rc.RUN_STEP_SECONDS_SOURCE
 
 
 def test_the_s0_rehearsal_plan_projects_inside_its_hours_bound_b5(tmp_path: Path) -> None:
@@ -675,7 +699,9 @@ def test_the_s0_rehearsal_plan_projects_inside_its_hours_bound_b5(tmp_path: Path
     # (dataset, trial) pool once: Qasper trial 1 at 970 (100 measured plus the
     # largest pre-load, 870) and SQuAD v2 trial 1 at 50 (the F1 cell)
     assert rp["compression_s"] == pytest.approx(5.0 * (970 + 50))
-    assert rp["total_h"] == pytest.approx(14.23 + rp["compression_s"] / 3600, abs=0.01)
+    # ADR-0176 Group A (2026-10-22): with the attempt 5 cell rows this plan
+    # projects 9.11 h before compression; the attempt 4 rows gave 14.23 h.
+    assert rp["total_h"] == pytest.approx(9.11 + rp["compression_s"] / 3600, abs=0.01)
     assert rp["total_s"] < hours * 3600
 
 

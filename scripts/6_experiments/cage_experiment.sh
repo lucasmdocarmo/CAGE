@@ -161,13 +161,18 @@ print(" ".join("%s=%s" % (v["model"], v["revision"]) for v in d.values() if isin
 fi
 POD_FREEZE_FILE="MyDocs/registration/freeze_resolutions.json"
 SCORE_BOUND_MIN="${SCORE_BOUND_MIN:-180}"
+FAIL_PROBE_NO_VERDICT="SCORING_BATCH_FAILED reason=no verdict line (the probe crashed before its verdict; see logs/runner/score_probe.log)"
 POD_READY_TIMEOUT_S="${CAGE_POD_READY_TIMEOUT_S:-900}"
 POD_READY_POLL_S="${CAGE_POD_READY_POLL_S:-15}"
 # Per-stage job bounds (seconds); the seatbelt must cover their sum plus the run.
 # Audit 2026-10-17 (G16): the pull margin was 60 min against S0 attempt 5's
 # measured pull of 68 min; the seal (600 s), the stage 4 start check (2,400 s)
 # and the readiness wait (POD_READY_TIMEOUT_S) were missing from the sum.
-VALIDATE_BOUND_S=1500; CALIBRATE_BOUND_S=3600; PLAN_BOUND_S=900; COLLECT_BOUND_S=1800; PULL_MARGIN_MIN=90
+VALIDATE_BOUND_S=1500; CALIBRATE_BOUND_S=3600; PLAN_BOUND_S=900; COLLECT_BOUND_S=1800
+# ADR-0176 Group C (owner 2026-10-22): the pull margin is a profile key (default
+# in _common.env, 90 min from S0 attempt 5's 68 min pull); S1 moves about three
+# times S0's bytes and sets its own.
+: "${PULL_MARGIN_MIN:=90}"
 SEAL_BOUND_S=600; START_CHECK_BOUND_S=2400
 # ADR-0154 / ADR-0156: the per-engine rung calibration job bound (profile key,
 # default in _common.env): up to PROBE_MAX_STEPS windows of 75 s plus a relaunch
@@ -345,7 +350,7 @@ rc_expected() { # rc_expected <rc> <expected: "0" or "0|1">
 
 run_step() {
   # run_step <expected_rc> <label> -- <cmd...>; stdout+stderr tee'd to a step log.
-  # expected_rc is one code or several joined by "|" (teardown_pod.sh: 0 or 1).
+  # expected_rc is one code or several joined by "|" (the yield table: 0 or 3).
   local expected="$1" label="$2"; shift 2; [ "${1:-}" = "--" ] && shift
   STEP_N=$((STEP_N + 1))
   if [ "$PLAN" -eq 1 ]; then
@@ -563,7 +568,7 @@ portal_block() {
   hr
   printf 'PORTAL ACTION\n'
   printf '  resource: pod              id: %s   cost clock: %s\n' "$POD_ID" "$clock"
-  printf '  resource: network volume   id: %s\n' "$VOL_ID"
+  printf '  resource: network volume   id: %s   (KEPT: never deleted by a script, owner rule 2026-10-22)\n' "$VOL_ID"
   printf '  verdict:  %s\n' "$verdict"
   printf '  watchdog: bash %s/runpod/pod_watchdog.sh status %s\n' "$SCRIPTS" "$POD_ID"
   # stage 8 (monitor) only reads alerts.log, which is append-only: its resume is the next stage
@@ -601,7 +606,10 @@ stage_preflight_mac() {
   # the stage loop moves to the conductor (owner, "follow recommendations").
   plan_only || { grep -v '^#' "$STEP_LOG" > "$EXTRAS/ops/pods_before.json"; json_only_ours "$EXTRAS/ops/pods_before.json" $(state get pod.id 2>/dev/null || true) $(state get conductor.id 2>/dev/null || true) || { printf '  [FAIL] clean room: pods exist before this experiment (see %s; this landing tolerates only its own pod and its recorded conductor, G8)\n' "$EXTRAS/ops/pods_before.json"; return 1; }; }
   run_step 0 "clean room: network-volume list" -- runpodctl network-volume list || return 1
-  plan_only || { grep -v '^#' "$STEP_LOG" > "$EXTRAS/ops/volumes_before.json"; json_only_ours "$EXTRAS/ops/volumes_before.json" $(state get pod.volume_id 2>/dev/null || true) || { printf '  [FAIL] clean room: network volumes exist before this experiment (see %s)\n' "$EXTRAS/ops/volumes_before.json"; return 1; }; }
+  # Owner rule 2026-10-22 (ADR-0176 Group B): no script deletes a network volume,
+  # so a volume kept from an earlier run is expected here: it is named and its
+  # storage bill noted, never a refusal. Pods stay strict.
+  plan_only || { grep -v '^#' "$STEP_LOG" > "$EXTRAS/ops/volumes_before.json"; json_only_ours "$EXTRAS/ops/volumes_before.json" $(state get pod.volume_id 2>/dev/null || true) || { say "NOTE: network volume(s) exist before this experiment (see $EXTRAS/ops/volumes_before.json): kept by the owner rule of 2026-10-22, billing storage until deleted by hand"; state note preflight-mac "network volume(s) listed before this experiment: kept, billing storage (owner rule 2026-10-22)"; }; }
   if [ "${PARTIAL_TREE_OK:-0}" = "1" ] && [ -z "${REHEARSAL_N:-}" ]; then
     printf '  [FAIL] PARTIAL_TREE_OK=1 on a registered run (REHEARSAL_N empty): a partial tree is never sealed on a registered run (decision 3 of 2026-10-13, S0 only); unset it or set REHEARSAL_N\n'
     return 1
@@ -831,13 +839,34 @@ stage_provision() {
     say "pod $existing is already recorded (resume after a partial provision): no volume, no pod is created"
     created=1
   fi
+  # Owner rule 2026-10-22 (ADR-0176 Group B): a volume recorded by an earlier
+  # attempt whose pod was refused is reused in its datacenter; no second one.
+  local kept_vol="" kept_dc=""
+  if ! plan_only && [ "$created" -eq 0 ]; then
+    kept_vol="$(state get pod.volume_id 2>/dev/null || true)"; kept_dc="$(state get pod.dc 2>/dev/null || true)"
+    if [ -n "$kept_vol" ] && [ -n "$kept_dc" ]; then
+      # review 2026-10-22 M1: a recorded volume the owner deleted by hand is not reused
+      run_step 0 "recorded volume $kept_vol listed" -- runpodctl network-volume list || return 1
+      if grep -v '^#' "$STEP_LOG" | grep -q "\"$kept_vol\""; then
+        say "volume $kept_vol in $kept_dc is already recorded (kept after a refused pod): reused, no second volume is created"
+        prefs=" $kept_dc"
+      else
+        say "recorded volume $kept_vol is no longer listed (deleted by hand): the record is cleared and a new volume is created in DC_PREFS order"
+        state put pod.volume_id ""; state put pod.dc ""; kept_vol=""
+      fi
+    else
+      kept_vol=""
+    fi
+  fi
   plan_only || [ "$created" -eq 1 ] || state go provision "--yes provision on the command line ($(utc))"
   [ "$created" -eq 1 ] || for dc in $prefs; do
-    run_step 0 "network volume create in $dc" -- runpodctl network-volume create --name "cage-$EXP-$DATE" --size "$VOLUME_GB" --data-center-id "$dc" || continue
-    if plan_only; then vol="<volume_id>"; else
-      vol="$(grep -v '^#' "$STEP_LOG" | sed -nE 's/.*"id"[[:space:]]*:[[:space:]]*"([A-Za-z0-9-]+)".*/\1/p' | head -1)"
-      [ -n "$vol" ] || { printf '  [FAIL] volume created in %s but its id was not parsed; find it with runpodctl network-volume list\n' "$dc"; return 1; }
-      state put pod.volume_id "$vol"; state put pod.dc "$dc"
+    if [ -n "$kept_vol" ]; then vol="$kept_vol"; else
+      run_step 0 "network volume create in $dc" -- runpodctl network-volume create --name "cage-$EXP-$DATE" --size "$VOLUME_GB" --data-center-id "$dc" || continue
+      if plan_only; then vol="<volume_id>"; else
+        vol="$(grep -v '^#' "$STEP_LOG" | sed -nE 's/.*"id"[[:space:]]*:[[:space:]]*"([A-Za-z0-9-]+)".*/\1/p' | head -1)"
+        [ -n "$vol" ] || { printf '  [FAIL] volume created in %s but its id was not parsed; find it with runpodctl network-volume list\n' "$dc"; return 1; }
+        state put pod.volume_id "$vol"; state put pod.dc "$dc"
+      fi
     fi
     # review 2026-10-13 item 24: CLOUD_TYPE and PORTS are the profile's, not the provisioner's defaults
     run_step 0 "provision pod in $dc (--yes)" -- bash "$SCRIPTS/runpod/provision_pod.sh" --gpu-id "$GPU_ID" --gpu-count "$GPU_COUNT" --disk-gb "$DISK_GB" --data-center-ids "$dc" --network-volume-id "$vol" --cloud-type "$CLOUD_TYPE" --ports "$PORTS" --terminate-after "$SEATBELT" --hours "$(pod_hours_bound)" --purpose "$EXP $DATE" --yes
@@ -856,9 +885,10 @@ stage_provision() {
       state put pod.id "unknown-see-portal"
       printf '  [FAIL] a pod was CREATED and is BILLING but its id was not parsed (rc=%s); find it in the console NOW\n' "$rc"; return 1
     fi
-    say "no pod in $dc (rc=$rc); deleting its volume and trying the next datacenter"
-    run_step 0 "network volume delete $vol (no pod)" -- runpodctl network-volume delete "$vol" || true
-    state put pod.volume_id ""
+    # Owner rule 2026-10-22: the volume is never deleted; the loop stops here and
+    # the resume reuses the recorded volume in this datacenter.
+    printf '  [FAIL] no pod in %s: volume %s is KEPT there (never deleted by a script; it bills storage); resume with --from provision --yes provision to try %s again, or delete the volume by hand (the resume then creates a new one in DC_PREFS order)\n' "$dc" "$vol" "$dc"
+    return 1
   done
   [ "$created" -eq 1 ] || { printf '  [FAIL] no datacenter accepted the pod\n'; return 1; }
   pod_env
@@ -1587,7 +1617,29 @@ stage_score() {
   [ "$REDO" -eq 1 ] && force=" --force"
   # G19 (2026-10-17): the profile's batch size reaches the pass (B13); the pass
   # itself resumes a partial directory window by window after a kill.
-  [ -z "${SCORING_BATCH_SIZE:-}" ] || bsize=" --batch-size $SCORING_BATCH_SIZE"
+  # ADR-0176 Group D (owner 2026-10-22): the batched path is used only after the
+  # probe grades the first 50 completed answers of this run both ways on the pod
+  # and finds every row identical; any other outcome (a difference, a crash)
+  # runs the pass row by row and says why. The job exits 0 on purpose: the
+  # verdict line decides, and a crashed probe is a failed proof, never a
+  # failed stage.
+  if [ -n "${SCORING_BATCH_SIZE:-}" ]; then
+    job_run score_probe 900 "cd $POD_REPO && env$(instrument_rev_env) $POD_PYTHON scripts/checks/probe_scoring_batch.py --run-root $POD_RUN_ROOT --batch-size $SCORING_BATCH_SIZE --rows 50 --device cuda --freeze-file $POD_FREEZE_FILE --out logs/scoring_batch_probe.json; exit 0" "$LAND/logs/runner" || return 1
+    if ! plan_only; then
+      local verdict; verdict="$(grep -E '^SCORING_BATCH_(OK|FAILED)' "$JOB_LOG" | tail -1 || true)"
+      case "$verdict" in
+        SCORING_BATCH_OK*)
+          say "$verdict"; say "scoring runs batched at $SCORING_BATCH_SIZE (the proof passed)"
+          state put scoring.batch_proof "$verdict"
+          bsize=" --batch-size $SCORING_BATCH_SIZE" ;;
+        *)
+          [ -n "$verdict" ] || verdict="$FAIL_PROBE_NO_VERDICT"
+          say "scoring batch proof did not pass ($verdict): the pass runs row by row"
+          state put scoring.batch_proof "$verdict"
+          state note score "batched scoring NOT used: $verdict" ;;
+      esac
+    fi
+  fi
   # Review 2026-10-10 (R2): the rescorer reads the freeze file too, so the four
   # instrument revisions are enforced at load (CAGE_*_REVISION) on the pod; (R3)
   # the rescorer builds its pass under a partial name and renames it only once
@@ -1620,6 +1672,23 @@ stage_pull() {
   run_step 0 "pull job logs" -- pscp_from ".cage_jobs/." "$LAND/logs/runner/pod_jobs/" || return 1
   run_step 0 "pull vm_logs forensics" -- pscp_from "$POD_BACKUP_DIR/vm_logs/." "$LAND/logs/system/vm_logs/" || return 1
   run_step 0 "pull pod calibration dir" -- pscp_from "$POD_REPO/results/calibration/." "$EXTRAS/calibration/pod/" || return 1
+  # ADR-0176 Group C: the A/A report (A6) the score job writes beside the run
+  # root; absent when that non-blocking step failed (its line is in score.log)
+  local aa="$POD_RUN_ROOT/../aa_repeats_$RUN_ID.json"
+  if plan_only; then
+    printf '  [plan] %-28s pscp_from %s when present\n' "pull A/A report (A6)" "$aa"
+  else
+    # review 2026-10-22 M1: only the pod's own "no such file" (rc 1) means absent;
+    # a dead channel (ssh_retry's 255) fails the stage, never a quiet "absent"
+    local aa_rc=0; pssh "test -f $aa" >/dev/null 2>&1 || aa_rc=$?
+    case "$aa_rc" in
+      0) run_step 0 "pull A/A report (A6)" -- pscp_from "$aa" "$EXTRAS/aa_repeats_$RUN_ID.json" || return 1
+         state put pull.aa_report "$EXTRAS/aa_repeats_$RUN_ID.json" ;;
+      1) say "no A/A report beside the run root (the A6 step failed or did not run; see logs/runner/score.log): nothing pulled"
+         state put pull.aa_report "absent" ;;
+      *) printf '  [FAIL] the A/A report probe did not reach the pod (ssh rc=%s): nothing is recorded as absent on a dead channel\n' "$aa_rc"; return 1 ;;
+    esac
+  fi
   # ADR-0154 / ADR-0153 (review MEDIUM 5): the ladder windows behind every
   # lambda* and the dry roots behind every regime gate are evidence; they
   # live outside the campaign root, so they are pulled here, best effort
@@ -1709,20 +1778,31 @@ stage_teardown() {
   pod_env
   plan_only || state go teardown "--yes teardown on the command line ($(utc))"
   local host="${POD_SSH}"
-  # teardown_pod.sh exits 1 at [5/5] while the volume is still listed (expected here),
-  # 0 only when nothing survives; the pod delete is [4/5]. Markers, not the code.
-  run_step "0|1" "teardown_pod.sh (0, or 1 with the volume still listed)" -- env CAGE_ASSUME_YES=1 CAGE_POD_SSH="$host" CAGE_SSH_OPTS="$SSH_OPTS" bash "$SCRIPTS/runpod/teardown_pod.sh" "$POD_ID" "ssh://$host$POD_BACKUP_DIR/$BACKUP_RUN_REL" "$RUN_LOCAL" || return 1
-  local trc=0
+  # Owner rule 2026-10-22 (ADR-0176 Group B): teardown deletes the POD only. The
+  # network volume keeps the run tree until the Mac-side S3 pull and is deleted
+  # by the owner by hand, if ever. teardown_pod.sh exits 0 with the volume
+  # listed; the pod delete is [4/5]. Markers, not the code.
+  run_step 0 "teardown_pod.sh (pod only; the volume is kept)" -- env CAGE_ASSUME_YES=1 CAGE_POD_SSH="$host" CAGE_SSH_OPTS="$SSH_OPTS" bash "$SCRIPTS/runpod/teardown_pod.sh" "$POD_ID" "ssh://$host$POD_BACKUP_DIR/$BACKUP_RUN_REL" "$RUN_LOCAL" || return 1
   if ! plan_only; then
-    if ! step_has "[4/5] deleting pod" || step_has "ERROR:"; then printf '  [FAIL] the pod delete did not run cleanly (rc=%s); see the step log\n' "$trc"; return 1; fi
+    if ! step_has "[4/5] deleting pod" || step_has "ERROR:"; then printf '  [FAIL] the pod delete did not run cleanly; see the step log\n'; return 1; fi
     step_has "TEARDOWN_COMPLETE" && say "teardown_pod.sh reports TEARDOWN_COMPLETE"
   fi
-  run_step 0 "network volume delete" -- runpodctl network-volume delete "$VOL_ID" || return 1
   run_step 0 "listing: pod list --all" -- runpodctl pod list --all || return 1
   # G8: the recorded A2 conductor (if any) is the one pod this proof tolerates
   plan_only || { grep -v '^#' "$STEP_LOG" > "$EXTRAS/ops/pods_after.json"; json_only_ours "$EXTRAS/ops/pods_after.json" $(state get conductor.id 2>/dev/null || true) || { printf '  [FAIL] pods STILL LISTED (STILL BILLING; only a recorded conductor.id is tolerated, G8): %s\n' "$EXTRAS/ops/pods_after.json"; return 1; }; }
   run_step 0 "listing: network-volume list" -- runpodctl network-volume list || return 1
-  plan_only || { grep -v '^#' "$STEP_LOG" > "$EXTRAS/ops/volumes_after.json"; json_empty "$EXTRAS/ops/volumes_after.json" || { printf '  [FAIL] volumes STILL LISTED (STILL BILLING): %s\n' "$EXTRAS/ops/volumes_after.json"; return 1; }; }
+  # the zero proof is ZERO PODS; a listed volume is the kept run tree (storage billing, by design)
+  if ! plan_only; then
+    grep -v '^#' "$STEP_LOG" > "$EXTRAS/ops/volumes_after.json"
+    if json_empty "$EXTRAS/ops/volumes_after.json"; then say "no network volume listed"; else
+      # review 2026-10-22 L4: the ids the listing holds, not the recorded one (which may be a placeholder)
+      local kept_ids; kept_ids="$("$PY3" -c 'import json,sys
+d = json.load(open(sys.argv[1], encoding="utf-8")); items = d if isinstance(d, list) else [v for vs in d.values() if isinstance(vs, list) for v in vs]
+print(" ".join(str(i.get("id", "")) for i in items if isinstance(i, dict)))' "$EXTRAS/ops/volumes_after.json" 2>/dev/null || echo "$VOL_ID")"
+      say "network volume(s) $kept_ids KEPT with the run tree (owner rule 2026-10-22): storage bills until deleted by hand after the S3 pull; listing in $EXTRAS/ops/volumes_after.json"
+      state put pod.volume_kept "$kept_ids"
+    fi
+  fi
   run_step 0 "cost report (--billing)" -- bash "$SCRIPTS/runpod/cost_report.sh" --billing || return 1
   plan_only || cp "$STEP_LOG" "$EXTRAS/ops/cost_report.txt"
   run_step 0 "account balance (after)" -- runpodctl user || return 1
