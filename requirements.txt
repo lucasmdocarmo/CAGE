@@ -132,6 +132,14 @@ numba==0.67.0
 loguru>=0.7.2
 pyyaml>=6.0.1
 python-dotenv>=1.0.0
+# pydantic-settings: exact pin (S1 validate stop 2026-10-23, owner option A).
+# vLLM 0.19.1 pulls it through fastapi[standard] with no upper bound, and
+# 2.16.0 (PyPI 2026-10-14) and 2.16.1 (2026-10-20) require python-dotenv>=1.2.2,
+# while lettucedetect's dependency rag-fact-checker 0.1.5 pins
+# python-dotenv==1.0.1, so `pip check` failed preflight gate (i) on the S1 pod.
+# 2.15.0 is what the S0 attempt 5 pod resolved (2026-10-14) and what the Mac
+# analysis venv runs; it accepts python-dotenv>=0.21.0. Bump only with a re-test.
+pydantic-settings==2.15.0
 tqdm>=4.66.0
 
 # Vector Store (for RAG baseline)
