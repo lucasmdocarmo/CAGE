@@ -1070,8 +1070,10 @@ stage_validate() {
       # sglang:num_queue_reqs is the queue gauge the section 6.1 clause (b)
       # regime label reads (ADR-0153; gap triage 2026-10-09 M3).
       # A7 (owner 2026-10-20): the cumulative retraction counter the dialect maps is
-      # checked by its TYPE declaration below: it prints no sample before its first
-      # retraction (SGLang 0.5.10.post1 scheduler.py 2574; review 2026-10-21)
+      # checked by its TYPE declaration below. S1 (live 2026-10-23): SGLang
+      # 0.5.10.post1 creates the counter, declaration included, only at its first
+      # retraction (multiprocess metrics; scheduler.py 2574-2575), so a fresh
+      # server shows the gauge alone, which the cage-stats dialect reads as 0
       sglang) names="sglang:token_usage sglang:num_retracted_reqs sglang:num_running_reqs sglang:num_queue_reqs"; gauge="sglang:num_running_reqs" ;;
       *) printf '  [FAIL] %s: no validation probe set is registered for this engine (S0F-37)\n' "$e"; return 1 ;;
     esac
@@ -1091,7 +1093,7 @@ stage_validate() {
       # S0F-88 U7: the server's own record that every row carries a cached-
       # token count (/server_info lists every launch argument at 0.5.10.post1)
       probe="$probe; curl -fsS $api/server_info 2>/dev/null | grep -Eq '\"enable_cache_report\": *true' && echo CACHE_REPORT_ON || { echo CACHE_REPORT_OFF; rc=1; }"
-      probe="$probe; printf '%s\\n' \"\$m\" | grep -Eq '^# TYPE sglang:num_retracted_requests(_total)? counter' && echo RETRACTION_COUNTER_DECLARED || { echo RETRACTION_COUNTER_MISSING; rc=1; }"
+      probe="$probe; printf '%s\\n' \"\$m\" | grep -Eq '^# TYPE sglang:num_retracted_requests(_total)? counter' && echo RETRACTION_COUNTER_DECLARED || { printf '%s\\n' \"\$m\" | grep -Eq '^sglang:num_retracted_reqs[{ ]' && echo RETRACTION_COUNTER_LAZY || { echo RETRACTION_COUNTER_MISSING; rc=1; }; }"
     fi
     # S0F-59 (ADR-0151): one chat request built the way the campaign runner
     # builds every request (its own adapter construction, the chat messages,
@@ -1154,7 +1156,10 @@ stage_validate() {
       [ "$(grep -c '^METRIC_OK ' "$JOB_LOG")" -eq "$n_names" ] || { printf '  [FAIL] %s: live /metrics lacks a name the regime bridge or the cold-start check reads:\n' "$e"; grep 'METRIC_MISSING' "$JOB_LOG" | sed 's/^/    /'; return 1; }
       grep -q "POOL_RECORD_OK" "$JOB_LOG" || { printf '  [FAIL] %s: the launcher wrote no CURRENT.kvpool.json (ADR-0142 realized pool)\n' "$e"; return 1; }
       grep -q "CACHE_REPORT_ON" "$JOB_LOG" || { printf '  [FAIL] %s: /server_info does not report enable_cache_report=true, so no row would carry a cached-token count (S0F-88 U7)\n' "$e"; return 1; }
-      grep -q "RETRACTION_COUNTER_DECLARED" "$JOB_LOG" || { printf '  [FAIL] %s: live /metrics does not declare the cumulative retraction counter sglang:num_retracted_requests_total, which the A7 dialect maps (no declaration = no preemption telemetry, every window refused)\n' "$e"; return 1; }
+      grep -Eq "RETRACTION_COUNTER_(DECLARED|LAZY)" "$JOB_LOG" || { printf '  [FAIL] %s: live /metrics shows neither the cumulative retraction counter sglang:num_retracted_requests_total nor the retraction gauge sglang:num_retracted_reqs that stands for it before the first retraction (no preemption telemetry: every window records scarcity as absent)\n' "$e"; return 1; }
+      if grep -q "RETRACTION_COUNTER_LAZY" "$JOB_LOG"; then
+        printf '  %s: no retraction yet, so the retraction counter is not created; the dialect reads the gauge as 0 until the first retraction (S1 2026-10-23)\n' "$e"
+      fi
       if [ -n "$hp_tokens" ]; then
         grep -q "HELPERS_FIT_OK" "$JOB_LOG" || { printf '  [FAIL] %s: the GPU helpers (reranker, compressor, encoder) did not run beside SGLang at the largest helper-cell pool (%s tokens), or that pool did not hold (review 2026-10-21 H1):\n' "$e" "$hp_tokens"; grep -E 'LARGEST_POOL_FAILED|_DEVICE_FAILED|HELPERS_FIT_FAILED' "$JOB_LOG" | sed 's/^/    /'; return 1; }
         printf '  %s: the GPU helpers fit beside SGLang at the largest helper-cell pool (%s tokens)\n' "$e" "$hp_tokens"

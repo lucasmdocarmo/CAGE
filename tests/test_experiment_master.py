@@ -163,7 +163,7 @@ def world(tmp_path: Path) -> Dict[str, Path]:
     _w(b / "git", "#!/bin/bash\ncase \"$*\" in *\"rev-parse HEAD\"*) echo \"${CAGE_TEST_HEAD_SHA:-${CAGE_TEST_SHA:-0123456789abcdef0123456789abcdef01234567}}\" ;; *) exit 1 ;; esac\n")
     # /metrics answers with the live names of 2026-10-07 (S0F-37), /server_info
     # with SGLang's launch arguments (S0F-88 U7); everything else is a silent 200
-    _w(b / "curl", "#!/bin/bash\ncase \"$*\" in *\"/metrics\"*) printf 'sglang:token_usage 0.1\\nsglang:num_retracted_reqs 0\\n# TYPE sglang:num_retracted_requests_total counter\\nsglang:num_running_reqs 0\\nsglang:num_queue_reqs 0\\nvllm:kv_cache_usage_perc 0.1\\n' ;; *\"/server_info\"*) printf '{\"version\":\"0.5.10.post1\",\"enable_cache_report\":%s}\\n' \"${CAGE_TEST_CACHE_REPORT:-true}\" ;; esac\nexit 0\n")
+    _w(b / "curl", "#!/bin/bash\ncase \"$*\" in *\"/metrics\"*) case \"${CAGE_TEST_RETRACTION:-lazy}\" in declared) r='sglang:num_retracted_reqs 0\\n# TYPE sglang:num_retracted_requests_total counter\\n' ;; none) r='' ;; prefix) r='sglang:num_retracted_reqs_created 1\\n' ;; *) r='sglang:num_retracted_reqs{model_name=\"m\"} 0.0\\n' ;; esac; printf \"sglang:token_usage 0.1\\n${r}sglang:num_running_reqs 0\\nsglang:num_queue_reqs 0\\nvllm:kv_cache_usage_perc 0.1\\n\" ;; *\"/server_info\"*) printf '{\"version\":\"0.5.10.post1\",\"enable_cache_report\":%s}\\n' \"${CAGE_TEST_CACHE_REPORT:-true}\" ;; esac\nexit 0\n")
     _w(b / "nvidia-smi", r'''
         #!/bin/bash
         case "$*" in
@@ -1904,8 +1904,49 @@ def test_validate_runs_the_helpers_beside_sglang_at_the_largest_helper_pool_revi
     for probe in ("pool-check --engine sglang --planned-tokens 70437", "probe_reranker_device.py", "probe_compressor_device.py", "probe_encoder_device.py"):
         assert second < cmd.index(probe, second) < cmd.rindex("manage_sglang_server.sh stop"), probe
     assert "the GPU helpers fit beside SGLang at the largest helper-cell pool (70437 tokens)" in proc.stdout
-    assert "RETRACTION_COUNTER_DECLARED" in (world["exp_root"] / "S1" / DATE / "logs" / "setup" / "validate_sglang.log").read_text(encoding="utf-8")
+    # S1 2026-10-23: the fake serves the live shape, the gauge with no counter yet
+    assert "RETRACTION_COUNTER_LAZY" in (world["exp_root"] / "S1" / DATE / "logs" / "setup" / "validate_sglang.log").read_text(encoding="utf-8")
+    assert "sglang: no retraction yet, so the retraction counter is not created" in proc.stdout
     assert "env CAGE_SGLANG_MAX_TOTAL_TOKENS=70437" not in (world["home"] / ".cage_jobs" / "validate_vllm.cmd").read_text(encoding="utf-8")
+
+
+def _two_engine_profile(world: Dict[str, Path], tmp_path: Path) -> None:
+    two = tmp_path / "S1_two_retraction.env"
+    two.write_text(world["profile"].read_text(encoding="utf-8").replace('ENGINES="vllm hf"', 'ENGINES="vllm sglang hf"'), encoding="utf-8")
+    world["profile"] = two
+
+
+def test_a_declared_retraction_counter_passes_without_the_lazy_note_s1_2026_10_23(world: Dict[str, Path], tmp_path: Path) -> None:
+    _two_engine_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "validate", CAGE_TEST_RETRACTION="declared")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    log = (world["exp_root"] / "S1" / DATE / "logs" / "setup" / "validate_sglang.log").read_text(encoding="utf-8")
+    assert "RETRACTION_COUNTER_DECLARED" in log and "RETRACTION_COUNTER_LAZY" not in log
+    assert "no retraction yet" not in proc.stdout
+
+
+def test_a_names_check_pass_without_counter_or_gauge_sample_fails_on_the_retraction_gate_review_m1(world: Dict[str, Path], tmp_path: Path) -> None:
+    """Review 2026-10-23 M1: a line that starts with the gauge name passes the names
+    check but is no gauge sample, so only the retraction check can stop it. The
+    probe exits 1 on RETRACTION_COUNTER_MISSING, so the job fails before the
+    master's marker gates run (the same two layers as the other stage 4 checks)."""
+    _two_engine_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "validate", CAGE_TEST_RETRACTION="prefix")
+    assert proc.returncode != 0, proc.stdout[-3000:]
+    assert "METRIC_OK sglang:num_retracted_reqs" in proc.stdout  # the names check passed
+    assert "RETRACTION_COUNTER_MISSING" in proc.stdout
+    assert "RETRACTION_COUNTER_LAZY" not in proc.stdout and "RETRACTION_COUNTER_DECLARED" not in proc.stdout
+    assert "lacks a name the regime bridge" not in proc.stdout
+    assert _state(world)["stages"]["validate"]["status"] == "failed"
+
+
+def test_neither_the_retraction_counter_nor_its_gauge_fails_validate_s1_2026_10_23(world: Dict[str, Path], tmp_path: Path) -> None:
+    _two_engine_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "validate", CAGE_TEST_RETRACTION="none")
+    assert proc.returncode != 0, proc.stdout[-3000:]
+    assert "RETRACTION_COUNTER_MISSING" in proc.stdout + "".join(
+        p.read_text(encoding="utf-8") for p in (world["exp_root"] / "S1" / DATE / "logs" / "setup").rglob("validate_sglang*.log"))
+    assert _state(world)["stages"]["validate"]["status"] == "failed"
 
 
 # ---------------------------------------------------------------------------
