@@ -1438,6 +1438,24 @@ KV_CEILING_RULE = (
     "queue_waiting_share >= QUEUE_SHARE_MIN; pinned on cells where r <= kv_ceiling_max_r"
 )
 KV_CEILING_MAX_R = 1.0
+#: ADR-0177 (owner 2026-10-25, option A2): the classes the plan interpolates
+#: carried no measured ceiling, so clause (a) held them to the absolute
+#: RHO_KV_MIN while the laddered classes were held to 0.95 x their own
+#: ceiling; on S1, SGLang's 1127- and 702-token dry windows read 0.867 and
+#: 0.851 queued with queue shares 0.597 and 0.964 and their F2 cells were
+#: skipped [V 2026-10-25 dry root]. ``calibrate-rungs --ceilings-only``
+#: ladders those classes by the registered ladder and writes their ceilings
+#: (KV_CEILING_RULE) to a separate artifact, so the rung artifacts and every
+#: rate they set stay byte-identical; the measured lambda* is recorded, never
+#: offered. The plan pins the ceiling (``plan --class-ceilings``) and
+#: ``relabel-regime`` re-judges the windows already written.
+CLASS_CEILINGS_SCHEMA = "cage-class-ceilings-v1"
+CLASS_CEILINGS_ADR = "ADR-0177"
+CLASS_CEILING_ROLE = "ceiling"
+#: ADR-0177: the sibling root of the drift window (one completed window
+#: rerun just before the reruns, record only). The "-dry-" infix puts it in
+#: the master's stage 12 pull of the dry roots; the campaign tree never sees it.
+DRIFT_ROOT_SUFFIX = "-dry-drift"
 #: S0F-88 B-8 (owner ruling R4): the one label a prefix-ON dry window may read
 #: without failing its cells: prefix sharing left the pool unfilled at the
 #: prefix-OFF twin's rate and budget, a measured outcome. Any other label
@@ -5853,7 +5871,8 @@ def _cell_step(
                     # the tokens per byte and LMCache offloads, so the
                     # absolute RHO_KV_MIN applies on those configurations
                     lambda_source = {
-                        **lambda_source,
+                        # ADR-0177: an unpinned ceiling names no source
+                        **{k: v for k, v in lambda_source.items() if k != "kv_ceiling_source"},
                         "kv_ceiling": None,
                         "kv_ceiling_note": (
                             "not pinned: the ceiling was measured on a bf16 pool without a "
@@ -6383,6 +6402,11 @@ class RungCalibration:
     ruler_lambdas: Dict[float, float] = field(default_factory=dict)
     ruler_labels: Dict[float, str] = field(default_factory=dict)
     ruler_kv_ceilings: Dict[float, float] = field(default_factory=dict)
+    # ADR-0177: the ceilings of the interpolated classes, from their own
+    # ceiling-only ladders (a separate artifact, its sha256 beside them); the
+    # rates of those classes stay the interpolation
+    class_kv_ceilings: Dict[int, Dict[float, float]] = field(default_factory=dict)
+    class_ceilings_sha256: Optional[str] = None
 
     @staticmethod
     def _at(table: Mapping[float, Any], r: float) -> Optional[Any]:
@@ -6417,12 +6441,15 @@ class RungCalibration:
 
     def kv_ceiling_for(self, seq_tokens: int, r: float, anchor_tokens: int) -> Optional[float]:
         """B-11: the measured KV ceiling of a laddered class (anchor, measured
-        or smallest) at rung r, or None (an interpolated class has no ladder)."""
+        or smallest) at rung r; for an interpolated class, its ceiling-only
+        ladder's (ADR-0177) when one was registered; else None."""
         if seq_tokens == anchor_tokens:
             return self._at(self.kv_ceilings, r)
         table = self.measured_kv_ceilings.get(int(seq_tokens))
         if table is None and seq_tokens == self.small_seq_tokens:
             table = self.small_kv_ceilings
+        if table is None:
+            table = self.class_kv_ceilings.get(int(seq_tokens))
         return None if table is None else self._at(table, r)
 
 
@@ -6700,6 +6727,118 @@ def load_rung_calibration(path: Path) -> RungCalibration:
     )
 
 
+def load_class_ceilings(path: Path) -> Dict[str, Any]:
+    """ADR-0177: load + validate ONE ``cage-class-ceilings-v1`` artifact
+    (``calibrate-rungs --ceilings-only``) fail closed: the schema, the
+    registered procedure version, ``confirmatory: false``, ``complete: true``,
+    a runner engine (normalized), the model, the session and a ``classes``
+    block of role "ceiling" entries keyed by their served tokens, each with a
+    rungs table whose optional ``kv_ceiling`` is a number in (0, 1].
+    Returns {path, sha256, engine, model, session, ceilings: {seq: {r: c}}}."""
+    path = Path(path)
+    if not path.is_file():
+        raise PlanError(
+            f"class ceilings artifact not found: {path} (run run_campaign.py calibrate-rungs "
+            f"--ceilings-only per engine; {CLASS_CEILINGS_ADR})"
+        )
+    raw = path.read_bytes()
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise PlanError(f"class ceilings artifact {path} is not valid JSON: {exc}") from exc
+    if not isinstance(doc, dict) or doc.get("schema") != CLASS_CEILINGS_SCHEMA:
+        raise PlanError(f"class ceilings artifact {path} schema is not {CLASS_CEILINGS_SCHEMA!r}")
+    problems: List[str] = []
+    if doc.get("procedure_version") != PROCEDURE_VERSION:
+        problems.append(f"procedure_version is {doc.get('procedure_version')!r}, not {PROCEDURE_VERSION!r}")
+    if doc.get("confirmatory") is not False:
+        problems.append("confirmatory must be the literal false")
+    if doc.get("complete") is not True:
+        problems.append("the artifact is INCOMPLETE (complete is not true): the ceiling ladders did not finish")
+    engine = ENGINE_OF_BACKEND.get(doc.get("engine")) if isinstance(doc.get("engine"), str) else None
+    if engine is None or engine == "hf":
+        problems.append(f"engine {doc.get('engine')!r} is not a server engine")
+    model, session = doc.get("model"), doc.get("session")
+    if not isinstance(model, str) or not model.strip():
+        problems.append(f"model {model!r} must be a non-empty string")
+    if not isinstance(session, str) or session not in SESSIONS:
+        problems.append(f"session {session!r} is not a §1 session")
+    ceilings: Dict[int, Dict[float, float]] = {}
+    classes = doc.get("classes")
+    if not isinstance(classes, dict) or not classes:
+        problems.append("classes must be a non-empty mapping seq_tokens -> class record")
+        classes = {}
+    for key, rec in classes.items():
+        where = f"classes[{key!r}]"
+        seq = rec.get("seq_tokens") if isinstance(rec, dict) else None
+        if not isinstance(rec, dict) or rec.get("role") != CLASS_CEILING_ROLE:
+            problems.append(f"{where}.role must be {CLASS_CEILING_ROLE!r}")
+            continue
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1 or str(seq) != str(key):
+            problems.append(f"{where}.seq_tokens={seq!r} must be the integer >= 1 the key names")
+            continue
+        if not isinstance(rec.get("rungs"), dict):
+            problems.append(f"{where}.rungs must be a mapping r -> rung record")
+            continue
+        ceilings[seq] = _parse_rung_ceilings(rec["rungs"], f"{where}.rungs", problems)
+    if problems:
+        raise PlanError(f"class ceilings artifact {path}: " + "; ".join(problems))
+    return {
+        "path": path, "sha256": hashlib.sha256(raw).hexdigest(), "engine": engine,
+        "model": model, "session": session, "ceilings": ceilings,
+    }
+
+
+def _register_class_ceilings(
+    grid: SessionGrid,
+    rung_table: Mapping[str, RungCalibration],
+    class_ceilings: Mapping[str, Path],
+    anchor_tokens: int,
+) -> Tuple[Dict[str, RungCalibration], Dict[str, Any]]:
+    """ADR-0177: attach each engine's class ceilings to its rung calibration.
+    Refuses an engine without a rung artifact, an artifact of another engine,
+    model or session, and a ceiling for a class the rung artifact ladders
+    itself (the anchor, the smallest class, a measured class): only the
+    interpolated classes take one. Returns (engine -> calibration, header)."""
+    out = dict(rung_table)
+    artifacts: Dict[str, Any] = {}
+    for engine, path in sorted(class_ceilings.items()):
+        cal = out.get(engine)
+        rec = load_class_ceilings(path)
+        where = f"--class-ceilings {engine}={rec['path']}"
+        if cal is None:
+            raise PlanError(f"{where}: engine {engine!r} has no --rung-calibration to attach the ceilings to")
+        if rec["engine"] != engine or rec["session"] != cal.session or rec["model"] not in (cal.model, grid.model, HF_ID_OF_SLUG[grid.model]):
+            raise PlanError(
+                f"{where}: the artifact is for engine {rec['engine']!r}, session {rec['session']!r}, "
+                f"model {rec['model']!r}; the rung artifact is {engine!r}, {cal.session!r}, {cal.model!r}"
+            )
+        laddered = {anchor_tokens, cal.small_seq_tokens, *cal.measured_labels}
+        overlap = sorted(seq for seq in rec["ceilings"] if seq in laddered)
+        if overlap:
+            raise PlanError(
+                f"{where}: class(es) {overlap} are laddered by the rung artifact itself; a ceiling-only "
+                f"ladder serves the interpolated classes alone ({CLASS_CEILINGS_ADR})"
+            )
+        out[engine] = replace(cal, class_kv_ceilings=dict(rec["ceilings"]), class_ceilings_sha256=rec["sha256"])
+        artifacts[engine] = {
+            "path": str(rec["path"].resolve()),
+            "sha256": rec["sha256"],
+            "ceilings": {
+                str(seq): {f"{r:g}": c for r, c in sorted(table.items(), reverse=True)}
+                for seq, table in sorted(rec["ceilings"].items())
+            },
+        }
+    header = {
+        "adr": CLASS_CEILINGS_ADR,
+        "schema": CLASS_CEILINGS_SCHEMA,
+        "rule": KV_CEILING_RULE,
+        "note": "ceilings only: the interpolated classes keep their interpolated lambda*",
+        "artifacts": artifacts,
+    }
+    return out, header
+
+
 def interpolation_alpha(lambda_gold: float, s_gold: int, lambda_small: float, s_small: int) -> float:
     """ADR-0156: the log-log slope through the two anchors,
     alpha = ln(lambda_m / lambda_g) / ln(s_g / s_m); 1 is the KV-bound limit.
@@ -6773,6 +6912,9 @@ def rung_lambda_for_class(
         # absolute RHO_KV_MIN applies
         "kv_ceiling": cal.kv_ceiling_for(seq_tokens, r, anchor_tokens) if r <= KV_CEILING_MAX_R else None,
     }
+    if source["kv_ceiling"] is not None and int(seq_tokens) in cal.class_kv_ceilings:
+        # ADR-0177: the ceiling came from the class's ceiling-only ladder
+        source["kv_ceiling_source"] = {"adr": CLASS_CEILINGS_ADR, "sha256": cal.class_ceilings_sha256}
     if seq_tokens == anchor_tokens:
         source["alpha"] = None
         return gold, LAMBDA_BASIS_RUNG, source
@@ -7374,8 +7516,13 @@ def build_plan(
     front_load: bool = False,
     frontier_loads: Optional[Mapping[str, Mapping[float, float]]] = None,
     last_block: Optional[str] = None,
+    class_ceilings: Optional[Mapping[str, Path]] = None,
 ) -> Dict[str, Any]:
     """PURE plan builder: registered grid -> ordered step list + counts.
+
+    ``class_ceilings`` (ADR-0177) maps engine -> class ceilings artifact
+    (``plan --class-ceilings ENGINE=PATH``): the interpolated classes of that
+    engine are pinned their measured ceiling; nothing else in the plan moves.
 
     ``last_block`` (owner 2026-10-21, "Through L5"): on a block session, the
     cells of every block after it in BLOCK_ORDER leave the plan; the cells
@@ -7486,6 +7633,9 @@ def build_plan(
     rung_header, rung_table = _register_rung_calibrations(
         grid, cells, rung_calibrations, anchor_tokens
     )
+    ceilings_header: Optional[Dict[str, Any]] = None
+    if class_ceilings:
+        rung_table, ceilings_header = _register_class_ceilings(grid, rung_table, class_ceilings, anchor_tokens)
     if grid.blocks and calibrations:
         # B4 (review 2026-10-20 L11): a block session's latency targets are per
         # class, so every executable class needs its floor on every engine
@@ -7623,7 +7773,7 @@ def build_plan(
     for s in unique_cells:
         cells_by_class[s["row_class"]] = cells_by_class.get(s["row_class"], 0) + 1
 
-    return {
+    plan_doc = {
         "schema": PLAN_SCHEMA,
         "session": session,
         "group": grid.group,
@@ -7904,6 +8054,11 @@ def build_plan(
         "charter_refs": ["6.1", "6.4", "6.8", "7.6", "7.6.1", "D5#5", "P6"],
         "steps": steps,
     }
+    if ceilings_header is not None:
+        # ADR-0177: present only when the plan pins class ceilings, so a plan
+        # built without them is byte-identical to one built before ADR-0177
+        plan_doc["class_ceilings"] = ceilings_header
+    return plan_doc
 
 
 # ---------------------------------------------------------------------------
@@ -9646,6 +9801,354 @@ def run_plan(
 
 
 # ---------------------------------------------------------------------------
+# ADR-0177: the ceiling-only re-plan, its diff gate, the re-label of the
+# windows already written, and the drift window
+# ---------------------------------------------------------------------------
+
+#: ADR-0177: the plan header keys a ceiling-only re-plan may change (the build
+#: time, the new ceilings record, and the frontier file's own provenance when
+#: the stage recomputes it; the loads it set are compared as part of the header).
+CEILING_REPLAN_HEADER_KEYS: FrozenSet[str] = frozenset({"generated_at_utc", "class_ceilings", "frontier_source"})
+
+
+def _ceiling_fields_removed(step: Mapping[str, Any]) -> Any:
+    """A step with the fields a ceiling pin touches removed: the env pin and
+    the source's kv_ceiling, kv_ceiling_source and kv_ceiling_note (the
+    fp8 and connector cells' "not pinned" record, written once their class
+    has a ceiling)."""
+    out = json.loads(json.dumps(step))
+    (out.get("env") or {}).pop(KV_CEILING_ENV, None)
+    source = out.get("lambda_star_source")
+    if isinstance(source, dict):
+        for key in ("kv_ceiling", "kv_ceiling_source", "kv_ceiling_note"):
+            source.pop(key, None)
+    return out
+
+
+def ceiling_plan_diff(old: Mapping[str, Any], new: Mapping[str, Any]) -> Tuple[List[str], int]:
+    """ADR-0177: the gate between the registered plan and its ceiling-only
+    re-plan. Every step must be equal once the ceiling fields are removed, a
+    changed ceiling must have been absent before (only an interpolated class
+    gains one; a laddered class's ceiling never moves), and every header key
+    outside CEILING_REPLAN_HEADER_KEYS must be equal. Returns (problems,
+    number of steps whose ceiling changed). Pure."""
+    problems: List[str] = []
+    old_steps, new_steps = list(old.get("steps") or []), list(new.get("steps") or [])
+    if len(old_steps) != len(new_steps):
+        problems.append(f"the re-plan has {len(new_steps)} steps, the registered plan {len(old_steps)}")
+    changed = 0
+    for i, (a, b) in enumerate(zip(old_steps, new_steps)):
+        if _ceiling_fields_removed(a) != _ceiling_fields_removed(b):
+            problems.append(f"steps[{i}] ({a.get('kind')} {a.get('row_key')}) differs outside the ceiling fields")
+            continue
+        pin_a = (a.get("env") or {}).get(KV_CEILING_ENV)
+        pin_b = (b.get("env") or {}).get(KV_CEILING_ENV)
+        if pin_a != pin_b:
+            changed += 1
+            if pin_a is not None:
+                problems.append(
+                    f"steps[{i}] ({a.get('row_key')}) changes a measured ceiling {pin_a} -> {pin_b}: only an "
+                    "interpolated class may gain one"
+                )
+    for key in sorted((set(old) | set(new)) - {"steps"} - CEILING_REPLAN_HEADER_KEYS):
+        if _json_norm(old.get(key)) != _json_norm(new.get(key)):
+            problems.append(f"header key {key!r} differs between the registered plan and the re-plan")
+    return problems, changed
+
+
+def _same_ceiling(a: Any, b: Any) -> bool:
+    if a is None or b is None:
+        return a is None and b is None
+    return math.isclose(float(a), float(b), rel_tol=1e-9, abs_tol=0.0)
+
+
+def _relabel_window(
+    window_dir: Path, want: Optional[float], journal_root: Path, plan_sha256: str, *, write: bool = True
+) -> Optional[Tuple[str, Optional[str], Optional[str]]]:
+    """Re-judge one window's regime.json under the ceiling ``want``. Returns
+    None when nothing changes, else (outcome, old label, new label) with
+    outcome "relabeled" or "not-judged" (no certified inputs or attainment:
+    the label stays as the writer left it). ``write=False`` judges only."""
+    from src.analysis.goodput import classify_regime
+    from src.orchestration.campaign_layout import _clause_a_record
+    from src.orchestration.campaign_session import _atomic_write_json as _journaled_write
+
+    path = window_dir / "regime.json"
+    if not path.is_file():
+        return None
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    if _same_ceiling(doc.get("kv_ceiling"), want):
+        return None
+    inputs = doc.get("inputs")
+    old_label = doc.get("label")
+    if not doc.get("telemetry_ok") or not isinstance(inputs, dict) or doc.get("attainment") is None or old_label is None:
+        return ("not-judged", old_label, old_label)
+    new_label = classify_regime(
+        rho_kv=inputs["rho_kv_time_avg"],
+        attainment=float(doc["attainment"]),
+        queue_waiting_share=inputs["queue_waiting_share"],
+        scarcity_events=inputs.get("scarcity_events"),
+        rho_kv_queued_median=inputs.get("rho_kv_queued_median"),
+        kv_ceiling=want,
+    )
+    if not write:
+        return ("relabeled", old_label, new_label)
+    # the writer's label survives once, under "registered", whatever later passes do
+    doc.setdefault("registered", {
+        "label": old_label, "kv_ceiling": doc.get("kv_ceiling"), "clause_a_rule": doc.get("clause_a_rule"),
+    })
+    doc["label"] = new_label
+    doc.update(_clause_a_record(inputs.get("rho_kv_queued_median"), want))
+    doc["relabel"] = {
+        "adr": CLASS_CEILINGS_ADR,
+        "plan_sha256": plan_sha256,
+        "utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "rule": "goodput.classify_regime on the window's own recorded inputs and attainment, under the ceiling the plan pins",
+    }
+    # S0-15: through the session's journaled write, so the seal's last entry is this file
+    _journaled_write(path, doc, journal_root=journal_root)
+    return ("relabeled", old_label, new_label)
+
+
+def relabel_windows(plan: Mapping[str, Any], campaign_root: Path, plan_sha256: str) -> Dict[str, Any]:
+    """ADR-0177: re-judge every pressure window already written (the campaign
+    tree and the dry root) under the KV ceiling the plan now pins on its
+    step; the window's measured inputs are never touched. A dry window's
+    attempt sidecar takes the new label and verdict, its first ones kept.
+    Idempotent: a window already judged under the pinned ceiling is left
+    alone. Returns the report (counts and every flipped label).
+
+    Refuses (RunError) before writing anything: a sealed tree (its ledger
+    would no longer match, review 2026-10-25 L9), and a dry window whose
+    passing verdict the new ceiling would turn into a failure (review M6:
+    its configuration's complete cells would then be skipped on a resume;
+    the owner decides, owner sub-choice 4 keeps such windows marked)."""
+    campaign_root = Path(campaign_root)
+    if (campaign_root / "ledger.json").is_file():
+        raise RunError(f"{campaign_root} is sealed (ledger.json): a re-label would break the seal ({CLASS_CEILINGS_ADR})")
+    dry_root = dry_window_root(campaign_root, plan)
+    report: Dict[str, Any] = {
+        "adr": CLASS_CEILINGS_ADR, "plan_sha256": plan_sha256, "relabeled": 0, "not_judged": 0,
+        "unchanged": 0, "flips": [], "not_judged_windows": [],
+    }
+    targets: List[Tuple[Dict[str, Any], int, Path, Path, Optional[float]]] = []
+    seen: set = set()
+    for step in plan["steps"]:
+        if step.get("blocked_on") or step.get("kind") not in ("cell", "dry_window"):
+            continue
+        if step["kind"] == "cell" and step.get("family") not in _PRESSURE_FAMILIES:
+            continue
+        pin = (step.get("env") or {}).get(KV_CEILING_ENV)
+        want = None if pin is None else float(pin)
+        if step["kind"] == "cell":
+            root = campaign_root
+            base, expected = _window_range(step)
+            ordinals: Sequence[int] = range(base + 1, base + expected + 1)
+        else:
+            root = dry_root
+            ordinals = _dry_attempt_ordinals(dry_root, step)
+        for ordinal in ordinals:
+            window_dir = root / "cells" / step["row_key"] / f"window_{step['dataset']}-{ordinal:02d}"
+            if window_dir in seen or not (window_dir / "regime.json").is_file():
+                continue
+            seen.add(window_dir)
+            targets.append((step, ordinal, window_dir, root, want))
+    regressions = []
+    for step, ordinal, window_dir, root, want in targets:
+        if step["kind"] != "dry_window":
+            continue
+        judged = _relabel_window(window_dir, want, root, plan_sha256, write=False)
+        if judged is not None and judged[0] == "relabeled" and _dry_verdict(step, judged[1]) != "failed" \
+                and _dry_verdict(step, judged[2]) == "failed":
+            regressions.append(f"{window_dir.relative_to(root.parent)}: {judged[1]} -> {judged[2]} (kv_ceiling {want})")
+    if regressions:
+        raise RunError(
+            f"the pinned ceilings would fail {len(regressions)} dry window(s) that passed: {regressions}; "
+            f"nothing was re-labeled, the owner decides ({CLASS_CEILINGS_ADR})"
+        )
+    for step, ordinal, window_dir, root, want in targets:
+        result = _relabel_window(window_dir, want, root, plan_sha256)
+        if result is None:
+            report["unchanged"] += 1
+            continue
+        outcome, old_label, new_label = result
+        rel = str(window_dir.relative_to(root.parent))
+        if outcome == "not-judged":
+            report["not_judged"] += 1
+            report["not_judged_windows"].append(rel)
+            continue
+        report["relabeled"] += 1
+        if old_label != new_label:
+            report["flips"].append({"window": rel, "from": old_label, "to": new_label, "kv_ceiling": want})
+        if step["kind"] == "dry_window":
+            side_path = _dry_sidecar_path(dry_root, step, ordinal)
+            side = _read_dry_sidecar(dry_root, step, ordinal)
+            if side:
+                side.setdefault("registered_label", side.get("label"))
+                side.setdefault("registered_verdict", side.get("verdict"))
+                side["label"], side["verdict"] = new_label, _dry_verdict(step, new_label)
+                side["relabel"] = {"adr": CLASS_CEILINGS_ADR, "plan_sha256": plan_sha256}
+                side_path.write_text(json.dumps(side, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return report
+
+
+def drift_root(campaign_root: Path) -> Path:
+    """ADR-0177: the sibling root of the drift window (DRIFT_ROOT_SUFFIX)."""
+    campaign_root = Path(campaign_root)
+    name = f"{campaign_root.name[:30]}{DRIFT_ROOT_SUFFIX}"
+    if not RUN_ID_RE.match(name):
+        raise RunError(f"drift root {name!r} violates the §1 grammar {RUN_ID_RE.pattern}")
+    return campaign_root.parent / name
+
+
+def drift_step(plan: Mapping[str, Any], campaign_root: Path) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """ADR-0177: the window the drift check reruns and its relaunch: the
+    first executable pressure cell step of the anchor class (its ceiling was
+    measured before the run, so its label rule never moved) whose first
+    window is complete, at its first trial. Returns (relaunch, cell step);
+    refuses (RunError) when no such window exists."""
+    anchor = (plan.get("demand_classes") or {}).get("anchor_seq_tokens")
+    relaunch: Optional[Dict[str, Any]] = None
+    for step in plan["steps"]:
+        if step["kind"] == "relaunch":
+            relaunch = step
+            continue
+        if (
+            step["kind"] != "cell" or step.get("blocked_on") or step.get("family") not in _PRESSURE_FAMILIES
+            or (step.get("demand_class") or {}).get("seq_tokens") != anchor
+            or step.get("trial_index") not in (None, 1) or relaunch is None
+        ):
+            continue
+        base, _expected = _window_range(step)
+        window = Path(campaign_root) / "cells" / step["row_key"] / f"window_{step['dataset']}-{base + 1:02d}"
+        if (window / "metrics.json").is_file():
+            return relaunch, step
+    raise RunError(f"no completed anchor-class pressure window in {campaign_root} to rerun ({CLASS_CEILINGS_ADR})")
+
+
+def _drift_summary(window_dir: Path) -> Dict[str, Any]:
+    regime: Dict[str, Any] = {}
+    try:
+        regime = json.loads((window_dir / "regime.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        pass
+    inputs = regime.get("inputs") if isinstance(regime.get("inputs"), dict) else {}
+    ttfts: List[float] = []
+    try:
+        for line in (window_dir / "requests.jsonl").read_text(encoding="utf-8").splitlines():
+            row = json.loads(line) if line.strip() else {}
+            v = row.get("ttft_from_send_ms")
+            if row.get("ok") is True and isinstance(v, (int, float)) and not isinstance(v, bool):
+                ttfts.append(float(v))
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {
+        "label": regime.get("label"),
+        "attainment": regime.get("attainment"),
+        "rho_kv_time_avg": inputs.get("rho_kv_time_avg"),
+        "rho_kv_queued_median": inputs.get("rho_kv_queued_median"),
+        "queue_waiting_share": inputs.get("queue_waiting_share"),
+        "ttft_from_send_ms_median": statistics.median(ttfts) if ttfts else None,
+        "ok_rows": len(ttfts),
+    }
+
+
+def run_drift_window(
+    plan: Mapping[str, Any],
+    campaign_root: Path,
+    *,
+    exec_fn: Callable[[Sequence[str], Mapping[str, str]], int] = _exec,
+) -> Dict[str, Any]:
+    """ADR-0177 (owner sub-choice 5): rerun one completed window, record only.
+    Starts the window's own relaunch, checks its realized pool (A11), runs
+    the cell's first trial into the drift root, stops the engine, and
+    returns the original and the rerun side by side (written beside the
+    drift root's cells as drift_report.json). A drift window already on disk
+    is not run again. Never a gate: the numbers are for the owner to read."""
+    campaign_root = Path(campaign_root)
+    root = drift_root(campaign_root)
+    relaunch, step = drift_step(plan, campaign_root)
+    base, _expected = _window_range(step)
+    name = f"window_{step['dataset']}-{base + 1:02d}"
+    original = campaign_root / "cells" / step["row_key"] / name
+    rerun = root / "cells" / step["row_key"] / name
+    report: Dict[str, Any] = {
+        "adr": CLASS_CEILINGS_ADR, "row_key": step["row_key"], "dataset": step["dataset"],
+        "relaunch_exit": None, "runner_exit": None, "stop_exit": None, "pool": None,
+    }
+    if not (rerun / "metrics.json").is_file():
+        # review 2026-10-25 L8: the run's clean room first (every launcher the
+        # plan uses), so no other family holds the GPU under this relaunch
+        for record in plan_launchers(plan["steps"]):
+            exec_fn(record["stop_argv"], record["env"])
+        rc = exec_fn(relaunch["argv"], relaunch["env"])
+        report["relaunch_exit"] = rc
+        try:
+            if rc == 0:
+                pool = realized_pool_check(relaunch)
+                report["pool"] = pool
+                if pool is None or pool["ok"]:
+                    env = _run_env(step["env"], pool, compression_memo_dir(campaign_root))
+                    report["runner_exit"] = exec_fn(list(step["argv"]) + ["--campaign-root", str(root)], env)
+        finally:
+            report["stop_exit"] = exec_fn(relaunch["stop_argv"], relaunch["env"])
+    report["original"] = _drift_summary(original)
+    report["rerun"] = _drift_summary(rerun)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "drift_report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return report
+
+
+def _cmd_plan_diff(args: argparse.Namespace) -> int:
+    old = json.loads(Path(args.old).read_text(encoding="utf-8"))
+    new = json.loads(Path(args.new).read_text(encoding="utf-8"))
+    problems, changed = ceiling_plan_diff(old, new)
+    for p in problems:
+        print(f"PLAN_DIFF_PROBLEM {p}")
+    if problems:
+        print(f"PLAN_DIFF_REFUSED problems={len(problems)} ({CLASS_CEILINGS_ADR})")
+        return 1
+    print(f"PLAN_DIFF_OK changed_steps={changed} ({CLASS_CEILINGS_ADR}: only the ceiling fields moved)")
+    return 0
+
+
+def _cmd_relabel(args: argparse.Namespace) -> int:
+    raw = Path(args.plan).read_bytes()
+    plan = load_plan(Path(args.plan))
+    report = relabel_windows(plan, Path(args.campaign_root), hashlib.sha256(raw).hexdigest())
+    if args.out:
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.out).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    for flip in report["flips"]:
+        print(f"RELABEL_FLIP {flip['window']} {flip['from']} -> {flip['to']} (kv_ceiling {flip['kv_ceiling']})")
+    print(
+        f"RELABEL_OK relabeled={report['relabeled']} flips={len(report['flips'])} "
+        f"unchanged={report['unchanged']} not_judged={report['not_judged']} ({CLASS_CEILINGS_ADR})"
+    )
+    return 0
+
+
+def _cmd_drift(args: argparse.Namespace) -> int:
+    plan = load_plan(Path(args.plan))
+    try:
+        drift_step(plan, Path(args.campaign_root))
+    except RunError as exc:
+        # review 2026-10-25 M3: a tree with no completed anchor window (a fresh
+        # landing's re-plan) has nothing to rerun; recorded, never a failure
+        print(f"DRIFT_WINDOW_SKIPPED {exc}")
+        return 0
+    report = run_drift_window(plan, Path(args.campaign_root))
+    o, r = report["original"], report["rerun"]
+    print(
+        f"DRIFT_WINDOW_DONE row={report['row_key']} relaunch_exit={report['relaunch_exit']} "
+        f"runner_exit={report['runner_exit']} stop_exit={report['stop_exit']} original(label={o['label']} rho_q={o['rho_kv_queued_median']} "
+        f"ttft_ms={o['ttft_from_send_ms_median']}) rerun(label={r['label']} rho_q={r['rho_kv_queued_median']} "
+        f"ttft_ms={r['ttft_from_send_ms_median']}) (record only, {CLASS_CEILINGS_ADR})"
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -9733,6 +10236,7 @@ def _cmd_plan(args: argparse.Namespace) -> int:
         front_load=args.front_load_first_contacts,
         frontier_loads=load_frontier_loads(Path(args.frontier_loads)) if args.frontier_loads else None,
         last_block=args.last_block,
+        class_ceilings=parse_calibration_args(args.class_ceilings, flag="--class-ceilings") or None,
     )
     plan["last_block"] = args.last_block
     if args.frontier_loads:
@@ -10225,9 +10729,18 @@ def calibrate_rungs(
     fail_fast: bool = False,
     window_retries: int = LADDER_WINDOW_RETRIES,
     ruler_start_qps: Optional[float] = None,
+    ceilings_only: bool = False,
 ) -> Dict[str, Any]:
     """Measure lambda* per budget rung for ONE engine and return the
     ``cage-rung-calibration-v2`` artifact document (the caller writes it).
+
+    ADR-0177: with ``ceilings_only`` the anchor, smallest-class and RULER
+    ladders are not run; every class between the two anchors is laddered at
+    its pressure rungs at or below KV_CEILING_MAX_R (the loosest rung a
+    ceiling is pinned on), exactly as ``all_classes`` ladders it, and the
+    ``cage-class-ceilings-v1`` document is returned: each rung's kv_ceiling
+    (KV_CEILING_RULE) is what the plan reads; its lambda* is recorded, never
+    offered (the plan keeps the interpolation).
 
     ADR-0169 (decision 5): when the engine carries executable RULER pressure
     cells and ``anchor_only`` is off, a third ladder (role RULER_ROLE) runs
@@ -10306,8 +10819,13 @@ def calibrate_rungs(
     manifests = _register_query_manifests(grid, query_manifests)
     launcher_cmds = dict(launcher_cmds or DEFAULT_LAUNCHER_CMDS)
     anchor_tokens = _check_floor_shape(grid, floor)
-    anchor_cells = [_gold_fresh_cell(grid, engine, r) for r in rung_list]
-    small_template = None if anchor_only else smallest_pressure_class(grid, engine, manifests)
+    if ceilings_only and (anchor_only or all_classes):
+        raise PlanError(
+            f"--ceilings-only ladders the interpolated classes alone; it takes neither --anchor-only "
+            f"nor --all-classes ({CLASS_CEILINGS_ADR})"
+        )
+    anchor_cells = [] if ceilings_only else [_gold_fresh_cell(grid, engine, r) for r in rung_list]
+    small_template = None if (anchor_only or ceilings_only) else smallest_pressure_class(grid, engine, manifests)
     small_cells = [] if small_template is None else [_class_cell_at(small_template, r) for r in rung_list]
     if small_template is not None and all_classes:
         # S0F-88 audit: with every class laddered nothing is interpolated, so
@@ -10330,19 +10848,26 @@ def calibrate_rungs(
     # B-9 (S0F-88): with --all-classes every class between the two anchors is
     # laddered at its own pressure rungs (within --rungs).
     measured_cells: Dict[int, List[PlannedCell]] = {}
-    if all_classes and not anchor_only:
+    if (all_classes or ceilings_only) and not anchor_only:
         for template, class_rungs in measured_pressure_classes(grid, engine, manifests):
             cells_m = [
                 _class_cell_at(template, r) for r in class_rungs
                 if any(math.isclose(r, x, rel_tol=0.0, abs_tol=1e-9) for x in rung_list)
+                # ADR-0177: a ceiling is pinned only at r <= KV_CEILING_MAX_R
+                and (not ceilings_only or r <= KV_CEILING_MAX_R)
             ]
             if cells_m:
                 measured_cells[demand_seq_tokens(grid, template.spec)] = cells_m
+    if ceilings_only and not measured_cells:
+        raise PlanError(
+            f"--ceilings-only: engine {engine!r} of session {session!r} interpolates no class at a rung "
+            f"<= {KV_CEILING_MAX_R:g} within --rungs; nothing to ladder ({CLASS_CEILINGS_ADR})"
+        )
     # ADR-0169 (decision 5): the RULER instrument's own ladder, at the rungs
     # the engine carries RULER pressure cells at (within --rungs), under the
     # anchor's relaunch (the RULER cell's serving config IS the anchor's).
     ruler_cells: List[PlannedCell] = []
-    ruler_class = None if anchor_only else ruler_pressure_class(grid, engine)
+    ruler_class = None if (anchor_only or ceilings_only) else ruler_pressure_class(grid, engine)
     if ruler_class is not None:
         ruler_template, ruler_rungs = ruler_class
         ruler_cells = [
@@ -10943,6 +11468,62 @@ def calibrate_rungs(
             "classes": classes,
         }
 
+    def _build_ceilings_doc(complete: bool) -> Dict[str, Any]:
+        # ADR-0177: the ceiling-only artifact; the ladder records are the same
+        # records a measured class carries (kv_ceiling per rung, KV_CEILING_RULE)
+        classes: Dict[str, Dict[str, Any]] = {}
+        for seq_m, cells_m in measured_cells.items():
+            template = cells_m[0]
+            classes[str(seq_m)] = {
+                "role": CLASS_CEILING_ROLE,
+                "arm": template.spec.arm,
+                "baseline_id": template.baseline_id,
+                "family": template.spec.family,
+                "prefix_mode": "OFF" if _prefix_off(template.spec) else "ON",
+                "ladder_prefix_mode": "OFF",  # S0F-88 option A (_ladder_config)
+                "seq_tokens": seq_m,
+                "dataset": template.dataset,
+                "corpus_budget_tokens": template.spec.corpus_budget_tokens,
+                "rungs": measured_records[seq_m],
+            }
+        return {
+            "schema": CLASS_CEILINGS_SCHEMA,
+            "procedure_version": PROCEDURE_VERSION,
+            "confirmatory": False,
+            "complete": complete,
+            "adr": CLASS_CEILINGS_ADR,
+            "engine": BACKEND_OF_ENGINE[engine],
+            "model": HF_ID_OF_SLUG[grid.model],
+            "session": session,
+            "rehearsal_n": rehearsal_n,
+            "seed": seed,
+            "anchor_seq_tokens": anchor_tokens,
+            "lambda_star_note": (
+                "each rung's lambda_star_qps is recorded, never offered: the plan keeps the "
+                "interpolated rate of these classes and reads only kv_ceiling"
+            ),
+            "ladder": {
+                "window_s": PROBE_WINDOW_S,
+                "warmup_s": PROBE_WARMUP_S,
+                "factor": PROBE_LADDER_FACTOR,
+                "max_steps": PROBE_MAX_STEPS,
+                "bisect_steps": PROBE_BISECT_STEPS,
+                "attainment_min": PROBE_ATTAINMENT_MIN,
+                "served_min": PROBE_SERVED_MIN,
+                "kv_ceiling_rule": KV_CEILING_RULE,
+                "kv_ceiling_max_r": KV_CEILING_MAX_R,
+                "start_rule": START_QPS_RULE,
+                "start_decode_tokens": LADDER_START_DECODE_TOKENS,
+                "chain_divisor": LADDER_CHAIN_DIVISOR,
+                "floor_start_qps": floor_start,
+                "first_start_qps": first_start,
+                "floor": dict(floors),
+                "floor_artifact": cal_header["artifacts"][engine],
+            },
+            "stop_failures": stop_failures,
+            "classes": classes,
+        }
+
     def _flush_partial() -> None:
         # ADR-0162: every finished rung lands on disk at once; a job killed at
         # its bound leaves the rungs it measured, marked incomplete.
@@ -10950,7 +11531,9 @@ def calibrate_rungs(
             return
         partial_out.parent.mkdir(parents=True, exist_ok=True)
         partial_out.write_text(
-            json.dumps(_build_doc(False), indent=2, sort_keys=False) + "\n", encoding="utf-8"
+            json.dumps((_build_ceilings_doc if ceilings_only else _build_doc)(False), indent=2, sort_keys=False)
+            + "\n",
+            encoding="utf-8",
         )
 
     try:
@@ -10970,7 +11553,7 @@ def calibrate_rungs(
         if resident is not None:
             _stop(resident, "end of calibration")
 
-    doc = _build_doc(stopped is None)
+    doc = (_build_ceilings_doc if ceilings_only else _build_doc)(stopped is None)
     doc["fail_fast_stop"] = stopped  # None when every rung was walked
     return doc
 
@@ -11142,9 +11725,36 @@ def _cmd_calibrate_rungs(args: argparse.Namespace) -> int:
         partial_out=out,  # ADR-0162: the same file, incomplete until this final write
         fail_fast=args.fail_fast,
         ruler_start_qps=args.ruler_start_qps,
+        ceilings_only=args.ceilings_only,
     )
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(doc, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+    if args.ceilings_only:
+        # ADR-0177: the lambda* labels do not gate a ceiling-only artifact; a rung
+        # with no queued window carries no ceiling and its class keeps RHO_KV_MIN
+        for seq, cls in doc["classes"].items():
+            print(
+                f"[calibrate-rungs] class ceilings written: {out} engine={args.engine} class {cls['arm']} "
+                f"({seq} tokens) "
+                + ", ".join(
+                    f"r={key}: kv_ceiling={rec.get('kv_ceiling')} ({rec.get('kv_ceiling_windows', 0)} queued windows, "
+                    f"{rec['label']})"
+                    for key, rec in cls["rungs"].items()
+                )
+            )
+        # review 2026-10-25 M5: an infrastructure failure (a relaunch or a probe
+        # window that never ran) is not a measurement; it fails the job like
+        # stage 5 does, the artifact written for forensics
+        broken = {
+            f"{cls['arm']} {seq} tokens r={key}": rec["label"]
+            for seq, cls in doc["classes"].items() for key, rec in cls["rungs"].items()
+            if rec["label"] in (RUNG_LABEL_RELAUNCH_FAILED, RUNG_LABEL_PROBE_FAILED)
+        }
+        if broken:
+            print(f"[calibrate-rungs] CEILING LADDER FAILED: {broken} (read the launcher and runner output)", file=sys.stderr)
+            return 1
+        print(f"CLASS_CEILINGS_DONE engine={args.engine} classes={len(doc['classes'])} complete={doc['complete']}")
+        return 0
     not_estimated: Dict[str, str] = {}
     for seq, cls in doc["classes"].items():
         for key, rec in cls["rungs"].items():
@@ -11299,6 +11909,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         "the run's first hours instead of 8 to 15 h in; whole relaunch segments move, the "
         "relaunch count is unchanged; never on a registered run",
     )
+    p_plan.add_argument(
+        "--class-ceilings", action="append", default=[], metavar="ENGINE=PATH",
+        help=f"{CLASS_CEILINGS_ADR}: the class ceilings artifact (calibrate-rungs --ceilings-only) of one "
+        "engine; its interpolated classes are pinned their measured fill ceiling, every rate unchanged",
+    )
     p_plan.add_argument("--out", default=None, help="write the plan JSON here (else stdout)")
     p_plan.set_defaults(func=_cmd_plan)
 
@@ -11384,6 +11999,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         "such class a fraction of its OWN measured lambda* instead of the interpolation",
     )
     p_cal.add_argument(
+        "--ceilings-only", action="store_true",
+        help=f"{CLASS_CEILINGS_ADR}: ladder only the classes between the two anchors, at their pressure "
+        f"rungs <= {KV_CEILING_MAX_R:g}, and write a {CLASS_CEILINGS_SCHEMA} artifact (their fill ceilings; "
+        "the rates stay the interpolation)",
+    )
+    p_cal.add_argument(
         "--fail-fast", action="store_true",
         help="review 2026-10-13 item 3 (S0F-77): stop the ladder at its first rung that is not "
         "ESTIMATED (the partial artifact is written, complete=false) instead of walking every "
@@ -11398,6 +12019,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     p_cal.add_argument("--out", required=True, help="write the rung-calibration artifact here")
     p_cal.set_defaults(func=_cmd_calibrate_rungs)
+
+    p_diff = sub.add_parser(
+        "plan-diff", help=f"{CLASS_CEILINGS_ADR}: refuse a ceiling-only re-plan that moved anything but the ceilings",
+    )
+    p_diff.add_argument("--old", required=True, help="the registered plan")
+    p_diff.add_argument("--new", required=True, help="the re-plan with --class-ceilings")
+    p_diff.set_defaults(func=_cmd_plan_diff)
+    p_relabel = sub.add_parser(
+        "relabel-regime",
+        help=f"{CLASS_CEILINGS_ADR}: re-judge the written pressure windows under the ceilings the plan pins",
+    )
+    p_relabel.add_argument("--plan", required=True)
+    p_relabel.add_argument("--campaign-root", required=True)
+    p_relabel.add_argument("--out", default=None, help="write the report JSON here")
+    p_relabel.set_defaults(func=_cmd_relabel)
+    p_drift = sub.add_parser(
+        "drift-window", help=f"{CLASS_CEILINGS_ADR}: rerun one completed window into the drift root, record only",
+    )
+    p_drift.add_argument("--plan", required=True)
+    p_drift.add_argument("--campaign-root", required=True)
+    p_drift.set_defaults(func=_cmd_drift)
 
     p_run = sub.add_parser("run", help="execute a plan")
     p_run.add_argument("--plan", required=True, help="plan JSON from 'plan'")

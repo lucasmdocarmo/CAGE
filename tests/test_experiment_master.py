@@ -2173,7 +2173,7 @@ def test_the_real_teardown_script_keeps_a_listed_volume_and_exits_0(world: Dict[
 def test_the_shipped_s1_profile_matches_adr0176() -> None:
     keys = ("LAST_BLOCK", "MIN_IN_REGIME_WINDOWS", "CHARTER_DATASETS", "RUN_BUDGET_HOURS", "SCORE_BOUND_MIN",
             "CALIBRATE_RUNGS_BOUND_S", "SEATBELT", "HOURS", "SESSION", "PULL_MARGIN_MIN", "QUERY_MANIFESTS",
-            "INSTALL_LMCACHE", "SKIP_BLOCKED")
+            "INSTALL_LMCACHE", "SKIP_BLOCKED", "CLASS_CEILINGS", "CLASS_CEILINGS_BOUND_S")
     fmt = "|".join("${%s:-}" % k for k in keys)
     proc = subprocess.run(["bash", "-c", f'set -a; source "{EXPDIR}/profiles/_common.env"; source "{EXPDIR}/profiles/S1.env"; printf "%s" "{fmt}"'],
                           capture_output=True, text=True, env=PROFILE_ENV)
@@ -2181,7 +2181,10 @@ def test_the_shipped_s1_profile_matches_adr0176() -> None:
     got = dict(zip(keys, proc.stdout.split("|")))
     assert got == {"LAST_BLOCK": "", "MIN_IN_REGIME_WINDOWS": "", "CHARTER_DATASETS": "squad_v2 musique qasper",
                    "RUN_BUDGET_HOURS": "115", "SCORE_BOUND_MIN": "1200", "CALIBRATE_RUNGS_BOUND_S": "18000",
-                   "SEATBELT": "164h", "HOURS": "120", "SESSION": "s1", "PULL_MARGIN_MIN": "300",
+                   # ADR-0177 (2026-10-25, review H1): the plan stage's ceiling ladders
+                   # (36,000 s per engine), re-label and drift window add 1,260 min
+                   "SEATBELT": "182h", "CLASS_CEILINGS": "1", "CLASS_CEILINGS_BOUND_S": "36000",
+                   "HOURS": "120", "SESSION": "s1", "PULL_MARGIN_MIN": "300",
                    # Group E (2026-10-23): the three registered question files, one per S1 dataset
                    "QUERY_MANIFESTS": "squad_v2=data/manifests/squad_v2_2000x3_seed42_wr50.json "
                                       "qasper=data/manifests/qasper_852x12_seed42_wr50.json "

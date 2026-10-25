@@ -178,6 +178,11 @@ SEAL_BOUND_S=600; START_CHECK_BOUND_S=2400
 # default in _common.env): up to PROBE_MAX_STEPS windows of 75 s plus a relaunch
 # per rung, for TWO classes (the anchor and the engine's smallest class).
 : "${CALIBRATE_RUNGS_BOUND_S:=18000}"
+# ADR-0177 (review 2026-10-25 H1): the ceiling-only ladder job bound per engine. Each
+# interpolated class climbs from its own class-floor start (A16), so S1 needs about
+# 94 to 98 windows per engine at the measured 222 s per window (stage 5: 46 windows
+# in 10,195 s), 21,600 to 24,100 s [D]; the default doubles the larger figure's order.
+: "${CLASS_CEILINGS_BOUND_S:=36000}"
 
 seatbelt_minutes() { # "24h" | "90m" -> minutes, or empty when malformed
   # Audit 2026-10-17 (G30): "<n>d" is refused here; provision_pod.sh accepts h,
@@ -202,7 +207,12 @@ stage_bound_minutes() { # G16: the pod-side bound of ONE stage, in minutes (one 
       # S1 audit 2026-10-23: the load gate (600 s) and the offline dataset probe (600 s)
       printf '%s' "$(( 20 + suite_min + n_srv * VALIDATE_BOUND_S / 60 + start_min ))" ;;
     calibrate) printf '%s' "$(( n_cal * CALIBRATE_BOUND_S / 60 + n_cal * CALIBRATE_RUNGS_BOUND_S / 60 ))" ;;
-    plan)      printf '%s' "$(( PLAN_BOUND_S / 60 ))" ;;
+    plan)
+      # ADR-0177: CLASS_CEILINGS=1 adds the ceiling-only ladders (one bound per
+      # engine) and 60 min for the re-label and the drift window
+      local plan_min=$(( PLAN_BOUND_S / 60 ))
+      [ "${CLASS_CEILINGS:-0}" = "1" ] && plan_min=$(( plan_min + n_cal * CLASS_CEILINGS_BOUND_S / 60 + 60 ))
+      printf '%s' "$plan_min" ;;
     run)       printf '%s' "$(( HOURS * 60 ))" ;;
     seal)      printf '%s' "$(( SEAL_BOUND_S / 60 ))" ;;
     score)     printf '%s' "$SCORE_BOUND_MIN" ;;
@@ -1361,6 +1371,62 @@ for slot, env in (("reranker", "CAGE_RERANKER_REVISION"), ("compressor", "CAGE_C
     if rev: print(" %s=%s" % (env, rev), end="")' "$FREEZE_FILE" 2>/dev/null || true
 }
 
+class_ceiling_ladders() {
+  # ADR-0177 (owner 2026-10-25, option A2): one ceiling-only ladder job per
+  # engine (calibrate-rungs --ceilings-only: the classes between the two
+  # anchors at their pressure rungs <= 1, the stage 5 ladder rule, their own
+  # artifact), resumable per engine on this pod and build like stage 5. No
+  # --fail-fast: a lambda* label never gates a ceiling, and a rung with no
+  # queued window leaves its class on the absolute bar, recorded.
+  local done_key e out item qm2="" reh2="" rungs root step_to=""
+  done_key="$(state get pod.id 2>/dev/null || true):$(state get build.sha 2>/dev/null || true)"
+  # review 2026-10-25 M4: these jobs start and stop engines; never beside a live run job
+  if ! plan_only && [ -f "$JOBS/run.json" ] && [ "$(bash "$PODJOB" status run 2>/dev/null || true)" = "RUNNING" ]; then
+    printf '  [FAIL] the run job is RUNNING on the pod: the ceiling ladders, the re-label and the drift window would run beside it (ADR-0177); wait for it to end\n'
+    return 1
+  fi
+  for item in $QUERY_MANIFESTS; do qm2="$qm2 --query-manifest $item"; done
+  [ -z "${REHEARSAL_N:-}" ] || reh2=" --rehearsal-n $REHEARSAL_N"
+  [ -z "${STEP_TIMEOUT_S:-}" ] || step_to=" CAGE_STEP_TIMEOUT_S=$STEP_TIMEOUT_S"
+  rungs="$("$PY" "$SCRIPTS/3_run/run_campaign.py" rungs --session "$SESSION"$reh2$qm2 | tr ' ' ',')" || { printf '  [FAIL] run_campaign.py rungs failed for session %s\n' "$SESSION"; return 1; }
+  # ladder roots are never reused: a fresh out-root per attempt (stage 5's rule)
+  root="results/rung-calibration/${RUN_ID}-ceilings-$(date -u +%H%M%S)"
+  for e in $CALIBRATE; do
+    out="results/calibration/ceilings_${EXP}_${e}.json"
+    if ! plan_only && [ "$(state get "calibration.ceilings_done.$e" 2>/dev/null || true)" = "$done_key" ] && [ -f "$EXTRAS/calibration/ceilings_${EXP}_${e}.json" ]; then
+      say "class ceilings $e already measured on this pod and build ($done_key): skipped on this resume"
+      continue
+    fi
+    job_run "class_ceilings_$e" "$CLASS_CEILINGS_BOUND_S" "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT$POD_ENGINE_ENV && env $RUN_ENV_UNSET CAGE_PROVIDER=runpod CAGE_HARDWARE='$GPU_ID x $GPU_COUNT'$step_to$(instrument_rev_env) $POD_PYTHON scripts/3_run/run_campaign.py calibrate-rungs --ceilings-only --session $SESSION --engine $e --floor-table results/calibration/floor_table.json --calibration results/calibration/${EXP}_${e}.json --rungs $rungs$qm2$reh2 --seed $SEED --freeze-file $POD_FREEZE_FILE --out $out --out-root $root" "$LAND/logs/setup" || return 1
+    run_step 0 "fetch class ceilings $e" -- pscp_from "$POD_REPO/$out" "$EXTRAS/calibration/ceilings_${EXP}_${e}.json" || return 1
+    plan_only && continue
+    grep -q "CLASS_CEILINGS_DONE engine=$e .* complete=True" "$JOB_LOG" || { printf '  [FAIL] class ceilings %s: no complete artifact (see %s)\n' "$e" "$JOB_LOG"; return 1; }
+    grep "class ceilings written" "$JOB_LOG" | sed 's/^/  /'
+    state put "calibration.ceilings_done.$e" "$done_key"
+  done
+  return 0
+}
+
+ceiling_replan_followups() {
+  # ADR-0177: after the promoted re-plan (its diff gate passed above), the
+  # windows already written are re-judged under
+  # the pinned ceilings (journaled, the writer's label kept under "registered")
+  # and one completed window is rerun into the drift root (record only)
+  job_run relabel 1800 "cd $POD_REPO && $POD_PYTHON scripts/3_run/run_campaign.py relabel-regime --plan results/calibration/plan_$RUN_ID.json --campaign-root $POD_RUN_ROOT --out logs/relabel_$RUN_ID.json" "$LAND/logs/setup" || return 1
+  if ! plan_only; then
+    grep -q "RELABEL_OK" "$JOB_LOG" || { printf '  [FAIL] relabel printed no RELABEL_OK line (see %s)\n' "$JOB_LOG"; return 1; }
+    grep -E "RELABEL_(OK|FLIP)" "$JOB_LOG" | sed 's/^/  /'
+  fi
+  local roster; roster="$("$PY3" -c 'import json,sys; p=json.load(open(sys.argv[1], encoding="utf-8")); print(" ".join(sorted({str(s["dataset"]) for s in p.get("steps", []) if s.get("kind") == "cell" and s.get("dataset")})))' "$EXTRAS/plan.json" 2>/dev/null || true)"
+  [ -n "$roster" ] || roster="$CHARTER_DATASETS"
+  # review 2026-10-25 L7: the drift relaunch records its serving config under the
+  # drift root (run_campaign.drift_root: the run id's first 30 characters), never the campaign tree
+  local droot="${POD_RUN_ROOT%/*}/${RUN_ID:0:30}-dry-drift"
+  job_run drift 1800 "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH$POD_ENGINE_ENV && env $RUN_ENV_UNSET CAGE_RUN_ROOT=$droot VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT CAGE_PROVIDER=runpod CAGE_HARDWARE='$GPU_ID x $GPU_COUNT' CAGE_CAMPAIGN_DATASETS='$roster'${STEP_TIMEOUT_S:+ CAGE_STEP_TIMEOUT_S=$STEP_TIMEOUT_S}$(instrument_rev_env) $POD_PYTHON scripts/3_run/run_campaign.py drift-window --plan results/calibration/plan_$RUN_ID.json --campaign-root $POD_RUN_ROOT" "$LAND/logs/setup" || return 1
+  plan_only || { grep -E "DRIFT_WINDOW_(DONE|SKIPPED)" "$JOB_LOG" | sed 's/^/  /'; state note plan "$(grep -E "DRIFT_WINDOW_(DONE|SKIPPED)" "$JOB_LOG" | tail -1)"; }
+  return 0
+}
+
 stage_plan() {
   pod_env
   local qm cal e item
@@ -1377,9 +1443,37 @@ stage_plan() {
     job_run frontier 600 "cd $POD_REPO && $POD_PYTHON scripts/3_run/run_campaign.py frontier --session $SESSION$cal --out results/calibration/frontier_$RUN_ID.json" "$LAND/logs/setup" || return 1
     front="$front --frontier-loads results/calibration/frontier_$RUN_ID.json"
   fi
-  job_run plan 900 "cd $POD_REPO && $POD_PYTHON scripts/3_run/run_campaign.py plan --session $SESSION --floor-table results/calibration/floor_table.json --window-duration-s $WINDOW_DURATION_S --seed $SEED$qm$cal$reh --calibration-budget-fraction $CALIBRATION_BUDGET_FRACTION --freeze-file $POD_FREEZE_FILE$front${LAST_BLOCK:+ --last-block $LAST_BLOCK} --out results/calibration/plan_$RUN_ID.json" "$LAND/logs/setup" || return 1
-  run_step 0 "fetch plan.json" -- pscp_from "$POD_REPO/results/calibration/plan_$RUN_ID.json" "$EXTRAS/plan.json" || return 1
-  plan_only && return 0
+  # ADR-0177 (owner 2026-10-25, option A2): with CLASS_CEILINGS=1 the plan pins
+  # each interpolated class its measured fill ceiling. On a landing that already
+  # has a plan, that plan is kept once as plan_registered.json, the baseline the
+  # diff gate, the re-label and the drift window below are judged against.
+  local ceil="" pout="results/calibration/plan_$RUN_ID.json" replan=0
+  if [ "${CLASS_CEILINGS:-0}" = "1" ]; then
+    class_ceiling_ladders || return 1
+    for e in $CALIBRATE; do ceil="$ceil --class-ceilings $e=results/calibration/ceilings_${EXP}_${e}.json"; done
+    if ! plan_only && [ -f "$EXTRAS/plan.json" ] && [ ! -f "$EXTRAS/plan_registered.json" ]; then
+      cp "$EXTRAS/plan.json" "$EXTRAS/plan_registered.json"
+      say "the registered plan is kept as $EXTRAS/plan_registered.json (ADR-0177 baseline)"
+    fi
+    # review 2026-10-25 M2: a re-plan is written beside the plan the run uses and
+    # promoted only after the diff gate passes, so a refused re-plan never runs
+    if plan_only || [ -f "$EXTRAS/plan_registered.json" ]; then replan=1; pout="results/calibration/plan_${RUN_ID}_candidate.json"; fi
+  fi
+  job_run plan 900 "cd $POD_REPO && $POD_PYTHON scripts/3_run/run_campaign.py plan --session $SESSION --floor-table results/calibration/floor_table.json --window-duration-s $WINDOW_DURATION_S --seed $SEED$qm$cal$reh --calibration-budget-fraction $CALIBRATION_BUDGET_FRACTION --freeze-file $POD_FREEZE_FILE$front${LAST_BLOCK:+ --last-block $LAST_BLOCK}$ceil --out $pout" "$LAND/logs/setup" || return 1
+  if [ "$replan" -eq 1 ]; then
+    run_step 0 "fetch the re-plan candidate" -- pscp_from "$POD_REPO/$pout" "$EXTRAS/plan_candidate.json" || return 1
+    run_step 0 "plan diff: only the ceiling fields moved (ADR-0177)" -- "$PY" "$SCRIPTS/3_run/run_campaign.py" plan-diff --old "$EXTRAS/plan_registered.json" --new "$EXTRAS/plan_candidate.json" || return 1
+    plan_only || step_has "PLAN_DIFF_OK" || { printf '  [FAIL] plan diff printed no PLAN_DIFF_OK line\n'; return 1; }
+    run_step 0 "promote the re-plan" -- pssh "cp $POD_REPO/$pout $POD_REPO/results/calibration/plan_$RUN_ID.json" || return 1
+    plan_only || cp "$EXTRAS/plan_candidate.json" "$EXTRAS/plan.json"
+  else
+    run_step 0 "fetch plan.json" -- pscp_from "$POD_REPO/results/calibration/plan_$RUN_ID.json" "$EXTRAS/plan.json" || return 1
+  fi
+  if plan_only; then
+    # ADR-0177: the plan print shows the follow-ups a re-plan runs after the audits
+    [ "${CLASS_CEILINGS:-0}" != "1" ] || ceiling_replan_followups || return 1
+    return 0
+  fi
   run_step 0 "plan argv audit (S0F-26) and run projection (S0F-88 B-5)" -- "$PY3" - "$EXTRAS/plan.json" "$HOURS" "${PRICE:-}" <<'PY' || return 1
 import json, sys
 plan = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -1442,6 +1536,9 @@ PY
   [ -z "$POD_RESULTS_DIR" ] || pod_gb="$DISK_GB"
   mac_free="$(df -k "$LAND" 2>/dev/null | awk 'NR == 2 { print int($4 / 1048576) }')"
   run_step 0 "disk projection (G7)" -- "$PY3" "$SCRIPT_DIR/disk_projection.py" "$EXTRAS/plan.json" --pod-gb "$pod_gb" --mac-free-gb "${mac_free:-0}" --copies "$copies" || return 1
+  if [ "${CLASS_CEILINGS:-0}" = "1" ] && [ -f "$EXTRAS/plan_registered.json" ]; then
+    ceiling_replan_followups || return 1
+  fi
   return 0
 }
 
