@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_batch_b_pressure import FakeWorld, _calibrate, _write_doc  # noqa: E402
 from test_run_campaign import _ANCHOR_SEQ_TOKENS, _tiny_grid, rc  # noqa: E402
 from test_experiment_master import _master, world  # noqa: E402,F401  (fixture re-export)
+import test_experiment_master  # noqa: E402
 from src.orchestration.campaign_session import read_write_time_journal  # noqa: E402
 
 CEILING = 0.86
@@ -443,3 +444,35 @@ def test_the_replan_is_a_candidate_until_the_diff_gate_passes_m2(world):  # noqa
     out = _master(world, "--plan", "--only", "plan").stdout
     cand, diff, promote = out.index("_candidate.json"), out.index("plan-diff"), out.index("promote the re-plan")
     assert cand < diff < promote < out.index("relabel-regime") < out.index("drift-window")
+
+
+# ---------------------------------------------------------------------------
+# 8. the S1 resume of 2026-10-26: the ladder root is a campaign slug
+# ---------------------------------------------------------------------------
+
+
+def test_the_ceiling_and_drift_roots_obey_the_slug_grammar_at_the_longest_run_id(world):  # noqa: F811
+    """S1 resume 2026-10-26 00:41Z: the ceiling ladder root
+    ``<run_id>-ceilings-HHMMSS`` was 44 characters for the S1 run id, the
+    runner's campaign seam refused every ladder window (slug grammar
+    ^[a-z0-9][a-z0-9-]{0,40}$), and all 12 vLLM rungs read PROBE_FAILED. At
+    the longest legal run id (41 characters) both new roots must still parse."""
+    import re
+    from src.orchestration.campaign_layout import CAMPAIGN_RE, RUN_ID_RE
+    run_id = "20261024-000946-s1-qwen3-14b-abcdefghijkl"
+    assert RUN_ID_RE.fullmatch(run_id) and len(run_id) == 41
+    extras = world["exp_root"] / "S1" / test_experiment_master.DATE / "extras"
+    extras.mkdir(parents=True, exist_ok=True)
+    (extras / "state.json").write_text(json.dumps({"run_id": run_id, "stages": {}}), encoding="utf-8")
+    on_profile = world["tmp"] / "S1_ceilings_slug.env"
+    on_profile.write_text(world["profile"].read_text(encoding="utf-8") + "CLASS_CEILINGS=1\n", encoding="utf-8")
+    world["profile"] = on_profile
+    proc = _master(world, "--plan", "--only", "plan")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    ladder_roots = re.findall(r"--ceilings-only\b.*?--out-root\\? (\S+)", proc.stdout)
+    drift_roots = re.findall(r"CAGE_RUN_ROOT=(\S+-dry-drift)\b", proc.stdout)
+    assert ladder_roots and drift_roots, proc.stdout
+    for root in ladder_roots:
+        assert CAMPAIGN_RE.fullmatch(Path(root).name), root
+    for root in drift_roots:
+        assert RUN_ID_RE.fullmatch(Path(root.rstrip("/")).name), root

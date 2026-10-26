@@ -1390,7 +1390,9 @@ class_ceiling_ladders() {
   [ -z "${STEP_TIMEOUT_S:-}" ] || step_to=" CAGE_STEP_TIMEOUT_S=$STEP_TIMEOUT_S"
   rungs="$("$PY" "$SCRIPTS/3_run/run_campaign.py" rungs --session "$SESSION"$reh2$qm2 | tr ' ' ',')" || { printf '  [FAIL] run_campaign.py rungs failed for session %s\n' "$SESSION"; return 1; }
   # ladder roots are never reused: a fresh out-root per attempt (stage 5's rule)
-  root="results/rung-calibration/${RUN_ID}-ceilings-$(date -u +%H%M%S)"
+  # S1 resume 2026-10-26: the root is the runner's campaign slug (at most 41
+  # characters); <run_id>-ceilings-HHMMSS was 44 for S1 and every window refused
+  root="results/rung-calibration/${RUN_ID:0:30}-ceil$(date -u +%H%M%S)"
   for e in $CALIBRATE; do
     out="results/calibration/ceilings_${EXP}_${e}.json"
     if ! plan_only && [ "$(state get "calibration.ceilings_done.$e" 2>/dev/null || true)" = "$done_key" ] && [ -f "$EXTRAS/calibration/ceilings_${EXP}_${e}.json" ]; then
