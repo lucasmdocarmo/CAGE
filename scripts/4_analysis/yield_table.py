@@ -71,6 +71,21 @@ B3 (ADR-0172, owner 2026-10-16), added 2026-10-16 night:
   at 1.05 x lambda* (a tie reads ambiguous); IN_REGIME at 0.95 or UNPRESSURED at
   1.05 flags the class, and a class flagged on two engines is listed apart.
 
+S0F-99 (figure block, owner 2026-10-27), added 2026-10-27:
+- ``--plan plan_registered.json``: the first-token bar of every predicate-universe
+  window is the REGISTERED class target (PRE_REGISTRATION section 9.0, ADR-0178
+  D12: ``class_first_token_targets_s`` keyed by the cell's served-token class,
+  one target shared by both engines), applied as ttft <= target, and NO decode-time
+  clause: the registered E1 timeliness is first token only (ADR-0178 D10; review of
+  the figure block 2026-10-27, HIGH 1: on S1 the 5 x floor decode bar alone failed
+  78 percent of the K1 control rung's requests, so a table that kept it could not
+  draw the registered quantity). ``slo_ttft_ms`` carries the target, ``slo_tpot_ms``
+  is empty, and ``baseline_source`` names the class and the plan. The class is
+  ``budget_plan.avg_seq_tokens`` of cell.json (pressure cells) or the plan's
+  ``demand_classes`` by arm (sub-pressure cells; B12 by its corpus cut). A class
+  with no target is a named skip. RULER windows keep the RULER floor (the plan
+  registers no 32k class target). Without ``--plan`` nothing changes.
+
 Exit codes: 0 table written (skips are rows, not failures); 3 the named refusal of the
 whole pass (printed as "[yield_table] REFUSED: ..."); 2 is left to Python and argparse
 (usage error, missing file) so that the master never mistakes a broken call for a refusal.
@@ -152,6 +167,14 @@ SLICE_COLUMNS: Tuple[str, ...] = (
     "goodput_frac", "running_goodput_frac", "note",
 )
 GROUP_KEYS: Tuple[str, ...] = ("engine", "family", "arm", "rung", "dataset")
+#: S0F-99: the plan keys the class target reads (run_campaign_analysis.py
+#: FRONTIER_CLASS_TARGETS_KEY and _FRONTIER_CLASS_CELL_PATH, the E1 rule).
+CLASS_TARGETS_KEY = "class_first_token_targets_s"
+#: Under --plan the decode-time clause is off: goodput.evaluate_window demands a
+#: finite positive multiplier, so this value makes the clause vacuous on every
+#: finite TPOT (the evaluator still refuses a null TPOT beside a decode phase).
+NO_DECODE_BAR_MULTIPLIER: float = 1e12
+CLASS_CELL_PATH: Tuple[str, str] = ("budget_plan", "avg_seq_tokens")
 CLASS_KEYS: Tuple[str, ...] = ("engine", "arm", "rung", "dataset")
 
 
@@ -181,6 +204,79 @@ class Baselines:
             )
         tag = ("ruler" if dataset == RULER_DATASET else "anchor") + ":" + self.source[engine]
         return table[engine], tag
+
+
+@dataclass(frozen=True)
+class PlanClasses:
+    """S0F-99: the registered first-token targets per served-token class and
+    the plan's class of every arm (sub-pressure cells carry no budget plan)."""
+
+    targets_s: Dict[str, float]
+    seq_tokens: Dict[str, int]
+    corpus_trunc_seq_tokens: Dict[str, int]
+    source: str
+
+    def class_of(self, cell: Dict[str, Any], arm: str, corpus_budget: str) -> int:
+        node: Any = cell
+        for key in CLASS_CELL_PATH:
+            node = node.get(key) if isinstance(node, dict) else None
+        if isinstance(node, int) and not isinstance(node, bool) and node > 0:
+            return node
+        if node is not None:
+            raise GoodputError(
+                f"cell.json {'.'.join(CLASS_CELL_PATH)}={node!r} is not an integer served-token class"
+            )
+        if arm == "corpus-trunc":
+            cls = self.corpus_trunc_seq_tokens.get(corpus_budget)
+            where = f"demand_classes.corpus_trunc_seq_tokens[{corpus_budget!r}]"
+        else:
+            cls = self.seq_tokens.get(arm)
+            where = f"demand_classes.seq_tokens[{arm!r}]"
+        if cls is None:
+            raise GoodputError(
+                f"no served-token class for the cell: cell.json carries no "
+                f"{'.'.join(CLASS_CELL_PATH)} and the plan has no {where}"
+            )
+        return int(cls)
+
+    def target_s(self, cls: int) -> float:
+        try:
+            return self.targets_s[str(cls)]
+        except KeyError:
+            raise GoodputError(
+                f"class {cls} tokens has no first-token target in the plan "
+                f"({CLASS_TARGETS_KEY} keys {sorted(self.targets_s)})"
+            ) from None
+
+
+def load_plan_classes(plan_path: Path) -> PlanClasses:
+    """Read the class targets and the demand classes of plan_registered.json;
+    a plan without targets, or a target that is not a positive finite number
+    of seconds, refuses the pass."""
+    try:
+        with open(plan_path, encoding="utf-8") as fh:
+            plan = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise YieldTableError(f"--plan {plan_path}: {exc}") from exc
+    targets = plan.get(CLASS_TARGETS_KEY) if isinstance(plan, dict) else None
+    if not isinstance(targets, dict) or not targets:
+        raise YieldTableError(f"--plan {plan_path}: carries no {CLASS_TARGETS_KEY!r} object")
+    out: Dict[str, float] = {}
+    for key, value in targets.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) <= 0.0:
+            raise YieldTableError(f"--plan {plan_path}: {CLASS_TARGETS_KEY}[{key!r}] = {value!r} is not a positive finite number of seconds")
+        out[str(key)] = float(value)
+    demand = plan.get("demand_classes") if isinstance(plan.get("demand_classes"), dict) else {}
+
+    def int_map(node: Any) -> Dict[str, int]:
+        return {str(k): int(v) for k, v in node.items()} if isinstance(node, dict) else {}
+
+    return PlanClasses(
+        targets_s=out,
+        seq_tokens=int_map(demand.get("seq_tokens")),
+        corpus_trunc_seq_tokens=int_map(demand.get("corpus_trunc_seq_tokens")),
+        source=os.path.basename(str(plan_path)),
+    )
 
 
 def _floor(obj: Any, where: str) -> SLOBaseline:
@@ -316,12 +412,15 @@ def _row_key_parts(row_key: str) -> Dict[str, str]:
     rung = next((p[1:] for p in parts[7:] if p.startswith("r") and p[1:2].isdigit()), "")
     # CellSpec.to_row_key spells the rate fraction as lam<frac> after the rung
     rate = next((p[3:] for p in parts[7:] if p.startswith("lam")), "")
+    # ADR-0106: the B12 corpus cut, cb<tokens> (S0F-99 reads the class by it)
+    corpus_budget = next((p[2:] for p in parts[7:] if p.startswith("cb")), "")
     return {
         "arm": parts[0] if parts else "",
         "engine": parts[4] if len(parts) > 4 else "",
         "family": parts[6] if len(parts) > 6 else "",
         "rung": rung,
         "rate_frac": rate,
+        "corpus_budget": corpus_budget,
     }
 
 
@@ -343,6 +442,8 @@ def time_resolved(
     baseline: SLOBaseline,
     duration: float,
     gpu_count: int,
+    ttft_multiplier: float = TTFT_SLO_MULTIPLIER,
+    tpot_multiplier: float = TPOT_SLO_MULTIPLIER,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """B16 (ADR-0172 item 6 i): goodput per SLICE_S slice of arrivals and the
     time to breach. Returns (per-slice records, {n_slices, time_to_breach_s,
@@ -376,6 +477,7 @@ def time_resolved(
                 wm = evaluate_window(
                     frame[in_slice].reset_index(drop=True), baseline,
                     duration_s=max(hi - lo, 1e-9), gpu_count=gpu_count,
+                    ttft_multiplier=ttft_multiplier, tpot_multiplier=tpot_multiplier,
                 )
                 rec["n_timely"], rec["goodput_frac"] = wm.n_timely, wm.goodput_frac
             except GoodputError as exc:
@@ -385,6 +487,7 @@ def time_resolved(
                 running = evaluate_window(
                     frame[below_hi].reset_index(drop=True), baseline,
                     duration_s=max(hi, 1e-9), gpu_count=gpu_count,
+                    ttft_multiplier=ttft_multiplier, tpot_multiplier=tpot_multiplier,
                 ).goodput_frac
                 rec["running_goodput_frac"] = running
                 if breach is None and running < BREACH_GOODPUT:
@@ -480,9 +583,11 @@ def lambda_star_consistency(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def evaluate_run(
-    run_root: Path, *, baselines: Baselines, scoring_run_id: str
+    run_root: Path, *, baselines: Baselines, scoring_run_id: str, plan: Optional[PlanClasses] = None
 ) -> List[Dict[str, Any]]:
-    """One output row per window directory (``cells/*/window_*``): a record or a named skip."""
+    """One output row per window directory (``cells/*/window_*``): a record or a named skip.
+    With ``plan`` (S0F-99) the first-token bar of every non-RULER window is the
+    registered class target; the decode-time bar stays the engine floor."""
     out: List[Dict[str, Any]] = []
     cells_dir = run_root / "cells"
     if not cells_dir.is_dir():
@@ -491,7 +596,7 @@ def evaluate_run(
         row_key = wdir.parent.name
         parts = _row_key_parts(row_key)
         rec: Dict[str, Any] = {c: "" for c in ALL_COLUMNS}
-        rec.update({"row_key": row_key, "window_dir": wdir.name, **parts})
+        rec.update({"row_key": row_key, "window_dir": wdir.name, **{k: v for k, v in parts.items() if k in ID_COLUMNS}})
         try:
             metrics_path = wdir / "metrics.json"
             if not metrics_path.is_file():
@@ -500,6 +605,7 @@ def evaluate_run(
                 metrics = json.load(fh)
             cell_path = wdir.parent / "cell.json"
             gpu_count = 1
+            cell: Dict[str, Any] = {}
             if cell_path.is_file():
                 with open(cell_path, encoding="utf-8") as fh:
                     cell = json.load(fh)
@@ -528,9 +634,20 @@ def evaluate_run(
             duration = float(t1) - float(t0)
             rec["duration_basis"] = str(mw.get("span") or "unlabeled")
             baseline, source = baselines.for_window(rec["engine"], dataset)
+            ttft_multiplier = TTFT_SLO_MULTIPLIER
+            tpot_multiplier = TPOT_SLO_MULTIPLIER
+            if plan is not None and dataset != RULER_DATASET:
+                # S0F-99: the registered class target replaces the first-token
+                # bar (one target per class, shared by both engines) and the
+                # decode-time clause is off: E1 grades the first token only.
+                cls = plan.class_of(cell, rec["arm"], parts["corpus_budget"])
+                baseline = SLOBaseline(ttft_s=plan.target_s(cls), tpot_s=baseline.tpot_s)
+                ttft_multiplier = 1.0
+                tpot_multiplier = NO_DECODE_BAR_MULTIPLIER
+                source = f"class-target:{cls}:{plan.source}"
             rec["baseline_source"] = source
-            rec["slo_ttft_ms"] = round(TTFT_SLO_MULTIPLIER * baseline.ttft_s * 1000.0, 3)
-            rec["slo_tpot_ms"] = round(TPOT_SLO_MULTIPLIER * baseline.tpot_s * 1000.0, 3)
+            rec["slo_ttft_ms"] = round(ttft_multiplier * baseline.ttft_s * 1000.0, 3)
+            rec["slo_tpot_ms"] = "" if plan is not None and dataset != RULER_DATASET else round(TPOT_SLO_MULTIPLIER * baseline.tpot_s * 1000.0, 3)
             rows = _read_jsonl(wdir / "requests.jsonl")
             total = (metrics.get("performance") or {}).get("total_requests")
             if total is not None and int(total) != len(rows):
@@ -549,7 +666,10 @@ def evaluate_run(
                 predicate = _predicate_map(ppath)
             frame, basis = build_records(rows, predicate)
             rec["ttft_basis"] = basis
-            wm: WindowMetrics = evaluate_window(frame, baseline, duration_s=duration, gpu_count=gpu_count)
+            wm: WindowMetrics = evaluate_window(
+                frame, baseline, duration_s=duration, gpu_count=gpu_count,
+                ttft_multiplier=ttft_multiplier, tpot_multiplier=tpot_multiplier,
+            )
             flat = wm.to_flat_dict()
             for col in METRIC_COLUMNS:
                 val = flat.get(col)
@@ -559,7 +679,7 @@ def evaluate_run(
                     rec[col] = ""
                 rec["skip_reason"] = y_skip
             # B16 (ADR-0172 item 6 i): the window over time, from the same rows
-            slices, resolved = time_resolved(rows, frame, baseline, duration, gpu_count)
+            slices, resolved = time_resolved(rows, frame, baseline, duration, gpu_count, ttft_multiplier, tpot_multiplier)
             slope, queue_note = queue_growth(wdir, regime)
             rec["n_slices"] = resolved["n_slices"]
             rec["time_to_breach_s"] = resolved["time_to_breach_s"]
@@ -581,7 +701,9 @@ def _is_record(r: Dict[str, Any]) -> bool:
     return not r["skip_reason"] or r["skip_reason"] == RULER_Y_SKIP
 
 
-def write_outputs(rows: List[Dict[str, Any]], out_dir: Path, *, run_root: Path) -> Tuple[Path, Path, Path]:
+def write_outputs(
+    rows: List[Dict[str, Any]], out_dir: Path, *, run_root: Path, plan: Optional[PlanClasses] = None
+) -> Tuple[Path, Path, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / "yield_table.csv"
     tmp = csv_path.with_suffix(".csv.tmp")
@@ -613,8 +735,14 @@ def write_outputs(rows: List[Dict[str, Any]], out_dir: Path, *, run_root: Path) 
         "",
         f"- run root: `{run_root}`",
         f"- windows: {len(rows)}; records: {len(records)}; named skips: {len(skips)}",
-        f"- SLO: TTFT <= {TTFT_SLO_MULTIPLIER:g} x floor, TPOT <= {TPOT_SLO_MULTIPLIER:g} x floor (section 6.1); "
-        "rows with a scheduled clock are graded from the intended arrival (W16), the others from the send",
+        (
+            f"- SLO (S0F-99, --plan {plan.source}): TTFT <= the registered class target "
+            f"({CLASS_TARGETS_KEY}, one per served-token class, shared by both engines), "
+            "no decode-time clause (the E1 rule, first token only); RULER keeps its floor; "
+            if plan is not None else
+            f"- SLO: TTFT <= {TTFT_SLO_MULTIPLIER:g} x floor, TPOT <= {TPOT_SLO_MULTIPLIER:g} x floor (section 6.1); "
+        )
+        + "rows with a scheduled clock are graded from the intended arrival (W16), the others from the send",
         "- RULER windows carry G only (outside the section 8.5 predicate universe)",
         "- duration_s is the writer's dispatch span (duration_basis column); rates divide by it, fractions use n_issued",
         f"- verdicts joined by (example_id, repeat_index, record_index): each arrival reads its own verdict row, scored or inherited by the scoring pass ({WINDOW_DESIGN_ADR} as amended 2026-10-17, E18)",
@@ -713,15 +841,20 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     ap.add_argument("--calibration-dir", required=True, help="dir holding rungs_*_<engine>.json")
     ap.add_argument("--scoring-run-id", required=True, help="predicate table id, for example full-cuda-1")
     ap.add_argument("--out", required=True, help="output directory for yield_table.csv and yield_summary.md")
+    ap.add_argument(
+        "--plan", default=None, metavar="JSON",
+        help="plan_registered.json: grade the first token against the registered class target (S0F-99)",
+    )
     args = ap.parse_args(list(argv) if argv is not None else None)
     run_root = Path(args.run_root)
     try:
         baselines = load_baselines(Path(args.calibration_dir))
-        rows = evaluate_run(run_root, baselines=baselines, scoring_run_id=args.scoring_run_id)
+        plan = load_plan_classes(Path(args.plan)) if args.plan else None
+        rows = evaluate_run(run_root, baselines=baselines, scoring_run_id=args.scoring_run_id, plan=plan)
     except YieldTableError as exc:
         print(f"[yield_table] REFUSED: {exc}", file=sys.stderr)
         return REFUSED_RC
-    csv_path, md_path, slices_path = write_outputs(rows, Path(args.out), run_root=run_root)
+    csv_path, md_path, slices_path = write_outputs(rows, Path(args.out), run_root=run_root, plan=plan)
     n_rec = sum(1 for r in rows if _is_record(r))
     n_skip = len(rows) - n_rec
     print(f"[yield_table] windows={len(rows)} records={n_rec} skips={n_skip} -> {csv_path} {md_path} {slices_path}")

@@ -359,6 +359,69 @@ BASELINES: dict[BaselineID, BaselineDef] = {
     "B12": BaselineDef("corpus-trunc", "none", "reuse"),
 }
 
+#: The strategy names every S1 figure, legend and table prints (owner approval
+#: 2026-10-27, figure block): a reader never sees a bare B code. B8 (RAG with
+#: an external KV store) was not in the approved list because S1 does not
+#: serve it; its name here follows the same pattern [A] so an S0 tree, which
+#: served it, still renders. ``hf`` is the reference engine, not a baseline.
+STRATEGY_DISPLAY_NAME: dict[str, str] = {
+    "B1": "Oracle context, fresh prefill",
+    "B2": "Oracle context, prefix reuse",
+    "B3": "CAG: shared corpus, prefix reuse",
+    "B4": "Shared corpus, recompute",
+    "B5": "RAG, dense retrieval",
+    "B6": "RAG, reranked",
+    "B7": "RAG, reranked, prefix reuse",
+    "B8": "RAG, reranked, external KV store",
+    "B9": "RAG, LLMLingua-2 compression",
+    "B10": "CAG, 8-bit KV cache",
+    "B11": "RAG, truncated passages",
+    "B12": "CAG, truncated corpus",
+    "hf": "Reference engine, no cache",
+}
+#: (arm, retriever) -> baseline code, the inverse of BASELINES (one code per
+#: pair by construction: B5 and B6 differ by retriever).
+BASELINE_OF_ARM: dict[tuple[str, str], str] = {
+    (d.arm, d.retriever): code for code, d in BASELINES.items()
+}
+
+
+def strategy_name(code: str, *, corpus_budget_tokens: int | None = None) -> str:
+    """The display name of a baseline code (or ``hf``); the B12 corpus cut,
+    when given, is spelled in the name ("CAG, truncated corpus (700 tokens)").
+    An unknown code refuses (``UnknownBaselineError``): a figure must never
+    print a code the table does not name."""
+    try:
+        name = STRATEGY_DISPLAY_NAME[code]
+    except KeyError:
+        raise UnknownBaselineError(
+            f"no strategy name for {code!r}; named: {list(STRATEGY_DISPLAY_NAME)}"
+        ) from None
+    if corpus_budget_tokens is not None:
+        if code != "B12":
+            raise UnknownBaselineError(
+                f"corpus cut {corpus_budget_tokens} given for {code!r}; only B12 carries a cut"
+            )
+        name = f"{name} ({corpus_budget_tokens:,} tokens)"
+    return name
+
+
+def strategy_name_of_cell(
+    arm: str, retriever: str, *, policy: str = "none", corpus_budget_tokens: int | None = None
+) -> str | None:
+    """The display name of the baseline a cell's (arm, retriever) pair maps
+    to, or None when the pair is not a numbered baseline. A pressure policy
+    (section 7.3: evict, recompute, offload, compress-fp8) is not a baseline
+    axis, so the name says it: "... with policy evict"."""
+    code = BASELINE_OF_ARM.get((arm, retriever))
+    if code is None:
+        return None
+    name = strategy_name(code, corpus_budget_tokens=corpus_budget_tokens)
+    if policy and policy != "none":
+        name = f"{name} with policy {policy}"
+    return name
+
+
 FRESH_SET: frozenset[BaselineID] = frozenset({"B1", "B5", "B6", "B9", "B11"})
 REUSE_SET: frozenset[BaselineID] = frozenset(
     {"B2", "B3", "B4", "B7", "B8", "B10", "B12"}

@@ -372,3 +372,155 @@ def test_summary_holds_group_medians_and_the_f1_reference(tmp_path: Path) -> Non
     assert f"| {ENGINE} | F2 | gold-fresh | 0.75 | qasper | 1 | 0.500 | 0.500 |" in md
     assert "## F1 reference (unpressured windows) per engine" in md
     assert f"| {ENGINE} | 1 | 1.000 | 1.000 |" in md
+
+
+# ---------------------------------------------------------------------------
+# S0F-99 (figure block, owner 2026-10-27): the registered class target
+# ---------------------------------------------------------------------------
+
+
+def _write_plan(path: Path, *, targets=None, seq=None, cb=None) -> Path:
+    doc = {
+        "class_first_token_targets_s": {"4779": 2.0, "348": 0.3} if targets is None else targets,
+        "demand_classes": {"seq_tokens": {"gold-fresh": 4779, "retr-trunc": 348} if seq is None else seq,
+                           "corpus_trunc_seq_tokens": {"700": 480} if cb is None else cb},
+    }
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    return path
+
+
+def _run_plan(tmp_path: Path, run_root: Path, plan: Path):
+    out = tmp_path / "out_plan"
+    rc = yt.main([str(run_root), "--calibration-dir", str(tmp_path / "cal"), "--scoring-run-id", SCORING,
+                  "--out", str(out), "--plan", str(plan)])
+    rows = {}
+    if rc == 0:
+        with open(out / "yield_table.csv", encoding="utf-8") as fh:
+            for r in csv.DictReader(fh):
+                rows[(r["row_key"], r["window_dir"])] = r
+    return rc, rows, out
+
+
+def _cell_with_plan(run_root: Path, row_key: str, avg_seq_tokens: int) -> None:
+    path = run_root / "cells" / row_key / "cell.json"
+    cell = json.loads(path.read_text(encoding="utf-8"))
+    cell["budget_plan"] = {"avg_seq_tokens": avg_seq_tokens}
+    path.write_text(json.dumps(cell), encoding="utf-8")
+
+
+def test_plan_grades_the_first_token_on_the_class_target_with_no_decode_clause(tmp_path: Path) -> None:
+    # floor bar: 10 x 0.1 s = 1000 ms; class target 2.0 s. The 1500 ms row is late
+    # under the floor and timely under the plan; the decode bar (50 ms under the
+    # floor rule) does not apply: E1 grades the first token only (review HIGH 1).
+    run_root = tmp_path / "run"
+    _write_calibration(tmp_path / "cal")
+    rows = [
+        _row(0, ttft_ms=1500.0, tpot_ms=10.0),
+        _row(1, ttft_ms=2000.0, tpot_ms=10.0),   # on the target: timely
+        _row(2, ttft_ms=2000.1, tpot_ms=10.0),   # over the target: late
+        _row(3, ttft_ms=500.0, tpot_ms=60.0),    # slow decode: timely under the plan, late under the floor
+    ]
+    _window(run_root, KEY_F2, "window_qasper-01", rows, dataset="qasper", open_loop=True, predicates=[True] * 4)
+    _cell_with_plan(run_root, KEY_F2, 4779)
+    rc, floor_table, _ = _run(tmp_path, run_root)
+    assert rc == 0 and int(floor_table[(KEY_F2, "window_qasper-01")]["n_timely"]) == 0 + 0 + 0 + 0
+    plan = _write_plan(tmp_path / "plan.json")
+    rc, table, out = _run_plan(tmp_path, run_root, plan)
+    assert rc == 0
+    r = table[(KEY_F2, "window_qasper-01")]
+    assert r["skip_reason"] == ""
+    assert int(r["n_timely"]) == 3
+    assert float(r["slo_ttft_ms"]) == pytest.approx(2000.0)
+    assert r["slo_tpot_ms"] == ""
+    assert r["baseline_source"] == "class-target:4779:plan.json"
+    # the slices use the same rule: with arrival offsets, the one slice holds
+    # the three timely rows under the plan multipliers
+    for i, rec in enumerate(rows):
+        rec["arrival_s"] = float(i)
+    frame, _basis = yt.build_records(rows, {yt._identity(r): True for r in rows})
+    baseline = yt.SLOBaseline(ttft_s=2.0, tpot_s=FLOOR_TPOT_S)
+    slices, resolved = yt.time_resolved(rows, frame, baseline, 5.0, 1, 1.0, yt.NO_DECODE_BAR_MULTIPLIER)
+    assert resolved["n_slices"] == 1 and slices[0]["n_timely"] == 3
+    md = (out / "yield_summary.md").read_text(encoding="utf-8")
+    assert "SLO (S0F-99, --plan plan.json): TTFT <= the registered class target" in md and "no decode-time clause" in md
+    assert set(yt.ALL_COLUMNS) == set(r.keys())
+
+
+def test_plan_reads_the_class_of_a_sub_pressure_cell_from_the_demand_classes(tmp_path: Path) -> None:
+    run_root = tmp_path / "run"
+    _write_calibration(tmp_path / "cal")
+    rows = [_row(i, ttft_ms=1500.0, tpot_ms=10.0, scheduled=False, mode="closed_loop") for i in range(2)]
+    _window(run_root, KEY_F1, "window_squad_v2-01", rows, dataset="squad_v2", open_loop=False, predicates=[True, True])
+    key_b12 = f"corpus-trunc|none|none|single|{ENGINE}|qwen3-14b|F1|cb700"
+    _window(run_root, key_b12, "window_squad_v2-01",
+            [_row(i, ttft_ms=400.0, tpot_ms=10.0, scheduled=False, mode="closed_loop") for i in range(2)],
+            dataset="squad_v2", open_loop=False, predicates=[True, True])
+    plan = _write_plan(tmp_path / "plan.json", targets={"4779": 2.0, "480": 0.45})
+    rc, table, _ = _run_plan(tmp_path, run_root, plan)
+    assert rc == 0
+    f1 = table[(KEY_F1, "window_squad_v2-01")]
+    assert f1["skip_reason"] == "" and int(f1["n_timely"]) == 2 and f1["baseline_source"].startswith("class-target:4779:")
+    b12 = table[(key_b12, "window_squad_v2-01")]
+    assert b12["skip_reason"] == "" and int(b12["n_timely"]) == 2 and b12["baseline_source"].startswith("class-target:480:")
+
+
+def test_plan_without_a_target_for_the_class_is_a_named_skip_and_ruler_keeps_its_floor(tmp_path: Path) -> None:
+    run_root = tmp_path / "run"
+    _write_calibration(tmp_path / "cal")
+    _window(run_root, KEY_F2, "window_qasper-01", [_row(0, ttft_ms=100.0, tpot_ms=10.0)],
+            dataset="qasper", open_loop=True, predicates=[True])
+    _window(run_root, KEY_F2, "window_ruler-01", [_row(0, ttft_ms=15000.0, tpot_ms=80.0)],
+            dataset="ruler", open_loop=True, predicates=None)
+    _cell_with_plan(run_root, KEY_F2, 2336)  # no target for 2336 in this plan (after the last _window write)
+    plan = _write_plan(tmp_path / "plan.json")
+    rc, table, _ = _run_plan(tmp_path, run_root, plan)
+    assert rc == 0
+    r = table[(KEY_F2, "window_qasper-01")]
+    assert "class 2336 tokens has no first-token target" in r["skip_reason"]
+    ruler = table[(KEY_F2, "window_ruler-01")]
+    assert ruler["skip_reason"] == yt.RULER_Y_SKIP and ruler["baseline_source"].startswith("ruler:")
+    assert int(ruler["n_timely"]) == 1
+    # a cell without budget plan and without a demand class is a named skip too
+    key_b7 = f"retr-reuse|rerank|none|single|{ENGINE}|qwen3-14b|F1"
+    _window(run_root, key_b7, "window_qasper-01",
+            [_row(0, ttft_ms=100.0, tpot_ms=10.0, scheduled=False, mode="closed_loop")],
+            dataset="qasper", open_loop=False, predicates=[True])
+    rc, table, _ = _run_plan(tmp_path, run_root, plan)
+    assert "no served-token class for the cell" in table[(key_b7, "window_qasper-01")]["skip_reason"]
+
+
+def test_malformed_plan_refuses_the_whole_pass(tmp_path: Path) -> None:
+    run_root = tmp_path / "run"
+    _write_calibration(tmp_path / "cal")
+    _window(run_root, KEY_F2, "window_qasper-01", [_row(0, ttft_ms=100.0, tpot_ms=10.0)],
+            dataset="qasper", open_loop=True, predicates=[True])
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"demand_classes": {}}), encoding="utf-8")
+    rc, _, _ = _run_plan(tmp_path, run_root, bad)
+    assert rc == yt.REFUSED_RC
+    bad.write_text(json.dumps({"class_first_token_targets_s": {"4779": -1.0}}), encoding="utf-8")
+    rc, _, _ = _run_plan(tmp_path, run_root, bad)
+    assert rc == yt.REFUSED_RC
+
+
+def test_plan_with_a_float_class_or_hf_engine_behaves_by_name(tmp_path: Path) -> None:
+    # review LOW 18: a float avg_seq_tokens is not an int class and must not fall
+    # through silently; hf has no floor, so the plan branch is never reached.
+    run_root = tmp_path / "run"
+    _write_calibration(tmp_path / "cal")
+    _window(run_root, KEY_F2, "window_qasper-01", [_row(0, ttft_ms=100.0, tpot_ms=10.0)],
+            dataset="qasper", open_loop=True, predicates=[True])
+    path = run_root / "cells" / KEY_F2 / "cell.json"
+    cell = json.loads(path.read_text(encoding="utf-8"))
+    cell["budget_plan"] = {"avg_seq_tokens": 4779.0}
+    path.write_text(json.dumps(cell), encoding="utf-8")
+    key_hf = "gold-fresh|none|none|single|hf|qwen3-14b|F1"
+    _window(run_root, key_hf, "window_qasper-01",
+            [_row(0, ttft_ms=300.0, tpot_ms=10.0, scheduled=False, engine="hf", mode="closed_loop")],
+            dataset="qasper", open_loop=False, predicates=[True], engine="hf")
+    plan = _write_plan(tmp_path / "plan.json")
+    rc, table, _ = _run_plan(tmp_path, run_root, plan)
+    assert rc == 0
+    r = table[(KEY_F2, "window_qasper-01")]
+    assert "not an integer served-token class" in r["skip_reason"]
+    assert "no section 6.1 anchor floor for engine 'hf'" in table[(key_hf, "window_qasper-01")]["skip_reason"]

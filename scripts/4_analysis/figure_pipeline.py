@@ -100,7 +100,7 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
 import _plot_style as ps
-from src.analysis.cellspec import CellSpec, CellSpecError
+from src.analysis.cellspec import CellSpec, CellSpecError, strategy_name_of_cell
 from src.analysis.conditioned_curves import EVIDENCE_POSITION_BINS
 from src.analysis.goodput import IN_REGIME, PAST_CLIFF, UNPRESSURED
 
@@ -576,10 +576,27 @@ def _check_registered_rows(
         seen.add(key)
 
 
+def strategy_label(key: str) -> str | None:
+    """The full strategy name of a row key's (arm, retriever) pair with its
+    B12 cut (figure block 2026-10-27), or None for a policy cell."""
+    axes = parse_row_key(key)
+    return strategy_name_of_cell(
+        str(axes["arm"]), str(axes["retriever"]), policy=str(axes["policy"]),
+        corpus_budget_tokens=axes.get("corpus_budget_tokens"),  # type: ignore[arg-type]
+    )
+
+
 def _registered_labels(rows: Sequence[ContrastStatRow]) -> dict[str, str]:
-    """Row-key -> display label; explicit contrast labels win over condensing."""
+    """Row-key -> display label: the full strategy name when the key is a
+    numbered baseline (plus the varying coordinates), the condensed axes
+    otherwise; explicit contrast labels win over both."""
     keys = [k for r in rows for k in (r.cell_row_key, r.reference_row_key)]
     labels = condense_row_key_labels(keys)
+    for key in list(labels):
+        name = strategy_label(key)
+        if name is not None:
+            coords = [p for p in key.split("|")[len(_AXES):] if not p.startswith("cb")]
+            labels[key] = name + (" " + " ".join(coords) if coords else "")
     for r in rows:
         if r.contrast_label:
             labels[r.cell_row_key] = r.contrast_label.split(" vs ")[0]
@@ -682,13 +699,16 @@ def plot_forest_registered(
         ax.set_xlim(-1.25 * span, 1.25 * span)
         ax.set_title(str(ds))
         ax.set_xlabel(
-            f"Δ {metric} vs {labels.get(reference, reference)}\n"
-            f"({'higher' if higher_is_better else 'lower'} is better)"
+            f"Δ {metric} ({'higher' if higher_is_better else 'lower'} is better)"
         )
     axes[0][0].set_yticks(list(ypos.values()))
     axes[0][0].set_yticklabels([labels[c] for c in cells])
-    if title:
-        fig.suptitle(title, y=1.02)
+    # the reference once per figure (a full strategy name no longer fits
+    # under every panel; figure block 2026-10-27)
+    fig.suptitle(
+        (f"{title}\n" if title else "") + f"reference: {labels.get(reference, reference)}",
+        y=1.02, fontsize=9,
+    )
     fig.text(
         0.995, 0.005,
         "W/L/T per row; stars = registered p"
