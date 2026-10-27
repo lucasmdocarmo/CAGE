@@ -49,24 +49,37 @@ _GIT_SHA_RE = re.compile(r"^[0-9a-f]{7,64}$")
 # §9.11 procedural clauses + §9.1/§9.2 primaries — registered verbatim, so the
 # text lives here as constants, not caller input.
 _PRIMARIES_TEXT = """\
-- **Headline contrast — B6-vs-B3 (RAG-ranked vs CAG), a per-dataset co-primary SET
-  (§9.1):** tested separately on each dataset with one pre-declared metric per dataset
-  (serving: paired TTFT delta; quality: the §8.5 per-dataset Y predicate). **Pooling
-  across datasets is PROHIBITED** — the pilot proved direction inversion, so the
-  locality gradient IS the hypothesis; sidedness is declared per dataset cell in the
-  family map below.
-- **Co-primary — the Y truth tax, as an ICH-E9(R1)-style estimand (§9.2):**
-  population = in-regime cells (D6 §6.1 three-layer definition); variable = G − Y
-  (goodput minus serving yield); population summary = batch-means contrast across
-  windows, with a named comparator and declared direction.
-- **Fingerprint table (§8.11), decomposed into 6 sub-hypotheses (§9.3):** Holm for the
-  3 superiority predictions; TOST for the 3 pre-registered NONE predictions.
-- **Floor-±15% falsification suite: OUT of the confirmatory chain (§9.2)** —
-  registered as a standalone falsification section (publishable in either direction;
-  it must not spend or kill downstream α). Onset = interpolated Chiu-Jain power-metric
-  argmax; band multiplicative ×/÷1.15; grid-resolution misses are labeled
-  INCONCLUSIVE-AT-RESOLUTION; λ* = min(λ_KV, λ_compute) from a calibrated roofline
-  service-time model.
+Two confirmatory families (section 9.0, ADR-0175 item 4, ADR-0178), each a
+Dmitrienko serial sequence at its own alpha; the two alphas sum to the total 0.05.
+
+- **Case-study family (alpha 0.02): E5, the headline contrast B6-vs-B3 (RAG-ranked
+  vs CAG), a per-dataset co-primary SET (§9.1):** tested separately on each dataset
+  with one pre-declared metric per dataset (serving: paired TTFT delta; quality: the
+  §8.5 per-dataset Y predicate). **Pooling across datasets is PROHIBITED**: the pilot
+  proved direction inversion, so the locality gradient IS the hypothesis; sidedness is
+  declared per dataset cell in the family map below. The reference engine (hf) is
+  reported beside the confirmatory members, never inside the merge (ruling A12).
+- **Pressure family (alpha 0.03), in the fixed order E1, then E2, then E4:**
+  - **E1: the yield frontier drop (contrast #12, variable `frontier_drop`,
+    ADR-0178):** the yield share (requests timely under the class first-token target
+    and accepted by the §8.5 predicate, over every issued request) at a constrained
+    rung minus the control rung 1.25 at the matched absolute offered rate, on the K1
+    baselines B1 and B3 on both engines; one-sided (a drop); interval from a bootstrap
+    over whole windows; engine members merge by the largest p (ruling A13); the
+    endpoint is disjunctive over the registered (arm, rung) points after Holm, each
+    arm reported on its own (ADR-0178 amendment 2, 2026-10-27, AMD-001).
+  - **E2: the Y truth tax, as an ICH-E9(R1)-style estimand (§9.2, contrast #14):**
+    population = in-regime cells (D6 §6.1 three-layer definition); variable = G − Y
+    (goodput minus serving yield); population summary = batch-means contrast across
+    windows, with a named comparator and declared direction.
+  - **E4: the fingerprint table (§8.11, contrast #13), decomposed into 6
+    sub-hypotheses (§9.3):** Holm for the 3 superiority predictions; TOST for the 3
+    pre-registered NONE predictions.
+- **The former floor-±15% suite is DESCRIPTIVE, reported under contrast #12 beside
+  E1 (ADR-0175 amendment 2026-10-21 item 2):** it spends no alpha and gates nothing.
+  Onset = interpolated Chiu-Jain power-metric argmax; band multiplicative ×/÷1.15;
+  grid-resolution misses are labeled INCONCLUSIVE-AT-RESOLUTION; λ* = min(λ_KV,
+  λ_compute) from a calibrated roofline service-time model.
 """
 
 _ONE_LOOK_TEXT = """\

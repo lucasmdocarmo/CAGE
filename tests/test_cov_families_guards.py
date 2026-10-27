@@ -77,19 +77,21 @@ class TestRegistryValidation:
             _validated(_mutated(2, groups=("A", "E")))
 
     def test_primary_tier_restricted_to_chain_ids(self):
-        # Only 4/13/14 may carry tier='primary' (§9.1; floor suite exiled).
-        with pytest.raises(FamilyMapError, match="only the three §9.1 chain primaries"):
+        # Only 4/12/13/14 may carry tier='primary' (section 9.0, ADR-0178).
+        with pytest.raises(FamilyMapError, match="only the four registered chain primaries"):
             _validated(_mutated(1, tier="primary"))
 
-    def test_falsification_tier_restricted_to_floor_suite(self):
-        with pytest.raises(FamilyMapError, match="only the floor-±15% suite"):
+    def test_falsification_tier_has_no_registry_row(self):
+        # ADR-0178: the floor suite is a descriptive section under #12, so
+        # no contrast may carry the falsification tier, #12 included.
+        with pytest.raises(FamilyMapError, match="no registry row carries tier='falsification'"):
             _validated(_mutated(16, tier="falsification", gatekept=False))
+        with pytest.raises(FamilyMapError, match="no registry row carries tier='falsification'"):
+            _validated(_mutated(FLOOR_SUITE_CONTRAST_ID, tier="falsification", gatekept=False))
 
-    @pytest.mark.parametrize("tier", ["exploratory", "falsification"])
-    def test_gatekept_outside_the_chain_refused(self, tier):
-        target = FLOOR_SUITE_CONTRAST_ID if tier == "falsification" else 11
+    def test_gatekept_outside_the_chain_refused(self):
         with pytest.raises(FamilyMapError, match="outside the.*confirmatory chain"):
-            _validated(_mutated(target, gatekept=True))
+            _validated(_mutated(11, gatekept=True))
 
     def test_empty_pinned_metrics_refused(self):
         with pytest.raises(FamilyMapError, match="pinned metrics must be non-empty"):

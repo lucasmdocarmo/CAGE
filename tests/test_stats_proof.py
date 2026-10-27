@@ -677,9 +677,14 @@ class TestPrereg:
         # the registered content that used to be missing/prose-only
         assert "B12 vs B3" in text
         assert "truth_tax" in text
-        assert "lambda_star_onset" in text
+        # ADR-0178: #12 registers the E1 variable; the former floor suite
+        # (lambda_star_onset) is descriptive prose under it, not a table row
+        assert "frontier_drop" in text
+        assert "lambda_star_onset" not in text.split("## 2. Family map")[1]
         assert "tost" in text
-        assert "falsification" in text
+        assert "DESCRIPTIVE, reported under contrast #12" in text
+        assert "Pressure family (alpha 0.03)" in text
+        assert "Case-study family (alpha 0.02)" in text
         # the registered gating topology rides the table (2026-08-16)
         assert "contrast-14" in text
         assert "ungated" in text

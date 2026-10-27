@@ -59,21 +59,33 @@ class TestFamilies:
         assert c4.sidedness == "two-sided"
         assert c4.gatekept
 
-    def test_three_chain_primaries_and_floor_exile(self) -> None:
+    def test_four_chain_primaries_and_the_frontier_estimand(self) -> None:
+        # ADR-0178 (section 9.0): #12 is E1, a gatekept primary; the former
+        # floor suite is a descriptive section under it, not a registry row.
         primaries = {c.id for c in CONTRASTS if c.tier == "primary"}
-        assert primaries == PRIMARY_IDS == {4, 13, 14}
-        floor = CONTRASTS[11]
-        # §9.1/§9.2 exile (2026-08-02): the floor suite is NOT a primary —
-        # it is a standalone falsification tier that spends no α.
-        assert floor.id == 12
-        assert floor.tier == "falsification"
-        assert not floor.gatekept
-        assert all(CONTRASTS[i - 1].gatekept for i in (4, 13, 14))
+        assert primaries == PRIMARY_IDS == {4, 12, 13, 14}
+        frontier = CONTRASTS[11]
+        assert frontier.id == 12
+        assert frontier.tier == "primary"
+        assert frontier.gatekept
+        assert frontier.sidedness == "one-sided"
+        assert frontier.metrics == ("frontier_drop",)
+        assert not any(c.tier == "falsification" for c in CONTRASTS)
+        assert all(CONTRASTS[i - 1].gatekept for i in (4, 12, 13, 14))
 
-    def test_primary_chain_order_declared(self) -> None:
-        # Dmitrienko serial sequence declared as data (audit §2.1).
-        assert PRIMARY_CHAIN_ORDER == (4, 14, 13)
+    def test_registered_chains_declared(self) -> None:
+        # Two Dmitrienko serial sequences declared as data (audit section 2.1,
+        # ADR-0175 item 4, ADR-0178): the case-study family at 0.02 and the
+        # pressure family at 0.03; the roster covers every primary once.
+        from src.analysis.stats.families import REGISTERED_CHAINS
+
+        assert REGISTERED_CHAINS == (
+            ("case_study", (4,), 0.02),
+            ("pressure", (12, 14, 13), 0.03),
+        )
+        assert PRIMARY_CHAIN_ORDER == (4, 12, 14, 13)
         assert set(PRIMARY_CHAIN_ORDER) == set(PRIMARY_IDS)
+        assert sum(a for _n, _o, a in REGISTERED_CHAINS) == pytest.approx(0.05)
 
     def test_units_follow_family_pressure_split(self) -> None:
         for c in CONTRASTS:
@@ -91,15 +103,24 @@ class TestFamilies:
         fm = compile_family_map(DATASETS)
         assert set(fm["correction"].unique()) == {"none", "holm", "bh-fdr", "tost"}
         tiers = fm.drop_duplicates("contrast_id").set_index("contrast_id")["tier"]
-        # chain primaries #4/#14 at full alpha; #13 carries its own holm/tost
-        # decomposition (tested separately); floor suite spends no alpha
+        # chain primaries #4/#12/#14 at their family alpha; #13 carries its
+        # own holm/tost decomposition (tested separately); no row carries
+        # the falsification tier since ADR-0178
         confirmatory = fm[fm["tier"] != "exploratory"]
         assert set(
-            confirmatory.loc[confirmatory["contrast_id"].isin([4, 14]), "correction"]
+            confirmatory.loc[confirmatory["contrast_id"].isin([4, 12, 14]), "correction"]
         ) == {"none"}
         assert set(fm.loc[fm["tier"] == "secondary", "correction"]) == {"holm"}
         assert set(fm.loc[fm["tier"] == "exploratory", "correction"]) == {"bh-fdr"}
-        assert set(fm.loc[fm["tier"] == "falsification", "correction"]) == {"none"}
+        assert (fm["tier"] == "falsification").sum() == 0
+        # ADR-0178 D3': confirmatory rows carry the alpha of the family they
+        # spend (the ADR-0087 exploratory faithfulness rows spend none and
+        # keep the total for the record)
+        assert set(confirmatory.loc[confirmatory["contrast_id"] == 4, "alpha"]) == {0.02}
+        assert set(fm.loc[fm["contrast_id"].isin([12, 13, 14]), "alpha"]) == {0.03}
+        assert set(fm.loc[fm["tier"] == "exploratory", "alpha"]) == {0.05}
+        assert set(fm.loc[fm["upstream"] == "contrast-4", "alpha"]) == {0.02}
+        assert set(fm.loc[fm["upstream"].isin(["contrast-13", "contrast-14"]), "alpha"]) == {0.03}
         # 2026-08-07 amendment (ADR-0087): every generic per_query contrast leg
         # carries one exploratory faithfulness row — BH-FDR, ungated, two-sided.
         faith = fm[fm["metric"] == "faithfulness"]
@@ -200,14 +221,15 @@ class TestFamilies:
         assert fm["correction"].value_counts().to_dict() == {
             "holm": 282,  # 270 secondary + 12 fingerprint superiority
             "bh-fdr": 154,
-            "none": 40,  # #4 (32) + #14 (4) + #12 falsification (4)
+            "none": 40,  # #4 (32) + #14 (4) + #12 frontier (4)
             "tost": 12,
         }
+        # ADR-0178: #12's four rows moved from the falsification tier to the
+        # primary tier (the frontier estimand); the row total is unchanged.
         assert fm.groupby("tier").size().to_dict() == {
-            "primary": 60,  # #4 32 + #13 24 + #14 4
+            "primary": 64,  # #4 32 + #12 4 + #13 24 + #14 4
             "secondary": 270,
             "exploratory": 154,
-            "falsification": 4,
         }
         holm_sizes = fm[fm["correction"] == "holm"].groupby("family_id").size()
         assert int(holm_sizes.max()) == 9  # was 12 pre-unit-split
@@ -254,7 +276,9 @@ class TestFamilies:
         # every non-sentinel upstream is a registered chain endpoint
         gated = fm.loc[fm["upstream"] != UNGATED, "upstream"]
         assert set(gated) <= set(CHAIN_ENDPOINTS)
-        assert set(CHAIN_ENDPOINTS) == {"contrast-4", "contrast-13", "contrast-14"}
+        assert set(CHAIN_ENDPOINTS) == {
+            "contrast-4", "contrast-12", "contrast-13", "contrast-14",
+        }
         # one family = one gate (§9.3) holds by construction
         per_family = fm[fm["upstream"] != UNGATED].groupby("family_id")["upstream"]
         assert (per_family.nunique() == 1).all()
@@ -304,10 +328,10 @@ class TestFamilies:
 
     def test_primary_estimand_metrics_are_pinned(self) -> None:
         # §9.2: #14's registered variable is truth_tax = G − Y; #12's is the
-        # λ* onset — never the generic ttft/predicate pair.
+        # E1 frontier drop (ADR-0178), never the generic ttft/predicate pair.
         fm = compile_family_map(DATASETS)
         assert set(fm.loc[fm["contrast_id"] == 14, "metric"]) == {"truth_tax"}
-        assert set(fm.loc[fm["contrast_id"] == 12, "metric"]) == {"lambda_star_onset"}
+        assert set(fm.loc[fm["contrast_id"] == 12, "metric"]) == {"frontier_drop"}
         spurious = fm[
             fm["contrast_id"].isin([12, 14]) & fm["metric"].isin(DEFAULT_METRICS)
         ]

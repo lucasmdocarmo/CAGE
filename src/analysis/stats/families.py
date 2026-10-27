@@ -4,24 +4,31 @@ The 20 registered contrasts encoded as DATA. Contrast #21 (the S5
 up/down-sweep) is FUTURE WORK per §7.8/§6.7 and is deliberately absent —
 D9's family map inherits contrasts 1-20 only.
 
-The confirmatory chain (§9.1, adopted 2026-08-02) holds THREE gatekept
-primaries, tested in the declared fixed sequence ``PRIMARY_CHAIN_ORDER``
-(Dmitrienko serial, audit §2.1):
-- #4  B6-vs-B3 — the headline, a per-dataset co-primary SET (pooling
-  prohibited; the pilot proved direction inversion, hence two-sided).
-- #14 serving-yield (Y) cross-engine contrast — carries the §9.2 truth-tax
-  estimand; its registered variable is ``truth_tax`` = G − Y (population =
-  in-regime cells; batch-means contrast), never a generic per-window metric.
-- #13 the coping-frontier fingerprint — the §8.11 table decomposed per §9.3
-  into SIX registered sub-hypothesis rows (one intersection hypothesis in the
-  chain): Holm within the 3 superiority predictions (evict/compress/truncate),
-  conditional TOST for the 3 pre-registered NONE predictions
-  (recompute/offload/distribute).
-- #12 the pressure curve + floor-±15% suite is OUT of the primary chain
-  (§9.1/§9.2 exile): ``tier="falsification"`` — a standalone suite,
-  publishable in either direction, spends no α (``gatekept=False``); its
-  registered variable is ``lambda_star_onset`` (interpolated Chiu-Jain argmax
-  vs the min(λ_KV, λ_compute) prediction, ×/÷1.15 band).
+The confirmatory chains (section 9.0 of the registration, ADR-0175 item 4,
+ADR-0178) hold FOUR gatekept primaries in TWO registered families, each a
+Dmitrienko serial sequence (``REGISTERED_CHAINS``; audit section 2.1):
+- the case-study family at alpha ``CASE_STUDY_FAMILY_ALPHA``: #4 B6-vs-B3,
+  the headline, a per-dataset co-primary SET (pooling prohibited; the pilot
+  proved direction inversion, hence two-sided);
+- the pressure family at alpha ``PRESSURE_FAMILY_ALPHA``, in the order
+  #12 (E1), #14 (E2), #13 (E4):
+  - #12 the yield frontier drop (E1, ADR-0178): the registered RQ1
+    estimand, variable ``frontier_drop`` = the yield share (timely and
+    accepted over issued requests) at a constrained rung minus the control
+    rung 1.25 at the matched absolute rate, one-sided (a drop), window
+    unit. The former floor-plus-or-minus-15-percent suite stays under #12
+    as a DESCRIPTIVE section spending no alpha (ADR-0175 amendment
+    2026-10-21 item 2); its variable ``lambda_star_onset`` is no registry
+    row.
+  - #14 serving-yield (Y) cross-engine contrast, the section 9.2 truth-tax
+    estimand; its registered variable is ``truth_tax`` = G minus Y
+    (population = in-regime cells; batch-means contrast).
+  - #13 the coping-frontier fingerprint, the section 8.11 table decomposed
+    per section 9.3 into SIX registered sub-hypothesis rows (one
+    intersection hypothesis in the chain): Holm within the 3 superiority
+    predictions (evict/compress/truncate), conditional TOST for the 3
+    pre-registered NONE predictions (recompute/offload/distribute).
+The two family alphas sum to ``REGISTERED_ALPHA_TOTAL`` (0.05).
 
 ``compile_family_map`` expands the registry into the §9.3 registered test
 table: one row per contrast leg × campaign group × metric × dataset (a
@@ -147,13 +154,28 @@ _CORRECTION_BY_TIER: dict[str, str] = {
     "primary": "none",
     "secondary": "holm",
     "exploratory": "bh-fdr",
-    # §9.2 exile: the floor suite is a standalone falsification section — it
-    # spends no α, so nothing corrects it; outcomes are labeled, never pooled.
+    # The tier literal stays for the type; no registry row carries it since
+    # ADR-0178 (the floor suite is a descriptive section under #12).
     "falsification": "none",
 }
 
 FINGERPRINT_CONTRAST_ID: int = 13
-FLOOR_SUITE_CONTRAST_ID: int = 12
+#: ADR-0178: #12 is E1, the yield frontier drop; the former floor suite is
+#: reported under the same id as a descriptive section (no registry row).
+FRONTIER_CONTRAST_ID: int = 12
+FLOOR_SUITE_CONTRAST_ID: int = FRONTIER_CONTRAST_ID
+FRONTIER_METRIC: str = "frontier_drop"
+
+#: Registered family alphas (section 9.0, ADR-0175 item 4, ADR-0178 D3'):
+#: the pressure family (E1, E2, E4) and the case-study family (E5). They
+#: sum to the total the one look spends.
+REGISTERED_ALPHA_TOTAL: float = 0.05
+PRESSURE_FAMILY_ALPHA: float = 0.03
+CASE_STUDY_FAMILY_ALPHA: float = 0.02
+if abs(PRESSURE_FAMILY_ALPHA + CASE_STUDY_FAMILY_ALPHA - REGISTERED_ALPHA_TOTAL) > 1e-12:
+    raise RuntimeError(
+        "registered family alphas must sum to REGISTERED_ALPHA_TOTAL (ADR-0178)"
+    )
 # §9.3: "Fingerprint table (§8.11) decomposed into 6 sub-hypotheses: Holm for
 # the 3 superiority predictions; TOST for the 3 pre-registered NONE
 # predictions" (conditional policy-event population, §9.5). Entered in the
@@ -237,16 +259,16 @@ def _validated(contrasts: tuple[Contrast, ...]) -> tuple[Contrast, ...]:
                 raise FamilyMapError(
                     f"contrast #{c.id}: unknown groups {sorted(unknown)}"
                 )
-        if c.tier == "primary" and c.id not in (4, 13, 14):
+        if c.tier == "primary" and c.id not in (4, 12, 13, 14):
             raise FamilyMapError(
-                f"contrast #{c.id}: only the three §9.1 chain primaries "
-                f"(4/13/14) may carry tier='primary' — the floor suite is "
-                f"exiled (§9.2, tier='falsification')"
+                f"contrast #{c.id}: only the four registered chain primaries "
+                f"(4/12/13/14) may carry tier='primary' (section 9.0, ADR-0178)"
             )
-        if c.tier == "falsification" and c.id != FLOOR_SUITE_CONTRAST_ID:
+        if c.tier == "falsification":
             raise FamilyMapError(
-                f"contrast #{c.id}: only the floor-±15% suite (#12) carries "
-                f"tier='falsification' (§9.2)"
+                f"contrast #{c.id}: no registry row carries tier="
+                f"'falsification' since ADR-0178; the floor suite is a "
+                f"descriptive section under #{FLOOR_SUITE_CONTRAST_ID}"
             )
         if c.gatekept and c.tier in ("exploratory", "falsification"):
             raise FamilyMapError(
@@ -301,13 +323,14 @@ CONTRASTS: tuple[Contrast, ...] = _validated(
                  ("A", "B"),
                  "curve-collapse claim (same arm, datasets as the dial); "
                  "descriptive by design"),
-        Contrast(12, "The pressure curve + floor-±15% suite", None, None,
-                 "budget_r × rate_frac grid (same cell)", "F2", "falsification",
-                 "two-sided", "window", False, ("A", "B", "C", "D"),
-                 "§9.2 EXILE: standalone falsification suite, OUT of the "
-                 "primary chain; ×/÷1.15 band; INCONCLUSIVE-AT-RESOLUTION "
-                 "label applies",
-                 metrics=("lambda_star_onset",)),
+        Contrast(12, "The yield frontier drop (E1)", None, None,
+                 "budget_r (control 1.25 vs constrained) at matched absolute rate",
+                 "F2", "primary", "one-sided", "window", True,
+                 ("A", "B", "C", "D"),
+                 "ADR-0178: the registered RQ1 estimand on the K1 baselines "
+                 "B1 and B3, both engines; the former floor suite rides "
+                 "beside it as a descriptive section spending no alpha",
+                 metrics=(FRONTIER_METRIC,)),
         Contrast(13, "The within-vLLM coping frontier (fingerprints)", None,
                  None, "policy (recompute vs offload vs compress-fp8)", "F2",
                  "primary", "one-sided", "window", True, ("A", "B", "C", "D"),
@@ -356,14 +379,38 @@ CONTRASTS: tuple[Contrast, ...] = _validated(
 )
 
 HEADLINE_CONTRAST_ID: int = 4
-# §9.1 (adopted 2026-08-02): THREE chain primaries — the floor suite (#12) is
-# exiled to tier='falsification' and is NOT a primary endpoint.
-PRIMARY_IDS: frozenset[int] = frozenset({4, 13, 14})
-# The declared Dmitrienko SERIAL fixed sequence (audit §2.1: "Declare the
-# fixed-sequence order of primaries explicitly"): headline co-primary set →
-# truth-tax estimand → fingerprint intersection hypothesis. Consumed by
-# ``gatekeeping.evaluate_chain(primary_order=...)``.
-PRIMARY_CHAIN_ORDER: tuple[int, ...] = (4, 14, 13)
+# Section 9.0 (ADR-0175 item 4, ADR-0178): FOUR chain primaries in two
+# registered families.
+PRIMARY_IDS: frozenset[int] = frozenset({4, 12, 13, 14})
+# The registered Dmitrienko SERIAL sequences, one per family (audit section
+# 2.1: "Declare the fixed-sequence order of primaries explicitly"): the
+# case-study family holds the headline alone; the pressure family runs the
+# frontier drop, then the truth-tax estimand, then the fingerprint
+# intersection hypothesis. Each is consumed by its own
+# ``gatekeeping.evaluate_chain(registered_order=...)`` call at its alpha.
+CASE_STUDY_CHAIN_ORDER: tuple[int, ...] = (4,)
+PRESSURE_CHAIN_ORDER: tuple[int, ...] = (12, 14, 13)
+#: (family name, serial order, alpha), in the order the driver reports them.
+REGISTERED_CHAINS: tuple[tuple[str, tuple[int, ...], float], ...] = (
+    ("case_study", CASE_STUDY_CHAIN_ORDER, CASE_STUDY_FAMILY_ALPHA),
+    ("pressure", PRESSURE_CHAIN_ORDER, PRESSURE_FAMILY_ALPHA),
+)
+#: Every registered primary, family by family (the chain-endpoint roster;
+#: NOT one serial order: each family gates itself, ADR-0178).
+PRIMARY_CHAIN_ORDER: tuple[int, ...] = CASE_STUDY_CHAIN_ORDER + PRESSURE_CHAIN_ORDER
+if frozenset(PRIMARY_CHAIN_ORDER) != PRIMARY_IDS or len(set(PRIMARY_CHAIN_ORDER)) != len(PRIMARY_CHAIN_ORDER):
+    raise RuntimeError("REGISTERED_CHAINS must partition PRIMARY_IDS (ADR-0178)")
+
+
+def chain_of(contrast_id: int) -> tuple[str, float]:
+    """(family name, alpha) of a registered primary; unknown ids fail loud."""
+    for name, order, alpha in REGISTERED_CHAINS:
+        if contrast_id in order:
+            return name, alpha
+    raise FamilyMapError(
+        f"contrast #{contrast_id} is not a registered chain primary "
+        f"{sorted(PRIMARY_IDS)} (section 9.0, ADR-0178)"
+    )
 
 
 def chain_endpoint(contrast_id: int) -> str:
@@ -495,8 +542,24 @@ def compile_family_map(
         )
     if not 0.0 < alpha < 1.0:
         raise FamilyMapError(f"alpha={alpha} must be in (0, 1)")
+    if abs(alpha - REGISTERED_ALPHA_TOTAL) > 1e-12:
+        raise FamilyMapError(
+            f"alpha={alpha} is not the registered total {REGISTERED_ALPHA_TOTAL}: "
+            "the family alphas are registration content (section 9.0, "
+            "ADR-0178), never a caller knob"
+        )
 
     rows: list[dict[str, object]] = []
+
+    def row_alpha(contrast_id: int, tier: str, upstream: str) -> float:
+        """The family alpha a row spends (ADR-0178 D3'): a primary's own
+        chain, a gated secondary's upstream chain; ungated tiers spend none
+        and carry the total for the record."""
+        if tier == "primary":
+            return chain_of(contrast_id)[1]
+        if tier == "secondary" and upstream != UNGATED:
+            return chain_of(int(upstream.rsplit("-", 1)[1]))[1]
+        return alpha
 
     def emit(
         c: Contrast,
@@ -516,6 +579,7 @@ def compile_family_map(
     ) -> None:
         row_tier = c.tier if tier is None else tier
         f_unit = family_unit_of(unit)
+        upstream = registered_upstream(row_tier, family, unit)
         rows.append(
             {
                 "contrast_id": c.id,
@@ -538,11 +602,11 @@ def compile_family_map(
                 # gates — a §9.3 map error `_validate_compiled` refuses.
                 "family_id": f"{group}|{metric}|{dataset}|{family}|{f_unit}",
                 "family_unit": f_unit,
-                "upstream": registered_upstream(row_tier, family, unit),
+                "upstream": upstream,
                 "correction": correction,
                 "sidedness": sidedness,
                 "unit": unit,
-                "alpha": alpha,
+                "alpha": row_alpha(c.id, row_tier, upstream),
                 "notes": notes,
             }
         )

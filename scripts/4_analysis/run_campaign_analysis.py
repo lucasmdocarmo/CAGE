@@ -132,8 +132,15 @@ Guards (§9.4 unit-of-analysis rules):
   this one seam), batch-means contrast per cross-engine leg vs the vLLM
   anchor — with the SAME loud refusal when the predicate table, SLO floors,
   or regime artifacts are missing (naming exactly what is absent); #12
-  (lambda_star_onset) computes the interpolated Chiu-Jain argmax from the
-  F2 rate grid or fails loud naming the missing artifact.
+  (frontier_drop, ADR-0178) runs ``compute_frontier_drop``: the E1 yield
+  frontier drop on the K1 points (a constrained cell and the control cell
+  at the same offered rate), graded on the plan's class targets
+  (``--plan``), or fails loud naming the missing artifact; the former
+  floor suite (lambda_star_onset) is reported beside it as a descriptive
+  section whose missing inputs are a labeled skip. The gate runs the TWO
+  registered chains (families.REGISTERED_CHAINS: the case-study family
+  at 0.02 and the pressure family at 0.03), each a Dmitrienko serial
+  sequence through the unchanged ``gatekeeping.evaluate_chain``.
 - Sidedness (owner decision a, 2026-08-16): each row EXECUTES its REGISTERED
   sidedness from the §9.3 family-map row — one-sided rows derive their scipy
   ``alternative`` from the registered contrast direction
@@ -197,13 +204,17 @@ from src.analysis.stats.families import (  # noqa: E402
     FINGERPRINT_CONTRAST_ID,
     FINGERPRINT_SUB_HYPOTHESES,
     FLOOR_SUITE_CONTRAST_ID,
+    FRONTIER_CONTRAST_ID,
+    FRONTIER_METRIC,
     HEADLINE_CONTRAST_ID,
     KNOWN_DATASETS,
     PREDICATE_METRIC,
-    PRIMARY_CHAIN_ORDER,
+    REGISTERED_ALPHA_TOTAL,
+    REGISTERED_CHAINS,
     UNGATED,
     FamilyMapError,
     chain_endpoint,
+    chain_of,
     compile_family_map,
 )
 from src.analysis.stats.gatekeeping import (  # noqa: E402
@@ -293,10 +304,13 @@ UNBLIND_LOG_NAME = "unblind_log.jsonl"
 _UPSTREAM_LEG_METRIC: dict[str, str] = {
     chain_endpoint(FINGERPRINT_CONTRAST_ID): "fingerprint",
     chain_endpoint(14): "truth_tax",
+    chain_endpoint(FRONTIER_CONTRAST_ID): FRONTIER_METRIC,
 }
 
-#: G1 (2026-08-16): confirmatory registration binding.
-REGISTERED_ALPHA: float = 0.05
+#: G1 (2026-08-16): confirmatory registration binding. ADR-0178: the TOTAL
+#: the two registered families spend (families.REGISTERED_CHAINS carries
+#: each family's share); a CLI alpha that differs refuses in both modes.
+REGISTERED_ALPHA: float = REGISTERED_ALPHA_TOTAL
 _REGISTERED_SHA_RE = re.compile(r"^[0-9a-f]{7,64}$")
 #: The SHA line ``prereg.assemble_preregistration`` embeds ("Machinery SHA:
 #: `<sha>`") — the confirmatory look must execute exactly that machinery.
@@ -364,6 +378,10 @@ ESTIMAND_HIGHER_IS_BETTER: dict[str, bool] = {
     "lambda_star_onset": True,
     # fingerprint legs test harm on a quality instrument (higher better).
     "fingerprint": True,
+    # ADR-0178: the E1 variable is the yield share (timely and accepted over
+    # issued requests); the registered claim is a DROP under a constrained
+    # rung, executed as alternative "less" on this higher-is-better share.
+    FRONTIER_METRIC: True,
 }
 
 #: W4.10 (§8.11): the per-query degradation-label columns the loader threads
@@ -387,6 +405,30 @@ LAMBDA_STAR_MIN_GRID_POINTS: int = 3
 #: Per-window inputs of the Chiu-Jain power metric (goodput-weighted offered
 #: rate over response time).
 _LAMBDA_STAR_REQUIRED_COLUMNS: tuple[str, ...] = ("goodput_frac", "latency_ms")
+
+#: ADR-0178 (D10, D12): the E1 executor's registered inputs. The control
+#: rung every class shares (ruling A2); the relative tolerance under which
+#: a constrained cell's offered rate equals a control cell's (the K1 points
+#: are found by data, never by name); the window bootstrap of the interval;
+#: the plan key holding the class first-token targets (ten times the class
+#: floor, one target per demand class shared by both engines).
+FRONTIER_CONTROL_BUDGET_R: float = 1.25
+FRONTIER_RATE_RTOL: float = 1e-3
+FRONTIER_BOOTSTRAP_REPS: int = 2000
+#: The alpha E1's per-arm verdicts are read against: its family's share.
+_FRONTIER_FAMILY_ALPHA: float = chain_of(FRONTIER_CONTRAST_ID)[1]
+FRONTIER_CLASS_TARGETS_KEY = "class_first_token_targets_s"
+#: cell.json path of the demand class (served tokens) the cell was budgeted
+#: for, and metrics.json path of the offered rate the dispatcher served.
+_FRONTIER_CLASS_CELL_PATH: tuple[str, ...] = ("budget_plan", "avg_seq_tokens")
+_FRONTIER_RATE_METRICS_PATH: tuple[str, ...] = (
+    "workload", "open_loop", "schedule", "rate_qps",
+)
+#: The axes a control and a constrained cell must share (everything but the
+#: rung and the load fraction).
+_FRONTIER_MATCH_AXES: tuple[str, ...] = (
+    "engine", "model", "arm", "retriever", "policy", "topology", "dataset",
+)
 
 #: Task #119 (§8.5): the joined predicate table — a post-seal sibling tree
 #: produced by scripts/4_analysis/build_predicate_table.py, mirroring
@@ -2484,6 +2526,14 @@ def apply_blinding_to_sections(
             axes = result.get("cell_axes", {})
             if "arm" in axes:
                 axes["arm"] = f"BLINDED:{_blind_value(mapping, axes['arm'])}"
+        # ADR-0178 review H1: the sidebar's labeled skip embeds raw row keys
+        # (the suite's refusal names its cells); rewrite them like the
+        # equivalence and fingerprint skip reasons above.
+        if isinstance(falsification.get("skipped"), str):
+            reason = falsification["skipped"]
+            for raw, code in key_codes.items():
+                reason = reason.replace(raw, code)
+            falsification["skipped"] = reason
     pressure_block = stats.get("skipped", {}).get("pressure_rows")
     if pressure_block:
         pressure_block["row_keys"] = sorted(
@@ -2812,10 +2862,12 @@ def run_gatekeeping(
     so the outcome's dataset key is ``<dataset>|<metric>``.
     ``extra_primaries`` carries executor-produced endpoint outcomes (the #13
     fingerprint intersection-union p per dataset, keyed
-    ``<dataset>|fingerprint``). The chain runs in the registered
-    ``families.PRIMARY_CHAIN_ORDER`` restricted to the endpoints this run
-    computed; ``chain_complete`` is False (and loudly listed) whenever any
-    registered chain endpoint is missing.
+    ``<dataset>|fingerprint``; the #14 and #12 executor outcomes likewise).
+    The registered chains (``families.REGISTERED_CHAINS``, one per
+    confirmatory family at its own alpha, ADR-0178) each run their FULL
+    registered order and close at their first missing endpoint;
+    ``chain_complete`` is False (and loudly listed) whenever any registered
+    chain endpoint is missing.
 
     Tier routing consults the family-map ROW tier carried on each entry (G2)
     — an ADR-0087 exploratory row can never enter here as a primary or a
@@ -2974,73 +3026,93 @@ def run_gatekeeping(
                 )
             )
 
-    # C2 (2026-10-10): the FULL registered order goes to the chain, which
-    # closes at the first endpoint with no outcome. Filtering it to the
-    # computed endpoints let a missing #14 drop out of 4 -> 14 -> 13.
-    registered_order = [_primary_endpoint(cid) for cid in PRIMARY_CHAIN_ORDER]
-    missing_endpoints = [
-        _primary_endpoint(cid)
-        for cid in PRIMARY_CHAIN_ORDER
-        if cid not in computed_primary_ids
-    ]
-    registered_sets: dict[str, tuple[str, ...]] | None = None
+    # ADR-0178 (D3'): the registered chains are TWO Dmitrienko serial
+    # sequences, one per confirmatory family, each at its own alpha
+    # (families.REGISTERED_CHAINS). Each runs through the unchanged
+    # evaluate_chain with its FULL registered order (C2: the chain closes at
+    # the first endpoint with no outcome) and its own secondaries (the rows
+    # whose registered upstream is one of its endpoints). The flat lists
+    # below are the concatenation over the families, in roster order.
+    if abs(alpha - REGISTERED_ALPHA) > 1e-12:
+        raise AnalysisError(
+            f"gatekeeping alpha {alpha!r} differs from the registered total "
+            f"{REGISTERED_ALPHA!r}; the family alphas are registration "
+            "content (section 9.0, ADR-0178)"
+        )
     registered_family_sizes: dict[str, int] | None = None
     upstream_by_family: dict[str, str] | None = None
     if family_ctx is not None:
-        # G5 / decision d: bind the chain to the REGISTERED expectations.
-        registered_sets = {
-            endpoint: family_ctx.registered_set_legs(cid)
-            for cid, endpoint in (
-                (cid, _primary_endpoint(cid)) for cid in PRIMARY_CHAIN_ORDER
-            )
-            if cid in computed_primary_ids
-            and family_ctx.registered_set_legs(cid)
-        }
+        # G5 / decision d: bind the chains to the REGISTERED expectations.
         registered_family_sizes = family_ctx.registered_family_sizes()
         upstream_by_family = family_ctx.upstream_by_family()
-    try:
-        trace: GatekeepingTrace = evaluate_chain(
-            primaries,
-            secondaries,
-            alpha=alpha,
-            registered_order=registered_order,
-            intra_set_rule=intra_set_rule,  # type: ignore[arg-type]
-            registered_sets=registered_sets,
-            registered_family_sizes=registered_family_sizes,
-            upstream_by_family=upstream_by_family,
-        )
-    except GatekeepingError as exc:
-        raise AnalysisError(f"gatekeeping chain refused (§9.3): {exc}") from exc
 
-    return {
-        "alpha": trace.alpha,
-        "intra_set_rule": trace.intra_set_rule,
-        "primary_chain_order_registered": [
-            _primary_endpoint(cid) for cid in PRIMARY_CHAIN_ORDER
-        ],
-        "primary_chain_order_executed": list(trace.primary_order or ()),
-        "chain_complete": not missing_endpoints,
-        "missing_primary_endpoints": missing_endpoints,
-        "missing_endpoints_note": (
-            None
-            if not missing_endpoints
-            else (
-                "INCOMPLETE CHAIN: the registered Dmitrienko serial sequence "
-                f"(families.PRIMARY_CHAIN_ORDER) includes {missing_endpoints} "
-                "which this invocation could not compute — downstream "
-                "endpoints of a missing gate cannot be claimed confirmatory"
+    families_out: dict[str, dict[str, Any]] = {}
+    registered_all: list[str] = []
+    executed_all: list[str] = []
+    missing_all: list[str] = []
+    primaries_out: list[dict[str, Any]] = []
+    secondaries_out: list[dict[str, Any]] = []
+    sets_out: list[dict[str, Any]] = []
+    events_out: list[dict[str, Any]] = []
+    for family_name, order, family_alpha in REGISTERED_CHAINS:
+        endpoints = [_primary_endpoint(cid) for cid in order]
+        missing_endpoints = [
+            _primary_endpoint(cid) for cid in order if cid not in computed_primary_ids
+        ]
+        registered_all.extend(endpoints)
+        missing_all.extend(missing_endpoints)
+        fam_primaries = [p for p in primaries if p.endpoint in endpoints]
+        fam_secondaries = [s for s in secondaries if s.upstream in endpoints]
+        record: dict[str, Any] = {
+            "alpha": family_alpha,
+            "order_registered": endpoints,
+            "order_executed": [],
+            "chain_complete": not missing_endpoints,
+            "missing_primary_endpoints": missing_endpoints,
+        }
+        if not fam_primaries:
+            record["skipped"] = (
+                f"no primary of the {family_name} family was computed in this "
+                "invocation; its chain did not run"
             )
-        ),
-        "primaries": [
+            families_out[family_name] = record
+            continue
+        registered_sets: dict[str, tuple[str, ...]] | None = None
+        if family_ctx is not None:
+            registered_sets = {
+                _primary_endpoint(cid): family_ctx.registered_set_legs(cid)
+                for cid in order
+                if cid in computed_primary_ids and family_ctx.registered_set_legs(cid)
+            }
+        try:
+            trace: GatekeepingTrace = evaluate_chain(
+                fam_primaries,
+                fam_secondaries,
+                alpha=family_alpha,
+                registered_order=endpoints,
+                intra_set_rule=intra_set_rule,  # type: ignore[arg-type]
+                registered_sets=registered_sets,
+                registered_family_sizes=registered_family_sizes,
+                upstream_by_family=upstream_by_family,
+            )
+        except GatekeepingError as exc:
+            raise AnalysisError(
+                f"gatekeeping chain refused (§9.3, {family_name} family): {exc}"
+            ) from exc
+        record["order_executed"] = list(trace.primary_order or ())
+        executed_all.extend(record["order_executed"])
+        families_out[family_name] = record
+        primaries_out.extend(
             {
                 "endpoint": p.endpoint,
                 "dataset_metric": p.dataset,
                 "p_value": p.p_value,
                 "alpha": p.alpha,
+                "family": family_name,
                 "passed": p.passed,
                 "status": p.status,
                 # S0F-66: the merged members of a contrast-derived leg (None
-                # on the executor primaries of #13 and #14).
+                # on the executor primaries of #12, #13 and #14).
                 "members": leg_audit.get((p.endpoint, p.dataset), {}).get("members"),
                 "missing_members": leg_audit.get((p.endpoint, p.dataset), {}).get(
                     "missing_members"
@@ -3050,8 +3122,8 @@ def run_gatekeeping(
                 ).get("directions_concordant"),
             }
             for p in trace.primaries
-        ],
-        "secondaries": [
+        )
+        secondaries_out.extend(
             {
                 "contrast": s.contrast,
                 "family_id": s.family_id,
@@ -3062,10 +3134,11 @@ def run_gatekeeping(
                 "significant": s.significant,
                 "m_supplied": s.m_supplied,
                 "m_registered": s.m_registered,
+                "alpha": family_alpha,
             }
             for s in trace.secondaries
-        ],
-        "set_decisions": [
+        )
+        sets_out.extend(
             {
                 "endpoint": d.endpoint,
                 "rule": d.rule,
@@ -3075,6 +3148,7 @@ def run_gatekeeping(
                 "status": d.status,
                 "confirmed": d.confirmed,
                 "binding_p": d.binding_p,
+                "alpha": family_alpha,
                 "supplied_legs": list(d.supplied_legs),
                 "registered_legs": (
                     list(d.registered_legs)
@@ -3088,8 +3162,8 @@ def run_gatekeeping(
                 ],
             }
             for d in trace.set_decisions
-        ],
-        "events": [
+        )
+        events_out.extend(
             {
                 "family_id": e.family_id,
                 "upstream": e.upstream,
@@ -3099,7 +3173,31 @@ def run_gatekeeping(
                 "reason": e.reason,
             }
             for e in trace.events
-        ],
+        )
+
+    return {
+        "alpha": alpha,
+        "family_alphas": {name: a for name, _order, a in REGISTERED_CHAINS},
+        "families": families_out,
+        "intra_set_rule": intra_set_rule,
+        "primary_chain_order_registered": registered_all,
+        "primary_chain_order_executed": executed_all,
+        "chain_complete": not missing_all,
+        "missing_primary_endpoints": missing_all,
+        "missing_endpoints_note": (
+            None
+            if not missing_all
+            else (
+                "INCOMPLETE CHAIN: the registered serial sequences "
+                f"(families.REGISTERED_CHAINS) include {missing_all} "
+                "which this invocation could not compute; downstream "
+                "endpoints of a missing gate cannot be claimed confirmatory"
+            )
+        ),
+        "primaries": primaries_out,
+        "secondaries": secondaries_out,
+        "set_decisions": sets_out,
+        "events": events_out,
         "ungated": ungated,
     }
 
@@ -3794,15 +3892,545 @@ def compute_falsification_suite(
         )
     return {
         "contrast_id": FLOOR_SUITE_CONTRAST_ID,
-        "tier": "falsification",
+        "tier": "descriptive",
         "label": (
-            "§9.2 EXILE: standalone falsification suite — spends no α, "
-            "gates nothing, publishable in either direction"
+            "ADR-0178 (ADR-0175 amendment 2026-10-21 item 2): the former "
+            "floor suite, reported under #12 beside the E1 estimand as a "
+            "descriptive section: spends no alpha, gates nothing"
         ),
         "estimand": "lambda_star_onset",
         "band_multiplicative": LAMBDA_STAR_BAND,
         "results": results,
     }
+
+
+# ---------------------------------------------------------------------------
+# G4d (ADR-0178): #12 frontier_drop, the E1 estimand executor
+# ---------------------------------------------------------------------------
+
+
+def _nested(obj: Any, path: Sequence[str]) -> Any:
+    """``obj[path[0]][path[1]]...`` or None at the first missing key."""
+    node = obj
+    for key in path:
+        node = node.get(key) if isinstance(node, Mapping) else None
+        if node is None:
+            return None
+    return node
+
+
+def load_class_targets(plan_path: Path) -> dict[str, float]:
+    """The plan's class first-token targets (seconds, keyed by the class's
+    served tokens as a string); malformed or absent targets refuse (D12)."""
+    try:
+        plan = json.loads(Path(plan_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AnalysisError(f"--plan {plan_path}: {exc}") from exc
+    targets = plan.get(FRONTIER_CLASS_TARGETS_KEY) if isinstance(plan, dict) else None
+    if not isinstance(targets, dict) or not targets:
+        raise AnalysisError(
+            f"--plan {plan_path}: carries no {FRONTIER_CLASS_TARGETS_KEY!r} "
+            "object (run_campaign.py writes it from the per-class floors); "
+            "E1 grades timeliness on the class target (ADR-0178 D12)"
+        )
+    out: dict[str, float] = {}
+    for key, value in targets.items():
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) <= 0.0
+        ):
+            raise AnalysisError(
+                f"--plan {plan_path}: {FRONTIER_CLASS_TARGETS_KEY}[{key!r}] = "
+                f"{value!r} is not a positive finite number of seconds"
+            )
+        out[str(key)] = float(value)
+    return out
+
+
+def _cell_rate_qps(run_dir: Path, cell_rows: pd.DataFrame) -> float:
+    """One cell's offered rate from its windows' metrics.json; the windows
+    must agree within ``FRONTIER_RATE_RTOL`` (one cell = one rate)."""
+    rates: list[float] = []
+    for rec in cell_rows.itertuples(index=False):
+        path = run_dir / str(rec.window_dir) / WINDOW_METRICS_NAME
+        if not path.is_file():
+            raise AnalysisError(
+                f"contrast #12 ({FRONTIER_METRIC}): MISSING ARTIFACT: {path} "
+                "absent; the matched absolute rate is read from "
+                f"{'.'.join(_FRONTIER_RATE_METRICS_PATH)} (ADR-0178 D12)"
+            )
+        try:
+            node = _nested(json.loads(path.read_text(encoding="utf-8")), _FRONTIER_RATE_METRICS_PATH)
+        except json.JSONDecodeError as exc:
+            raise AnalysisError(f"{path}: invalid JSON: {exc}") from exc
+        if isinstance(node, bool) or not isinstance(node, (int, float)) or float(node) <= 0.0:
+            raise AnalysisError(
+                f"contrast #12 ({FRONTIER_METRIC}): {path} carries "
+                f"{'.'.join(_FRONTIER_RATE_METRICS_PATH)}={node!r}; the K1 "
+                "match needs a positive offered rate"
+            )
+        rates.append(float(node))
+    if max(rates) - min(rates) > FRONTIER_RATE_RTOL * max(rates):
+        raise AnalysisError(
+            f"contrast #12 ({FRONTIER_METRIC}): the windows of cell "
+            f"{str(cell_rows['row_key'].iloc[0])!r} disagree on rate_qps "
+            f"({min(rates):.6g} to {max(rates):.6g}); one cell serves one rate"
+        )
+    return float(np.mean(rates))
+
+
+def _cell_class_tokens(run_dir: Path, cell_json_rel: str) -> int:
+    """The demand class (served tokens) cell.json's budget plan records."""
+    path = run_dir / cell_json_rel
+    try:
+        node = _nested(json.loads(path.read_text(encoding="utf-8")), _FRONTIER_CLASS_CELL_PATH)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AnalysisError(f"{path}: {exc}") from exc
+    if isinstance(node, bool) or not isinstance(node, int) or node <= 0:
+        raise AnalysisError(
+            f"contrast #12 ({FRONTIER_METRIC}): {path} carries "
+            f"{'.'.join(_FRONTIER_CLASS_CELL_PATH)}={node!r}; the class "
+            "target is keyed by the cell's served-token class (ADR-0178 D12)"
+        )
+    return node
+
+
+def _window_yield_shares(
+    run_dir: Path, rec: Any, predicate_root: Path, target_s: float
+) -> dict[str, float]:
+    """One window's E1 shares over EVERY issued request (ADR-0178 D10):
+    timely = a completed request whose first token arrived within the class
+    target on the section 6.3 clock (``_slo_ttft_ms``, the #14 rule);
+    accepted = the section 8.5 predicate is true; yield = both. A non-
+    completion is neither; a completion without a predicate row refuses."""
+    window_dir = run_dir / str(rec.window_dir)
+    label = str(rec.window_dir)
+    requests = _read_jsonl(window_dir / "requests.jsonl")
+    if not requests:
+        raise AnalysisError(
+            f"contrast #12 ({FRONTIER_METRIC}): {window_dir / 'requests.jsonl'} "
+            "has no rows: an empty window has no yield"
+        )
+    pred_path = predicate_root / label / PREDICATE_ROWS_NAME
+    if not pred_path.is_file():
+        raise AnalysisError(
+            f"contrast #12 ({FRONTIER_METRIC}): MISSING ARTIFACT: {pred_path} "
+            f"absent; {_PREDICATE_FIX_HINT}"
+        )
+    if not any("ok" in r for r in requests):
+        raise AnalysisError(
+            f"contrast #12 ({FRONTIER_METRIC}): MISSING ARTIFACT: requests.jsonl "
+            f"rows in {label} carry no 'ok' column; the yield share needs the "
+            "#127 completion stamp on every row (review L7)"
+        )
+    predicate_by_key = {
+        _predicate_join_key(obj): obj.get("predicate") for obj in _read_jsonl(pred_path)
+    }
+    n_timely = n_accepted = n_yield = 0
+    basis_counts: dict[str, int] = {TTFT_BASIS_SCHEDULED: 0, TTFT_BASIS_SEND: 0}
+    unscored: list[tuple[Any, str, Any]] = []
+    null_ok: list[tuple[Any, str, Any]] = []
+    for req in requests:
+        ok = bool(req.get("ok"))
+        key = _predicate_join_key(req)
+        if ok and key not in predicate_by_key:
+            unscored.append(key)
+            continue
+        pred = predicate_by_key.get(key)
+        if ok and pred is None:
+            # Review M2: a completion without a verdict has no yield value;
+            # #14 refuses the same window (goodput._veridical_array), so E1
+            # does too, by count, never a silent "not accepted".
+            null_ok.append(key)
+            continue
+        if pred is not None and not isinstance(pred, bool):
+            raise AnalysisError(
+                f"contrast #12 ({FRONTIER_METRIC}): {label}: predicate value "
+                f"{pred!r} for {key!r} is not a JSON boolean or null; the "
+                "section 8.5 table is tri-state (true, false, null)"
+            )
+        accepted = ok and pred is True
+        try:
+            ttft_ms, basis = _slo_ttft_ms(req)
+        except AnalysisError as exc:
+            raise AnalysisError(f"contrast #12 ({FRONTIER_METRIC}): {label}: {exc}") from exc
+        basis_counts[basis] += 1
+        timely = (
+            ok
+            and ttft_ms is not None
+            and math.isfinite(ttft_ms)
+            and ttft_ms / 1000.0 <= target_s
+        )
+        n_timely += int(timely)
+        n_accepted += int(accepted)
+        n_yield += int(timely and accepted)
+    if unscored:
+        raise AnalysisError(
+            f"contrast #12 ({FRONTIER_METRIC}): {len(unscored)} completed (ok) "
+            f"request(s) in {label} have NO predicate row (first: "
+            f"{unscored[:3]}): the section 8.5 predicate must be scored for "
+            "every completion (section 9.10)"
+        )
+    if null_ok:
+        raise AnalysisError(
+            f"contrast #12 ({FRONTIER_METRIC}): {len(null_ok)} completed (ok) "
+            f"request(s) in {label} carry a NULL predicate (first: "
+            f"{null_ok[:3]}): a completion without a verdict has no yield "
+            "value; #14 refuses the same window (review M2)"
+        )
+    n = len(requests)
+    return {
+        "n_issued": float(n),
+        "timely_frac": n_timely / n,
+        "accepted_frac": n_accepted / n,
+        "yield_frac": n_yield / n,
+        "n_basis_scheduled": float(basis_counts[TTFT_BASIS_SCHEDULED]),
+        "n_basis_send": float(basis_counts[TTFT_BASIS_SEND]),
+    }
+
+
+def _window_bootstrap_delta(
+    constrained: np.ndarray, control: np.ndarray, *, reps: int, seed: int
+) -> tuple[float, float]:
+    """95 percent percentile interval of mean(constrained) minus mean(control)
+    under a bootstrap that resamples whole windows on each side."""
+    rng = np.random.default_rng(seed)
+    ia = rng.integers(0, len(constrained), size=(reps, len(constrained)))
+    ib = rng.integers(0, len(control), size=(reps, len(control)))
+    deltas = constrained[ia].mean(axis=1) - control[ib].mean(axis=1)
+    return float(np.percentile(deltas, 2.5)), float(np.percentile(deltas, 97.5))
+
+
+def compute_frontier_drop(
+    run_dir: Path,
+    index: pd.DataFrame,
+    family_ctx: FamilyContext | None,
+    *,
+    predicate_root: Path | None,
+    plan_path: Path | None,
+    alpha: float = REGISTERED_ALPHA,
+) -> tuple[dict[str, Any], list[PrimaryOutcome]]:
+    """#12 executor: the E1 estimand (ADR-0178 D10, D11, D12).
+
+    A confirmatory point is a constrained cell (budget_r below the control
+    rung) whose offered rate equals a control cell's (budget_r 1.25) on the
+    same engine, model, arm, retriever, policy, topology and dataset, within
+    ``FRONTIER_RATE_RTOL``; every control cell at that rate contributes its
+    windows (D2). Per point: the window means of the yield share on both
+    sides, delta = constrained minus control, a one-sided Welch batch-means
+    p (alternative "less") and a window-bootstrap interval; the timely and
+    accepted shares ride beside as the decomposition. Per dataset: engine
+    members of one (baseline, rung) leg merge by the largest p (ruling
+    A13), the legs enter Holm, and the intersection-union maximum is the
+    endpoint contribution keyed ``<dataset>|frontier_drop``.
+
+    FAIL-LOUD (G4): no predicate table, no ``--plan``, a class without a
+    target, a window without a rate, or no confirmatory point at all each
+    refuse naming the artifact. A constrained cell without a control at its
+    rate is not a confirmatory point and is listed, never refused.
+    """
+    if predicate_root is None:
+        raise AnalysisError(
+            f"contrast #12 ({FRONTIER_METRIC}, E1) cannot be computed: the yield "
+            f"share needs the per-query section 8.5 predicate, and {_PREDICATE_FIX_HINT}"
+        )
+    if plan_path is None:
+        raise AnalysisError(
+            f"contrast #12 ({FRONTIER_METRIC}): MISSING ARTIFACT: no --plan "
+            "supplied; the class first-token targets (plan_registered.json "
+            f"{FRONTIER_CLASS_TARGETS_KEY}) grade timeliness (ADR-0178 D12)"
+        )
+    targets = load_class_targets(plan_path)
+    pressure = index[index["family"].isin(sorted(PRESSURE_FAMILIES))].copy()
+    pressure["_r"] = pd.to_numeric(pressure["budget_r"], errors="coerce")
+    pressure = pressure[pressure["_r"].notna()]
+    if pressure.empty:
+        raise AnalysisError(
+            f"contrast #12 ({FRONTIER_METRIC}): MISSING ARTIFACT: no F2/F3 "
+            "rows with a budget_r in this run's index; the K1 block (control "
+            "rung 1.25 and the constrained rungs at the frontier load) has not "
+            "been served"
+        )
+    section: dict[str, Any] = {
+        "contrast_id": FRONTIER_CONTRAST_ID,
+        "tier": "primary",
+        "estimand": FRONTIER_METRIC,
+        "estimand_text": (
+            "ADR-0178 D10: yield share = requests timely (first token within "
+            "the class target on the section 6.3 clock) and accepted (section "
+            "8.5 predicate true) over every issued request; E1 = the share at "
+            "a constrained rung minus the control rung 1.25 at the matched "
+            "absolute offered rate; registered direction: a drop (one-sided)"
+        ),
+        "higher_is_better": ESTIMAND_HIGHER_IS_BETTER[FRONTIER_METRIC],
+        "registered_sidedness": "one-sided",
+        "executed_alternative": "less",
+        "control_budget_r": FRONTIER_CONTROL_BUDGET_R,
+        "rate_match_rtol": FRONTIER_RATE_RTOL,
+        "bootstrap": {
+            "unit": "window",
+            "replicates": FRONTIER_BOOTSTRAP_REPS,
+            "seed": BOOTSTRAP_SEED,
+            "interval": "95 percent percentile",
+        },
+        "class_targets_source": str(plan_path),
+        "ttft_clock": TTFT_CLOCK_RULE,
+        "predicate_table": predicate_root.name,
+        "legs": [],
+        "per_dataset_intersection": [],
+        "not_confirmatory_points": [],
+        "skipped": [],
+    }
+
+    def skip(reason: str) -> None:
+        section["skipped"].append({"reason": reason})
+
+    cell_rate: dict[str, float] = {}
+    cell_json_of: dict[str, str] = {}
+    for row_key, grp in pressure.groupby("row_key"):
+        cell_rate[str(row_key)] = _cell_rate_qps(run_dir, grp)
+        cell_json_of[str(row_key)] = str(grp["cell_json"].iloc[0])
+    #: Review L5: the class (and its target) is read for MATCHED cells only,
+    #: so a listed non-K1 cell without a plan class never refuses the look.
+    cell_class: dict[str, int] = {}
+
+    def class_of(row_key: str) -> int:
+        if row_key not in cell_class:
+            cls = _cell_class_tokens(run_dir, cell_json_of[row_key])
+            if str(cls) not in targets:
+                raise AnalysisError(
+                    f"contrast #12 ({FRONTIER_METRIC}): class {cls} tokens of cell "
+                    f"{row_key!r} has no target in {plan_path} "
+                    f"({FRONTIER_CLASS_TARGETS_KEY} keys {sorted(targets)})"
+                )
+            cell_class[row_key] = cls
+        return cell_class[row_key]
+
+    shares_cache: dict[str, dict[str, float]] = {}
+
+    def window_shares(grp: pd.DataFrame, target_s: float) -> list[dict[str, float]]:
+        out: list[dict[str, float]] = []
+        for rec in grp.itertuples(index=False):
+            key = f"{rec.window_dir}"
+            if key not in shares_cache:
+                shares_cache[key] = _window_yield_shares(
+                    run_dir, rec, predicate_root, target_s
+                )
+            out.append(shares_cache[key])
+        return out
+
+    #: dataset -> leg key -> engine -> p
+    leg_p: dict[str, dict[str, dict[str, float]]] = {}
+    registered = (
+        family_ctx.contrast_datasets(FRONTIER_CONTRAST_ID)
+        if family_ctx is not None else None
+    )
+    for axes_key, grp in pressure.groupby(list(_FRONTIER_MATCH_AXES), dropna=False):
+        axes = {k: str(v) for k, v in zip(_FRONTIER_MATCH_AXES, axes_key)}
+        dataset = axes["dataset"]
+        controls = grp[grp["_r"] == FRONTIER_CONTROL_BUDGET_R]
+        # Review M4: a constrained rung is BELOW the control rung; a rung
+        # above it (none on S1) is listed, never tested as a drop.
+        for above_key in sorted(grp.loc[grp["_r"] > FRONTIER_CONTROL_BUDGET_R, "row_key"].unique()):
+            section["not_confirmatory_points"].append(
+                {
+                    "row_key": str(above_key),
+                    "rate_qps": cell_rate[str(above_key)],
+                    "reason": f"budget_r above the control rung {FRONTIER_CONTROL_BUDGET_R:g}: "
+                    "E1 is registered as a drop below the control rung",
+                }
+            )
+        constrained = grp[grp["_r"] < FRONTIER_CONTROL_BUDGET_R]
+        for con_key, con_grp in constrained.groupby("row_key"):
+            con_key = str(con_key)
+            rate = cell_rate[con_key]
+            matched = sorted(
+                str(k) for k in controls["row_key"].unique()
+                if abs(cell_rate[str(k)] - rate) <= FRONTIER_RATE_RTOL * rate
+            )
+            if not matched:
+                section["not_confirmatory_points"].append(
+                    {
+                        "row_key": con_key,
+                        "rate_qps": rate,
+                        "reason": "no control cell (budget_r 1.25) at this "
+                        "offered rate on the same axes: not a K1 point",
+                    }
+                )
+                continue
+            if dataset not in PREDICATE_DATASETS:
+                skip(f"{con_key}: dataset {dataset!r} is outside the section 8.5 predicate universe")
+                continue
+            if registered is not None and dataset not in registered:
+                skip(
+                    f"{con_key}: {dataset} is not a registered dataset for contrast "
+                    f"#{FRONTIER_CONTRAST_ID} (the section 9.3 table registers it on "
+                    f"{sorted(registered)}; C1)"
+                )
+                continue
+            classes = {class_of(k) for k in matched} | {class_of(con_key)}
+            if len(classes) != 1:
+                raise AnalysisError(
+                    f"contrast #12 ({FRONTIER_METRIC}): {con_key!r} and its control "
+                    f"cells {matched} span classes {sorted(classes)}; one point, one class"
+                )
+            target_s = targets[str(class_of(con_key))]
+            con_shares = window_shares(con_grp, target_s)
+            ctl_shares = window_shares(controls[controls["row_key"].isin(matched)], target_s)
+            rung = float(con_grp["_r"].iloc[0])
+            baseline = str(con_grp["baseline"].iloc[0])
+            leg = f"{baseline}|r{rung:g}"
+            engine = axes["engine"]
+            if len(con_shares) < 2 or len(ctl_shares) < 2:
+                skip(
+                    f"{dataset} {leg} {engine}: needs >= 2 windows per side for a "
+                    f"Welch variance estimate; got constrained={len(con_shares)}, "
+                    f"control={len(ctl_shares)}"
+                )
+                continue
+            a = np.array([s["yield_frac"] for s in con_shares], dtype=float)
+            b = np.array([s["yield_frac"] for s in ctl_shares], dtype=float)
+            try:
+                result = batch_means_contrast(a, b, alternative="less")
+            except ValueError as exc:
+                skip(f"{dataset} {leg} {engine}: {exc}")
+                continue
+            ci_low, ci_high = _window_bootstrap_delta(
+                a, b, reps=FRONTIER_BOOTSTRAP_REPS, seed=BOOTSTRAP_SEED
+            )
+            engines = leg_p.setdefault(dataset, {}).setdefault(leg, {})
+            if engine in engines:
+                raise AnalysisError(
+                    f"contrast #12 ({FRONTIER_METRIC}): leg {leg!r} x {dataset} is "
+                    f"supplied twice by engine {engine!r} ({con_key!r}); one point "
+                    "per engine, refusing to guess"
+                )
+            engines[engine] = result.p_value
+
+            def share(key: str) -> dict[str, float]:
+                mc = float(np.mean([s[key] for s in con_shares]))
+                mk = float(np.mean([s[key] for s in ctl_shares]))
+                return {"mean_constrained": mc, "mean_control": mk, "delta": mc - mk}
+
+            section["legs"].append(
+                {
+                    "dataset": dataset,
+                    "leg": leg,
+                    "baseline": baseline,
+                    "arm": axes["arm"],
+                    "budget_r": rung,
+                    "engine": engine,
+                    "constrained_row_key": con_key,
+                    "control_row_keys": matched,
+                    "rate_qps": rate,
+                    "class_tokens": cell_class[con_key],
+                    "target_s": target_s,
+                    "n_windows_constrained": int(len(a)),
+                    "n_windows_control": int(len(b)),
+                    "n_issued_mean_constrained": float(np.mean([s["n_issued"] for s in con_shares])),
+                    "n_issued_mean_control": float(np.mean([s["n_issued"] for s in ctl_shares])),
+                    # Review L8: which clock graded how many rows (the #14 audit).
+                    "ttft_basis_counts": {
+                        TTFT_BASIS_SCHEDULED: int(sum(s["n_basis_scheduled"] for s in con_shares + ctl_shares)),
+                        TTFT_BASIS_SEND: int(sum(s["n_basis_send"] for s in con_shares + ctl_shares)),
+                    },
+                    "yield": {
+                        **share("yield_frac"),
+                        "statistic": result.statistic,
+                        "df": result.df,
+                        "p_value": result.p_value,
+                        "ci95_low_bootstrap": ci_low,
+                        "ci95_high_bootstrap": ci_high,
+                        "ci95_low_welch": result.ci95_low,
+                        "ci95_high_welch": result.ci95_high,
+                    },
+                    "timely": share("timely_frac"),
+                    "accepted": share("accepted_frac"),
+                    "executed_alternative": "less",
+                }
+            )
+
+    primaries: list[PrimaryOutcome] = []
+    for dataset in sorted(leg_p):
+        legs = leg_p[dataset]
+        merged = {leg: max(engines.values()) for leg, engines in legs.items()}
+        adjusted = holm(list(merged.values()))
+        p_holm = dict(zip(merged, (float(p) for p in adjusted)))
+        # ADR-0178 amendment 2 (owner 2026-10-27): the endpoint is
+        # DISJUNCTIVE over the registered points, Holm-corrected: it rejects
+        # when any (arm, rung) point drops after correction, and each arm is
+        # reported on its own. The conjunctive intersection-union maximum of
+        # D11 stays in the record as a sensitivity line, never the gate.
+        p_endpoint = float(min(adjusted))
+        p_conjunctive = float(max(adjusted))
+        per_arm: dict[str, dict[str, Any]] = {}
+        for leg, p_adj in p_holm.items():
+            arm_key = leg.split("|", 1)[0]
+            record = per_arm.setdefault(
+                arm_key, {"p_holm_any": 1.0, "rungs": {}, "verdict": "no drop"}
+            )
+            record["rungs"][leg] = p_adj
+            record["p_holm_any"] = min(record["p_holm_any"], p_adj)
+            record["verdict"] = (
+                "drop confirmed at the registered alpha"
+                if record["p_holm_any"] < _FRONTIER_FAMILY_ALPHA
+                else "no drop"
+            )
+        for leg_row in section["legs"]:
+            if leg_row["dataset"] == dataset:
+                leg_row["p_merged_engines"] = merged[leg_row["leg"]]
+                leg_row["p_holm_within_dataset"] = p_holm[leg_row["leg"]]
+        section["per_dataset_intersection"].append(
+            {
+                "dataset": dataset,
+                "p_endpoint": p_endpoint,
+                "p_intersection_union_sensitivity": p_conjunctive,
+                "n_legs": len(merged),
+                "per_arm": per_arm,
+                "legs": {
+                    leg: {
+                        "engines": dict(sorted(engines.items())),
+                        "p_merged": merged[leg],
+                        "p_holm": p_holm[leg],
+                    }
+                    for leg, engines in sorted(legs.items())
+                },
+                "rule": (
+                    "ADR-0178 amendment 2 (2026-10-27): engine members merge by "
+                    "the largest p (ruling A13); Holm over every registered "
+                    "(arm, rung) point of the dataset; the endpoint rejects when "
+                    "any point survives (smallest adjusted p); each arm reported "
+                    "on its own; the conjunctive maximum is a sensitivity line"
+                ),
+            }
+        )
+        primaries.append(
+            PrimaryOutcome(
+                endpoint=_primary_endpoint(FRONTIER_CONTRAST_ID),
+                dataset=f"{dataset}|{FRONTIER_METRIC}",
+                p_value=p_endpoint,
+            )
+        )
+    if not primaries:
+        if section["skipped"]:
+            # Review G: name the real cause when points matched but no leg
+            # could be computed (window count, zero variance, dataset rule).
+            detail = "; ".join(s["reason"] for s in section["skipped"])
+            raise AnalysisError(
+                f"contrast #12 ({FRONTIER_METRIC}): MISSING ARTIFACT: confirmatory "
+                f"point(s) matched but no leg could be computed: {detail}"
+            )
+        raise AnalysisError(
+            f"contrast #12 ({FRONTIER_METRIC}): MISSING ARTIFACT: no confirmatory "
+            "point: no constrained cell shares an offered rate "
+            f"({'.'.join(_FRONTIER_RATE_METRICS_PATH)}, relative tolerance "
+            f"{FRONTIER_RATE_RTOL:g}) with a control cell (budget_r "
+            f"{FRONTIER_CONTROL_BUDGET_R:g}) on the same engine, arm and dataset "
+            f"({len(section['not_confirmatory_points'])} constrained cell(s) listed)"
+        )
+    return section, primaries
 
 
 # ---------------------------------------------------------------------------
@@ -4618,8 +5246,17 @@ def build_summary_md(stats: Mapping[str, Any]) -> str:
         if gate.get("missing_endpoints_note"):
             lines.append(f"- **{gate['missing_endpoints_note']}**")
         lines.append(
-            f"- intra-set rule: `{gate['intra_set_rule']}` at α={gate['alpha']:g}"
+            f"- intra-set rule: `{gate['intra_set_rule']}`; registered total "
+            f"α={gate['alpha']:g} split over the families (ADR-0178)"
         )
+        for family_name, record in gate.get("families", {}).items():
+            executed = " → ".join(record["order_executed"]) or "(none)"
+            lines.append(
+                f"- family `{family_name}` at α={record['alpha']:g}: registered "
+                f"{' → '.join(record['order_registered'])}; executed {executed}; "
+                f"chain {'COMPLETE' if record['chain_complete'] else 'INCOMPLETE'}"
+                + (f"; {record['skipped']}" if record.get("skipped") else "")
+            )
         for decision in gate.get("set_decisions", ()):
             # C3: PASSED only for a set the serial chain tested.
             if decision["confirmed"]:
@@ -4755,13 +5392,67 @@ def build_summary_md(stats: Mapping[str, Any]) -> str:
             )
         lines.append("")
 
+    frontier = stats.get("frontier")
+    if frontier and "suppressed" not in frontier:
+        lines.append(
+            "## Yield frontier drop (#12, E1: pressure family primary, ADR-0178)"
+        )
+        lines.append("")
+        lines.append(f"- {frontier['estimand_text']}")
+        lines.append(
+            f"- control rung {frontier['control_budget_r']:g}; rate match within "
+            f"{frontier['rate_match_rtol']:g}; interval: window bootstrap, "
+            f"{frontier['bootstrap']['replicates']} replicates, seed "
+            f"{frontier['bootstrap']['seed']}; class targets from "
+            f"`{frontier['class_targets_source']}`"
+        )
+        lines.append("")
+        lines.append(
+            "| dataset | leg | engine | rate (req/s) | windows (constr/ctrl) "
+            "| yield constr | yield ctrl | Δ yield [bootstrap 95%] | p (one-sided) "
+            "| Δ timely | Δ accepted |"
+        )
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
+        for leg in frontier.get("legs", ()):
+            y = leg["yield"]
+            lines.append(
+                f"| {leg['dataset']} | {leg['leg']} | {leg['engine']} "
+                f"| {leg['rate_qps']:.4g} "
+                f"| {leg['n_windows_constrained']}/{leg['n_windows_control']} "
+                f"| {y['mean_constrained']:.3f} | {y['mean_control']:.3f} "
+                f"| {y['delta']:+.3f} [{y['ci95_low_bootstrap']:+.3f}, "
+                f"{y['ci95_high_bootstrap']:+.3f}] | {y['p_value']:.3g} "
+                f"| {leg['timely']['delta']:+.3f} | {leg['accepted']['delta']:+.3f} |"
+            )
+        for iu in frontier.get("per_dataset_intersection", ()):
+            lines.append(
+                f"- **{iu['dataset']}: endpoint p = {iu['p_endpoint']:.3g}** "
+                f"({iu['n_legs']} point(s); conjunctive sensitivity p = "
+                f"{iu['p_intersection_union_sensitivity']:.3g}; {iu['rule']})"
+            )
+            for arm_key, record in iu.get("per_arm", {}).items():
+                lines.append(
+                    f"  - {arm_key}: {record['verdict']} (smallest Holm-adjusted p "
+                    f"{record['p_holm_any']:.3g} over {sorted(record['rungs'])})"
+                )
+        for skipped_leg in frontier.get("skipped", ()):
+            lines.append(f"- SKIPPED: {skipped_leg['reason']}")
+        if frontier.get("not_confirmatory_points"):
+            lines.append(
+                f"- constrained cells with no control at their rate (not K1 "
+                f"points): {len(frontier['not_confirmatory_points'])} (listed in stats.json)"
+            )
+        lines.append("")
+
     falsification = stats.get("falsification")
     if falsification:
         lines.append(
-            "## Falsification suite (#12, §9.2 exile — spends no α)"
+            "## Floor suite (under #12, descriptive, spends no alpha, ADR-0178)"
         )
         lines.append("")
-        for result in falsification["results"]:
+        if "skipped" in falsification:
+            lines.append(f"SKIPPED (labeled): {falsification['skipped']}")
+        for result in falsification.get("results", ()):
             lines.append(
                 f"- onset rate_frac = {result['onset_rate_frac']:.4g} "
                 f"-> **{result['verdict']}** ({result['reason']})"
@@ -6304,6 +6995,7 @@ def run_analysis(
     accepted_step_down: int | None = None,
     predicate_run_id: str | None = None,
     workload_manifest: Path | None = None,
+    plan_path: Path | None = None,
 ) -> AnalysisResult:
     """Execute the pipeline; the CLI wraps this with the one-look flag checks.
 
@@ -6318,6 +7010,15 @@ def run_analysis(
     run_dir = Path(run_dir).resolve()
     if not run_dir.is_dir():
         raise AnalysisError(f"run directory does not exist: {run_dir}")
+    # ADR-0178 (D3'): the family alphas are registration content in BOTH
+    # modes; the CLI total must be the registered total.
+    if abs(alpha - REGISTERED_ALPHA) > 1e-12:
+        raise AnalysisError(
+            f"--alpha {alpha!r} differs from the registered alpha "
+            f"{REGISTERED_ALPHA!r}: the family alphas "
+            f"{dict((n, a) for n, _o, a in REGISTERED_CHAINS)} are registration "
+            "content, not a CLI knob (section 9.0, ADR-0178)"
+        )
 
     # G1a: confirmatory metrics ARE the registered pair — the CLI list is a
     # design-input instrument only.
@@ -6684,12 +7385,28 @@ def run_analysis(
                 )
             )
 
-        # §9.3 wiring: the registered chain + Holm-within-family corrections.
+        # G4d (ADR-0178): the #12 E1 estimand executor, only when requested
+        # (fail-loud on missing artifacts by design, G4).
+        frontier_section: dict[str, Any] | None = None
+        frontier_primaries: list[PrimaryOutcome] = []
+        if FRONTIER_CONTRAST_ID in contrast_ids:
+            frontier_section, frontier_primaries = compute_frontier_drop(
+                run_dir,
+                index,
+                family_ctx,
+                predicate_root=predicate_root,
+                plan_path=plan_path,
+                alpha=alpha,
+            )
+
+        # §9.3 wiring: the registered chains + Holm-within-family corrections.
         gatekeeping_section = run_gatekeeping(
             contrast_stats,
             family_ctx,
             alpha=alpha,
-            extra_primaries=[*fingerprint_primaries, *truth_tax_primaries],
+            extra_primaries=[
+                *fingerprint_primaries, *truth_tax_primaries, *frontier_primaries,
+            ],
         )
 
         # §9.5 wiring: conditional TOST for the declared equivalence legs.
@@ -6702,13 +7419,35 @@ def run_analysis(
             alpha=alpha,
         )
 
-        # G4b: the #12 falsification suite, only when explicitly requested
-        # (fail-loud on missing inputs by design).
-        falsification_section = (
-            compute_falsification_suite(per_query_loader, index)
-            if FLOOR_SUITE_CONTRAST_ID in contrast_ids
-            else None
-        )
+        # The former floor suite (ADR-0178 D1'): reported under #12 beside the
+        # E1 estimand as a descriptive section; its missing inputs are a
+        # LABELED skip, never a refusal, because the primary lives under the
+        # same id and must not be aborted by a descriptive sidebar.
+        falsification_section: dict[str, Any] | None = None
+        if FLOOR_SUITE_CONTRAST_ID in contrast_ids:
+            try:
+                falsification_section = compute_falsification_suite(
+                    per_query_loader, index
+                )
+            except Exception as exc:  # noqa: BLE001 -- a sidebar never aborts the primary (review M3)
+                falsification_section = {
+                    "contrast_id": FLOOR_SUITE_CONTRAST_ID,
+                    "tier": "descriptive",
+                    "estimand": "lambda_star_onset",
+                    "skipped": f"{type(exc).__name__}: {exc}",
+                    "label": (
+                        "ADR-0178: the former floor suite rides beside the E1 "
+                        "estimand as a descriptive section; its inputs are "
+                        "absent on this tree (labeled skip, no alpha, no gate)"
+                    ),
+                }
+                # Review H1: the refusal names cells, so under an active seal
+                # the console line carries the type only; the stats copy is
+                # rewritten by apply_blinding_to_sections.
+                print(
+                    "[floor-suite] SKIP (descriptive, under #12): "
+                    + (type(exc).__name__ if blinding_active else f"{type(exc).__name__}: {exc}")
+                )
 
         # G3: the exploratory tier — BH-FDR, separated, non-confirmatory.
         exploratory_section = build_exploratory_section(
@@ -6802,6 +7541,17 @@ def run_analysis(
                 }
                 if blinding_active and truth_tax_section is not None
                 else truth_tax_section
+            ),
+            "frontier": (
+                {
+                    "suppressed": (
+                        "§9.8 blinding active: the #12 section carries "
+                        "row_key/arm-bearing axes; suppressed until the "
+                        "logged unblinding"
+                    )
+                }
+                if blinding_active and frontier_section is not None
+                else frontier_section
             ),
             "exploratory": exploratory_section,
             "falsification": falsification_section,
@@ -7059,10 +7809,20 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--alpha",
         type=float,
-        default=0.05,
+        default=REGISTERED_ALPHA,
         metavar="ALPHA",
-        help="significance level for the gatekeeping chain and family map "
-        "(default: 0.05; confirmatory mode must match REGISTERED_ALPHA)",
+        help="the registered TOTAL alpha the two confirmatory families spend "
+        f"(default and only accepted value: {REGISTERED_ALPHA}; the family "
+        "alphas are registration content, ADR-0178)",
+    )
+    parser.add_argument(
+        "--plan",
+        type=Path,
+        default=None,
+        metavar="JSON",
+        help="the registered plan (plan_registered.json) whose "
+        f"{FRONTIER_CLASS_TARGETS_KEY} grade timeliness for the #12 E1 "
+        "estimand (ADR-0178 D12); required when --contrasts includes 12",
     )
     parser.add_argument(
         "--accept-step-down",
@@ -7150,6 +7910,7 @@ def main(argv: list[str] | None = None) -> int:
             accepted_step_down=args.accept_step_down,
             predicate_run_id=args.predicate_run_id,
             workload_manifest=args.workload_manifest,
+            plan_path=args.plan,
         )
     except AnalysisError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

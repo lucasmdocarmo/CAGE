@@ -430,11 +430,18 @@ def test_design_input_default_stats_figures_and_stamp(organized_run: Path) -> No
     assert prov["rope_seed"] == 42
     assert "executing_git_sha" in prov and "executing_git_dirty" in prov
 
-    # The §9.3 chain ran on the computed primary, flagged INCOMPLETE loudly.
+    # The §9.3 chains ran on the computed primary, flagged INCOMPLETE loudly.
+    # ADR-0178: the case-study chain (#4) executed; the pressure chain
+    # (#12, #14, #13) has no computed endpoint and is a labeled skip.
     gate = stats["gatekeeping"]
     assert gate["chain_complete"] is False
     assert gate["primary_chain_order_executed"] == ["contrast-4"]
-    assert set(gate["missing_primary_endpoints"]) == {"contrast-14", "contrast-13"}
+    assert set(gate["missing_primary_endpoints"]) == {
+        "contrast-12", "contrast-14", "contrast-13",
+    }
+    assert gate["family_alphas"] == {"case_study": 0.02, "pressure": 0.03}
+    assert gate["families"]["case_study"]["chain_complete"] is True
+    assert "skipped" in gate["families"]["pressure"]
     assert "INCOMPLETE" in gate["missing_endpoints_note"]
     assert {p["endpoint"] for p in gate["primaries"]} == {"contrast-4"}
     for p in gate["primaries"]:
@@ -765,6 +772,8 @@ def test_truth_tax_registered_set_is_the_pressure_dataset_alone_c1(
     assert ctx is not None
     assert ctx.registered_set_legs(14) == (f"{PRESSURE}|truth_tax",)
     assert ctx.registered_set_legs(13) == (f"{PRESSURE}|fingerprint",)
+    # ADR-0178: E1 (#12) is the first link of the pressure chain
+    assert ctx.registered_set_legs(12) == (f"{PRESSURE}|frontier_drop",)
     assert ctx.contrast_datasets(14) == frozenset({PRESSURE})
     assert ctx.contrast_datasets(4) == frozenset(DATASETS)
     headline = [
@@ -778,15 +787,23 @@ def test_truth_tax_registered_set_is_the_pressure_dataset_alone_c1(
     gate = rca.run_gatekeeping(
         headline, ctx,
         extra_primaries=[
+            rca.PrimaryOutcome("contrast-12", f"{PRESSURE}|frontier_drop", 0.001),
             rca.PrimaryOutcome("contrast-14", f"{PRESSURE}|truth_tax", 0.001),
             rca.PrimaryOutcome("contrast-13", f"{PRESSURE}|fingerprint", 0.001),
         ],
     )
     decisions = {d["endpoint"]: d for d in gate["set_decisions"]}
-    for endpoint in ("contrast-4", "contrast-14", "contrast-13"):
+    for endpoint in ("contrast-4", "contrast-12", "contrast-14", "contrast-13"):
         assert decisions[endpoint]["missing_legs"] == []
         assert decisions[endpoint]["confirmed"] is True, endpoint
     assert gate["chain_complete"] is True
+    # ADR-0178: two chains, each complete at its own alpha
+    assert gate["families"]["case_study"]["order_executed"] == ["contrast-4"]
+    assert gate["families"]["pressure"]["order_executed"] == [
+        "contrast-12", "contrast-14", "contrast-13",
+    ]
+    assert decisions["contrast-4"]["alpha"] == 0.02
+    assert decisions["contrast-12"]["alpha"] == 0.03
 
 
 def test_gatekeeping_gates_secondaries_with_holm_within_family(
@@ -911,16 +928,19 @@ def test_driver_source_no_longer_claims_119_unbuilt() -> None:
             assert "has not landed" not in chunk
 
 
-def test_contrast_12_lambda_star_fails_loud_naming_missing_inputs(
+def test_contrast_12_frontier_fails_loud_naming_missing_inputs(
     organized_run: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # G4b: #12 requested on a run without the §6.1 rate grid must name the
-    # missing artifact, never emit a silent skip.
+    # G4 (ADR-0178): #12 is the E1 estimand; requested on a run without a
+    # predicate table it must name the producer command, never emit a silent
+    # skip (the former floor suite under #12 is a labeled sidebar now; its
+    # own executor is pinned in test_lambda_star_computed_from_f2_rate_grid).
     rc = rca.main([str(organized_run), "--contrasts", "12"])
     assert rc == 1
     err = capsys.readouterr().err
-    assert "MISSING ARTIFACT" in err
-    assert "rate_frac" in err
+    assert "frontier_drop" in err
+    assert "build_predicate_table.py" in err
+    assert not (organized_run / "analysis").exists()
 
 
 def test_window_contrast_computes_batch_means(tmp_path: Path) -> None:
@@ -2171,8 +2191,9 @@ def test_fingerprint_complete_legs_holm_and_iu_pass(tmp_path: Path) -> None:
         assert iu["p_intersection_union"] < 0.05
     gate = stats["gatekeeping"]
     assert gate["primary_chain_order_executed"] == ["contrast-4", "contrast-13"]
-    # C2/C3 (2026-10-10): the registered order is 4 -> 14 -> 13 and this run
-    # computes no #14, so the chain closes there. This test pinned #13 as a
+    # C2/C3 (2026-10-10): the registered pressure order is 12 -> 14 -> 13
+    # (ADR-0178) and this run computes neither #12 nor #14, so the chain
+    # closes at its first missing link, #12. This test once pinned #13 as a
     # confirmatory pass behind the missing gate (the review's H1/H2 defect);
     # the complete fingerprint is still visible in the raw set rule.
     for p in gate["primaries"]:
@@ -2187,7 +2208,7 @@ def test_fingerprint_complete_legs_holm_and_iu_pass(tmp_path: Path) -> None:
     closure = next(
         e for e in gate["events"] if e["family_id"] == "primary-chain:contrast-13"
     )
-    assert closure["upstream"] == "contrast-14" and closure["opened"] is False
+    assert closure["upstream"] == "contrast-12" and closure["opened"] is False
     summary = (sorted((run_dir / "analysis").iterdir())[-1] / "summary.md").read_text(
         encoding="utf-8"
     )
@@ -2236,6 +2257,9 @@ def test_lambda_star_grid_needs_three_points() -> None:
 def test_lambda_star_computed_from_f2_rate_grid(tmp_path: Path) -> None:
     # A real F2 rate grid with per-window goodput_frac + latency_ms: the
     # suite computes per-cell onsets and labels them against the ×/÷1.15 band.
+    # ADR-0178: the suite is a descriptive section under #12 (the E1
+    # estimand now owns the id and refuses this tree for want of a predicate
+    # table), so its executor is exercised directly, as its grid tests are.
     goodput_of_rate = {0.85: 0.90, 0.95: 0.95, 1.05: 0.60}
     specs: list[tuple[CellSpec, EvidenceExtra]] = []
     for rate, goodput in goodput_of_rate.items():
@@ -2247,12 +2271,12 @@ def test_lambda_star_computed_from_f2_rate_grid(tmp_path: Path) -> None:
         specs.append((spec, lambda i, g=goodput: {"goodput_frac": g}))
     run_dir = _build_run_tree(tmp_path, special_specs=specs)
     org.organize_run(run_dir)
-    rc = rca.main([str(run_dir), "--contrasts", "12"])
-    assert rc == 0
-    _, stats = _load_stats(run_dir)
-    fals = stats["falsification"]
+    index = rca.load_index(run_dir)
+    fals = rca.compute_falsification_suite(
+        lambda keys: rca.load_per_query(run_dir, index, keys), index
+    )
     assert fals["contrast_id"] == 12
-    assert fals["tier"] == "falsification"
+    assert fals["tier"] == "descriptive"
     assert len(fals["results"]) == len(DATASETS)  # one grid per dataset
     for result in fals["results"]:
         assert result["interpolated"] is True
