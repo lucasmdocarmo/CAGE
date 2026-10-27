@@ -1344,3 +1344,47 @@ class TestCalibrationReportSerializer:
         assert loaded.injections[0].meets_target is False
         with pytest.raises(rca.CalibrationGateError, match="injection targets"):
             rca.check_calibration(loaded, out)
+
+
+class TestCalibrationReportPerArmGate:
+    def test_per_arm_gate_round_trips_and_is_absent_by_default(self, tmp_path: Path) -> None:
+        # ADR-0178 block 2 (D5): the pooled S1 report carries the per-arm
+        # verdict; a pilot-path report carries none and keeps the 4-key shape.
+        base = _sample_report()
+        assert base.per_arm_gate is None
+        assert set(base.to_json_dict()) == {"seed", "n_observations", "aa", "injections"}
+        # at the gate's registered floor (400 splits per leg, C7) so the
+        # per-arm block is what the verdict turns on
+        aa_lo, aa_hi = _rejection_ci(16, 400)
+        inj_lo, inj_hi = _rejection_ci(340, 400)
+        gated = CalibrationReport(
+            seed=base.seed, n_observations=base.n_observations,
+            aa=AAResult(n_splits=400, alpha=0.05, n_rejections=16, fp_rate=0.04,
+                        ci_low=aa_lo, ci_high=aa_hi),
+            injections=(InjectionResult(
+                effect_size=0.05, kind="flip", n_splits=400, alpha=0.05, n_rejections=340,
+                power=0.85, ci_low=inj_lo, ci_high=inj_hi, target_power=None),),
+            per_arm_gate={"schema": "cage-aa-repeats-v1", "n_arms": 2, "all_pass": True,
+                          "arms_failing": [], "source": "aa.json", "rule": "r"},
+        )
+        out = gated.write(tmp_path / "calibration_report.json")
+        loaded = rca.load_calibration_report(out)
+        assert loaded == gated
+        assert loaded.per_arm_gate["n_arms"] == 2
+        assert rca.check_calibration(loaded, out)["per_arm_gate"] == {"n_arms": 2, "all_pass": True}
+
+    def test_malformed_per_arm_gate_refuses(self, tmp_path: Path) -> None:
+        raw = _sample_report().to_json_dict()
+        raw["per_arm_gate"] = {"n_arms": 2}  # no boolean all_pass
+        path = tmp_path / "calibration_report.json"
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        with pytest.raises(rca.CalibrationGateError, match="schema"):
+            rca.load_calibration_report(path)
+
+    def test_failing_block_without_an_arm_list_refuses_as_a_schema_error_l1(self, tmp_path: Path) -> None:
+        raw = _sample_report().to_json_dict()
+        raw["per_arm_gate"] = {"n_arms": 2, "all_pass": False, "arms_failing": None}
+        path = tmp_path / "calibration_report.json"
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        with pytest.raises(rca.CalibrationGateError, match="schema"):
+            rca.load_calibration_report(path)

@@ -67,6 +67,18 @@ done
 [ -n "$host" ] || { echo "fake ssh: no host" >&2; exit 255; }
 # ADR-0161: an outage injector; .ssh_fail holds a count of round trips that
 # fail like a timed-out channel (exit 255, nothing run).
+# ADR-0178 block 2 (review M3): .ssh_fail_skip lets that many round trips
+# through first, so an outage can start at a later probe of one stage.
+if [ -s "$CAGE_TEST_HOME/.ssh_fail_skip" ]; then
+  k=$(cat "$CAGE_TEST_HOME/.ssh_fail_skip")
+  if [ "$k" -gt 0 ]; then
+    echo $(( k - 1 )) > "$CAGE_TEST_HOME/.ssh_fail_skip"
+    echo "ssh $host :: $*" >> "$CAGE_TEST_LOG"
+    export HOME="$CAGE_TEST_HOME"
+    cd "$HOME"
+    exec bash -c "$*"
+  fi
+fi
 if [ -s "$CAGE_TEST_HOME/.ssh_fail" ]; then
   n=$(cat "$CAGE_TEST_HOME/.ssh_fail")
   if [ "$n" -gt 0 ]; then
@@ -2247,6 +2259,65 @@ def test_a_dead_channel_during_the_aa_probe_fails_the_pull_instead_of_recording_
     assert "did not reach the pod (ssh rc=255)" in proc.stdout
     st = _state(world)
     assert st["stages"]["pull"]["status"] == "failed" and "aa_report" not in st.get("pull", {})
+
+
+def test_the_pull_brings_the_driver_shape_calibration_report_beside_the_aa_report(world: Dict[str, Path]) -> None:
+    # ADR-0178 block 2 (D4): the A6 step writes calibration_report_<run>.json
+    # beside aa_repeats_<run>.json; the pull brings both, and notes the sibling
+    # absent on a pod build that predates block 2
+    proc = _master(world, "--yes", "provision", "--to", "pull")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    st = _state(world)
+    rid = st["run_id"]
+    land = world["exp_root"] / "S1" / DATE
+    pod_dir = world["pod_repo"] / "results" / "camp1" / "a"
+    # the A/A file alone: the sibling is noted absent, the stage passes
+    (pod_dir / f"aa_repeats_{rid}.json").write_text('{"aa": "ok"}', encoding="utf-8")
+    proc = _master(world, "--only", "pull", "--redo")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    assert "no driver-shape calibration report beside the run root" in proc.stdout
+    assert _state(world)["pull"]["calibration_report"] == "absent"
+    # both files: both pulled, both recorded
+    (pod_dir / f"calibration_report_{rid}.json").write_text('{"seed": 1}', encoding="utf-8")
+    proc = _master(world, "--only", "pull", "--redo")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    assert (land / "extras" / f"calibration_report_{rid}.json").read_text(encoding="utf-8") == '{"seed": 1}'
+    assert _state(world)["pull"]["calibration_report"].endswith(f"calibration_report_{rid}.json")
+    assert any("calibration_report" in c and c.startswith("scp") for c in _calls(world))
+    # the plan prints the sibling pull beside the A/A pull
+    proc = _master(world, "--plan", "--only", "pull")
+    assert "pull calibration report" in proc.stdout and "pull A/A report (A6)" in proc.stdout
+
+
+def test_a_dead_channel_during_the_calibration_report_probe_fails_the_pull(world: Dict[str, Path]) -> None:
+    # review M3: the second probe fails the stage on a dead channel exactly
+    # like the first; the outage starts at that probe (.ssh_fail_skip lets the
+    # earlier round trips of the stage through)
+    proc = _master(world, "--yes", "provision", "--to", "pull")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    rid = _state(world)["run_id"]
+    pod_dir = world["pod_repo"] / "results" / "camp1" / "a"
+    (pod_dir / f"aa_repeats_{rid}.json").write_text('{"aa": "ok"}', encoding="utf-8")
+    (pod_dir / f"calibration_report_{rid}.json").write_text('{"seed": 1}', encoding="utf-8")
+    before = len(_calls(world))
+    proc = _master(world, "--only", "pull", "--redo")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    stage_calls = _calls(world)[before:]
+    ssh_calls = [c for c in stage_calls if c.startswith("ssh")]
+    probe = next(i for i, c in enumerate(ssh_calls) if "calibration_report" in c and "test -f" in c)
+    (world["home"] / ".ssh_fail_skip").write_text(f"{probe}\n", encoding="utf-8")
+    (world["home"] / ".ssh_fail").write_text("3\n", encoding="utf-8")
+    proc = _master(world, "--only", "pull", "--redo", CAGE_SSH_RETRY_S="0")
+    (world["home"] / ".ssh_fail").write_text("0\n", encoding="utf-8")
+    (world["home"] / ".ssh_fail_skip").write_text("0\n", encoding="utf-8")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "the calibration report probe did not reach the pod (ssh rc=255)" in proc.stdout
+    st = _state(world)
+    assert st["stages"]["pull"]["status"] == "failed"
+    # the A/A pull of this run completed before the dead probe; the sibling key
+    # is the earlier successful pull's record (state persists across runs), so
+    # the proof of the refusal is the stage status and the probe message above
+    assert st["pull"]["aa_report"].endswith(f"aa_repeats_{rid}.json")
 
 
 # ---------------------------------------------------------------------------

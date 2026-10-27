@@ -627,9 +627,220 @@ def campaign_aa_report(
             "arms": arms, "pass": bool(arms) and all(v["pass"] for v in arms.values())}
 
 
+AA_REPEATS_SCHEMA = "cage-aa-repeats-v1"
+#: ADR-0178 block 2 (D4): the driver-shape sibling the campaign mode writes
+#: beside ``aa_repeats_<run>.json``; the master pulls both.
+CALIBRATION_REPORT_PREFIX = "calibration_report_"
+AA_REPEATS_PREFIX = "aa_repeats_"
+#: An arm's stored rate must be an exact multiple of 1/n_resamples and its
+#: stored interval must be the exact binomial CI of that count (C7 doctrine:
+#: the consumer recomputes, never trusts; so does this converter).
+_COUNT_TOL = 1e-9
+
+
+def _num(arm: str, key: str, value: Any) -> float:
+    """A stored number of one arm, or a refusal naming the arm (review L4)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(float(value)):
+        raise CalibrationCLIError(
+            f"aa-repeats arm {arm!r}: {key}={value!r} is not a finite number"
+        )
+    return float(value)
+
+
+def _exact_count(rate: float, n: int, *, arm: str, what: str) -> int:
+    k = rate * n
+    if abs(k - round(k)) > _COUNT_TOL * max(1.0, n):
+        raise CalibrationCLIError(
+            f"aa-repeats arm {arm!r}: {what}={rate!r} x n_resamples={n} is not an "
+            f"integer count; refusing to pool a rate that no count produced"
+        )
+    return int(round(k))
+
+
+def _check_stored_ci(k: int, n: int, low: float, high: float, *, arm: str, what: str) -> None:
+    exp_low, exp_high = _rejection_ci(k, n)
+    if abs(low - exp_low) > _COUNT_TOL or abs(high - exp_high) > _COUNT_TOL:
+        raise CalibrationCLIError(
+            f"aa-repeats arm {arm!r}: the stored {what} interval [{low}, {high}] is "
+            f"not the exact binomial CI of {k}/{n} ([{exp_low}, {exp_high}])"
+        )
+
+
+def calibration_report_from_aa_repeats(
+    aa_repeats: Mapping[str, Any], *, source: str = ""
+) -> CalibrationReport:
+    """ADR-0178 block 2 (D4, D5): the S1 per-arm A/A report pooled into the
+    driver's ``CalibrationReport`` shape.
+
+    Every arm's rejection count is recovered exactly from its rate (a rate that
+    is not a multiple of 1/n_resamples refuses, naming the arm), its stored
+    interval must be the exact binomial CI of that count, and the pod's
+    one-sided rule (fail only when ci_low is above alpha) is RECOMPUTED from
+    that interval; a stored ``pass`` that disagrees with the rule refuses
+    (review H1: the converter recomputes, never trusts). The pooled ``aa``
+    block adds the counts over the arms; the one registered injection shift
+    pools the same way (kind "flip", no target power: none is registered);
+    arms that disagree on the shift, or arms with and without an injection,
+    cannot mix (review M1). ``per_arm_gate`` carries the recomputed per-arm
+    verdict so the driver's gate refuses when any arm failed, whatever the
+    pool says, plus the capped-resample and paired-question totals.
+    """
+    if aa_repeats.get("schema") != AA_REPEATS_SCHEMA:
+        raise CalibrationCLIError(
+            f"not a {AA_REPEATS_SCHEMA} report (schema={aa_repeats.get('schema')!r})"
+        )
+    n = aa_repeats.get("n_resamples")
+    alpha = aa_repeats.get("alpha")
+    seed = aa_repeats.get("seed")
+    arms = aa_repeats.get("arms")
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise CalibrationCLIError(f"aa-repeats n_resamples={n!r} must be a positive integer")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or not 0.0 < alpha < 1.0:
+        raise CalibrationCLIError(f"aa-repeats alpha={alpha!r} must be in (0, 1)")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise CalibrationCLIError(f"aa-repeats seed={seed!r} must be an integer")
+    if not isinstance(arms, Mapping) or not arms:
+        raise CalibrationCLIError("aa-repeats carries no arms; nothing to pool")
+    alpha = float(alpha)
+    k_total = 0
+    n_pairs_total = 0
+    n_capped_total = 0
+    failing: list[str] = []
+    inj_by_shift: dict[float, list[int]] = {}
+    arms_with_injection = 0
+    for name, arm in sorted(arms.items()):
+        for key in ("n_pairs", "fp_rate", "ci_low", "ci_high", "pass"):
+            if key not in arm:
+                raise CalibrationCLIError(f"aa-repeats arm {name!r} lacks {key!r}")
+        fp_rate = _num(name, "fp_rate", arm["fp_rate"])
+        ci_low = _num(name, "ci_low", arm["ci_low"])
+        ci_high = _num(name, "ci_high", arm["ci_high"])
+        k = _exact_count(fp_rate, n, arm=name, what="fp_rate")
+        _check_stored_ci(k, n, ci_low, ci_high, arm=name, what="A/A")
+        k_total += k
+        n_pairs_total += int(_num(name, "n_pairs", arm["n_pairs"]))
+        # Review H1: the pod's one-sided rule, recomputed from the verified
+        # interval; the stored verdict must agree or the file is not the
+        # producer's.
+        rule_fail = ci_low > alpha
+        if bool(arm["pass"]) != (not rule_fail):
+            raise CalibrationCLIError(
+                f"aa-repeats arm {name!r}: stored pass={arm['pass']!r} contradicts "
+                f"the one-sided rule on its own interval (ci_low={ci_low} vs "
+                f"alpha={alpha}); refusing an edited verdict"
+            )
+        if rule_fail:
+            failing.append(name)
+        inj = arm.get("injection")
+        if inj is not None:
+            arms_with_injection += 1
+            for key in ("shift", "power", "ci_low", "ci_high"):
+                if key not in inj:
+                    raise CalibrationCLIError(f"aa-repeats arm {name!r} injection lacks {key!r}")
+            shift = _num(name, "injection.shift", inj["shift"])
+            kp = _exact_count(_num(name, "injection.power", inj["power"]), n, arm=name, what="injection power")
+            _check_stored_ci(
+                kp, n, _num(name, "injection.ci_low", inj["ci_low"]),
+                _num(name, "injection.ci_high", inj["ci_high"]), arm=name, what="injection",
+            )
+            inj_by_shift.setdefault(shift, []).append(kp)
+            capped = inj.get("n_capped", 0)
+            n_capped_total += int(_num(name, "injection.n_capped", capped))
+    if arms_with_injection not in (0, len(arms)):
+        raise CalibrationCLIError(
+            f"aa-repeats: {arms_with_injection} of {len(arms)} arms carry an injection; "
+            "a partial injection cannot be pooled"
+        )
+    if len(inj_by_shift) > 1:
+        # Review M1: one registered shift; arms that disagree cannot pool into
+        # one injection entry without misstating the splits per shift.
+        raise CalibrationCLIError(
+            f"aa-repeats: arms carry {len(inj_by_shift)} different injection shifts "
+            f"{sorted(inj_by_shift)}; the registered injection is one shift for every arm"
+        )
+    n_arms = len(arms)
+    n_pooled = n * n_arms
+    ci_low, ci_high = _rejection_ci(k_total, n_pooled)
+    aa = AAResult(
+        n_splits=n_pooled, alpha=alpha, n_rejections=k_total,
+        fp_rate=k_total / n_pooled, ci_low=ci_low, ci_high=ci_high,
+    )
+    injections: list[InjectionResult] = []
+    for shift, counts in sorted(inj_by_shift.items()):
+        kp = sum(counts)
+        n_shift = n * len(counts)
+        lo, hi = _rejection_ci(kp, n_shift)
+        injections.append(
+            InjectionResult(
+                effect_size=shift, kind="flip", n_splits=n_shift, alpha=alpha,
+                n_rejections=kp, power=kp / n_shift, ci_low=lo, ci_high=hi,
+                target_power=None,
+            )
+        )
+    return CalibrationReport(
+        seed=int(seed),
+        n_observations=n_pairs_total,
+        aa=aa,
+        injections=tuple(injections),
+        per_arm_gate={
+            "schema": AA_REPEATS_SCHEMA,
+            "source": source,
+            "n_arms": n_arms,
+            "n_resamples_per_arm": n,
+            "n_pairs_total": n_pairs_total,
+            "n_capped_total": n_capped_total,
+            "all_pass": not failing,
+            "arms_failing": failing,
+            "rule": (
+                "ADR-0178 block 2 (D5): the pooled A/A gate passes only when "
+                "every arm passed the pod's one-sided rule (ci_low <= alpha), "
+                "recomputed here from each arm's verified interval; the pool "
+                "never relaxes the per-arm verdict"
+            ),
+        },
+    )
+
+
+def write_calibration_report_from_aa_repeats(aa_path: Path, out_path: Path) -> Path:
+    """Read ``aa_repeats_<run>.json`` and write the driver-shape sibling."""
+    aa_path = Path(aa_path)
+    try:
+        raw = json.loads(aa_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CalibrationCLIError(f"{aa_path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise CalibrationCLIError(f"{aa_path}: root must be an object")
+    report = calibration_report_from_aa_repeats(raw, source=aa_path.name)
+    return report.write(Path(out_path))
+
+
+def sibling_calibration_report_path(aa_out: Path) -> Path:
+    """``aa_repeats_<run>.json`` -> ``calibration_report_<run>.json`` beside it."""
+    aa_out = Path(aa_out)
+    name = aa_out.name
+    if name.startswith(AA_REPEATS_PREFIX):
+        name = CALIBRATION_REPORT_PREFIX + name[len(AA_REPEATS_PREFIX):]
+    else:
+        name = CALIBRATION_REPORT_PREFIX + name
+    return aa_out.with_name(name)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
+    if "--from-aa-repeats" in argv:
+        # ADR-0178 block 2: the Mac-side conversion of a pulled A/A report
+        p = argparse.ArgumentParser(description="Pool a cage-aa-repeats-v1 file into the driver's CalibrationReport shape.")
+        p.add_argument("--from-aa-repeats", type=Path, required=True)
+        p.add_argument("--out", type=Path, default=None, help="default: calibration_report_<run>.json beside the input")
+        a = p.parse_args(argv)
+        out = a.out if a.out is not None else sibling_calibration_report_path(a.from_aa_repeats)
+        written = write_calibration_report_from_aa_repeats(a.from_aa_repeats, out)
+        loaded = json.loads(written.read_text(encoding="utf-8"))
+        print(f"[run_calibration] pooled {loaded['per_arm_gate']['n_arms']} arm(s): aa "
+              f"{loaded['aa']['n_rejections']}/{loaded['aa']['n_splits']} "
+              f"(all arms pass: {loaded['per_arm_gate']['all_pass']}) -> {written}")
+        return 0
     if "--campaign-root" in argv:
         # A6: the S1 mode, on the pod after the scoring stage
         p = argparse.ArgumentParser(description="A6 A/A on an S1 run's repeated arms (McNemar path).")
@@ -648,6 +859,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         a.out.parent.mkdir(parents=True, exist_ok=True)
         a.out.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         print(f"[run_calibration] A/A on {len(report['arms'])} repeated arm(s): {'PASS' if report['pass'] else 'FAIL'} -> {a.out}")
+        # ADR-0178 block 2 (D4): the driver-shape sibling, written always (a
+        # failing calibration is documented, never hidden; the gate refuses).
+        if report["arms"]:
+            sibling = sibling_calibration_report_path(a.out)
+            try:
+                calibration_report_from_aa_repeats(report, source=a.out.name).write(sibling)
+            except (CalibrationCLIError, OSError) as exc:
+                # Review L3: the sibling never changes the pod's own verdict or
+                # its exit code; the Mac conversion (--from-aa-repeats) can
+                # produce it later from the per-arm file.
+                print(f"[run_calibration] driver-shape report NOT written ({type(exc).__name__}: {exc}); "
+                      f"convert on the Mac with --from-aa-repeats {a.out}")
+            else:
+                print(f"[run_calibration] driver-shape report -> {sibling}")
         return 0 if report["pass"] else 1
     parser = argparse.ArgumentParser(
         description=(

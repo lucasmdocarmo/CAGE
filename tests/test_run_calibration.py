@@ -328,3 +328,185 @@ class TestEndToEnd:
             rc.write_outputs(
                 e2e["report"], e2e["provenance"], tmp_path / "results" / "x"
             )
+
+
+# --------------------------------------------------------------------------- #
+# ADR-0178 block 2 (D4, D5): the S1 per-arm A/A pooled into the driver's shape
+# --------------------------------------------------------------------------- #
+
+
+def _aa_repeats(n: int = 1000, *, arms: dict[str, tuple[int, int]] | None = None,
+                injection: bool = True) -> dict:
+    """A cage-aa-repeats-v1 payload built from COUNTS: arms = name -> (A/A
+    rejections, injection rejections); rates and exact CIs derived from them."""
+    from src.analysis.stats.calibration import _rejection_ci
+
+    arms = arms or {"armA": (2, 940), "armB": (1, 950), "armC": (0, 930)}
+    out = {"schema": "cage-aa-repeats-v1", "alpha": 0.05, "n_resamples": n, "seed": 7,
+           "rule": "one-sided", "injections": "run", "arms": {}, "pass": True}
+    for name, (k, kp) in arms.items():
+        lo, hi = _rejection_ci(k, n)
+        arm = {"n_pairs": 100, "fp_rate": k / n, "ci_low": lo, "ci_high": hi, "pass": lo <= 0.05}
+        if injection:
+            plo, phi = _rejection_ci(kp, n)
+            arm["injection"] = {"shift": 0.05, "power": kp / n, "ci_low": plo, "ci_high": phi, "n_capped": 0}
+        out["arms"][name] = arm
+    out["pass"] = all(a["pass"] for a in out["arms"].values())
+    return out
+
+
+class TestAaRepeatsToCalibrationReport:
+    def test_pools_counts_exactly_and_the_driver_gate_passes(self, tmp_path: Path) -> None:
+        import run_campaign_analysis as rca
+
+        report = rc.calibration_report_from_aa_repeats(_aa_repeats(), source="aa.json")
+        assert report.aa.n_splits == 3000 and report.aa.n_rejections == 3
+        assert report.aa.fp_rate == pytest.approx(3 / 3000)
+        assert report.n_observations == 300 and report.seed == 7
+        (inj,) = report.injections
+        assert inj.kind == "flip" and inj.effect_size == 0.05
+        assert inj.n_splits == 3000 and inj.n_rejections == 940 + 950 + 930
+        assert inj.target_power is None
+        assert report.per_arm_gate["all_pass"] is True and report.per_arm_gate["n_arms"] == 3
+        path = report.write(tmp_path / "calibration_report.json")
+        loaded = rca.load_calibration_report(path)
+        assert loaded == report
+        summary = rca.check_calibration(loaded, path)
+        assert summary["verdict"] == "PASS" and summary["per_arm_gate"] == {"n_arms": 3, "all_pass": True}
+
+    def test_one_failing_arm_blocks_the_gate_even_when_the_pool_passes(self, tmp_path: Path) -> None:
+        import run_campaign_analysis as rca
+
+        # armC rejects 120 of 1000 (CI above 0.05): the pool (123/3000 = 0.041,
+        # CI below 0.05) would PASS; D5 says the per-arm verdict governs.
+        payload = _aa_repeats(arms={"armA": (2, 940), "armB": (1, 950), "armC": (120, 930)})
+        assert payload["arms"]["armC"]["pass"] is False and payload["pass"] is False
+        report = rc.calibration_report_from_aa_repeats(payload)
+        assert report.aa.approximates_nominal is True  # the pool alone would pass
+        assert report.per_arm_gate["all_pass"] is False
+        assert report.per_arm_gate["arms_failing"] == ["armC"]
+        path = report.write(tmp_path / "calibration_report.json")
+        with pytest.raises(rca.CalibrationGateError, match="every arm passed"):
+            rca.check_calibration(rca.load_calibration_report(path), path)
+
+    def test_non_integer_rate_refuses_naming_the_arm(self) -> None:
+        payload = _aa_repeats()
+        payload["arms"]["armB"]["fp_rate"] = 0.0015  # 1.5 rejections of 1000
+        with pytest.raises(rc.CalibrationCLIError, match="armB.*not an integer count"):
+            rc.calibration_report_from_aa_repeats(payload)
+
+    def test_stored_interval_must_be_the_exact_ci(self) -> None:
+        payload = _aa_repeats()
+        payload["arms"]["armA"]["ci_high"] += 0.01
+        with pytest.raises(rc.CalibrationCLIError, match="armA.*not the exact binomial CI"):
+            rc.calibration_report_from_aa_repeats(payload)
+
+    def test_partial_injection_refuses(self) -> None:
+        payload = _aa_repeats()
+        del payload["arms"]["armC"]["injection"]
+        with pytest.raises(rc.CalibrationCLIError, match="partial injection"):
+            rc.calibration_report_from_aa_repeats(payload)
+
+    def test_no_injection_is_written_and_the_gate_refuses_it(self, tmp_path: Path) -> None:
+        import run_campaign_analysis as rca
+
+        report = rc.calibration_report_from_aa_repeats(_aa_repeats(injection=False))
+        assert report.injections == ()
+        path = report.write(tmp_path / "calibration_report.json")
+        with pytest.raises(rca.CalibrationGateError, match="no effect injection"):
+            rca.check_calibration(rca.load_calibration_report(path), path)
+
+    @pytest.mark.parametrize("mutate,match", [
+        (lambda d: d.update(schema="other"), "not a cage-aa-repeats-v1"),
+        (lambda d: d.update(n_resamples=0), "n_resamples"),
+        (lambda d: d.update(arms={}), "no arms"),
+        (lambda d: d["arms"]["armA"].pop("ci_low"), "lacks 'ci_low'"),
+    ])
+    def test_malformed_payloads_refuse(self, mutate, match) -> None:
+        payload = _aa_repeats()
+        mutate(payload)
+        with pytest.raises(rc.CalibrationCLIError, match=match):
+            rc.calibration_report_from_aa_repeats(payload)
+
+    def test_cli_conversion_writes_the_sibling_by_default(self, tmp_path: Path) -> None:
+        aa = tmp_path / "aa_repeats_run1.json"
+        aa.write_text(json.dumps(_aa_repeats()), encoding="utf-8")
+        assert rc.main(["--from-aa-repeats", str(aa)]) == 0
+        sibling = tmp_path / "calibration_report_run1.json"
+        assert sibling.is_file()
+        loaded = json.loads(sibling.read_text(encoding="utf-8"))
+        assert loaded["per_arm_gate"]["source"] == "aa_repeats_run1.json"
+        assert set(loaded) == {"seed", "n_observations", "aa", "injections", "per_arm_gate"}
+
+    def test_sibling_path_rule(self) -> None:
+        assert rc.sibling_calibration_report_path(Path("/x/aa_repeats_r.json")) == Path("/x/calibration_report_r.json")
+        assert rc.sibling_calibration_report_path(Path("/x/other.json")) == Path("/x/calibration_report_other.json")
+
+    def test_campaign_mode_writes_both_files(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # the campaign branch of main: the per-arm report and its driver-shape
+        # sibling beside it, written even when an arm fails (documented, never hidden)
+        payload = _aa_repeats(arms={"armA": (2, 940), "armB": (120, 950)})
+        monkeypatch.setattr(rc, "campaign_aa_report", lambda *a, **k: payload)
+        out = tmp_path / "aa_repeats_run9.json"
+        rc_code = rc.main(["--campaign-root", str(tmp_path), "--scoring-run-id", "s", "--out", str(out)])
+        assert rc_code == 1  # armB fails the pod's own rule
+        assert out.is_file()
+        sibling = tmp_path / "calibration_report_run9.json"
+        loaded = json.loads(sibling.read_text(encoding="utf-8"))
+        assert loaded["per_arm_gate"]["all_pass"] is False
+        assert loaded["per_arm_gate"]["arms_failing"] == ["armB"]
+
+
+class TestAaRepeatsReviewFixes:
+    """The 2026-10-27 review of block 2: H1, M1, L2, L3, L4, L6."""
+
+    def test_edited_pass_on_a_failing_interval_refuses_h1(self) -> None:
+        payload = _aa_repeats(arms={"a": (0, 950), "b": (0, 950), "c": (120, 930)})
+        assert payload["arms"]["c"]["pass"] is False
+        payload["arms"]["c"]["pass"] = True  # the edit the pool would have trusted
+        with pytest.raises(rc.CalibrationCLIError, match="'c'.*contradicts the one-sided rule"):
+            rc.calibration_report_from_aa_repeats(payload)
+
+    def test_per_arm_verdict_is_recomputed_not_read(self) -> None:
+        # an arm whose stored pass is consistent but whose rule fails lands in arms_failing
+        payload = _aa_repeats(arms={"a": (0, 950), "b": (120, 930)})
+        report = rc.calibration_report_from_aa_repeats(payload)
+        assert report.per_arm_gate["arms_failing"] == ["b"] and report.per_arm_gate["all_pass"] is False
+
+    def test_mixed_injection_shifts_refuse_m1(self) -> None:
+        payload = _aa_repeats()
+        payload["arms"]["armB"]["injection"]["shift"] = 0.10
+        with pytest.raises(rc.CalibrationCLIError, match="2 different injection shifts"):
+            rc.calibration_report_from_aa_repeats(payload)
+
+    def test_injection_splits_count_the_arms_that_carry_the_shift(self) -> None:
+        report = rc.calibration_report_from_aa_repeats(_aa_repeats())
+        (inj,) = report.injections
+        assert inj.n_splits == 3 * 1000 and inj.power == pytest.approx((940 + 950 + 930) / 3000)
+
+    def test_capped_and_pair_totals_ride_the_gate_block_l2_l6(self) -> None:
+        payload = _aa_repeats()
+        payload["arms"]["armA"]["injection"]["n_capped"] = 4
+        report = rc.calibration_report_from_aa_repeats(payload)
+        assert report.per_arm_gate["n_capped_total"] == 4
+        assert report.per_arm_gate["n_pairs_total"] == 300 == report.n_observations
+
+    @pytest.mark.parametrize("key,where", [("fp_rate", "arms"), ("ci_low", "arms"), ("power", "injection")])
+    def test_non_numeric_values_refuse_naming_the_arm_l4(self, key: str, where: str) -> None:
+        payload = _aa_repeats()
+        target = payload["arms"]["armC"] if where == "arms" else payload["arms"]["armC"]["injection"]
+        target[key] = "0.1"
+        with pytest.raises(rc.CalibrationCLIError, match="'armC'.*not a finite number"):
+            rc.calibration_report_from_aa_repeats(payload)
+
+    def test_a_sibling_write_failure_keeps_the_pod_verdict_and_exit_code_l3(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(rc, "campaign_aa_report", lambda *a, **k: _aa_repeats())
+        monkeypatch.setattr(rc, "calibration_report_from_aa_repeats",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+        out = tmp_path / "aa_repeats_run3.json"
+        rc_code = rc.main(["--campaign-root", str(tmp_path), "--scoring-run-id", "s", "--out", str(out)])
+        assert rc_code == 0  # every arm passed; the sibling failure is reported, not fatal
+        assert out.is_file() and not (tmp_path / "calibration_report_run3.json").exists()
+        assert "driver-shape report NOT written (OSError" in capsys.readouterr().out

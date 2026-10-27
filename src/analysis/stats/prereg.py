@@ -168,6 +168,11 @@ def assemble_preregistration(
             f"calibration injection targets missed at effects "
             f"{[i.effect_size for i in failed]} — registration is BLOCKED (§9.7/§9.13)"
         )
+    per_arm_reason = calibration_report.per_arm_gate_failure()
+    if per_arm_reason is not None:
+        # ADR-0178 block 2 (D5, review M2): the same per-arm refusal the
+        # analysis driver's gate applies.
+        raise PreregError(f"{per_arm_reason}: registration is BLOCKED (section 9.7/9.13)")
     # D9 §9.13 refuse-to-register hook for the L4 QUALITY instruments (D8
     # §8.6): a failing instrument calibration blocks assembly exactly like the
     # failing §9.7 stats calibration above — never a warning, never a skip.

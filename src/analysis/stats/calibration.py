@@ -90,6 +90,12 @@ class CalibrationReport:
     n_observations: int
     aa: AAResult
     injections: tuple[InjectionResult, ...] = field(default_factory=tuple)
+    #: ADR-0178 block 2 (D5): when the report pools a per-arm A/A (the S1
+    #: ``cage-aa-repeats-v1`` file), this block carries the per-arm verdict
+    #: the pod enforced; the gate refuses unless ``all_pass`` is true, so the
+    #: pooled shape can never pass more easily than the per-arm file did.
+    #: None on a report built from one observation vector (the pilot path).
+    per_arm_gate: dict[str, Any] | None = None
 
     def to_json_dict(self) -> dict[str, Any]:
         """The §9.7 gate-artifact payload, exactly as the consumers parse it.
@@ -106,7 +112,7 @@ class CalibrationReport:
         current criterion (fail-closed). Values are coerced to native
         ``int``/``float`` so numpy scalars never leak into the JSON.
         """
-        return {
+        payload: dict[str, Any] = {
             "seed": int(self.seed),
             "n_observations": int(self.n_observations),
             "aa": {
@@ -136,6 +142,23 @@ class CalibrationReport:
                 for inj in self.injections
             ],
         }
+        if self.per_arm_gate is not None:
+            payload["per_arm_gate"] = dict(self.per_arm_gate)
+        return payload
+
+    def per_arm_gate_failure(self) -> str | None:
+        """ADR-0178 block 2 (D5), shared by the analysis driver's gate and the
+        registration assembler (review M2): the reason the per-arm verdict
+        blocks this report, or None when it does not apply or passed."""
+        gate = self.per_arm_gate
+        if gate is None or bool(gate.get("all_pass")):
+            return None
+        failing = gate.get("arms_failing") or []
+        return (
+            f"calibration A/A FAILED on {len(failing)} of {gate.get('n_arms')} "
+            f"repeated arm(s) (first: {list(failing)[:3]}): the pooled gate passes "
+            "only when every arm passed the pod's one-sided rule"
+        )
 
     def to_json(self) -> str:
         """Serialized artifact text (same conventions as the L4 instrument

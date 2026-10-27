@@ -1832,13 +1832,25 @@ stage_pull() {
   local aa="$POD_RUN_ROOT/../aa_repeats_$RUN_ID.json"
   if plan_only; then
     printf '  [plan] %-28s pscp_from %s when present\n' "pull A/A report (A6)" "$aa"
+    printf '  [plan] %-28s pscp_from %s when present\n' "pull calibration report" "$POD_RUN_ROOT/../calibration_report_$RUN_ID.json"
   else
     # review 2026-10-22 M1: only the pod's own "no such file" (rc 1) means absent;
     # a dead channel (ssh_retry's 255) fails the stage, never a quiet "absent"
     local aa_rc=0; pssh "test -f $aa" >/dev/null 2>&1 || aa_rc=$?
     case "$aa_rc" in
       0) run_step 0 "pull A/A report (A6)" -- pscp_from "$aa" "$EXTRAS/aa_repeats_$RUN_ID.json" || return 1
-         state put pull.aa_report "$EXTRAS/aa_repeats_$RUN_ID.json" ;;
+         state put pull.aa_report "$EXTRAS/aa_repeats_$RUN_ID.json"
+         # ADR-0178 block 2 (D4): the driver-shape sibling the same step writes
+         # (calibration_report_<run>.json); absent on a pre-block-2 pod build
+         local cal="$POD_RUN_ROOT/../calibration_report_$RUN_ID.json" cal_rc=0
+         pssh "test -f $cal" >/dev/null 2>&1 || cal_rc=$?
+         case "$cal_rc" in
+           0) run_step 0 "pull calibration report (driver shape)" -- pscp_from "$cal" "$EXTRAS/calibration_report_$RUN_ID.json" || return 1
+              state put pull.calibration_report "$EXTRAS/calibration_report_$RUN_ID.json" ;;
+           1) say "no driver-shape calibration report beside the run root (pod build predates block 2): convert on the Mac with run_calibration.py --from-aa-repeats"
+              state put pull.calibration_report "absent" ;;
+           *) printf '  [FAIL] the calibration report probe did not reach the pod (ssh rc=%s)\n' "$cal_rc"; return 1 ;;
+         esac ;;
       1) say "no A/A report beside the run root (the A6 step failed or did not run; see logs/runner/score.log): nothing pulled"
          state put pull.aa_report "absent" ;;
       *) printf '  [FAIL] the A/A report probe did not reach the pod (ssh rc=%s): nothing is recorded as absent on a dead channel\n' "$aa_rc"; return 1 ;;

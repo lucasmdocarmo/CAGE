@@ -2269,11 +2269,23 @@ def load_calibration_report(path: Path) -> CalibrationReport:
             )
             for inj in raw.get("injections", ())
         )
+        per_arm_gate = raw.get("per_arm_gate")
+        if per_arm_gate is not None:
+            # ADR-0178 block 2 (D5): a pooled per-arm report must carry its
+            # per-arm verdict in full; a malformed block refuses.
+            if not isinstance(per_arm_gate, dict) or not isinstance(per_arm_gate.get("all_pass"), bool):
+                raise ValueError("per_arm_gate must be an object with a boolean all_pass")
+            if not per_arm_gate["all_pass"] and not isinstance(per_arm_gate.get("arms_failing"), list):
+                # Review L1: a failing block must name its arms (a list), so the
+                # refusal below is a gate error, never a traceback.
+                raise ValueError("per_arm_gate with all_pass false must carry arms_failing as a list")
+            per_arm_gate = dict(per_arm_gate)
         report = CalibrationReport(
             seed=int(raw["seed"]),
             n_observations=int(raw["n_observations"]),
             aa=aa,
             injections=injections,
+            per_arm_gate=per_arm_gate,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise CalibrationGateError(
@@ -2371,6 +2383,13 @@ def check_calibration(report: CalibrationReport, source: Path) -> dict[str, Any]
             f"{[i.effect_size for i in failed]} in {source} — the "
             "confirmatory look is BLOCKED (§9.7/§9.13)"
         )
+    per_arm_reason = report.per_arm_gate_failure()
+    if per_arm_reason is not None:
+        # ADR-0178 block 2 (D5): the pool never relaxes the per-arm verdict
+        # (the rule lives on the report, shared with prereg.py; review M2).
+        raise CalibrationGateError(
+            f"{per_arm_reason} in {source}; the confirmatory look is BLOCKED (section 9.7)"
+        )
     return {
         "path": str(source),
         "seed": report.seed,
@@ -2378,6 +2397,10 @@ def check_calibration(report: CalibrationReport, source: Path) -> dict[str, Any]
         "aa_fp_rate": report.aa.fp_rate,
         "aa_approximates_nominal": report.aa.approximates_nominal,
         "n_injections": len(report.injections),
+        "per_arm_gate": (
+            None if report.per_arm_gate is None
+            else {"n_arms": report.per_arm_gate.get("n_arms"), "all_pass": True}
+        ),
         "verdict": "PASS",
     }
 

@@ -667,6 +667,22 @@ class TestPrereg:
                 _family_map(), {"m": "y"}, never_reject, "a" * 40
             )
 
+    def test_failing_per_arm_gate_blocks_registration_m2(self) -> None:
+        # ADR-0178 block 2 (D5): the registration assembler applies the same
+        # per-arm refusal the analysis driver's gate applies.
+        import dataclasses as dc
+
+        report = _passing_report()
+        gated = dc.replace(report, per_arm_gate={
+            "schema": "cage-aa-repeats-v1", "n_arms": 3, "all_pass": False,
+            "arms_failing": ["armC"], "source": "aa.json", "rule": "r",
+        })
+        assert gated.aa.approximates_nominal  # the pool alone would pass
+        with pytest.raises(PreregError, match="every arm passed"):
+            assemble_preregistration(_family_map(), {"m": "y"}, gated, "a" * 40)
+        passing = dc.replace(gated, per_arm_gate={**gated.per_arm_gate, "all_pass": True, "arms_failing": []})
+        assert "## 1. Primary endpoints" in assemble_preregistration(_family_map(), {"m": "y"}, passing, "a" * 40)
+
     def test_composes_with_compiled_family_map(self) -> None:
         # The 2026-08-02 regression: §9.3 compiler output feeds §9.13 assembly
         # DIRECTLY — no ad-hoc rename step, no markdown pipe corruption.
