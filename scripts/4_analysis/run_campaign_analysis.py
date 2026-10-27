@@ -458,6 +458,10 @@ _PREDICATE_FIX_HINT = (
 #: ms→s conversion into ``goodput.evaluate_window`` happens HERE, at the one
 #: registered seam (Topic-6 F2: no conversion existed anywhere).
 _TRUTH_TAX_ANCHOR_ENGINE = "vllm"
+#: ADR-0178 amendment 4 (owner 2026-10-27, block 3): the reference engine
+#: leaves EVERY confirmatory merge (ruling A12 names the headline; the owner
+#: extended it to the secondaries) and is reported beside, never inside.
+REFERENCE_ENGINES: frozenset[str] = frozenset({"hf"})
 _TRUTH_TAX_GROUP_AXES: tuple[str, ...] = (
     "model", "arm", "retriever", "policy", "topology", "budget_r", "rate_frac",
 )
@@ -530,6 +534,11 @@ _FINGERPRINT_POLICY_OF_LEG: dict[str, str] = {
     "compress": "compress-fp8",
 }
 _FINGERPRINT_TRUNCATE_PAIR: tuple[str, str] = ("B11", "B6")
+#: ADR-0178 amendment 4 (D6; section 9.0 E4 names "truncation B11 vs B6 and
+#: B12 vs B3"): the truncate leg's registered arm pairs, each served at
+#: several matched pressure points (and B12 at two corpus cuts); every point
+#: enters the leg, engines merged by the largest p, Holm over the points.
+_FINGERPRINT_TRUNCATE_PAIRS: tuple[tuple[str, str], ...] = (("B11", "B6"), ("B12", "B3"))
 #: Registered Holm family size of the fingerprint superiority legs (§9.3:
 #: 3 superiority predictions). Missing legs are padded at p=1.0 (conservative)
 #: and force the intersection-union p to 1.0 — an incomplete fingerprint can
@@ -897,6 +906,37 @@ class WindowPair:
     cell_row_key: str
     reference_row_key: str
     datasets: tuple[str, ...]
+    #: ADR-0178 amendment 4 (D6): the registered point of a leg that the
+    #: grid serves more than once, the B12 corpus cut ("cb700"); "" when the
+    #: leg has one point.
+    point: str = ""
+
+
+def _cut_of_key(key: str) -> str:
+    """``cb<tokens>`` when the row key carries the ADR-0106 corpus cut, else
+    the empty string: the cut is read from the key itself, so a B12 pair
+    served at ONE cut keeps its label (review of amendment 4, MEDIUM 2)."""
+    cut = fp.parse_row_key(key).get("corpus_budget_tokens")
+    return "" if cut is None else f"cb{int(cut)}"
+
+
+def _split_by_cut(keys: Sequence[str]) -> dict[int, str] | None:
+    """{corpus cut -> row key} when the keys differ ONLY by their ADR-0106
+    corpus cut (the B12 truncation ratio, a registered slot of contrast #15);
+    None otherwise. One point per cut, never one cell chosen over another."""
+    if len(keys) < 2:
+        return None
+    parsed = {k: fp.parse_row_key(k) for k in keys}
+    cuts = {k: v.get("corpus_budget_tokens") for k, v in parsed.items()}
+    if any(c is None for c in cuts.values()) or len(set(cuts.values())) != len(keys):
+        return None
+    rest = {
+        tuple(sorted((a, str(v)) for a, v in parsed[k].items() if a != "corpus_budget_tokens"))
+        for k in keys
+    }
+    if len(rest) != 1:
+        return None
+    return {int(c): k for k, c in cuts.items()}
 
 
 #: Window pairs must additionally agree on the §6.1 pressure coordinates —
@@ -994,7 +1034,17 @@ def select_window_pairs(
                 continue
             cell_keys = sorted(cell_grp["row_key"].unique())
             ref_keys = sorted(ref_grp["row_key"].unique())
-            if len(cell_keys) != 1 or len(ref_keys) != 1:
+            # ADR-0178 amendment 4 (D6): several cells on one side that differ
+            # only by the B12 corpus cut are the registered points of one leg.
+            points: list[tuple[str, str, str]] = []
+            if len(cell_keys) == 1 and len(ref_keys) == 1:
+                points.append((cell_keys[0], ref_keys[0],
+                               _cut_of_key(cell_keys[0]) or _cut_of_key(ref_keys[0])))
+            elif len(ref_keys) == 1 and (cuts := _split_by_cut(cell_keys)):
+                points.extend((k, ref_keys[0], f"cb{cut}") for cut, k in sorted(cuts.items()))
+            elif len(cell_keys) == 1 and (cuts := _split_by_cut(ref_keys)):
+                points.extend((cell_keys[0], k, f"cb{cut}") for cut, k in sorted(cuts.items()))
+            else:
                 raise AnalysisError(
                     f"contrast #{contrast.id} leg {baseline_a}-vs-{baseline_b}: "
                     f"axes {dict(zip(_WINDOW_PAIR_MATCH_AXES, key))} select "
@@ -1010,15 +1060,17 @@ def select_window_pairs(
             if not datasets:
                 continue
             matched = True
-            pairs.append(
-                WindowPair(
-                    contrast=contrast,
-                    family=family,
-                    cell_row_key=cell_keys[0],
-                    reference_row_key=ref_keys[0],
-                    datasets=datasets,
+            for cell_key, ref_key, point in points:
+                pairs.append(
+                    WindowPair(
+                        contrast=contrast,
+                        family=family,
+                        cell_row_key=cell_key,
+                        reference_row_key=ref_key,
+                        datasets=datasets,
+                        point=point,
+                    )
                 )
-            )
         if not matched:
             skip_reasons.append(
                 f"contrast #{contrast.id} leg {baseline_a}-vs-{baseline_b} "
@@ -1930,6 +1982,7 @@ def compute_window_pair_stats(
         "reference_baseline": pair.contrast.baseline_b,
         "cell_row_key": pair.cell_row_key,
         "reference_row_key": pair.reference_row_key,
+        "point": pair.point,
         "metric": metric,
         "unit": "window",
         "test": "batch_means_welch_t (tests_by_unit.batch_means_contrast, §9.4)",
@@ -2574,6 +2627,9 @@ def apply_blinding_to_sections(
 _CONTRAST_IDENTIFYING_FIELDS: tuple[str, ...] = (
     "name", "tier", "tier_source", "family", "family_id", "upstream",
     "registered_sidedness", "executed_alternative", "correction",
+    # ADR-0178 amendment 4 review (HIGH 1): a corpus cut ("cb700") is legal
+    # on arm corpus-trunc only, so the point named B12 through the mask.
+    "point",
 )
 _BLINDED = "BLINDED"
 
@@ -2634,6 +2690,18 @@ def apply_contrast_blinding(
         iu["missing_legs"] = [_BLINDED] * len(iu.get("missing_legs", ()))
         if "note" in iu:
             iu["note"] = _BLINDED
+    fingerprint = stats.get("fingerprint", {})
+    if fingerprint.get("leg_points"):
+        # ADR-0178 amendment 4: point keys name arm pairs ("B11 vs B6").
+        fingerprint["leg_points"] = _BLINDED
+    roster = stats.get("cut_roster")
+    if isinstance(roster, dict) and roster.get("missing"):
+        # the notes name the truncated-corpus arm's slots; the count stays
+        roster["n_missing"] = len(roster["missing"])
+        roster["missing"] = _BLINDED
+    for leg in fingerprint.get("legs", ()):
+        if "point" in leg:
+            leg["point"] = _BLINDED
     skipped = stats.get("skipped", {})
     skipped["contrasts"] = [
         {"contrast_id": code(s["contrast_id"]), "name": _BLINDED,
@@ -2869,6 +2937,44 @@ def _annotate_missing_leg(leg: str) -> str:
     )
 
 
+def _secondary_point(axes: Mapping[str, Any]) -> str:
+    """The point a secondary row occupies inside its registered leg: the
+    pressure slot of its cell row key (budget_r, rate_frac) and the corpus
+    cut the key carries, joined as ``r<..>|lam<..>|cb<..>``. A leg served at
+    several slots (the S1 grid runs each pressure pair at four) and, for
+    B12, at two cuts, enters Holm over these points (ADR-0178 amendment 4).
+    An unpressured row (F1, no coords) yields the empty point. The cut is
+    read from the key, never from the pair, so one served cut of two
+    registered ones still names itself; the roster check against the
+    registered rungs is not performed here (the audit lists the points)."""
+    parts: list[str] = []
+    for axis, prefix in (("budget_r", "r"), ("rate_frac", "lam")):
+        value = axes.get(axis)
+        if value is not None and value != "":
+            parts.append(f"{prefix}{value}")
+    cut = axes.get("corpus_budget_tokens")
+    if cut is not None:
+        parts.append(f"cb{int(cut)}")
+    return "|".join(parts)
+
+
+#: ADR-0178 amendment 4 (ruling A12 extended by the owner 2026-10-27).
+_REFERENCE_ENGINE_RULE = (
+    "ADR-0178 amendment 4 (ruling A12 extended by the owner 2026-10-27): "
+    f"engines {sorted(REFERENCE_ENGINES)} leave every confirmatory merge, "
+    "primaries and secondaries, and are reported here beside them"
+)
+
+
+def _holm_or_refuse(p_values: Sequence[float], what: str) -> list[float]:
+    """Holm over ``p_values`` as a labeled refusal: a non-finite p (review of
+    amendment 4, LOW 6) names its leg instead of escaping as a ValueError."""
+    try:
+        return [float(a) for a in holm(list(p_values))]
+    except ValueError as exc:
+        raise AnalysisError(f"{what}: {exc}") from exc
+
+
 def run_gatekeeping(
     contrast_stats: Sequence[Mapping[str, Any]],
     family_ctx: FamilyContext | None,
@@ -2929,11 +3035,13 @@ def run_gatekeeping(
     # review 2026-10-10, CRITICAL). Before this, two engines raised the
     # chain's duplicate-outcome refusal and stage 13 stopped the master.
     leg_members: dict[tuple[str, str], dict[str, dict[str, Any]]] = {}
+    #: ADR-0178 amendment 4: the reference engine's rows, reported beside
+    #: every confirmatory merge (primaries and secondaries), never inside.
+    reference_sidebar: list[dict[str, Any]] = []
     for entry in contrast_stats:
         if entry["tier"] != "primary":
             continue
         cid = int(entry["contrast_id"])
-        computed_primary_ids.add(cid)
         # Engine and topology only: the row key itself reveals the arm and
         # this trace is not masked under blinding (section 9.8).
         axes = fp.parse_row_key(str(entry["cell_row_key"]))
@@ -2941,6 +3049,20 @@ def run_gatekeeping(
         for row in entry["per_dataset"]:
             if "p_value" not in row:
                 continue
+            delta = row.get("median_delta", row.get("mean_diff"))
+            if str(axes["engine"]) in REFERENCE_ENGINES:
+                reference_sidebar.append(
+                    {"tier": "primary", "endpoint": _primary_endpoint(cid),
+                     "dataset_metric": f"{row['dataset']}|{entry['metric']}",
+                     "member": member, "p_value": float(row["p_value"]),
+                     "delta": None if delta is None else float(delta)}
+                )
+                continue
+            # An endpoint counts as computed only once a confirmatory p
+            # exists for it: an entry whose rows were all skipped, or served
+            # by the reference engine alone, leaves the chain closed there
+            # (review of amendment 4, LOW 10; absence never passes a gate).
+            computed_primary_ids.add(cid)
             leg = (_primary_endpoint(cid), f"{row['dataset']}|{entry['metric']}")
             members = leg_members.setdefault(leg, {})
             if member in members:
@@ -2948,7 +3070,6 @@ def run_gatekeeping(
                     f"primary leg {leg[1]!r} of {leg[0]!r} is supplied twice "
                     f"by member {member!r}: ambiguous, refusing to guess"
                 )
-            delta = row.get("median_delta", row.get("mean_diff"))
             members[member] = {
                 "member": member,
                 "p_value": float(row["p_value"]),
@@ -2980,19 +3101,36 @@ def run_gatekeeping(
         }
 
     if not primaries:
+        # Review of amendment 4 (MEDIUM 4): an invocation whose only primary
+        # rows come from the reference engine still reports them beside.
         return {
             "skipped": (
                 "no primary-tier contrast was computed in this invocation — "
                 "the §9.3 serial chain needs at least the headline (#4) "
                 "outcomes to gate anything"
-            )
+            ),
+            "reference_engine_sidebar": reference_sidebar,
+            "reference_engine_rule": _REFERENCE_ENGINE_RULE,
         }
 
     supplied_primary_keys = {(p.endpoint, p.dataset) for p in primaries}
     group = family_ctx.group if family_ctx is not None else "?"
+    # ADR-0178 amendment 4 (ruling A13 for the secondaries): one registered
+    # member per (contrast, family, gate leg). Engine rows of one point merge
+    # by the largest p; the points of a leg (the B12 corpus cuts, D6) enter
+    # Holm and the leg takes the maximum. Before this, every engine row joined
+    # its Holm family as its own member and a two-engine tree exceeded the
+    # registered family size.
+    secondary_groups: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    #: (group key, point, member) -> the cell row key that supplied it, for
+    #: the refusal message only (row keys never enter the audit: masked).
+    supplied_by: dict[tuple[tuple[str, str, str, str], str, str], str] = {}
     for entry in contrast_stats:
         if entry["tier"] != "secondary":
             continue
+        axes = fp.parse_row_key(str(entry["cell_row_key"]))
+        member = f"{axes['engine']}/{axes['topology']}"
+        point = _secondary_point(axes)
         for row in entry["per_dataset"]:
             if "p_value" not in row:
                 continue
@@ -3021,7 +3159,9 @@ def run_gatekeeping(
             else:
                 # No charter family map (non-charter datasets, design-input):
                 # legacy flat behavior — headline-gated pseudo-family.
-                family_id = f"{group}|{metric}|{dataset}"
+                # The family axis keeps the F2 and F3 legs of one contrast
+                # apart (#15: B11 vs B6 and B12 vs B3; review LOW 7).
+                family_id = f"{group}|{metric}|{dataset}|{entry.get('family')}"
                 upstream = _primary_endpoint(HEADLINE_CONTRAST_ID)
             gate_key = _gate_leg_key(upstream, dataset, metric)
             if (upstream, gate_key) not in supplied_primary_keys:
@@ -3039,15 +3179,54 @@ def run_gatekeeping(
                     }
                 )
                 continue
-            secondaries.append(
-                SecondaryOutcome(
-                    contrast=f"#{entry['contrast_id']} {entry['name']}",
-                    family_id=family_id,
-                    upstream=upstream,
-                    dataset=gate_key,
-                    p_value=float(row["p_value"]),
+            contrast_label = f"#{entry['contrast_id']} {entry['name']}"
+            delta = row.get("median_delta", row.get("mean_diff"))
+            if str(axes["engine"]) in REFERENCE_ENGINES:
+                reference_sidebar.append(
+                    {"tier": "secondary", "contrast": contrast_label, "family_id": family_id,
+                     "dataset_metric": gate_key, "point": point, "member": member,
+                     "p_value": float(row["p_value"]),
+                     "delta": None if delta is None else float(delta)}
                 )
+                continue
+            group_key = (contrast_label, family_id, upstream, gate_key)
+            grp = secondary_groups.setdefault(group_key, {"points": {}})
+            engines = grp["points"].setdefault(point, {})
+            if member in engines:
+                raise AnalysisError(
+                    f"secondary {contrast_label!r} on {gate_key!r}"
+                    f"{' point ' + point if point else ''} is supplied twice by "
+                    f"member {member!r} (cells {supplied_by[(group_key, point, member)]!r} "
+                    f"and {entry['cell_row_key']!r}): ambiguous, refusing to guess"
+                )
+            supplied_by[(group_key, point, member)] = str(entry["cell_row_key"])
+            engines[member] = {"member": member, "p_value": float(row["p_value"]),
+                               "delta": None if delta is None else float(delta)}
+    secondary_audit: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for (contrast_label, family_id, upstream, gate_key), grp in secondary_groups.items():
+        merged = {pt: max(m["p_value"] for m in eng.values()) for pt, eng in grp["points"].items()}
+        adjusted = _holm_or_refuse(
+            list(merged.values()), f"secondary {contrast_label!r} on {gate_key!r}"
+        )
+        p_leg = float(max(adjusted))
+        secondary_audit[(contrast_label, family_id, gate_key)] = {
+            "members": sorted({m for eng in grp["points"].values() for m in eng}),
+            "points": {
+                pt: {"members": [eng[k] for k in sorted(eng)], "p_merged": merged[pt],
+                     "p_holm_within_leg": float(adj)}
+                for (pt, eng), adj in zip(grp["points"].items(), adjusted)
+            },
+            "n_points": len(merged),
+        }
+        secondaries.append(
+            SecondaryOutcome(
+                contrast=contrast_label,
+                family_id=family_id,
+                upstream=upstream,
+                dataset=gate_key,
+                p_value=p_leg,
             )
+        )
 
     # ADR-0178 (D3'): the registered chains are TWO Dmitrienko serial
     # sequences, one per confirmatory family, each at its own alpha
@@ -3158,6 +3337,9 @@ def run_gatekeeping(
                 "m_supplied": s.m_supplied,
                 "m_registered": s.m_registered,
                 "alpha": family_alpha,
+                # ADR-0178 amendment 4: the engine members and the leg's
+                # points this registered outcome merged.
+                **secondary_audit.get((s.contrast, s.family_id, s.dataset), {}),
             }
             for s in trace.secondaries
         )
@@ -3222,6 +3404,8 @@ def run_gatekeeping(
         "set_decisions": sets_out,
         "events": events_out,
         "ungated": ungated,
+        "reference_engine_sidebar": reference_sidebar,
+        "reference_engine_rule": _REFERENCE_ENGINE_RULE,
     }
 
 
@@ -3247,13 +3431,15 @@ def _match_pressure_pairs(
     refs: pd.DataFrame,
     match_axes: Sequence[str],
     label: str,
-) -> list[tuple[str, str, list[str]]]:
-    """(cell_row_key, ref_row_key, shared datasets) per matched axes-slot.
+) -> list[tuple[str, str, list[str], str]]:
+    """(cell_row_key, ref_row_key, shared datasets, point) per matched
+    axes-slot. ``point`` is the B12 corpus cut ("cb700") when several cells
+    on one side differ only by it (ADR-0178 amendment 4, D6), else "".
 
     Shared §9.5/#13 pressure matcher; groups the ``_coord_keyed`` copies so
     NaN pressure coordinates pair as absence (H4). Ambiguous slots fail loud.
     """
-    pairs: list[tuple[str, str, list[str]]] = []
+    pairs: list[tuple[str, str, list[str], str]] = []
     ref_groups = {
         key: grp
         for key, grp in _coord_keyed(refs).groupby(list(match_axes), dropna=False)
@@ -3264,14 +3450,19 @@ def _match_pressure_pairs(
             continue
         cell_keys = sorted(cell_grp["row_key"].unique())
         ref_keys = sorted(ref_grp["row_key"].unique())
-        if len(cell_keys) != 1 or len(ref_keys) != 1:
+        points: list[tuple[str, str, str]] = []
+        if len(cell_keys) == 1 and len(ref_keys) == 1:
+            points.append((cell_keys[0], ref_keys[0], _cut_of_key(cell_keys[0])))
+        elif len(ref_keys) == 1 and (cuts := _split_by_cut(cell_keys)):
+            points.extend((k, ref_keys[0], f"cb{cut}") for cut, k in sorted(cuts.items()))
+        else:
             raise AnalysisError(
                 f"{label}: ambiguous cell pair (cells={cell_keys}, "
                 f"refs={ref_keys}); refusing to guess"
             )
         datasets = sorted(set(cell_grp["dataset"]) & set(ref_grp["dataset"]))
         if datasets:
-            pairs.append((cell_keys[0], ref_keys[0], datasets))
+            pairs.extend((c, r, datasets, pt) for c, r, pt in points)
     return pairs
 
 
@@ -3415,7 +3606,7 @@ def compute_equivalence(
         )
         found_pair = False
         registered = family_ctx.contrast_datasets(FINGERPRINT_CONTRAST_ID)
-        for cell_key, ref_key, datasets in matched:
+        for cell_key, ref_key, datasets, _point in matched:
             charter = sorted(set(datasets) & set(family_ctx.datasets))
             for dataset in charter:
                 if dataset not in registered:
@@ -3617,10 +3808,13 @@ def compute_fingerprint(
     # The registered claim: the coping policy HARMS quality (cell worse).
     alternative = "greater" if not higher_is_better else "less"
     pressure = index[index["family"].isin(sorted(PRESSURE_FAMILIES))]
-    #: dataset -> {leg -> p}
-    leg_p: dict[str, dict[str, float]] = {}
+    #: dataset -> leg -> point key -> engine -> p (ADR-0178 amendment 4: a
+    #: leg is served at several matched pressure points on several engines;
+    #: the point key is the pair label, rung, load and corpus cut)
+    leg_points: dict[str, dict[str, dict[str, dict[str, float]]]] = {}
+    section["leg_points"] = []
 
-    def leg_pairs(leg: str) -> list[tuple[str, str, list[str]]] | None:
+    def leg_pairs(leg: str) -> list[tuple[str, str, list[str], str]] | None:
         if leg in _FINGERPRINT_POLICY_OF_LEG:
             policy_value = _FINGERPRINT_POLICY_OF_LEG[leg]
             cells = pressure[pressure["policy"] == policy_value]
@@ -3631,19 +3825,23 @@ def compute_fingerprint(
             return _match_pressure_pairs(
                 cells, refs, _POLICY_PAIR_MATCH_AXES, f"fingerprint leg {leg!r}"
             )
-        cell_b, ref_b = _FINGERPRINT_TRUNCATE_PAIR
-        cells = pressure[pressure["baseline"] == cell_b]
-        refs = pressure[pressure["baseline"] == ref_b]
-        if cells.empty or refs.empty:
-            skip(
-                leg,
-                f"no {cell_b}-vs-{ref_b} pressure pair in this run "
-                "(truncation rides the arm axis, §7.3)",
+        matched_all: list[tuple[str, str, list[str], str]] = []
+        for cell_b, ref_b in _FINGERPRINT_TRUNCATE_PAIRS:
+            cells = pressure[pressure["baseline"] == cell_b]
+            refs = pressure[pressure["baseline"] == ref_b]
+            if cells.empty or refs.empty:
+                skip(
+                    leg,
+                    f"no {cell_b}-vs-{ref_b} pressure pair in this run "
+                    "(truncation rides the arm axis, §7.3)",
+                )
+                continue
+            matched_all.extend(
+                _match_pressure_pairs(
+                    cells, refs, _TRUNCATE_PAIR_MATCH_AXES, f"fingerprint leg {leg!r}"
+                )
             )
-            return None
-        return _match_pressure_pairs(
-            cells, refs, _TRUNCATE_PAIR_MATCH_AXES, f"fingerprint leg {leg!r}"
-        )
+        return matched_all or None
 
     for leg_info in declared:
         leg = leg_info["leg"]
@@ -3652,7 +3850,7 @@ def compute_fingerprint(
             continue
         found = False
         registered = family_ctx.contrast_datasets(FINGERPRINT_CONTRAST_ID)
-        for cell_key, ref_key, datasets in matched:
+        for cell_key, ref_key, datasets, point in matched:
             charter = sorted(set(datasets) & set(family_ctx.datasets))
             for dataset in charter:
                 if dataset not in registered:
@@ -3696,19 +3894,44 @@ def compute_fingerprint(
                 result = paired_wilcoxon(
                     a, b, alternative=alternative, zero_method="pratt"
                 )
-                if dataset in leg_p and leg in leg_p[dataset]:
+                axes = fp.parse_row_key(cell_key)
+                engine = str(axes["engine"])
+                if engine in REFERENCE_ENGINES:
+                    # CellSpec admits the reference engine in F1 only and the
+                    # fingerprint reads pressure rows: a reference row here
+                    # means a corrupt index (review LOW 9), never a sidebar.
                     raise AnalysisError(
-                        f"fingerprint leg {leg!r} × {dataset}: two matched "
-                        "pressure pairs supply the same registered leg — "
-                        "ambiguous; refusing to guess"
+                        f"fingerprint leg {leg!r} × {dataset}: reference engine "
+                        f"{engine!r} row {cell_key!r} in the pressure frame; the "
+                        "cell index contradicts the cellspec rule, refusing"
                     )
-                leg_p.setdefault(dataset, {})[leg] = result.p_value
+                # The point names what the leg varies over: the pair (a
+                # policy leg by its policy, a truncation leg by its baselines),
+                # the coordinates the key carries, and the key's own cut.
+                if leg in _FINGERPRINT_POLICY_OF_LEG:
+                    pair_label = f"{axes['policy']} vs none"
+                else:
+                    pair_label = f"{_baseline_of_key(index, cell_key)} vs {_baseline_of_key(index, ref_key)}"
+                coords = [
+                    f"{prefix}{axes[axis]}" for axis, prefix in (("budget_r", "r"), ("rate_frac", "lam"))
+                    if axes.get(axis) is not None
+                ]
+                point_key = "|".join(s for s in [pair_label, *coords, _cut_of_key(cell_key)] if s)
+                engines = leg_points.setdefault(dataset, {}).setdefault(leg, {}).setdefault(point_key, {})
+                if engine in engines:
+                    raise AnalysisError(
+                        f"fingerprint leg {leg!r} × {dataset}: point {point_key!r} is "
+                        f"supplied twice by engine {engine!r} ({cell_key!r}); refusing to guess"
+                    )
+                engines[engine] = result.p_value
                 section["legs"].append(
                     {
                         "leg": leg,
                         "predicted": leg_info["predicted"],
                         "dataset": dataset,
                         "metric": metric,
+                        "point": point_key,
+                        "engine": engine,
                         "cell_row_key": cell_key,
                         "reference_row_key": ref_key,
                         "n_pairs": result.n_pairs,
@@ -3726,6 +3949,36 @@ def compute_fingerprint(
                 "dataset in this run",
             )
 
+    # ADR-0178 amendment 4 (D6): one p per leg and dataset from its points:
+    # engine members of a point merge by the largest p (ruling A13), the
+    # points enter Holm, the leg takes the maximum (every registered point of
+    # the leg must show the harm).
+    leg_p: dict[str, dict[str, float]] = {}
+    for dataset, legs in sorted(leg_points.items()):
+        for leg, points in sorted(legs.items()):
+            merged = {pk: max(eng.values()) for pk, eng in points.items()}
+            adjusted = _holm_or_refuse(
+                list(merged.values()), f"fingerprint leg {leg!r} × {dataset}"
+            )
+            leg_p.setdefault(dataset, {})[leg] = float(max(adjusted))
+            point_holm = dict(zip(merged, adjusted))
+            for leg_row in section["legs"]:
+                if leg_row["dataset"] == dataset and leg_row["leg"] == leg:
+                    # review LOW 11: the row's own point, not the leg's value
+                    leg_row["p_holm_within_leg"] = point_holm[leg_row["point"]]
+            section["leg_points"].append(
+                {
+                    "dataset": dataset, "leg": leg, "n_points": len(merged),
+                    "points": {
+                        pk: {"engines": dict(sorted(points[pk].items())), "p_merged": merged[pk],
+                             "p_holm_within_leg": float(adj)}
+                        for pk, adj in zip(merged, adjusted)
+                    },
+                    "p_leg": float(max(adjusted)),
+                    "rule": "engine members merge by the largest p (A13); Holm over the "
+                            "registered points; the leg takes the maximum (ADR-0178 amendment 4)",
+                }
+            )
     primaries: list[PrimaryOutcome] = []
     for dataset in sorted(leg_p):
         supplied = leg_p[dataset]
@@ -3733,12 +3986,14 @@ def compute_fingerprint(
             {d["leg"] for d in declared} - set(supplied)
         )
         padded = list(supplied.values()) + [1.0] * len(missing)
-        adjusted = holm(padded)
+        adjusted = _holm_or_refuse(padded, f"fingerprint intersection-union × {dataset}")
         p_iu = float(max(adjusted))
         for leg_row in section["legs"]:
-            if leg_row["dataset"] != dataset:
+            if leg_row["dataset"] != dataset or leg_row["leg"] not in supplied:
                 continue
             leg_idx = list(supplied).index(leg_row["leg"])
+            # the LEG's Holm value across the registered legs, stamped on
+            # each of its rows (the row's own value is p_holm_within_leg)
             leg_row["p_holm_within_fingerprint"] = float(adjusted[leg_idx])
         section["per_dataset_intersection"].append(
             {
@@ -3970,6 +4225,73 @@ def load_class_targets(plan_path: Path) -> dict[str, float]:
             )
         out[str(key)] = float(value)
     return out
+
+
+#: plan_registered.json: behavior_knobs.corpus_trunc_budgets, the registered
+#: B12 corpus cuts (ADR-0106 rungs; run_campaign.py writes [1400, 700]).
+CUT_ROSTER_KEY = "corpus_trunc_budgets"
+
+
+def load_cut_roster(plan_path: Path) -> list[int] | None:
+    """The plan's registered B12 cut roster, sorted; None when the plan
+    carries no ``behavior_knobs.corpus_trunc_budgets`` (a plan written for
+    the E1 targets alone); a malformed roster refuses."""
+    try:
+        plan = json.loads(Path(plan_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AnalysisError(f"--plan {plan_path}: {exc}") from exc
+    knobs = plan.get("behavior_knobs") if isinstance(plan, dict) else None
+    roster = knobs.get(CUT_ROSTER_KEY) if isinstance(knobs, dict) else None
+    if roster is None:
+        return None
+    if (
+        not isinstance(roster, list) or not roster
+        or any(isinstance(c, bool) or not isinstance(c, int) or c <= 0 for c in roster)
+        or len(set(roster)) != len(roster)
+    ):
+        raise AnalysisError(
+            f"--plan {plan_path}: behavior_knobs.{CUT_ROSTER_KEY} = {roster!r} is not "
+            "a non-empty list of distinct positive token budgets"
+        )
+    return sorted(int(c) for c in roster)
+
+
+def check_cut_roster(
+    contrast_stats: Sequence[Mapping[str, Any]], roster: Sequence[int] | None
+) -> dict[str, Any]:
+    """Every B12 pair served at a pressure slot must carry each registered
+    cut (review of ADR-0178 amendment 4, MEDIUM 2): the points of a leg are
+    the registered rungs, so a rung that never ran would otherwise shrink
+    the leg silently. One labeled note per (contrast, metric, engine,
+    topology, policy, slot) that misses a registered cut; counts only when
+    the plan carries no roster."""
+    served: dict[tuple[Any, ...], set[int]] = {}
+    for entry in contrast_stats:
+        cut = fp.parse_row_key(str(entry["cell_row_key"])).get("corpus_budget_tokens")
+        if cut is None:
+            continue
+        axes = fp.parse_row_key(str(entry["cell_row_key"]))
+        slot = tuple(
+            axes.get(a) for a in ("engine", "topology", "policy", "budget_r", "rate_frac")
+        )
+        served.setdefault((int(entry["contrast_id"]), str(entry["metric"]), *slot), set()).add(int(cut))
+    if roster is None:
+        return {
+            "registered": None, "slots_checked": len(served), "missing": [],
+            "note": f"the plan carries no behavior_knobs.{CUT_ROSTER_KEY}; roster not checked",
+        }
+    missing: list[dict[str, Any]] = []
+    for (cid, metric, engine, topology, policy, budget_r, rate_frac), cuts in sorted(
+        served.items(), key=lambda kv: tuple(str(x) for x in kv[0])
+    ):
+        absent = sorted(set(roster) - cuts)
+        if absent:
+            missing.append(
+                {"contrast_id": cid, "metric": metric, "engine": engine, "topology": topology,
+                 "policy": policy, "slot": f"r{budget_r}|lam{rate_frac}",
+                 "served": sorted(cuts), "missing": absent}
+            )
+    return {"registered": list(roster), "slots_checked": len(served), "missing": missing}
 
 
 def _cell_rate_qps(run_dir: Path, cell_rows: pd.DataFrame) -> float:
@@ -5320,6 +5642,15 @@ def build_summary_md(stats: Mapping[str, Any]) -> str:
                     f"| {s['dataset_metric']} | {s['p_value']:.3g} "
                     f"| {p_holm_s} | {s['status']} | {s['significant']} |"
                 )
+        if gate.get("reference_engine_sidebar"):
+            lines.append("")
+            lines.append("| reference engine (beside, never inside) | tier | endpoint or contrast | dataset×metric | point | p |")
+            lines.append("|---|---|---|---|---|---|")
+            for r in gate["reference_engine_sidebar"]:
+                lines.append(
+                    f"| {r['member']} | {r['tier']} | {r.get('endpoint') or r.get('contrast')} "
+                    f"| {r['dataset_metric']} | {r.get('point') or ''} | {r['p_value']:.3g} |"
+                )
         lines.append("")
         lines.append(f"Gate events (auditable trace): {len(gate['events'])} — see stats.json.")
     lines.append("")
@@ -5351,12 +5682,26 @@ def build_summary_md(stats: Mapping[str, Any]) -> str:
     lines.append("")
     for leg_row in fingerprint.get("legs", ()):
         p_holm_fp = leg_row.get("p_holm_within_fingerprint")
+        p_holm_pt = leg_row.get("p_holm_within_leg")
+        # ADR-0178 amendment 4: a leg holds several points (pair, slot, cut)
+        # per engine; name each so the rows do not read as duplicates.
+        where = ", ".join(
+            str(leg_row[k]) for k in ("point", "engine") if leg_row.get(k)
+        )
         lines.append(
             f"- `{leg_row['leg']}` × {leg_row['dataset']} "
-            f"[{leg_row['metric']}]: p={leg_row['p_value']:.3g}"
-            + (f", p_holm={p_holm_fp:.3g}" if p_holm_fp is not None else "")
+            f"[{leg_row['metric']}]" + (f" ({where})" if where else "")
+            + f": p={leg_row['p_value']:.3g}"
+            + (f", p_holm_point={p_holm_pt:.3g}" if p_holm_pt is not None else "")
+            + (f", p_holm_leg={p_holm_fp:.3g}" if p_holm_fp is not None else "")
             + f" (alternative `{leg_row['executed_alternative']}`, "
             f"n_nonzero={leg_row['n_nonzero']})"
+        )
+    for lp in (fingerprint.get("leg_points") if isinstance(fingerprint.get("leg_points"), list) else ()):
+        lines.append(
+            f"- {lp['dataset']} leg `{lp['leg']}`: p_leg = {lp['p_leg']:.3g} over "
+            f"{lp['n_points']} registered point(s): "
+            + "; ".join(f"{pk} {v['p_merged']:.3g}" for pk, v in lp["points"].items())
         )
     for iu in fingerprint.get("per_dataset_intersection", ()):
         lines.append(
@@ -5503,13 +5848,31 @@ def build_summary_md(stats: Mapping[str, Any]) -> str:
         lines.append("")
 
     skipped = stats["skipped"]
+    roster = stats.get("cut_roster")
     if (
         skipped["pressure_rows"]
         or skipped["contrasts"]
         or skipped.get("confirmatory_exclusions")
+        or roster
     ):
         lines.append("## Skipped (labeled — never silently absent)")
         lines.append("")
+        if roster:
+            missing = roster["missing"]
+            lines.append(
+                f"- Corpus cut roster (plan): registered {roster['registered']}, "
+                f"{roster['slots_checked']} slot(s) checked, "
+                + (f"missing: {missing}" if isinstance(missing, str) else
+                   f"{len(missing)} slot(s) missing a registered cut" if missing else "none missing")
+                + (f"; {roster['note']}" if roster.get("note") else "")
+            )
+            if isinstance(missing, list):
+                for m in missing:
+                    lines.append(
+                        f"  - contrast #{m['contrast_id']} [{m['metric']}] {m['engine']}/{m['topology']} "
+                        f"policy={m['policy']} {m['slot']}: served {m['served']}, missing {m['missing']}"
+                    )
+            lines.append("")
         if skipped["pressure_rows"]:
             block = skipped["pressure_rows"]
             lines.append(
@@ -7422,6 +7785,13 @@ def run_analysis(
                 alpha=alpha,
             )
 
+        # ADR-0178 amendment 4 review (MEDIUM 2): with the registered plan in
+        # hand, a B12 pair missing a registered cut is a labeled note.
+        cut_roster_section: dict[str, Any] | None = (
+            check_cut_roster(contrast_stats, load_cut_roster(plan_path))
+            if plan_path is not None else None
+        )
+
         # §9.3 wiring: the registered chains + Holm-within-family corrections.
         gatekeeping_section = run_gatekeeping(
             contrast_stats,
@@ -7551,6 +7921,7 @@ def run_analysis(
                 }
             ),
             "contrasts": contrast_stats,
+            "cut_roster": cut_roster_section,
             "gatekeeping": gatekeeping_section,
             "equivalence": equivalence_section,
             "fingerprint": fingerprint_section,

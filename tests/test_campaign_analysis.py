@@ -58,6 +58,7 @@ for _p in (str(_SCRIPTS_DIR), str(REPO_ROOT)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import figure_pipeline as fp  # noqa: E402
 import organize_results as org  # noqa: E402
 import run_campaign_analysis as rca  # noqa: E402
 from src.analysis.cellspec import CellSpec  # noqa: E402
@@ -91,8 +92,8 @@ REG_SHA = "deadbeefcafef00d"
 
 #: Deterministic per-baseline serving/quality offsets: B6 (RAG) pays TTFT vs
 #: B3 (CAG) on every example -> the paired Wilcoxon has an unambiguous sign.
-TTFT_OFFSET = {"B1": 200.0, "B2": 160.0, "B3": 140.0, "B6": 235.0, "B11": 180.0}
-F1_OFFSET = {"B1": 0.80, "B2": 0.65, "B3": 0.62, "B6": 0.71, "B11": 0.66}
+TTFT_OFFSET = {"B1": 200.0, "B2": 160.0, "B3": 140.0, "B6": 235.0, "B11": 180.0, "B12": 150.0}
+F1_OFFSET = {"B1": 0.80, "B2": 0.65, "B3": 0.62, "B6": 0.71, "B11": 0.66, "B12": 0.55}
 
 WINDOW_ARTIFACTS = (
     "requests.jsonl",
@@ -1178,16 +1179,32 @@ def test_member_expectation_is_per_dataset_not_per_endpoint_a7_1() -> None:
     by_leg = {p["dataset_metric"]: p for p in gate["primaries"]}
     assert by_leg["hotpotqa|ttft_ms"]["missing_members"] == []
     assert by_leg["hotpotqa|ttft_ms"]["p_value"] == 0.002
-    assert by_leg["squad_v2|ttft_ms"]["p_value"] == 0.003
+    # ADR-0178 amendment 4 (ruling A12, extended 2026-10-27): the reference
+    # engine hf is reported BESIDE the merge, never inside it, so squad_v2
+    # merges the server engine alone and hf's row rides the sidebar.
+    assert by_leg["squad_v2|ttft_ms"]["p_value"] == 0.001
+    assert [m["member"] for m in by_leg["squad_v2|ttft_ms"]["members"]] == ["vllm/single"]
     assert all(p["passed"] for p in gate["primaries"])
+    (side,) = gate["reference_engine_sidebar"]
+    assert side == {"tier": "primary", "endpoint": "contrast-4", "dataset_metric": "squad_v2|ttft_ms",
+                    "member": "hf/single", "p_value": 0.003, "delta": 2.0}
     # A member that supplied one metric of a dataset but not the other is
-    # padded on the leg it misses.
+    # padded on the leg it misses (two server engines: sglang pads vllm's
+    # predicate leg).
+    stats_two = [
+        _primary_entry("vllm", [
+            {"dataset": "squad_v2", "p_value": 0.001, "median_delta": 5.0},
+        ]),
+        _primary_entry("sglang", [
+            {"dataset": "squad_v2", "p_value": 0.003, "median_delta": 2.0},
+        ]),
+    ]
     predicate_only_vllm = dict(_primary_entry("vllm", [
         {"dataset": "squad_v2", "p_value": 0.004, "median_delta": 1.0},
     ]), metric="predicate")
-    gate2 = rca.run_gatekeeping(stats + [predicate_only_vllm], None)
+    gate2 = rca.run_gatekeeping(stats_two + [predicate_only_vllm], None)
     by_leg2 = {p["dataset_metric"]: p for p in gate2["primaries"]}
-    assert by_leg2["squad_v2|predicate"]["missing_members"] == ["hf/single"]
+    assert by_leg2["squad_v2|predicate"]["missing_members"] == ["sglang/single"]
     assert by_leg2["squad_v2|predicate"]["p_value"] == 1.0
 
 
@@ -2533,3 +2550,341 @@ def test_predicate_tree_refuses_a_file_added_after_its_build_c6(tmp_path: Path) 
     (rows.parent / "stray.jsonl").write_text("{}\n", encoding="utf-8")
     with pytest.raises(rca.AnalysisError, match="EXTRA"):
         rca._verify_predicate_tree(run_dir, pred_dir)
+
+
+# ---------------------------------------------------------------------------
+# ADR-0178 amendment 4 (block 3, owner 2026-10-27): the ruling-A13 engine merge
+# for secondaries, hf beside every merge, the truncation legs per cut and slot
+# ---------------------------------------------------------------------------
+
+
+def test_secondary_engine_members_merge_into_one_registered_outcome_a13(tmp_path: Path) -> None:
+    # Two engines serve contrast #1 (B1 vs B2); before the amendment each
+    # engine's row joined the Holm family as its own member and a two-engine
+    # tree exceeded the registered family size. Now one outcome per leg,
+    # the largest p over the engines, the members recorded beside it.
+    run_dir = _build_run_tree(tmp_path, extra_specs=_two_engine_b2_specs())
+    org.organize_run(run_dir)
+    assert rca.main([str(run_dir), "--contrasts", "4", "1"]) == 0
+    _, stats = _load_stats(run_dir)
+    rows = {}
+    for e in stats["contrasts"]:
+        if e["contrast_id"] == 1:
+            for r in e["per_dataset"]:
+                rows.setdefault(r["dataset"], []).append(r["p_value"])
+    assert all(len(v) == 2 for v in rows.values())
+    gate = stats["gatekeeping"]
+    sec = [s for s in gate["secondaries"] if s["contrast"].startswith("#1 ")]
+    assert len(sec) == len(DATASETS)
+    for s in sec:
+        dataset = s["dataset_metric"].split("|")[0]
+        assert s["p_value"] == max(rows[dataset])
+        assert s["members"] == ["sglang/single", "vllm/single"]
+        assert s["n_points"] == 1 and s["m_supplied"] == 1
+        assert s["status"] == "confirmatory"
+
+
+def test_reference_engine_rides_beside_the_secondary_merge(tmp_path: Path) -> None:
+    extra = [
+        CellSpec.from_baseline("B1", model=MODEL, engine="hf"),  # type: ignore[arg-type]
+        CellSpec.from_baseline("B6", model=MODEL, engine="hf"),  # type: ignore[arg-type]
+        CellSpec.from_baseline("B3", model=MODEL, engine="hf"),  # type: ignore[arg-type]
+    ]
+    run_dir = _build_run_tree(tmp_path, extra_specs=extra)
+    org.organize_run(run_dir)
+    assert rca.main([str(run_dir), "--contrasts", "4", "3"]) == 0
+    _, stats = _load_stats(run_dir)
+    gate = stats["gatekeeping"]
+    for p in gate["primaries"]:
+        assert [m["member"] for m in p["members"]] == ["vllm/single"]
+    vllm_p = {
+        (e["contrast_id"], r["dataset"]): r["p_value"]
+        for e in stats["contrasts"] if e["contrast_id"] == 3 and "|vllm|" in e["cell_row_key"]
+        for r in e["per_dataset"] if "p_value" in r
+    }
+    for s in gate["secondaries"]:
+        assert s["members"] == ["vllm/single"]
+        # the merged value is the server engine's own p (review LOW 12b)
+        assert s["p_value"] == vllm_p[(3, s["dataset_metric"].split("|")[0])]
+    side = gate["reference_engine_sidebar"]
+    assert {r["tier"] for r in side} == {"primary", "secondary"}
+    assert all(r["member"] == "hf/single" for r in side)
+    assert {r.get("endpoint") or r.get("contrast") for r in side} == {"contrast-4", "#3 Retrieval's price vs oracle context"}
+    summary = (sorted((run_dir / "analysis").iterdir())[-1] / "summary.md").read_text(encoding="utf-8")
+    assert "reference engine (beside, never inside)" in summary
+
+
+def _b12_cut_specs() -> list[CellSpec]:
+    """Contrast #15's F3 leg at TWO corpus cuts beside one B3 reference."""
+    return [
+        CellSpec.from_baseline("B12", model=MODEL, family="F3", budget_r=0.5, rate_frac=0.8, corpus_budget_tokens=700),  # type: ignore[arg-type]
+        CellSpec.from_baseline("B12", model=MODEL, family="F3", budget_r=0.5, rate_frac=0.8, corpus_budget_tokens=1400),  # type: ignore[arg-type]
+        CellSpec.from_baseline("B3", model=MODEL, family="F3", budget_r=0.5, rate_frac=0.8),  # type: ignore[arg-type]
+    ]
+
+
+def test_contrast_15_corpus_cuts_are_points_of_one_leg_d6(tmp_path: Path) -> None:
+    # Part 1, the driver: the F3 leg at two corpus cuts yields one entry per
+    # cut carrying its point, none skipped as a duplicate pair. #15 gates on
+    # the pressure chain (#14 / #13), which this invocation does not compute,
+    # so the rows are listed ungated here (the registered topology, C1).
+    run_dir = _build_run_tree(tmp_path, extra_specs=_f2_pair_specs() + _b12_cut_specs())
+    org.organize_run(run_dir)
+    assert rca.main([str(run_dir), "--contrasts", "4", "15"]) == 0
+    _, stats = _load_stats(run_dir)
+    f3 = [e for e in stats["contrasts"] if e["contrast_id"] == 15 and e["family"] == "F3"]
+    assert sorted(e["point"] for e in f3) == ["cb1400", "cb700"]
+    f2 = [e for e in stats["contrasts"] if e["contrast_id"] == 15 and e["family"] == "F2"]
+    assert len(f2) == 1 and f2[0]["point"] == ""
+    assert not any(s["contrast_id"] == 15 for s in stats["skipped"]["contrasts"])
+    ungated_15 = [u for u in stats["gatekeeping"]["ungated"] if u["contrast_id"] == 15]
+    assert {u["upstream"] for u in ungated_15 if u["dataset"] == PRESSURE} == {"contrast-13", "contrast-14"}
+
+
+def _secondary_entry_15(engine: str, cut: int, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "tier": "secondary",
+        "contrast_id": 15,
+        "name": "Truncation priced",
+        "metric": "ttft_ms",
+        "family": "F3",
+        "point": f"cb{cut}",
+        "cell_row_key": CellSpec.from_baseline(
+            "B12", model=MODEL, engine=engine, family="F3", budget_r=0.5,  # type: ignore[arg-type]
+            rate_frac=0.8, corpus_budget_tokens=cut,
+        ).to_row_key(),
+        "per_dataset": rows,
+    }
+
+
+def test_secondary_points_merge_engines_then_holm_then_max_a13_d6() -> None:
+    # Part 2, the merge rule: two engines of one point take the larger p;
+    # the two cuts of the leg enter Holm and the leg takes the maximum.
+    stats = [
+        _primary_entry("vllm", [{"dataset": "squad_v2", "p_value": 0.001, "median_delta": 5.0}]),
+        _secondary_entry_15("vllm", 700, [{"dataset": "squad_v2", "p_value": 0.004, "median_delta": -3.0}]),
+        _secondary_entry_15("sglang", 700, [{"dataset": "squad_v2", "p_value": 0.008, "median_delta": -2.0}]),
+        _secondary_entry_15("vllm", 1400, [{"dataset": "squad_v2", "p_value": 0.002, "median_delta": -4.0}]),
+    ]
+    gate = rca.run_gatekeeping(stats, None)
+    (leg,) = [s for s in gate["secondaries"] if s["contrast"].startswith("#15")]
+    # the point names the pressure slot of the row key and the cut: a pair
+    # served at several slots (S1: four) is several points of one leg
+    assert leg["n_points"] == 2
+    assert leg["members"] == ["sglang/single", "vllm/single"]
+    assert leg["points"]["r0.5|lam0.8|cb700"]["p_merged"] == 0.008
+    assert leg["points"]["r0.5|lam0.8|cb1400"]["p_merged"] == 0.002
+    assert [m["member"] for m in leg["points"]["r0.5|lam0.8|cb700"]["members"]] == ["sglang/single", "vllm/single"]
+    from src.analysis.stats.corrections import holm as holm_ref
+
+    assert leg["p_value"] == pytest.approx(float(max(holm_ref([0.008, 0.002]))))
+    assert leg["p_value"] == pytest.approx(0.008)
+    # a second slot of the same engine is a third point, not a duplicate
+    slot2 = dict(_secondary_entry_15("vllm", 700, [{"dataset": "squad_v2", "p_value": 0.5, "median_delta": -0.1}]))
+    slot2["cell_row_key"] = CellSpec.from_baseline(
+        "B12", model=MODEL, engine="vllm", family="F3", budget_r=0.25,  # type: ignore[arg-type]
+        rate_frac=0.8, corpus_budget_tokens=700,
+    ).to_row_key()
+    gate3 = rca.run_gatekeeping(stats + [slot2], None)
+    (leg3,) = [s for s in gate3["secondaries"] if s["contrast"].startswith("#15")]
+    assert leg3["n_points"] == 3 and "r0.25|lam0.8|cb700" in leg3["points"]
+    assert leg3["p_value"] == pytest.approx(float(max(holm_ref([0.008, 0.002, 0.5]))))
+    # the same engine twice on one point is ambiguous and refuses
+    with pytest.raises(rca.AnalysisError, match="supplied twice"):
+        rca.run_gatekeeping(stats + [stats[1]], None)
+    # an unpressured row with no cut occupies the empty point; the legacy
+    # pseudo-family keeps the F2 and F3 legs of one contrast apart (LOW 7)
+    assert rca._secondary_point({"budget_r": None, "rate_frac": None}) == ""
+    assert leg["family_id"].endswith("|F3")
+    # review LOW 5: the refusal names both cells; LOW 6: a non-finite p is a
+    # labeled refusal, never a bare ValueError
+    with pytest.raises(rca.AnalysisError, match="cells 'corpus-trunc"):
+        rca.run_gatekeeping(stats + [stats[1]], None)
+    nan_row = _secondary_entry_15("vllm", 700, [{"dataset": "squad_v2", "p_value": float("nan"), "median_delta": -1.0}])
+    with pytest.raises(rca.AnalysisError, match="secondary '#15 Truncation priced'"):
+        rca.run_gatekeeping([stats[0], nan_row], None)
+
+
+def test_fingerprint_truncate_leg_takes_every_slot_and_both_pairs(tmp_path: Path) -> None:
+    # Two B11/B6 pressure slots (two loads) and the B12/B3 pair at two cuts:
+    # before the amendment the second slot refused; now every point enters
+    # the truncate leg, Holm over the points, the leg takes the maximum.
+    base = dict(arm="gold-fresh", retriever="none", topology="single", engine="vllm",
+                model=MODEL, family="F2", budget_r=0.5, rate_frac=0.9)
+
+    def harm(level: float) -> EvidenceExtra:
+        return lambda i: {"grounding_score": level}
+
+    specs: list[tuple[CellSpec, EvidenceExtra]] = [
+        (CellSpec(policy="evict", **base), harm(0.70)),  # type: ignore[arg-type]
+        (CellSpec(policy="compress-fp8", **base), harm(0.75)),  # type: ignore[arg-type]
+        (CellSpec(policy="none", **base), harm(0.80)),  # type: ignore[arg-type]
+    ]
+    for rate in (0.8, 0.9):
+        specs += [
+            (CellSpec.from_baseline("B11", model=MODEL, family="F2", budget_r=0.5, rate_frac=rate), harm(0.72)),  # type: ignore[arg-type]
+            (CellSpec.from_baseline("B6", model=MODEL, family="F2", budget_r=0.5, rate_frac=rate), harm(0.80)),  # type: ignore[arg-type]
+        ]
+    # a second engine on one slot: its rows are members of that point (A13);
+    # half its pairs tie, so its p is larger than vllm's one-signed run
+    specs += [
+        (CellSpec.from_baseline("B11", model=MODEL, engine="sglang", family="F2", budget_r=0.5, rate_frac=0.8),  # type: ignore[arg-type]
+         lambda i: {"grounding_score": 0.80 if i % 2 else 0.76}),
+        (CellSpec.from_baseline("B6", model=MODEL, engine="sglang", family="F2", budget_r=0.5, rate_frac=0.8), harm(0.80)),  # type: ignore[arg-type]
+    ]
+    specs += [
+        (CellSpec.from_baseline("B12", model=MODEL, family="F3", budget_r=0.5, rate_frac=0.8, corpus_budget_tokens=700), harm(0.60)),  # type: ignore[arg-type]
+        (CellSpec.from_baseline("B12", model=MODEL, family="F3", budget_r=0.5, rate_frac=0.8, corpus_budget_tokens=1400), harm(0.70)),  # type: ignore[arg-type]
+        (CellSpec.from_baseline("B3", model=MODEL, family="F3", budget_r=0.5, rate_frac=0.8), harm(0.80)),  # type: ignore[arg-type]
+    ]
+    run_dir = _build_run_tree(tmp_path, special_specs=specs)
+    org.organize_run(run_dir)
+    assert rca.main([str(run_dir), "--equivalence-metric", "grounding_score"]) == 0
+    _, stats = _load_stats(run_dir)
+    fpr = stats["fingerprint"]
+    truncate = [leg for leg in fpr["legs"] if leg["leg"] == "truncate" and leg["dataset"] == PRESSURE]
+    # five rows: the lam0.8 slot of B11 vs B6 is served by two engines
+    assert sorted((leg["point"], leg["engine"]) for leg in truncate) == [
+        ("B11 vs B6|r0.5|lam0.8", "sglang"), ("B11 vs B6|r0.5|lam0.8", "vllm"),
+        ("B11 vs B6|r0.5|lam0.9", "vllm"),
+        ("B12 vs B3|r0.5|lam0.8|cb1400", "vllm"), ("B12 vs B3|r0.5|lam0.8|cb700", "vllm"),
+    ]
+    (lp,) = [x for x in fpr["leg_points"] if x["leg"] == "truncate" and x["dataset"] == PRESSURE]
+    assert lp["n_points"] == 4
+    from src.analysis.stats.corrections import holm as holm_ref
+
+    assert lp["p_leg"] == pytest.approx(float(max(holm_ref([v["p_merged"] for v in lp["points"].values()]))))
+    # engine members merge by the LARGEST p (review LOW 12a): sglang's
+    # milder harm gives the larger p, and the point takes it
+    two = lp["points"]["B11 vs B6|r0.5|lam0.8"]
+    assert set(two["engines"]) == {"sglang", "vllm"}
+    assert two["engines"]["sglang"] > two["engines"]["vllm"]
+    assert two["p_merged"] == max(two["engines"].values())
+    # each row carries its own point's Holm value, the leg's value apart (LOW 11)
+    for row in truncate:
+        assert row["p_holm_within_leg"] == lp["points"][row["point"]]["p_holm_within_leg"]
+        assert row["p_holm_within_fingerprint"] >= lp["p_leg"] or row["p_holm_within_fingerprint"] == pytest.approx(lp["p_leg"])
+    # policy legs are labeled by their policy, not by two equal baselines (LOW 8)
+    assert {leg["point"] for leg in fpr["legs"] if leg["leg"] == "evict"} == {"evict vs none|r0.5|lam0.9"}
+    assert {leg["point"] for leg in fpr["legs"] if leg["leg"] == "compress"} == {"compress-fp8 vs none|r0.5|lam0.9"}
+    assert "reference_sidebar" not in fpr
+    (iu,) = [x for x in fpr["per_dataset_intersection"] if x["dataset"] == PRESSURE]
+    assert iu["missing_legs"] == [] and iu["n_legs_supplied"] == 3
+    assert iu["p_intersection_union"] < 0.05
+
+
+def test_blinding_masks_the_corpus_cut_point(tmp_path: Path) -> None:
+    # Review of amendment 4 (HIGH 1): a cut label is legal on the truncated
+    # corpus arm only, so "cb700" in a masked entry named B12 and, through
+    # the registry, its B3 reference. No cut, pair or baseline string may
+    # survive in stats.json or summary.md.
+    run_dir = _build_run_tree(tmp_path, extra_specs=_f2_pair_specs() + _b12_cut_specs())
+    org.organize_run(run_dir)
+    _seal_arm_map(run_dir)
+    assert rca.main([str(run_dir), "--contrasts", "4", "15"]) == 0
+    analysis_dir, stats = _load_stats(run_dir)
+    assert stats["blinding"]["active"] is True
+    for e in stats["contrasts"]:
+        assert e.get("point", rca._BLINDED) == rca._BLINDED
+    blob = (analysis_dir / "stats.json").read_text(encoding="utf-8") + (analysis_dir / "summary.md").read_text(encoding="utf-8")
+    for needle in ("cb700", "cb1400", "B12", "B11 vs B6", "corpus-trunc"):
+        assert needle not in blob, needle
+
+
+def test_single_cut_b12_pair_keeps_its_cut_label(tmp_path: Path) -> None:
+    # Review of amendment 4 (MEDIUM 2): one served cut of two registered
+    # ones still names itself; the cut is read from the row key.
+    one_cut = [
+        CellSpec.from_baseline("B12", model=MODEL, family="F3", budget_r=0.5, rate_frac=0.8, corpus_budget_tokens=700),  # type: ignore[arg-type]
+        CellSpec.from_baseline("B3", model=MODEL, family="F3", budget_r=0.5, rate_frac=0.8),  # type: ignore[arg-type]
+    ]
+    run_dir = _build_run_tree(tmp_path, extra_specs=_f2_pair_specs() + one_cut)
+    org.organize_run(run_dir)
+    assert rca.main([str(run_dir), "--contrasts", "4", "15"]) == 0
+    _, stats = _load_stats(run_dir)
+    (f3,) = [e for e in stats["contrasts"] if e["contrast_id"] == 15 and e["family"] == "F3"]
+    assert f3["point"] == "cb700"
+    assert rca._secondary_point(fp.parse_row_key(f3["cell_row_key"])) == "r0.5|lam0.8|cb700"
+    assert rca._cut_of_key(f3["reference_row_key"]) == ""
+
+
+def test_reference_engine_only_invocation_keeps_its_rows_beside() -> None:
+    # Review of amendment 4 (MEDIUM 4): with no server engine primary the
+    # chain cannot run, and the hf rows are still reported beside it.
+    gate = rca.run_gatekeeping(
+        [_primary_entry("hf", [{"dataset": "squad_v2", "p_value": 0.003, "median_delta": 2.0}])], None
+    )
+    assert "skipped" in gate
+    assert gate["reference_engine_sidebar"] == [
+        {"tier": "primary", "endpoint": "contrast-4", "dataset_metric": "squad_v2|ttft_ms",
+         "member": "hf/single", "p_value": 0.003, "delta": 2.0}
+    ]
+    assert gate["reference_engine_rule"] == rca._REFERENCE_ENGINE_RULE
+
+
+def _plan_with_roster(tmp_path: Path, roster: Any) -> Path:
+    path = tmp_path / "plan_registered.json"
+    path.write_text(json.dumps({"behavior_knobs": {"corpus_trunc_budgets": roster}}), encoding="utf-8")
+    return path
+
+
+def test_cut_roster_labels_a_b12_slot_missing_a_registered_cut(tmp_path: Path) -> None:
+    # Review of amendment 4 (MEDIUM 2): the registered rungs are the points
+    # of the leg; a rung that never ran is a labeled note, never a shorter
+    # leg in silence. The check rides the registered plan.
+    one_cut = [
+        CellSpec.from_baseline("B12", model=MODEL, family="F3", budget_r=0.5, rate_frac=0.8, corpus_budget_tokens=700),  # type: ignore[arg-type]
+        CellSpec.from_baseline("B3", model=MODEL, family="F3", budget_r=0.5, rate_frac=0.8),  # type: ignore[arg-type]
+    ]
+    run_dir = _build_run_tree(tmp_path, extra_specs=_f2_pair_specs() + one_cut)
+    org.organize_run(run_dir)
+    plan = _plan_with_roster(tmp_path, [1400, 700])
+    assert rca.main([str(run_dir), "--contrasts", "4", "15", "--plan", str(plan)]) == 0
+    analysis_dir, stats = _load_stats(run_dir)
+    roster = stats["cut_roster"]
+    assert roster["registered"] == [700, 1400] and roster["slots_checked"] == 1
+    (note,) = roster["missing"]
+    assert note["contrast_id"] == 15 and note["served"] == [700] and note["missing"] == [1400]
+    assert note["slot"] == "r0.5|lam0.8" and note["engine"] == "vllm"
+    summary = (analysis_dir / "summary.md").read_text(encoding="utf-8")
+    assert "1 slot(s) missing a registered cut" in summary
+    assert "served [700], missing [1400]" in summary
+    # without --plan the section is absent, never a silent pass
+    assert rca.main([str(run_dir), "--contrasts", "4", "15"]) == 0
+    _, stats2 = _load_stats(run_dir)
+    assert stats2["cut_roster"] is None
+
+
+def test_cut_roster_passes_on_the_full_grid_and_refuses_a_malformed_roster(tmp_path: Path) -> None:
+    run_dir = _build_run_tree(tmp_path, extra_specs=_f2_pair_specs() + _b12_cut_specs())
+    org.organize_run(run_dir)
+    plan = _plan_with_roster(tmp_path, [1400, 700])
+    assert rca.main([str(run_dir), "--contrasts", "4", "15", "--plan", str(plan)]) == 0
+    _, stats = _load_stats(run_dir)
+    assert stats["cut_roster"] == {"registered": [700, 1400], "slots_checked": 1, "missing": []}
+    # a plan without the knob is a labeled note, not a refusal (the E1 plans)
+    bare = tmp_path / "bare_plan.json"
+    bare.write_text(json.dumps({"class_first_token_targets_s": {"480": 1.0}}), encoding="utf-8")
+    assert rca.load_cut_roster(bare) is None
+    assert rca.check_cut_roster([], None)["note"].startswith("the plan carries no")
+    for bad in ([], [700, 700], [0], ["700"], [True]):
+        with pytest.raises(rca.AnalysisError, match="corpus_trunc_budgets"):
+            rca.load_cut_roster(_plan_with_roster(tmp_path, bad))
+
+
+def test_cut_roster_notes_are_masked_under_blinding(tmp_path: Path) -> None:
+    one_cut = [
+        CellSpec.from_baseline("B12", model=MODEL, family="F3", budget_r=0.5, rate_frac=0.8, corpus_budget_tokens=700),  # type: ignore[arg-type]
+        CellSpec.from_baseline("B3", model=MODEL, family="F3", budget_r=0.5, rate_frac=0.8),  # type: ignore[arg-type]
+    ]
+    run_dir = _build_run_tree(tmp_path, extra_specs=_f2_pair_specs() + one_cut)
+    org.organize_run(run_dir)
+    _seal_arm_map(run_dir)
+    plan = _plan_with_roster(tmp_path, [1400, 700])
+    assert rca.main([str(run_dir), "--contrasts", "4", "15", "--plan", str(plan)]) == 0
+    analysis_dir, stats = _load_stats(run_dir)
+    assert stats["cut_roster"]["missing"] == rca._BLINDED
+    assert stats["cut_roster"]["n_missing"] == 1
+    blob = (analysis_dir / "stats.json").read_text(encoding="utf-8") + (analysis_dir / "summary.md").read_text(encoding="utf-8")
+    for needle in ("cb700", "B12", "corpus-trunc", "served [700]"):
+        assert needle not in blob, needle
