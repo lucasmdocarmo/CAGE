@@ -152,17 +152,23 @@ POD_ENGINE_ENV=""
 SGLANG_START_TIMEOUT="${SGLANG_START_TIMEOUT:-600}"
 POD_ENGINE_ENV=" SGLANG_START_TIMEOUT=$SGLANG_START_TIMEOUT$POD_ENGINE_ENV"
 FREEZE_FILE="${FREEZE_FILE:-$PROJECT_DIR/MyDocs/registration/freeze_resolutions.json}"
-# A10 (owner 2026-10-20): the served model's pinned revision (freeze slot
-# served_model); every engine job then loads it offline at that revision, and
+# A10 (owner 2026-10-20): the served model's pinned revision (a freeze slot
+# named served_model*, the one whose model is $MODEL; S2 block E-4 added one
+# slot per S2 served model); every engine job then loads it offline at that revision, and
 # setup prefetches every pinned revision and checks the Hub (a newer served
 # revision stops setup, never an automatic switch).
 MODEL_REVISION=""; PREFETCH_REVISIONS=""
 if [ "${PIN_MODEL_REVISION:-0}" = "1" ]; then
-  # review 2026-10-21 L2: only a pin for THIS model counts (stage 0 refuses an empty one)
-  MODEL_REVISION="$("${PY3:-python3}" -c 'import json,sys; s = ((json.load(open(sys.argv[1], encoding="utf-8")).get("INSTRUMENT_REVISIONS") or {}).get("served_model") or {}); print(s.get("revision") or "" if s.get("model") == sys.argv[2] else "")' "$FREEZE_FILE" "${MODEL:-}" 2>/dev/null || true)"
+  # review 2026-10-21 L2: only a pin for THIS model counts (stage 0 refuses an empty one);
+  # review 2026-11-01 (block E, L3): two served_model* slots naming this model with
+  # different revisions are no pin either (ambiguity refuses, never a silent first match)
+  MODEL_REVISION="$("${PY3:-python3}" -c 'import json,sys; d = json.load(open(sys.argv[1], encoding="utf-8")).get("INSTRUMENT_REVISIONS") or {}; r = sorted({v.get("revision") or "" for k, v in d.items() if k.startswith("served_model") and isinstance(v, dict) and v.get("model") == sys.argv[2]}); print(r[0] if len(r) == 1 else "")' "$FREEZE_FILE" "${MODEL:-}" 2>/dev/null || true)"
+  # review 2026-11-01 (block E, M1): only the models this landing prefetches carry a
+  # pin, so a slot for another landing's served model leaves the setup command unchanged
   PREFETCH_REVISIONS="$("${PY3:-python3}" -c 'import json,sys
 d = json.load(open(sys.argv[1], encoding="utf-8")).get("INSTRUMENT_REVISIONS") or {}
-print(" ".join("%s=%s" % (v["model"], v["revision"]) for v in d.values() if isinstance(v, dict) and v.get("model") and v.get("revision")))' "$FREEZE_FILE" 2>/dev/null || true)"
+want = set(sys.argv[2].split())
+print(" ".join("%s=%s" % (v["model"], v["revision"]) for v in d.values() if isinstance(v, dict) and v.get("model") in want and v.get("revision")))' "$FREEZE_FILE" "${PREFETCH_MODELS:-}" 2>/dev/null || true)"
   [ -n "$MODEL_REVISION" ] && POD_ENGINE_ENV=" HF_HUB_OFFLINE=1 CAGE_MODEL_REVISION=$MODEL_REVISION$POD_ENGINE_ENV"
 fi
 POD_FREEZE_FILE="MyDocs/registration/freeze_resolutions.json"
@@ -189,6 +195,10 @@ SEAL_BOUND_S=600; START_CHECK_BOUND_S=2400
 # 94 to 98 windows per engine at the measured 222 s per window (stage 5: 46 windows
 # in 10,195 s), 21,600 to 24,100 s [D]; the default doubles the larger figure's order.
 : "${CLASS_CEILINGS_BOUND_S:=36000}"
+# S2 block C (2026-11-01, charter 5.2): the stage 4 identity gate job bound on a
+# gated session (profile key, default in _common.env): two or three engine starts
+# (SGLang when the profile serves it) and up to 1,000 greedy requests of 32 tokens.
+: "${IDENTITY_GATE_BOUND_S:=3600}"
 
 seatbelt_minutes() { # "24h" | "90m" -> minutes, or empty when malformed
   # Audit 2026-10-17 (G30): "<n>d" is refused here; provision_pod.sh accepts h,
@@ -211,7 +221,10 @@ stage_bound_minutes() { # G16: the pod-side bound of ONE stage, in minutes (one 
       [ "${SUITE_ON_POD:-0}" = "1" ] && suite_min=30
       [ "${START_CHECK:-1}" = "1" ] && start_min=$(( START_CHECK_BOUND_S / 60 ))
       # S1 audit 2026-10-23: the load gate (600 s) and the offline dataset probe (600 s)
-      printf '%s' "$(( 20 + suite_min + n_srv * VALIDATE_BOUND_S / 60 + start_min ))" ;;
+      # S2 block C: the identity gate (stage 0 recorded the session as gated)
+      local ig_min=0
+      [ "$(state get registration.identity_gated 2>/dev/null || echo 0)" = "1" ] && ig_min=$(( IDENTITY_GATE_BOUND_S / 60 ))
+      printf '%s' "$(( 20 + suite_min + n_srv * VALIDATE_BOUND_S / 60 + start_min + ig_min ))" ;;
     calibrate) printf '%s' "$(( n_cal * CALIBRATE_BOUND_S / 60 + n_cal * CALIBRATE_RUNGS_BOUND_S / 60 ))" ;;
     plan)
       # ADR-0177: CLASS_CEILINGS=1 adds the ceiling-only ladders (one bound per
@@ -577,6 +590,8 @@ PY
 engine_launcher() { case "$1" in vllm) echo manage_vllm_server.sh ;; sglang) echo manage_sglang_server.sh ;; lmdeploy) echo manage_lmdeploy_server.sh ;; *) return 1 ;; esac; }
 engine_api()      { case "$1" in vllm) echo http://localhost:8000 ;; sglang) echo http://localhost:30000 ;; lmdeploy) echo http://localhost:23333 ;; *) return 1 ;; esac; }
 server_engines()  { local e; for e in $ENGINES; do [ "$e" = "hf" ] || echo "$e"; done; }
+# S2 block C: the QUERY_MANIFESTS entry the identity gate draws its prompts from (empty when none)
+gate_manifest()   { local item; for item in $QUERY_MANIFESTS; do [ "${item%%=*}" = "$IDENTITY_GATE_DATASET" ] || continue; printf '%s' "${item#*=}"; return 0; done; return 0; }
 
 # env pins run_campaign.py refuses on presence or on a mismatch (drift sweep 2026-10-06, 8e)
 RUN_ENV_UNSET="-u CAGE_SLO_FLOORS_JSON -u CAGE_BUDGET_PLAN_JSON -u CAGE_KV_CEILING -u CAGE_TELEMETRY_ENDPOINTS -u CAGE_ALLOW_STALE_INDEX -u CAGE_SGLANG_API_BASE -u CAGE_LMDEPLOY_API_BASE -u VLLM_PORT -u SGLANG_PORT -u CAGE_PD_PROXY_PORT -u CAGE_PD_PREFILL_PORT -u CAGE_PD_DECODE_PORT"
@@ -663,6 +678,38 @@ stage_preflight_mac() {
       return 1
     fi
   fi
+  # S2 block E-2 (owner 2026-11-01): a gated served model's Hub token travels as
+  # a FILE (HF_TOKEN_FILE on the Mac, outside the repo, mode 600) to
+  # $POD_HF_CACHE/token at stage 2, the path the hub reads under its default
+  # HF_HOME. The token never enters a shell variable, a job command, a step log
+  # or the state; stage 0 stats the file and refuses a bad one before anything bills.
+  if [ -n "${HF_TOKEN_FILE:-}" ]; then
+    run_step 0 "HF token file (E-2): regular, non-empty, mode 600, outside the repo" -- "$PY3" - "$HF_TOKEN_FILE" "$PROJECT_DIR" <<'PY' || return 1
+import os, stat, sys
+path, repo = sys.argv[1], sys.argv[2]
+bad = []
+if path.startswith("~"):
+    bad.append("the path starts with a literal ~ (write it unquoted so bash expands it, or absolute)")
+try:
+    st = os.stat(path)
+except OSError as exc:
+    bad.append("not readable: %s" % exc.strerror)
+else:
+    if not stat.S_ISREG(st.st_mode):
+        bad.append("not a regular file")
+    if st.st_size == 0:
+        bad.append("empty")
+    if stat.S_IMODE(st.st_mode) != 0o600:
+        bad.append("mode %04o, not 0600 (chmod 600 it)" % stat.S_IMODE(st.st_mode))
+    real, top = os.path.realpath(path), os.path.realpath(repo)
+    if real == top or real.startswith(top + os.sep):
+        bad.append("inside the repo at %s (the tarball would ship it)" % real)
+if bad:
+    print("  [FAIL] HF_TOKEN_FILE=%s: %s (E-2; the contents are never read or printed)" % (path, "; ".join(bad)))
+    sys.exit(1)
+print("HF_TOKEN_FILE_OK path=%s mode=0600 size=%d (contents never read)" % (path, st.st_size))
+PY
+  fi
   # The Mac suite is the free gate. MAC_SUITE=0 skips that one step loudly when
   # the profile vouches for HEAD and says why (SUITE_ON_POD=1 keeps the suite
   # on the pod); every other stage 0 check stays (owner, 2026-10-07, ADR-0145).
@@ -726,7 +773,8 @@ except Exception as exc:
     print(f"REFUSED: session {session!r}: {exc}"); sys.exit(1)
 print(f"session {session!r}: anchor shape {report['anchor_seq_tokens']} served tokens; {report['cells']} cells, "
       f"{report['executable_cells']} executable; NEEDS_LMCACHE={1 if report['needs_lmcache'] else 0}; "
-      f"LMCACHE_STORE_GIB={report.get('lmcache_store_gib') or 0}")
+      f"LMCACHE_STORE_GIB={report.get('lmcache_store_gib') or 0}; "
+      f"IDENTITY_GATED={1 if report.get('identity_gated') else 0}")
 # A11 item 4: the largest planned pool per engine, which stage 4 starts and checks
 for key, tag in (("largest_pools", "LARGEST_POOL"), ("largest_helper_pools", "LARGEST_HELPER_POOL")):
     for e, p in sorted((report.get(key) or {}).items()):
@@ -742,6 +790,20 @@ for p in report["problems"]:
 sys.exit(1 if report["problems"] else 0)
 PY
   plan_only || { if step_has "NEEDS_LMCACHE=1"; then state put registration.needs_lmcache 1; else state put registration.needs_lmcache 0; fi; }
+  # S2 block C (2026-11-01, charter 5.2): the registered grid says whether the
+  # session is identity gated (A-7); the gate's inputs, the manifest of
+  # IDENTITY_GATE_DATASET and the pinned served-model revision, are checked
+  # here, before anything bills, and the stage 4 bound grows by the gate's.
+  plan_only || { if step_has "IDENTITY_GATED=1"; then state put registration.identity_gated 1; else state put registration.identity_gated 0; fi; }
+  if ! plan_only && [ "$(state get registration.identity_gated 2>/dev/null || echo 0)" = "1" ]; then
+    local ig_manifest ig_bad="" ig_starts
+    ig_manifest="$(gate_manifest)"
+    [ -n "$ig_manifest" ] || ig_bad="$ig_bad no QUERY_MANIFESTS entry for IDENTITY_GATE_DATASET=$IDENTITY_GATE_DATASET (the gate draws its $IDENTITY_GATE_PROMPTS prompts from it);"
+    [ -n "$MODEL_REVISION" ] || ig_bad="$ig_bad MODEL_REVISION empty (PIN_MODEL_REVISION=${PIN_MODEL_REVISION:-0}; the gate renders its prompts with the pinned tokenizer and the verdict records the revision);"
+    [ -z "$ig_bad" ] || { printf '  [FAIL] session %s is identity gated (charter 5.2) but the gate inputs are missing:%s fix the profile before anything bills (S2 block C-1)\n' "$SESSION" "$ig_bad"; return 1; }
+    ig_starts="two"; case " $ENGINES " in *" sglang "*) ig_starts="three" ;; esac
+    say "identity gate (charter 5.2): $IDENTITY_GATE_PROMPTS $IDENTITY_GATE_DATASET prompts from $ig_manifest at revision $MODEL_REVISION; $ig_starts engine starts at stage 4 (+$((IDENTITY_GATE_BOUND_S / 60)) min on the validate bound)"
+  fi
   # S0F-88 U2: the largest LMCache CPU store the plan will size (GiB, 0 = none)
   plan_only || state put registration.lmcache_store_gib "$(grep -o 'LMCACHE_STORE_GIB=[0-9]*' "$STEP_LOG" | tail -1 | cut -d= -f2)"
   # A11 item 4 (owner 2026-10-21): stage 4 starts each engine at its largest planned pool
@@ -1068,6 +1130,19 @@ stage_ship() {
   run_step 0 "results root accepts | in names" -- pssh "d=$POD_REPO/results/.cage_name_probe_\$\$; mkdir -p \"\$d\" && if mkdir \"\$d/a|b\" 2>/dev/null; then rm -rf \"\$d\"; echo NAME_PROBE_OK; else rm -rf \"\$d\"; echo NAME_PROBE_REFUSED; fi" || return 1
   plan_only || step_has "NAME_PROBE_OK" || { printf '  [FAIL] the results root refuses the character | in file names (cell directories are row keys, S0F-39): set POD_RESULTS_DIR to a container-disk path in the profile, or choose a datacenter whose volume accepts it\n'; return 1; }
   run_step 0 "scp freeze file" -- pscp_to "$FREEZE_FILE" "$POD_REPO/$POD_FREEZE_FILE" || return 1
+  # S2 block E-2: the gated model's token lands at the pod's token path (the hub
+  # reads $HF_HOME/token; POD_HF_CACHE is that directory); no step carries its contents.
+  if [ -n "${HF_TOKEN_FILE:-}" ]; then
+    # review 2026-11-01 (block E, M2): the pod says where its hub reads the token
+    # (HF_TOKEN_PATH, else HF_HOME/token, else ~/.cache/huggingface/token); a
+    # POD_HF_CACHE that is not that directory is refused before the copy
+    run_step 0 "HF token: the pod's token path" -- pssh 'printf "HF_TOKEN_PATH=%s;\n" "${HF_TOKEN_PATH:-${HF_HOME:-$HOME/.cache/huggingface}/token}"' || return 1
+    plan_only || step_has "HF_TOKEN_PATH=$POD_HF_CACHE/token;" || { printf '  [FAIL] the pod reads its Hub token at another path than %s/token (see %s): POD_HF_CACHE must be the hub directory of the pod user, since no HF_HOME is set on the pod (E-2, B-4 option a)\n' "$POD_HF_CACHE" "$STEP_LOG"; return 1; }
+    run_step 0 "HF token: pod cache dir" -- pssh "mkdir -p $POD_HF_CACHE" || return 1
+    run_step 0 "scp HF token file" -- pscp_to "$HF_TOKEN_FILE" "$POD_HF_CACHE/token" || return 1
+    run_step 0 "HF token: mode 600 on the pod" -- pssh "chmod 600 $POD_HF_CACHE/token && test -s $POD_HF_CACHE/token && echo HF_TOKEN_OK" || return 1
+    plan_only || step_has "HF_TOKEN_OK" || { printf '  [FAIL] the token file on the pod is empty or its mode could not be set (E-2)\n'; return 1; }
+  fi
   return 0
 }
 
@@ -1158,6 +1233,8 @@ stage_validate() {
     grep "DATASETS_OFFLINE_OK" "$JOB_LOG" | tail -1 | sed 's/^/  /'
   fi
   local e launcher api
+  # S2 block C: the identity gate starts each engine at the env its validate start used
+  local ig_env_vllm="" ig_env_sglang=""
   for e in $(server_engines); do
     launcher="$(engine_launcher "$e")" || { printf '  [FAIL] unknown engine %s\n' "$e"; return 1; }
     api="$(engine_api "$e")"
@@ -1242,6 +1319,7 @@ stage_validate() {
     else
       lp_env="$tp_env_e"
     fi
+    case "$e" in vllm) ig_env_vllm="$lp_env" ;; sglang) ig_env_sglang="$lp_env" ;; esac
     # Review 2026-10-21 H1 (owner: "Add a check"): SGLang starts a second time at the
     # largest pool a GPU-helper cell plans, and the three helper probes run beside it
     local hp_tokens="" hp_bytes="" hp_tp="" hp_env="" helper="" vbound=1500
@@ -1293,6 +1371,55 @@ stage_validate() {
     grep -q "THINKING_PIN_OK" "$JOB_LOG" || { printf '  [FAIL] %s: the thinking pin probe did not pass (S0F-59, ADR-0151): the served text carried the thinking marker or the probe request failed\n' "$e"; grep 'THINKING_PIN_FAILED' "$JOB_LOG" | sed 's/^/    /'; return 1; }
     grep -q "COMPUTE_APPS=0" "$JOB_LOG" || { printf '  [FAIL] %s: compute apps remain after stop\n' "$e"; return 1; }
   done
+  # S2 block C-1 (2026-11-01, charter 5.2): on an identity-gated session the T=0
+  # token-identity gate runs here, after the engine probes and before the start
+  # check: the prompts (IDENTITY_GATE_PROMPTS questions of IDENTITY_GATE_DATASET,
+  # trial 1, rendered by the pinned tokenizer), then one start per server
+  # configuration at the env its validate start used (vLLM prefix on, vLLM
+  # prefix off, SGLang when the profile serves it), each with its run phase,
+  # then the verdict. PASS and FAIL are results the plan stage reads (A-7);
+  # ERROR fails this stage before stage 5 bills. The verdict's own exit (1 on
+  # ERROR) is not the job's: the fetched verdict file is judged on the Mac, so
+  # the log of an ERROR lands beside the other stage logs.
+  if [ "$(state get registration.identity_gated 2>/dev/null || echo 0)" = "1" ]; then
+    local ig_manifest ig_p="logs/identity_gate/prompts.json" ig_cmd ig_nosgl="" ig_vapi ig_sapi ig_verdict
+    ig_manifest="$(gate_manifest)"
+    [ -n "$ig_manifest" ] || { printf '  [FAIL] no QUERY_MANIFESTS entry for IDENTITY_GATE_DATASET=%s (stage 0 checks this; the profile changed since)\n' "$IDENTITY_GATE_DATASET"; return 1; }
+    [ -n "$MODEL_REVISION" ] || { printf '  [FAIL] MODEL_REVISION is empty on an identity-gated session (stage 0 checks this; the freeze file changed since)\n'; return 1; }
+    ig_vapi="$(engine_api vllm)"; ig_sapi="$(engine_api sglang)"
+    ig_cmd="rc=0; $POD_PYTHON scripts/checks/identity_gate.py prompts --manifest $ig_manifest --dataset $IDENTITY_GATE_DATASET --trial 1 --count $IDENTITY_GATE_PROMPTS --model '$MODEL' --revision $MODEL_REVISION --session $SESSION --out $ig_p || rc=1"
+    ig_cmd="$ig_cmd; if [ \$rc -eq 0 ]; then env$ig_env_vllm bash scripts/2_serving/manage_vllm_server.sh start '$MODEL' && $POD_PYTHON scripts/checks/identity_gate.py run --engine vllm --phase vllm_on --api-base $ig_vapi --model '$MODEL' --prompts $ig_p --passes 2 --out logs/identity_gate/vllm_on.json || rc=1; bash scripts/2_serving/manage_vllm_server.sh stop; fi"
+    ig_cmd="$ig_cmd; if [ \$rc -eq 0 ]; then env$ig_env_vllm bash scripts/2_serving/manage_vllm_server.sh start '$MODEL' --no-prefix-cache && $POD_PYTHON scripts/checks/identity_gate.py run --engine vllm --phase vllm_off --api-base $ig_vapi --model '$MODEL' --prompts $ig_p --passes 1 --out logs/identity_gate/vllm_off.json || rc=1; bash scripts/2_serving/manage_vllm_server.sh stop; fi"
+    case " $ENGINES " in
+      *" sglang "*) ig_cmd="$ig_cmd; if [ \$rc -eq 0 ]; then env$ig_env_sglang bash scripts/2_serving/manage_sglang_server.sh start '$MODEL' && $POD_PYTHON scripts/checks/identity_gate.py run --engine sglang --phase sglang --api-base $ig_sapi --model '$MODEL' --prompts $ig_p --passes 2 --out logs/identity_gate/sglang.json || rc=1; bash scripts/2_serving/manage_sglang_server.sh stop; fi" ;;
+      *) ig_nosgl=" --no-sglang" ;;
+    esac
+    ig_cmd="$ig_cmd; if [ \$rc -eq 0 ]; then $POD_PYTHON scripts/checks/identity_gate.py verdict --phases logs/identity_gate --out logs/identity_gate.json$ig_nosgl || true; fi"
+    ig_cmd="$ig_cmd; n=1; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do n=\$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . || true); [ \"\$n\" -eq 0 ] && break; sleep 2; done; echo COMPUTE_APPS=\$n; exit \$rc"
+    local ig_job=0
+    job_run identity_gate "$IDENTITY_GATE_BOUND_S" "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT$POD_ENGINE_ENV && $ig_cmd" "$LAND/logs/setup" || ig_job=1
+    plan_only || mkdir -p "$EXTRAS/identity_gate"
+    # review 2026-11-01 LOW 1: the record (prompts.json and each phase file, with
+    # its error reason and every request up to it) is fetched before the job's
+    # exit is judged, so a phase that died still leaves its evidence in extras
+    if ! run_step 0 "fetch the identity gate record (prompts and phases)" -- pscp_from "$POD_REPO/logs/identity_gate/." "$EXTRAS/identity_gate"; then
+      [ "$ig_job" -ne 0 ] || return 1
+    fi
+    [ "$ig_job" -eq 0 ] || { printf '  [FAIL] the identity gate job ended before a verdict (a prompt build refusal, a launcher start that did not come up, or a run phase that errored; the tail above names it): nothing bills at stage 5 on a session whose gate did not run (charter 5.2)\n'; return 1; }
+    run_step 0 "fetch the identity gate verdict" -- pscp_from "$POD_REPO/logs/identity_gate.json" "$EXTRAS/identity_gate/identity_gate.json" || return 1
+    if ! plan_only; then
+      grep -q "COMPUTE_APPS=0" "$JOB_LOG" || { printf '  [FAIL] identity gate: compute apps remain after stop\n'; return 1; }
+      { grep -E '^(comparisons:|error:|IDENTITY_GATE )' "$JOB_LOG" || true; } | sed 's/^/  /'
+      ig_verdict="$("$PY3" -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("verdict") or "")' "$EXTRAS/identity_gate/identity_gate.json" 2>/dev/null || true)"
+      case "$ig_verdict" in
+        PASS) state put stages.validate.identity_gate PASS
+              say "IDENTITY_GATE PASS: the aligned prefix cache changed no generated token on $IDENTITY_GATE_PROMPTS prompts; the gated cells run labeled experimental-align-mode (charter 5.2)" ;;
+        FAIL) state put stages.validate.identity_gate FAIL
+              say "IDENTITY_GATE FAIL: the aligned prefix cache changed generated tokens (the first divergence is in $EXTRAS/identity_gate/identity_gate.json). This IS a result (charter 5.2): the plan stage excludes the vLLM prefix-on cells of session $SESSION once the owner writes IDENTITY_FAIL_ACCEPTED=1 in the profile, and refuses until then" ;;
+        *)    printf '  [FAIL] identity gate verdict %s (charter 5.2: neither PASS nor FAIL): the gate did not run to a verdict; see the error line above and %s; nothing bills at stage 5\n' "${ig_verdict:-missing}" "$EXTRAS/identity_gate/identity_gate.json"; return 1 ;;
+      esac
+    fi
+  fi
   # Review 2026-10-13 (Part 8 option A1, items 29 and 32): the serving
   # configurations the run stage would start for the first time 15 to 27
   # pod-hours in are started ONCE here, each with one served request: SGLang
@@ -1562,7 +1689,29 @@ stage_plan() {
     # promoted only after the diff gate passes, so a refused re-plan never runs
     if plan_only || [ -f "$EXTRAS/plan_registered.json" ]; then replan=1; pout="results/calibration/plan_${RUN_ID}_candidate.json"; fi
   fi
-  job_run plan 900 "cd $POD_REPO && $POD_PYTHON scripts/3_run/run_campaign.py plan --session $SESSION --floor-table results/calibration/floor_table.json --window-duration-s $WINDOW_DURATION_S --seed $SEED$qm$cal$reh --calibration-budget-fraction $CALIBRATION_BUDGET_FRACTION --freeze-file $POD_FREEZE_FILE$front${LAST_BLOCK:+ --last-block $LAST_BLOCK}$ceil --out $pout" "$LAND/logs/setup" || return 1
+  # S2 block C (A-7, charter 5.2): on an identity-gated session the plan reads the
+  # stage 4 verdict; a FAIL runs only under the owner's written acceptance
+  # (IDENTITY_FAIL_ACCEPTED=1), which the planner turns into the exclusion of
+  # the session's vLLM prefix-on cells (blocked_on, ADR-0181).
+  local igf="" igv=""
+  if [ "$(state get registration.identity_gated 2>/dev/null || echo 0)" = "1" ]; then
+    igv="$(state get stages.validate.identity_gate 2>/dev/null || true)"
+    if ! plan_only; then
+      [ -n "$igv" ] || { printf '  [FAIL] session %s is identity gated but stage 4 recorded no identity verdict (stages.validate.identity_gate): rerun stage 4 (--only validate --redo)\n' "$SESSION"; return 1; }
+      if [ "$igv" = "FAIL" ] && [ "${IDENTITY_FAIL_ACCEPTED:-0}" != "1" ]; then
+        hr
+        printf 'IDENTITY GATE FAIL (charter 5.2): the aligned prefix cache changed generated tokens at stage 4\n'
+        printf '  verdict:  %s/identity_gate/identity_gate.json (comparisons A and B decide; the first divergence is recorded)\n' "$EXTRAS"
+        printf '  meaning:  the vLLM prefix-on cells of session %s cannot carry the experimental-align-mode label; the plan excludes them (blocked_on, ADR-0181) once you accept\n' "$SESSION"
+        printf '  action:   write IDENTITY_FAIL_ACCEPTED=1 in the profile (the written acceptance) and resume with --from plan; the pod keeps billing until then\n'
+        hr
+        return 1
+      fi
+    fi
+    igf=" --identity-gate logs/identity_gate.json"
+    [ "$igv" != "FAIL" ] || [ "${IDENTITY_FAIL_ACCEPTED:-0}" != "1" ] || igf="$igf --accept-identity-fail"
+  fi
+  job_run plan 900 "cd $POD_REPO && $POD_PYTHON scripts/3_run/run_campaign.py plan --session $SESSION --floor-table results/calibration/floor_table.json --window-duration-s $WINDOW_DURATION_S --seed $SEED$qm$cal$reh --calibration-budget-fraction $CALIBRATION_BUDGET_FRACTION --freeze-file $POD_FREEZE_FILE$front${LAST_BLOCK:+ --last-block $LAST_BLOCK}$ceil$igf --out $pout" "$LAND/logs/setup" || return 1
   if [ "$replan" -eq 1 ]; then
     run_step 0 "fetch the re-plan candidate" -- pscp_from "$POD_REPO/$pout" "$EXTRAS/plan_candidate.json" || return 1
     run_step 0 "plan diff: only the ceiling fields moved (ADR-0177)" -- "$PY" "$SCRIPTS/3_run/run_campaign.py" plan-diff --old "$EXTRAS/plan_registered.json" --new "$EXTRAS/plan_candidate.json" || return 1

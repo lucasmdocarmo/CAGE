@@ -206,7 +206,8 @@ def test_the_runner_stub_row_and_the_evidence_stub_carry_the_labels(tmp_path: Pa
 
 def test_confirmatory_family_map_compiles_over_the_registered_roster() -> None:
     model = next(iter(rca.GROUP_OF_MODEL))
-    index = pd.DataFrame([{"model": model, "dataset": d} for d in ("squad_v2", "qasper")])
+    # S2 (register A-4): the context reads the index's session for the pressure dataset
+    index = pd.DataFrame([{"model": model, "dataset": d, "session": "s1"} for d in ("squad_v2", "qasper")])
     ctx = rca.build_family_context(
         index, rca.DEFAULT_METRICS, 0.05, confirmatory=True,
         registered_datasets=["squad_v2", "musique", "qasper"],

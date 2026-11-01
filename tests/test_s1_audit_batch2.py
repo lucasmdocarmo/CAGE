@@ -71,7 +71,7 @@ def test_the_reserve_takes_whole_groups_outside_every_trial() -> None:
     # pool_target packs the whole slate (the default max(3N, N T) would stop at 15)
     m = build_manifest(pool, num_queries=5, num_trials=3, seed=1, block_budget=BUDGET, warmup_reserve=7,
                        pool_target=1000)
-    assert m["manifest_version"] == MANIFEST_VERSION == 4
+    assert m["manifest_version"] == MANIFEST_VERSION == 5  # v5 since S2 block A-6 (the tokenizer record)
     assert m["stats"]["pool_size"] == 40
     reserve = m["warmup_reserve"]
     reserved = set(reserve["ids"])

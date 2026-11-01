@@ -108,7 +108,13 @@ _ARMS_BY_FAMILY: dict[str, frozenset[str]] = {
             "corpus-trunc",
         }
     ),
-    "DIST": frozenset({"corpus-reuse", "gold-fresh"}),
+    # S2 experiment C (owner 2026-10-31, MyDocs/RunPod/S2_PLAN_2026-10-30.md
+    # section 8 decision 2): the disaggregation overlay carries the five
+    # full-grid arms, read against their TP=4 twins; before S2 it carried
+    # the #18 transfer pair alone.
+    "DIST": frozenset(
+        {"gold-fresh", "corpus-reuse", "corpus-fresh", "retr-fresh", "retr-reuse"}
+    ),
 }
 _LMDEPLOY_MODELS: frozenset[str] = frozenset({"qwen3-14b", "llama-3.3-70b"})
 _PRESSURE_FAMILIES: frozenset[str] = frozenset({"F2", "F3"})

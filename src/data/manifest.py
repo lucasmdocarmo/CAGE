@@ -65,7 +65,11 @@ from src.data.overlap import (  # re-exported: consumers import from either modu
 # v4 (2026-10-17, audit G4): + top-level "warmup_reserve" (whole context groups set
 #     aside before the trial draws for the ADR-0102 warm-up and the ADR-0172 pre-load;
 #     ids [] when none requested) and stats.warmup_reserve_n / stats.trial_pool_size
-MANIFEST_VERSION = 4
+# v5 (2026-11-01, S2 register A-6, DEC-2 (b)): + top-level "tokenizer" ({"id",
+#     "revision"} when the blocks and rungs were packed with an exact model
+#     tokenizer, null under the default word heuristic); block_budget is then in
+#     that tokenizer's tokens
+MANIFEST_VERSION = 5
 
 
 def _reserve_group_key(example: Any) -> tuple:
@@ -168,8 +172,17 @@ def build_manifest(
     overlap_group_size: int = 4,
     trunc_budgets: Tuple[int, ...] = (),
     warmup_reserve: int = 0,
+    count_tokens: Optional[Callable[[str], int]] = None,
+    tokenizer: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Build the manifest dict from loader examples (.id/.question/.context/.answer).
+
+    ``count_tokens`` (S2 register A-6, DEC-2 (b)): the token counter the corpus
+    blocks and the B12 rungs are packed with; None keeps the default word
+    heuristic (src.data.corpus.default_token_counter). ``tokenizer`` is the
+    provenance record written beside it ({"id", "revision"}). An engineered
+    overlap target refuses with a counter: the overlap planner budget-checks
+    with the default counter and the packer would then disagree with it.
 
     ``warmup_reserve`` (audit 2026-10-17, G4): the number of in-corpus questions
     to set aside, by whole context groups, for the runner's warm-up and pre-load
@@ -218,6 +231,13 @@ def build_manifest(
     question_to_block: Dict[str, int] = {}
     excluded: List[str] = []
 
+    if count_tokens is not None and overlap_target is not None:
+        raise ValueError(
+            "an engineered overlap target cannot be packed with an exact token counter: "
+            "plan_overlap_groups budget-checks with the default word counter and the packer "
+            "would disagree with it (S2 register A-6; build the engineered store without "
+            "--tokenizer, or add the counter seam to the planner first)"
+        )
     if overlap_target is not None:
         # Engineered-overlap store: seeded planner composes the query groups
         # (validates the knobs fail-closed), then each planned group packs into
@@ -232,7 +252,7 @@ def build_manifest(
             tolerance=overlap_tolerance,
         )
         for group in planned:
-            block = build_corpus_block(group, token_budget=block_budget)
+            block = build_corpus_block(group, token_budget=block_budget, count_tokens=count_tokens)
             # The planner budget-checked every addition with this same builder;
             # a partial pack here is a structural impossibility, not bad input.
             assert len(block.example_ids) == len(group), (
@@ -266,7 +286,7 @@ def build_manifest(
 
         remaining = ordered
         while remaining and len(question_to_block) < target:
-            block = build_corpus_block(remaining, token_budget=block_budget)
+            block = build_corpus_block(remaining, token_budget=block_budget, count_tokens=count_tokens)
             if not block.example_ids:
                 # The first example's paragraph alone exceeds the budget: exclude
                 # that whole paragraph group (counted) and continue with the rest.
@@ -342,7 +362,8 @@ def build_manifest(
             available = [i for i in available if i not in chosen]
 
     trunc_rungs = derive_trunc_rungs(
-        blocks, block_paragraphs, question_to_block, gold_by_id, trunc_budgets
+        blocks, block_paragraphs, question_to_block, gold_by_id, trunc_budgets,
+        count_tokens=count_tokens,
     )
 
     n_loaded = len(examples)
@@ -360,6 +381,7 @@ def build_manifest(
         "overlap": overlap,
         "trunc_rungs": trunc_rungs,
         "warmup_reserve": reserve,
+        "tokenizer": dict(tokenizer) if tokenizer else None,
         "stats": {
             "source_examples_loaded": n_loaded,
             "pool_size": len(pool_ids),

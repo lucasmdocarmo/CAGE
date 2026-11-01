@@ -28,6 +28,14 @@ same packed blocks truncated in packing order at each descending rung, every
 pool query labeled in-corpus / out-of-corpus by construction. A rung >= the
 block budget refuses (that point of the ladder is B3's own cell).
 
+S2 (register A-6, DEC-2 (b)): --tokenizer <hub id> [--tokenizer-revision <sha>]
+packs the blocks and rungs with that model's exact token counter (transformers
+AutoTokenizer, add_special_tokens=False) instead of the default word heuristic,
+records {"id", "revision"} under "tokenizer" (manifest v5) and tags the default
+filename with _tok-<last path element>, so manifests of two served models never
+collide. An engineered overlap target refuses with a counter (the planner has no
+counter seam).
+
 Needs the `datasets` package (loads the real split); pure CPU, no GPU/serving.
 """
 from __future__ import annotations
@@ -94,14 +102,37 @@ def main() -> int:
                         "refuses a manifest with fewer candidates than its registered "
                         "warm-up size. Default 0 (none). The default filename gains "
                         "_wr<n> when > 0.")
+    p.add_argument("--tokenizer", default=None,
+                   help="S2 register A-6: Hub id of the served model's tokenizer; the "
+                        "blocks and rungs are then packed in its exact tokens "
+                        "(--block-budget in model tokens). Default: the word heuristic.")
+    p.add_argument("--tokenizer-revision", default=None,
+                   help="The Hub revision (commit sha) of --tokenizer, recorded in the "
+                        "manifest; required with --tokenizer.")
     p.add_argument("--out", default=None,
                    help="Default: data/manifests/<dataset>_<N>x<T>_seed<seed>"
-                        "[_ov<target>][_wr<reserve>].json")
+                        "[_ov<target>][_wr<reserve>][_tok-<tokenizer>].json")
     args = p.parse_args()
     trunc_budgets = parse_trunc_budgets(args.trunc_budgets)
 
     from src.data.loader import get_loader, gold_only
     from src.data.manifest import build_manifest
+
+    count_tokens = None
+    tokenizer_record = None
+    if args.tokenizer:
+        if not args.tokenizer_revision:
+            raise SystemExit("--tokenizer needs --tokenizer-revision (the manifest records both)")
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(args.tokenizer, revision=args.tokenizer_revision)
+
+        def count_tokens(text: str) -> int:
+            return len(tok.encode(text, add_special_tokens=False))
+
+        tokenizer_record = {"id": args.tokenizer, "revision": args.tokenizer_revision}
+    elif args.tokenizer_revision:
+        raise SystemExit("--tokenizer-revision without --tokenizer")
 
     kwargs = {"seed": args.seed}
     if args.split:
@@ -129,16 +160,20 @@ def main() -> int:
         overlap_group_size=args.overlap_group_size,
         trunc_budgets=trunc_budgets,
         warmup_reserve=args.warmup_reserve,
+        count_tokens=count_tokens,
+        tokenizer=tokenizer_record,
     )
 
     # An engineered store is a DIFFERENT artifact than the natural manifest for
     # the same (dataset, N, T, seed): tag the default filename so they never collide.
     # So is a manifest with a warm-up reserve (its trials are drawn from a smaller pool).
+    # And one packed in a model's exact tokens (its block budget means another thing).
     ov_tag = f"_ov{args.overlap_target:g}" if args.overlap_target is not None else ""
     wr_tag = f"_wr{args.warmup_reserve}" if args.warmup_reserve > 0 else ""
+    tok_tag = f"_tok-{args.tokenizer.split('/')[-1]}" if args.tokenizer else ""
     out = Path(args.out) if args.out else (
         REPO_ROOT / "data" / "manifests"
-        / f"{args.dataset}_{args.num_queries}x{args.num_trials}_seed{args.seed}{ov_tag}{wr_tag}.json"
+        / f"{args.dataset}_{args.num_queries}x{args.num_trials}_seed{args.seed}{ov_tag}{wr_tag}{tok_tag}.json"
     )
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(manifest, indent=1), encoding="utf-8")
@@ -147,6 +182,7 @@ def main() -> int:
     print(f"MANIFEST_BUILT -> {out}")
     print(f"  dataset={args.dataset} split={split} N={args.num_queries} T={args.num_trials} "
           f"seed={args.seed} budget={args.block_budget}")
+    print(f"  tokenizer={tokenizer_record or 'default word heuristic (src.data.corpus.default_token_counter)'}")
     print(f"  blocks={s['n_blocks']} pool={s['pool_size']} loaded={s['source_examples_loaded']} "
           f"excluded={s['examples_excluded']} ({s['exclusion_rate']:.1%}) "
           f"trials_disjoint={s['trials_disjoint']}")

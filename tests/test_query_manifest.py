@@ -290,3 +290,88 @@ def test_trial_ids_are_prefix_stable_for_nested_cells() -> None:
     prefixes = [set(m["trials"][t][:4]) for t in ("1", "2", "3")]
     assert not (prefixes[0] & prefixes[1]) and not (prefixes[0] & prefixes[2])
     assert not (prefixes[1] & prefixes[2])
+
+
+# ---------------------------------------------------------------------------
+# S2 register A-6 (DEC-2 (b), 2026-11-01): manifest v5 packs the blocks and
+# the B12 rungs with an injected exact token counter and records the tokenizer
+# ---------------------------------------------------------------------------
+
+import importlib.util  # noqa: E402
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _word_counter(text: str) -> int:
+    """A stand-in exact counter: whole words (the heuristic is words x 4 // 3)."""
+    return len(text.split())
+
+
+def test_injected_counter_packs_blocks_and_rungs_in_its_own_units() -> None:
+    pool = make_pool()
+    counted = build_manifest(pool, num_queries=10, num_trials=2, seed=42, block_budget=BUDGET,
+                             trunc_budgets=RUNGS, count_tokens=_word_counter)
+    plain = build_manifest(pool, num_queries=10, num_trials=2, seed=42, block_budget=BUDGET,
+                           trunc_budgets=RUNGS)
+    assert counted["manifest_version"] == plain["manifest_version"] == 5
+    # every block and rung block is counted by the injected counter and stays
+    # within its budget in those units
+    for block in counted["blocks"]:
+        assert block["token_count"] == _word_counter(block["text"]) <= BUDGET
+    for b_str, rung in counted["trunc_rungs"].items():
+        for block in rung["blocks"]:
+            assert block["token_count"] == _word_counter(block["text"]) <= int(b_str)
+    # the units change the packing: 300 words hold 4 paragraphs (7 + 4 x 62 =
+    # 255; a fifth makes 317), the heuristic's 300 tokens hold 3 (257)
+    assert max(b["n_paragraphs"] for b in counted["blocks"]) == 4
+    assert max(b["n_paragraphs"] for b in plain["blocks"]) == 3
+    # the rungs follow the same counter: 200 words keep 3 paragraphs (193),
+    # 100 words keep 1 (69); the heuristic keeps 2 and 1
+    assert {b["n_paragraphs"] for b in counted["trunc_rungs"]["200"]["blocks"]} == {3}
+    assert {b["n_paragraphs"] for b in counted["trunc_rungs"]["100"]["blocks"]} == {1}
+    assert {b["n_paragraphs"] for b in plain["trunc_rungs"]["200"]["blocks"]} == {2}
+
+
+def test_tokenizer_record_round_trips_and_defaults_to_none() -> None:
+    pool = make_pool()
+    plain = build_manifest(pool, num_queries=10, num_trials=1, seed=42, block_budget=BUDGET)
+    assert plain["tokenizer"] is None
+    record = {"id": "Qwen/Qwen3-Next-80B-A3B-Instruct", "revision": "9c7f2fbe84465e40164a94cc16cd30b6999b0cc7"}
+    counted = build_manifest(pool, num_queries=10, num_trials=1, seed=42, block_budget=BUDGET,
+                             count_tokens=_word_counter, tokenizer=record)
+    assert counted["tokenizer"] == record and counted["tokenizer"] is not record
+    # the counter alone changes the packing; the record alone changes nothing
+    tagged = build_manifest(pool, num_queries=10, num_trials=1, seed=42, block_budget=BUDGET,
+                            tokenizer=record)
+    assert tagged["blocks"] == plain["blocks"] and tagged["tokenizer"] == record
+
+
+def test_engineered_overlap_refuses_an_injected_counter() -> None:
+    pool = make_pool()
+    with pytest.raises(ValueError, match="engineered overlap target cannot be packed with an exact token counter"):
+        build_manifest(pool, num_queries=10, num_trials=1, seed=42, block_budget=BUDGET,
+                       overlap_target=0.33, count_tokens=_word_counter)
+
+
+def _load_build_cli():
+    path = REPO_ROOT / "scripts" / "1_setup" / "build_query_manifest.py"
+    spec = importlib.util.spec_from_file_location("build_query_manifest", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize(
+    "argv, message",
+    [
+        (["--tokenizer", "Qwen/Qwen3-Next-80B-A3B-Instruct"], "--tokenizer needs --tokenizer-revision"),
+        (["--tokenizer-revision", "9c7f2fbe84465e40164a94cc16cd30b6999b0cc7"], "--tokenizer-revision without --tokenizer"),
+    ],
+)
+def test_cli_tokenizer_flags_come_as_a_pair(monkeypatch: pytest.MonkeyPatch, argv: list, message: str) -> None:
+    # refused before any split is loaded: the manifest records the pair or nothing
+    cli = _load_build_cli()
+    monkeypatch.setattr(sys, "argv", ["build_query_manifest.py", "--dataset", "musique", *argv])
+    with pytest.raises(SystemExit) as info:
+        cli.main()
+    assert message in str(info.value)

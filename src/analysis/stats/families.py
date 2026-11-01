@@ -86,18 +86,36 @@ KNOWN_DATASETS: frozenset[str] = frozenset(
 #: carried three phantom legs that no run could supply (G5 then failed them
 #: by construction) and a root missing a QA dataset compiled a smaller #4 set.
 PRESSURE_DATASET: str = "qasper"
+#: S2 (register A-4, owner 2026-10-31): the pressure dataset per session where
+#: it differs from the constant. cd-act1 (the 80B, experiments B and C) runs
+#: F2, F3 and DIST on MuSiQue; every other session (a, b, s1, s2a) keeps
+#: Qasper, the constant.
+PRESSURE_DATASET_BY_SESSION: dict[str, str] = {"cd-act1": "musique"}
 PRESSURE_FAMILY_SET: frozenset[str] = frozenset({"F2", "F3", "DIST"})
 
 
-def registered_datasets(family: str, datasets: Sequence[str]) -> tuple[str, ...]:
+def pressure_dataset(session: str | None = None) -> str:
+    """The dataset the pressure families compile on for ``session``: its
+    ``PRESSURE_DATASET_BY_SESSION`` entry when one is registered, else
+    ``PRESSURE_DATASET``. Both are read at call time, so a test that patches
+    the constant still steers the default."""
+    if session is not None and session in PRESSURE_DATASET_BY_SESSION:
+        return PRESSURE_DATASET_BY_SESSION[session]
+    return PRESSURE_DATASET
+
+
+def registered_datasets(
+    family: str, datasets: Sequence[str], *, session: str | None = None
+) -> tuple[str, ...]:
     """The datasets a family's rows compile on, out of the caller's roster.
 
     F1 rows compile on every roster dataset; F2, F3 and DIST rows compile on
-    ``PRESSURE_DATASET`` alone (none when the roster lacks it). Order follows
-    the roster.
+    the session's pressure dataset alone (``pressure_dataset(session)``; none
+    when the roster lacks it). Order follows the roster.
     """
     if family in PRESSURE_FAMILY_SET:
-        return tuple(d for d in datasets if d == PRESSURE_DATASET)
+        target = pressure_dataset(session)
+        return tuple(d for d in datasets if d == target)
     return tuple(datasets)
 # §9.1 co-primary metric pair (audit §2.1): serving = paired TTFT delta,
 # quality = the §8.5 per-dataset Y predicate. 2026-08-16 (assertion G7):
@@ -498,8 +516,12 @@ def compile_family_map(
     *,
     metrics: Sequence[str] = DEFAULT_METRICS,
     alpha: float = 0.05,
+    session: str | None = None,
 ) -> pd.DataFrame:
     """Expand the registry into the §9.3 registered test table.
+
+    ``session`` picks the pressure families' dataset (``pressure_dataset``:
+    MuSiQue on cd-act1, the constant Qasper elsewhere and when None).
 
     One row per contrast leg × carrying group × metric × dataset. Contrast
     #11's varied slot IS the dataset axis, so it emits a single
@@ -624,7 +646,7 @@ def compile_family_map(
             comparison = f"{a} vs {b}" if a is not None and b is not None else slot
             row_datasets: tuple[str, ...] = (
                 ("cross-dataset",) if slot == "dataset"
-                else registered_datasets(family, datasets)
+                else registered_datasets(family, datasets, session=session)
             )
             for group in groups:
                 for dataset in row_datasets:

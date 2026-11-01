@@ -106,7 +106,9 @@ CAMPAIGN_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 
 #: MUST equal organize_results.SESSIONS (§1 session vocabulary, RUNBOOK §1.1).
 #: "s1" (ADR-0175, 2026-10-20): the Run 2 session, registered blocks K1 to L6.
-SESSIONS: frozenset[str] = frozenset({"a", "b", "cd-act1", "cd-act2", "s1"})
+#: "s2a" (S2, owner 2026-10-31): the 70B session of experiment A, Group B
+#: re-homed on the S2 node (blocks X1 and X2); cd-act1 carries Y1, Y2, Z1.
+SESSIONS: frozenset[str] = frozenset({"a", "b", "cd-act1", "cd-act2", "s1", "s2a"})
 
 #: MUST equal organize_results.DATASET_IDS (§1 — the only legal window-name
 #: datasets).

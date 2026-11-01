@@ -1133,6 +1133,20 @@ SGLANG_STORE_BLOCKED_ON = (
     "sglang KV-store connector wiring (manage_sglang_server.sh, Wave-3)"
 )
 
+#: S2 block C (register A-7, charter 5.2, ADR-0181): the T=0 token-identity
+#: verdict an identity_gated session plans against (``plan --identity-gate
+#: PATH``: the file scripts/checks/identity_gate.py verdict writes at stage 4,
+#: fetched by the master). Its schema, the label every gated cell carries on
+#: PASS, and the blocked_on text of every executable prefix-on vLLM cell on an
+#: accepted FAIL (``--accept-identity-fail``, the owner's IDENTITY_FAIL_ACCEPTED=1).
+IDENTITY_GATE_SCHEMA = "cage.identity_gate/1"
+IDENTITY_GATE_LABEL_ON_PASS = "experimental-align-mode"
+IDENTITY_GATE_ADR = "ADR-0181"
+IDENTITY_GATE_BLOCKED_ON = (
+    "identity gate FAIL (charter 5.2, ADR-0181): vLLM's aligned Qwen3-Next prefix "
+    "cache changed generated tokens at T=0; the prefix-on vLLM cells are excluded"
+)
+
 #: cache_budget primary-knob flag -> the launcher env that carries it
 #: (frozen launcher contract; the vLLM blocks-override is the FALLBACK knob
 #: and is never emitted here — setting both is a launcher refusal).
@@ -1308,6 +1322,65 @@ DEMAND_CLASS_MAX_SERVED_TOKENS_2026_10_08: Dict[int, int] = {
     702: 1607,    # retr-comp
     480: 1551,    # corpus-trunc, 700-token rung
     348: 1068,    # retr-trunc
+}
+#: S2 register A-5 (owner 2026-10-31, method (b)): the MuSiQue demand classes
+#: of the Qwen3-Next-80B-A3B-Instruct session (cd-act1), derived on the Mac on
+#: 2026-11-01 by experiments/S1/2026-10-23_2350/plots/demand_tables_20261101/
+#: s2_demand_tables.py in manifest mode (its result files and run log sit
+#: beside it: demand_tables_musique_Qwen3-Next-80B-A3B-Instruct_manifest.json
+#: and .md). Every served prompt of the S1 MuSiQue windows on vLLM (cells root
+#: experiments/S1/2026-10-23_2350/run/camp1/s1/20261024-000946-s1-qwen3-14b/
+#: cells, 11,184 rows over the ten arms) is rebuilt from its recorded question
+#: and contexts with src.utils.prompting.format_qa_messages and rendered with
+#: the target tokenizer (Qwen/Qwen3-Next-80B-A3B-Instruct at revision
+#: 9c7f2fbe84465e40164a94cc16cd30b6999b0cc7, chat template with
+#: enable_thinking False and add_generation_prompt True, the adapter's pinned
+#: kwargs); the source rendering (Qwen/Qwen3-14B at revision
+#: 40c069824f4251a91eefaf281ebe4c544efd3e18) reproduces the recorded
+#: prompt_tokens exactly on every gold and retrieval row [V]. The corpus arms
+#: (B3, B4, B10, B12) serve the S2 manifest's 2,640-token blocks
+#: (data/manifests/musique_2000x3_seed42_wr50_tok-Qwen3-Next-80B-A3B-Instruct
+#: .json), not S1's 2,800-word blocks, so their prompts are rebuilt from that
+#: manifest's block of each question (its 700-token rung for corpus-trunc).
+#: Output tokens are the S1 vLLM counts per row [A: the 80B's output lengths
+#: are not measured; the S1 outputs are 5 to 9 tokens against prompts of 220
+#: to 2,700]. retr-store (B8) takes retr-fresh's shape [D], as on the
+#: 2026-10-08 table. The retrieval contexts are the S1 windows' [A: F-6
+#: rebuilds one corpus per dataset, so the passages retrieved on the pod may
+#: differ]. Values are the rounded means; two corpus classes differ by one
+#: token (2386 and 2387) and are kept as measured.
+DEMAND_SEQ_TOKENS_SOURCE_MUSIQUE_QWEN3_NEXT_2026_11_01 = (
+    "mean served sequence tokens (prompt + output) over the MuSiQue windows of "
+    "experiments/S1/2026-10-23_2350 on vLLM, prompts rebuilt and rendered with the "
+    "Qwen/Qwen3-Next-80B-A3B-Instruct tokenizer (revision "
+    "9c7f2fbe84465e40164a94cc16cd30b6999b0cc7), corpus arms from the S2 manifest's "
+    "2,640-token blocks, S1 vLLM output counts [A]; retr-store takes retr-fresh's "
+    "shape [D]; plots/demand_tables_20261101 (2026-11-01)"
+)
+DEMAND_SEQ_TOKENS_MUSIQUE_QWEN3_NEXT_2026_11_01: Dict[str, int] = {
+    "gold-fresh": 2694,
+    "gold-reuse": 2694,
+    "corpus-fresh": 2386,
+    "corpus-reuse": 2387,
+    "corpus-comp": 2386,
+    "retr-fresh": 506,
+    "retr-reuse": 517,
+    "retr-store": 506,
+    "retr-comp": 320,
+    "retr-trunc": 221,
+}
+CORPUS_TRUNC_DEMAND_SEQ_TOKENS_MUSIQUE_QWEN3_NEXT_2026_11_01: Dict[int, int] = {700: 690}
+#: ADR-0158 on cd-act1: served maxima (prompt + output) of the same rebuilt
+#: rows, keyed by the class's served tokens; no RULER rows on this session.
+DEMAND_CLASS_MAX_SERVED_TOKENS_MUSIQUE_QWEN3_NEXT_2026_11_01: Dict[int, int] = {
+    2694: 4939,  # gold-fresh and gold-reuse
+    2387: 2786,  # corpus-reuse
+    2386: 2786,  # corpus-fresh, corpus-comp
+    690: 860,    # corpus-trunc, 700-token rung
+    517: 1092,   # retr-reuse
+    506: 1196,   # retr-fresh; retr-store takes the same shape [D]
+    320: 589,    # retr-comp
+    221: 587,    # retr-trunc
 }
 REQUEST_CAP_MARGIN: float = 2.0
 REQUEST_CAP_ADR = "ADR-0158"
@@ -1523,6 +1596,26 @@ WINDOW_MAX_TOKENS: int = 256
 WINDOW_DESIGN_ADR = "ADR-0172"
 
 _PRESSURE_FAMILIES = frozenset({"F2", "F3"})
+
+
+def _pressure_spec(spec: CellSpec) -> bool:
+    """A cell served under an offered rate: the F2/F3 coordinate, or a DIST
+    row that carries a rate (S2 block Z1: the five arms on the PD stack at
+    the rung and load of their TP twins). The #18 references (DIST without a
+    rate) and every F1 cell are not pressure cells."""
+    return spec.family in _PRESSURE_FAMILIES or (
+        spec.family == "DIST" and spec.rate_frac is not None
+    )
+
+
+def _pressure_step(step: Mapping[str, Any]) -> bool:
+    """``_pressure_spec`` read from a plan step: a cell step carries its family
+    and flat cellspec; a dry window or relaunch step carries neither and is
+    never a pressure cell."""
+    family = step.get("family")
+    if family in _PRESSURE_FAMILIES:
+        return True
+    return family == "DIST" and (step.get("cellspec") or {}).get("rate_frac") is not None
 
 
 def class_floor_latency_bound_s(floor_ttft_s: float, floor_tpot_s: float, max_tokens: int) -> float:
@@ -1816,9 +1909,15 @@ def _grid_datasets(grid: "SessionGrid") -> FrozenSet[str]:
 #: ADR-0176 (owner 2026-10-22): P1, the S1 pressure table (every strategy on
 #: both engines at the constrained rungs), runs right after K1; K2 to K9 and
 #: L1 to L6 keep their names for S2. MyDocs/RunPod/S1_PLAN_2026-10-22.md.
+#: S2 (owner 2026-10-31, "Keep letters"; MyDocs/RunPod/S2_PLAN_2026-10-30.md
+#: sections 2 and 8): X1 the 70B full grid and X2 its one-point arms
+#: (experiment A, session s2a); Y1 the 80B full grid and Y2 its B8 point on
+#: vLLM (experiment B); Z1 the 80B full grid on the PD stack (experiment C);
+#: Y and Z share session cd-act1. A new block name never reuses a letter in use.
 BLOCK_ORDER: Tuple[str, ...] = (
     "K1", "P1", "K2", "K3", "K4", "K5", "K6", "K7", "K8", "K9",
     "L1", "L2", "L3", "L4", "L5", "L6",
+    "X1", "X2", "Y1", "Y2", "Z1",
 )
 LOAD_KINDS: Tuple[str, ...] = ("own", "slower", "frontier")
 
@@ -1858,8 +1957,9 @@ class Load:
 @dataclass(frozen=True)
 class PressurePoint:
     """One registered entry of a block: every baseline x engine x rung x load
-    of it is a pressure cell (F2 for the FRESH set, F3 for the REUSE set),
-    served ``windows`` times; RULER entries name their tasks."""
+    of it is a pressure cell (F2 for the FRESH set, F3 for the REUSE set;
+    DIST on a pd point), served ``windows`` times; RULER entries name their
+    tasks."""
 
     block: str
     baselines: Tuple[str, ...]
@@ -1869,6 +1969,10 @@ class PressurePoint:
     dataset: str = "qasper"
     windows: int = REPLICATIONS
     ruler_tasks: Tuple[str, ...] = ()
+    # S2 experiment C (register A-3, option (a)): "pd" enumerates the point's
+    # cells as DIST rows on the vLLM PD stack, each carrying the rung and
+    # load of its single-topology twin; "single" is every pre-S2 point.
+    topology: str = "single"
 
 
 @dataclass(frozen=True)
@@ -2002,6 +2106,9 @@ class SessionGrid:
     demand_class_max_served_tokens: Mapping[int, int] = field(
         default_factory=lambda: dict(DEMAND_CLASS_MAX_SERVED_TOKENS_2026_10_08)
     )
+    # S2 register A-5: where the three tables above were measured; the plan
+    # header (demand_classes.source) and the floor-shape refusal name it
+    demand_seq_tokens_source: str = DEMAND_SEQ_TOKENS_SOURCE
     # ADR-0175 (C4, Run 2): a block-registered session lists its pressure
     # cells here and the f2/f3/ruler cross products are not enumerated (the
     # f2/f3 fields then only describe the union, for the ladders and the
@@ -2014,6 +2121,12 @@ class SessionGrid:
     # The rung the calibration floor is measured at and every ladder starts
     # from (1.5 on session a; 1.25 on s1, ADR-0175 item 5: the control rung).
     floor_budget_r: float = FLOOR_BUDGET_FRACTION
+    # S2 (register A-2 and A-7; the identity gate C-1, plan section 7 "5.2"):
+    # True marks every executable prefix-on vLLM cell of the session as gated
+    # on the identity verdict (the plan header's identity_gated_row_keys);
+    # the verdict file that excludes them lands with block C. False on every
+    # other session, whose header carries an empty list.
+    identity_gated: bool = False
 
     def __post_init__(self) -> None:
         problems: List[str] = []
@@ -2072,6 +2185,11 @@ class SessionGrid:
                             f"demand_class_max_served_tokens lacks an integer >= 1 for the class of "
                             f"{seq} served tokens ({REQUEST_CAP_ADR}: the per-class request cap needs it)"
                         )
+        if not isinstance(self.demand_seq_tokens_source, str) or not self.demand_seq_tokens_source.strip():
+            problems.append(
+                f"demand_seq_tokens_source={self.demand_seq_tokens_source!r} must name where the "
+                f"demand tables were measured ({DEMAND_CLASS_ADR})"
+            )
         # A9 per-row N registration (fail closed on shapes; the classifier
         # and the manifest-coverage check refuse per cell at plan time).
         for name in ("n_primary", "n_secondary", "n_identity", "window_requests"):
@@ -2353,6 +2471,13 @@ class SessionGrid:
                 problems.append(f"{where}: dataset {point.dataset!r} is not a §1 dataset id")
             if point.ruler_tasks and set(point.baselines) != {"B1"}:
                 problems.append(f"{where}: RULER rides the oracle-context arm B1 only (D5 item 5)")
+            if point.topology not in ("single", "pd"):
+                problems.append(f"{where}: topology {point.topology!r} must be 'single' or 'pd'")
+            elif point.topology == "pd" and (set(point.engines) != {"vllm"} or point.ruler_tasks):
+                problems.append(
+                    f"{where}: a pd point rides the vLLM PD launcher only (manage_vllm_pd.sh) "
+                    "and carries no RULER task"
+                )
         if self.blocks and not any(r == self.floor_budget_r for p in self.blocks for r in p.rungs):
             problems.append(
                 f"floor_budget_r={self.floor_budget_r} is not a rung of any block: the ladders "
@@ -2588,6 +2713,142 @@ SESSION_GRIDS["s1"] = replace(
 )
 
 
+#: S2 (owner 2026-10-31; MyDocs/RunPod/S2_PLAN_2026-10-30.md sections 2, 8
+#: and 11; the build register A-1 to A-3): every full-grid cell runs the
+#: cache rungs {1.0, 0.5, 0.25} at loads 0.95 (two windows) and 1.05 (three
+#: windows) of its own measured rate, 15 windows per cell; a one-point cell
+#: runs r 0.25 at load 1.05 with three windows; every cell has one no-load
+#: reference (its F1 row at replications 1, or on the PD stack the #18-shaped
+#: DIST row at dist_budget_r). The 0.85 load and SQuAD v2 are out; LMDeploy
+#: is not in S2 (P7). Session s2a = experiment A (the 70B, Group B re-homed);
+#: cd-act1 = experiments B and C (the 80B, Group C).
+S2_RUNGS: Tuple[float, ...] = (1.0, 0.5, 0.25)
+S2_CONTROL_R: float = 1.0
+#: (load as a fraction of lambda*, windows): plan section 8, choice 23
+S2_LOADS: Tuple[Tuple[float, int], ...] = ((0.95, 2), (1.05, 3))
+S2_ONE_POINT_R: float = 0.25
+S2_ONE_POINT_LOAD: Tuple[float, int] = (1.05, 3)
+S2_CORE_ARMS: Tuple[str, ...] = ("B1", "B3", "B4", "B6", "B7")
+S2_ONE_POINT_ARMS: Tuple[str, ...] = ("B2", "B5", "B9", "B10", "B11", "B12")
+#: DEC-2 (b): five whole 528-token align quanta in the served model's tokenizer
+S2_CORPUS_BLOCK_TOKENS: int = 2640
+#: B12 at the 700 rung only (plan section 8, choice 24)
+S2_TRUNC_RUNGS: Tuple[int, ...] = (700,)
+
+
+def _s2_points(
+    block: str, baselines: Tuple[str, ...], engines: Tuple[str, ...], dataset: str,
+    *, topology: str = "single",
+) -> Tuple[PressurePoint, ...]:
+    """The full-grid points of one S2 block: one PressurePoint per load, so
+    the window counts differ (two at 0.95, three at 1.05)."""
+    return tuple(
+        PressurePoint(block, baselines, engines, S2_RUNGS, _own(frac), dataset=dataset,
+                      windows=windows, topology=topology)
+        for frac, windows in S2_LOADS
+    )
+
+
+_S2A_BLOCKS: Tuple[PressurePoint, ...] = (
+    *_s2_points("X1", S2_CORE_ARMS, _BOTH, "qasper"),
+    # the six coping arms at the harshest point (plan section 8, choice 24)
+    PressurePoint("X2", S2_ONE_POINT_ARMS, _BOTH, (S2_ONE_POINT_R,), _own(S2_ONE_POINT_LOAD[0]),
+                  dataset="qasper", windows=S2_ONE_POINT_LOAD[1]),
+)
+SESSION_GRIDS["s2a"] = replace(
+    SESSION_GRIDS["b"],
+    session="s2a",
+    # one no-load reference window per cell: the eleven S1 arms (no B8: no
+    # store on the 70B session) on both engines, Qasper, one trial
+    replications=1,
+    f1_baselines=tuple(b for b in _ALL_BASELINES if b != "B8"),
+    f1_datasets=("qasper",),
+    hf_oracle_cells=(),
+    # the union of the blocks' coordinates, read by the ladders (budgeted_rungs)
+    # and the header; enumeration reads the blocks
+    f2_budgets=S2_RUNGS,
+    f2_rates=tuple(frac for frac, _ in S2_LOADS),
+    f3_budgets=S2_RUNGS,
+    f3_rates=tuple(frac for frac, _ in S2_LOADS),
+    # no overlay on the 70B (experiment C runs on the 80B); the TP=8 dist leg
+    # of session b leaves with it, so the node is 4 GPUs (B-1 gpu_count_needed)
+    dist_cells=(),
+    dist_tp_size=None,
+    dist_pd_role_gpus=(1, 1),
+    corpus_prefix_budget_tokens=S2_CORPUS_BLOCK_TOKENS,
+    corpus_trunc_budgets=S2_TRUNC_RUNGS,
+    blocks=_S2A_BLOCKS,
+    # as session a: the Qasper dev split supplies 852 of the primary 2,000
+    # (A5) and the pressure window pool is 500 (E17)
+    achievable_n={"qasper": 852},
+    window_pool_n={"qasper": 500},
+    floor_budget_r=S2_CONTROL_R,
+    helpers_on_gpu=True,
+    # register A-5: the demand tables stay session b's (the 2026-10-08 Qasper
+    # means with the Qwen3-14B tokenizer) [A: the Llama-3.3-70B tokenizer is
+    # gated for this account and the S2 Qasper manifest is not built; the
+    # corpus classes also still describe 2,800-word blocks, not the 2,640-token
+    # blocks S2 serves; re-measure with s2_demand_tables.py once the tokenizer
+    # is readable, before the landing A floor table]
+)
+
+_CD_ACT1_BLOCKS: Tuple[PressurePoint, ...] = (
+    *_s2_points("Y1", S2_CORE_ARMS, _BOTH, "musique"),
+    # B8 (retr-store, LMCache) rides vLLM only: SGLang has no store connector
+    *_s2_points("Y2", ("B8",), ("vllm",), "musique"),
+    # experiment C: the five arms on the vLLM PD stack, roles (2, 2), read
+    # against their TP=4 twins in Y1 (same arm, engine, dataset, rung, load)
+    *_s2_points("Z1", S2_CORE_ARMS, ("vllm",), "musique", topology="pd"),
+)
+SESSION_GRIDS["cd-act1"] = SessionGrid(
+    session="cd-act1",
+    group="C",
+    model="qwen3-next-80b",
+    # one no-load reference per cell on MuSiQue; B8's SGLang row enumerates
+    # BLOCKED (no store connector) and is skipped loudly under SKIP_BLOCKED=1
+    f1_baselines=_ordered(frozenset(S2_CORE_ARMS + ("B8",))),
+    f1_engines=_BOTH,
+    f1_datasets=("musique",),
+    hf_oracle_cells=(),
+    f2_baselines=("B1", "B4", "B6"),
+    f2_engines=_BOTH,
+    f2_budgets=S2_RUNGS,
+    f2_rates=tuple(frac for frac, _ in S2_LOADS),
+    f2_dataset="musique",
+    f3_baselines=("B3", "B7", "B8"),
+    f3_engines=_BOTH,
+    f3_budgets=S2_RUNGS,
+    f3_rates=tuple(frac for frac, _ in S2_LOADS),
+    f3_dataset="musique",
+    # the five no-load PD references: the #18 shape (the registered
+    # dist_budget_r, no rate, the identity class) on the same stack as Z1
+    dist_cells=tuple((b, "vllm", "pd") for b in S2_CORE_ARMS),
+    replications=1,
+    corpus_prefix_budget_tokens=S2_CORPUS_BLOCK_TOKENS,
+    corpus_trunc_budgets=S2_TRUNC_RUNGS,
+    dist_pd_split=0.5,
+    dist_budget_r=S2_CONTROL_R,
+    serving_tp=4,
+    dist_tp_size=None,
+    dist_pd_role_gpus=(2, 2),
+    blocks=_CD_ACT1_BLOCKS,
+    # the pressure window pool, as Qasper's on s1 [A: the plan does not
+    # restate it; the S2 MuSiQue manifest carries 2,000 x 3 for the references]
+    window_pool_n={"musique": 500},
+    floor_budget_r=S2_CONTROL_R,
+    helpers_on_gpu=True,
+    # register A-5 (method (b)): the MuSiQue classes measured with the 80B
+    # tokenizer on 2026-11-01 (the provenance comment above the tables)
+    demand_seq_tokens=dict(DEMAND_SEQ_TOKENS_MUSIQUE_QWEN3_NEXT_2026_11_01),
+    corpus_trunc_demand_seq_tokens=dict(CORPUS_TRUNC_DEMAND_SEQ_TOKENS_MUSIQUE_QWEN3_NEXT_2026_11_01),
+    demand_class_max_served_tokens=dict(DEMAND_CLASS_MAX_SERVED_TOKENS_MUSIQUE_QWEN3_NEXT_2026_11_01),
+    demand_seq_tokens_source=DEMAND_SEQ_TOKENS_SOURCE_MUSIQUE_QWEN3_NEXT_2026_11_01,
+    # register A-2: the prefix-on vLLM cells of the hybrid are gated on the
+    # identity verdict (C-1); A-7 (block C) reads the verdict file
+    identity_gated=True,
+)
+
+
 def get_session_grid(session: str) -> SessionGrid:
     """The registered grid for a session — fail closed on both unknowns."""
     if session not in SESSIONS:
@@ -2600,7 +2861,7 @@ def get_session_grid(session: str) -> SessionGrid:
         raise PlanError(
             f"session {session!r} is in the §1 vocabulary but its grid is NOT "
             f"yet registered in this driver (registered: {sorted(SESSION_GRIDS)}); "
-            "the cd-* sessions land with the Group-C/D topology registrations — "
+            "cd-act2 lands with the Group-D registration; "
             "refusing to fabricate a grid"
         )
     return grid
@@ -2863,7 +3124,10 @@ def _mac_relaunch_records(
         if spec.topology == "tp":
             r, tp, topology, split = grid.dist_budget_r, int(grid.dist_tp_size or 1), "tp", None
         elif spec.topology == "pd":
-            r, tp, topology, split = grid.dist_budget_r, 1, "pd", grid.dist_pd_split
+            # S2 block Z1: a pd row of a block carries its own rung; the #18
+            # references (no rung) keep the registered dist_budget_r
+            r = grid.dist_budget_r if spec.budget_r is None else float(spec.budget_r)
+            tp, topology, split = 1, "pd", grid.dist_pd_split
         else:
             r, tp, topology, split = float(spec.budget_r), int(grid.serving_tp), "single", None
             if tp != 1:
@@ -2944,6 +3208,8 @@ def preflight_registration_check(
         env every server engine's start carries at serving_tp >= 2, empty at
         1), "gpu_count_needed": int or None (the largest GPU count an
         executable cell launches with, _cell_gpu_count),
+        "identity_gated": bool (S2 block C: the session plans only against
+        the stage 4 identity verdict, which the master runs at stage 4),
         "problems": [str]} where an empty problems list is a pass.
 
     Raises: nothing on a registration problem (recorded in ``problems``); a
@@ -2956,7 +3222,7 @@ def preflight_registration_check(
         return {
             "session": session, "anchor_seq_tokens": None, "cells": 0,
             "executable_cells": 0, "needs_lmcache": False, "lmcache_store_gib": None,
-            "problems": [str(exc)],
+            "identity_gated": False, "problems": [str(exc)],
         }
     anchor = int(grid.demand_seq_tokens[DEMAND_ANCHOR_ARM])
     if str(floor_avg_seq_tokens).strip() != str(anchor):
@@ -3072,6 +3338,7 @@ def preflight_registration_check(
         "largest_helper_pools": largest_helpers,
         "tp_env": tp_env,
         "gpu_count_needed": gpu_count_needed,
+        "identity_gated": bool(grid.identity_gated),
         "problems": problems,
     }
 
@@ -3739,7 +4006,7 @@ def window_span_summary(cell_steps: Sequence[Mapping[str, Any]]) -> Dict[str, An
     spans: List[Tuple[float, int]] = []
     for s in cell_steps:
         span = s.get("window_span_s_expected")
-        if s.get("family") in _PRESSURE_FAMILIES and s.get("blocked_on") is None and isinstance(span, (int, float)):
+        if _pressure_step(s) and s.get("blocked_on") is None and isinstance(span, (int, float)):
             seq = (s.get("demand_class") or {}).get("seq_tokens")
             spans.append((float(span), int(seq) if isinstance(seq, int) else 0))
     values = sorted(v for v, _seq in spans)
@@ -3759,12 +4026,12 @@ def window_span_summary(cell_steps: Sequence[Mapping[str, Any]]) -> Dict[str, An
         ),
         "durations_s": sorted({
             int(s["window"]["duration_s"]) for s in cell_steps
-            if s.get("family") in _PRESSURE_FAMILIES and s.get("blocked_on") is None
+            if _pressure_step(s) and s.get("blocked_on") is None
             and isinstance(s.get("window"), dict)
         }),
         "passes_max": max(
             (int(s["window"]["passes"]) for s in cell_steps
-             if s.get("family") in _PRESSURE_FAMILIES and s.get("blocked_on") is None
+             if _pressure_step(s) and s.get("blocked_on") is None
              and isinstance(s.get("window"), dict)),
             default=None,
         ),
@@ -3886,12 +4153,21 @@ def _block_cells(grid: SessionGrid, rung_specs: Callable[..., List[CellSpec]]) -
             )
         tasks: Sequence[Optional[str]] = point.ruler_tasks or (None,)
         for bid in point.baselines:
-            family = "F2" if bid in FRESH_SET else "F3"
+            # S2 block Z1: a pd point's cells are DIST rows on the PD stack
+            # (cellspec: topology pd requires family DIST), each with the rung
+            # and load of its single-topology twin
+            if point.topology == "pd":
+                family = "DIST"
+            else:
+                family = "F2" if bid in FRESH_SET else "F3"
             for engine in point.engines:
                 for r in point.rungs:
                     for load in point.loads:
                         frac = load.frac if load.kind == "own" else None
-                        for spec in rung_specs(bid, engine=engine, family=family, budget_r=r, rate_frac=frac):
+                        for spec in rung_specs(
+                            bid, engine=engine, family=family, topology=point.topology,
+                            budget_r=r, rate_frac=frac,
+                        ):
                             for task in tasks:
                                 cell = PlannedCell(
                                     spec=spec,
@@ -3964,8 +4240,57 @@ def enumerate_cells(grid: SessionGrid) -> List[PlannedCell]:
             for spec in _rung_specs(bid, engine="hf", family="F1"):
                 cells.append(_planned(spec, bid, dataset))
 
+    def _dist_cells() -> List[PlannedCell]:
+        # S2 (block Z1's session carries both blocks and dist_cells): the
+        # overlay references enumerate on block sessions too, so the DIST
+        # branch is one helper called on both paths (the non-block order
+        # below is unchanged).
+        out: List[PlannedCell] = []
+        # DIST: the topology overlay. pd cells on vllm are EXECUTABLE since T3.2
+        # (manage_vllm_pd.sh + pd_proxy.py); they carry the --allow-pd gate label
+        # instead of blocked_on. tp cells are EXECUTABLE (W4.6) when the session
+        # registered a dist_tp_size AND the engine has a T3.1 TP launch env.
+        # Everything else stays enumerated-but-blocked: pd on an engine with no
+        # PD launcher, and the tp overlay on an unregistered degree or a
+        # TP-env-less engine ('run' refuses blocked cells loudly).
+        for bid, engine, topology in grid.dist_cells:
+            spec = CellSpec.from_baseline(
+                bid,
+                engine=engine,  # type: ignore[arg-type]
+                model=grid.model,  # type: ignore[arg-type]
+                family="DIST",
+                topology=topology,  # type: ignore[arg-type]
+            )
+            if topology == "pd":
+                if engine != "vllm":
+                    blocked: Optional[str] = (
+                        f"{engine} PD launcher (manage_vllm_pd.sh is vLLM-only; "
+                        "other engines' PD rides its own Wave-3 wiring)"
+                    )
+                else:
+                    blocked = _launch_blocked_on(spec)  # arm levers still gate
+            elif grid.dist_tp_size is None:
+                blocked = TP_DIST_BLOCKED_ON
+            elif engine not in TP_LAUNCH_ENV:
+                blocked = (
+                    f"{engine} launcher has no T3.1 tensor-parallel env "
+                    f"(registered: {sorted(TP_LAUNCH_ENV)})"
+                )
+            else:
+                blocked = _launch_blocked_on(spec)  # arm levers still gate
+            out.append(
+                PlannedCell(
+                    spec=spec,
+                    baseline_id=bid,
+                    dataset=grid.f1_datasets[0],
+                    blocked_on=blocked,
+                )
+            )
+        return out
+
     if grid.blocks:
         cells.extend(_block_cells(grid, _rung_specs))
+        cells.extend(_dist_cells())
         return cells
 
     # F2 — pressure, prefix OFF. Grid points = the §6.1/§6.8 factorial PLUS
@@ -4050,46 +4375,7 @@ def enumerate_cells(grid: SessionGrid) -> List[PlannedCell]:
                     ):
                         cells.append(_planned(spec, bid, grid.f3_dataset))
 
-    # DIST — topology overlay. pd cells on vllm are EXECUTABLE since T3.2
-    # (manage_vllm_pd.sh + pd_proxy.py); they carry the --allow-pd gate label
-    # instead of blocked_on. tp cells are EXECUTABLE (W4.6) when the session
-    # registered a dist_tp_size AND the engine has a T3.1 TP launch env.
-    # Everything else stays enumerated-but-blocked: pd on an engine with no
-    # PD launcher, and the tp overlay on an unregistered degree or a
-    # TP-env-less engine ('run' refuses blocked cells loudly).
-    for bid, engine, topology in grid.dist_cells:
-        spec = CellSpec.from_baseline(
-            bid,
-            engine=engine,  # type: ignore[arg-type]
-            model=grid.model,  # type: ignore[arg-type]
-            family="DIST",
-            topology=topology,  # type: ignore[arg-type]
-        )
-        if topology == "pd":
-            if engine != "vllm":
-                blocked: Optional[str] = (
-                    f"{engine} PD launcher (manage_vllm_pd.sh is vLLM-only; "
-                    "other engines' PD rides its own Wave-3 wiring)"
-                )
-            else:
-                blocked = _launch_blocked_on(spec)  # arm levers still gate
-        elif grid.dist_tp_size is None:
-            blocked = TP_DIST_BLOCKED_ON
-        elif engine not in TP_LAUNCH_ENV:
-            blocked = (
-                f"{engine} launcher has no T3.1 tensor-parallel env "
-                f"(registered: {sorted(TP_LAUNCH_ENV)})"
-            )
-        else:
-            blocked = _launch_blocked_on(spec)  # arm levers still gate
-        cells.append(
-            PlannedCell(
-                spec=spec,
-                baseline_id=bid,
-                dataset=grid.f1_datasets[0],
-                blocked_on=blocked,
-            )
-        )
+    cells.extend(_dist_cells())
 
     if not cells:
         raise PlanError(
@@ -4183,7 +4469,7 @@ def _check_floor_shape(grid: SessionGrid, floor: FloorTable) -> int:
             f"floor table {floor.path} was sized on avg_seq_tokens="
             f"{floor.avg_seq_tokens} but session {grid.session!r} registers "
             f"{anchor} served tokens for the anchor arm {DEMAND_ANCHOR_ARM!r} "
-            f"({DEMAND_CLASS_ADR}: {DEMAND_SEQ_TOKENS_SOURCE}); rebuild the table "
+            f"({DEMAND_CLASS_ADR}: {grid.demand_seq_tokens_source}); rebuild the table "
             f"with --avg-seq-tokens {anchor} (profile FLOOR_AVG_SEQ_TOKENS) or "
             "re-register the shape"
         )
@@ -4303,8 +4589,10 @@ def classify_row(
     - engine hf -> "identity" (the HF-oracle / T=0 identity cells);
     - family F2/F3, or the RULER instrument dataset -> "window" (loaded
       cells: W requests per window);
-    - family DIST -> "identity" (the TTFT-only topology contrast #18: a
-      closed-loop latency pair, never a per-query predicate cell);
+    - family DIST with a rate (S2 block Z1: the PD stack under the same rung
+      and load as its TP twin) -> "window"; without one -> "identity" (the
+      TTFT-only topology contrast #18: a closed-loop latency pair, never a
+      per-query predicate cell);
     - family F1 with baseline in ``primary_baselines`` on ``primary_engine``
       -> "primary" (the #4 contrast cells); every other F1 cell ->
       "secondary".
@@ -4314,7 +4602,7 @@ def classify_row(
     """
     if spec.engine == "hf":
         return "identity"
-    if spec.family in _PRESSURE_FAMILIES or dataset == "ruler":
+    if _pressure_spec(spec) or dataset == "ruler":
         return "window"
     if spec.family == "DIST":
         return "identity"
@@ -4535,10 +4823,13 @@ def _pd_budget_env(
     *,
     seq_tokens: int,
     anchor_tokens: int,
+    budget_r: Optional[float] = None,
 ) -> Tuple[Dict[str, str], Dict[str, Any], BudgetPlan]:
-    """PD launcher env: the §6.5 split of floor(dist_budget_r × D) into the
-    two REQUIRED per-role byte budgets, plus the role-tagged telemetry
-    endpoints. ``role_tp`` is the TP degree BOTH role instances launch with
+    """PD launcher env: the §6.5 split of floor(r × D) into the two REQUIRED
+    per-role byte budgets, plus the role-tagged telemetry endpoints. ``r`` is
+    ``budget_r``, the rung of a pd row that carries one (S2 block Z1), or
+    the registered dist_budget_r when None (the #18 references).
+    ``role_tp`` is the TP degree BOTH role instances launch with
     (the frozen one-env launcher contract): the launcher passes each budget
     env VERBATIM as ``--kv-cache-memory-bytes`` on that instance, and the
     flag's registered convention is PER-RANK (the same convention the paired
@@ -4554,12 +4845,13 @@ def _pd_budget_env(
             f"{floor.kv_dtype!r} but the pd relaunch is a plain launch — "
             "rebuild with --kv-dtype bf16"
         )
-    row = floor.row(grid.dist_budget_r)
+    r = grid.dist_budget_r if budget_r is None else float(budget_r)
+    row = floor.row(r)
     try:
         plan = plan_budget(
             model=model,
             engine=engine,
-            r=grid.dist_budget_r,
+            r=r,
             # ADR-0155: the DIST leg's demand is its arm's class (B1 gold, B3
             # corpus), the same scaling as the single-instance relaunches.
             demand=_class_demand_bytes(int(row["demand_bytes"]), seq_tokens, anchor_tokens),
@@ -4571,7 +4863,7 @@ def _pd_budget_env(
     except CacheBudgetError as exc:
         raise PlanError(
             f"pd budget planning refused for engine={engine} "
-            f"r={grid.dist_budget_r:g} split={grid.dist_pd_split:g}: {exc}"
+            f"r={r:g} split={grid.dist_pd_split:g}: {exc}"
         ) from exc
     assert plan.pools_bytes is not None  # topology='pd' always emits pools
     prefill_bytes, decode_bytes = plan.pools_bytes
@@ -4599,7 +4891,7 @@ def _pd_budget_env(
     }
     record = {
         "split": grid.dist_pd_split,
-        "budget_r": grid.dist_budget_r,
+        "budget_r": r,
         "budget_bytes_total": plan.budget_bytes_total,
         "prefill_bytes": prefill_bytes,
         "decode_bytes": decode_bytes,
@@ -4654,7 +4946,7 @@ def _relaunch_step(
         assert seq_tokens is not None  # a pd config is budgeted by identity
         env, pd_record, plan = _pd_budget_env(
             grid, engine, model, floor, role_tp,
-            seq_tokens=seq_tokens, anchor_tokens=anchor_tokens,
+            seq_tokens=seq_tokens, anchor_tokens=anchor_tokens, budget_r=budget_r,
         )
         demand_class = {
             "seq_tokens": seq_tokens,
@@ -4680,9 +4972,9 @@ def _relaunch_step(
             "model": model,
             "prefix_mode": "OFF" if prefix_off else "ON",
             "max_model_len": request_cap,
-            # budget_r stays the CELL coordinate (None — DIST is the
-            # topology overlay, not a pressure family); the pd byte budgets
-            # ride the dedicated record + env.
+            # budget_r is the CELL coordinate: None on the #18 references
+            # (DIST serves the registered dist_budget_r), the row's rung on
+            # an S2 block Z1 cell; the pd byte budgets ride the record + env.
             "budget_r": budget_r,
             "budget_bytes": pd_record["budget_bytes_total"],
             "kv_dtype": kv_dtype,
@@ -5189,7 +5481,7 @@ def _stale_plan_problems(
     lambda_star = step.get("lambda_star_rps")
     rate_basis = step.get("rate_basis")
     demand_class = step.get("demand_class")
-    if spec.family in _PRESSURE_FAMILIES:
+    if _pressure_spec(spec):
         if step.get("blocked_on") is None:
             # ADR-0169: a RULER cell offers the instrument's own ladder, never
             # another basis; a non-RULER cell never carries the RULER basis
@@ -5368,7 +5660,7 @@ def _stale_plan_problems(
     # instrument) is bounded by --arrival-count == its --num-queries and
     # never by --duration-s; every other cell carries neither flag.
     got_arrivals = _argv_flag_value(argv, "--arrival-count")
-    if spec.family in _PRESSURE_FAMILIES or step.get("dataset") == "ruler":
+    if _pressure_spec(spec) or step.get("dataset") == "ruler":
         if "--duration-s" in argv:
             problems.append(
                 f"{label}: window cell {row!r} carries --duration-s "
@@ -5412,7 +5704,7 @@ def _stale_plan_problems(
     # S0F-88 U3: every pressure cell carries the registered steady-state
     # pre-load before its measured arrivals; no other cell carries one.
     got_preload = _argv_flag_value(argv, "--open-loop-preload-s")
-    want_preload = f"{PRESSURE_PRELOAD_S:g}" if spec.family in _PRESSURE_FAMILIES else None
+    want_preload = f"{PRESSURE_PRELOAD_S:g}" if _pressure_spec(spec) else None
     if got_preload != want_preload:
         problems.append(
             f"{label}: cell {row!r} carries --open-loop-preload-s {got_preload!r}, the "
@@ -5849,7 +6141,7 @@ def _cell_step(
             "demand_bytes": class_demand,
             "adr": DEMAND_CLASS_ADR,
         }
-    if spec.family in _PRESSURE_FAMILIES:
+    if _pressure_spec(spec):
         assert spec.budget_r is not None and spec.rate_frac is not None
         assert demand_class is not None
         row = floor.row(spec.budget_r)
@@ -7139,7 +7431,7 @@ def _register_rung_calibrations(
     ruler_required: Dict[str, set] = {}  # ADR-0169: engine -> rungs of executable RULER cells
     for cell in cells:
         spec = cell.spec
-        if cell.blocked_on is None and spec.engine != "hf" and spec.family in _PRESSURE_FAMILIES:
+        if cell.blocked_on is None and spec.engine != "hf" and _pressure_spec(spec):
             assert spec.budget_r is not None
             r = float(spec.budget_r)
             required.setdefault(spec.engine, set()).add(r)
@@ -7507,7 +7799,7 @@ def front_load_first_contacts(steps: List[Dict[str, Any]]) -> Tuple[List[Dict[st
         pick("first pressure", lambda seg, e=engine: seg[0]["engine"] == e and has_dry(seg))
     for engine in engines:
         pick("ruler pressure", lambda seg, e=engine: seg[0]["engine"] == e and any(
-            s.get("dataset") == "ruler" and s.get("family") in _PRESSURE_FAMILIES for s in cells(seg)))
+            s.get("dataset") == "ruler" and _pressure_step(s) for s in cells(seg)))
     for engine in engines:
         pick("retr-comp closed loop", lambda seg, e=engine: seg[0]["engine"] == e and any(
             (s.get("cellspec") or {}).get("arm") == "retr-comp" and s.get("family") == "F1" for s in cells(seg)))
@@ -7550,6 +7842,76 @@ def _size_lmcache_stores(steps: Sequence[Dict[str, Any]], grid: SessionGrid) -> 
         }
 
 
+def load_identity_gate(path: Path) -> Dict[str, Any]:
+    """Purpose: read and fail-closed-validate the stage 4 identity verdict
+    (scripts/checks/identity_gate.py verdict) a gated session plans against
+    (S2 block C, register A-7, charter 5.2, ADR-0181).
+
+    Args:
+        path: the verdict JSON (the master fetches it beside the landing as
+            extras/identity_gate/identity_gate.json and passes the pod path).
+
+    Returns: the verdict document plus ``path`` (str) and ``sha256`` of its
+        bytes; ``verdict`` is PASS or FAIL.
+
+    Raises: PlanError when the file is missing, is not JSON, carries another
+        schema, carries no PASS or FAIL verdict, or is ERROR (the gate did
+        not run to a verdict: nothing is planned on it; stage 4 is rerun).
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise PlanError(f"identity verdict not found: {path} (plan --identity-gate names the stage 4 record)")
+    raw = path.read_bytes()
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PlanError(f"identity verdict {path} is not valid JSON: {exc}") from exc
+    if not isinstance(doc, dict) or doc.get("schema") != IDENTITY_GATE_SCHEMA:
+        got = doc.get("schema") if isinstance(doc, dict) else type(doc).__name__
+        raise PlanError(f"identity verdict {path} schema is not {IDENTITY_GATE_SCHEMA!r} (got {got!r})")
+    verdict = doc.get("verdict")
+    if verdict == "ERROR":
+        raise PlanError(
+            f"identity verdict {path} is ERROR ({doc.get('error')}): the gate did not run to a "
+            "verdict (charter 5.2); nothing is planned on it, rerun stage 4"
+        )
+    if verdict not in ("PASS", "FAIL"):
+        raise PlanError(f"identity verdict {path} carries verdict {verdict!r}, not PASS or FAIL")
+    rec = dict(doc)
+    rec["path"] = str(path)
+    rec["sha256"] = hashlib.sha256(raw).hexdigest()
+    return rec
+
+
+def _identity_gate_header(
+    rec: Optional[Mapping[str, Any]], excluded: bool, gated_keys: Sequence[str]
+) -> Optional[Dict[str, Any]]:
+    """The plan header's record of the verdict it was built against (None on
+    an ungated session, never absent)."""
+    if rec is None:
+        return None
+    phases = rec.get("phases") or {}
+    return {
+        "verdict": rec["verdict"],
+        "accepted_fail": bool(excluded),
+        "label_on_pass": IDENTITY_GATE_LABEL_ON_PASS if rec["verdict"] == "PASS" else None,
+        "blocked_on": IDENTITY_GATE_BLOCKED_ON if excluded else None,
+        "excluded_row_keys": list(gated_keys) if excluded else [],
+        "path": rec["path"],
+        "sha256": rec["sha256"],
+        "session": rec.get("session"),
+        "model": rec.get("model"),
+        "revision": rec.get("revision"),
+        "tokenizer_revision": rec.get("tokenizer_revision"),
+        "engine_versions": {
+            name: (ph.get("engine_version") if isinstance(ph, dict) else ph) for name, ph in phases.items()
+        } or None,
+        "deciding": rec.get("deciding"),
+        "comparisons": rec.get("comparisons"),
+        "adr": IDENTITY_GATE_ADR,
+    }
+
+
 def build_plan(
     session: str,
     floor: FloorTable,
@@ -7568,8 +7930,22 @@ def build_plan(
     frontier_loads: Optional[Mapping[str, Mapping[float, float]]] = None,
     last_block: Optional[str] = None,
     class_ceilings: Optional[Mapping[str, Path]] = None,
+    identity_gate: Optional[Mapping[str, Any]] = None,
+    accept_identity_fail: bool = False,
 ) -> Dict[str, Any]:
     """PURE plan builder: registered grid -> ordered step list + counts.
+
+    ``identity_gate`` (S2 block C, register A-7, charter 5.2, ADR-0181) is
+    the loaded stage 4 verdict (``load_identity_gate``; ``plan
+    --identity-gate PATH``): REQUIRED on an identity_gated session, refused
+    on any other, and refused when it names another session or model. PASS
+    keeps every cell and labels the gated rows (the header's
+    ``identity_gated_row_keys``) ``experimental-align-mode``; FAIL plans only
+    with ``accept_identity_fail`` (``--accept-identity-fail``, the owner's
+    IDENTITY_FAIL_ACCEPTED=1), under which every executable prefix-on vLLM
+    cell of the session is blocked_on IDENTITY_GATE_BLOCKED_ON before the
+    relaunches and dry windows are enumerated. The header ``identity_gate``
+    records the verdict, its sha256 and the excluded keys (None when ungated).
 
     ``class_ceilings`` (ADR-0177) maps engine -> class ceilings artifact
     (``plan --class-ceilings ENGINE=PATH``): the interpolated classes of that
@@ -7607,6 +7983,40 @@ def build_plan(
     demand class and ADR-0153 plans one dry window per (engine, class).
     """
     grid = get_session_grid(session)
+    # S2 block C (A-7, charter 5.2, ADR-0181): a gated session plans only
+    # against the stage 4 identity verdict of its own session and model; an
+    # ungated one refuses a verdict (no cell reads it). FAIL plans only under
+    # the owner's written acceptance, which excludes the gated cells below.
+    if grid.identity_gated:
+        if identity_gate is None:
+            raise PlanError(
+                f"session {session!r} is identity gated (charter 5.2): plan with --identity-gate <verdict> "
+                "(the stage 4 record of scripts/checks/identity_gate.py, fetched by the master); nothing is "
+                "planned on the hybrid's prefix-on vLLM cells without it"
+            )
+        if identity_gate.get("session") != session:
+            raise PlanError(
+                f"the identity verdict {identity_gate.get('path')} is for session "
+                f"{identity_gate.get('session')!r}, not {session!r}"
+            )
+        model_id = HF_ID_OF_SLUG[grid.model]
+        if identity_gate.get("model") not in (model_id, grid.model):
+            raise PlanError(
+                f"the identity verdict {identity_gate.get('path')} is for model "
+                f"{identity_gate.get('model')!r}, not the session's {model_id!r}"
+            )
+        if identity_gate.get("verdict") == "FAIL" and not accept_identity_fail:
+            raise PlanError(
+                f"identity gate FAIL for session {session!r} ({identity_gate.get('path')}): the aligned prefix "
+                "cache changed generated tokens at T=0; the plan runs only with --accept-identity-fail (the "
+                "owner's IDENTITY_FAIL_ACCEPTED=1), which excludes every prefix-on vLLM cell of the session "
+                f"({IDENTITY_GATE_ADR})"
+            )
+    elif identity_gate is not None:
+        raise PlanError(
+            f"session {session!r} is not identity gated: --identity-gate is refused (no cell reads the verdict)"
+        )
+    identity_fail = bool(grid.identity_gated and identity_gate is not None and identity_gate.get("verdict") == "FAIL")
     rehearsal: Optional[Dict[str, Any]] = None
     if rehearsal_n is not None:
         # ADR-0144: the rehearsal is derived from the registered grid by the
@@ -7654,6 +8064,18 @@ def build_plan(
         else c
         for c in cells
     ]
+    # S2 block C (A-7, DEC-C5, ADR-0181): an accepted FAIL excludes every
+    # executable prefix-on vLLM cell of the gated session here, before the
+    # relaunches and dry windows are enumerated: the rows stay in the plan as
+    # blocked rows under one fixed reason (visible debt, a 'run' refusal
+    # without --skip-blocked); an already-blocked cell keeps its own reason.
+    if identity_fail:
+        cells = [
+            replace(c, blocked_on=IDENTITY_GATE_BLOCKED_ON)
+            if c.blocked_on is None and c.spec.engine == "vllm" and not _prefix_off(c.spec)
+            else c
+            for c in cells
+        ]
 
     # Pre-resolve every budget row so a floor-table gap refuses BEFORE any
     # step is emitted (all problems at plan time, none at 3 a.m. on the pod).
@@ -7771,7 +8193,7 @@ def build_plan(
         # and a dry window must never precede a cell that will not run.
         if (
             cell_step["blocked_on"] is None
-            and cell.spec.family in _PRESSURE_FAMILIES
+            and _pressure_spec(cell.spec)
             and cell_step["demand_class"] is not None
         ):
             key = dry_window_key(cell_step["serving"], cell_step["demand_class"])
@@ -7820,6 +8242,15 @@ def build_plan(
     for s in unique_cells:
         by_family[s["family"]]["cells"] += 1
     blocked = [s["row_key"] for s in unique_cells if s["blocked_on"]]
+    # S2 register A-2 / A-7: the cells gated on the identity verdict (C-1):
+    # the executable prefix-on vLLM cells of an identity_gated session. The
+    # verdict file (block C) excludes them under an accepted FAIL, and the
+    # excluded rows stay listed here (an empty list on every other session).
+    identity_gated = sorted({
+        s["row_key"] for s in unique_cells
+        if grid.identity_gated and s["blocked_on"] in (None, IDENTITY_GATE_BLOCKED_ON) and s["serving"] is not None
+        and s["serving"]["engine"] == "vllm" and s["serving"]["prefix_mode"] == "ON"
+    })
     cells_by_class: Dict[str, int] = {}
     for s in unique_cells:
         cells_by_class[s["row_class"]] = cells_by_class.get(s["row_class"], 0) + 1
@@ -7960,7 +8391,7 @@ def build_plan(
         "demand_classes": {
             "adr": DEMAND_CLASS_ADR,
             "finding": DEMAND_CLASS_FINDING,
-            "source": DEMAND_SEQ_TOKENS_SOURCE,
+            "source": grid.demand_seq_tokens_source,
             "anchor_arm": DEMAND_ANCHOR_ARM,
             "anchor_seq_tokens": anchor_tokens,
             "floor_avg_seq_tokens": floor.avg_seq_tokens,
@@ -8101,6 +8532,10 @@ def build_plan(
             "by_family": by_family,
         },
         "blocked_row_keys": blocked,
+        "identity_gated_row_keys": identity_gated,
+        # S2 block C (A-7): the stage 4 identity verdict the plan was built
+        # against (None on an ungated session, never absent)
+        "identity_gate": _identity_gate_header(identity_gate, identity_fail, identity_gated),
         "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "charter_refs": ["6.1", "6.4", "6.8", "7.6", "7.6.1", "D5#5", "P6"],
         "steps": steps,
@@ -8610,7 +9045,7 @@ def load_plan(path: Path) -> Dict[str, Any]:
     # schema literal; a hand-edited v6 plan without them is refused here.
     executable_pressure = any(
         isinstance(s, dict) and s.get("kind") == "cell" and s.get("blocked_on") is None
-        and s.get("family") in _PRESSURE_FAMILIES
+        and _pressure_step(s)
         for s in steps
     )
     if executable_pressure and not isinstance(plan.get("rung_calibration"), dict):
@@ -9254,7 +9689,7 @@ def _step_already_skipped(step: Mapping[str, Any], dry_failed: Mapping[Tuple[Any
     if step.get("blocked_on"):
         return True
     return (
-        step.get("family") in _PRESSURE_FAMILIES
+        _pressure_step(step)
         and isinstance(step.get("demand_class"), dict)
         and dry_window_key(step["serving"], step["demand_class"]) in dry_failed
     )
@@ -9754,7 +10189,7 @@ def run_plan(
                 )
                 outcomes.append(_Outcome(row_key, dataset, "skipped-launch-failed"))
                 continue
-            if step.get("family") in _PRESSURE_FAMILIES and isinstance(step.get("demand_class"), dict):
+            if _pressure_step(step) and isinstance(step.get("demand_class"), dict):
                 key = dry_window_key(step["serving"], step["demand_class"])
                 if key in dry_failed:
                     # Q-9 (owner ruling R15, review 2026-10-13 item 1): a class
@@ -10014,7 +10449,7 @@ def relabel_windows(plan: Mapping[str, Any], campaign_root: Path, plan_sha256: s
     for step in plan["steps"]:
         if step.get("blocked_on") or step.get("kind") not in ("cell", "dry_window"):
             continue
-        if step["kind"] == "cell" and step.get("family") not in _PRESSURE_FAMILIES:
+        if step["kind"] == "cell" and not _pressure_step(step):
             continue
         pin = (step.get("env") or {}).get(KV_CEILING_ENV)
         want = None if pin is None else float(pin)
@@ -10092,7 +10527,7 @@ def drift_step(plan: Mapping[str, Any], campaign_root: Path) -> Tuple[Dict[str, 
             relaunch = step
             continue
         if (
-            step["kind"] != "cell" or step.get("blocked_on") or step.get("family") not in _PRESSURE_FAMILIES
+            step["kind"] != "cell" or step.get("blocked_on") or not _pressure_step(step)
             or (step.get("demand_class") or {}).get("seq_tokens") != anchor
             or step.get("trial_index") not in (None, 1) or relaunch is None
         ):
@@ -10315,6 +10750,8 @@ def _cmd_plan(args: argparse.Namespace) -> int:
         frontier_loads=load_frontier_loads(Path(args.frontier_loads)) if args.frontier_loads else None,
         last_block=args.last_block,
         class_ceilings=parse_calibration_args(args.class_ceilings, flag="--class-ceilings") or None,
+        identity_gate=load_identity_gate(Path(args.identity_gate)) if args.identity_gate else None,
+        accept_identity_fail=args.accept_identity_fail,
     )
     plan["last_block"] = args.last_block
     if args.frontier_loads:
@@ -10338,6 +10775,15 @@ def _cmd_plan(args: argparse.Namespace) -> int:
             f"{c['engine_stops']} engine stops, {c['dry_windows']} dry windows, "
             f"{c['blocked']} blocked"
         )
+        ig = plan.get("identity_gate")
+        if ig is not None:
+            # S2 block C: the verdict this plan stands on, and what it did to the gated rows
+            print(
+                f"[run_campaign] identity gate (charter 5.2): {ig['verdict']}; "
+                + (f"{len(plan['identity_gated_row_keys'])} gated cells labeled {ig['label_on_pass']}"
+                   if ig["verdict"] == "PASS"
+                   else f"{len(ig['excluded_row_keys'])} prefix-on vLLM cells excluded under the owner's acceptance")
+            )
         ws = plan["window_spans"]
         if ws["executable_pressure_cells"]:
             print(
@@ -10461,7 +10907,7 @@ def smallest_pressure_class(
     best: Optional[Tuple[Tuple[int, int, int], PlannedCell]] = None
     for cell in enumerate_cells(grid):
         spec = cell.spec
-        if spec.engine != engine or spec.family not in _PRESSURE_FAMILIES or cell.blocked_on is not None:
+        if spec.engine != engine or not _pressure_spec(spec) or cell.blocked_on is not None:
             continue
         if spec.arm == CORPUS_TRUNC_ARM and cell.dataset not in (manifests or {}):
             continue
@@ -10493,7 +10939,7 @@ def measured_pressure_classes(
     rungs: Dict[int, set] = {}
     for cell in enumerate_cells(grid):
         spec = cell.spec
-        if spec.engine != engine or spec.family not in _PRESSURE_FAMILIES or cell.blocked_on is not None:
+        if spec.engine != engine or not _pressure_spec(spec) or cell.blocked_on is not None:
             continue
         if spec.arm == CORPUS_TRUNC_ARM and cell.dataset not in (manifests or {}):
             continue
@@ -10547,7 +10993,7 @@ def ruler_pressure_class(
         spec = cell.spec
         if (
             cell.dataset != "ruler" or spec.engine != engine or cell.blocked_on is not None
-            or spec.family not in _PRESSURE_FAMILIES or spec.budget_r is None
+            or not _pressure_spec(spec) or spec.budget_r is None
         ):
             continue
         rungs.add(float(spec.budget_r))
@@ -10915,7 +11361,7 @@ def calibrate_rungs(
             float(c.spec.budget_r)  # type: ignore[arg-type]
             for c in enumerate_cells(grid)
             if c.spec.engine == engine and c.blocked_on is None
-            and c.spec.family in _PRESSURE_FAMILIES
+            and _pressure_spec(c.spec)
             and demand_seq_tokens(grid, c.spec) == small_seq_own
             and not (c.spec.arm == CORPUS_TRUNC_ARM and c.dataset not in manifests)
         }
@@ -11992,6 +12438,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--class-ceilings", action="append", default=[], metavar="ENGINE=PATH",
         help=f"{CLASS_CEILINGS_ADR}: the class ceilings artifact (calibrate-rungs --ceilings-only) of one "
         "engine; its interpolated classes are pinned their measured fill ceiling, every rate unchanged",
+    )
+    p_plan.add_argument(
+        "--identity-gate", default=None, metavar="PATH",
+        help=f"S2 block C (charter 5.2, {IDENTITY_GATE_ADR}): the stage 4 identity verdict (scripts/checks/"
+        "identity_gate.py verdict --out) of this landing; REQUIRED on an identity-gated session, refused on any "
+        f"other. PASS labels the gated cells {IDENTITY_GATE_LABEL_ON_PASS}; FAIL refuses unless "
+        "--accept-identity-fail; ERROR refuses",
+    )
+    p_plan.add_argument(
+        "--accept-identity-fail", action="store_true",
+        help="the owner's written acceptance of a FAIL verdict (the profile's IDENTITY_FAIL_ACCEPTED=1): every "
+        "executable prefix-on vLLM cell of the session is excluded (blocked_on) and the rest of the plan runs",
     )
     p_plan.add_argument("--out", default=None, help="write the plan JSON here (else stdout)")
     p_plan.set_defaults(func=_cmd_plan)

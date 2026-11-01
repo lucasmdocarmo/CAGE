@@ -1736,12 +1736,12 @@ class TestPlanRefusals:
             rc.build_plan("zz", rc.load_floor_table(floor_table), window_duration_s=60.0)
 
     def test_known_but_unregistered_session_refuses(self, floor_table):
-        # 'cd-act1' is §1 vocabulary but its grid registration is Group-C/D
-        # work ('b' registered with W4.6): the driver must refuse loudly,
-        # never fabricate a grid.
+        # 'cd-act2' is §1 vocabulary but its grid registration is Group-D
+        # work ('b' registered with W4.6, 'cd-act1' with S2 block A): the
+        # driver must refuse loudly, never fabricate a grid.
         with pytest.raises(rc.PlanError, match="NOT yet registered"):
             rc.build_plan(
-                "cd-act1", rc.load_floor_table(floor_table), window_duration_s=60.0
+                "cd-act2", rc.load_floor_table(floor_table), window_duration_s=60.0
             )
 
     def test_empty_enumeration_refuses(self):
@@ -2322,15 +2322,36 @@ class TestRegisteredDatasetsAgreeWithTheFamilyMap:
     def test_pressure_dataset_and_qa_roster_pins_c1(self):
         # C1 (2026-10-10): src.analysis.stats.families registers the pressure
         # dataset the session grids run F2/F3 on; the two must never drift.
+        # S2 register A-4: the registration is per session (cd-act1 runs the
+        # pressure families on MuSiQue), the constant is every other session's.
         from src.analysis.stats.families import (
-            KNOWN_DATASETS, PRESSURE_DATASET,
+            KNOWN_DATASETS, PRESSURE_DATASET, pressure_dataset,
         )
 
         assert set(rc.QA_DATASETS) == KNOWN_DATASETS
         for name, grid in rc.SESSION_GRIDS.items():
-            assert grid.f2_dataset == PRESSURE_DATASET, name
-            assert grid.f3_dataset == PRESSURE_DATASET, name
+            assert grid.f2_dataset == pressure_dataset(name), name
+            assert grid.f3_dataset == pressure_dataset(name), name
             assert set(grid.f1_datasets) <= KNOWN_DATASETS, name
+            if name != "cd-act1":
+                assert grid.f2_dataset == PRESSURE_DATASET, name
+
+    def test_pressure_dataset_per_session_a4(self):
+        from src.analysis.stats.families import (
+            PRESSURE_DATASET, PRESSURE_DATASET_BY_SESSION, pressure_dataset, registered_datasets,
+        )
+
+        assert PRESSURE_DATASET == "qasper" and PRESSURE_DATASET_BY_SESSION == {"cd-act1": "musique"}
+        assert pressure_dataset("cd-act1") == "musique"
+        assert pressure_dataset("s2a") == pressure_dataset("a") == pressure_dataset(None) == "qasper"
+        roster = ("squad_v2", "musique", "qasper")
+        for family in ("F2", "F3", "DIST"):
+            assert registered_datasets(family, roster, session="cd-act1") == ("musique",)
+            assert registered_datasets(family, roster) == ("qasper",)
+            assert registered_datasets(family, roster, session="s2a") == ("qasper",)
+        assert registered_datasets("F1", roster, session="cd-act1") == roster
+        # a roster without the session's pressure dataset compiles no pressure rows
+        assert registered_datasets("F2", ("squad_v2", "qasper"), session="cd-act1") == ()
 
 
 class TestGpuCountProducer:
@@ -3224,9 +3245,14 @@ class TestPerRowN:
             # ADR-0172 item 5 as amended (E17 d) registers the S1 window pools
             # on session a only, as window_pool_n.
             # ADR-0175: s1 (Run 2) serves session a's registrations through its blocks
-            assert dict(grid.achievable_n) == (_ACHIEVABLE_N_A if grid.session in ("a", "s1") else {})
+            # S2 block A: s2a serves Qasper as session a; cd-act1 draws its
+            # window pool from the S2 MuSiQue manifest [A: 500, as Qasper's]
+            assert dict(grid.achievable_n) == (_ACHIEVABLE_N_A if grid.session in ("a", "s1", "s2a") else {})
             # s1 (owner 2026-10-23): Qasper as session a, SQuAD v2 at the secondary n, no RULER
-            assert dict(grid.window_pool_n) == {"a": _WINDOW_POOL_N_A, "s1": {"qasper": 500, "squad_v2": 800}}.get(grid.session, {})
+            assert dict(grid.window_pool_n) == {
+                "a": _WINDOW_POOL_N_A, "s1": {"qasper": 500, "squad_v2": 800},
+                "s2a": {"qasper": 500}, "cd-act1": {"musique": 500},
+            }.get(grid.session, {})
 
     def test_classifier_table_every_family_engine_baseline(self, plan_a, plan_b):
         # Every (family x engine x baseline) cell of both sessions lands in
@@ -5660,3 +5686,620 @@ class TestSessionS1ScopeResetAdr0176:
         assert all(s["num_queries"] == 500 for s in qasper)
         # B8 (the LMCache connector) left S1 on 2026-10-23: its three relaunches and one dry window with it
         assert plan["counts"]["relaunches"] == 62 and plan["counts"]["dry_windows"] == 22
+
+
+# ---------------------------------------------------------------------------
+# S2 register block A (2026-11-01, MyDocs/RunPod/S2_BUILD_REGISTER_2026-10-31.md):
+# the two S2 grids (s2a: the 70B on Qasper, blocks X1 and X2; cd-act1: the
+# 80B on MuSiQue, blocks Y1 and Y2 plus the PD overlay Z1), the DIST
+# widening (A-3 option (a): a pd point carries its twin's rung and load),
+# the per-session pressure dataset (A-4) and the 80B demand tables (A-5)
+# ---------------------------------------------------------------------------
+
+from collections import Counter  # noqa: E402
+
+_SCRIPTS_4_ANALYSIS = REPO_ROOT / "scripts" / "4_analysis"
+if str(_SCRIPTS_4_ANALYSIS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_4_ANALYSIS))
+import organize_results as _org  # noqa: E402
+from src.orchestration import campaign_layout as _layout  # noqa: E402
+
+#: The anchor shape each S2 fixture floor table is sized on: cd-act1's
+#: gold-fresh class measured with the 80B tokenizer (A-5, method (b)); s2a
+#: keeps session b's 2026-10-08 Qasper table, so its anchor is the registry
+#: default [A: the Llama-3.3-70B tokenizer is gated for this account].
+_S2_ANCHOR_SEQ_TOKENS: Dict[str, int] = {"cd-act1": 2694, "s2a": _ANCHOR_SEQ_TOKENS}
+#: The S2 MuSiQue manifest (A-6): 2,000 x 3 packed in 2,640 tokens of the 80B
+#: tokenizer, one B12 rung at 700, a 50-question warm-up reserve.
+_S2_MUSIQUE_MANIFEST = (
+    REPO_ROOT / "data" / "manifests"
+    / "musique_2000x3_seed42_wr50_tok-Qwen3-Next-80B-A3B-Instruct.json"
+)
+_S2_SGLANG_B8_REFERENCE = "retr-store|rerank|none|single|sglang|qwen3-next-80b|F1"
+
+
+def _s2_plan(session: str, tmp_path: Path, *, anchor: Optional[int] = None, **overrides: Any) -> Dict[str, Any]:
+    """A full plan of one S2 session through the fixture stack: a reduced
+    floor table at the session's anchor shape, cal-v1 artifacts on both
+    engines at the control rung with every class floor (B4), and the ladders."""
+    grid = rc.get_session_grid(session)
+    anchor = _S2_ANCHOR_SEQ_TOKENS[session] if anchor is None else anchor
+    doc = _floor_table_doc(model=grid.model, grid="reduced", r_values=(1.0, 0.5, 0.25))
+    doc["generated_inputs"]["avg_seq_tokens"] = anchor
+    floor = tmp_path / f"floor_{session}.json"
+    floor.write_text(json.dumps(doc), encoding="utf-8")
+    cal = _write_calibrations(
+        tmp_path / f"cal_{session}", ("vllm", "sglang"),
+        model=rc.HF_ID_OF_SLUG[grid.model], budget_fraction=grid.floor_budget_r,
+    )
+    classes = rc.session_demand_classes(grid)
+    for path in cal.values():
+        d = json.loads(path.read_text(encoding="utf-8"))
+        d["class_floors"] = {str(c): {"ttft_s": 0.05 + c / 40000.0, "tpot_s": 0.011, "n_requests": 30} for c in classes}
+        path.write_text(json.dumps(d), encoding="utf-8")
+    kwargs: Dict[str, Any] = dict(
+        window_duration_s=300.0, calibrations=cal,
+        rung_calibrations=_rungs_for(cal, session, anchor_seq_tokens=anchor),
+    )
+    # S2 block C (A-7): a gated session plans only against an identity verdict;
+    # the fixture default is a PASS (a test passes identity_gate=None to test
+    # the refusal, or a FAIL verdict with accept_identity_fail=True)
+    if grid.identity_gated and "identity_gate" not in overrides:
+        kwargs["identity_gate"] = rc.load_identity_gate(_identity_verdict(tmp_path, "PASS"))
+    kwargs.update(overrides)
+    return rc.build_plan(session, rc.load_floor_table(floor), **kwargs)
+
+
+def _s2_rows(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """One step per row (B1 splits each executable cell into trial steps)."""
+    return [s for s in _cells(plan) if (s.get("trial_index") or 1) == 1]
+
+
+def _serving_shape(serving: Dict[str, Any], seq_tokens: Optional[int]) -> tuple:
+    """A serving coordinate without its rung: engine, prefix, kv dtype,
+    connector, topology and demand class."""
+    return (
+        serving["engine"], serving["prefix_mode"], serving.get("kv_dtype"),
+        serving.get("connector"), serving["topology"], seq_tokens,
+    )
+
+
+def _relaunch_boundary(step: Dict[str, Any]) -> tuple:
+    """The relaunch's serving coordinate with its rung (the driver's
+    _serving_config minus the model, which one session fixes)."""
+    seq = (step.get("demand_class") or {}).get("seq_tokens")
+    return _serving_shape(step, seq) + (step["budget_r"],)
+
+
+def _next_cell_block(plan: Dict[str, Any], relaunch: Dict[str, Any]) -> Optional[str]:
+    """The block of the first cell step served after ``relaunch``."""
+    for step in plan["steps"][relaunch["index"] + 1:]:
+        if step["kind"] == "cell":
+            return step.get("block")
+    return None
+
+
+@pytest.fixture(scope="module")
+def plan_s2a(tmp_path_factory: pytest.TempPathFactory) -> Dict[str, Any]:
+    return _s2_plan("s2a", tmp_path_factory.mktemp("s2a"))
+
+
+@pytest.fixture(scope="module")
+def plan_cd_act1(tmp_path_factory: pytest.TempPathFactory) -> Dict[str, Any]:
+    return _s2_plan("cd-act1", tmp_path_factory.mktemp("cd_act1"))
+
+
+class TestS2RegisterBlockA:
+    def test_the_sessions_are_registered_in_every_vocabulary(self):
+        for name in ("s2a", "cd-act1"):
+            assert name in rc.SESSIONS and name in _layout.SESSIONS and name in _org.SESSIONS
+            assert rc.get_session_grid(name).session == name
+        assert rc.SESSIONS == _layout.SESSIONS == _org.SESSIONS
+        # cd-act2 stays vocabulary without a grid (the Group-D registration)
+        assert "cd-act2" in rc.SESSIONS and "cd-act2" not in rc.SESSION_GRIDS
+        with pytest.raises(rc.PlanError, match="NOT yet registered"):
+            rc.get_session_grid("cd-act2")
+
+    def test_the_grids_as_registered(self):
+        s2a = rc.get_session_grid("s2a")
+        assert s2a.model == "llama-3.3-70b" and s2a.replications == 1
+        assert s2a.f1_datasets == ("qasper",) and s2a.f2_dataset == s2a.f3_dataset == "qasper"
+        assert s2a.f1_baselines == tuple(b for b in rc._ALL_BASELINES if b != "B8") and len(s2a.f1_baselines) == 11
+        assert s2a.hf_oracle_cells == () and s2a.dist_cells == ()
+        assert (s2a.serving_tp, s2a.dist_tp_size, s2a.dist_pd_role_gpus) == (4, None, (1, 1))
+        assert (s2a.corpus_prefix_budget_tokens, s2a.corpus_trunc_budgets) == (2640, (700,))
+        assert s2a.f2_budgets == s2a.f3_budgets == (1.0, 0.5, 0.25) and s2a.f2_rates == s2a.f3_rates == (0.95, 1.05)
+        assert s2a.floor_budget_r == 1.0 and not s2a.identity_gated and s2a.helpers_on_gpu
+        assert dict(s2a.achievable_n) == {"qasper": 852} and dict(s2a.window_pool_n) == {"qasper": 500}
+        assert [p.block for p in s2a.blocks] == ["X1", "X1", "X2"]
+        assert all(p.topology == "single" and p.dataset == "qasper" for p in s2a.blocks)
+
+        cd = rc.get_session_grid("cd-act1")
+        assert (cd.model, cd.group, cd.replications) == ("qwen3-next-80b", "C", 1)
+        assert cd.f1_datasets == ("musique",) and cd.f2_dataset == cd.f3_dataset == "musique"
+        assert set(cd.f1_baselines) == {"B1", "B3", "B4", "B6", "B7", "B8"} and cd.hf_oracle_cells == ()
+        assert cd.f2_baselines == ("B1", "B4", "B6") and cd.f3_baselines == ("B3", "B7", "B8")
+        assert cd.dist_cells == tuple((b, "vllm", "pd") for b in ("B1", "B3", "B4", "B6", "B7"))
+        assert (cd.serving_tp, cd.dist_tp_size, cd.dist_pd_role_gpus, cd.dist_pd_split) == (4, None, (2, 2), 0.5)
+        assert (cd.dist_budget_r, cd.floor_budget_r, cd.identity_gated, cd.helpers_on_gpu) == (1.0, 1.0, True, True)
+        assert (cd.corpus_prefix_budget_tokens, cd.corpus_trunc_budgets) == (2640, (700,))
+        assert dict(cd.achievable_n) == {} and dict(cd.window_pool_n) == {"musique": 500}
+        assert [p.block for p in cd.blocks] == ["Y1", "Y1", "Y2", "Y2", "Z1", "Z1"]
+        assert [p.topology for p in cd.blocks] == ["single"] * 4 + ["pd"] * 2
+        assert all(p.dataset == "musique" and p.rungs == (1.0, 0.5, 0.25) for p in cd.blocks)
+        assert [(p.loads[0].frac, p.windows) for p in cd.blocks] == [(0.95, 2), (1.05, 3)] * 3
+        assert all(p.engines == ("vllm",) for p in cd.blocks if p.block in ("Y2", "Z1"))
+
+    def test_block_order_ends_with_the_s2_blocks(self):
+        assert rc.BLOCK_ORDER[-5:] == ("X1", "X2", "Y1", "Y2", "Z1")
+        assert len(set(rc.BLOCK_ORDER)) == len(rc.BLOCK_ORDER)
+
+    def test_pressure_point_topology_refusals(self):
+        grid = rc.get_session_grid("cd-act1")
+        base: Dict[str, Any] = dict(
+            block="Z1", baselines=("B1",), engines=("vllm",), rungs=(1.0,), loads=rc._own(0.95), dataset="musique",
+        )
+        pd_point = rc.PressurePoint(**base, topology="pd")
+        assert _dc_replace(grid, blocks=grid.blocks + (pd_point,)).blocks[-1] is pd_point
+        with pytest.raises(rc.PlanError, match="topology 'tp' must be 'single' or 'pd'"):
+            _dc_replace(grid, blocks=grid.blocks + (rc.PressurePoint(**base, topology="tp"),))
+        with pytest.raises(rc.PlanError, match="a pd point rides the vLLM PD launcher only"):
+            _dc_replace(grid, blocks=grid.blocks + (
+                rc.PressurePoint(**{**base, "engines": ("vllm", "sglang")}, topology="pd"),
+            ))
+        with pytest.raises(rc.PlanError, match="carries no RULER task"):
+            _dc_replace(grid, blocks=grid.blocks + (
+                rc.PressurePoint(**{**base, "dataset": "ruler", "ruler_tasks": (rc.RULER_F2_TASKS[0],)}, topology="pd"),
+            ))
+        assert rc.PressurePoint(**base).topology == "single"
+
+    def test_s2a_counts(self, plan_s2a):
+        plan = plan_s2a
+        rows = _s2_rows(plan)
+        assert plan["session"] == "s2a" and plan["model"] == "llama-3.3-70b"
+        # rows: 11 arms x 2 engines of references (22); X1: 5 core arms x 2
+        # engines x 3 rungs x 2 loads (60); X2: 6 coping arms x 2 engines at
+        # one point (12). Windows: one per reference; 2 + 3 per (arm, engine,
+        # rung) in X1; 3 per X2 row.
+        assert plan["counts"]["cells"] == len(rows) == 22 + 60 + 12
+        assert plan["counts"]["windows"] == 22 + 60 * 5 // 2 + 12 * 3 == 208
+        assert Counter(s.get("block") or ("ref-" + s["family"]) for s in rows) == {"X1": 60, "X2": 12, "ref-F1": 22}
+        assert sum(s["windows"] for s in _cells(plan) if s.get("block") == "X1") == 150
+        assert sum(s["windows"] for s in _cells(plan) if s.get("block") == "X2") == 36
+        # families: the fresh arms (gold-fresh, retr-fresh, retr-comp,
+        # retr-trunc) are F2; the corpus, reuse and corpus-comp arms are F3
+        assert {(s["baseline"], s["family"]) for s in rows if s.get("block")} == {
+            ("B1", "F2"), ("B5", "F2"), ("B6", "F2"), ("B9", "F2"), ("B11", "F2"),
+            ("B2", "F3"), ("B3", "F3"), ("B4", "F3"), ("B7", "F3"), ("B10", "F3"), ("B12", "F3"),
+        }
+        assert plan["counts"]["by_family"] == {
+            "F1": {"cells": 22, "windows": 22},
+            "F2": {"cells": 2 * 2 * 6 + 3 * 2, "windows": 24 * 5 // 2 + 6 * 3},
+            "F3": {"cells": 3 * 2 * 6 + 3 * 2, "windows": 36 * 5 // 2 + 6 * 3},
+        }
+        # the four B12 rung-700 rows (the X2 pair and the reference pair) wait
+        # for a Qasper manifest carrying the ladder; nothing else is blocked
+        blocked = {s["row_key"]: s["blocked_on"] for s in rows if s["blocked_on"]}
+        assert sorted(blocked) == sorted(plan["blocked_row_keys"]) and len(blocked) == plan["counts"]["blocked"] == 4
+        assert all(k.startswith("corpus-trunc|") and k.endswith("|cb700") for k in blocked)
+        assert all("query-manifest:qasper" in v for v in blocked.values())
+        assert {s.get("cell_windows") for s in rows if s["blocked_on"]} == {None}
+        # row classes: the #4 pair on vLLM is primary, the other references secondary
+        assert Counter(s["row_class"] for s in rows) == {"window": 72, "secondary": 20, "primary": 2}
+        assert sorted(s["row_key"] for s in rows if s["row_class"] == "primary") == [
+            "corpus-reuse|none|none|single|vllm|llama-3.3-70b|F1",
+            "retr-fresh|rerank|none|single|vllm|llama-3.3-70b|F1",
+        ]
+        assert {s["row_class"]: s["num_queries"] for s in rows if not s["blocked_on"]} == {"window": 500, "secondary": 800, "primary": 852}
+        assert plan["identity_gated_row_keys"] == []
+        assert plan["counts"]["relaunches"] == 46 and plan["counts"]["dry_windows"] == 18
+        assert plan["rung_calibration"]["required_rungs"] == {"sglang": [1.0, 0.5, 0.25], "vllm": [1.0, 0.5, 0.25]}
+
+    def test_cd_act1_counts(self, plan_cd_act1):
+        plan = plan_cd_act1
+        rows = _s2_rows(plan)
+        assert plan["session"] == "cd-act1" and plan["model"] == "qwen3-next-80b"
+        # rows: references of the 5 core arms x 2 engines plus B8 on both (12,
+        # the SGLang B8 one blocked) and the 5 PD references; Y1: 5 x 2 x 3
+        # rungs x 2 loads (60); Y2: B8 on vLLM (6); Z1: 5 arms x 3 x 2 on the
+        # PD stack (30). Windows: one per reference, 2 + 3 per (arm, engine,
+        # rung) in every block.
+        assert plan["counts"]["cells"] == len(rows) == 12 + 5 + 60 + 6 + 30
+        assert plan["counts"]["windows"] == 17 + (60 + 6 + 30) * 5 // 2 == 257
+        assert Counter(s.get("block") or ("ref-" + s["family"]) for s in rows) == {
+            "Y1": 60, "Y2": 6, "Z1": 30, "ref-F1": 12, "ref-DIST": 5,
+        }
+        assert {(s["baseline"], s["family"]) for s in rows if s.get("block") in ("Y1", "Y2")} == {
+            ("B1", "F2"), ("B6", "F2"), ("B3", "F3"), ("B4", "F3"), ("B7", "F3"), ("B8", "F3"),
+        }
+        assert plan["counts"]["by_family"] == {
+            "F1": {"cells": 12, "windows": 12},
+            "F2": {"cells": 2 * 2 * 6, "windows": 24 * 5 // 2},
+            "F3": {"cells": 3 * 2 * 6 + 6, "windows": 42 * 5 // 2},
+            "DIST": {"cells": 30 + 5, "windows": 30 * 5 // 2 + 5},
+        }
+        blocked = {s["row_key"]: s["blocked_on"] for s in rows if s["blocked_on"]}
+        assert list(blocked) == plan["blocked_row_keys"] == [_S2_SGLANG_B8_REFERENCE]
+        assert "connector" in blocked[_S2_SGLANG_B8_REFERENCE] and plan["counts"]["blocked"] == 1
+        assert Counter(s["row_class"] for s in rows) == {"window": 96, "secondary": 10, "identity": 5, "primary": 2}
+        assert sorted(s["row_key"] for s in rows if s["row_class"] == "primary") == [
+            "corpus-reuse|none|none|single|vllm|qwen3-next-80b|F1",
+            "retr-fresh|rerank|none|single|vllm|qwen3-next-80b|F1",
+        ]
+        assert all(s["row_class"] == "identity" for s in rows if s["family"] == "DIST" and s.get("block") is None)
+        # per-row n: no achievable cap on MuSiQue, the window pool 500 [A]
+        assert {s["row_class"]: s["num_queries"] for s in rows if not s["blocked_on"]} == {
+            "window": 500, "secondary": 800, "identity": 300, "primary": 2000,
+        }
+        assert plan["counts"]["relaunches"] == 58 and plan["counts"]["dry_windows"] == 16
+        assert plan["rung_calibration"]["required_rungs"] == {"sglang": [1.0, 0.5, 0.25], "vllm": [1.0, 0.5, 0.25]}
+        assert all(s["gpu_count"] == 4 for s in rows)
+
+    def test_z1_rows_twin_y1_on_the_pd_stack(self, plan_cd_act1):
+        rows = _s2_rows(plan_cd_act1)
+        z1 = [s for s in rows if s.get("block") == "Z1"]
+        y1_vllm = [s for s in rows if s.get("block") == "Y1" and s["cellspec"]["engine"] == "vllm"]
+        assert len(z1) == 30 and len(y1_vllm) == 30
+        assert all(
+            s["family"] == "DIST" and s["cellspec"]["topology"] == "pd" and s["cellspec"]["engine"] == "vllm"
+            and s["dataset"] == "musique" and s["serving"]["topology"] == "pd" and not s["blocked_on"]
+            for s in z1
+        )
+
+        def coord(s: Dict[str, Any]) -> tuple:
+            cs = s["cellspec"]
+            return (cs["arm"], cs["retriever"], cs["policy"], cs["budget_r"], cs["rate_frac"])
+
+        assert sorted(map(coord, z1)) == sorted(map(coord, y1_vllm))
+        assert {c[3] for c in map(coord, z1)} == {1.0, 0.5, 0.25} and {c[4] for c in map(coord, z1)} == {0.95, 1.05}
+        twins = {coord(s): s for s in y1_vllm}
+        for s in z1:
+            twin = twins[coord(s)]
+            # the same prefix mode (fresh arms OFF, reuse arms ON), rung, load
+            # and windows per load as the TP=4 twin; the row key differs in
+            # the topology and the family alone
+            assert s["serving"]["prefix_mode"] == twin["serving"]["prefix_mode"]
+            assert s["serving"]["budget_r"] == twin["serving"]["budget_r"] == s["cellspec"]["budget_r"]
+            assert s["cell_windows"] == twin["cell_windows"] == {0.95: 2, 1.05: 3}[s["cellspec"]["rate_frac"]]
+            assert s["row_key"] == twin["row_key"].replace("|single|", "|pd|").replace(f"|{twin['family']}|", "|DIST|")
+            assert s["row_class"] == twin["row_class"] == "window" and s["num_queries"] == twin["num_queries"] == 500
+        assert Counter((s["serving"]["prefix_mode"], s["baseline"]) for s in z1) == {
+            ("OFF", "B1"): 6, ("OFF", "B4"): 6, ("OFF", "B6"): 6, ("ON", "B3"): 6, ("ON", "B7"): 6,
+        }
+
+    def test_pd_relaunches_carry_the_rung_and_exact_sum_pools(self, plan_cd_act1):
+        grid = rc.get_session_grid("cd-act1")
+        rel = _relaunches(plan_cd_act1)
+        pd = [s for s in rel if s["topology"] == "pd"]
+        assert len(pd) == 20 and len(rel) - len(pd) == 38
+        # five classes (one per arm) at the three rungs, plus the five
+        # budget-free references on the registered control rung
+        assert Counter(s["budget_r"] for s in pd) == {0.25: 5, 0.5: 5, 1.0: 5, None: 5}
+        assert Counter(s["demand_class"]["seq_tokens"] for s in pd) == {2694: 4, 2387: 4, 2386: 4, 517: 4, 506: 4}
+        for s in pd:
+            assert s["engine"] == "vllm" and s["launcher_key"] == "vllm:pd" and s["model"] == "qwen3-next-80b"
+            assert s["tp"] == grid.dist_pd_role_gpus[0] == 2
+            cls = s["demand_class"]
+            r = grid.dist_budget_r if s["budget_r"] is None else s["budget_r"]
+            assert cls["anchor_seq_tokens"] == 2694
+            assert abs(cls["demand_bytes"] - _ANCHOR_DEMAND * cls["seq_tokens"] / 2694) <= 1
+            bp = s["budget_plan"]
+            assert bp["r"] == r and bp["topology"] == "pd" and bp["pd_split"] == 0.5
+            assert bp["budget_bytes_total"] == s["budget_bytes"] and abs(s["budget_bytes"] - r * cls["demand_bytes"]) < 1
+            rec = s["pd"]
+            assert rec["budget_r"] == r and rec["split"] == 0.5 and rec["budget_bytes_total"] == s["budget_bytes"]
+            assert rec["prefill_bytes"] + rec["decode_bytes"] == s["budget_bytes"]
+            assert abs(rec["prefill_bytes"] - rec["decode_bytes"]) <= 1
+            assert bp["pools_bytes"] == [rec["prefill_bytes"], rec["decode_bytes"]]
+            # the launcher env carries each role's per-rank slice at role TP 2
+            assert rec["prefill_bytes_per_rank"] == rec["prefill_bytes"] // 2 == int(s["env"]["CAGE_KV_BUDGET_BYTES_PREFILL"])
+            assert rec["decode_bytes_per_rank"] == rec["decode_bytes"] // 2 == int(s["env"]["CAGE_KV_BUDGET_BYTES_DECODE"])
+            assert s["max_model_len"] == rc.request_cap_tokens(grid, cls["seq_tokens"])
+        # a Z1 row and a PD reference of the same arm are distinct boundaries
+        # (the reference at the control rung carries no budget_r)
+        boundaries = Counter(_relaunch_boundary(s) for s in pd)
+        assert len(boundaries) == 20 and max(boundaries.values()) == 1
+
+    def test_identity_gated_rows_are_the_executable_prefix_on_vllm_rows(self, plan_cd_act1, plan_s2a):
+        rows = _s2_rows(plan_cd_act1)
+        want = sorted(
+            s["row_key"] for s in rows
+            if s["serving"] is not None and s["serving"]["engine"] == "vllm"
+            and s["serving"]["prefix_mode"] == "ON" and not s["blocked_on"]
+        )
+        gated = plan_cd_act1["identity_gated_row_keys"]
+        assert gated == want and len(gated) == 35
+        # the prefix-on arms: corpus-reuse and retr-reuse (one reference and
+        # six Y1 rows each, the same seven again on the PD stack) and
+        # retr-store (its vLLM reference and the six Y2 rows)
+        assert Counter((k.split("|")[0], k.split("|")[3]) for k in gated) == {
+            ("corpus-reuse", "single"): 7, ("corpus-reuse", "pd"): 7,
+            ("retr-reuse", "single"): 7, ("retr-reuse", "pd"): 7,
+            ("retr-store", "single"): 7,
+        }
+        assert all(k.split("|")[4] == "vllm" for k in gated)
+        assert plan_s2a["identity_gated_row_keys"] == []
+
+    def test_dist_rows_with_a_rate_are_pressure_cells(self, plan_cd_act1):
+        rows = _s2_rows(plan_cd_act1)
+        z1 = next(s for s in rows if s.get("block") == "Z1")
+        ref = next(s for s in rows if s["family"] == "DIST" and s.get("block") is None)
+        assert rc._pressure_step(z1) and not rc._pressure_step(ref)
+        z_spec, r_spec = CellSpec(**z1["cellspec"]), CellSpec(**ref["cellspec"])
+        assert rc._pressure_spec(z_spec) and not rc._pressure_spec(r_spec)
+        pin = dict(primary_engine="vllm", primary_baselines=("B3", "B6"))
+        assert rc.classify_row(z_spec, z1["baseline"], "musique", **pin) == "window"
+        assert rc.classify_row(r_spec, ref["baseline"], "musique", **pin) == "identity"
+        # a relaunch or dry-window step carries no family: never a pressure cell
+        assert not rc._pressure_step({"kind": "relaunch"}) and not rc._pressure_step({"family": "F1"})
+        assert rc._pressure_step({"family": "F2"}) and rc._pressure_step({"family": "DIST", "cellspec": {"rate_frac": 0.95}})
+        assert not rc._pressure_step({"family": "DIST", "cellspec": {"rate_frac": None}})
+
+    def test_dry_windows_are_one_per_budgeted_serving_shape(self, plan_s2a, plan_cd_act1):
+        for plan, want in ((plan_s2a, 18), (plan_cd_act1, 16)):
+            dry = [s for s in plan["steps"] if s["kind"] == "dry_window"]
+            shapes = {
+                _serving_shape(s, s["demand_class"]["seq_tokens"])
+                for s in _relaunches(plan) if s["budget_r"] is not None
+            }
+            assert len(dry) == plan["counts"]["dry_windows"] == len(shapes) == want
+            assert {_serving_shape(s["serving"], s["demand_class"]["seq_tokens"]) for s in dry} == shapes
+        # cd-act1: the five classes once per engine (SGLang), twice on vLLM
+        # (the TP and the PD stacks), and retr-store's class once more behind
+        # the LMCache connector
+        dry_cd = [s for s in plan_cd_act1["steps"] if s["kind"] == "dry_window"]
+        assert Counter((s["serving"]["engine"], s["serving"]["topology"]) for s in dry_cd) == {
+            ("sglang", "single"): 5, ("vllm", "single"): 6, ("vllm", "pd"): 5,
+        }
+
+    def test_s2a_relaunch_boundaries(self, plan_s2a):
+        rel = _relaunches(plan_s2a)
+        boundaries = Counter(_relaunch_boundary(s) for s in rel)
+        # per engine: prefix OFF at the classes of each rung (five at 0.25,
+        # three at 0.5 and at 1.0), prefix ON (four at 0.25 counting the fp8
+        # lever, two at 0.5 and at 1.0), plus the three budget-free reference
+        # shapes (OFF, ON, ON fp8): 22 boundaries, 44 in all
+        assert len(rel) == 46 and len(boundaries) == 44
+        assert Counter(k[0] for k in boundaries) == {"vllm": 22, "sglang": 22}
+        assert all(s["topology"] == "single" and s["tp"] == 4 and s["model"] == "llama-3.3-70b" for s in rel)
+        # one boundary per engine is served twice: block X1 leaves it and
+        # block X2's one point (r 0.25, load 1.05) returns to it
+        repeated = {k for k, n in boundaries.items() if n == 2}
+        assert repeated == {
+            ("sglang", "OFF", None, None, "single", 1127, 0.25),
+            ("vllm", "OFF", None, None, "single", 1127, 0.25),
+        }
+        for key in repeated:
+            blocks = [_next_cell_block(plan_s2a, s) for s in rel if _relaunch_boundary(s) == key]
+            assert blocks == ["X1", "X2"]
+
+    def test_cd_act1_demand_tables_measured_with_the_80b_tokenizer(self, plan_cd_act1, plan_s2a, tmp_path):
+        grid = rc.get_session_grid("cd-act1")
+        table = rc.DEMAND_SEQ_TOKENS_MUSIQUE_QWEN3_NEXT_2026_11_01
+        assert dict(grid.demand_seq_tokens) == table and table[rc.DEMAND_ANCHOR_ARM] == 2694
+        assert table == {
+            "gold-fresh": 2694, "gold-reuse": 2694, "corpus-fresh": 2386, "corpus-reuse": 2387,
+            "corpus-comp": 2386, "retr-fresh": 506, "retr-reuse": 517, "retr-store": 506,
+            "retr-comp": 320, "retr-trunc": 221,
+        }
+        assert dict(grid.corpus_trunc_demand_seq_tokens) == {700: 690}
+        assert dict(grid.demand_class_max_served_tokens) == {
+            2694: 4939, 2387: 2786, 2386: 2786, 690: 860, 517: 1092, 506: 1196, 320: 589, 221: 587,
+        }
+        source = grid.demand_seq_tokens_source
+        assert source == rc.DEMAND_SEQ_TOKENS_SOURCE_MUSIQUE_QWEN3_NEXT_2026_11_01
+        assert "Qwen/Qwen3-Next-80B-A3B-Instruct" in source and "9c7f2fbe84465e40164a94cc16cd30b6999b0cc7" in source
+        assert "2026-10-23_2350" in source and "demand_tables_20261101" in source
+        # the request caps: the smallest power of two at or above twice the
+        # served maximum, the anchor class at the session cap of 32,768
+        caps = {c: rc.request_cap_tokens(grid, c) for c in (2694, 2387, 2386, 690, 517, 506, 320, 221)}
+        assert caps == {2694: 32768, 2387: 8192, 2386: 8192, 690: 2048, 517: 4096, 506: 4096, 320: 2048, 221: 2048}
+        assert plan_cd_act1["serving_shapes"]["request_caps"] == {str(c): v for c, v in caps.items()}
+        assert rc.session_demand_classes(grid) == [506, 517, 2386, 2387, 2694]
+        assert plan_cd_act1["demand_classes"]["anchor_seq_tokens"] == 2694
+        assert plan_cd_act1["demand_classes"]["source"] == source
+        # s2a keeps the 2026-10-08 Qasper table [A], named as such in its header
+        s2a = rc.get_session_grid("s2a")
+        assert dict(s2a.demand_seq_tokens) == dict(rc.DEMAND_SEQ_TOKENS_2026_10_08)
+        assert s2a.demand_seq_tokens_source == rc.DEMAND_SEQ_TOKENS_SOURCE != source
+        assert plan_s2a["demand_classes"]["source"] == rc.DEMAND_SEQ_TOKENS_SOURCE
+        assert plan_s2a["demand_classes"]["anchor_seq_tokens"] == _ANCHOR_SEQ_TOKENS == 4779
+        # a floor table sized on the Qasper anchor refuses on cd-act1, naming
+        # the table the registration was measured from
+        with pytest.raises(rc.PlanError, match="Qwen3-Next-80B-A3B-Instruct"):
+            _s2_plan("cd-act1", tmp_path, anchor=_ANCHOR_SEQ_TOKENS)
+
+    def test_a_grid_without_a_demand_table_source_refuses(self):
+        with pytest.raises(rc.PlanError, match="demand_seq_tokens_source"):
+            _tiny_grid(demand_seq_tokens_source="   ")
+        assert _tiny_grid().demand_seq_tokens_source == rc.DEMAND_SEQ_TOKENS_SOURCE
+
+    def test_the_plans_round_trip_through_load_plan(self, plan_s2a, plan_cd_act1, tmp_path):
+        for name, plan in (("s2a", plan_s2a), ("cd-act1", plan_cd_act1)):
+            loaded = rc.load_plan(_dump(tmp_path, plan, name))
+            assert loaded["counts"] == plan["counts"]
+            assert loaded["identity_gated_row_keys"] == plan["identity_gated_row_keys"]
+            assert loaded["blocked_row_keys"] == plan["blocked_row_keys"]
+            assert [s["row_key"] for s in _cells(loaded)] == [s["row_key"] for s in _cells(plan)]
+            assert [s["row_class"] for s in _cells(loaded)] == [s["row_class"] for s in _cells(plan)]
+            assert [(s["topology"], s["budget_r"]) for s in _relaunches(loaded)] == [
+                (s["topology"], s["budget_r"]) for s in _relaunches(plan)
+            ]
+            assert loaded["demand_classes"] == plan["demand_classes"]
+
+    def test_the_s2_musique_manifest_registers_on_cd_act1(self, tmp_path):
+        import hashlib
+
+        raw = _S2_MUSIQUE_MANIFEST.read_bytes()
+        doc = json.loads(raw)
+        assert hashlib.sha256(raw).hexdigest().startswith("19a47fe1")  # the registered file, not a rebuild
+        assert doc["manifest_version"] == 5 and doc["dataset"] == "musique" and doc["block_budget"] == 2640
+        assert doc["tokenizer"] == {
+            "id": "Qwen/Qwen3-Next-80B-A3B-Instruct", "revision": "9c7f2fbe84465e40164a94cc16cd30b6999b0cc7",
+        }
+        assert list(doc["trunc_rungs"]) == ["700"] and doc["warmup_reserve"]["requested"] == 50
+        assert {k: len(v) for k, v in doc["trials"].items()} == {"1": 2000, "2": 2000, "3": 2000}
+        assert all(b["token_count"] <= 2640 for b in doc["blocks"])
+        plan = _s2_plan("cd-act1", tmp_path, query_manifests={"musique": _S2_MUSIQUE_MANIFEST})
+        rec = plan["query_manifests"]["musique"]
+        assert rec["trial_sizes"] == {"1": 2000, "2": 2000, "3": 2000}
+        assert rec["block_budget"] == 2640 and rec["trunc_rungs"] == [700]
+        assert rec["sha256"].startswith("19a47fe1")
+        # the manifest unblocks nothing and blocks nothing: the SGLang B8
+        # reference stays the one blocked row, the counts stay the same
+        assert plan["blocked_row_keys"] == [_S2_SGLANG_B8_REFERENCE]
+        assert (plan["counts"]["cells"], plan["counts"]["windows"], plan["counts"]["relaunches"]) == (113, 257, 58)
+        assert {s["num_queries"] for s in _s2_rows(plan) if s["row_class"] == "primary"} == {2000}
+
+    def test_s2a_refuses_the_pre_s2_qasper_manifest(self, tmp_path):
+        old = REPO_ROOT / "data" / "manifests" / "qasper_852x12_seed42_wr50.json"
+        assert json.loads(old.read_text(encoding="utf-8"))["block_budget"] == 2800
+        with pytest.raises(rc.PlanError, match="block_budget 2800 but the grid registers corpus_prefix_budget_tokens=2640"):
+            _s2_plan("s2a", tmp_path, query_manifests={"qasper": old})
+
+
+# ---------------------------------------------------------------------------
+# S2 block C (2026-11-01, register A-7 / C-1): the plan reads the identity
+# verdict (charter 5.2). A gated session (cd-act1) plans only against a
+# verdict file: PASS keeps the plan and labels the gated rows
+# experimental-align-mode; FAIL excludes them with a fixed reason once the
+# owner accepts it (--accept-identity-fail); ERROR is neither and refuses.
+# ---------------------------------------------------------------------------
+
+import hashlib  # noqa: E402
+import re  # noqa: E402
+
+_IG_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+_IG_REVISION = "9c7f2fbe84465e40164a94cc16cd30b6999b0cc7"
+
+
+def _identity_verdict(tmp_path: Path, verdict: str, *, session: str = "cd-act1", model: str = _IG_MODEL,
+                      name: str = "identity_gate.json", **extra: Any) -> Path:
+    """A verdict file in the shape scripts/checks/identity_gate.py writes."""
+    comparisons = {k: {"decides": k in ("A", "B"), "compared": 200, "identical": 200, "first_divergence": None}
+                   for k in "ABCDE"}
+    if verdict == "FAIL":
+        comparisons["A"].update(identical=199, first_divergence={
+            "prompt_index": 7, "prompt_id": "q7", "position": 3, "left_id": 11, "right_id": 12,
+            "left_text": "left", "right_text": "right"})
+    doc: Dict[str, Any] = {
+        "schema": rc.IDENTITY_GATE_SCHEMA, "verdict": verdict,
+        "error": "cache-on path not exercised" if verdict == "ERROR" else None,
+        "session": session, "model": model, "revision": _IG_REVISION, "tokenizer_revision": _IG_REVISION,
+        "deciding": ["A", "B"], "comparisons": comparisons, "label_on_pass": "experimental-align-mode",
+    }
+    doc.update(extra)
+    p = tmp_path / name
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    return p
+
+
+class TestS2BlockCIdentityGate:
+    def test_the_registration_report_says_which_session_is_gated(self):
+        kw: Dict[str, Any] = dict(query_manifests={"musique": str(_S2_MUSIQUE_MANIFEST)}, charter_datasets=("musique",),
+                                  floor_concurrency=50, gpu_id="NVIDIA H200")
+        cd = rc.preflight_registration_check("cd-act1", floor_avg_seq_tokens=str(_S2_ANCHOR_SEQ_TOKENS["cd-act1"]), **kw)
+        s2a = rc.preflight_registration_check("s2a", floor_avg_seq_tokens=str(_S2_ANCHOR_SEQ_TOKENS["s2a"]), **kw)
+        assert cd["identity_gated"] is True and s2a["identity_gated"] is False
+
+    def test_a_pass_verdict_keeps_the_cd_act1_plan_and_records_the_gate(self, plan_cd_act1, plan_s2a):
+        ig = plan_cd_act1["identity_gate"]
+        assert ig["verdict"] == "PASS" and ig["accepted_fail"] is False
+        assert ig["label_on_pass"] == "experimental-align-mode" and ig["excluded_row_keys"] == []
+        assert ig["path"].endswith("identity_gate.json") and re.fullmatch(r"[0-9a-f]{64}", ig["sha256"])
+        assert ig["comparisons"]["A"]["identical"] == 200 and ig["deciding"] == ["A", "B"]
+        # block A's pins hold: the one blocked row, the counts, the 35 gated rows
+        assert plan_cd_act1["blocked_row_keys"] == [_S2_SGLANG_B8_REFERENCE]
+        c = plan_cd_act1["counts"]
+        assert (c["cells"], c["windows"], c["relaunches"], c["dry_windows"], c["blocked"]) == (113, 257, 58, 16, 1)
+        assert len(plan_cd_act1["identity_gated_row_keys"]) == 35
+        # an ungated session carries no gate block (null, never absent)
+        assert "identity_gate" in plan_s2a and plan_s2a["identity_gate"] is None
+
+    def test_an_accepted_fail_excludes_every_gated_row_with_the_fixed_reason(self, tmp_path):
+        plan = _s2_plan("cd-act1", tmp_path, identity_gate=rc.load_identity_gate(_identity_verdict(tmp_path, "FAIL")),
+                        accept_identity_fail=True)
+        gated = plan["identity_gated_row_keys"]
+        assert len(gated) == 35, "the 35 rows of block A's pin stay listed, now as the excluded set"
+        rows = _s2_rows(plan)
+        blocked = {s["row_key"]: s["blocked_on"] for s in rows if s["blocked_on"]}
+        assert set(blocked) == set(gated) | {_S2_SGLANG_B8_REFERENCE}
+        assert {blocked[k] for k in gated} == {rc.IDENTITY_GATE_BLOCKED_ON}
+        assert blocked[_S2_SGLANG_B8_REFERENCE] != rc.IDENTITY_GATE_BLOCKED_ON, "a launch-side reason is kept"
+        assert all(s.get("budget_plan") is None for s in _cells(plan) if s["row_key"] in gated)
+        assert all(s["blocked_on"] == rc.IDENTITY_GATE_BLOCKED_ON for s in _cells(plan) if s["row_key"] in gated)
+        c = plan["counts"]
+        assert (c["cells"], c["windows"], c["blocked"]) == (113, 257, 36)
+        # [D] spec section 8: without the 35 vLLM prefix-on rows the plan keeps
+        # 39 relaunches and 11 dry windows (pinned here, measured by this test)
+        assert (c["relaunches"], c["dry_windows"]) == (39, 11)
+        assert sorted(plan["blocked_row_keys"]) == sorted(gated + [_S2_SGLANG_B8_REFERENCE])
+        # no relaunch serves vLLM with the prefix cache ON any more
+        assert not any(r["engine"] == "vllm" and r["prefix_mode"] == "ON" for r in _relaunches(plan))
+        # the consequence the plan text misses: the B3 vLLM F1 reference, one of
+        # the two primary rows, is out; one primary row stays executable
+        assert sum(1 for s in rows if s["row_class"] == "primary" and not s["blocked_on"]) == 1
+        ig = plan["identity_gate"]
+        assert ig["verdict"] == "FAIL" and ig["accepted_fail"] is True and ig["label_on_pass"] is None
+        assert ig["excluded_row_keys"] == gated
+        assert ig["comparisons"]["A"]["first_divergence"]["prompt_index"] == 7
+        out = tmp_path / "plan_fail.json"
+        out.write_text(json.dumps(plan), encoding="utf-8")
+        loaded = rc.load_plan(out)
+        assert loaded["identity_gate"] == plan["identity_gate"]
+        assert loaded["blocked_row_keys"] == plan["blocked_row_keys"]
+
+    def test_a_fail_verdict_refuses_without_the_owner_acceptance(self, tmp_path):
+        with pytest.raises(rc.PlanError, match="accept-identity-fail"):
+            _s2_plan("cd-act1", tmp_path, identity_gate=rc.load_identity_gate(_identity_verdict(tmp_path, "FAIL")))
+
+    def test_the_verdict_is_required_on_a_gated_session_and_refused_on_an_ungated_one(self, tmp_path):
+        with pytest.raises(rc.PlanError, match="--identity-gate"):
+            _s2_plan("cd-act1", tmp_path, identity_gate=None)
+        s2a_model = rc.HF_ID_OF_SLUG[rc.get_session_grid("s2a").model]
+        with pytest.raises(rc.PlanError, match="not identity gated"):
+            _s2_plan("s2a", tmp_path, identity_gate=rc.load_identity_gate(
+                _identity_verdict(tmp_path, "PASS", session="s2a", model=s2a_model)))
+
+    def test_the_plan_refuses_a_verdict_of_another_session_or_model(self, tmp_path):
+        with pytest.raises(rc.PlanError, match="session"):
+            _s2_plan("cd-act1", tmp_path, identity_gate=rc.load_identity_gate(
+                _identity_verdict(tmp_path, "PASS", session="s2a")))
+        with pytest.raises(rc.PlanError, match="model"):
+            _s2_plan("cd-act1", tmp_path, identity_gate=rc.load_identity_gate(
+                _identity_verdict(tmp_path, "PASS", model="Qwen/Qwen3-14B")))
+
+    def test_the_loader_refuses_error_missing_malformed_and_foreign_files(self, tmp_path):
+        with pytest.raises(rc.PlanError, match="ERROR"):
+            rc.load_identity_gate(_identity_verdict(tmp_path, "ERROR"))
+        with pytest.raises(rc.PlanError, match="not found"):
+            rc.load_identity_gate(tmp_path / "absent.json")
+        bad = tmp_path / "bad.json"
+        bad.write_text("{not json", encoding="utf-8")
+        with pytest.raises(rc.PlanError, match="not valid JSON"):
+            rc.load_identity_gate(bad)
+        with pytest.raises(rc.PlanError, match="schema"):
+            rc.load_identity_gate(_identity_verdict(tmp_path, "PASS", name="other.json", schema="something-else"))
+        with pytest.raises(rc.PlanError, match="verdict"):
+            rc.load_identity_gate(_identity_verdict(tmp_path, "MAYBE", name="maybe.json"))
+        rec = rc.load_identity_gate(_identity_verdict(tmp_path, "PASS"))
+        raw = (tmp_path / "identity_gate.json").read_bytes()
+        assert rec["sha256"] == hashlib.sha256(raw).hexdigest() and rec["verdict"] == "PASS"
+        assert rec["path"] == str(tmp_path / "identity_gate.json")
+
+    def test_the_cli_refuses_a_missing_verdict_with_exit_2_and_writes_nothing(self, tmp_path, capsys):
+        grid = rc.get_session_grid("cd-act1")
+        doc = _floor_table_doc(model=grid.model, grid="reduced", r_values=(1.0, 0.5, 0.25))
+        doc["generated_inputs"]["avg_seq_tokens"] = _S2_ANCHOR_SEQ_TOKENS["cd-act1"]
+        floor = tmp_path / "floor.json"
+        floor.write_text(json.dumps(doc), encoding="utf-8")
+        out = tmp_path / "plan.json"
+        base = ["plan", "--session", "cd-act1", "--floor-table", str(floor), "--window-duration-s", "300", "--out", str(out)]
+        code = rc.main([*base, "--identity-gate", str(tmp_path / "absent.json")])
+        assert code == 2 and not out.exists()
+        assert "REFUSED" in capsys.readouterr().err
+        # without the flag the gated session refuses before any calibration artifact is read
+        code = rc.main(base)
+        assert code == 2 and not out.exists()
+        err = capsys.readouterr().err
+        assert "REFUSED" in err and "--identity-gate" in err

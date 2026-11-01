@@ -288,6 +288,8 @@ def world(tmp_path: Path) -> Dict[str, Path]:
             return {"session": session, "anchor_seq_tokens": 4779, "cells": 3, "executable_cells": 3,
                     "needs_lmcache": os.environ.get("CAGE_TEST_NEEDS_LMCACHE") == "1", "largest_pools": largest,
                     "largest_helper_pools": helpers, "tp_env": tp_env, "gpu_count_needed": int(gc) if gc else None,
+                    # S2 block C (A-7): the identity gate rides the report like NEEDS_LMCACHE
+                    "identity_gated": os.environ.get("CAGE_TEST_IDENTITY_GATED") == "1",
                     "problems": problems}
         if __name__ == "__main__":
             a = sys.argv[1:]
@@ -418,6 +420,26 @@ def world(tmp_path: Path) -> Dict[str, Path]:
             fh.write(f"thinking_probe {backend} {a[a.index('--api-base') + 1]}\n")
         print(f"THINKING_PIN_OK backend={backend} num_tokens=3" if ok else f"THINKING_PIN_FAILED backend={backend} reason=test")
         sys.exit(0 if ok else 1)
+        ''', exe=False)
+    # S2 block C (C-1): the identity gate script; prompts and run record their argv and
+    # write --out, verdict prints the one marker from CAGE_TEST_IDENTITY_VERDICT (PASS default);
+    # a run whose --phase equals CAGE_TEST_IDENTITY_RUN_FAIL writes an error phase file and exits 1
+    _w(pr / "scripts" / "checks" / "identity_gate.py", r'''
+        import json, os, sys
+        from pathlib import Path
+        a = sys.argv[1:]
+        with open(os.environ["CAGE_TEST_LOG"], "a", encoding="utf-8") as fh:
+            fh.write("identity_gate " + " ".join(a) + "\n")
+        out = Path(a[a.index("--out") + 1]); out.parent.mkdir(parents=True, exist_ok=True)
+        if a[0] == "run" and a[a.index("--phase") + 1] == os.environ.get("CAGE_TEST_IDENTITY_RUN_FAIL", ""):
+            out.write_text(json.dumps({"phase": a[a.index("--phase") + 1], "error": "HTTP 500 at prompt 3"}), encoding="utf-8")
+            print("IDENTITY_GATE_RUN_ERROR phase=" + a[a.index("--phase") + 1] + " reason=HTTP 500 at prompt 3", file=sys.stderr); sys.exit(1)
+        if a[0] in ("prompts", "run"):
+            out.write_text(json.dumps({"phase": a[0], "argv": a}), encoding="utf-8"); sys.exit(0)
+        verdict = os.environ.get("CAGE_TEST_IDENTITY_VERDICT", "PASS")
+        out.write_text(json.dumps({"schema": "cage.identity_gate/1", "verdict": verdict, "session": "a", "argv": a}), encoding="utf-8")
+        print(f"IDENTITY_GATE {verdict}")
+        sys.exit(1 if verdict == "ERROR" else 0)
         ''', exe=False)
     # S1 audit 2026-10-23 (MEDIUM 4): the offline dataset probe, before any engine starts
     _w(pr / "scripts" / "checks" / "probe_datasets_offline.py", r'''
@@ -638,7 +660,7 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         CELL_STALL_MIN=60
         MONITOR_INTERVAL_S=1
         POD_REPO={pr}
-        POD_HF_CACHE={tmp_path}/hf_cache/huggingface
+        POD_HF_CACHE={tmp_path}/podhome/.cache/huggingface
         POD_BACKUP_DIR={backup}
         POD_TARBALL={tmp_path}/cage_repo.tar.gz
         FREEZE_FILE={freeze}
@@ -946,22 +968,43 @@ def test_short_seatbelt_fails_stage_0_before_anything_bills(world: Dict[str, Pat
     assert not any("provision_pod" in c for c in _calls(world))
 
 
+def _run_campaign_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("cage_run_campaign_for_profile_tests", REPO_ROOT / "scripts" / "3_run" / "run_campaign.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def test_shipped_profiles_cover_their_stage_bounds_and_name_registered_models() -> None:
     import importlib
     cb = importlib.import_module("src.orchestration.cache_budget")
+    rc = _run_campaign_module()
     for p in sorted((EXPDIR / "profiles").glob("S*.env")):
+        if p.read_text(encoding="utf-8").startswith("# SUPERSEDED"):
+            continue  # a kept record (S2.env since block E-1), not a landing profile; the master's preflight refuses it on the anchor shape
         proc = subprocess.run(["bash", "-c", f'set -a; source "{EXPDIR}/profiles/_common.env"; source "{p}"; '
-                               'printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" "$MODEL_SLUG" "$SEATBELT" "$HOURS" "$SETUP_BOUND_MIN" "$ENGINES" "$CALIBRATE" "${SCORE_BOUND_MIN:-180}" "$CALIBRATE_RUNGS_BOUND_S" "$FLOOR_AVG_SEQ_TOKENS" "${SUITE_ON_POD:-0}" "${START_CHECK:-1}" "${PULL_MARGIN_MIN:-90}"'],
+                               'printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" "$MODEL_SLUG" "$SEATBELT" "$HOURS" "$SETUP_BOUND_MIN" "$ENGINES" "$CALIBRATE" "${SCORE_BOUND_MIN:-180}" "$CALIBRATE_RUNGS_BOUND_S" "$FLOOR_AVG_SEQ_TOKENS" "${SUITE_ON_POD:-0}" "${START_CHECK:-1}" "${PULL_MARGIN_MIN:-90}" "$SESSION" "$IDENTITY_GATE_BOUND_S"'],
                               capture_output=True, text=True, env=PROFILE_ENV)
-        slug, seatbelt, hours, setup_min, engines, calibrate, score_min, rungs_bound_s, floor_tokens, suite_on_pod, start_check, pull_min = proc.stdout.split("|")
+        slug, seatbelt, hours, setup_min, engines, calibrate, score_min, rungs_bound_s, floor_tokens, suite_on_pod, start_check, pull_min, session, ig_bound_s = proc.stdout.split("|")
         assert slug in cb.MODEL_KV, f"{p.name}: MODEL_SLUG={slug} is not in cache_budget.MODEL_KV {sorted(cb.MODEL_KV)}"
-        # ADR-0155: every shipped profile sizes the floor table on the anchor shape
-        assert floor_tokens == "4779", f"{p.name}: FLOOR_AVG_SEQ_TOKENS={floor_tokens} is not the registered anchor shape"
+        # ADR-0155, S2 block A-5 (2026-11-01): every shipped profile sizes the floor table on ITS
+        # session's anchor shape (s2a keeps the S0 shape, cd-act1 registers 2694); a placeholder
+        # profile for a session the driver does not register yet (S3.env) keeps the common anchor
+        try:
+            grid = rc.get_session_grid(session)
+            anchor, gated = str(grid.demand_seq_tokens[rc.DEMAND_ANCHOR_ARM]), bool(grid.identity_gated)
+        except rc.PlanError:
+            anchor, gated = "4779", False
+        assert floor_tokens == anchor, f"{p.name}: FLOOR_AVG_SEQ_TOKENS={floor_tokens} is not session {session}'s anchor shape {anchor}"
         n_srv = len([e for e in engines.split() if e != "hf"]); n_cal = len(calibrate.split())
         # S0F-88 review L4: plus the stage 4 load gate and the offline dataset probe (20 min) and the pod suite (30 min when SUITE_ON_POD=1);
         # G16 (2026-10-17): plus the readiness wait (900 s), the start check (2,400 s), the seal (600 s) and a
         # the profile's pull margin (ADR-0176 Group C; the common default 90 = S0 attempt 5's 68 min)
+        # S2 block C (2026-11-01): the identity gate (IDENTITY_GATE_BOUND_S) bills at stage 4 on a gated session
         need = (15 + int(setup_min) + 20 + (30 if suite_on_pod == "1" else 0) + n_srv * 25 + (40 if start_check == "1" else 0)
+                + (int(ig_bound_s) // 60 if gated else 0)
                 + n_cal * 60 + n_cal * int(rungs_bound_s) // 60 + 15 + int(hours) * 60 + 10 + int(score_min) + 30 + int(pull_min))
         unit = seatbelt[-1]; n = int(seatbelt.split()[0][:-1])
         assert unit in ("h", "m"), f"{p.name}: SEATBELT={seatbelt} must be <n>h or <n>m (G30)"
@@ -2557,7 +2600,7 @@ def test_stage_3_records_the_weights_disk_free_space_and_refuses_below_the_floor
     # review 2026-10-31 (G8 finding 1): the read is of the disk holding the model cache
     # (POD_HF_CACHE, the pod user's cache by default), never of POD_REPO on the network
     # volume; the fake profile names a local cache, absent until stage 3 creates it
-    cache = world["tmp"] / "hf_cache" / "huggingface"
+    cache = world["home"] / ".cache" / "huggingface"
     assert not cache.exists()
     proc = _master(world, "--yes", "provision", "--to", "setup")
     assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
@@ -2597,3 +2640,409 @@ def test_the_shipped_s2_profile_holds_the_weights_on_a_300_gb_container_disk_s2_
     got = dict(zip(keys, proc.stdout.split("|")))
     # B-4 option a: 300 GB holds the 80B (163 GB bf16) or the 70B (141 GB); the master's 20 GB floor applies
     assert got == {"DISK_GB": "300", "GPU_COUNT": "4", "TOPOLOGY": "tp", "VOLUME_GB": "300", "DISK_FREE_MIN_GB": "", "ENGINES": "vllm sglang"}
+
+
+# ---------------------------------------------------------------------------
+# 11. S2 block E (2026-11-01): the two landing profiles, the Hub token path (E-2)
+#     and the served-model pins (E-4)
+# ---------------------------------------------------------------------------
+
+S2_HELPERS = ("intfloat/e5-large-v2", "BAAI/bge-reranker-large", "microsoft/llmlingua-2-xlm-roberta-large-meetingbank",
+              "KRLabsOrg/lettucedect-base-modernbert-en-v1", "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli",
+              "sentence-transformers/all-MiniLM-L6-v2", "roberta-base")
+
+
+def _profile_values(name: str, keys: tuple) -> Dict[str, str]:
+    fmt = "|".join("${%s:-}" % k for k in keys)
+    proc = subprocess.run(["bash", "-c", f'set -a; source "{EXPDIR}/profiles/_common.env"; source "{EXPDIR}/profiles/{name}"; printf "%s" "{fmt}"'],
+                          capture_output=True, text=True, env=PROFILE_ENV)
+    assert proc.returncode == 0, proc.stderr
+    return dict(zip(keys, proc.stdout.split("|")))
+
+
+def _profile_keys(name: str) -> set:
+    return set(re.findall(r"^([A-Z_][A-Z0-9_]*)=", (EXPDIR / "profiles" / name).read_text(encoding="utf-8"), re.M))
+
+
+def test_the_shipped_s2_landing_profiles_carry_every_s1_key_and_the_block_e_picks_s2_e1() -> None:
+    s1_keys = _profile_keys("S1.env")
+    for name in ("S2A.env", "S2B.env"):
+        missing = s1_keys - _profile_keys(name)
+        assert not missing, f"{name}: S1.env keys without a value: {sorted(missing)}"
+    keys = ("EXP", "SESSION", "MODEL", "MODEL_SLUG", "GPU_ID", "GPU_COUNT", "ENGINES", "CALIBRATE", "TOPOLOGY", "DC_PREFS",
+            "HOURS", "RUN_BUDGET_HOURS", "SEATBELT", "SETUP_BOUND_MIN", "CALIBRATE_RUNGS_BOUND_S", "SCORE_BOUND_MIN", "PULL_MARGIN_MIN",
+            "FLOOR_AVG_SEQ_TOKENS", "INSTALL_LMCACHE", "LMCACHE_VERSION", "PIN_MODEL_REVISION", "RUNG_ALL_CLASSES", "CLASS_CEILINGS",
+            "MIN_IN_REGIME_WINDOWS", "MAX_NULL_FRACTION", "SUITE_ON_POD", "MAC_SUITE", "FRONT_LOAD", "VOLUME_GB", "DISK_GB",
+            "QUERY_MANIFESTS", "CALIBRATION_MANIFEST", "PREFETCH_MODELS", "HF_TOKEN_FILE", "SKIP_BLOCKED")
+    a, b = _profile_values("S2A.env", keys), _profile_values("S2B.env", keys)
+    shared = {"GPU_ID": "NVIDIA H200", "GPU_COUNT": "4", "ENGINES": "vllm sglang", "CALIBRATE": "vllm sglang", "TOPOLOGY": "tp",
+              "DC_PREFS": "US-CA-2 US-CO-1 CA-MTL-3 CA-MTL-4 EU-FR-1 AP-JP-1", "CALIBRATE_RUNGS_BOUND_S": "18000",
+              "PIN_MODEL_REVISION": "1", "RUNG_ALL_CLASSES": "1", "CLASS_CEILINGS": "0", "MIN_IN_REGIME_WINDOWS": "6",
+              "MAX_NULL_FRACTION": "0.06", "SUITE_ON_POD": "1", "MAC_SUITE": "1", "FRONT_LOAD": "0", "VOLUME_GB": "300",
+              "DISK_GB": "300", "SKIP_BLOCKED": "0"}
+    for k, v in shared.items():
+        assert a[k] == v and b[k] == v, (k, a[k], b[k])
+    own = ("EXP", "SESSION", "MODEL", "MODEL_SLUG", "HOURS", "RUN_BUDGET_HOURS", "SEATBELT", "SETUP_BOUND_MIN",
+           "SCORE_BOUND_MIN", "PULL_MARGIN_MIN", "FLOOR_AVG_SEQ_TOKENS", "INSTALL_LMCACHE", "LMCACHE_VERSION")
+    assert {k: a[k] for k in own} == {
+        "EXP": "S2A", "SESSION": "s2a", "MODEL": "meta-llama/Llama-3.3-70B-Instruct", "MODEL_SLUG": "llama-3.3-70b",
+        "HOURS": "50", "RUN_BUDGET_HOURS": "45", "SEATBELT": "75h", "SETUP_BOUND_MIN": "40", "SCORE_BOUND_MIN": "120",
+        "PULL_MARGIN_MIN": "150", "FLOOR_AVG_SEQ_TOKENS": "4779", "INSTALL_LMCACHE": "0", "LMCACHE_VERSION": ""}
+    assert {k: b[k] for k in own} == {
+        "EXP": "S2B", "SESSION": "cd-act1", "MODEL": "Qwen/Qwen3-Next-80B-A3B-Instruct", "MODEL_SLUG": "qwen3-next-80b",
+        "HOURS": "60", "RUN_BUDGET_HOURS": "55", "SEATBELT": "90h", "SETUP_BOUND_MIN": "50", "SCORE_BOUND_MIN": "150",
+        "PULL_MARGIN_MIN": "180", "FLOOR_AVG_SEQ_TOKENS": "2694", "INSTALL_LMCACHE": "1", "LMCACHE_VERSION": "0.4.4"}
+    # the served model plus the seven helpers, and no Qwen3-14B (no pod reader defaults to it)
+    for p in (a, b):
+        assert p["PREFETCH_MODELS"].split() == [p["MODEL"], *S2_HELPERS], p["PREFETCH_MODELS"]
+    # S2B serves its MuSiQue questions packed in the 80B's tokens (the file exists and calibrates too);
+    # S2A names the 70B-token Qasper file, which stage 0 refuses until the gated tokenizer can be loaded (A-6)
+    assert b["QUERY_MANIFESTS"] == "musique=data/manifests/musique_2000x3_seed42_wr50_tok-Qwen3-Next-80B-A3B-Instruct.json"
+    assert b["CALIBRATION_MANIFEST"] == b["QUERY_MANIFESTS"].partition("=")[2] and (REPO_ROOT / b["CALIBRATION_MANIFEST"]).is_file()
+    assert a["QUERY_MANIFESTS"] == "qasper=data/manifests/qasper_852x12_seed42_wr50_tok-Llama-3.3-70B-Instruct.json"
+    assert a["CALIBRATION_MANIFEST"] == a["QUERY_MANIFESTS"].partition("=")[2]
+    # E-2: the token file key is set on the gated 70B only, as an expanded path outside the repo
+    assert a["HF_TOKEN_FILE"].startswith("/") and not a["HF_TOKEN_FILE"].startswith(str(REPO_ROOT)), a["HF_TOKEN_FILE"]
+    assert b["HF_TOKEN_FILE"] == ""
+
+
+def test_the_block_b_s2_profile_is_marked_superseded_by_the_landing_profiles_s2_e1() -> None:
+    head = (EXPDIR / "profiles" / "S2.env").read_text(encoding="utf-8").splitlines()[:2]
+    assert head[0].startswith("# SUPERSEDED 2026-11-01") and "S2A.env" in head[0] and "S2B.env" in head[1], head
+
+
+def _profile_with(world: Dict[str, Path], name: str, extra: str) -> None:
+    # a profile variant (the master reads profile keys from the profile; _common.env's empty
+    # HF_TOKEN_FILE default means a value in the environment never reaches it, review 2026-11-01 L2)
+    p = world["tmp"] / name
+    p.write_text(world["profile"].read_text(encoding="utf-8") + "\n" + extra + "\n", encoding="utf-8")
+    world["profile"] = p
+
+
+def _pod_hub_dir(world: Dict[str, Path]) -> Path:
+    # the fake ssh runs every remote command with HOME = the pod home, so the pod's hub reads
+    # HOME/.cache/huggingface/token there; the world profile's POD_HF_CACHE names that directory
+    return world["home"] / ".cache" / "huggingface"
+
+
+def test_a_mac_token_file_ships_to_the_pod_cache_as_a_file_and_never_enters_a_log_s2_e2(world: Dict[str, Path], tmp_path: Path) -> None:
+    token = "hf_FAKEtokenFORtheTESTonly0123456789"
+    tf = tmp_path / "hf_token"  # outside the repo
+    tf.write_text(token + "\n", encoding="utf-8")
+    tf.chmod(0o600)
+    _profile_with(world, "S1_token.env", f"HF_TOKEN_FILE={tf}")
+    proc = _master(world, "--yes", "provision", "--to", "ship")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert "HF_TOKEN_FILE_OK path=" + str(tf) in proc.stdout
+    landed = _pod_hub_dir(world) / "token"
+    assert landed.read_text(encoding="utf-8") == token + "\n" and stat.S_IMODE(landed.stat().st_mode) == 0o600
+    calls = _calls(world)
+    assert any(c.startswith("scp ") and str(tf) in c and c.rstrip().endswith("/token") for c in calls), calls
+    assert any("chmod 600 " in c and c.rstrip().endswith("echo HF_TOKEN_OK") for c in calls), calls
+    # the token's bytes exist in the Mac file and the pod file only: no step log, job command,
+    # state, call line or ledger line carries them (the paths may appear, the contents never)
+    carriers = [world["log"], world["ledger"], *world["exp_root"].rglob("*"), *(world["home"] / ".cage_jobs").glob("*")]
+    for pth in carriers:
+        if pth.is_file():
+            assert token not in pth.read_text(encoding="utf-8", errors="replace"), pth
+    assert token not in proc.stdout and token not in proc.stderr
+    steps = world["exp_root"] / "S1" / DATE / "extras" / "steps"
+    (log,) = list(steps.glob("ship_*scp_HF_token_file*.log"))
+    assert str(tf) in log.read_text(encoding="utf-8")
+    # review 2026-11-01 M2: the pod named its token path first, and it is the landed file
+    (log,) = list(steps.glob("ship_*the_pod_s_token_path*.log"))
+    assert f"HF_TOKEN_PATH={landed};" in log.read_text(encoding="utf-8")
+
+
+def test_a_cache_dir_the_pod_hub_does_not_read_is_refused_before_the_token_is_copied_s2_e2(world: Dict[str, Path], tmp_path: Path) -> None:
+    # review 2026-11-01 (block E, M2): a profile override of POD_HF_CACHE away from the pod's
+    # hub directory would land the token where nothing reads it; ship refuses before the copy
+    tf = tmp_path / "hf_token"
+    tf.write_text("hf_FAKEtokenFORtheTESTonly0123456789\n", encoding="utf-8")
+    tf.chmod(0o600)
+    elsewhere = tmp_path / "elsewhere" / "huggingface"
+    _profile_with(world, "S1_token_elsewhere.env", f"HF_TOKEN_FILE={tf}\nPOD_HF_CACHE={elsewhere}")
+    proc = _master(world, "--yes", "provision", "--to", "ship")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert f"[FAIL] the pod reads its Hub token at another path than {elsewhere}/token" in proc.stdout
+    assert not (elsewhere / "token").exists() and not (_pod_hub_dir(world) / "token").exists()
+    assert not any(c.startswith("scp ") and str(tf) in c for c in _calls(world))
+    assert _state(world)["stages"]["ship"]["status"] == "failed"
+
+
+@pytest.mark.parametrize("case", ["missing", "mode644", "in_repo", "tilde"])
+def test_a_bad_token_file_is_refused_at_stage_0_before_the_suite_or_any_pod_s2_e2(world: Dict[str, Path], tmp_path: Path, case: str) -> None:
+    probe = REPO_ROOT / "tests" / f".hf_token_probe_{os.getpid()}"
+    try:
+        if case == "missing":
+            path, reason = str(tmp_path / "absent"), "not readable"
+        elif case == "mode644":
+            tf = tmp_path / "hf_token"
+            tf.write_text("hf_x\n", encoding="utf-8")
+            tf.chmod(0o644)
+            path, reason = str(tf), "mode 0644, not 0600"
+        elif case == "in_repo":
+            probe.write_text("hf_x\n", encoding="utf-8")
+            probe.chmod(0o600)
+            path, reason = str(probe), "inside the repo"
+        else:
+            path, reason = "~/absent_token", "starts with a literal ~"
+        _profile_with(world, "S1_badtoken.env", f'HF_TOKEN_FILE="{path}"')  # quoted: bash keeps a literal ~
+        proc = _master(world)
+        assert proc.returncode == 1, proc.stdout[-3000:]
+        assert f"[FAIL] HF_TOKEN_FILE={path}: " in proc.stdout and reason in proc.stdout, proc.stdout[-1500:]
+        calls = _calls(world)
+        assert not any(c.startswith("provision_pod") or c.startswith("run_tests") for c in calls), calls
+    finally:
+        if probe.exists():
+            probe.unlink()
+
+
+def test_an_empty_token_file_key_leaves_the_flow_unchanged_and_the_shell_cannot_set_it_s2_e2(world: Dict[str, Path], tmp_path: Path) -> None:
+    tf = tmp_path / "hf_token"
+    tf.write_text("hf_x\n", encoding="utf-8")
+    tf.chmod(0o600)
+    # review 2026-11-01 L2: a value exported in the operator's shell never ships a token on a
+    # profile that does not set the key (_common.env's empty default wins over the environment)
+    proc = _master(world, "--yes", "provision", "--to", "ship", HF_TOKEN_FILE=str(tf))
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    assert not list((world["exp_root"] / "S1" / DATE / "extras" / "steps").glob("*HF_token*"))
+    assert not (_pod_hub_dir(world) / "token").exists()
+    assert "HF_TOKEN" not in proc.stdout
+
+
+def test_a_served_model_slot_named_for_the_model_pins_it_and_only_prefetched_models_carry_pins_s2_e4(world: Dict[str, Path], tmp_path: Path) -> None:
+    _profile_with(world, "S1_pin_slot.env", "PIN_MODEL_REVISION=1")
+    freeze_path = world["tmp"] / "freeze_resolutions.json"
+    freeze = json.loads(freeze_path.read_text(encoding="utf-8"))
+    # no slot named exactly served_model: the pin sits in a slot named for the model, as the S2 freeze file does
+    freeze["INSTRUMENT_REVISIONS"] = {"served_model_other": {"model": "Other/Model-X", "revision": "def456"},
+                                      "served_model_qwen3_14b": {"model": "Qwen/Qwen3-14B", "revision": "abc123"}}
+    freeze_path.write_text(json.dumps(freeze), encoding="utf-8")
+    proc = _master(world, "--yes", "provision", "--to", "setup")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    cmd = (world["home"] / ".cage_jobs" / "setup.cmd").read_text(encoding="utf-8")
+    assert "CAGE_HUB_CHECK_MODEL='Qwen/Qwen3-14B=abc123'" in cmd, cmd
+    # review 2026-11-01 M1: a pin for a model this profile does not prefetch stays out of the
+    # setup command (the S1 command keeps its eight pairs with the two S2 slots in the file)
+    prefetch = cmd.split("PREFETCH_REVISIONS='")[1].split("'")[0].split()
+    assert prefetch == ["Qwen/Qwen3-14B=abc123"] and "Other/Model-X" not in cmd, prefetch
+
+
+def test_a_served_model_slot_for_another_model_is_no_pin_and_two_revisions_for_one_model_are_none_s2_e4(world: Dict[str, Path], tmp_path: Path) -> None:
+    _profile_with(world, "S1_pin_other.env", "PIN_MODEL_REVISION=1")
+    freeze_path = world["tmp"] / "freeze_resolutions.json"
+    freeze = json.loads(freeze_path.read_text(encoding="utf-8"))
+    freeze["INSTRUMENT_REVISIONS"] = {"served_model_other": {"model": "Other/Model-X", "revision": "def456"}}
+    freeze_path.write_text(json.dumps(freeze), encoding="utf-8")
+    proc = _master(world)
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "PIN_MODEL_REVISION=1-but-no-served_model-revision-for-Qwen/Qwen3-14B" in proc.stdout
+    assert not any("provision_pod" in c for c in _calls(world))
+    # review 2026-11-01 L3: two slots naming this model with different revisions refuse the same
+    # way (no silent first match); two slots agreeing on one revision are that pin
+    freeze["INSTRUMENT_REVISIONS"] = {"served_model": {"model": "Qwen/Qwen3-14B", "revision": "abc123"},
+                                      "served_model_again": {"model": "Qwen/Qwen3-14B", "revision": "zzz999"}}
+    freeze_path.write_text(json.dumps(freeze), encoding="utf-8")
+    proc = _master(world)
+    assert proc.returncode == 1 and "PIN_MODEL_REVISION=1-but-no-served_model-revision-for-Qwen/Qwen3-14B" in proc.stdout, proc.stdout[-2000:]
+    freeze["INSTRUMENT_REVISIONS"]["served_model_again"]["revision"] = "abc123"
+    freeze_path.write_text(json.dumps(freeze), encoding="utf-8")
+    proc = _master(world, "--yes", "provision", "--to", "setup")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    assert "CAGE_HUB_CHECK_MODEL='Qwen/Qwen3-14B=abc123'" in (world["home"] / ".cage_jobs" / "setup.cmd").read_text(encoding="utf-8")
+
+
+def test_the_live_freeze_file_pins_both_s2_served_models_and_every_prefetched_model_s2_e4() -> None:
+    freeze = REPO_ROOT / "MyDocs" / "registration" / "freeze_resolutions.json"
+    if not freeze.is_file():
+        pytest.skip("the registration drafts live in MyDocs (not in every checkout)")
+    slots = json.loads(freeze.read_text(encoding="utf-8"))["INSTRUMENT_REVISIONS"]
+    pins = {v["model"]: v["revision"] for v in slots.values() if isinstance(v, dict) and v.get("model")}
+    for name, model in (("served_model_llama33_70b", "meta-llama/Llama-3.3-70B-Instruct"),
+                        ("served_model_qwen3_next_80b", "Qwen/Qwen3-Next-80B-A3B-Instruct")):
+        assert slots[name]["model"] == model and re.fullmatch(r"[0-9a-f]{40}", slots[name]["revision"]), name
+    for p in ("S2A.env", "S2B.env"):
+        for model in _profile_values(p, ("PREFETCH_MODELS",))["PREFETCH_MODELS"].split():
+            assert re.fullmatch(r"[0-9a-f]{40}", pins.get(model, "")), f"{p}: {model} has no 40-hex pin in the freeze file"
+
+
+# ---------------------------------------------------------------------------
+# S2 block C (2026-11-01, register C-1 / A-7, charter 5.2): the identity gate
+# runs once at stage 4 on a gated session (stage 0's IDENTITY_GATED=1), after
+# the engine probes and before the start check: one prompt build, then three
+# launcher starts (vLLM prefix on, vLLM prefix off, SGLang) each with its run
+# phase, then one verdict. PASS and FAIL are results the plan reads at stage
+# 6; ERROR fails stage 4 before anything bills at stage 5.
+# ---------------------------------------------------------------------------
+
+
+def _gated_profile(world: Dict[str, Path], tmp_path: Path, *, engines: str = "vllm sglang hf", extra: str = "") -> None:
+    """A profile that can carry the gate: the engines, the musique manifest the
+    gate draws its prompts from, and the served-model revision pin."""
+    p = tmp_path / "S1_gated.env"
+    text = world["profile"].read_text(encoding="utf-8").replace('ENGINES="vllm hf"', f'ENGINES="{engines}"')
+    # the gate adds 60 min to the validate bound: the world's 12 h seatbelt (720 min) no longer covers the 766 min needed
+    text = text.replace("SEATBELT=12h", "SEATBELT=14h")
+    text = text.replace('QUERY_MANIFESTS="squad_v2=data/manifests/squad_v2_50x3_seed42.json"',
+                        'QUERY_MANIFESTS="squad_v2=data/manifests/squad_v2_50x3_seed42.json musique=data/manifests/musique_2000x1_seed42_wr50.json"')
+    p.write_text(text + "\nPIN_MODEL_REVISION=1\n" + extra + "\n", encoding="utf-8")
+    freeze_path = world["tmp"] / "freeze_resolutions.json"
+    freeze = json.loads(freeze_path.read_text(encoding="utf-8"))
+    freeze["INSTRUMENT_REVISIONS"] = {"served_model": {"model": "Qwen/Qwen3-14B", "revision": "abc123"}}
+    freeze_path.write_text(json.dumps(freeze), encoding="utf-8")
+    world["profile"] = p
+
+
+def _job_names(world: Dict[str, Path]) -> List[str]:
+    names: List[str] = []
+    for n in re.findall(r"\.cage_jobs/([A-Za-z0-9_.-]+)\.cmd", world["log"].read_text(encoding="utf-8")):
+        if not names or names[-1] != n:
+            names.append(n)
+    return names
+
+
+def _job_cmd(world: Dict[str, Path], name: str) -> str:
+    return (world["home"] / ".cage_jobs" / f"{name}.cmd").read_text(encoding="utf-8")
+
+
+def test_stage_4_runs_the_identity_gate_between_the_engine_probes_and_the_start_check_s2_c1(world: Dict[str, Path], tmp_path: Path) -> None:
+    _gated_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_IDENTITY_GATED="1", CAGE_TEST_LARGEST_POOL="1")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    # stage 0 prints and records the gate like NEEDS_LMCACHE, and the stage 4 bound grows by the gate bound
+    assert "IDENTITY_GATED=1" in proc.stdout and _state(world)["registration"]["identity_gated"] in ("1", 1)
+    assert "validate 170," in proc.stdout, [ln for ln in proc.stdout.splitlines() if "seatbelt" in ln]
+    assert "three engine starts at stage 4" in proc.stdout, "vLLM on, vLLM off and SGLang (review 2026-11-01 LOW 5)"
+    assert _job_names(world) == ["setup", "load_gate", "datasets_offline", "validate_vllm", "validate_sglang", "identity_gate",
+                                 "start_check", "calibrate_vllm", "calibrate_rungs_vllm", "plan"]
+    cmd = _job_cmd(world, "identity_gate")
+    pr = world["pod_repo"]
+    assert cmd.startswith(f"cd {pr} && export PATH={pr}/cage-env/bin:$PATH VLLM_START_TIMEOUT=600"), cmd[:200]
+    assert " SGLANG_START_TIMEOUT=600" in cmd and " HF_HUB_OFFLINE=1 CAGE_MODEL_REVISION=abc123" in cmd
+    # the prompt build: the profile's musique manifest, trial 1, the pinned revision, the session
+    assert ("cage-env/bin/python scripts/checks/identity_gate.py prompts --manifest data/manifests/musique_2000x1_seed42_wr50.json "
+            "--dataset musique --trial 1 --count 200 --model 'Qwen/Qwen3-14B' --revision abc123 --session a "
+            "--out logs/identity_gate/prompts.json") in cmd
+    # three starts in order: vLLM prefix on, vLLM prefix off, SGLang; each at the engine's largest-pool env
+    on = "env CAGE_KV_BUDGET_BYTES=48936960000 VLLM_MAX_MODEL_LEN=32768 bash scripts/2_serving/manage_vllm_server.sh start 'Qwen/Qwen3-14B' && "
+    assert cmd.count(on[:-len(" && ")]) == 2
+    i_on = cmd.index(on)
+    i_off = cmd.index(on.replace("' && ", "' --no-prefix-cache && "))
+    i_sgl = cmd.index("bash scripts/2_serving/manage_sglang_server.sh start 'Qwen/Qwen3-14B' && ")
+    assert i_on < i_off < i_sgl
+    assert cmd.count("bash scripts/2_serving/manage_vllm_server.sh stop") == 2
+    assert cmd.count("bash scripts/2_serving/manage_sglang_server.sh stop") == 1
+    run = "cage-env/bin/python scripts/checks/identity_gate.py run --engine {e} --phase {ph} --api-base {api} --model 'Qwen/Qwen3-14B' --prompts logs/identity_gate/prompts.json --passes {n} --out logs/identity_gate/{ph}.json"
+    assert run.format(e="vllm", ph="vllm_on", api="http://localhost:8000", n=2) in cmd
+    assert run.format(e="vllm", ph="vllm_off", api="http://localhost:8000", n=1) in cmd
+    assert run.format(e="sglang", ph="sglang", api="http://localhost:30000", n=2) in cmd
+    assert cmd.count("identity_gate.py run ") == 3
+    assert "cage-env/bin/python scripts/checks/identity_gate.py verdict --phases logs/identity_gate --out logs/identity_gate.json" in cmd
+    assert "--no-sglang" not in cmd and cmd.rstrip().endswith("echo COMPUTE_APPS=$n; exit $rc")
+    # the fake launchers saw the three starts, the control one prefix-off
+    starts = [c for c in _calls(world) if c.startswith("launcher ") and " start " in c]
+    assert "launcher vllm start Qwen/Qwen3-14B --no-prefix-cache" in starts
+    # every gate file is pulled beside the landing's extras, the verdict is recorded, the plan reads it
+    extras = world["exp_root"] / "S1" / DATE / "extras" / "identity_gate"
+    assert sorted(p.name for p in extras.iterdir()) == ["identity_gate.json", "prompts.json", "sglang.json", "vllm_off.json", "vllm_on.json"]
+    assert json.loads((extras / "identity_gate.json").read_text(encoding="utf-8"))["verdict"] == "PASS"
+    assert _state(world)["stages"]["validate"]["identity_gate"] == "PASS"
+    assert "IDENTITY_GATE PASS" in proc.stdout
+    plan_cmd = _job_cmd(world, "plan")
+    assert " --identity-gate logs/identity_gate.json" in plan_cmd and "--accept-identity-fail" not in plan_cmd
+
+
+def test_a_vllm_only_gated_profile_runs_two_starts_and_records_sglang_absent(world: Dict[str, Path], tmp_path: Path) -> None:
+    _gated_profile(world, tmp_path, engines="vllm hf")
+    proc = _master(world, "--yes", "provision", "--to", "validate", CAGE_TEST_IDENTITY_GATED="1")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    cmd = _job_cmd(world, "identity_gate")
+    assert "manage_sglang_server.sh" not in cmd and cmd.count("identity_gate.py run ") == 2
+    assert "--out logs/identity_gate.json --no-sglang" in cmd
+    assert "validate 145," in proc.stdout, [ln for ln in proc.stdout.splitlines() if "seatbelt" in ln]
+    assert "two engine starts at stage 4" in proc.stdout, "no SGLang on this profile (review 2026-11-01 LOW 5)"
+    extras = world["exp_root"] / "S1" / DATE / "extras" / "identity_gate"
+    assert sorted(p.name for p in extras.iterdir()) == ["identity_gate.json", "prompts.json", "vllm_off.json", "vllm_on.json"]
+
+
+def test_a_fail_verdict_is_a_result_at_stage_4_and_the_plan_waits_for_the_owner_acceptance(world: Dict[str, Path], tmp_path: Path) -> None:
+    _gated_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_IDENTITY_GATED="1", CAGE_TEST_IDENTITY_VERDICT="FAIL")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    st = _state(world)
+    assert st["stages"]["validate"]["status"] == "passed" and st["stages"]["validate"]["identity_gate"] == "FAIL"
+    assert st["stages"]["calibrate"]["status"] == "passed", "FAIL is a result: stage 5 runs"
+    assert st["stages"]["plan"]["status"] == "failed"
+    assert "IDENTITY_GATE FAIL" in proc.stdout and "IDENTITY_FAIL_ACCEPTED" in proc.stdout
+    assert not (world["home"] / ".cage_jobs" / "plan.cmd").exists(), "the plan job never ran"
+    # the owner's acceptance in the profile: the resumed master plans the rest with both flags
+    _profile_with(world, "S1_gated_accept.env", "IDENTITY_FAIL_ACCEPTED=1")
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_IDENTITY_GATED="1", CAGE_TEST_IDENTITY_VERDICT="FAIL")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    plan_cmd = _job_cmd(world, "plan")
+    assert " --identity-gate logs/identity_gate.json --accept-identity-fail" in plan_cmd
+    assert _state(world)["stages"]["plan"]["status"] == "passed"
+
+
+def test_an_error_verdict_fails_stage_4_before_anything_bills_at_stage_5(world: Dict[str, Path], tmp_path: Path) -> None:
+    _gated_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_IDENTITY_GATED="1", CAGE_TEST_IDENTITY_VERDICT="ERROR")
+    assert proc.returncode == 1 and "stage validate FAILED" in proc.stdout, proc.stdout[-3000:]
+    assert "identity_gate" not in _state(world)["stages"]["validate"]
+    assert not (world["home"] / ".cage_jobs" / "calibrate_vllm.cmd").exists(), "stage 5 must not run"
+    log = (world["exp_root"] / "S1" / DATE / "logs" / "setup" / "identity_gate.log").read_text(encoding="utf-8")
+    assert "IDENTITY_GATE ERROR" in log
+
+
+def test_a_run_phase_failure_fetches_the_gate_record_before_failing_stage_4_review_l1(world: Dict[str, Path], tmp_path: Path) -> None:
+    """A phase that ends in an error leaves prompts.json and the phase files on
+    the pod with the reason and every request recorded up to it: they are
+    fetched before the stage fails, not only the job log tail."""
+    _gated_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_IDENTITY_GATED="1", CAGE_TEST_IDENTITY_RUN_FAIL="vllm_off")
+    assert proc.returncode == 1 and "stage validate FAILED" in proc.stdout, proc.stdout[-3000:]
+    assert "the identity gate job ended before a verdict" in proc.stdout
+    extras = world["exp_root"] / "S1" / DATE / "extras" / "identity_gate"
+    assert sorted(p.name for p in extras.iterdir()) == ["prompts.json", "vllm_off.json", "vllm_on.json"], "the record of the failed job"
+    assert json.loads((extras / "vllm_off.json").read_text(encoding="utf-8"))["error"] == "HTTP 500 at prompt 3"
+    assert "identity_gate" not in _state(world)["stages"]["validate"]
+    assert not (world["home"] / ".cage_jobs" / "calibrate_vllm.cmd").exists(), "stage 5 must not run"
+
+
+def test_a_failed_redo_of_stage_4_wipes_the_stale_verdict_so_the_plan_refuses_review_l2(world: Dict[str, Path], tmp_path: Path) -> None:
+    """Run 1 ends PASS. A --redo of stage 4 that dies inside a run phase never
+    reaches the verdict step: `state begin` opens the stage with a fresh record,
+    so no verdict key survives, and --from plan --redo (which applies no
+    predecessor rule) refuses instead of planning on run 1's verdict (review
+    2026-11-01 LOW 2: the scenario it names cannot occur; this pins why)."""
+    _gated_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_IDENTITY_GATED="1")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert _state(world)["stages"]["validate"]["identity_gate"] == "PASS"
+    proc = _master(world, "--only", "validate", "--redo", CAGE_TEST_IDENTITY_GATED="1", CAGE_TEST_IDENTITY_RUN_FAIL="vllm_on")
+    assert proc.returncode == 1 and "stage validate FAILED" in proc.stdout, proc.stdout[-3000:]
+    assert "identity_gate" not in _state(world)["stages"]["validate"], "state begin resets the stage record"
+    proc = _master(world, "--from", "plan", "--to", "plan", "--redo", CAGE_TEST_IDENTITY_GATED="1")
+    assert proc.returncode == 1 and "recorded no identity verdict" in proc.stdout, proc.stdout[-3000:]
+    assert _state(world)["stages"]["plan"]["status"] == "failed"
+
+
+def test_an_ungated_profile_runs_no_identity_gate_and_passes_no_flag(world: Dict[str, Path], tmp_path: Path) -> None:
+    _gated_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "plan")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert "IDENTITY_GATED=0" in proc.stdout and _state(world)["registration"]["identity_gated"] in ("0", 0)
+    assert "validate 110," in proc.stdout
+    assert "identity_gate" not in _job_names(world) and not (world["home"] / ".cage_jobs" / "identity_gate.cmd").exists()
+    assert "--identity-gate" not in _job_cmd(world, "plan") and "identity_gate" not in _state(world)["stages"]["validate"]
+    assert not (world["exp_root"] / "S1" / DATE / "extras" / "identity_gate").exists()
+
+
+def test_a_gated_session_without_the_gate_manifest_or_the_revision_pin_refuses_at_stage_0(world: Dict[str, Path], tmp_path: Path) -> None:
+    # the world profile registers squad_v2 only and pins no served-model revision
+    _two_engine_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_IDENTITY_GATED="1")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "IDENTITY_GATE_DATASET=musique" in proc.stdout and "MODEL_REVISION" in proc.stdout
+    assert not any("provision_pod" in c and "--yes" in c for c in _calls(world)), "nothing bills on a refused stage 0"

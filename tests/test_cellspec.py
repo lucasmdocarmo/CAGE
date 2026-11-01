@@ -197,7 +197,7 @@ def _spec(**overrides: object) -> CellSpec:
         # topology rules
         dict(topology="pd"),  # pd outside DIST
         dict(family="DIST"),  # DIST at single topology
-        dict(family="DIST", topology="pd", arm="retr-fresh", retriever="rerank"),
+        dict(family="DIST", topology="pd", arm="gold-reuse"),  # outside the five DIST arms (S2)
         # engine-model support
         dict(engine="lmdeploy", model="deepseek-v3"),
         dict(engine="lmdeploy", model="qwen3-next-80b"),
@@ -237,6 +237,13 @@ def test_legal_pressure_and_dist_cells() -> None:
     assert f3.policy == "evict"
     dist = _spec(family="DIST", topology="pd", model="deepseek-v3", arm="corpus-reuse")
     assert dist.topology == "pd"
+    # S2 experiment C (owner 2026-10-31, S2 plan section 8 decision 2): the
+    # disaggregation overlay carries the five full-grid arms, not the pair alone
+    for arm, retriever in (
+        ("gold-fresh", "none"), ("corpus-reuse", "none"), ("corpus-fresh", "none"),
+        ("retr-fresh", "rerank"), ("retr-reuse", "rerank"),
+    ):
+        assert _spec(family="DIST", topology="pd", arm=arm, retriever=retriever).arm == arm
 
 
 def test_pressure_coords_coerced_to_float() -> None:

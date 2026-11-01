@@ -389,3 +389,49 @@ def test_restart_with_bad_tp_never_reaches_teardown(stub_bin: Path) -> None:
         assert "Stopping" not in proc.stdout, (
             f"{script.name}: refusal fired AFTER teardown began"
         )
+
+
+# ---------------------------------------------------------------------------
+# S2 block C-2 (2026-11-01, charter 5.2): the vLLM launcher pins the hybrid
+# cache mode on every prefix-on start of a Qwen3-Next model. vLLM 0.19.1 serves
+# Qwen3-Next with prefix caching only in --mamba-cache-mode align (the "all"
+# mode raises NotImplementedError); the flag is emitted, never left to a
+# fallback, and the reuse check reads it back as a dial.
+# ---------------------------------------------------------------------------
+
+QWEN3_NEXT = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+
+
+def test_vllm_qwen3_next_prefix_on_start_carries_the_align_cache_mode(stub_bin: Path) -> None:
+    line = _server_args_line(_run_launcher(VLLM_SH, stub_bin, "start", QWEN3_NEXT).stdout)
+    assert "--enable-prefix-caching" in line
+    assert "--mamba-cache-mode align" in line
+
+
+def test_vllm_qwen3_next_prefix_off_start_omits_the_cache_mode(stub_bin: Path) -> None:
+    line = _server_args_line(
+        _run_launcher(VLLM_SH, stub_bin, "start", QWEN3_NEXT, "--no-prefix-cache").stdout
+    )
+    assert "--no-enable-prefix-caching" in line
+    assert "--mamba-cache-mode" not in line
+
+
+def test_vllm_non_hybrid_models_never_carry_the_cache_mode(stub_bin: Path) -> None:
+    for args in (
+        ("start", "Qwen/Qwen3-14B"),
+        ("start", "Qwen/Qwen3-14B", "--no-prefix-cache"),
+        ("start", "meta-llama/Llama-3.3-70B-Instruct"),
+    ):
+        line = _server_args_line(_run_launcher(VLLM_SH, stub_bin, *args).stdout)
+        assert "--mamba-cache-mode" not in line, args
+
+
+def test_vllm_reuse_check_reads_the_cache_mode_as_a_dial() -> None:
+    """Static pin: the running-server reuse block compares the live cmdline's
+    --mamba-cache-mode with the requested one, space-anchored like the TP
+    dial, so a prefix-on 80B server started without the mode is never reused
+    and a prefix-off start never reuses an aligned server."""
+    vllm = VLLM_SH.read_text(encoding="utf-8")
+    reuse = vllm[vllm.index("dials_match=true"):vllm.index("Start server")]
+    assert '*" --mamba-cache-mode align "*' in reuse
+    assert '"$live_cmd" != *"--mamba-cache-mode"*' in reuse

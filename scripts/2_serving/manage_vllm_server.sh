@@ -30,6 +30,12 @@
 # (cage_validate_vllm_budget_env in scripts/lib/_serving_config.sh); preflight
 # gate (j) verifies the REALIZED bytes from the startup log, never the dial.
 #
+# Hybrid cache mode (S2 block C-2, 2026-11-01, charter 5.2): a prefix-on start
+# of a Qwen/Qwen3-Next-* model adds `--mamba-cache-mode align`, the only mode
+# that serves the hybrid with prefix caching at vLLM 0.19.1; the reuse check
+# treats the mode as a dial. No env knob: the model name and the cache mode
+# decide it. A prefix-off start of the same model carries no mode flag.
+#
 # Tensor-parallel env contract (T3.1 — Wave-3 distributed serving; the
 # 2026-08-27 audit verified NO launcher passed any TP flag):
 #   CAGE_VLLM_TENSOR_PARALLEL     positive integer; when set >= 2, the launch
@@ -153,6 +159,15 @@ start_server() {
         cache_flag="--no-enable-prefix-caching"
         want_prefix_cache=false
     fi
+    # S2 block C-2 (2026-11-01, charter 5.2): a prefix-on start of a Qwen3-Next model
+    # (the hybrid Gated DeltaNet + attention 80B of cd-act1) pins vLLM's aligned mamba
+    # cache mode, the only mode that serves the hybrid with prefix caching at 0.19.1
+    # (the "all" mode raises NotImplementedError). Emitted here, never left to an
+    # engine fallback, so the serving record names the mode the gated rows ran in.
+    local want_mamba_align=false
+    case "$model" in
+        Qwen/Qwen3-Next-*) [ "$want_prefix_cache" = "true" ] && want_mamba_align=true ;;
+    esac
     
     echo -e "${YELLOW}Starting vLLM server with model: $model${NC}"
     
@@ -210,6 +225,14 @@ start_server() {
         else
             [[ "$live_cmd" != *"--tensor-parallel-size"* ]] || dials_match=false
         fi
+        # S2 block C-2 (2026-11-01): the hybrid cache mode is a dial too. A server
+        # started without the aligned mode, or a prefix-off request against an
+        # aligned server, is never reused (its data would carry the wrong cache mode).
+        if [ "$want_mamba_align" = "true" ]; then
+            [[ " $live_cmd " == *" --mamba-cache-mode align "* ]] || dials_match=false
+        else
+            [[ "$live_cmd" != *"--mamba-cache-mode"* ]] || dials_match=false
+        fi
 
         # Reuse the running server ONLY when no serving lever is requested. The running
         # check cannot read back the live --speculative-config / --kv-cache-dtype, so if
@@ -238,6 +261,7 @@ start_server() {
     # Build the server argv as an ARRAY so values with internal whitespace (notably the
     # JSON speculative config) are passed as a single token and never word-split.
     local -a vllm_args=( --port "$PORT" "$cache_flag" )
+    [ "$want_mamba_align" != "true" ] || vllm_args+=( --mamba-cache-mode align )
 
     # MiMo-7B-RL (and any repo shipping custom modeling code, incl. its MTP draft head)
     # fails vLLM ModelConfig validation without this: "contains custom code which must be

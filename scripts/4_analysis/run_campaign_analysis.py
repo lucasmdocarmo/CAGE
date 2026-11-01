@@ -2741,8 +2741,9 @@ class FamilyContext:
 
     def contrast_datasets(self, contrast_id: int) -> frozenset[str]:
         """The datasets the table registers rows for under ``contrast_id``
-        (C1): the pressure families compile on ``families.PRESSURE_DATASET``
-        alone, so an executor must never compute a chain leg elsewhere."""
+        (C1): the pressure families compile on the session's pressure dataset
+        alone (``families.pressure_dataset``), so an executor must never
+        compute a chain leg elsewhere."""
         rows = self.table[self.table["contrast_id"] == contrast_id]
         return frozenset(str(d) for d in rows["dataset"] if d != "cross-dataset")
 
@@ -2840,6 +2841,9 @@ def build_family_context(
     confirmatory look without the roster refuses.
     """
     model = str(index["model"].iloc[0])
+    # S2 (register A-4): the pressure families compile on the session's
+    # dataset (MuSiQue on cd-act1), read from the index like the model
+    session = str(index["session"].iloc[0])
     group = GROUP_OF_MODEL.get(model)
     if group is None:
         raise AnalysisError(
@@ -2866,7 +2870,9 @@ def build_family_context(
     else:
         datasets = run_datasets
     try:
-        table = compile_family_map(datasets, metrics=tuple(metrics), alpha=alpha)
+        table = compile_family_map(
+            datasets, metrics=tuple(metrics), alpha=alpha, session=session
+        )
     except FamilyMapError as exc:
         raise AnalysisError(f"family map compilation failed (§9.3): {exc}") from exc
     scoped = table[table["group"] == group]
