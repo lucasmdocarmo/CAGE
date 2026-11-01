@@ -583,6 +583,24 @@ def test_stage_0_refuses_the_s1_anchor_at_r1p5_on_one_h100_and_passes_s0_b7() ->
     assert '"$FLOOR_CONCURRENCY" "$GPU_ID" <<\'PY\'' in master and "gpu_id=gpu_id)" in master
 
 
+def test_the_s2_models_have_a_derived_h200_bound_that_the_first_start_refreshes_s2_b2() -> None:
+    """S2 Block B-2 (owner 2026-10-31): per-rank bounds for the two S2 models on
+    one H200 of a four-GPU pod, derived from the 141 GB card, the 0.90 share and
+    the bf16 weights split four ways, with a 10 GiB cut [D, A]; the first live
+    H200 start at the largest planned pool refreshes them."""
+    assert rc.FREE_BYTES_AFTER_WEIGHTS[("llama-3.3-70b", "NVIDIA H200")] == 75 * 1024 ** 3
+    assert rc.FREE_BYTES_AFTER_WEIGHTS[("qwen3-next-80b", "NVIDIA H200")] == 70 * 1024 ** 3
+    # the per-rank pool of a TP=4 plan is what the bound judges
+    step = {"engine": "vllm", "budget_r": 1.0, "topology": "single", "demand_class": {"seq_tokens": 4779},
+            "budget_plan": {"model": "qwen3-next-80b", "r": 1.0, "per_rank_bytes": 70 * 1024 ** 3, "pools_bytes": None}}
+    assert rc.pool_ceiling_overruns([step], "NVIDIA H200") == []
+    step["budget_plan"]["per_rank_bytes"] += 1
+    (over,) = rc.pool_ceiling_overruns([step], "NVIDIA H200")
+    assert (over["free_bytes"], over["pool_bytes"]) == (70 * 1024 ** 3, 70 * 1024 ** 3 + 1)
+    # the 14B on the H200 stays unmeasured: blind is still a refusal
+    assert rc.pool_ceiling_overruns([_relaunch(1)], "NVIDIA H200")[0]["free_bytes"] is None
+
+
 # --------------------------------------------------------------------------- #
 # B-9 wiring: S0 ladders every class (R5) through the master and the CLI
 # --------------------------------------------------------------------------- #

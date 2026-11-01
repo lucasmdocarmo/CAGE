@@ -1736,6 +1736,20 @@ with open(os.environ["STUB_CALLS"], "a", encoding="utf-8") as fh:
         "argv": sys.argv[1:],
         "env": {k: v for k, v in os.environ.items() if k.startswith("CAGE_")},
     }) + "\\n")
+# S2 Block B-2 (2026-10-31): a pd `start` leaves the record the real pd
+# launcher's cage_kv_pool_capture_pd writes at its ready line (one entry per
+# role pool), which run_plan's A11 pool check reads and sums; the tokens
+# follow each role budget at Qwen3-14B's 163,840 B per bf16 token (MODEL_KV,
+# the figure tests/test_run_campaign.py's stub uses). `stop` writes nothing.
+if sys.argv[1:2] == ["start"] and os.environ.get("CAGE_KV_BUDGET_BYTES_PREFILL") and os.environ.get("CAGE_KV_BUDGET_BYTES_DECODE"):
+    roles = {}
+    for role in ("prefill", "decode"):
+        budget = int(os.environ["CAGE_KV_BUDGET_BYTES_" + role.upper()])
+        roles[role] = {"tokens": budget // 163840, "bytes": budget}
+    pool_dir = os.path.join(os.environ["CAGE_LOG_ROOT"], "vllm")
+    os.makedirs(pool_dir, exist_ok=True)
+    with open(os.path.join(pool_dir, "CURRENT.pd.kvpool.json"), "w", encoding="utf-8") as fh:
+        json.dump({"engine": "vllm", "topology": "pd", "roles": roles}, fh)
 sys.exit(0)
 """
 
@@ -1816,6 +1830,18 @@ class TestAllowPdGating:
         # S0F-22 Batch 1: the cell subprocess carries the role telemetry pair
         assert cell["env"]["CAGE_TELEMETRY_ENDPOINTS"] == rc.PD_TELEMETRY_ENDPOINTS
         assert "--vllm-telemetry" in cell["argv"]
+        # S2 Block B-2 (2026-10-31): the pd relaunch's realized pool (the pd
+        # record's two roles summed) was checked against the plan's own token
+        # total and handed to the cell under it, as a single relaunch's is.
+        pool = json.loads(cell["env"][rc.REALIZED_POOL_ENV])
+        pd_relaunch = [s for s in _relaunches(plan) if s["topology"] == "pd"][0]
+        expect_tokens = sum(
+            int(relaunch["env"][f"CAGE_KV_BUDGET_BYTES_{role}"]) // 163840 for role in ("PREFILL", "DECODE")
+        )
+        assert pool["ok"] is True and pool["topology"] == "pd"
+        assert pool["record"].endswith(rc.KV_POOL_PD_RECORD_NAME)
+        assert pool["realized_tokens"] == expect_tokens
+        assert pool["planned_tokens"] == pd_relaunch["budget_plan"]["budget_tokens_total"]
 
     def test_run_refuses_a_shell_telemetry_endpoints_export(self, tmp_path, stub, monkeypatch):
         # The runner refuses CAGE_TELEMETRY_ENDPOINTS without --vllm-telemetry

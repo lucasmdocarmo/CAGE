@@ -329,40 +329,139 @@ def plot02_truth_tax(L: Landing, out: Path) -> Tuple[str, str]:
     return _out(fig, out, "p02_truth_tax"), f"{len(y)} IN_REGIME windows; table rows unknown to the index: {L.yield_unmatched}"
 
 
+#: p03 (redrawn 2026-10-29, owner approval of the Spec Block): the frontier
+#: block's ladder loads differ per engine and rung (ten distinct fractions on
+#: S1), so its cells pool into one column, read from the plan's block field.
+FRONTIER_COLUMN = "frontier (K1)"
+#: window labels that carry no regime verdict: counted in the cell, named in its text
+NO_RECORD_LABELS = frozenset({"UNKNOWN_TELEMETRY", "NO_REGIME_RECORD"})
+
+
+def _plan_blocks(L: Landing) -> Dict[str, str]:
+    """row_key -> block (K1 frontier, P1 pressure table) from the registered
+    plan's cell steps; {} without a plan or when the steps carry no block."""
+    if L.plan is None:
+        return {}
+    try:
+        doc = L.plan_doc()
+    except PlotSkip:
+        return {}
+    return {str(s["row_key"]): str(s["block"]) for s in doc.get("steps", [])
+            if s.get("kind") == "cell" and s.get("block") and s.get("row_key")}
+
+
+def _rate_label(rate: Any) -> str:
+    """A load fraction as a two-decimal column label, rounded half up on the
+    decimal digits (review LOW 4: binary float formatting sent 0.705 to 0.70)."""
+    from decimal import ROUND_HALF_UP, Decimal
+
+    return str(Decimal(str(float(rate))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def _frontier_rates(c: pd.DataFrame, blocks: Dict[str, str]) -> List[str]:
+    """The distinct ladder rates the frontier column pools, numeric ascending,
+    printed with every digit the index carries (review MEDIUM 1: a four-digit
+    format merged 0.7692 with 0.769206)."""
+    rates = {float(r) for k, r in zip(c["row_key"], c["rate_frac"]) if blocks.get(str(k)) == "K1" and pd.notna(r)}
+    return [f"{r:g}" for r in sorted(rates)]
+
+
+def _pressure_map_table(c: pd.DataFrame, blocks: Dict[str, str]) -> Tuple[List[str], pd.DataFrame]:
+    """One row per (engine, column, budget_r): windows, in regime, no record.
+    The column is the pooled frontier column for row keys the plan marks K1,
+    else the rate fraction rounded to two decimals (two rates that round to the
+    same label share a column). Rows without a finite rate are left out; the
+    caller counts them, and filters rows without a budget before calling (a
+    NaN budget_r would leave the groupby silently). A missing label counts as
+    no record. Columns are returned numeric ascending, frontier last."""
+    c = c[pd.to_numeric(c["rate_frac"], errors="coerce").notna()].copy()
+    c["label"] = c["label"].fillna("NO_REGIME_RECORD")
+    c["column"] = [FRONTIER_COLUMN if blocks.get(str(k)) == "K1" else _rate_label(r)
+                   for k, r in zip(c["row_key"], c["rate_frac"])]
+    c["in_regime"] = (c["label"] == IN_REGIME).astype(int)
+    c["no_record"] = c["label"].isin(NO_RECORD_LABELS).astype(int)
+    table = (c.groupby(["engine", "column", "budget_r"])
+             .agg(windows=("label", "size"), in_regime=("in_regime", "sum"), no_record=("no_record", "sum"))
+             .reset_index())
+    numeric = sorted({col for col in table["column"] if col != FRONTIER_COLUMN}, key=float)
+    columns = numeric + ([FRONTIER_COLUMN] if (table["column"] == FRONTIER_COLUMN).any() else [])
+    return columns, table
+
+
+def _cell_text(in_regime: int, windows: int, no_record: int) -> str:
+    """One line per cell: windows in regime over windows served, the
+    label-less windows named only when there are any."""
+    return f"{in_regime}/{windows} in regime" + (f" ({no_record} no record)" if no_record else "")
+
+
+def _pressure_map_width(n_columns: int, n_engines: int, with_suffix: bool = False) -> float:
+    """At least 0.78 in per column per panel, 1.4 in when any cell carries the
+    no-record suffix (review LOW 5: measured 0.72 in and 1.34 in at 7 pt), so a
+    cell's one line never overprints."""
+    per_column = 1.4 if with_suffix else 0.78
+    return max(ps.FULL_WIDTH_IN, 0.6 + per_column * n_columns * n_engines)
+
+
 def plot03_pressure_map(L: Landing, out: Path) -> Tuple[str, str]:
-    """For each budget x load, the regime label the windows reached, per engine."""
+    """For each cache rung x load column, the windows in regime over the
+    windows served, per engine; the frontier block pooled into one column."""
     c = L.cells[(L.cells["family"] != "F1") & L.cells["budget_r"].notna() & (L.cells["dataset"] != "ruler")].copy()
     if c.empty:
         raise PlotSkip("no pressured window in the cell index")
     c["label"] = [L.window_json(w, "regime.json").get("label") or "NO_REGIME_RECORD" for w in c["window_dir"]]
-    labels = sorted(c["label"].unique())
-    colors = ps.categorical_colors(labels, "plot03")
-    engines = _engines_in(c["engine"])
-    budgets, rates = sorted(c["budget_r"].unique()), sorted(c["rate_frac"].unique())
-    fig, axes = plt.subplots(1, len(engines), figsize=(ps.FULL_WIDTH_IN, 0.9 + 0.75 * len(budgets)), squeeze=False, layout="constrained")
+    blocks = _plan_blocks(L)
+    n_no_rate = int(pd.to_numeric(c["rate_frac"], errors="coerce").isna().sum())
+    columns, table = _pressure_map_table(c, blocks)
+    if table.empty:
+        raise PlotSkip("no pressured window carries a rate fraction")
+    engines = _engines_in(table["engine"])
+    budgets = sorted(table["budget_r"].unique())
+    cmap = plt.get_cmap("Blues")
+    width = _pressure_map_width(len(columns), len(engines), with_suffix=bool(table["no_record"].any()))
+    fig, axes = plt.subplots(1, len(engines), figsize=(width, 0.9 + 0.75 * len(budgets)), squeeze=False, layout="constrained")
     for ax, engine in zip(axes[0], engines):
-        e = c[c["engine"] == engine]
-        for i, r in enumerate(rates):
+        e = table[table["engine"] == engine].set_index(["column", "budget_r"])
+        for i, col in enumerate(columns):
             for j, b in enumerate(budgets):
-                w = e[(e["rate_frac"] == r) & (e["budget_r"] == b)]
-                if w.empty:
+                if (col, b) not in e.index:
                     ax.add_patch(plt.Rectangle((i - 0.45, j - 0.45), 0.9, 0.9, fill=False, ls=":", ec="#999999"))
                     continue
-                counts = w["label"].value_counts()
-                ax.add_patch(plt.Rectangle((i - 0.45, j - 0.45), 0.9, 0.9, color=colors[counts.index[0]], alpha=0.85))
-                ax.text(i, j, "\n".join(f"{READABLE.get(k, k)}: {v}" for k, v in counts.items()), ha="center", va="center", fontsize=6.5)
-        ax.set_xticks(range(len(rates)), [f"{r:g}" for r in rates])
+                r = e.loc[(col, b)]
+                share = float(r["in_regime"]) / float(r["windows"])
+                ax.add_patch(plt.Rectangle((i - 0.45, j - 0.45), 0.9, 0.9, facecolor=cmap(share), edgecolor="#999999", lw=0.4))
+                ax.text(i, j, _cell_text(int(r["in_regime"]), int(r["windows"]), int(r["no_record"])), ha="center", va="center",
+                        fontsize=7, color="white" if share > 0.55 else "black")
+        ax.set_xticks(range(len(columns)), columns, fontsize=7)
         ax.set_yticks(range(len(budgets)), [f"{b:g}" for b in budgets])
-        ax.set_xlim(-0.6, len(rates) - 0.4)
+        ax.set_xlim(-0.6, len(columns) - 0.4)
         ax.set_ylim(-0.6, len(budgets) - 0.4)
         ax.grid(False)
         ax.set_title(ENGINE_LABEL[engine])
-        ax.set_xlabel("offered load (fraction of saturation)")
+    # one shared axis label: two per-panel labels collide at the panel seam
+    fig.supxlabel("offered load (fraction of the strategy's saturation rate; the frontier block pooled)", fontsize=8)
     axes[0][0].set_ylabel("cache budget r (pool / need)")
-    handles = [plt.Rectangle((0, 0), 1, 1, color=colors[k]) for k in labels]
-    fig.legend(handles, [READABLE.get(k, k) for k in labels], loc="outside lower center", ncol=len(labels), fontsize=7)
-    fig.suptitle("Pressure map: the regime each budget x load cell reached (window counts per label)")
-    return _out(fig, out, "p03_pressure_map"), f"{len(c)} pressured windows"
+    fig.colorbar(plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, 1)), ax=list(axes[0]), shrink=0.8,
+                 label="share of windows in regime")
+    fig.suptitle("Pressure map: windows in the pressure regime per cache rung and load cell, per engine", fontsize=9)
+    frontier_rates = _frontier_rates(c, blocks)
+    pooled = (f"the frontier block (plan block field K1) pools its ladder loads {', '.join(frontier_rates)} into the one column "
+              f"\"{FRONTIER_COLUMN}\", which therefore holds the block's control rung 1.25 as well as its constrained rungs"
+              if frontier_rates else "no plan block field: one column per rounded rate")
+    stem = "p03_pressure_map"
+    _write_caption(out, stem, f"""
+P3. Pressure map. Each cell is one cache rung (rows, pool over need) and one load column, per engine; the text is the
+number of windows the section 6.1 referee labeled in regime over the windows served in the cell, and the shade is that
+share. The referee's three conditions: the queued occupancy reached the class ceiling (0.95 of the window's measured
+ceiling where one was pinned, the rungs at or below 1 on S1; the absolute 0.90 where no ceiling was pinned, the control
+rung 1.25), the engine attained it (not a single spike), and a non-empty queue.
+Columns are the pressure-table loads as fractions of each strategy's estimated saturation rate, rounded to two decimals;
+{pooled}. Windows without a regime label or telemetry are counted in their cell and named in its text. The per-strategy
+split of the same windows is the regime table T2 of MyDocs/RunPod/S1_CLAIM_RUNDOWN_2026-10-28.md. Companion of a07.
+""")
+    used = f"{int(table['windows'].sum())} pressured windows in {len(table)} cells; " + \
+        (f"frontier column pools rates {', '.join(frontier_rates)}" if frontier_rates else "no plan block field: one column per rounded rate") + \
+        (f"; left out (no rate): {n_no_rate}" if n_no_rate else "")
+    return _out(fig, out, stem), used
 
 
 def plot05_avg_vs_peak(L: Landing, out: Path) -> Tuple[str, str]:

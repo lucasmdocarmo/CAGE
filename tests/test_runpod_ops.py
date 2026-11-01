@@ -403,6 +403,30 @@ def test_provision_plan_price_follows_cloud_type(tmp_path: Path) -> None:
     assert re.search(r"estimated total\s+: \$2\.04", proc.stdout), "6h x $0.34 x 1 GPU = $2.04"
 
 
+def test_provision_prices_and_creates_a_four_gpu_pod_s2_b5(tmp_path: Path) -> None:
+    """S2 Block B-5 (owner 2026-10-31): a four-GPU pod. The plan prints the count
+    beside the GPU id and prices the whole pod (6 h x $0.69/h x 4 GPU), the
+    create argv carries --gpu-count 4 and the ledger records the count. Host
+    runnable: the watchdog refuses to arm (invalid tick), so nothing is spawned."""
+    fake, log = _install_fake(tmp_path)
+    plan = _bash(f'bash "{PROVISION}" --gpu-id "{GPU}" --gpu-count 4 --hours 6', env=_env(fake))
+    assert plan.returncode == 0, f"stdout:\n{plan.stdout}\nstderr:\n{plan.stderr}"
+    assert "(x4, cloud-type SECURE)" in plan.stdout
+    assert re.search(r"estimated total\s+: \$16\.56 \(6h x \$0\.69/h x 4 GPU\)", plan.stdout), plan.stdout
+    assert not any(c.startswith("pod create") for c in _argv_lines(log))
+    proc = _bash(f'bash "{PROVISION}" --gpu-id "{GPU}" --gpu-count 4 --yes', env=_env_nospawn(fake, tmp_path))
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    creates = [c for c in _argv_lines(log) if c.startswith("pod create")]
+    assert len(creates) == 1 and " --gpu-count 4 " in creates[0] + " ", creates
+    e = json.loads((tmp_path / "l.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert e["event"] == "create" and e["gpu_count"] == 4
+    assert not list(tmp_path.glob("watchdog_*.pid"))
+    # a count that is not a positive integer is refused before anything bills
+    bad = _bash(f'bash "{PROVISION}" --gpu-id "{GPU}" --gpu-count 0 --yes', env=_env_nospawn(fake, tmp_path))
+    assert bad.returncode != 0 and "--gpu-count" in bad.stderr
+    assert len([c for c in _argv_lines(log) if c.startswith("pod create")]) == 1
+
+
 def test_provision_plan_degrades_to_null_price_when_cli_fails(tmp_path: Path) -> None:
     fake, log = _install_fake(tmp_path, fail_all=True)
     proc = _bash(f'bash "{PROVISION}" --gpu-id "{GPU}" --hours 6', env=_env(fake))

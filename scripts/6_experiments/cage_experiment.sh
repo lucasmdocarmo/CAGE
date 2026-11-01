@@ -118,6 +118,12 @@ done
 printf '%s' "$CAMPAIGN" | grep -qE '^[a-z0-9][a-z0-9-]{0,40}$' \
   || die "CAMPAIGN='$CAMPAIGN' violates the campaign slug grammar ^[a-z0-9][a-z0-9-]{0,40}$ (docs/RESULTS_LAYOUT.md)"
 POD_REPO="${POD_REPO:-/workspace/CAGE}"
+# S2 Block B-4 (review 2026-10-31, G8 finding 1): the Hugging Face cache the
+# prefetch fills sits on the container disk under the pod user's home (no
+# HF_HOME is set anywhere in the pod flow; the S1 setup log names
+# /root/.cache/huggingface/hub 460 times), while POD_REPO sits on the network
+# volume mounted at /workspace; stage 3 reads the free space of THIS path.
+POD_HF_CACHE="${POD_HF_CACHE:-/root/.cache/huggingface}"
 POD_BACKUP_DIR="${POD_BACKUP_DIR:-/workspace/backup}"
 # S0F-39 (live CA-MTL-1, 2026-10-07): the network volume (NFS4, vast backend)
 # refuses "|" in names, and every cell directory is named by its row key, so
@@ -725,7 +731,12 @@ print(f"session {session!r}: anchor shape {report['anchor_seq_tokens']} served t
 for key, tag in (("largest_pools", "LARGEST_POOL"), ("largest_helper_pools", "LARGEST_HELPER_POOL")):
     for e, p in sorted((report.get(key) or {}).items()):
         env = ",".join(f"{k}={v}" for k, v in sorted(p["env"].items()))
-        print(f"{tag} engine={e} planned_tokens={p['planned_tokens']} planned_bytes={p['planned_bytes']} env={env}")
+        print(f"{tag} engine={e} tp={p.get('tp') or 1} planned_tokens={p['planned_tokens']} planned_bytes={p['planned_bytes']} env={env}")
+# S2 Block B-1: the TP env each engine's start carries and the GPU count the grid needs
+for e, env in sorted((report.get("tp_env") or {}).items()):
+    print(f"TP_ENV engine={e} env=" + ",".join(f"{k}={v}" for k, v in sorted(env.items())))
+need = report.get("gpu_count_needed")
+print(f"GPU_COUNT_NEEDED={'' if need is None else need}")
 for p in report["problems"]:
     print(f"REFUSED: {p}")
 sys.exit(1 if report["problems"] else 0)
@@ -744,8 +755,30 @@ PY
         state put "registration.$lp_key.$lp_eng.planned_tokens" "$(printf '%s' "$lp_line" | sed -n 's/.* planned_tokens=\([0-9]*\).*/\1/p')"
         state put "registration.$lp_key.$lp_eng.planned_bytes" "$(printf '%s' "$lp_line" | sed -n 's/.* planned_bytes=\([0-9]*\).*/\1/p')"
         state put "registration.$lp_key.$lp_eng.env" "$(printf '%s' "$lp_line" | sed -n 's/.* env=\([^ ]*\).*/\1/p')"
+        state put "registration.$lp_key.$lp_eng.tp" "$(printf '%s' "$lp_line" | sed -n 's/.* tp=\([0-9]*\) .*/\1/p')"
       done
     done
+    # S2 Block B-1 (owner 2026-10-31): the TP env each engine's start carries and
+    # the GPU count the grid's executable cells need, against the profile's GPU_COUNT
+    local tp_eng tp_line need
+    for tp_eng in vllm sglang; do
+      tp_line="$(grep "^TP_ENV engine=$tp_eng " "$STEP_LOG" | tail -1 || true)"
+      state put "registration.tp_env.$tp_eng" "$(printf '%s' "$tp_line" | sed -n 's/.* env=\([^ ]*\).*/\1/p')"
+    done
+    need="$(grep -o '^GPU_COUNT_NEEDED=[0-9]*' "$STEP_LOG" | tail -1 | cut -d= -f2)"
+    state put registration.gpu_count_needed "$need"
+    [ -n "$need" ] || { printf '  [FAIL] stage 0 derived no GPU count for session %s (GPU_COUNT_NEEDED empty): nothing bills on an unknown shape (S2 Block B-1)\n' "$SESSION"; return 1; }
+    [ "$need" = "$GPU_COUNT" ] || { printf '  [FAIL] the profile provisions GPU_COUNT=%s but session %s needs %s GPU(s) per serving stack (serving_tp, dist legs): fix the profile before anything bills (S2 Block B-1)\n' "$GPU_COUNT" "$SESSION" "$need"; return 1; }
+    # Review 2026-10-31 (G8 finding 2): on a multi-GPU pod every engine the master
+    # starts (ENGINES, CALIBRATE) must have a recorded TP variable; an engine with
+    # no executable single cell in the grid gets none and would start at TP=1
+    if [ "$GPU_COUNT" != "1" ]; then
+      for tp_eng in $(server_engines) $CALIBRATE; do
+        [ -n "$(state get "registration.tp_env.$tp_eng" 2>/dev/null || true)" ] || { printf '  [FAIL] the profile starts engine %s (ENGINES or CALIBRATE) on a %s-GPU pod but stage 0 recorded no TP variable for it (session %s has no executable single cell on that engine, or the engine has no TP launch variable): drop it from the profile or register its cells before anything bills (S2 Block B-1, review 2026-10-31)\n' "$tp_eng" "$GPU_COUNT" "$SESSION"; return 1; }
+      done
+    fi
+    # S2 Block B-5: the stock read below is per GPU id; a multi-GPU pod in one datacenter is proven only by the create
+    [ "$GPU_COUNT" = "1" ] || say "NOTE: a $GPU_COUNT-GPU pod: the stock read is per GPU id, so $GPU_COUNT GPUs together in one datacenter are proven only by the create at stage 1 (S2 Block B-5)"
   fi
   run_step 0 "stock read (gpu list --include-unavailable)" -- runpodctl gpu list --include-unavailable || return 1
   if ! plan_only; then
@@ -859,6 +892,23 @@ stage_provision() {
     say "pod $existing is already recorded (resume after a partial provision): no volume, no pod is created"
     created=1
   fi
+  # S2 Block B-6 (owner 2026-10-31): CAGE_VOLUME_ID_OVERRIDE with
+  # CAGE_VOLUME_DC_OVERRIDE records a volume found in the console (the second
+  # S2 landing reuses the first landing's volume), mirroring CAGE_POD_ID_OVERRIDE;
+  # the listing check below still decides whether it is reused.
+  local vol_override=0 prior_vol=""
+  if ! plan_only && [ "$created" -eq 0 ] && [ -n "${CAGE_VOLUME_ID_OVERRIDE:-}" ]; then
+    [ -n "${CAGE_VOLUME_DC_OVERRIDE:-}" ] || { printf '  [FAIL] CAGE_VOLUME_ID_OVERRIDE=%s needs CAGE_VOLUME_DC_OVERRIDE=<datacenter id>: a volume lives in one datacenter and the pod must be sited there (S2 Block B-6)\n' "$CAGE_VOLUME_ID_OVERRIDE"; return 1; }
+    # review 2026-10-31 (G8 finding 3): a volume this landing already recorded
+    # (kept after a refused pod, billing storage) is never dropped from the state
+    prior_vol="$(state get pod.volume_id 2>/dev/null || true)"
+    if [ -n "$prior_vol" ] && [ "$prior_vol" != "$CAGE_VOLUME_ID_OVERRIDE" ]; then
+      printf '  [FAIL] this landing already recorded volume %s (kept after a refused pod, billing storage); CAGE_VOLUME_ID_OVERRIDE=%s would drop it from the state: unset the override to reuse %s, or delete that volume by hand first (S2 Block B-6, review 2026-10-31)\n' "$prior_vol" "$CAGE_VOLUME_ID_OVERRIDE" "$prior_vol"
+      return 1
+    fi
+    state put pod.volume_id "$CAGE_VOLUME_ID_OVERRIDE"; state put pod.dc "$CAGE_VOLUME_DC_OVERRIDE"; vol_override=1
+    say "volume $CAGE_VOLUME_ID_OVERRIDE in $CAGE_VOLUME_DC_OVERRIDE recorded from CAGE_VOLUME_ID_OVERRIDE (S2 Block B-6)"
+  fi
   # Owner rule 2026-10-22 (ADR-0176 Group B): a volume recorded by an earlier
   # attempt whose pod was refused is reused in its datacenter; no second one.
   local kept_vol="" kept_dc=""
@@ -868,9 +918,26 @@ stage_provision() {
       # review 2026-10-22 M1: a recorded volume the owner deleted by hand is not reused
       run_step 0 "recorded volume $kept_vol listed" -- runpodctl network-volume list || return 1
       if grep -v '^#' "$STEP_LOG" | grep -q "\"$kept_vol\""; then
+        if [ "$vol_override" -eq 1 ]; then
+          # review 2026-10-31 (G8 finding 3): the listing's own datacenter for the
+          # override id must agree with CAGE_VOLUME_DC_OVERRIDE (a pod is created only
+          # in its volume's datacenter); a listing without the field trusts the override
+          local listed_dc; listed_dc="$(grep -v '^#' "$STEP_LOG" | "$PY3" -c 'import json, sys
+d = json.load(sys.stdin); items = d if isinstance(d, list) else [v for vs in d.values() if isinstance(vs, list) for v in vs]
+print(" ".join(str(i.get("dataCenterId") or "") for i in items if isinstance(i, dict) and str(i.get("id", "")) == sys.argv[1]).strip())' "$kept_vol" 2>/dev/null || true)"
+          if [ -n "$listed_dc" ] && [ "$listed_dc" != "$kept_dc" ]; then
+            state put pod.volume_id ""; state put pod.dc ""
+            printf '  [FAIL] CAGE_VOLUME_DC_OVERRIDE=%s but the listing sites volume %s in %s: set CAGE_VOLUME_DC_OVERRIDE=%s; nothing is created (S2 Block B-6, review 2026-10-31)\n' "$kept_dc" "$kept_vol" "$listed_dc" "$listed_dc"
+            return 1
+          fi
+          [ -n "$listed_dc" ] || say "the listing carries no dataCenterId for volume $kept_vol: CAGE_VOLUME_DC_OVERRIDE=$kept_dc is trusted (S2 Block B-6)"
+        fi
         say "volume $kept_vol in $kept_dc is already recorded (kept after a refused pod): reused, no second volume is created"
         prefs=" $kept_dc"
       else
+        # S2 Block B-6: a volume the owner named by hand that is not listed is a
+        # typo or a deleted volume; no second volume bills on it
+        [ "$vol_override" -eq 0 ] || { state put pod.volume_id ""; state put pod.dc ""; printf '  [FAIL] CAGE_VOLUME_ID_OVERRIDE=%s is not in the network-volume listing: check the id in the console; nothing is created (S2 Block B-6)\n' "$kept_vol"; return 1; }
         say "recorded volume $kept_vol is no longer listed (deleted by hand): the record is cleared and a new volume is created in DC_PREFS order"
         state put pod.volume_id ""; state put pod.dc ""; kept_vol=""
       fi
@@ -1027,6 +1094,23 @@ stage_setup() {
   [ "$bad" -eq 0 ] || return 1
   run_step 0 "pod shape evidence" -- pssh "nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader && python3 --version && $POD_REPO/$POD_PYTHON -c 'import torch, vllm; print(\"torch\", torch.__version__, \"cuda\", torch.version.cuda, \"vllm\", vllm.__version__)' && df -h $POD_REPO | tail -1" || return 1
   cp "$STEP_LOG" "$LAND/logs/system/pod_shape.txt"
+  # S2 Block B-4 (owner 2026-10-31, option a): the weights stay on the container
+  # disk (DISK_GB); a disk with less than DISK_FREE_MIN_GB free after the
+  # prefetch refuses here, before stage 4 bills an engine start [A 20 GB].
+  # Review 2026-10-31 (G8 finding 1): the read is of the disk that holds the
+  # model cache (POD_HF_CACHE), never of POD_REPO, which sits on the network
+  # volume (mkdir, df and tail on the pod are stage 2's and the shape step's
+  # own; the POSIX -P -k columns are parsed on the Mac)
+  run_step 0 "weights disk free space" -- pssh "mkdir -p $POD_HF_CACHE && df -Pk $POD_HF_CACHE | tail -1" || return 1
+  if ! plan_only; then
+    local free_kb free_gb
+    free_kb="$(grep -v '^#' "$STEP_LOG" | awk 'NF >= 4 { print $4 }' | grep -E '^[0-9]+$' | tail -1 || true)"
+    [ -n "$free_kb" ] || { printf '  [FAIL] setup: the free-space read on %s returned no number (S2 Block B-4)\n' "$POD_HF_CACHE"; return 1; }
+    free_gb=$(( free_kb / 1024 / 1024 ))
+    state put pod.disk_free_gb "$free_gb"
+    [ "$free_gb" -ge "${DISK_FREE_MIN_GB:-20}" ] || { printf '  [FAIL] setup: %s GB free on the disk holding the model cache (%s) after the prefetch, below DISK_FREE_MIN_GB=%s (DISK_GB=%s holds the weights, S2 Block B-4 option a): raise DISK_GB in the profile\n' "$free_gb" "$POD_HF_CACHE" "${DISK_FREE_MIN_GB:-20}" "$DISK_GB"; return 1; }
+    say "weights disk ($POD_HF_CACHE): $free_gb GB free after the prefetch (DISK_GB=$DISK_GB, floor ${DISK_FREE_MIN_GB:-20} GB)"
+  fi
   return 0
 }
 
@@ -1034,7 +1118,10 @@ stage_validate() {
   pod_env
   [ "${NEGATIVE_CONTROLS:-0}" = "1" ] && { printf '  [FAIL] NEGATIVE_CONTROLS=1: the S0 refusal controls are not built into this stage yet (profile default 6, 2026-10-06); set 0 or build them\n'; return 1; }
   [ "${PD_PROBES:-0}" = "1" ] && { printf '  [FAIL] PD_PROBES=1: the S0 pd probes are not built into this stage yet; set 0 or build them\n'; return 1; }
-  [ "$TOPOLOGY" = "single" ] || { printf '  [FAIL] TOPOLOGY=%s: only single-instance validation is built; tp/pd launch flags are a separate Spec\n' "$TOPOLOGY"; return 1; }
+  case "$TOPOLOGY" in
+    single|tp) ;;
+    *) printf '  [FAIL] TOPOLOGY=%s: single-instance and tensor-parallel validation are built (S2 Block B-1); the pd stack validation is a separate Spec\n' "$TOPOLOGY"; return 1 ;;
+  esac
   if [ "${SUITE_ON_POD:-0}" = "1" ]; then
     # A stage 4 retry on the same shipped code does not rerun the pod suite
     # (2026-10-07: six retries reran the 7-minute suite every time); the sha it
@@ -1141,23 +1228,31 @@ stage_validate() {
     [ "$e" = "vllm" ] && rerank="$rerank; env$(instrument_rev_env) $POD_PYTHON scripts/checks/probe_compressor_device.py --freeze-file $POD_FREEZE_FILE --out logs/compress_device_probe.json || rc=1; $POD_PYTHON scripts/checks/probe_encoder_device.py --freeze-file $POD_FREEZE_FILE --out logs/encoder_device_probe.json || rc=1"
     # A11 item 4 (owner 2026-10-21): the start runs at the engine's largest planned
     # pool (stage 0), and the relaunch rule checks it, before calibration bills
-    local lp_tokens lp_bytes lp_env="" lp_check=""
+    local lp_tokens lp_bytes lp_tp lp_env="" lp_check=""
     lp_tokens="$(state get "registration.largest_pool.$e.planned_tokens" 2>/dev/null || true)"
     lp_bytes="$(state get "registration.largest_pool.$e.planned_bytes" 2>/dev/null || true)"
+    # S2 Block B-1 (owner 2026-10-31): the TP env stage 0 recorded rides every start
+    # of this engine; the largest-pool env already carries it, the budget-free start gets it here
+    local tp_env_e=""; tp_env_e="$(state get "registration.tp_env.$e" 2>/dev/null | tr ',' ' ' || true)"
+    [ -z "$tp_env_e" ] || tp_env_e=" $tp_env_e"
     if [ -n "$lp_tokens" ] && [ -n "$lp_bytes" ]; then
       lp_env=" $(state get "registration.largest_pool.$e.env" 2>/dev/null | tr ',' ' ')"
-      lp_check="; $POD_PYTHON scripts/3_run/run_campaign.py pool-check --engine $e --planned-tokens $lp_tokens --planned-bytes $lp_bytes --out logs/$e/largest_pool_check.json || rc=1"
+      lp_tp="$(state get "registration.largest_pool.$e.tp" 2>/dev/null || true)"
+      lp_check="; $POD_PYTHON scripts/3_run/run_campaign.py pool-check --engine $e --planned-tokens $lp_tokens --planned-bytes $lp_bytes${lp_tp:+ --tp $lp_tp} --out logs/$e/largest_pool_check.json || rc=1"
+    else
+      lp_env="$tp_env_e"
     fi
     # Review 2026-10-21 H1 (owner: "Add a check"): SGLang starts a second time at the
     # largest pool a GPU-helper cell plans, and the three helper probes run beside it
-    local hp_tokens="" hp_bytes="" hp_env="" helper="" vbound=1500
+    local hp_tokens="" hp_bytes="" hp_tp="" hp_env="" helper="" vbound=1500
     if [ "$e" = "sglang" ]; then
       hp_tokens="$(state get "registration.largest_helper_pool.$e.planned_tokens" 2>/dev/null || true)"
       hp_bytes="$(state get "registration.largest_helper_pool.$e.planned_bytes" 2>/dev/null || true)"
     fi
     if [ -n "$hp_tokens" ] && [ -n "$hp_bytes" ]; then
       hp_env=" $(state get "registration.largest_helper_pool.$e.env" 2>/dev/null | tr ',' ' ')"
-      helper="; env$hp_env bash scripts/2_serving/$launcher start '$MODEL' && { $POD_PYTHON scripts/3_run/run_campaign.py pool-check --engine $e --planned-tokens $hp_tokens --planned-bytes $hp_bytes --out logs/$e/helper_pool_check.json && env$(instrument_rev_env) $POD_PYTHON scripts/checks/probe_reranker_device.py --out logs/rerank_device_probe_beside_sglang.json && env$(instrument_rev_env) $POD_PYTHON scripts/checks/probe_compressor_device.py --freeze-file $POD_FREEZE_FILE --out logs/compress_device_probe_beside_sglang.json && $POD_PYTHON scripts/checks/probe_encoder_device.py --freeze-file $POD_FREEZE_FILE --out logs/encoder_device_probe_beside_sglang.json && echo HELPERS_FIT_OK; } || { echo HELPERS_FIT_FAILED; rc=1; }; bash scripts/2_serving/$launcher stop"
+      hp_tp="$(state get "registration.largest_helper_pool.$e.tp" 2>/dev/null || true)"
+      helper="; env$hp_env bash scripts/2_serving/$launcher start '$MODEL' && { $POD_PYTHON scripts/3_run/run_campaign.py pool-check --engine $e --planned-tokens $hp_tokens --planned-bytes $hp_bytes${hp_tp:+ --tp $hp_tp} --out logs/$e/helper_pool_check.json && env$(instrument_rev_env) $POD_PYTHON scripts/checks/probe_reranker_device.py --out logs/rerank_device_probe_beside_sglang.json && env$(instrument_rev_env) $POD_PYTHON scripts/checks/probe_compressor_device.py --freeze-file $POD_FREEZE_FILE --out logs/compress_device_probe_beside_sglang.json && $POD_PYTHON scripts/checks/probe_encoder_device.py --freeze-file $POD_FREEZE_FILE --out logs/encoder_device_probe_beside_sglang.json && echo HELPERS_FIT_OK; } || { echo HELPERS_FIT_FAILED; rc=1; }; bash scripts/2_serving/$launcher stop"
       vbound=3000
     fi
     # after `stop` the GPU process takes a few seconds to leave the compute-apps list: wait up to 60 s before reading it
@@ -1168,7 +1263,7 @@ stage_validate() {
       grep -q "LARGEST_POOL_OK" "$JOB_LOG" || { printf '  [FAIL] %s: the realized pool at the largest planned pool (%s tokens) is outside the 0.5%% rule, or unread (A11 item 4):\n' "$e" "$lp_tokens"; grep 'LARGEST_POOL_FAILED' "$JOB_LOG" | sed 's/^/    /'; return 1; }
       grep 'LARGEST_POOL_OK' "$JOB_LOG" | tail -1 | sed 's/^/  /'
     else
-      printf '  %s: no budgeted single-GPU pool in the plan; the largest-pool start is skipped (A11 item 4)\n' "$e"
+      printf '  %s: no budgeted single-instance pool in the plan; the largest-pool start is skipped (A11 item 4)\n' "$e"
     fi
     grep -q "VALIDATE_API_OK" "$JOB_LOG" || { printf '  [FAIL] %s: /v1/models never answered\n' "$e"; return 1; }
     if [ "$e" = "vllm" ]; then
@@ -1212,16 +1307,20 @@ stage_validate() {
     local sglang_on=0 vllm_on=0 sgl_api vllm_api
     for e in $ENGINES; do case "$e" in sglang) sglang_on=1 ;; vllm) vllm_on=1 ;; esac; done
     sgl_api="$(engine_api sglang)"; vllm_api="$(engine_api vllm)"
+    # S2 Block B-1 (owner 2026-10-31): each start carries the TP env stage 0 recorded
+    local sgl_tp="" vllm_tp=""
+    sgl_tp="$(state get registration.tp_env.sglang 2>/dev/null | tr ',' ' ' || true)"; [ -z "$sgl_tp" ] || sgl_tp=" $sgl_tp"
+    vllm_tp="$(state get registration.tp_env.vllm 2>/dev/null | tr ',' ' ' || true)"; [ -z "$vllm_tp" ] || vllm_tp=" $vllm_tp"
     if [ "$sglang_on" = "1" ]; then
-      sc="$sc; one sglang_fp8_e4m3 sglang $sgl_api manage_sglang_server.sh SGLANG_KV_CACHE_DTYPE=fp8_e4m3; stopall"
+      sc="$sc; one sglang_fp8_e4m3 sglang $sgl_api manage_sglang_server.sh SGLANG_KV_CACHE_DTYPE=fp8_e4m3$sgl_tp; stopall"
     fi
     if [ "$vllm_on" = "1" ]; then
-      sc="$sc; one vllm_fp8 vllm $vllm_api manage_vllm_server.sh VLLM_KV_CACHE_DTYPE=fp8; stopall"
+      sc="$sc; one vllm_fp8 vllm $vllm_api manage_vllm_server.sh VLLM_KV_CACHE_DTYPE=fp8$vllm_tp; stopall"
       if [ "$needs_lmcache" = "1" ]; then
-        sc="$sc; one vllm_lmcache vllm $vllm_api manage_vllm_server.sh VLLM_KV_TRANSFER_CONFIG='{\"kv_connector\":\"LMCacheConnectorV1\",\"kv_role\":\"kv_both\"}' LMCACHE_MAX_LOCAL_CPU_SIZE=${store_gib:-0}; { grep -lE \"'max_local_cpu_size': ${store_gib:-0}(\\.0)?,\" logs/vllm/vllm_*.log >/dev/null 2>&1 && echo START_OK:lmcache_store_${store_gib:-0}; } || { echo START_FAILED:lmcache_store_${store_gib:-0}; rc=1; }; stopall"
+        sc="$sc; one vllm_lmcache vllm $vllm_api manage_vllm_server.sh VLLM_KV_TRANSFER_CONFIG='{\"kv_connector\":\"LMCacheConnectorV1\",\"kv_role\":\"kv_both\"}' LMCACHE_MAX_LOCAL_CPU_SIZE=${store_gib:-0}$vllm_tp; { grep -lE \"'max_local_cpu_size': ${store_gib:-0}(\\.0)?,\" logs/vllm/vllm_*.log >/dev/null 2>&1 && echo START_OK:lmcache_store_${store_gib:-0}; } || { echo START_FAILED:lmcache_store_${store_gib:-0}; rc=1; }; stopall"
       fi
       # item 29: the reranker on the GPU while vLLM holds its default pool
-      sc="$sc; bash scripts/2_serving/manage_vllm_server.sh restart '$MODEL' && { $POD_PYTHON scripts/checks/probe_reranker_device.py --out logs/rerank_device_probe_beside_vllm.json && echo START_OK:rerank_beside_vllm || { echo START_FAILED:rerank_beside_vllm; rc=1; }; }; stopall"
+      sc="$sc; env$vllm_tp bash scripts/2_serving/manage_vllm_server.sh restart '$MODEL' && { $POD_PYTHON scripts/checks/probe_reranker_device.py --out logs/rerank_device_probe_beside_vllm.json && echo START_OK:rerank_beside_vllm || { echo START_FAILED:rerank_beside_vllm; rc=1; }; }; stopall"
     fi
     # the job exits 0 on purpose: the START_* markers carry each verdict and the
     # check below names the failed configuration (a crashed job still fails here)
@@ -1261,11 +1360,13 @@ stage_calibrate() {
     # live: VLLM_MAX_MODEL_LEN at the session cap plus the anchor pool). With
     # class floors on and no record, the job would fail 15 min in: refused here.
     local cal_env=""; cal_env="$(state get "registration.largest_pool.$e.env" 2>/dev/null | tr ',' ' ' || true)"
-    [ -z "$cal_env" ] || cal_env=" $cal_env"
     if ! plan_only && [ -n "$cls" ] && [ -z "$cal_env" ]; then
       printf '  [FAIL] %s: CLASS_FLOORS=1 but stage 0 recorded no largest pool for this engine (registration.largest_pool.%s.env): the class floor prompts (up to the anchor class) exceed the launcher default context (S1 audit 2026-10-23)\n' "$e" "$e"
       return 1
     fi
+    # S2 Block B-1 (owner 2026-10-31): without a recorded largest pool the start still carries the TP env
+    [ -n "$cal_env" ] || cal_env="$(state get "registration.tp_env.$e" 2>/dev/null | tr ',' ' ' || true)"
+    [ -z "$cal_env" ] || cal_env=" $cal_env"
     job_run "calibrate_$e" 3600 "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT$POD_ENGINE_ENV && env$cal_env bash scripts/2_serving/$launcher start '$MODEL' && $POD_PYTHON scripts/3_run/calibrate_cell.py --backend $e --model '$MODEL' --api-base $api --manifest $CALIBRATION_MANIFEST --output $out --budget-fraction $CALIBRATION_BUDGET_FRACTION$cls; rc=\$?; bash scripts/2_serving/$launcher stop; exit \$rc" "$LAND/logs/setup" || return 1
     run_step 0 "fetch calibration $e" -- pscp_from "$POD_REPO/$out" "$EXTRAS/calibration/${EXP}_${e}.json" || return 1
     plan_only && continue

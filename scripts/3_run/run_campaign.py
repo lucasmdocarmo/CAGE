@@ -2712,6 +2712,18 @@ def _pool_shortfall_text(shortfalls: Sequence[Mapping[str, Any]], where: str) ->
 #: (A11 item 4). A pair the table lacks fails the stage 0 check closed.
 FREE_BYTES_AFTER_WEIGHTS: Dict[Tuple[str, str], int] = {
     ("qwen3-14b", "NVIDIA H100 80GB HBM3"): int(45.58 * 1024 ** 3),
+    # S2 Block B-2 (owner 2026-10-31): per-rank bounds for the two S2 models on
+    # one H200 of a four-GPU pod, derived, not measured [D]. The H200 SXM lists
+    # 141 GB (gpuId "NVIDIA H200", runpodctl gpu list 2026-10-31) = 131.32 GiB;
+    # vLLM takes 0.90 of it (_serving_config.sh VLLM_GPU_MEMORY_UTILIZATION)
+    # = 118.19 GiB per rank. The bf16 weights split four ways are 32.85 GiB
+    # (Llama-3.3-70B-Instruct, 70,553.7M parameters, Hub 2026-10-31) and
+    # 37.87 GiB (Qwen3-Next-80B-A3B-Instruct, 81,324.9M parameters, same read),
+    # leaving 85.34 and 80.32 GiB; a 10 GiB cut for CUDA graphs, activations
+    # and engine workspace [A] gives 75 and 70 GiB. The first live H200 start
+    # at the largest planned pool (stage 4, A11 item 4) refreshes both.
+    ("llama-3.3-70b", "NVIDIA H200"): 75 * 1024 ** 3,
+    ("qwen3-next-80b", "NVIDIA H200"): 70 * 1024 ** 3,
 }
 
 
@@ -2750,17 +2762,25 @@ def pool_ceiling_overruns(
 
 
 def largest_planned_pools(relaunch_steps: Sequence[Mapping[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """A11 item 4 (owner 2026-10-21): per engine, the largest single-GPU pool
-    the plan will start, as the launcher env that starts it (the primary
+    """A11 item 4 (owner 2026-10-21): per engine, the largest single-instance
+    pool the plan will start, as the launcher env that starts it (the primary
     budget knob plus the class's request cap), so stage 4 proves the pod holds
-    it before calibration bills. tp and pd pools are out of scope (no S1 cell
-    uses them, as in realized_pool_check). Pure."""
+    it before calibration bills. S2 Block B-1 (owner 2026-10-31): a single
+    instance sharded over serving_tp ranks counts too, and its env carries the
+    engine's TP variable (TP_LAUNCH_ENV) so the start spans the ranks the plan
+    does; an engine without that variable at tp >= 2 is skipped here and
+    refused by preflight_registration_check. The dist overlay legs (step
+    topology tp or pd: their own GPU count, two role instances on pd) stay
+    out of scope. Pure."""
     best: Dict[str, Dict[str, Any]] = {}
     for step in relaunch_steps:
         record = step.get("budget_plan")
-        if not isinstance(record, Mapping) or step.get("topology") != "single" or int(record.get("tp") or 1) != 1:
+        if not isinstance(record, Mapping) or step.get("topology") != "single":
             continue
         engine = str(step["engine"])
+        tp = int(record.get("tp") or 1)
+        if tp >= 2 and engine not in TP_LAUNCH_ENV:
+            continue
         if engine in best and int(record["budget_bytes_total"]) <= best[engine]["planned_bytes"]:
             continue
         env = {
@@ -2771,10 +2791,13 @@ def largest_planned_pools(relaunch_steps: Sequence[Mapping[str, Any]]) -> Dict[s
         if not env:
             continue
         env[MAX_MODEL_LEN_ENV] = str(step["max_model_len"])
+        if tp >= 2:
+            env[TP_LAUNCH_ENV[engine]] = str(tp)
         best[engine] = {
             "engine": engine,
             "budget_r": step.get("budget_r"),
             "seq_tokens": (step.get("demand_class") or {}).get("seq_tokens"),
+            "tp": tp,
             "planned_tokens": int(record["budget_tokens_total"]),
             "planned_bytes": int(record["budget_bytes_total"]),
             "env": env,
@@ -2917,6 +2940,10 @@ def preflight_registration_check(
         LMCACHE_STORE_RULE, or None: stage 4's RAM check, S0F-88 U2),
         "pool_shortfalls": [record] (empty without floor_concurrency),
         "pool_ceiling_overruns": [record] (empty without gpu_id),
+        "tp_env": {engine: {variable: degree}} (S2 Block B-1: the TP launch
+        env every server engine's start carries at serving_tp >= 2, empty at
+        1), "gpu_count_needed": int or None (the largest GPU count an
+        executable cell launches with, _cell_gpu_count),
         "problems": [str]} where an empty problems list is a pass.
 
     Raises: nothing on a registration problem (recorded in ``problems``); a
@@ -3010,6 +3037,28 @@ def preflight_registration_check(
                 problems.append(_pool_ceiling_text(
                     overruns, f"session {session!r} on {gpu_id!r} at FLOOR_CONCURRENCY={int(floor_concurrency)}"
                 ))
+    # S2 Block B-1 (owner 2026-10-31): the TP env each server engine's relaunch
+    # carries (_relaunch_step, TP_LAUNCH_ENV) and the GPU count the executable
+    # cells need (_cell_gpu_count), so the master refuses a profile whose
+    # GPU_COUNT or engine set cannot launch the plan before anything bills; an
+    # engine without a TP variable at serving_tp >= 2 would raise PlanError at
+    # stage 6, after the setup, validate and calibrate stages billed.
+    tp_env: Dict[str, Dict[str, str]] = {}
+    serving_tp = int(grid.serving_tp)
+    for engine in sorted({c.spec.engine for c in executable if c.spec.engine != "hf" and c.spec.topology == "single"}):
+        if serving_tp < 2:
+            continue
+        variable = TP_LAUNCH_ENV.get(engine)
+        if variable is None:
+            problems.append(
+                f"session {session!r} registers serving_tp={serving_tp} but engine {engine!r} has no TP launch "
+                f"variable (TP_LAUNCH_ENV covers {sorted(TP_LAUNCH_ENV)}): its relaunch would raise PlanError at "
+                "stage 6, after the setup, validate and calibrate stages billed (S2 Block B-1)"
+            )
+            continue
+        tp_env[engine] = {variable: str(serving_tp)}
+    gpu_counts = [_cell_gpu_count(grid, c.spec) for c in executable]
+    gpu_count_needed = max((g for g in gpu_counts if g is not None), default=None)
     return {
         "session": session,
         "anchor_seq_tokens": anchor,
@@ -3021,6 +3070,8 @@ def preflight_registration_check(
         "pool_ceiling_overruns": overruns,
         "largest_pools": largest,
         "largest_helper_pools": largest_helpers,
+        "tp_env": tp_env,
+        "gpu_count_needed": gpu_count_needed,
         "problems": problems,
     }
 
@@ -8862,6 +8913,10 @@ def _stop_process_group(popen: "subprocess.Popen[Any]") -> None:
 #: manage_sglang_server.sh 157, 575, 602-604), so a record present after a
 #: relaunch is that relaunch's.
 KV_POOL_RECORD_NAME: str = "CURRENT.kvpool.json"
+#: S2 Block B-2: the pd launcher's record (manage_vllm_pd.sh start, through
+#: cage_kv_pool_capture_pd: kv_pool_log.CURRENT_PD_NAME), one capture per
+#: role under "roles", written beside the vllm directory's single record.
+KV_POOL_PD_RECORD_NAME: str = "CURRENT.pd.kvpool.json"
 #: A11 item 2: the env that carries a relaunch's realized pool to the cells
 #: under it; the runner writes it into each window's metrics.json.
 REALIZED_POOL_ENV: str = "CAGE_REALIZED_POOL_JSON"
@@ -8872,16 +8927,29 @@ POOL_REFUSED_EXIT: int = 75
 def realized_pool_check(step: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     """A11 items 1 and 2 (owner 2026-10-20): the realized KV pool of a
     relaunch that just started, against its plan, in tokens, two-sided
-    within POOL_TOKEN_TOLERANCE. None when the relaunch plans no single-GPU
-    pool (budget-free, tp or pd: no S1 cell uses tp or pd). A missing or
-    unreadable record fails the check: an unverified pool is never served."""
+    within POOL_TOKEN_TOLERANCE. None when the relaunch plans no pool
+    (budget-free). S2 Block B-2 (owner 2026-10-31): a tensor-parallel
+    instance reads the same record and the verdict rests on its token count
+    [A: every rank holds the same block count; whether the captured bytes
+    are per rank or the whole pool is [?] until the first live TP start on an
+    H200 (no TP capture exists in the repo, review 2026-10-31 finding 5), so
+    realized_bytes under tp >= 2 is the figure as logged, never a comparand],
+    and a pd stack reads
+    the pd launcher's record (KV_POOL_PD_RECORD_NAME) and sums its roles'
+    tokens, since the plan's budget_tokens_total spans both role pools. A
+    missing or unreadable record, or a role without a token count, fails the
+    check: an unverified pool is never served."""
     plan_record = step.get("budget_plan")
-    if not isinstance(plan_record, Mapping) or step.get("topology") != "single" or int(step.get("tp") or 1) != 1:
+    if not isinstance(plan_record, Mapping):
         return None
+    topology = str(step.get("topology") or "single")
     planned = int(plan_record["budget_tokens_total"])
-    path = Path(os.environ.get("CAGE_LOG_ROOT") or REPO_ROOT / "logs") / str(step["engine"]) / KV_POOL_RECORD_NAME
+    name = KV_POOL_PD_RECORD_NAME if topology == "pd" else KV_POOL_RECORD_NAME
+    path = Path(os.environ.get("CAGE_LOG_ROOT") or REPO_ROOT / "logs") / str(step["engine"]) / name
     out: Dict[str, Any] = {
         "engine": step["engine"],
+        "topology": topology,
+        "tp": int(step.get("tp") or 1),
         "budget_r": step.get("budget_r"),
         "planned_tokens": planned,
         "planned_bytes": int(plan_record["budget_bytes_total"]),
@@ -8895,12 +8963,21 @@ def realized_pool_check(step: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     }
     try:
         doc = json.loads(path.read_text(encoding="utf-8"))
-        tokens = int(doc["tokens"])
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+        if topology == "pd":
+            roles = doc["roles"]
+            if not isinstance(roles, Mapping) or not roles:
+                raise ValueError("the pd record names no roles")
+            tokens = sum(int(rec["tokens"]) for rec in roles.values())
+            sizes = [rec.get("bytes") for rec in roles.values()]
+            realized_bytes = sum(int(b) for b in sizes) if all(b is not None for b in sizes) else None
+        else:
+            tokens = int(doc["tokens"])
+            realized_bytes = doc.get("bytes")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         out["reason"] = f"no readable pool record ({type(exc).__name__}: {exc})"
         return out
     gap = (tokens - planned) / planned
-    out.update(realized_tokens=tokens, realized_bytes=doc.get("bytes"), gap=gap, ok=abs(gap) <= POOL_TOKEN_TOLERANCE)
+    out.update(realized_tokens=tokens, realized_bytes=realized_bytes, gap=gap, ok=abs(gap) <= POOL_TOKEN_TOLERANCE)
     if not out["ok"]:
         out["reason"] = (
             f"realized {tokens} tokens is {gap:+.3%} from the planned {planned}, "
@@ -9405,8 +9482,9 @@ def run_plan(
     if fail_fast not in ("off", "infra", "all"):
         raise RunError(f"fail_fast must be off, infra or all (got {fail_fast!r})")
     server_ok = True  # state of the current serving config (non-hf cells)
-    # A11: the realized pool of the current relaunch (None: budget-free,
-    # skipped, or not single-GPU), passed to the cells under it
+    # A11: the realized pool of the current relaunch (None: budget-free or
+    # skipped; S2 Block B-2: tp and pd stacks are checked too), passed to the
+    # cells under it
     realized_pool: Optional[Dict[str, Any]] = None
     memo_dir = compression_memo_dir(campaign_root)
     # ADR-0153: (engine, demand-class seq_tokens) -> the dry window's label
@@ -11667,9 +11745,10 @@ def _cmd_frontier(args: argparse.Namespace) -> int:
 
 def _cmd_pool_check(args: argparse.Namespace) -> int:
     """A11 item 4: the stage 4 start at the largest planned pool, checked by
-    the relaunch rule (realized_pool_check: tokens, two-sided, 0.5 percent)."""
+    the relaunch rule (realized_pool_check: tokens, two-sided, 0.5 percent);
+    --tp records the degree the start used (S2 Block B-2)."""
     out = realized_pool_check({
-        "engine": args.engine, "topology": "single", "tp": 1, "budget_r": None,
+        "engine": args.engine, "topology": "single", "tp": args.tp, "budget_r": None,
         "budget_plan": {"budget_tokens_total": args.planned_tokens, "budget_bytes_total": args.planned_bytes},
     })
     if args.out:
@@ -11941,6 +12020,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_pool.add_argument("--engine", required=True)
     p_pool.add_argument("--planned-tokens", type=int, required=True)
     p_pool.add_argument("--planned-bytes", type=int, required=True)
+    p_pool.add_argument("--tp", type=int, default=1, help="S2 Block B-2: the tensor-parallel degree the start used (recorded)")
     p_pool.add_argument("--out", default=None)
     p_pool.set_defaults(func=_cmd_pool_check)
     p_front = sub.add_parser(

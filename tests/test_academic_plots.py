@@ -64,6 +64,7 @@ def test_cell_pair_maps_to_one_name_and_a_policy_cell_to_none() -> None:
 
 import csv
 import json
+import re
 
 import academic_plots as ap  # noqa: E402
 import figure_pipeline as fp  # noqa: E402
@@ -470,3 +471,116 @@ def test_older_plots_keep_the_two_b12_cuts_apart_and_print_no_code(tmp_path: Pat
     texts = [t.get_text() for fig_num in plt.get_fignums() for ax in plt.figure(fig_num).axes
              for t in list(ax.get_xticklabels()) + list(ax.get_legend_handles_labels()[1] and [])]
     assert all(not any(tok in {"B1", "B3", "B6", "B12"} for tok in t.replace("\n", " ").split()) for t in texts)
+
+
+# ---------------------------------------------------------------------------
+# p03, the pressure map, redrawn 2026-10-29 (owner approval of the Spec Block):
+# one column per rounded pressure-table load, the frontier block pooled by the
+# plan's block field, one line of text per cell, a one-hue shade by the share
+# of windows in regime.
+# ---------------------------------------------------------------------------
+
+CELL_TEXT = re.compile(r"^\d+/\d+ in regime( \(\d+ no record\))?$")
+
+
+def _plan_with_blocks(parts: dict) -> None:
+    """Mark the fixture's two K1 steps and add P1 steps for the other pressure cells."""
+    plan = json.loads(parts["plan"].read_text(encoding="utf-8"))
+    for s in plan["steps"]:
+        s["block"] = "K1"
+    for b, fam in (("B3", "F3"), ("B6", "F2"), ("B11", "F2")):
+        key = CellSpec.from_baseline(b, model=MODEL, family=fam, budget_r=0.5, rate_frac=0.8).to_row_key()  # type: ignore[arg-type]
+        plan["steps"].append({"kind": "cell", "baseline": b, "row_key": key, "block": "P1", "windows": 3,
+                              "cellspec": {"engine": "vllm", "budget_r": 0.5, "rate_frac": 0.8}})
+    parts["plan"].write_text(json.dumps(plan), encoding="utf-8")
+
+
+def _pressured_with_labels(L: ap.Landing):
+    c = L.cells[(L.cells["family"] != "F1") & L.cells["budget_r"].notna() & (L.cells["dataset"] != "ruler")].copy()
+    c["label"] = [L.window_json(w, "regime.json").get("label") or "NO_REGIME_RECORD" for w in c["window_dir"]]
+    return c
+
+
+def test_p03_pools_the_frontier_cells_by_the_plan_block_and_prints_one_line_per_cell(tmp_path: Path) -> None:
+    parts = _write_landing(tmp_path)
+    _plan_with_blocks(parts)
+    L = _landing(parts)
+    blocks = ap._plan_blocks(L)
+    assert set(blocks.values()) == {"K1", "P1"} and len(blocks) == 5
+    columns, table = ap._pressure_map_table(_pressured_with_labels(L), blocks)
+    assert columns == ["0.80", ap.FRONTIER_COLUMN]
+    cell = {(r.column, float(r.budget_r)): (int(r.in_regime), int(r.windows), int(r.no_record)) for r in table.itertuples()}
+    assert cell[(ap.FRONTIER_COLUMN, 0.25)] == (3, 3, 0)
+    assert cell[(ap.FRONTIER_COLUMN, 1.25)] == (0, 3, 0)
+    assert cell[("0.80", 0.5)] == (0, 9, 0)
+    assert len(table) == 3 and int(table["windows"].sum()) == 15
+    for r in table.itertuples():
+        assert CELL_TEXT.match(ap._cell_text(int(r.in_regime), int(r.windows), int(r.no_record)))
+    out = tmp_path / "out"
+    out.mkdir()
+    ap.ps.apply_style()
+    path, used = ap.plot03_pressure_map(L, out)
+    assert (out / path).exists() and (out / path).stat().st_size > 0
+    assert used.startswith("15 pressured windows in 3 cells") and "pools rates 0.8" in used and "left out" not in used
+    caption = (out / "p03_pressure_map.caption.txt").read_text(encoding="utf-8")
+    for phrase in (ap.FRONTIER_COLUMN, "queued occupancy", "non-empty queue", "attain", "T2", "control rung 1.25"):
+        assert phrase in caption, phrase
+    # review MEDIUM 2: the rule as goodput.classify_regime applies it (0.95 x a
+    # pinned ceiling, the absolute 0.90 without one), never the reverse
+    assert "where no ceiling was pinned" in caption and "for the two laddered classes" not in caption
+    # the in-regime total is the one a07 prints
+    _, a07_used = ap.plot_a07_consort_flow(L, out)
+    assert f"{int(table['in_regime'].sum())} in regime" in a07_used
+
+
+def test_p03_without_block_information_uses_rounded_rates_and_sizes_the_figure(tmp_path: Path) -> None:
+    import pandas as pd
+
+    parts = _write_landing(tmp_path)
+    L = ap.Landing(parts["landing"], yield_table=parts["yield"], stats=parts["stats"])  # no plan
+    assert ap._plan_blocks(L) == {}
+    columns, table = ap._pressure_map_table(_pressured_with_labels(L), {})
+    assert columns == ["0.80"] and int(table["windows"].sum()) == 15
+    out = tmp_path / "out"
+    out.mkdir()
+    ap.ps.apply_style()
+    _, used = ap.plot03_pressure_map(L, out)
+    assert "no plan block field" in used
+    # the S1 shape: twelve distinct rates, ten of them frontier ladder points
+    rates = [0.65506, 0.7, 0.7156, 0.716055, 0.716451, 0.71599, 0.7692, 0.769206, 0.76927, 0.8163, 0.826896, 0.85]
+    df = pd.DataFrame({"engine": "vllm", "row_key": [f"k{i}" for i in range(12)], "rate_frac": rates,
+                       "budget_r": 0.5, "label": "UNPRESSURED"})
+    cols, _ = ap._pressure_map_table(df, {})
+    assert cols == ["0.66", "0.70", "0.72", "0.77", "0.82", "0.83", "0.85"]
+    frontier = {f"k{i}": "K1" for i, r in enumerate(rates) if r not in (0.7, 0.85)}
+    cols2, t2 = ap._pressure_map_table(df, frontier)
+    assert cols2 == ["0.70", "0.85", ap.FRONTIER_COLUMN]
+    assert int(t2.set_index("column").loc[ap.FRONTIER_COLUMN, "windows"]) == 10
+    # the width grows with the column count so cells never overprint; a
+    # no-record suffix needs 1.4 in per column (review LOW 5)
+    assert ap._pressure_map_width(3, 2) == ap.ps.FULL_WIDTH_IN
+    assert ap._pressure_map_width(7, 2) >= 0.78 * 14
+    assert ap._pressure_map_width(3, 2, with_suffix=True) >= 1.4 * 6
+    # review MEDIUM 1: every pooled rate is printed with its own digits
+    df2 = pd.DataFrame({"engine": "sglang", "row_key": ["x", "y", "z", "w"], "rate_frac": [0.7692, 0.769206, 0.8163, 0.7],
+                        "budget_r": 0.5, "label": "UNPRESSURED"})
+    assert ap._frontier_rates(df2, {"x": "K1", "y": "K1", "z": "K1"}) == ["0.7692", "0.769206", "0.8163"]
+    assert ap._frontier_rates(df2, {}) == []
+
+
+def test_p03_counts_mixed_labels_and_leaves_rate_less_rows_out() -> None:
+    import pandas as pd
+
+    df = pd.DataFrame({
+        "engine": ["vllm"] * 5, "row_key": ["a", "a", "a", "b", "a"], "rate_frac": [0.7, 0.7, 0.7, float("nan"), 0.7],
+        "budget_r": [0.5] * 5, "label": ["IN_REGIME", "UNPRESSURED", "UNKNOWN_TELEMETRY", "IN_REGIME", None],
+    })
+    cols, t = ap._pressure_map_table(df, {})
+    assert cols == ["0.70"] and len(t) == 1
+    r = t.iloc[0]
+    # the None label counts as a window and as no record (review LOW 6)
+    assert (int(r.in_regime), int(r.windows), int(r.no_record)) == (1, 4, 2)
+    assert ap._cell_text(1, 3, 1) == "1/3 in regime (1 no record)"
+    assert ap._cell_text(10, 12, 0) == "10/12 in regime"
+    # review LOW 4: decimal half-up labels, not binary float formatting
+    assert [ap._rate_label(v) for v in (0.705, 0.695, 0.7156, 0.85, 0.7)] == ["0.71", "0.70", "0.72", "0.85", "0.70"]

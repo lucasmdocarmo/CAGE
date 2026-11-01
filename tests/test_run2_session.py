@@ -237,12 +237,13 @@ def _pool_step(engine, nbytes, tokens, *, topology="single", tp=1, flag=None, va
 def test_the_largest_planned_pool_per_engine_a11_item4() -> None:
     steps = [
         _pool_step("vllm", 100, 10, r=0.5), _pool_step("vllm", 300, 30), _pool_step("vllm", 200, 20, r=1.0),
-        _pool_step("vllm", 900, 90, topology="tp", tp=2),  # tp and pd are out of scope
+        _pool_step("vllm", 900, 90, topology="tp", tp=8),  # the dist tp overlay leg: its own GPU count, out of scope
+        _pool_step("vllm", 950, 95, topology="pd"),  # the pd leg: two role instances, out of scope
         _pool_step("sglang", 250, 25),
         {"engine": "sglang", "topology": "single"},  # a budget-free relaunch
     ]
     got = rc.largest_planned_pools(steps)
-    assert got["vllm"]["planned_bytes"] == 300 and got["vllm"]["planned_tokens"] == 30
+    assert got["vllm"]["planned_bytes"] == 300 and got["vllm"]["planned_tokens"] == 30 and got["vllm"]["tp"] == 1
     assert got["vllm"]["env"] == {"CAGE_KV_BUDGET_BYTES": "300", "VLLM_MAX_MODEL_LEN": "32768"}
     assert got["sglang"]["env"] == {"CAGE_SGLANG_MAX_TOTAL_TOKENS": "25", "VLLM_MAX_MODEL_LEN": "32768"}
     assert rc.largest_planned_pools([]) == {}
@@ -275,6 +276,72 @@ def test_the_pool_check_command_applies_the_relaunch_rule_a11_item4(tmp_path, mo
     assert rc.main(argv) == 1 and "LARGEST_POOL_FAILED" in capsys.readouterr().out
     record.unlink()  # no record is never a pass
     assert rc.main(argv) == 1 and "no readable pool record" in capsys.readouterr().out
+
+
+def test_a_tp_sharded_instance_is_the_largest_pool_and_carries_its_tp_env_s2_b1() -> None:
+    # S2 Block B-1 (owner 2026-10-31): a single instance over serving_tp ranks
+    # (step topology "single", budget_plan tp 4) is in scope and its start env
+    # names the degree; an engine without a TP launch variable is skipped at
+    # tp >= 2 (the preflight refuses it) and kept at tp 1
+    steps = [
+        _pool_step("vllm", 400, 40, tp=4), _pool_step("vllm", 300, 30, tp=4, r=1.0),
+        _pool_step("sglang", 250, 25, tp=4),
+        _pool_step("lmdeploy", 500, 50, tp=4, flag="--max-total-tokens", value="50"),
+    ]
+    got = rc.largest_planned_pools(steps)
+    assert got["vllm"]["tp"] == 4 and got["vllm"]["planned_bytes"] == 400
+    assert got["vllm"]["env"] == {"CAGE_KV_BUDGET_BYTES": "400", "CAGE_VLLM_TENSOR_PARALLEL": "4", "VLLM_MAX_MODEL_LEN": "32768"}
+    assert got["sglang"]["env"] == {"CAGE_SGLANG_MAX_TOTAL_TOKENS": "25", "CAGE_SGLANG_TP": "4", "VLLM_MAX_MODEL_LEN": "32768"}
+    assert "lmdeploy" not in got
+    assert "lmdeploy" in rc.largest_planned_pools([_pool_step("lmdeploy", 500, 50, flag="--max-total-tokens", value="50")])
+
+
+def test_the_realized_pool_rule_covers_tp_and_pd_stacks_s2_b2(tmp_path, monkeypatch) -> None:
+    # S2 Block B-2 (owner 2026-10-31): a tensor-parallel single instance reads the
+    # plain record; a pd stack reads the pd launcher's record and sums its roles
+    monkeypatch.setenv("CAGE_LOG_ROOT", str(tmp_path))
+    (tmp_path / "vllm").mkdir()
+    plan = {"budget_tokens_total": 1000, "budget_bytes_total": 4000}
+    (tmp_path / "vllm" / rc.KV_POOL_RECORD_NAME).write_text(json.dumps({"tokens": 1002, "bytes": 4008}), encoding="utf-8")
+    tp = rc.realized_pool_check({"engine": "vllm", "topology": "single", "tp": 4, "budget_r": 1.0, "budget_plan": plan})
+    assert tp["ok"] is True and (tp["topology"], tp["tp"], tp["realized_tokens"], tp["realized_bytes"]) == ("single", 4, 1002, 4008)
+    pd_record = tmp_path / "vllm" / rc.KV_POOL_PD_RECORD_NAME
+    pd_record.write_text(json.dumps({"topology": "pd", "roles": {"prefill": {"tokens": 500, "bytes": 2000},
+                                                                 "decode": {"tokens": 498, "bytes": 1992}}}), encoding="utf-8")
+    pd = rc.realized_pool_check({"engine": "vllm", "topology": "pd", "budget_r": 1.0, "budget_plan": plan})
+    assert pd["ok"] is True and pd["record"].endswith(rc.KV_POOL_PD_RECORD_NAME)
+    assert (pd["topology"], pd["tp"], pd["realized_tokens"], pd["realized_bytes"]) == ("pd", 1, 998, 3992)
+    # a role without a byte count leaves the bytes unknown; the tokens still decide
+    pd_record.write_text(json.dumps({"roles": {"prefill": {"tokens": 500, "bytes": None}, "decode": {"tokens": 498}}}), encoding="utf-8")
+    partial = rc.realized_pool_check({"engine": "vllm", "topology": "pd", "budget_plan": plan})
+    assert partial["ok"] is True and partial["realized_bytes"] is None
+    # a role without a token count, or no roles at all, is unreadable: never a pass
+    pd_record.write_text(json.dumps({"roles": {"prefill": {"tokens": 500}, "decode": {"tokens": None}}}), encoding="utf-8")
+    bad = rc.realized_pool_check({"engine": "vllm", "topology": "pd", "budget_plan": plan})
+    assert bad["ok"] is False and "no readable pool record" in bad["reason"]
+    pd_record.write_text(json.dumps({"roles": {}}), encoding="utf-8")
+    assert "no readable pool record" in rc.realized_pool_check({"engine": "vllm", "topology": "pd", "budget_plan": plan})["reason"]
+    # a pd stack never falls back to the single record; a budget-free step is still None
+    pd_record.unlink()
+    assert rc.realized_pool_check({"engine": "vllm", "topology": "pd", "budget_plan": plan})["ok"] is False
+    assert rc.realized_pool_check({"engine": "vllm", "topology": "pd"}) is None
+    # the 0.5 percent rule is the same at tp 4
+    (tmp_path / "vllm" / rc.KV_POOL_RECORD_NAME).write_text(json.dumps({"tokens": 990, "bytes": 3960}), encoding="utf-8")
+    assert rc.realized_pool_check({"engine": "vllm", "topology": "single", "tp": 4, "budget_plan": plan})["ok"] is False
+
+
+def test_the_pool_check_command_records_the_degree_s2_b2(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("CAGE_LOG_ROOT", str(tmp_path))
+    record = tmp_path / "vllm" / rc.KV_POOL_RECORD_NAME
+    record.parent.mkdir(parents=True)
+    record.write_text(json.dumps({"tokens": 1000, "bytes": 4000}), encoding="utf-8")
+    out = tmp_path / "check.json"
+    argv = ["pool-check", "--engine", "vllm", "--planned-tokens", "1000", "--planned-bytes", "4000", "--out", str(out)]
+    assert rc.main(argv + ["--tp", "4"]) == 0
+    doc = json.loads(out.read_text(encoding="utf-8"))
+    assert (doc["tp"], doc["topology"], doc["ok"]) == (4, "single", True)
+    assert rc.main(argv) == 0 and json.loads(out.read_text(encoding="utf-8"))["tp"] == 1
+    assert capsys.readouterr().out.count("LARGEST_POOL_OK engine=vllm") == 2
 
 
 def test_the_power_injection_raises_the_accepted_share_by_the_registered_margin_a6() -> None:

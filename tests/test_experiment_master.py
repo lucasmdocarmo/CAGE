@@ -268,17 +268,27 @@ def world(tmp_path: Path) -> Dict[str, Path]:
                 problems.append(f"FLOOR_AVG_SEQ_TOKENS={floor_avg_seq_tokens} but session {session!r} registers 4779 served tokens for the anchor arm 'gold-fresh' (ADR-0155)")
             if os.environ.get("CAGE_TEST_PREFLIGHT_PROBLEMS"):
                 problems.append(os.environ["CAGE_TEST_PREFLIGHT_PROBLEMS"])
-            # A11 item 4: the largest planned pool per engine, on request
+            # S2 Block B-1: CAGE_TEST_TP_ENV=1 shards the single instance over four ranks
+            tp4 = os.environ.get("CAGE_TEST_TP_ENV") == "1"
+            # A11 item 4: the largest planned pool per engine, on request (its env carries the TP variable at tp 4)
             largest = {} if os.environ.get("CAGE_TEST_LARGEST_POOL") != "1" else {
-                "vllm": {"planned_tokens": 298687, "planned_bytes": 48936960000,
-                         "env": {"CAGE_KV_BUDGET_BYTES": "48936960000", "VLLM_MAX_MODEL_LEN": "32768"}}}
+                "vllm": {"planned_tokens": 298687, "planned_bytes": 48936960000, "tp": 4 if tp4 else 1,
+                         "env": dict({"CAGE_KV_BUDGET_BYTES": "48936960000", "VLLM_MAX_MODEL_LEN": "32768"},
+                                     **({"CAGE_VLLM_TENSOR_PARALLEL": "4"} if tp4 else {}))}}
             # review 2026-10-21 H1: the largest pool a GPU-helper cell plans, on request
             helpers = {} if os.environ.get("CAGE_TEST_HELPER_POOL") != "1" else {
-                "sglang": {"planned_tokens": 70437, "planned_bytes": 11540480000,
-                           "env": {"CAGE_SGLANG_MAX_TOTAL_TOKENS": "70437", "VLLM_MAX_MODEL_LEN": "8192"}}}
+                "sglang": {"planned_tokens": 70437, "planned_bytes": 11540480000, "tp": 4 if tp4 else 1,
+                           "env": dict({"CAGE_SGLANG_MAX_TOTAL_TOKENS": "70437", "VLLM_MAX_MODEL_LEN": "8192"},
+                                       **({"CAGE_SGLANG_TP": "4"} if tp4 else {}))}}
+            # review 2026-10-31 (G8 finding 2): only an engine with executable single cells gets a TP env
+            tp_engines = os.environ.get("CAGE_TEST_TP_ENV_ENGINES", "vllm sglang").split()
+            tp_env = {e: v for e, v in {"vllm": {"CAGE_VLLM_TENSOR_PARALLEL": "4"}, "sglang": {"CAGE_SGLANG_TP": "4"}}.items()
+                      if tp4 and e in tp_engines}
+            gc = os.environ.get("CAGE_TEST_GPU_COUNT_NEEDED", "4" if tp4 else "1")  # "" = no count (an older preflight)
             return {"session": session, "anchor_seq_tokens": 4779, "cells": 3, "executable_cells": 3,
                     "needs_lmcache": os.environ.get("CAGE_TEST_NEEDS_LMCACHE") == "1", "largest_pools": largest,
-                    "largest_helper_pools": helpers, "problems": problems}
+                    "largest_helper_pools": helpers, "tp_env": tp_env, "gpu_count_needed": int(gc) if gc else None,
+                    "problems": problems}
         if __name__ == "__main__":
             a = sys.argv[1:]
             if a and a[0] == "rungs":  # ADR-0154: stage 5 lists the budgeted rungs on the Mac
@@ -389,7 +399,7 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         ''')
     for eng in ("vllm", "sglang", "lmdeploy"):
         # a start writes the realized-pool record the validate probes read (ADR-0142)
-        _w(pr / "scripts" / "2_serving" / f"manage_{eng}_server.sh", f"#!/bin/bash\nextra=\"\"; [ -z \"${{VLLM_KV_CACHE_DTYPE:-}}${{SGLANG_KV_CACHE_DTYPE:-}}\" ] || extra=\" kv=${{VLLM_KV_CACHE_DTYPE:-}}${{SGLANG_KV_CACHE_DTYPE:-}}\"; [ -z \"${{LMCACHE_MAX_LOCAL_CPU_SIZE:-}}\" ] || extra=\"$extra store=${{LMCACHE_MAX_LOCAL_CPU_SIZE}}\"; echo \"launcher {eng} $*$extra\" >> \"$CAGE_TEST_LOG\"; case \"$1\" in start|restart) mkdir -p logs/{eng}; echo '{{}}' > logs/{eng}/CURRENT.kvpool.json; [ -n \"${{LMCACHE_MAX_LOCAL_CPU_SIZE:-}}\" ] && echo \"'max_local_cpu_size': ${{LMCACHE_MAX_LOCAL_CPU_SIZE}}.0,\" >> logs/{eng}/vllm_fake.log ;; esac; echo \"{eng} $1 ok\"; exit 0\n")
+        _w(pr / "scripts" / "2_serving" / f"manage_{eng}_server.sh", f"#!/bin/bash\nextra=\"\"; [ -z \"${{VLLM_KV_CACHE_DTYPE:-}}${{SGLANG_KV_CACHE_DTYPE:-}}\" ] || extra=\" kv=${{VLLM_KV_CACHE_DTYPE:-}}${{SGLANG_KV_CACHE_DTYPE:-}}\"; [ -z \"${{LMCACHE_MAX_LOCAL_CPU_SIZE:-}}\" ] || extra=\"$extra store=${{LMCACHE_MAX_LOCAL_CPU_SIZE}}\"; [ -z \"${{CAGE_VLLM_TENSOR_PARALLEL:-}}${{CAGE_SGLANG_TP:-}}\" ] || extra=\"$extra tp=${{CAGE_VLLM_TENSOR_PARALLEL:-}}${{CAGE_SGLANG_TP:-}}\"; echo \"launcher {eng} $*$extra\" >> \"$CAGE_TEST_LOG\"; case \"$1\" in start|restart) mkdir -p logs/{eng}; echo '{{}}' > logs/{eng}/CURRENT.kvpool.json; [ -n \"${{LMCACHE_MAX_LOCAL_CPU_SIZE:-}}\" ] && echo \"'max_local_cpu_size': ${{LMCACHE_MAX_LOCAL_CPU_SIZE}}.0,\" >> logs/{eng}/vllm_fake.log ;; esac; echo \"{eng} $1 ok\"; exit 0\n")
     _w(pr / "scripts" / "checks" / "preflight_check.sh", "#!/bin/bash\necho \"preflight $* BACKENDS=$CAGE_PREFLIGHT_BACKENDS\" >> \"$CAGE_TEST_LOG\"; echo 'PREFLIGHT PASS -- all Gate-2 components green.'; exit \"${CAGE_TEST_PREFLIGHT_RC:-0}\"\n")
     # S0F-59 (ADR-0151): the thinking pin probe, one per server engine at stage 4
     _w(pr / "scripts" / "checks" / "probe_thinking_pin.py", r'''
@@ -628,6 +638,7 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         CELL_STALL_MIN=60
         MONITOR_INTERVAL_S=1
         POD_REPO={pr}
+        POD_HF_CACHE={tmp_path}/hf_cache/huggingface
         POD_BACKUP_DIR={backup}
         POD_TARBALL={tmp_path}/cage_repo.tar.gz
         FREEZE_FILE={freeze}
@@ -1573,6 +1584,9 @@ def test_validate_starts_at_the_largest_planned_pool_and_checks_it_a11_item4(wor
     assert cmd.index("pool-check --engine vllm --planned-tokens 298687 --planned-bytes 48936960000") < cmd.index("manage_vllm_server.sh stop")
     assert any(c.startswith("pool_check --engine vllm --planned-tokens 298687") for c in _calls(world))
     assert "LARGEST_POOL_OK engine=vllm" in proc.stdout
+    # S2 Block B-2: the degree the start used is recorded with the check (1 on a single GPU)
+    assert "--planned-bytes 48936960000 --tp 1 --out logs/vllm/largest_pool_check.json" in cmd
+    assert _state(world)["registration"]["largest_pool"]["vllm"]["tp"] == "1"
     # a pool outside the rule fails stage 4, and nothing calibrates
     proc = _master(world, "--only", "validate", "--redo", CAGE_TEST_LARGEST_POOL="1", CAGE_TEST_POOL_CHECK_RC="1")
     assert proc.returncode == 1, proc.stdout[-3000:]
@@ -1585,7 +1599,7 @@ def test_validate_skips_the_largest_pool_start_when_the_plan_has_none_a11_item4(
     assert proc.returncode == 0, proc.stdout[-3000:]
     cmd = (world["home"] / ".cage_jobs" / "validate_vllm.cmd").read_text(encoding="utf-8")
     assert "pool-check" not in cmd and "env bash scripts/2_serving/manage_vllm_server.sh start" in cmd
-    assert "no budgeted single-GPU pool in the plan; the largest-pool start is skipped (A11 item 4)" in proc.stdout
+    assert "no budgeted single-instance pool in the plan; the largest-pool start is skipped (A11 item 4)" in proc.stdout
 
 
 def test_validate_fails_when_the_thinking_pin_probe_fails(world: Dict[str, Path]) -> None:
@@ -2370,3 +2384,216 @@ def test_without_a_batch_size_no_probe_runs(world: Dict[str, Path]) -> None:
     assert not any(c.startswith("scoring_probe ") for c in _calls(world))
     assert not (world["home"] / ".cage_jobs" / "score_probe.cmd").exists()
     assert "scoring" not in _state(world)
+
+
+# ---------------------------------------------------------------------------
+# 10. S2 Block B (owner 2026-10-31): the master on four GPUs. B-1 the TP env
+#     and the GPU count at stage 0, the stage 4 gate and every engine start;
+#     B-2 the degree on the pool checks; B-4 the container disk free-space
+#     floor; B-5 the stock note; B-6 the console volume override
+# ---------------------------------------------------------------------------
+
+
+def _four_gpu_profile(world: Dict[str, Path], tmp_path: Path, topology: str = "tp") -> None:
+    """The world profile on a four-GPU tensor-parallel pod with both server engines."""
+    prof = tmp_path / f"S1_{topology}4.env"
+    prof.write_text(world["profile"].read_text(encoding="utf-8").replace("GPU_COUNT=1", "GPU_COUNT=4")
+                    .replace('ENGINES="vllm hf"', 'ENGINES="vllm sglang hf"') + f"\nTOPOLOGY={topology}\n", encoding="utf-8")
+    world["profile"] = prof
+
+
+def test_stage_0_records_the_tp_env_and_the_gpu_count_and_refuses_a_mismatch_s2_b1(world: Dict[str, Path], tmp_path: Path) -> None:
+    # a single-GPU session: no TP env, one GPU needed, no stock note
+    proc = _master(world)
+    assert proc.returncode == 10, proc.stdout[-2500:]
+    st = _state(world)
+    assert st["registration"]["gpu_count_needed"] == "1" and st["registration"]["tp_env"] == {"vllm": "", "sglang": ""}
+    assert "S2 Block B-5" not in proc.stdout
+
+    def plans() -> int:
+        return sum(1 for c in _calls(world) if "provision_pod" in c)
+    before = plans()
+    # the grid shards each stack over four GPUs but the profile provisions one: refused before the plan print
+    proc = _master(world, "--only", "preflight-mac", "--redo", CAGE_TEST_TP_ENV="1")
+    assert proc.returncode == 1, proc.stdout[-2500:]
+    assert "the profile provisions GPU_COUNT=1 but session a needs 4 GPU(s) per serving stack" in proc.stdout
+    assert plans() == before
+    st = _state(world)
+    assert st["registration"]["gpu_count_needed"] == "4"
+    assert st["registration"]["tp_env"] == {"vllm": "CAGE_VLLM_TENSOR_PARALLEL=4", "sglang": "CAGE_SGLANG_TP=4"}
+    # an empty count (an older preflight) refuses too
+    proc = _master(world, "--only", "preflight-mac", "--redo", CAGE_TEST_TP_ENV="1", CAGE_TEST_GPU_COUNT_NEEDED="")
+    assert proc.returncode == 1 and "GPU_COUNT_NEEDED empty" in proc.stdout, proc.stdout[-2500:]
+    assert plans() == before
+    # the four-GPU profile passes, notes that the stock read is per GPU id, and prices four GPUs
+    _four_gpu_profile(world, tmp_path)
+    proc = _master(world, "--only", "preflight-mac", "--redo", CAGE_TEST_TP_ENV="1")
+    assert proc.returncode == 0, proc.stdout[-2500:]
+    assert "NOTE: a 4-GPU pod: the stock read is per GPU id, so 4 GPUs together in one datacenter are proven only by the create at stage 1 (S2 Block B-5)" in proc.stdout
+    assert "--gpu-count 4" in [c for c in _calls(world) if "provision_pod" in c][-1]
+    assert _state(world)["stages"]["preflight-mac"]["status"] == "passed"
+    # review 2026-10-31 (G8 finding 2): an engine the profile starts with no executable
+    # single cell gets no TP env and would start at TP=1 at stage 4: refused at stage 0
+    before = plans()
+    proc = _master(world, "--only", "preflight-mac", "--redo", CAGE_TEST_TP_ENV="1", CAGE_TEST_TP_ENV_ENGINES="vllm")
+    assert proc.returncode == 1, proc.stdout[-2500:]
+    assert "the profile starts engine sglang (ENGINES or CALIBRATE) on a 4-GPU pod but stage 0 recorded no TP variable for it" in proc.stdout
+    assert plans() == before
+    assert _state(world)["registration"]["tp_env"] == {"vllm": "CAGE_VLLM_TENSOR_PARALLEL=4", "sglang": ""}
+    # the same grid on a profile that starts vLLM alone passes
+    world["profile"].write_text(world["profile"].read_text(encoding="utf-8").replace('ENGINES="vllm sglang hf"', 'ENGINES="vllm hf"'), encoding="utf-8")
+    proc = _master(world, "--only", "preflight-mac", "--redo", CAGE_TEST_TP_ENV="1", CAGE_TEST_TP_ENV_ENGINES="vllm")
+    assert proc.returncode == 0, proc.stdout[-2500:]
+    assert _state(world)["stages"]["preflight-mac"]["status"] == "passed"
+
+
+def test_every_engine_start_carries_the_tp_env_and_the_gate_accepts_tp_s2_b1(world: Dict[str, Path], tmp_path: Path) -> None:
+    _four_gpu_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "calibrate", CAGE_TEST_TP_ENV="1", CAGE_TEST_HELPER_POOL="1")
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-1500:]
+    jobs = world["home"] / ".cage_jobs"
+    # the budget-free validate starts (no largest pool in this plan)
+    vllm_cmd = (jobs / "validate_vllm.cmd").read_text(encoding="utf-8")
+    assert "env CAGE_VLLM_TENSOR_PARALLEL=4 bash scripts/2_serving/manage_vllm_server.sh start" in vllm_cmd and "pool-check" not in vllm_cmd
+    sgl_cmd = (jobs / "validate_sglang.cmd").read_text(encoding="utf-8")
+    assert "env CAGE_SGLANG_TP=4 bash scripts/2_serving/manage_sglang_server.sh start" in sgl_cmd
+    # review 2026-10-31 (G8 finding 4): the helper start beside SGLang carries the degree and its pool check records it
+    assert "env CAGE_SGLANG_MAX_TOTAL_TOKENS=70437 CAGE_SGLANG_TP=4 VLLM_MAX_MODEL_LEN=8192 bash scripts/2_serving/manage_sglang_server.sh start" in sgl_cmd
+    assert "pool-check --engine sglang --planned-tokens 70437 --planned-bytes 11540480000 --tp 4 --out logs/sglang/helper_pool_check.json" in sgl_cmd
+    assert any(c.startswith("pool_check --engine sglang") and " --tp 4 " in c for c in _calls(world))
+    # the four start-check starts, the reranker start among them
+    sc = (jobs / "start_check.cmd").read_text(encoding="utf-8")
+    assert "manage_sglang_server.sh SGLANG_KV_CACHE_DTYPE=fp8_e4m3 CAGE_SGLANG_TP=4; stopall" in sc
+    assert "manage_vllm_server.sh VLLM_KV_CACHE_DTYPE=fp8 CAGE_VLLM_TENSOR_PARALLEL=4; stopall" in sc
+    assert "env CAGE_VLLM_TENSOR_PARALLEL=4 bash scripts/2_serving/manage_vllm_server.sh restart" in sc
+    # the floor calibration start, and the seam names the four GPUs
+    assert "env CAGE_VLLM_TENSOR_PARALLEL=4 bash scripts/2_serving/manage_vllm_server.sh start" in (jobs / "calibrate_vllm.cmd").read_text(encoding="utf-8")
+    assert "CAGE_HARDWARE='NVIDIA H100 80GB HBM3 x 4'" in (jobs / "calibrate_rungs_vllm.cmd").read_text(encoding="utf-8")
+    # every launcher start the fakes saw carried the degree
+    starts = [c for c in _calls(world) if c.startswith("launcher ") and (" start " in c or " restart " in c)]
+    assert len(starts) >= 7 and all(" tp=4" in c for c in starts), starts
+    # the pd stack is still a separate Spec: stage 4 refuses it by name
+    _four_gpu_profile(world, tmp_path, topology="pd")
+    proc = _master(world, "--from", "validate", "--redo", "--to", "validate", CAGE_TEST_TP_ENV="1")
+    assert proc.returncode == 1, proc.stdout[-2500:]
+    assert "TOPOLOGY=pd: single-instance and tensor-parallel validation are built (S2 Block B-1); the pd stack validation is a separate Spec" in proc.stdout
+
+
+def test_the_largest_pool_start_carries_the_tp_env_and_the_check_records_the_degree_s2_b2(world: Dict[str, Path], tmp_path: Path) -> None:
+    _four_gpu_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "validate", CAGE_TEST_TP_ENV="1", CAGE_TEST_LARGEST_POOL="1")
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-1500:]
+    cmd = (world["home"] / ".cage_jobs" / "validate_vllm.cmd").read_text(encoding="utf-8")
+    assert "env CAGE_KV_BUDGET_BYTES=48936960000 CAGE_VLLM_TENSOR_PARALLEL=4 VLLM_MAX_MODEL_LEN=32768 bash scripts/2_serving/manage_vllm_server.sh start" in cmd
+    assert "pool-check --engine vllm --planned-tokens 298687 --planned-bytes 48936960000 --tp 4 --out logs/vllm/largest_pool_check.json" in cmd
+    assert any(c.startswith("pool_check --engine vllm") and " --tp 4 " in c for c in _calls(world))
+    assert _state(world)["registration"]["largest_pool"]["vllm"]["tp"] == "4"
+    assert "LARGEST_POOL_OK engine=vllm" in proc.stdout
+
+
+def test_stage_1_records_a_console_volume_from_the_override_s2_b6(world: Dict[str, Path]) -> None:
+    # the id without its datacenter is refused before anything is created
+    proc = _master(world, "--yes", "provision", "--to", "provision", CAGE_VOLUME_ID_OVERRIDE="volx")
+    assert proc.returncode == 1, proc.stdout[-2500:]
+    assert "CAGE_VOLUME_ID_OVERRIDE=volx needs CAGE_VOLUME_DC_OVERRIDE=<datacenter id>" in proc.stdout
+    assert not any("network-volume create" in c or ("provision_pod" in c and "--yes" in c) for c in _calls(world))
+    st = _state(world)
+    assert st["stages"]["provision"]["status"] == "failed" and st["go"] == []
+    # an id that is not listed (a typo, a deleted volume) refuses: no second volume bills on it
+    proc = _master(world, "--from", "provision", "--yes", "provision", "--to", "provision",
+                   CAGE_VOLUME_ID_OVERRIDE="volx", CAGE_VOLUME_DC_OVERRIDE="US-NE-1")
+    assert proc.returncode == 1, proc.stdout[-2500:]
+    assert "CAGE_VOLUME_ID_OVERRIDE=volx is not in the network-volume listing: check the id in the console; nothing is created" in proc.stdout
+    assert not any("network-volume create" in c or ("provision_pod" in c and "--yes" in c) for c in _calls(world))
+    st = _state(world)
+    assert st["pod"]["volume_id"] == "" and st["stages"]["provision"]["status"] == "failed" and st["go"] == []
+    # review 2026-10-31 (G8 finding 3): the listing sites the volume elsewhere: refused, record cleared, nothing created
+    proc = _master(world, "--from", "provision", "--yes", "provision", "--to", "provision",
+                   CAGE_VOLUME_ID_OVERRIDE="volx", CAGE_VOLUME_DC_OVERRIDE="US-CA-2", CAGE_TEST_VOLUMES='[{"id": "volx", "dataCenterId": "US-NE-1"}]')
+    assert proc.returncode == 1, proc.stdout[-2500:]
+    assert "CAGE_VOLUME_DC_OVERRIDE=US-CA-2 but the listing sites volume volx in US-NE-1: set CAGE_VOLUME_DC_OVERRIDE=US-NE-1; nothing is created" in proc.stdout
+    assert not any("network-volume create" in c or ("provision_pod" in c and "--yes" in c) for c in _calls(world))
+    st = _state(world)
+    assert st["pod"]["volume_id"] == "" and st["stages"]["provision"]["status"] == "failed" and st["go"] == []
+    # with the datacenter the listing confirms: recorded, found in the listing, reused; no volume is created
+    proc = _master(world, "--from", "provision", "--yes", "provision", "--to", "provision",
+                   CAGE_VOLUME_ID_OVERRIDE="volx", CAGE_VOLUME_DC_OVERRIDE="US-NE-1", CAGE_TEST_VOLUMES='[{"id": "volx", "dataCenterId": "US-NE-1"}]')
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert "volume volx in US-NE-1 recorded from CAGE_VOLUME_ID_OVERRIDE (S2 Block B-6)" in proc.stdout
+    assert "volume volx in US-NE-1 is already recorded (kept after a refused pod): reused, no second volume is created" in proc.stdout
+    calls = _calls(world)
+    assert not any("network-volume create" in c for c in calls)
+    pods = [c for c in calls if "provision_pod" in c and "--yes" in c]
+    assert len(pods) == 1 and "--data-center-ids US-NE-1 --network-volume-id volx" in pods[0]
+    st = _state(world)
+    assert st["pod"]["id"] == "pod123" and st["pod"]["volume_id"] == "volx" and st["pod"]["dc"] == "US-NE-1"
+    assert st["stages"]["provision"]["status"] == "passed" and [g["stage"] for g in st["go"]] == ["provision"]
+
+
+def test_the_volume_override_never_drops_a_volume_this_landing_recorded_s2_b6(world: Dict[str, Path]) -> None:
+    # review 2026-10-31 (G8 finding 3): a refused pod leaves the created volume recorded
+    # (ADR-0176 Group B, billing storage); the override must not replace it in the state
+    proc = _master(world, "--yes", "provision", "--to", "provision", CAGE_TEST_PROVISION_YES_RC="1")
+    assert proc.returncode == 1, proc.stdout[-2500:]
+    assert _state(world)["pod"]["volume_id"] == "vol123"
+    creates = sum(1 for c in _calls(world) if "network-volume create" in c or ("provision_pod" in c and "--yes" in c))
+    proc = _master(world, "--from", "provision", "--yes", "provision", "--to", "provision",
+                   CAGE_VOLUME_ID_OVERRIDE="volx", CAGE_VOLUME_DC_OVERRIDE="US-NE-1", CAGE_TEST_VOLUMES='[{"id": "volx", "dataCenterId": "US-NE-1"}]')
+    assert proc.returncode == 1, proc.stdout[-2500:]
+    assert "this landing already recorded volume vol123 (kept after a refused pod, billing storage); CAGE_VOLUME_ID_OVERRIDE=volx would drop it from the state" in proc.stdout
+    assert sum(1 for c in _calls(world) if "network-volume create" in c or ("provision_pod" in c and "--yes" in c)) == creates
+    st = _state(world)
+    assert st["pod"]["volume_id"] == "vol123" and st["pod"]["dc"] == "US-NE-1" and st["stages"]["provision"]["status"] == "failed"
+    # the recorded id itself is a no-op override: reused as before, nothing created
+    proc = _master(world, "--from", "provision", "--yes", "provision", "--to", "provision",
+                   CAGE_VOLUME_ID_OVERRIDE="vol123", CAGE_VOLUME_DC_OVERRIDE="US-NE-1", CAGE_TEST_VOLUMES='[{"id": "vol123", "dataCenterId": "US-NE-1"}]')
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert "volume vol123 in US-NE-1 is already recorded (kept after a refused pod): reused, no second volume is created" in proc.stdout
+    assert sum(1 for c in _calls(world) if "network-volume create" in c) == 1
+    assert _state(world)["pod"]["id"] == "pod123" and _state(world)["pod"]["volume_id"] == "vol123"
+
+
+def test_stage_3_records_the_weights_disk_free_space_and_refuses_below_the_floor_s2_b4(world: Dict[str, Path], tmp_path: Path) -> None:
+    # review 2026-10-31 (G8 finding 1): the read is of the disk holding the model cache
+    # (POD_HF_CACHE, the pod user's cache by default), never of POD_REPO on the network
+    # volume; the fake profile names a local cache, absent until stage 3 creates it
+    cache = world["tmp"] / "hf_cache" / "huggingface"
+    assert not cache.exists()
+    proc = _master(world, "--yes", "provision", "--to", "setup")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    free = _state(world)["pod"]["disk_free_gb"]
+    assert re.fullmatch(r"[0-9]+", free), free
+    assert f"weights disk ({cache}): {free} GB free after the prefetch (DISK_GB=120, floor 20 GB)" in proc.stdout
+    steps = world["exp_root"] / "S1" / DATE / "extras" / "steps"
+    (log,) = list(steps.glob("setup_*weights_disk_free_space*.log"))
+    cmd = log.read_text(encoding="utf-8").split("# cmd:")[1].splitlines()[0]  # the command is %q-escaped in the step log
+    assert "df\\ -Pk" in cmd and str(cache) in cmd and str(world["pod_repo"]) not in cmd and "awk" not in cmd, cmd
+    assert cache.is_dir()  # the pod-side mkdir -p ran first: a cache the prefetch has not created never fails the read
+    # the recorded figure is the POSIX "Available" column of that path's disk (within 1 GB of a second read)
+    mac = subprocess.run(["df", "-Pk", str(cache)], capture_output=True, text=True, check=True).stdout.splitlines()[-1].split()
+    assert abs(int(mac[3]) // 1024 // 1024 - int(free)) <= 1, (mac, free)
+    # a floor above the disk refuses, names the profile key to raise, and no engine starts
+    proc = _master(world, "--from", "setup", "--redo", "--to", "setup", DISK_FREE_MIN_GB="999999999")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert f"[FAIL] setup: {free} GB free on the disk holding the model cache ({cache}) after the prefetch, below DISK_FREE_MIN_GB=999999999 (DISK_GB=120 holds the weights, S2 Block B-4 option a): raise DISK_GB in the profile" in proc.stdout
+    assert _state(world)["stages"]["setup"]["status"] == "failed"
+    assert not (world["home"] / ".cage_jobs" / "validate_vllm.cmd").exists()
+    # without the profile key the command names the pod user's cache on the container disk, whatever the Mac answers
+    bare = tmp_path / "S1_nocache.env"
+    bare.write_text("\n".join(ln for ln in world["profile"].read_text(encoding="utf-8").splitlines() if not ln.strip().startswith("POD_HF_CACHE=")) + "\n", encoding="utf-8")
+    world["profile"] = bare
+    _master(world, "--from", "setup", "--redo", "--to", "setup")
+    (log,) = list(steps.glob("setup_*weights_disk_free_space*.log"))
+    cmd = log.read_text(encoding="utf-8").split("# cmd:")[1].splitlines()[0]
+    assert "/root/.cache/huggingface" in cmd and str(world["pod_repo"]) not in cmd, cmd
+
+
+def test_the_shipped_s2_profile_holds_the_weights_on_a_300_gb_container_disk_s2_b4() -> None:
+    keys = ("DISK_GB", "GPU_COUNT", "TOPOLOGY", "VOLUME_GB", "DISK_FREE_MIN_GB", "ENGINES")
+    fmt = "|".join("${%s:-}" % k for k in keys)
+    proc = subprocess.run(["bash", "-c", f'set -a; source "{EXPDIR}/profiles/_common.env"; source "{EXPDIR}/profiles/S2.env"; printf "%s" "{fmt}"'],
+                          capture_output=True, text=True, env=PROFILE_ENV)
+    assert proc.returncode == 0, proc.stderr
+    got = dict(zip(keys, proc.stdout.split("|")))
+    # B-4 option a: 300 GB holds the 80B (163 GB bf16) or the 70B (141 GB); the master's 20 GB floor applies
+    assert got == {"DISK_GB": "300", "GPU_COUNT": "4", "TOPOLOGY": "tp", "VOLUME_GB": "300", "DISK_FREE_MIN_GB": "", "ENGINES": "vllm sglang"}
