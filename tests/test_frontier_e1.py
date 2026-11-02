@@ -502,13 +502,70 @@ def test_rung_above_control_is_listed_not_tested_m4(tmp_path: Path) -> None:
     assert len(above) == 1 and "above the control rung" in above[0]["reason"]
 
 
-def test_duplicate_constrained_cell_per_engine_and_rung_refuses(
+def test_two_constrained_cells_of_one_engine_at_one_rate_pool_f8(tmp_path: Path) -> None:
+    """Block F row F-8 (S2 register T4, DEC-6 item 5): a constrained cell
+    repeated at one offered rate (the shape a resume can produce; the register's
+    S1 pair, sglang B1 at rate_frac 0.7692 and 0.769206, are two CONTROL keys
+    that D2 already pools), two constrained cells of one engine and rung at one
+    rate (equal within FRONTIER_RATE_RTOL), is ONE point carrying both cells' windows; the
+    leg names every pooled cell and keeps the first as constrained_row_key.
+    Until 2026-11-02 this shape refused ("supplied twice by engine"); the owner
+    flipped the test on that date."""
+    second_rate = RATE * (1 + 5e-4)
+    cells = _k1_cells() + [(_spec("vllm", 0.25, 0.81), second_rate)]
+    run_dir = _build_run(tmp_path, cells)
+    assert rca.main([str(run_dir), "--contrasts", "12", "--plan", str(_plan(tmp_path))]) == 0
+    _, stats = _load_stats(run_dir)
+    legs = {(leg["engine"], leg["leg"]): leg for leg in stats["frontier"]["legs"]}
+    assert set(legs) == {("vllm", "B1|r0.5"), ("vllm", "B1|r0.25"), ("sglang", "B1|r0.25")}
+    pooled = legs[("vllm", "B1|r0.25")]
+    keys = sorted(_spec("vllm", 0.25, f).to_row_key() for f in (0.8, 0.81))
+    assert pooled["constrained_row_keys"] == keys
+    assert pooled["constrained_row_key"] == keys[0]
+    assert pooled["n_windows_constrained"] == 2 * WINDOWS
+    assert len(pooled["control_row_keys"]) == 2 and pooled["n_windows_control"] == 2 * WINDOWS
+    assert pooled["rate_qps"] == pytest.approx((RATE + second_rate) / 2)
+    # both cells follow the r0.25 late pattern, so the pooled mean is that pattern's
+    assert pooled["yield"]["mean_constrained"] == pytest.approx(_expected_shares(0.25)["yield"])
+    for leg in stats["frontier"]["legs"]:
+        assert leg["constrained_row_keys"][0] == leg["constrained_row_key"]
+        if leg is not pooled:
+            assert leg["constrained_row_keys"] == [leg["constrained_row_key"]]
+    # the r0.25 cell at 2.0 req/s has no control: listed, never pooled
+    assert [p["rate_qps"] for p in stats["frontier"]["not_confirmatory_points"]] == pytest.approx([2.0])
+
+
+def test_two_constrained_cells_at_two_rates_refuse_naming_both_f8(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    cells = _k1_cells() + [(_spec("vllm", 0.25, 0.81), RATE)]
+    """Block F row F-8: two constrained cells of one engine and rung, each with
+    a control at its own rate, the rates apart by more than FRONTIER_RATE_RTOL:
+    the look refuses, naming both rates and both cells, and writes nothing."""
+    cells = _k1_cells() + [(_spec("vllm", 1.25, 0.9), 3.6), (_spec("vllm", 0.25, 0.81), 3.6)]
     run_dir = _build_run(tmp_path, cells)
     assert rca.main([str(run_dir), "--contrasts", "12", "--plan", str(_plan(tmp_path))]) == 1
-    assert "supplied twice by engine" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "one point serves one rate" in err and "3.5" in err and "3.6" in err
+    assert _spec("vllm", 0.25, 0.8).to_row_key() in err and _spec("vllm", 0.25, 0.81).to_row_key() in err
+    assert not (run_dir / "analysis").exists()
+
+
+def test_a_control_outside_tolerance_of_the_pooled_rate_refuses_f8(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Review 2026-11-02 LOW 2 (block F row F-8): a control matched by one
+    pooled cell can sit up to 1.5 times the tolerance from the pooled rate;
+    D2 wants every control of a point within the tolerance of the point's
+    rate, so the look refuses, naming the control."""
+    second_rate = RATE * (1 + 9e-4)           # pools with the cell at RATE (spread within the tolerance)
+    far_control = second_rate * (1 + 9e-4)    # matches the second cell only; outside the tolerance of the pooled mean
+    cells = _k1_cells() + [(_spec("vllm", 0.25, 0.81), second_rate), (_spec("vllm", 1.25, 0.762), far_control)]
+    run_dir = _build_run(tmp_path, cells)
+    assert rca.main([str(run_dir), "--contrasts", "12", "--plan", str(_plan(tmp_path))]) == 1
+    err = capsys.readouterr().err
+    assert "outside the tolerance of the pooled rate" in err
+    assert _spec("vllm", 1.25, 0.762).to_row_key() in err and f"{far_control:.6g}" in err
+    assert not (run_dir / "analysis").exists()
 
 
 def test_class_mismatch_between_point_and_control_refuses(

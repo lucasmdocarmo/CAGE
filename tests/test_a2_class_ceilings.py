@@ -476,3 +476,27 @@ def test_the_ceiling_and_drift_roots_obey_the_slug_grammar_at_the_longest_run_id
         assert CAMPAIGN_RE.fullmatch(Path(root).name), root
     for root in drift_roots:
         assert RUN_ID_RE.fullmatch(Path(root.rstrip("/")).name), root
+
+
+def test_the_rung_root_obeys_the_slug_grammar_at_the_cd_act1_run_id(world):  # noqa: F811
+    """Block F row F-1 (S2 register T2): stage 5's rung ladder root
+    ``<run_id>-HHMMSS`` is checked by the runner against the campaign slug
+    grammar (at most 41 characters). The S1 run id has 28 characters, so its
+    root fit; the cd-act1 run id has 38, so its root would have 45 and every
+    rung window would be refused on the first S2 pod. The ceiling and drift
+    roots already cut the run id to its first 30 characters; the rung root
+    must use the same cut."""
+    import re
+    from src.orchestration.campaign_layout import CAMPAIGN_RE, RUN_ID_RE
+    run_id = "20261008-132328-cd-act1-qwen3-next-80b"
+    assert RUN_ID_RE.fullmatch(run_id) and len(run_id) == 38
+    extras = world["exp_root"] / "S1" / test_experiment_master.DATE / "extras"
+    extras.mkdir(parents=True, exist_ok=True)
+    (extras / "state.json").write_text(json.dumps({"run_id": run_id, "stages": {}}), encoding="utf-8")
+    proc = _master(world, "--plan", "--only", "calibrate")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    rung_roots = re.findall(r"calibrate-rungs\\? --session\b.*?--out-root\\? (\S+)", proc.stdout)
+    assert rung_roots, proc.stdout
+    for root in rung_roots:
+        assert len(Path(root).name) <= 41, root
+        assert CAMPAIGN_RE.fullmatch(Path(root).name), root

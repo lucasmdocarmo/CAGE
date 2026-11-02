@@ -113,6 +113,11 @@ def wilson(k: float, n: float, z: float = 1.96) -> Tuple[float, float]:
     return max(0.0, c - h), min(1.0, c + h)
 
 
+def _identity(r: Dict[str, Any]) -> Tuple[str, str, Any]:
+    """The request identity the predicate and scoring rows are keyed on."""
+    return (str(r.get("example_id")), str(r.get("repeat_index") or "0"), r.get("record_index"))
+
+
 class Landing:
     """The pulled landing: the run root, its cell index, its predicate tree and
     the per-window yield table."""
@@ -147,6 +152,8 @@ class Landing:
             scoring_run_id = pred_dirs[0].name
         self.scoring_run_id = scoring_run_id
         self.predicate_root = run_root / "predicate" / scoring_run_id
+        #: Block F row F-3 (S2 register D4): the scoring pass behind the predicate tree
+        self.scoring_root = run_root / "scoring" / scoring_run_id
         self.calibration_dir = calibration_dir or landing / "extras" / "calibration" / "pod"
         self._yield_csv = yield_table
         self._yield: Optional[pd.DataFrame] = None
@@ -155,15 +162,30 @@ class Landing:
         self._rows: Dict[str, pd.DataFrame] = {}
 
     def rows(self, window_dir: str) -> pd.DataFrame:
-        """One window's request rows, each with its predicate verdict (None when unscored)."""
+        """One window's request rows, each with its predicate verdict (None when
+        unscored) and, where the scoring pass scored the window, its grounded flag."""
         if window_dir not in self._rows:
             reqs = _read_jsonl(self.run_root / window_dir / "requests.jsonl")
-            verdict = {
-                (str(r.get("example_id")), str(r.get("repeat_index") or "0"), r.get("record_index")): r.get("predicate")
-                for r in _read_jsonl(self.predicate_root / window_dir / "predicate.jsonl")
-            }
+            verdict = {_identity(r): r.get("predicate") for r in _read_jsonl(self.predicate_root / window_dir / "predicate.jsonl")}
+            # Block F row F-3 (S2 register D4): every campaign cell pins
+            # CAGE_SKIP_QUALITY=1, so the serving rows' grounded flag is null by
+            # design (every S1 row) while the instrument scored the window in
+            # the scoring pass (270,205 of 365,410 S1 rows carry a score). The
+            # flag is derived from that score with the scorer's rule
+            # (rescore_quality.py: grounded = grounding_score >= 0.5; a null
+            # score stays null); a window without score rows keeps the serving flag.
+            scores: Dict[Tuple[str, str, Any], Any] = {}
+            for r in _read_jsonl(self.scoring_root / window_dir / "qa_scores.jsonl"):
+                k = _identity(r)
+                if k in scores:
+                    raise SystemExit(f"academic_plots: duplicate identity {k} in {self.scoring_root / window_dir}/qa_scores.jsonl; refusing to guess")
+                scores[k] = r.get("grounding_score")
             for r in reqs:
-                r["predicate"] = verdict.get((str(r.get("example_id")), str(r.get("repeat_index") or "0"), r.get("record_index")))
+                k = _identity(r)
+                r["predicate"] = verdict.get(k)
+                if k in scores:
+                    g = scores[k]
+                    r["grounded"] = None if g is None or (isinstance(g, float) and math.isnan(g)) else bool(float(g) >= 0.5)
             self._rows[window_dir] = pd.DataFrame(reqs)
         return self._rows[window_dir]
 
@@ -697,6 +719,13 @@ def _frontier_legs(L: Landing) -> List[Dict[str, Any]]:
     return legs
 
 
+def _constrained_keys(leg: Dict[str, Any]) -> List[str]:
+    """Block F row F-8: a leg pooled from several constrained cells carries
+    constrained_row_keys (the first is constrained_row_key); an older
+    stats.json carries the one key only."""
+    return list(leg.get("constrained_row_keys") or [leg["constrained_row_key"]])
+
+
 def plot_a01_frontier_drop(L: Landing, out: Path) -> Tuple[str, str]:
     """A1: the yield frontier drop (E1) per engine: window dots, timely and
     accepted means, the registered merged p printed beside each point."""
@@ -723,7 +752,7 @@ def plot_a01_frontier_drop(L: Landing, out: Path) -> Tuple[str, str]:
             for leg in rows:
                 sides = (
                     (CONTROL_LABEL, leg["control_row_keys"], leg["yield"]["mean_control"], leg["timely"]["mean_control"], "#0173b2"),
-                    (f"{CONSTRAINED_LABEL} r={float(leg['budget_r']):g}", [leg["constrained_row_key"]],
+                    (f"{CONSTRAINED_LABEL} r={float(leg['budget_r']):g}", _constrained_keys(leg),
                      leg["yield"]["mean_constrained"], leg["timely"]["mean_constrained"], "#d55e00"),
                 )
                 for k, (side, keys, y_mean, t_mean, color) in enumerate(sides):
@@ -790,7 +819,7 @@ def plot_a02_ttft_cdf(L: Landing, out: Path) -> Tuple[str, str]:
         sides_drawn: set = set()
         for leg in sorted((l for l in legs if l["engine"] == engine), key=lambda l: (_bnum(l["baseline"]), -float(l["budget_r"]))):
             for side, keys, ls in ((CONTROL_LABEL, leg["control_row_keys"], "-"),
-                                   (f"{CONSTRAINED_LABEL} r={float(leg['budget_r']):g}", [leg["constrained_row_key"]], "--")):
+                                   (f"{CONSTRAINED_LABEL} r={float(leg['budget_r']):g}", _constrained_keys(leg), "--")):
                 if (tuple(keys), leg["dataset"]) in sides_drawn:
                     continue  # a control shared by two legs is drawn and counted once
                 sides_drawn.add((tuple(keys), leg["dataset"]))
@@ -1020,6 +1049,7 @@ def plot_a05_outcome_breakdown(L: Landing, out: Path) -> Tuple[str, str]:
     shares per strategy, at no load and under load, per engine."""
     cells = L.cells[L.cells["dataset"].isin(["qasper", "squad_v2"])]
     counts: Dict[Tuple[str, Tuple[str, Optional[int]], str], Dict[str, int]] = {}
+    n_scored = n_total = 0
     for row in cells.itertuples(index=False):
         if row.engine in NO_STREAM_ENGINES:
             continue
@@ -1029,8 +1059,10 @@ def plot_a05_outcome_breakdown(L: Landing, out: Path) -> Tuple[str, str]:
         if d.empty:
             continue
         rec = counts.setdefault((str(row.engine), skey, load), {k: 0 for k in OUTCOME_ORDER})
+        n_total += len(d)
         if "grounded" in d.columns and d["grounded"].notna().any():
             L.grounding_seen = True
+            n_scored += int(d["grounded"].notna().sum())
         for r in d.itertuples(index=False):
             rec[_outcome(r)] += 1
     if not counts:
@@ -1058,7 +1090,14 @@ def plot_a05_outcome_breakdown(L: Landing, out: Path) -> Tuple[str, str]:
     fig.legend(*axes[0][0].get_legend_handles_labels(), loc="outside lower center", ncol=6, fontsize=7)
     fig.suptitle("What happens to each request: outcome shares per strategy (left bar: no load; hatched: under load; qasper and squad_v2)")
     stem = "a05_outcome_breakdown"
-    note = "" if grounding_ran else "\nThe grounding instrument did not run on this tree (grounded is null on every row), so no request is classed ungrounded."
+    # Block F row F-3 (S2 register D4): the flag comes from the scoring pass, so
+    # the note states the instrument's coverage instead of "did not run"
+    if n_scored:
+        note = (f"\nThe grounded flag is derived from the scoring pass {L.scoring_run_id} (grounding_score >= 0.5, the scorer's "
+                f"rule); {n_scored} of {n_total} issued requests carry a grounding score.")
+    else:
+        note = (f"\nNo request carries a grounding score in the scoring pass {L.scoring_run_id} and the serving rows' grounded "
+                "flag is null, so no request is classed ungrounded.")
     _write_caption(out, stem, """
 A5. Every issued request of qasper and squad_v2 is placed in one class: accepted (section 8.5 predicate true); abstained
 (predicate false and the model declined to answer, predicted_no_answer); ungrounded (predicate false and the grounding
@@ -1131,7 +1170,7 @@ def _k1_cells(L: Landing) -> List[Dict[str, Any]]:
                         "keys": list(leg["control_row_keys"])})
         out.append({"engine": leg["engine"], "baseline": leg["baseline"], "budget_r": float(leg["budget_r"]),
                     "dataset": leg["dataset"], "side": f"{CONSTRAINED_LABEL} r={float(leg['budget_r']):g}",
-                    "keys": [leg["constrained_row_key"]]})
+                    "keys": _constrained_keys(leg)})
     return out
 
 

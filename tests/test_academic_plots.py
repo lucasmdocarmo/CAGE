@@ -97,6 +97,12 @@ def _cells() -> list[tuple[CellSpec, str, dict]]:
     return out
 
 
+def _grounding_score(i: int):
+    """The fixture's scoring-pass grounding score: one in five below the 0.5
+    rule (ungrounded), one exactly at it, one null (unscored), the rest above."""
+    return 0.2 if i % 5 == 0 else 0.5 if i == 1 else None if i == 11 else 0.9
+
+
 def _write_landing(tmp_path: Path, *, with_retrieval: bool = True) -> dict:
     landing = tmp_path / "landing"
     run_root = landing / "run" / "camp1" / "s1" / RUN_ID
@@ -131,7 +137,7 @@ def _write_landing(tmp_path: Path, *, with_retrieval: bool = True) -> dict:
                     "ttft_from_scheduled_ms": ttft + 2.0 if ok else None, "tpot_ms": 10.0 if ok else None,
                     "num_tokens": 9 if ok else 0, "latency_ms": ttft + 90.0 if ok else None,
                     "generated_answer": f"answer {i}" if ok else "", "predicted_no_answer": i % 7 == 0,
-                    "grounded": i % 5 != 0, "arrival_s": i * 2.5,
+                    "grounded": None, "arrival_s": i * 2.5,
                     **({"retrieval_hit": i % 3 != 0, "retrieval_rank": 1 + i % 3} if (with_retrieval and baseline in ("B6", "B11")) else {}),
                 })
                 preds.append({"example_id": f"e{i:03d}", "repeat_index": "0", "record_index": i, "ok": ok,
@@ -154,6 +160,15 @@ def _write_landing(tmp_path: Path, *, with_retrieval: bool = True) -> dict:
             pdir = run_root / "predicate" / SCORING / "cells" / key / f"window_{wname}"
             pdir.mkdir(parents=True)
             (pdir / "predicate.jsonl").write_text("\n".join(json.dumps(p) for p in preds) + "\n", encoding="utf-8")
+            # Block F row F-3 (S2 register D4): the serving rows' grounded flag is
+            # null on every campaign cell (CAGE_SKIP_QUALITY=1); the instrument's
+            # score lives in the scoring pass, one qa_scores.jsonl per window
+            sdir = run_root / "scoring" / SCORING / "cells" / key / f"window_{wname}"
+            sdir.mkdir(parents=True)
+            (sdir / "qa_scores.jsonl").write_text("\n".join(json.dumps({
+                "example_id": f"e{i:03d}", "repeat_index": "0", "record_index": i,
+                "grounding_score": _grounding_score(i), "predicted_no_answer": 1.0 if i % 7 == 0 else 0.0})
+                for i in range(N)) + "\n", encoding="utf-8")
             index_rows.append({
                 "run_id": RUN_ID, "campaign": "camp1", "session": "s1", "model": MODEL, "engine": spec.engine,
                 "arm": spec.arm, "baseline": baseline, "retriever": spec.retriever, "policy": spec.policy,
@@ -584,3 +599,88 @@ def test_p03_counts_mixed_labels_and_leaves_rate_less_rows_out() -> None:
     assert ap._cell_text(10, 12, 0) == "10/12 in regime"
     # review LOW 4: decimal half-up labels, not binary float formatting
     assert [ap._rate_label(v) for v in (0.705, 0.695, 0.7156, 0.85, 0.7)] == ["0.71", "0.70", "0.72", "0.85", "0.70"]
+
+
+def test_a05_derives_the_grounded_flag_from_the_scoring_pass(tmp_path: Path) -> None:
+    """Block F row F-3 (S2 register D4): every campaign cell pins
+    CAGE_SKIP_QUALITY=1, so the serving rows' grounded flag is null on S1 while
+    270,205 of 365,410 score rows carry a grounding_score and no window is
+    all-null. The flag is derived from the score with the scorer's rule
+    (rescore_quality.py: grounded = grounding_score >= 0.5; null stays null)."""
+    parts = _write_landing(tmp_path)
+    L = _landing(parts)
+    wd = next(w for e, w in zip(L.cells["engine"], L.cells["window_dir"]) if e != "hf")
+    d = L.rows(wd)
+    by = dict(zip(d["example_id"], d["grounded"]))
+    assert by["e000"] is False and by["e001"] is True and by["e002"] is True and by["e011"] is None
+    assert d["grounded"].notna().sum() == N - 1
+    out = tmp_path / "out"
+    out.mkdir()
+    ap.ps.apply_style()
+    ap.plot_a05_outcome_breakdown(L, out)
+    text = (out / "a05_outcome_breakdown.caption.txt").read_text(encoding="utf-8")
+    assert "did not run" not in text
+    assert "grounding_score >= 0.5" in text and f"scoring pass {SCORING}" in text
+    # a window with no scoring file keeps the serving rows' own flag
+    sfile = parts["run_root"] / "scoring" / SCORING / wd / "qa_scores.jsonl"
+    rfile = parts["run_root"] / wd / "requests.jsonl"
+    rows = [json.loads(ln) for ln in rfile.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    for r in rows:
+        r["grounded"] = True
+    rfile.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    sfile.unlink()
+    assert _landing(parts).rows(wd)["grounded"].eq(True).all()
+    # a duplicate identity in the score file refuses instead of guessing
+    dup = json.dumps({"example_id": "e000", "repeat_index": "0", "record_index": 0, "grounding_score": 0.9})
+    sfile.write_text(dup + "\n" + dup + "\n", encoding="utf-8")
+    with pytest.raises(SystemExit, match="duplicate"):
+        _landing(parts).rows(wd)
+
+
+def _add_pooled_constrained_cell(parts: dict) -> str:
+    """Block F row F-8: a second B1 r0.25 cell at a neighboring rate (a
+    constrained cell repeated at one rate, the shape a resume can produce), the
+    first cell's windows copied under a new key and the index rows appended."""
+    import shutil
+
+    k1 = CellSpec.from_baseline("B1", model=MODEL, family="F2", budget_r=0.25, rate_frac=0.8).to_row_key()  # type: ignore[arg-type]
+    k2 = CellSpec.from_baseline("B1", model=MODEL, family="F2", budget_r=0.25, rate_frac=0.81).to_row_key()  # type: ignore[arg-type]
+    root = parts["run_root"]
+    for rel in ("cells", f"predicate/{SCORING}/cells", f"scoring/{SCORING}/cells"):
+        shutil.copytree(root / rel / k1, root / rel / k2)
+    idx = root / "index" / "cells_index.csv"
+    rows = list(csv.DictReader(open(idx, encoding="utf-8")))
+    for r in [r for r in rows if r["row_key"] == k1]:
+        rows.append({**r, "row_key": k2, "rate_frac": "0.81", "window_dir": r["window_dir"].replace(k1, k2),
+                     "cell_json": r["cell_json"].replace(k1, k2)})
+    with open(idx, "w", newline="", encoding="utf-8") as fh:
+        wr = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        wr.writeheader()
+        wr.writerows(rows)
+    return k2
+
+
+def test_frontier_readers_take_every_pooled_constrained_key_f8(tmp_path: Path) -> None:
+    """Block F row F-8 (S2 register T4): a leg pooled from two constrained cells
+    carries constrained_row_keys; a01, a02 and the K1 cell list draw every key,
+    and a leg without the list (an older stats.json) still reads its one key."""
+    parts = _write_landing(tmp_path)
+    k2 = _add_pooled_constrained_cell(parts)
+    out = tmp_path / "out"
+    out.mkdir()
+    ap.ps.apply_style()
+    L = _landing(parts)
+    (leg,) = L.stats()["frontier"]["legs"]
+    assert "constrained_row_keys" not in leg
+    assert ap.plot_a01_frontier_drop(L, out)[1] == "1 legs, 6 windows"
+    assert ap.plot_a02_ttft_cdf(L, out)[1] == "114 completed requests"
+    assert ap.plot_a06_preemption_kv(L, out)[1] == "6 windows"
+    stats = json.loads(parts["stats"].read_text(encoding="utf-8"))
+    stats["frontier"]["legs"][0]["constrained_row_keys"] = [leg["constrained_row_key"], k2]
+    parts["stats"].write_text(json.dumps(stats), encoding="utf-8")
+    L2 = _landing(parts)
+    assert ap.plot_a01_frontier_drop(L2, out)[1] == "1 legs, 9 windows"
+    assert ap.plot_a02_ttft_cdf(L2, out)[1] == "171 completed requests"
+    assert ap.plot_a06_preemption_kv(L2, out)[1] == "9 windows"
+    con = [c for c in ap._k1_cells(L2) if c["budget_r"] == 0.25]
+    assert len(con) == 1 and con[0]["keys"] == [leg["constrained_row_key"], k2]

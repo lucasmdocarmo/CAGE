@@ -1349,3 +1349,53 @@ def test_truth_tax_passes_the_cell_gpu_count_c8(tmp_path: Path) -> None:
         assert metrics.goodput_per_gpu == pytest.approx(metrics.goodput_rps / 4)
     for metrics in other.values():
         assert metrics.gpu_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Block F row F-3 (S2 register D4): the grounding instrument's coverage
+# ---------------------------------------------------------------------------
+
+
+def test_grounding_coverage_is_bounded_on_the_qasper_clause_rows() -> None:
+    # Block F row F-3 (S2 register D4): on S1 the serving rows' grounded flag
+    # was null by design while the scoring pass carried the score on 270,205 of
+    # 365,410 rows. The per-window share of clause-3 rows (abstractive and
+    # extractive, completed, not abstained) without a grounding_score is
+    # bounded by max_null_fraction like the pooled share. Here the pooled
+    # bound passes (4 nulls of 10 completed rows, bound 0.5) and the clause
+    # bound refuses (4 of 4), so the refusal is the clause bound's own.
+    evidence = [_qasper_evidence_row(i, "unanswerable") for i in range(6)]
+    evidence += [_qasper_evidence_row(i, "abstractive") for i in range(6, 10)]
+    scores = [_score_row(i, predicted_no_answer=1.0) for i in range(6)]
+    scores += [_score_row(i, grounding_score=None, predicted_no_answer=0.0) for i in range(6, 10)]
+    joined = join_window_rows(evidence, scores, window="w")
+    with pytest.raises(PredicateError, match="grounding_score null share"):
+        compute_window_predicate(joined, "qasper", _config(qasper_tau=0.8, max_null_fraction=0.5), window="w")
+    # one null of four stays under the bound: the window passes and the summary
+    # reports the coverage; an abstained clause-3 row and a not-ok row are
+    # outside the clause count (the scorer nulls grounding on abstention)
+    for s in scores[6:9]:
+        s["grounding_score"] = 0.9
+    evidence.append(_qasper_evidence_row(10, "abstractive"))
+    scores.append(_score_row(10, grounding_score=None, predicted_no_answer=1.0))
+    evidence.append(_qasper_evidence_row(11, "extractive", ok=False))
+    scores.append(_score_row(11, grounding_score=None, predicted_no_answer=0.0))
+    joined = join_window_rows(evidence, scores, window="w")
+    rows, summary = compute_window_predicate(joined, "qasper", _config(qasper_tau=0.8, max_null_fraction=0.5), window="w")
+    assert len(rows) == 12
+    assert summary["grounding_coverage"] == {
+        "n_ok_rows": 11, "n_null": 8, "null_fraction": 8 / 11,
+        "n_clause_rows": 4, "n_clause_null": 1, "null_fraction_clause_rows": 0.25,
+    }
+
+
+def test_grounding_coverage_is_descriptive_on_span_qa() -> None:
+    # musique and squad_v2 read exact_match, so an all-null grounding_score
+    # window passes and the coverage is reported with no clause rows
+    joined = join_window_rows([_evidence_row(0), _evidence_row(1)], [_score_row(0), _score_row(1)], window="w")
+    rows, summary = compute_window_predicate(joined, "musique", _config(), window="w")
+    assert [r["predicate"] for r in rows] == [True, True]
+    assert summary["grounding_coverage"] == {
+        "n_ok_rows": 2, "n_null": 2, "null_fraction": 1.0,
+        "n_clause_rows": 0, "n_clause_null": 0, "null_fraction_clause_rows": 0.0,
+    }

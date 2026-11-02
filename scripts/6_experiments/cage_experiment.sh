@@ -4,17 +4,21 @@
 # Cloud:     runpod
 # =============================================================================
 # cage_experiment.sh <S> [--from STAGE] [--to STAGE] [--only STAGE] [--redo] [--yes STAGE]...
-#                        [--plan] [--date YYYY-MM-DD] [--profile FILE] [--list-stages]
+#                        [--plan] [--date YYYY-MM-DD] [--profile FILE] [--list-stages] [--authorize teardown "<words>"]
 #   --to STAGE stops after that stage passes (a smoke that bootstraps, validates,
 #   calibrates and plans without running the grid); the pod keeps billing and the
 #   PORTAL ACTION block says so.
 #
 # Design: MyDocs/RunPod/EXPERIMENT_PROCESS_DESIGN_2026-10-03.md (rev. 2) with the
 # drift sweep of 2026-10-06 folded in. Principles (binding):
-#   1. Money gate inherited: stage 1 (provision) and stage 14 (teardown) run only
+#   1. Money gate inherited: stage 1 (provision) and stage 13 (teardown) run only
 #      with `--yes <stage>` on THIS invocation; the GO is recorded verbatim with
 #      its instant in extras/state.json. `--plan` prints every stage's commands
-#      and runs nothing.
+#      and runs nothing. Teardown alone may be pre-authorized instead: the
+#      owner's `--authorize teardown "<words>"` writes extras/go_teardown with
+#      its instant, and stage 13 honors that file only once the pull gate has
+#      passed, recording the file's line as the GO (block F row F-9, ADR-0183).
+#      No path deletes the network volume (owner rule 2026-10-22).
 #   2. No new mechanics: every step calls an existing script.
 #   3. The sealed run tree is never modified here.
 #   4. Fail closed, resumable: each stage records rc, instants and evidence;
@@ -66,7 +70,7 @@ usage() {
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-EXP_ARG=""; FROM=""; TO=""; ONLY=""; REDO=0; PLAN=0; DATE_ARG=""; PROFILE_ARG=""; YES_STAGES=" "
+EXP_ARG=""; FROM=""; TO=""; ONLY=""; REDO=0; PLAN=0; DATE_ARG=""; PROFILE_ARG=""; YES_STAGES=" "; AUTH_STAGE=""; AUTH_WORDS=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --from)    [ $# -ge 2 ] || usage; FROM="$2"; shift 2 ;;
@@ -75,6 +79,7 @@ while [ $# -gt 0 ]; do
     --redo)    REDO=1; shift ;;
     --yes)     [ $# -ge 2 ] || usage; YES_STAGES="$YES_STAGES$2 "; shift 2 ;;
     --plan)    PLAN=1; shift ;;
+    --authorize) [ $# -ge 3 ] || usage; AUTH_STAGE="$2"; AUTH_WORDS="$3"; shift 3 ;;
     --date)    [ $# -ge 2 ] || usage; DATE_ARG="$2"; shift 2 ;;
     --profile) [ $# -ge 2 ] || usage; PROFILE_ARG="$2"; shift 2 ;;
     --list-stages) printf '%s\n' $STAGES; exit 0 ;;
@@ -380,6 +385,7 @@ PY
 CUR_STAGE=""
 STEP_N=0
 STEP_LOG=""
+GO_TEARDOWN_LINE=""   # block F row F-9: the honored extras/go_teardown line, set by the gate loop
 
 rc_expected() { # rc_expected <rc> <expected: "0" or "0|1">
   case "|$2|" in *"|$1|"*) return 0 ;; esac; return 1
@@ -536,6 +542,18 @@ job_attach_or_submit() {
   esac
   run_step 0 "job $name: submit" -- bash "$PODJOB" submit "$name" "$cmd" "$deadline"
 }
+keep_fetched_log() {
+  # keep_fetched_log <name> <logdir>: block F row F-2 (S2 register T3, S0F-98).
+  # The S1 resume's re-fetch overwrote the first attempt's run.log. Every
+  # fetched log is also kept under the attempt that wrote it,
+  # <name>_<submitted_at>.log, so a later attempt's fetch replaces <name>.log
+  # (the latest, for every reader) and nothing else; a re-attach refreshes its
+  # own copy. The pod keeps its side in pod_job.sh submit. Both fetch sites
+  # call this (job_run, and the run stage's own fetch; review 2026-11-02 M1).
+  local name="$1" logdir="$2" sub_at=""
+  [ ! -f "$JOBS/$name.json" ] || sub_at="$(sed -n 's/.*"submitted_at": "\([0-9TZ:-]*\)".*/\1/p' "$JOBS/$name.json" | head -1)"
+  cp "$logdir/$name.log" "$logdir/${name}_$(printf '%s' "${sub_at:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" | tr -d ':-').log"
+}
 job_run() {
   # job_run <name> <deadline_s> <remote command> [logdir]: submit, wait, fetch
   # the log into logdir; the job's DONE(0) is the step's expected outcome.
@@ -552,6 +570,7 @@ job_run() {
   fi
   run_step 0 "job $name: fetch log" -- bash "$PODJOB" fetch "$name" "$logdir" || return 1
   JOB_LOG="$logdir/$name.log"
+  plan_only || keep_fetched_log "$name" "$logdir" || return 1   # block F row F-2
   return 0
 }
 JOB_LOG=""
@@ -1623,7 +1642,10 @@ PY
   # The ladder roots are never reused (a reused root is a PROBE_FAILED rung),
   # so each attempt of this stage gets its own out-root under the run id
   # (review MEDIUM 4); stage 12 pulls the whole rung-calibration tree.
-  local rungs_root="results/rung-calibration/${RUN_ID}-$(date -u +%H%M%S)"
+  # Block F row F-1 (S2 register T2): the root is the runner's campaign slug
+  # (at most 41 characters), so the run id is cut to 30 like the ceiling and
+  # drift roots; the cd-act1 run id (38) would otherwise make a 45-character root.
+  local rungs_root="results/rung-calibration/${RUN_ID:0:30}-$(date -u +%H%M%S)"
   plan_only || state put calibration.rungs_out_root "$rungs_root"
   # S0F-88 B-9 (owner ruling R5): RUNG_ALL_CLASSES=1 ladders every class
   # between the two anchors at its own pressure rungs (no interpolation).
@@ -1997,7 +2019,13 @@ stage_run() {
   fi
   local wrc=0
   bash "$PODJOB" wait "$name" "$JOB_WAIT_S" | tee "$EXTRAS/steps/run_wait.log" || wrc="${PIPESTATUS[0]}"
-  bash "$PODJOB" fetch "$name" "$LAND/logs/runner" || true
+  # Block F row F-2 (review 2026-11-02 M1): the run log is the one the row was
+  # written for; its copy under the attempt's stamp follows a successful fetch
+  # only (a failed fetch leaves the previous attempt's run.log, which must not
+  # be relabeled), and a failed copy is said, not fatal: the pod keeps its side
+  if bash "$PODJOB" fetch "$name" "$LAND/logs/runner"; then
+    keep_fetched_log "$name" "$LAND/logs/runner" || say "WARN: the stamped copy of logs/runner/run.log failed; the pod keeps the attempt's log under ~/.cage_jobs (stage 12 pulls it)"
+  fi
   JOB_LOG="$LAND/logs/runner/run.log"
   if [ "$wrc" -eq 124 ]; then printf '  [FAIL] the run exceeded its %s h bound and is STILL RUNNING on the pod (see PORTAL ACTION)\n' "$HOURS"; return 1; fi
   if [ "$wrc" -ne 0 ]; then
@@ -2308,7 +2336,10 @@ stage_analyze() {
 
 stage_teardown() {
   pod_env
-  plan_only || state go teardown "--yes teardown on the command line ($(utc))"
+  if ! plan_only; then
+    if has_yes teardown; then state go teardown "--yes teardown on the command line ($(utc))"
+    else state go teardown "pre-authorized: $EXTRAS/go_teardown holds \"$GO_TEARDOWN_LINE\" (honored after the pull gate passed, read at $(utc))"; fi
+  fi
   local host="${POD_SSH}"
   # Owner rule 2026-10-22 (ADR-0176 Group B): teardown deletes the POD only. The
   # network volume keeps the run tree until the Mac-side S3 pull and is deleted
@@ -2401,6 +2432,23 @@ take_lock() {
   printf '%s\n' "$$" > "$LOCK"
 }
 
+# Block F row F-9 (S2 register decision 7, ADR-0183): the pre-authorized
+# teardown. The owner's words, given at review pause 2, are written to
+# extras/go_teardown with their instant; the gate loop honors the file for
+# teardown only once the pull gate has passed, and stage 13 records the
+# file's line as the GO. teardown_pod.sh is unchanged: it deletes the pod
+# only, and no path deletes the network volume (owner rule 2026-10-22).
+if [ -n "$AUTH_STAGE" ]; then
+  [ "$PLAN" -eq 0 ] || die "--authorize teardown: refused under --plan (the plan creates nothing; drop --plan to write the pre-authorization)"
+  [ "$AUTH_STAGE" = "teardown" ] || die "--authorize: only teardown can be pre-authorized (not '$AUTH_STAGE'); provision stays behind --yes provision on the invocation"
+  AUTH_WORDS="$(printf '%s' "$AUTH_WORDS" | tr '\n' ' ')"
+  [ -n "$(printf '%s' "$AUTH_WORDS" | tr -d '[:space:]')" ] || die "--authorize teardown: the words are empty; the GO is written in words"
+  [ -d "$EXTRAS" ] || die "--authorize teardown: no landing at $LAND (the pre-authorization belongs to an experiment that stage 0 has started)"
+  printf '%s %s\n' "$(utc)" "$AUTH_WORDS" > "$EXTRAS/go_teardown"
+  say "teardown pre-authorized: $EXTRAS/go_teardown holds \"$(head -n 1 "$EXTRAS/go_teardown")\"; stage 13 runs teardown_pod.sh (pod only; the volume is kept) once the pull gate has passed, without a live prompt"
+  exit 0
+fi
+
 if [ "$PLAN" -eq 1 ]; then
   say "PLAN mode: printing every stage's commands for $EXP ($DATE); nothing runs, nothing is created"
   say "landing: $LAND"
@@ -2453,10 +2501,22 @@ for s in $STAGES; do
   st="$(state status "$s")"
   if [ "$st" = "passed" ] && [ "$REDO" -ne 1 ]; then say "stage $s already passed (use --redo to repeat)"; continue; fi
   if is_billable "$s" && ! has_yes "$s"; then
-    hr; say "stage $s is BILLABLE or IRREVERSIBLE: this is what it would run (plan print). Re-run with --yes $s to execute it."
-    PLAN=1; CUR_STAGE="$s"; STEP_N=0; set +e; "stage_$(printf '%s' "$s" | tr '-' '_')"; set -e; PLAN=0
-    say "stopped before $s (no --yes $s). Resume: bash $0 $EXP --date $DATE --from $s --yes $s"
-    exit 10
+    # Block F row F-9: teardown alone may run on the owner's pre-authorization
+    # (extras/go_teardown), and only once the pull gate has passed for the LIVE
+    # pod: a pull that ended before the last provision ended belongs to an
+    # earlier pod of this landing (review 2026-11-02 HIGH 1); the Z instants
+    # compare as strings, as the takeover check does
+    if [ "$s" = "teardown" ] && [ -s "$EXTRAS/go_teardown" ] && [ "$(state status pull)" = "passed" ] \
+       && [ "$(state get stages.pull.ended_utc 2>/dev/null || true)" \> "$(state get stages.provision.ended_utc 2>/dev/null || true)" ]; then
+      GO_TEARDOWN_LINE="$(head -n 1 "$EXTRAS/go_teardown")"
+      say "stage teardown is pre-authorized by $EXTRAS/go_teardown (\"$GO_TEARDOWN_LINE\") and the pull gate passed: it runs without a live prompt (block F row F-9)"
+    else
+      hr; say "stage $s is BILLABLE or IRREVERSIBLE: this is what it would run (plan print). Re-run with --yes $s to execute it."
+      [ "$s" != "teardown" ] || [ ! -s "$EXTRAS/go_teardown" ] || say "$EXTRAS/go_teardown is present but the pull gate has not passed for the live pod (pull: $(state status pull), ended $(state get stages.pull.ended_utc 2>/dev/null || true); provision ended $(state get stages.provision.ended_utc 2>/dev/null || true)): the pre-authorization is honored only after a verified pull of this pod"
+      PLAN=1; CUR_STAGE="$s"; STEP_N=0; set +e; "stage_$(printf '%s' "$s" | tr '-' '_')"; set -e; PLAN=0
+      say "stopped before $s (no --yes $s). Resume: bash $0 $EXP --date $DATE --from $s --yes $s"
+      exit 10
+    fi
   fi
   run_stage "$s" || exit 1
 done

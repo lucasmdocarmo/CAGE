@@ -386,3 +386,48 @@ def test_static_contract() -> None:
     assert proc.returncode == 0, proc.stderr
     # kills name the recorded pid's group, never a pattern
     assert 'kill -- -$pid' in text
+
+
+def test_resubmit_keeps_the_previous_attempts_log_under_its_submit_stamp(pod: Dict[str, Path]) -> None:
+    # Block F row F-2 (S2 register T3, S0F-98): the S1 resume's resubmit
+    # truncated attempt 1's remote log (run.log, 84,218 lines). The log is kept
+    # first as <name>_<submitted_at of the attempt that wrote it>.log.
+    assert _run(pod, "submit", "again", "echo ATTEMPT_ONE_MARKER").returncode == 0
+    assert _wait_status(pod, "again", "DONE") == "DONE(0)"
+    handle = json.loads((pod["jobs"] / "again.json").read_text(encoding="utf-8"))
+    stamp = handle["submitted_at"].replace(":", "").replace("-", "")
+    assert re.fullmatch(r"\d{8}T\d{6}Z", stamp)
+    assert _run(pod, "submit", "again", "echo attempt two").returncode == 0
+    assert _wait_status(pod, "again", "DONE") == "DONE(0)"
+    remote = pod["home"] / ".cage_jobs"
+    kept = (remote / f"again_{stamp}.log").read_text(encoding="utf-8")
+    assert "ATTEMPT_ONE_MARKER" in kept and "attempt two" not in kept
+    fresh = (remote / "again.log").read_text(encoding="utf-8")
+    assert "attempt two" in fresh and "ATTEMPT_ONE_MARKER" not in fresh
+
+
+def test_a_taken_keep_name_gets_a_suffix_and_a_missing_handle_stamps_the_submit_instant(pod: Dict[str, Path]) -> None:
+    # Block F row F-2: two attempts stamped alike never replace each other, and
+    # a log with no local handle (another Mac, a wiped handle dir) is still kept.
+    assert _run(pod, "submit", "k", "echo one").returncode == 0
+    assert _wait_status(pod, "k", "DONE") == "DONE(0)"
+    handle_path = pod["jobs"] / "k.json"
+    for text in ("echo two", "echo three"):
+        h = json.loads(handle_path.read_text(encoding="utf-8"))
+        h["submitted_at"] = "2026-10-26T00:41:00Z"
+        handle_path.write_text(json.dumps(h), encoding="utf-8")
+        assert _run(pod, "submit", "k", text).returncode == 0
+        assert _wait_status(pod, "k", "DONE") == "DONE(0)"
+    remote = pod["home"] / ".cage_jobs"
+    assert (remote / "k_20261026T004100Z.log").read_text(encoding="utf-8").strip() == "one"
+    assert (remote / "k_20261026T004100Z-1.log").read_text(encoding="utf-8").strip() == "two"
+    assert (remote / "k.log").read_text(encoding="utf-8").strip() == "three"
+    handle_path.unlink()
+    assert _run(pod, "submit", "k", "echo four").returncode == 0
+    assert _wait_status(pod, "k", "DONE") == "DONE(0)"
+    kept = sorted(p.name for p in remote.glob("k_*.log"))
+    assert len(kept) == 3, kept
+    (fallback,) = [n for n in kept if "20261026" not in n]
+    assert re.fullmatch(r"k_\d{8}T\d{6}Z\.log", fallback), fallback
+    assert (remote / fallback).read_text(encoding="utf-8").strip() == "three"
+    assert (remote / "k.log").read_text(encoding="utf-8").strip() == "four"

@@ -469,6 +469,14 @@ def compute_window_predicate(
     n_not_ok = 0
     n_missing_verdict = 0
     n_abstained_on_answerable = 0
+    # Block F row F-3 (S2 register D4): the grounding instrument's coverage per
+    # window. Every completed row counts toward the reported share; a clause-3
+    # row (Qasper abstractive / extractive, completed, not abstained) counts
+    # toward the bounded share, since its verdict IS the grounding_score.
+    n_grounding_ok = 0
+    n_grounding_null = 0
+    n_clause_rows = 0
+    n_clause_null = 0
     for row, row_column in zip(joined_rows, row_columns):
         out: dict[str, Any] = {
             "example_id": row["example_id"],
@@ -496,6 +504,9 @@ def compute_window_predicate(
             out["predicate_null_reason"] = "not_ok"
             rows_out.append(out)
             continue
+        n_grounding_ok += 1
+        if row.get("grounding_score") is None:
+            n_grounding_null += 1
         if row_column == "grounding_score":
             # Clause 3 rows are ANSWERABLE, so a no-answer prediction is a
             # wrong answer. Checked before the span score: the scorer treats
@@ -519,6 +530,10 @@ def compute_window_predicate(
                 continue
         verdict = _verdict_value(row, row_column, window)
         out["verdict"] = verdict
+        if row_column == "grounding_score":
+            n_clause_rows += 1
+            if verdict is None:
+                n_clause_null += 1
         if verdict is None:
             n_missing_verdict += 1
             out["predicate"] = None
@@ -571,6 +586,24 @@ def compute_window_predicate(
             f"sanity bound max_null_fraction={float(config.max_null_fraction)}: "
             "a run whose predicate is mostly unscoreable must not feed Y; "
             "fix the chain or re-state the bound deliberately"
+        )
+    clause_share = (n_clause_null / n_clause_rows) if n_clause_rows else 0.0
+    summary["grounding_coverage"] = {
+        "n_ok_rows": n_grounding_ok,
+        "n_null": n_grounding_null,
+        "null_fraction": (n_grounding_null / n_grounding_ok) if n_grounding_ok else 0.0,
+        "n_clause_rows": n_clause_rows,
+        "n_clause_null": n_clause_null,
+        "null_fraction_clause_rows": clause_share,
+    }
+    if n_clause_rows and clause_share > float(config.max_null_fraction):
+        raise PredicateError(
+            f"{window}: grounding_score null share among the completed, "
+            f"non-abstained Qasper clause-3 rows {clause_share:.3f} "
+            f"({n_clause_null}/{n_clause_rows}) breaches the configured sanity "
+            f"bound max_null_fraction={float(config.max_null_fraction)}: the "
+            "grounding instrument (Instrument A) did not score these rows; fix "
+            "the scoring chain or re-state the bound deliberately (block F row F-3)"
         )
     return rows_out, summary
 

@@ -55,7 +55,9 @@
 #     LOST (pid reuse, the J8 guard); a dead pid with no status is CRASHED (the
 #     pod rebooted or the shell was killed before the exit code landed).
 #   - Every submit starts a FRESH remote log: a marker from an earlier attempt
-#     can never satisfy a later attempt's check (review 2026-10-06).
+#     can never satisfy a later attempt's check (review 2026-10-06); the
+#     previous attempt's log is kept beside it as <name>_<submitted_at>.log
+#     (block F row F-2).
 # =============================================================================
 set -euo pipefail
 
@@ -125,6 +127,18 @@ cmd_submit() {
   # Refuse to double-submit a live job: a retry must not spawn a second run.
   local s; s="$(cmd_status "$name" 2>/dev/null || true)"
   [ "$s" = "RUNNING" ] && die "job '$name' is already RUNNING on $HOST (kill it or use another name)"
+
+  # Block F row F-2 (S2 register T3, S0F-98): a resubmit used to truncate the
+  # previous attempt's remote log (the S1 resume lost run.log, 84,218 lines).
+  # An existing log is kept first as <name>_<stamp>.log, stamped with the
+  # attempt that wrote it (the local handle's submitted_at; the submit instant
+  # when no handle exists), -1, -2, ... when that name is taken. Stage 12
+  # pulls the whole directory, so every attempt reaches the Mac.
+  local prev_at="" stamp
+  [ ! -f "$DIR/$name.json" ] || prev_at="$(sed -n 's/.*"submitted_at": "\([0-9TZ:-]*\)".*/\1/p' "$DIR/$name.json" | head -1)"
+  stamp="$(printf '%s' "${prev_at:-$(iso)}" | tr -d ':-')"
+  rssh "if [ -e $RDIR/$name.log ]; then keep=\$HOME/.cage_jobs/${name}_$stamp.log; n=1; while [ -e \$keep ]; do keep=\$HOME/.cage_jobs/${name}_$stamp-\$n.log; n=\$((n + 1)); done; mv $RDIR/$name.log \$keep; fi" \
+    || die "could not keep the previous log of '$name' on $HOST"
 
   # setsid: own process group, so the job survives the ssh channel closing.
   # ( ... ); echo $? > status : the exit code is the ONLY durable record.

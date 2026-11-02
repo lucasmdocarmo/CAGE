@@ -3300,3 +3300,193 @@ def test_the_accepted_identity_fail_skip_restores_the_verdict_on_the_pod(world: 
     assert json.loads(pod_verdict.read_text(encoding="utf-8"))["verdict"] == "FAIL"
     assert " --identity-gate logs/identity_gate.json --accept-identity-fail" in _job_cmd(world, "plan")
 
+
+
+def test_a_redo_keeps_every_attempts_job_log_on_the_pod_and_on_the_mac(world: Dict[str, Path]) -> None:
+    """Block F row F-2 (S2 register T3, S0F-98): on the S1 resume the second
+    attempt's submit truncated the first attempt's remote log and its fetch
+    overwrote the Mac copy (run.log, 84,218 lines). Every attempt's log now
+    survives on both sides under <name>_<submitted_at>.log; <name>.log stays
+    the latest attempt for every reader."""
+    proc = _master(world, "--yes", "provision", "--to", "setup")
+    assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-1000:]
+    land = world["exp_root"] / "S1" / DATE
+    logdir = land / "logs" / "setup"
+    first = (logdir / "setup.log").read_text(encoding="utf-8")
+    assert first
+    handle_path = land / "extras" / "jobs" / "setup.json"
+    stamp1 = json.loads(handle_path.read_text(encoding="utf-8"))["submitted_at"].replace(":", "").replace("-", "")
+    assert re.fullmatch(r"\d{8}T\d{6}Z", stamp1)
+    # the Mac keeps attempt 1 under its own stamp as soon as it is fetched
+    assert (logdir / f"setup_{stamp1}.log").read_text(encoding="utf-8") == first
+    # attempt 2 (a deliberate --redo) carries a distinct submit instant
+    h = json.loads(handle_path.read_text(encoding="utf-8"))
+    h["submitted_at"] = "2026-10-26T00:41:00Z"
+    handle_path.write_text(json.dumps(h), encoding="utf-8")
+    proc = _master(world, "--from", "setup", "--redo", "--only", "setup")
+    assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-1000:]
+    stamp2 = json.loads(handle_path.read_text(encoding="utf-8"))["submitted_at"].replace(":", "").replace("-", "")
+    assert stamp2 != "20261026T004100Z"
+    remote = world["home"] / ".cage_jobs"
+    # the pod kept attempt 1's log beside the fresh one, stamped with the handle it read
+    assert (remote / "setup_20261026T004100Z.log").read_text(encoding="utf-8") == first
+    assert (remote / "setup.log").is_file()
+    # the Mac holds attempt 1 (its first stamp) and attempt 2 (its own), and the latest copy
+    assert (logdir / f"setup_{stamp1}.log").read_text(encoding="utf-8") == first
+    assert (logdir / f"setup_{stamp2}.log").read_text(encoding="utf-8") == (logdir / "setup.log").read_text(encoding="utf-8")
+    assert (logdir / "setup.log").read_text(encoding="utf-8") == (remote / "setup.log").read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Block F row F-9 (S2 register decision 7): the pre-authorized teardown. The
+# owner's words go to extras/go_teardown through --authorize teardown "<words>";
+# stage 13 honors the file only after the pull gate passed; the GO record
+# carries the file's line; teardown_pod.sh is unchanged and no path deletes
+# the network volume.
+# ---------------------------------------------------------------------------
+
+
+def _go_file(w: Dict[str, Path]) -> Path:
+    return w["exp_root"] / "S1" / DATE / "extras" / "go_teardown"
+
+
+def test_teardown_without_yes_or_pre_authorization_still_stops_before_it(world: Dict[str, Path]) -> None:
+    proc = _master(world, "--yes", "provision", CAGE_TEST_VOLUMES='[{"id": "vol123"}]')
+    assert proc.returncode == 10, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert "stopped before teardown (no --yes teardown)" in proc.stdout
+    assert not _go_file(world).exists()
+    calls = _calls(world)
+    assert not any("teardown_pod pod123" in c for c in calls)
+    assert not any("network-volume delete" in c for c in calls)
+    st = _state(world)
+    assert st["stages"]["pull"]["status"] == "passed" and "teardown" not in st["stages"]
+    assert not any(g["stage"] == "teardown" for g in st["go"])
+
+
+def test_the_authorize_verb_writes_the_go_file_and_runs_nothing(world: Dict[str, Path]) -> None:
+    import re
+
+    # no landing yet: refused, nothing created
+    proc = _master(world, "--authorize", "teardown", "delete the pod once the pull is verified")
+    assert proc.returncode == 1 and "no landing" in proc.stderr
+    assert not (world["exp_root"] / "S1").exists()
+    proc = _master(world, "--to", "preflight-mac")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    n_calls = len(_calls(world))
+    proc = _master(world, "--authorize", "teardown", "delete the pod once the pull is verified")
+    assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-1000:]
+    assert "teardown pre-authorized" in proc.stdout
+    line = _go_file(world).read_text(encoding="utf-8")
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z delete the pod once the pull is verified\n", line)
+    assert len(_calls(world)) == n_calls                                      # no fake was called
+    assert not any(g["stage"] == "teardown" for g in _state(world)["go"])    # the GO is recorded at stage 13
+    # the words are the GO: empty words are refused; only teardown can be pre-authorized
+    proc = _master(world, "--authorize", "teardown", "   ")
+    assert proc.returncode == 1 and "words are empty" in proc.stderr
+    proc = _master(world, "--authorize", "provision", "go")
+    assert proc.returncode == 1 and "only teardown" in proc.stderr
+    assert _go_file(world).read_text(encoding="utf-8") == line               # the refusals left the file alone
+
+
+def test_a_pre_authorized_teardown_runs_after_the_pull_gate_without_a_prompt_and_keeps_the_volume(world: Dict[str, Path]) -> None:
+    assert _master(world, "--to", "preflight-mac").returncode == 0
+    assert _master(world, "--authorize", "teardown", "go: delete the pod after the verified pull").returncode == 0
+    proc = _master(world, "--from", "provision", "--yes", "provision", CAGE_TEST_VOLUMES='[{"id": "vol123"}]')
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-1500:]
+    assert "stopped before teardown" not in proc.stdout
+    assert "pre-authorized" in proc.stdout and "[4/5] deleting pod pod123" in proc.stdout
+    calls = _calls(world)
+    assert any("teardown_pod pod123" in c and "ASSUME_YES=1" in c for c in calls)
+    assert not any("network-volume delete" in c for c in calls)
+    st = _state(world)
+    assert st["stages"]["pull"]["status"] == "passed" and st["stages"]["teardown"]["status"] == "passed"
+    assert st["stages"]["analyze"]["status"] == "passed"
+    (go,) = [g for g in st["go"] if g["stage"] == "teardown"]
+    line = _go_file(world).read_text(encoding="utf-8").strip()
+    assert line in go["words"] and "go: delete the pod after the verified pull" in go["words"]
+    assert "--yes teardown" not in go["words"]
+    assert st["pod"]["volume_kept"] == "vol123" and st["cost"]["true_zero_utc"]
+
+
+def test_a_pre_authorized_teardown_waits_for_the_pull_gate(world: Dict[str, Path]) -> None:
+    assert _master(world, "--to", "preflight-mac").returncode == 0
+    assert _master(world, "--authorize", "teardown", "go").returncode == 0
+    # the file alone opens nothing: with the pull not passed the master stops as without it
+    proc = _master(world, "--from", "teardown")
+    assert proc.returncode == 10, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert "the pull gate has not passed" in proc.stdout and "stopped before teardown" in proc.stdout
+    calls = _calls(world)
+    assert not any("teardown_pod" in c for c in calls)
+    assert not any("network-volume delete" in c for c in calls)
+    assert "teardown" not in _state(world)["stages"]
+    # --plan with the file present still runs nothing
+    proc = _master(world, "--plan")
+    assert proc.returncode == 0 and not any("teardown_pod" in c for c in _calls(world))
+
+
+def test_a_pre_authorized_teardown_is_not_honored_on_a_pod_provisioned_after_the_pull(world: Dict[str, Path]) -> None:
+    """Review 2026-11-02 HIGH 1 (block F row F-9): the pull gate must belong to
+    the LIVE pod. After an honored teardown the file stays; a new pod on the
+    same landing (provision redone, nothing pulled from it) must not be deleted
+    on the old pull: the pull's end instant has to be later than the provision's."""
+    assert _master(world, "--to", "preflight-mac").returncode == 0
+    assert _master(world, "--authorize", "teardown", "go: delete the pod after the verified pull").returncode == 0
+    proc = _master(world, "--from", "provision", "--yes", "provision", CAGE_TEST_VOLUMES='[{"id": "vol123"}]')
+    assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-1000:]
+    assert sum("teardown_pod pod123" in c for c in _calls(world)) == 1
+    # a new pod on the same landing: provision, ship and setup redone, nothing pulled from it
+    proc = _master(world, "--from", "provision", "--yes", "provision", "--redo", "--to", "setup", CAGE_TEST_VOLUMES='[{"id": "vol123"}]')
+    assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-1000:]
+    st = _state(world)["stages"]
+    assert st["pull"]["status"] == "passed" and st["pull"]["ended_utc"] < st["provision"]["ended_utc"], (st["pull"], st["provision"])
+    proc = _master(world, "--from", "teardown", "--redo")
+    assert proc.returncode == 10, proc.stdout[-2500:] + proc.stderr[-1000:]
+    assert "stopped before teardown (no --yes teardown)" in proc.stdout
+    assert "the pull gate has not passed for the live pod" in proc.stdout
+    assert st["pull"]["ended_utc"] in proc.stdout and st["provision"]["ended_utc"] in proc.stdout
+    assert sum("teardown_pod pod123" in c for c in _calls(world)) == 1
+    assert _state(world)["stages"]["teardown"]["status"] == "passed"   # the first, honored attempt's record is untouched
+
+
+def test_the_run_jobs_log_is_kept_under_its_submit_stamp_on_the_mac(world: Dict[str, Path]) -> None:
+    """Review 2026-11-02 MEDIUM 1 (block F row F-2): the run job is fetched by
+    the run stage itself, not by job_run, so the log the row was written for
+    (run.log) must get the same stamped copy on the Mac."""
+    proc = _master(world, "--yes", "provision", "--to", "run")
+    assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-1000:]
+    land = world["exp_root"] / "S1" / DATE
+    stamp = json.loads((land / "extras" / "jobs" / "run.json").read_text(encoding="utf-8"))["submitted_at"].replace(":", "").replace("-", "")
+    assert re.fullmatch(r"\d{8}T\d{6}Z", stamp)
+    latest = (land / "logs" / "runner" / "run.log").read_text(encoding="utf-8")
+    assert latest
+    assert (land / "logs" / "runner" / f"run_{stamp}.log").read_text(encoding="utf-8") == latest
+
+
+def test_the_authorize_verb_is_refused_under_plan(world: Dict[str, Path]) -> None:
+    """Review 2026-11-02 LOW 1 (block F row F-9): the plan banner promises that
+    nothing is created, so --plan --authorize writes no file."""
+    assert _master(world, "--to", "preflight-mac").returncode == 0
+    n_calls = len(_calls(world))
+    proc = _master(world, "--plan", "--authorize", "teardown", "go")
+    assert proc.returncode == 1, proc.stdout[-1500:] + proc.stderr[-1000:]
+    assert "refused under --plan" in proc.stderr
+    assert not _go_file(world).exists()
+    assert len(_calls(world)) == n_calls   # the refusal ran nothing (the preflight's calls precede it)
+
+
+def test_no_teardown_path_deletes_the_network_volume_static_contract() -> None:
+    """Review 2026-11-02 LOW 4 (block F row F-9): the fake teardown of this
+    world never calls runpodctl, so the "no volume delete" assertions of the
+    F-9 tests cannot fail there; the design is carried by the real scripts'
+    text (owner rule 2026-10-22): the pod delete is the one destructive step
+    and the volume is only ever listed."""
+    root = Path(__file__).resolve().parents[1]
+    for rel in ("scripts/runpod/teardown_pod.sh", "scripts/6_experiments/cage_experiment.sh", "scripts/runpod/pod_watchdog.sh"):
+        text = (root / rel).read_text(encoding="utf-8")
+        assert not re.search(r"network-volumes?\s+(delete|remove|rm)\b", text), rel
+        for line in text.splitlines():
+            if "network-volume" in line:
+                assert "DELETE" not in line and "-X " not in line, (rel, line)
+    teardown = (root / "scripts/runpod/teardown_pod.sh").read_text(encoding="utf-8")
+    assert 'runpodctl pod delete "$POD_ID"' in teardown
+    assert "network-volume list" in teardown

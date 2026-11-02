@@ -4469,10 +4469,13 @@ def compute_frontier_drop(
     rung) whose offered rate equals a control cell's (budget_r 1.25) on the
     same engine, model, arm, retriever, policy, topology and dataset, within
     ``FRONTIER_RATE_RTOL``; every control cell at that rate contributes its
-    windows (D2). Per point: the window means of the yield share on both
-    sides, delta = constrained minus control, a one-sided Welch batch-means
-    p (alternative "less") and a window-bootstrap interval; the timely and
-    accepted shares ride beside as the decomposition. Per dataset: engine
+    windows (D2); the constrained cells of one rung that each match a control
+    pool into one point when their rates agree within the same tolerance
+    (block F row F-8, the S1 resume pair). Per point: the window means of the
+    yield share on both sides, delta = constrained minus control, a one-sided
+    Welch batch-means p (alternative "less") and a window-bootstrap interval;
+    the timely and accepted shares ride beside as the decomposition. Per
+    dataset: engine
     members of one (baseline, rung) leg merge by the largest p (ruling
     A13), the legs enter Holm, and the intersection-union maximum is the
     endpoint contribution keyed ``<dataset>|frontier_drop``.
@@ -4594,23 +4597,62 @@ def compute_frontier_drop(
                 }
             )
         constrained = grp[grp["_r"] < FRONTIER_CONTROL_BUDGET_R]
-        for con_key, con_grp in constrained.groupby("row_key"):
-            con_key = str(con_key)
-            rate = cell_rate[con_key]
-            matched = sorted(
-                str(k) for k in controls["row_key"].unique()
-                if abs(cell_rate[str(k)] - rate) <= FRONTIER_RATE_RTOL * rate
-            )
-            if not matched:
-                section["not_confirmatory_points"].append(
-                    {
-                        "row_key": con_key,
-                        "rate_qps": rate,
-                        "reason": "no control cell (budget_r 1.25) at this "
-                        "offered rate on the same axes: not a K1 point",
-                    }
-                )
+        for rung_value, rung_grp in constrained.groupby("_r"):
+            # Block F row F-8 (S2 register T4, DEC-6 item 5): the constrained
+            # cells of one rung that each match a control at their rate pool
+            # into ONE point (a constrained cell repeated at one offered rate,
+            # the shape a resume can produce; the register's S1 pair, sglang B1
+            # at rate_frac 0.7692 and 0.769206, are two CONTROL keys that D2
+            # already pools, review 2026-11-02 L3); their rates must agree
+            # within FRONTIER_RATE_RTOL, else the look refuses naming every
+            # rate. A cell with no control is listed, as before.
+            pooled: list[str] = []
+            pooled_controls: set[str] = set()
+            for cell_key in sorted(str(k) for k in rung_grp["row_key"].unique()):
+                cell_qps = cell_rate[cell_key]
+                cell_controls = [
+                    str(k) for k in controls["row_key"].unique()
+                    if abs(cell_rate[str(k)] - cell_qps) <= FRONTIER_RATE_RTOL * cell_qps
+                ]
+                if not cell_controls:
+                    section["not_confirmatory_points"].append(
+                        {
+                            "row_key": cell_key,
+                            "rate_qps": cell_qps,
+                            "reason": "no control cell (budget_r 1.25) at this "
+                            "offered rate on the same axes: not a K1 point",
+                        }
+                    )
+                    continue
+                pooled.append(cell_key)
+                pooled_controls.update(cell_controls)
+            if not pooled:
                 continue
+            rates = [cell_rate[k] for k in pooled]
+            if max(rates) - min(rates) > FRONTIER_RATE_RTOL * max(rates):
+                raise AnalysisError(
+                    f"contrast #12 ({FRONTIER_METRIC}): the constrained cells "
+                    f"{pooled} of engine {axes['engine']!r} at budget_r "
+                    f"{float(rung_value):g} on {dataset} sit at offered rates "
+                    f"{', '.join(f'{r:.6g}' for r in rates)} (relative tolerance "
+                    f"{FRONTIER_RATE_RTOL:g}); one point serves one rate; refusing to guess"
+                )
+            con_key = pooled[0]
+            con_grp = rung_grp[rung_grp["row_key"].isin(pooled)]
+            rate = float(np.mean(rates))
+            matched = sorted(pooled_controls)
+            # Review 2026-11-02 LOW 2: a control matched by one pooled cell can
+            # sit up to 1.5 times the tolerance from the pooled rate; D2 wants
+            # every control of a point within the tolerance of the point's rate
+            # (with one pooled cell this holds by construction, so S1 is untouched)
+            far = [k for k in matched if abs(cell_rate[k] - rate) > FRONTIER_RATE_RTOL * rate]
+            if far:
+                raise AnalysisError(
+                    f"contrast #12 ({FRONTIER_METRIC}): the control cells {far} (offered rates "
+                    f"{', '.join(f'{cell_rate[k]:.6g}' for k in far)}) match one pooled cell of "
+                    f"{pooled} but sit outside the tolerance of the pooled rate {rate:.6g} "
+                    f"(relative tolerance {FRONTIER_RATE_RTOL:g}); one point serves one rate; refusing to guess"
+                )
             if dataset not in PREDICATE_DATASETS:
                 skip(f"{con_key}: dataset {dataset!r} is outside the section 8.5 predicate universe")
                 continue
@@ -4621,10 +4663,10 @@ def compute_frontier_drop(
                     f"{sorted(registered)}; C1)"
                 )
                 continue
-            classes = {class_of(k) for k in matched} | {class_of(con_key)}
+            classes = {class_of(k) for k in matched} | {class_of(k) for k in pooled}
             if len(classes) != 1:
                 raise AnalysisError(
-                    f"contrast #12 ({FRONTIER_METRIC}): {con_key!r} and its control "
+                    f"contrast #12 ({FRONTIER_METRIC}): {pooled} and the control "
                     f"cells {matched} span classes {sorted(classes)}; one point, one class"
                 )
             target_s = targets[str(class_of(con_key))]
@@ -4674,6 +4716,7 @@ def compute_frontier_drop(
                     "budget_r": rung,
                     "engine": engine,
                     "constrained_row_key": con_key,
+                    "constrained_row_keys": pooled,
                     "control_row_keys": matched,
                     "rate_qps": rate,
                     "class_tokens": cell_class[con_key],
