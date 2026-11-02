@@ -862,6 +862,13 @@ PD_ROLE_PORT_ENVS: Dict[str, int] = {
     "CAGE_PD_PREFILL_PORT": PD_PREFILL_PORT,
     "CAGE_PD_DECODE_PORT": PD_DECODE_PORT,
 }
+#: S2 block D DEC-D1 (owner 2026-11-01): the per-role CUDA_VISIBLE_DEVICES
+#: pins manage_vllm_pd.sh reads (both or neither, disjoint), emitted by the
+#: pd relaunch when the registered role counts partition the session's
+#: serving GPUs at role TP >= 2 (_pd_role_pins). Before block D no plan
+#: emitted them, so a (2, 2) stack on four GPUs would have started both
+#: roles on the same two devices under the launcher's shared-GPU rule.
+PD_ROLE_GPU_ENVS: Tuple[str, str] = ("CAGE_PD_PREFILL_GPUS", "CAGE_PD_DECODE_GPUS")
 #: The loopback host every campaign endpoint is dialed on: the runner and the
 #: servers share the pod, the launchers health-check on it, and
 #: PD_TELEMETRY_ENDPOINTS already spells it out.
@@ -1145,6 +1152,27 @@ IDENTITY_GATE_ADR = "ADR-0181"
 IDENTITY_GATE_BLOCKED_ON = (
     "identity gate FAIL (charter 5.2, ADR-0181): vLLM's aligned Qwen3-Next prefix "
     "cache changed generated tokens at T=0; the prefix-on vLLM cells are excluded"
+)
+
+#: S2 block D (DEC-D2, DEC-D5, DEC-D6, ADR-0182): the stage 4 PD smoke verdict
+#: a session with an executable pd cell plans against (``plan --pd-smoke
+#: PATH``: the file scripts/checks/pd_smoke.py writes, fetched by the master),
+#: the blocked_on text of every executable pd cell on an accepted FAIL
+#: (``--accept-pd-fail``, the owner's PD_FAIL_ACCEPTED=1), and the rate note
+#: of a pd cell: no PD ladder exists, so the cell is offered its TP twin's
+#: rate off the vLLM TP ladder (DEC-D5 (a)), the limitation recorded on the
+#: step and in the plan header.
+PD_SMOKE_SCHEMA = "cage.pd_smoke/1"
+PD_SMOKE_ADR = "ADR-0182"
+PD_SMOKE_BLOCKED_ON = (
+    "PD smoke FAIL (S2 block D, ADR-0182): the prefill/decode stack moved no KV bytes "
+    "through the proxy, or a request straight to the decode moved some; the pd cells are excluded"
+)
+PD_RATE_SOURCE_KIND = "tp-twin-ladder"
+PD_RATE_LIMITATION_FMT = (
+    "no PD ladder was calibrated: the pd cell is offered its TP={tp} twin's rate off the vLLM "
+    "TP={tp} ladder (S2 block D DEC-D5 (a), ADR-0182); its load is a fraction of the TP={tp} "
+    "capacity, not of the PD stack's own lambda*"
 )
 
 #: cache_budget primary-knob flag -> the launcher env that carries it
@@ -3066,6 +3094,48 @@ def largest_planned_pools(relaunch_steps: Sequence[Mapping[str, Any]]) -> Dict[s
     return best
 
 
+def pd_smoke_env(
+    grid: SessionGrid, relaunch_steps: Sequence[Mapping[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """S2 block D DEC-D3 (owner 2026-11-01): the env the stage 4 PD smoke
+    starts the stack with, derived on the Mac at stage 0 from the Mac-side
+    relaunch records (_mac_relaunch_records): the pd record of the anchor
+    class at the registered control rung (dist_budget_r), carried exactly as
+    that class's pd relaunch carries it (the per-rank role budgets of the
+    §6.5 split, the telemetry pair, and _pd_stack_env's TP degree, pins,
+    request cap and ports). None when no pd record of that class exists; the
+    caller refuses a pd session without one. Pure."""
+    anchor = int(grid.demand_seq_tokens[DEMAND_ANCHOR_ARM])
+    role_tp = int(grid.dist_pd_role_gpus[0])
+    for step in relaunch_steps:
+        record = step.get("budget_plan")
+        if not isinstance(record, Mapping) or step.get("topology") != "pd":
+            continue
+        if float(step["budget_r"]) != float(grid.dist_budget_r):
+            continue
+        if (step.get("demand_class") or {}).get("seq_tokens") != anchor:
+            continue
+        pools = record["pools_bytes"]
+        prefill_env, decode_env, _sharded = _pd_role_env_slices(
+            grid.model, role_tp, int(pools[0]), int(pools[1])
+        )
+        env = {
+            "CAGE_KV_BUDGET_BYTES_PREFILL": str(prefill_env),
+            "CAGE_KV_BUDGET_BYTES_DECODE": str(decode_env),
+            PD_TELEMETRY_ENDPOINTS_ENV: PD_TELEMETRY_ENDPOINTS,
+        }
+        env.update(_pd_stack_env(grid, int(step["max_model_len"])))
+        return {
+            "engine": str(step["engine"]),
+            "budget_r": float(step["budget_r"]),
+            "seq_tokens": anchor,
+            "tp": role_tp,
+            "planned_bytes": int(record["budget_bytes_total"]),
+            "env": env,
+        }
+    return None
+
+
 def _pool_ceiling_text(overruns: Sequence[Mapping[str, Any]], where: str) -> str:
     missing = sorted({(str(o["model"]), str(o["gpu_id"])) for o in overruns if o["free_bytes"] is None})
     over = sorted(
@@ -3119,7 +3189,9 @@ def _mac_relaunch_records(
         spec = cell.spec
         seq_tokens = int(config[4])
         d_floor = demand_bytes(spec.model, concurrency=int(floor_concurrency), avg_seq_tokens=anchor)
-        d_class = _class_demand_bytes(d_floor, seq_tokens, anchor)
+        d_class = _class_demand_bytes(
+            d_floor, seq_tokens, anchor, _fixed_state_bytes(spec.model, int(floor_concurrency))
+        )
         kv_dtype = ARM_KV_DTYPE.get(spec.arm) or "bf16"
         if spec.topology == "tp":
             r, tp, topology, split = grid.dist_budget_r, int(grid.dist_tp_size or 1), "tp", None
@@ -3210,6 +3282,10 @@ def preflight_registration_check(
         executable cell launches with, _cell_gpu_count),
         "identity_gated": bool (S2 block C: the session plans only against
         the stage 4 identity verdict, which the master runs at stage 4),
+        "pd_cells": bool (S2 block D: an executable cell runs on the pd
+        stack, so stage 4 runs the PD smoke and the run needs --allow-pd),
+        "pd_env": the pd_smoke_env record (the env the smoke starts the
+        stack with) or None (no pd cells, or no floor_concurrency),
         "problems": [str]} where an empty problems list is a pass.
 
     Raises: nothing on a registration problem (recorded in ``problems``); a
@@ -3222,7 +3298,7 @@ def preflight_registration_check(
         return {
             "session": session, "anchor_seq_tokens": None, "cells": 0,
             "executable_cells": 0, "needs_lmcache": False, "lmcache_store_gib": None,
-            "identity_gated": False, "problems": [str(exc)],
+            "identity_gated": False, "pd_cells": False, "pd_env": None, "problems": [str(exc)],
         }
     anchor = int(grid.demand_seq_tokens[DEMAND_ANCHOR_ARM])
     if str(floor_avg_seq_tokens).strip() != str(anchor):
@@ -3284,6 +3360,7 @@ def preflight_registration_check(
     overruns: List[Dict[str, Any]] = []
     largest: Dict[str, Dict[str, Any]] = {}
     largest_helpers: Dict[str, Dict[str, Any]] = {}
+    records: List[Dict[str, Any]] = []
     if floor_concurrency is not None:
         records = _mac_relaunch_records(grid, cells, int(floor_concurrency))
         largest = largest_planned_pools(records)
@@ -3325,6 +3402,18 @@ def preflight_registration_check(
         tp_env[engine] = {variable: str(serving_tp)}
     gpu_counts = [_cell_gpu_count(grid, c.spec) for c in executable]
     gpu_count_needed = max((g for g in gpu_counts if g is not None), default=None)
+    # S2 block D (owner 2026-11-01): a pd session runs the stage 4 PD smoke on
+    # the stack of the anchor class at the control rung; the master starts it
+    # with pd_env (the env that class's pd relaunch carries) and refuses a pd
+    # session without one before anything bills.
+    pd_cells = any(c.spec.topology == "pd" for c in executable)
+    pd_env = pd_smoke_env(grid, records) if pd_cells and records else None
+    if pd_cells and records and pd_env is None:
+        problems.append(
+            f"session {session!r} plans pd cells but no pd relaunch of the anchor class ({anchor} tokens) "
+            f"at the control rung r={float(grid.dist_budget_r):g}: the stage 4 PD smoke has no stack to "
+            "start (S2 block D)"
+        )
     return {
         "session": session,
         "anchor_seq_tokens": anchor,
@@ -3339,6 +3428,8 @@ def preflight_registration_check(
         "tp_env": tp_env,
         "gpu_count_needed": gpu_count_needed,
         "identity_gated": bool(grid.identity_gated),
+        "pd_cells": pd_cells,
+        "pd_env": pd_env,
         "problems": problems,
     }
 
@@ -4446,11 +4537,44 @@ def demand_seq_tokens(grid: SessionGrid, spec: CellSpec) -> int:
     return int(value)
 
 
-def _class_demand_bytes(demand_floor: int, seq_tokens: int, anchor_tokens: int) -> int:
-    """D_class = floor(D_floor x s_class / s_anchor): the floor table's demand
-    scaled by the served-token ratio (D is linear in the sequence length,
-    cache_budget.demand_bytes). Exact for the anchor class (ratio 1)."""
-    return (int(demand_floor) * int(seq_tokens)) // int(anchor_tokens)
+def _class_demand_bytes(
+    demand_floor: int, seq_tokens: int, anchor_tokens: int, fixed_bytes: int = 0
+) -> int:
+    """D_class = (D_floor - F) x s_class // s_anchor + F (ADR-0155, amended
+    by ADR-0182 / S2 block D DEC-D4): the floor table's demand splits into
+    the per-token part, linear in the sequence length, and the fixed part
+    F = concurrency x fixed_state_bytes_per_seq (cache_budget.demand_bytes's
+    two terms), the hybrid's recurrent-state slot, which no length scales.
+    F is zero on a dense model, so the rule stays the linear one there.
+    Exact for the anchor class (ratio 1). Before the amendment the whole
+    floor demand was scaled, and the short classes of Qwen3-Next got 39
+    percent of their demand at r = 1.0 (spec section 8)."""
+    fixed = int(fixed_bytes)
+    return ((int(demand_floor) - fixed) * int(seq_tokens)) // int(anchor_tokens) + fixed
+
+
+def _fixed_state_bytes(model: str, concurrency: int) -> int:
+    """F of _class_demand_bytes for ``concurrency`` sequences of ``model``:
+    the second term of cache_budget.demand_bytes (zero on a dense model)."""
+    return int(concurrency) * int(MODEL_KV[model].fixed_state_bytes_per_seq)
+
+
+def _floor_fixed_bytes(floor: FloorTable) -> int:
+    """F of _class_demand_bytes for a floor table: its concurrency_target
+    times the model's fixed state. A hybrid table that records no
+    concurrency cannot be split into its two parts and is refused (a dense
+    model's table needs none)."""
+    per_seq = int(MODEL_KV[floor.model].fixed_state_bytes_per_seq)
+    if not per_seq:
+        return 0
+    if floor.concurrency_target is None:
+        raise PlanError(
+            f"floor table {floor.path} is for the hybrid model {floor.model!r} but records no "
+            "generated_inputs.concurrency_target: the per-class demand scaling needs the fixed-state "
+            f"part F = concurrency x {per_seq} B (S2 block D DEC-D4, ADR-0182); rebuild the table with "
+            "build_floor_table.py"
+        )
+    return _fixed_state_bytes(floor.model, int(floor.concurrency_target))
 
 
 def _check_floor_shape(grid: SessionGrid, floor: FloorTable) -> int:
@@ -4767,7 +4891,9 @@ def _budget_env(
     (Batch 2 W4, cell.json["budget_plan"]).
     """
     row = floor.row(r)
-    demand_class = _class_demand_bytes(int(row["demand_bytes"]), seq_tokens, anchor_tokens)
+    demand_class = _class_demand_bytes(
+        int(row["demand_bytes"]), seq_tokens, anchor_tokens, _floor_fixed_bytes(floor)
+    )
     if served_kv_dtype is None and floor.kv_dtype != "bf16":
         # A floor table built with --kv-dtype fp8 halves bytes/token, so
         # deriving a PLAIN (non-fp8-lever) launch's token dial from it would
@@ -4814,6 +4940,57 @@ def _budget_env(
     return env, plan
 
 
+def _pd_role_pins(grid: SessionGrid) -> Dict[str, str]:
+    """S2 block D DEC-D1 (a): the per-role GPU pins of the pd stack, as
+    consecutive index ranges, prefill first (``0,1`` and ``2,3`` for roles
+    (2, 2) on serving_tp 4). Emitted only when the role counts partition the
+    session's serving GPUs at role TP >= 2; a (1, 1) grid, or roles that do
+    not partition the pod (session b's (4, 4) on serving_tp 4), keep the
+    pre-block-D env byte-identical and the launcher's shared-GPU rule."""
+    prefill_gpus, decode_gpus = (int(n) for n in grid.dist_pd_role_gpus)
+    if prefill_gpus < 2 or prefill_gpus + decode_gpus != int(grid.serving_tp):
+        return {}
+    prefill_env, decode_env = PD_ROLE_GPU_ENVS
+    return {
+        prefill_env: ",".join(str(i) for i in range(prefill_gpus)),
+        decode_env: ",".join(str(i) for i in range(prefill_gpus, prefill_gpus + decode_gpus)),
+    }
+
+
+def _pd_stack_env(grid: SessionGrid, request_cap: int) -> Dict[str, str]:
+    """The budget-free part of the pd launcher env, shared by the pd relaunch
+    (_relaunch_step) and the stage 0 smoke record (pd_smoke_env) so the two
+    cannot drift: the per-role TP degree (W4.6: degrees >= 2 only, the
+    launcher omits the flag at 1), the DEC-D1 pins, the class request cap
+    (A10 / ADR-0158, applied by the launcher to both role instances) and the
+    proxy and role ports (Batch 2 W2: one table, exported, never left to
+    the shell)."""
+    env: Dict[str, str] = {}
+    role_tp = int(grid.dist_pd_role_gpus[0])
+    if role_tp >= 2:
+        env["CAGE_VLLM_TENSOR_PARALLEL"] = str(role_tp)
+    env.update(_pd_role_pins(grid))
+    env[MAX_MODEL_LEN_ENV] = str(request_cap)
+    env[PD_PROXY_PORT_ENV] = str(PD_PROXY_PORT)
+    for role_env, role_port in PD_ROLE_PORT_ENVS.items():
+        env[role_env] = str(role_port)
+    return env
+
+
+def _pd_role_env_slices(
+    model: str, role_tp: int, prefill_bytes: int, decode_bytes: int
+) -> Tuple[int, int, bool]:
+    """W4.6: what each role's budget env carries for the §6.5 role pools at
+    role TP ``role_tp``: the per-rank slice pool // role_tp when the model
+    shards its KV over the ranks, the pool itself at TP 1 or on an MLA model
+    (replicated KV, contrast #20). Returns (prefill_env, decode_env,
+    sharded). One rule for the pd relaunch and the stage 0 smoke env."""
+    sharded = role_tp >= 2 and not MODEL_KV[model].mla_tp_replicated
+    if sharded:
+        return prefill_bytes // role_tp, decode_bytes // role_tp, True
+    return prefill_bytes, decode_bytes, False
+
+
 def _pd_budget_env(
     grid: SessionGrid,
     engine: str,
@@ -4854,7 +5031,9 @@ def _pd_budget_env(
             r=r,
             # ADR-0155: the DIST leg's demand is its arm's class (B1 gold, B3
             # corpus), the same scaling as the single-instance relaunches.
-            demand=_class_demand_bytes(int(row["demand_bytes"]), seq_tokens, anchor_tokens),
+            demand=_class_demand_bytes(
+                int(row["demand_bytes"]), seq_tokens, anchor_tokens, _floor_fixed_bytes(floor)
+            ),
             kv_dtype=floor.kv_dtype,
             tp=1,
             topology="pd",
@@ -4876,12 +5055,7 @@ def _pd_budget_env(
     # pool // tp, realized sum checked by gate (j); MLA replicates: per-rank
     # == pool, the replication cost IS registered contrast #20) — never
     # re-derived here from model arithmetic.
-    sharded = role_tp >= 2 and not MODEL_KV[model].mla_tp_replicated
-    if sharded:
-        prefill_env = prefill_bytes // role_tp
-        decode_env = decode_bytes // role_tp
-    else:
-        prefill_env, decode_env = prefill_bytes, decode_bytes
+    prefill_env, decode_env, sharded = _pd_role_env_slices(model, role_tp, prefill_bytes, decode_bytes)
     env = {
         # The launcher REFUSES to start without both (manage_vllm_pd.sh).
         "CAGE_KV_BUDGET_BYTES_PREFILL": str(prefill_env),
@@ -4954,18 +5128,11 @@ def _relaunch_step(
             "demand_bytes": plan.demand_bytes,
             "adr": DEMAND_CLASS_ADR,
         }
-        if role_tp >= 2:
-            env["CAGE_VLLM_TENSOR_PARALLEL"] = str(role_tp)
-        # Backlog A10 / ADR-0158: the class request cap, applied by the pd
-        # launcher to BOTH role instances (one env, frozen contract).
+        # The TP degree, the DEC-D1 pins, the class request cap (A10 /
+        # ADR-0158) and the proxy and role ports (Batch 2 W2): one derivation
+        # shared with the stage 0 smoke env (_pd_stack_env).
         request_cap = request_cap_tokens(grid, seq_tokens)
-        env[MAX_MODEL_LEN_ENV] = str(request_cap)
-        # Batch 2 W2: the proxy port the cells under this relaunch dial, and
-        # the role ports the proxy's upstreams and the telemetry endpoints
-        # above name (one table, exported, never left to the shell).
-        env[PD_PROXY_PORT_ENV] = str(PD_PROXY_PORT)
-        for role_env, role_port in PD_ROLE_PORT_ENVS.items():
-            env[role_env] = str(role_port)
+        env.update(_pd_stack_env(grid, request_cap))
         return {
             "kind": "relaunch",
             "engine": engine,
@@ -6129,7 +6296,7 @@ def _cell_step(
         class_r = spec.budget_r if spec.budget_r is not None else grid.dist_budget_r
         try:
             class_demand: Optional[int] = _class_demand_bytes(
-                int(floor.row(class_r)["demand_bytes"]), class_tokens, class_anchor
+                int(floor.row(class_r)["demand_bytes"]), class_tokens, class_anchor, _floor_fixed_bytes(floor)
             )
         except PlanError:
             if cell.blocked_on is None:
@@ -6222,6 +6389,12 @@ def _cell_step(
                             "connector (S0F-88 audit)"
                         ),
                     }
+                if spec.topology == "pd" and cell.blocked_on is None and cell.rate_source is None:
+                    # S2 block D DEC-D5 (a), ADR-0182: no PD ladder exists; an
+                    # executable pd cell rides its TP twin's lambda* off the vLLM
+                    # TP ladder, recorded on the step here and in the header
+                    # (pd_rates); a blocked one never runs and carries no note
+                    cell = replace(cell, rate_source=_pd_rate_source(grid, spec, lambda_star))
             offered_rate = spec.rate_frac * lambda_star
             # B3 (ADR-0172): the window is D_class seconds of arrivals at the
             # offered rate (window_shape), still bounded by --arrival-count
@@ -7912,6 +8085,88 @@ def _identity_gate_header(
     }
 
 
+def load_pd_smoke(path: Path) -> Dict[str, Any]:
+    """Purpose: read and fail-closed-validate the stage 4 PD smoke verdict
+    (scripts/checks/pd_smoke.py) a session with an executable pd cell plans
+    against (S2 block D DEC-D2 and DEC-D6, ADR-0182).
+
+    Args:
+        path: the verdict JSON (the master fetches it beside the landing as
+            extras/pd_smoke/pd_smoke.json and passes the pod path).
+
+    Returns: the verdict document plus ``path`` (str) and ``sha256`` of its
+        bytes; ``verdict`` is PASS or FAIL.
+
+    Raises: PlanError when the file is missing, is not JSON, carries another
+        schema, carries no PASS or FAIL verdict, or is ERROR (the smoke did
+        not run to a verdict: nothing is planned on it; stage 4 is rerun).
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise PlanError(f"PD smoke verdict not found: {path} (plan --pd-smoke names the stage 4 record)")
+    raw = path.read_bytes()
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PlanError(f"PD smoke verdict {path} is not valid JSON: {exc}") from exc
+    if not isinstance(doc, dict) or doc.get("schema") != PD_SMOKE_SCHEMA:
+        got = doc.get("schema") if isinstance(doc, dict) else type(doc).__name__
+        raise PlanError(f"PD smoke verdict {path} schema is not {PD_SMOKE_SCHEMA!r} (got {got!r})")
+    verdict = doc.get("verdict")
+    if verdict == "ERROR":
+        raise PlanError(
+            f"PD smoke verdict {path} is ERROR ({doc.get('error')}): the smoke did not run to a "
+            f"verdict ({PD_SMOKE_ADR}); nothing is planned on it, rerun stage 4"
+        )
+    if verdict not in ("PASS", "FAIL"):
+        raise PlanError(f"PD smoke verdict {path} carries verdict {verdict!r}, not PASS or FAIL")
+    rec = dict(doc)
+    rec["path"] = str(path)
+    rec["sha256"] = hashlib.sha256(raw).hexdigest()
+    return rec
+
+
+def _pd_smoke_header(
+    rec: Optional[Mapping[str, Any]], excluded: bool, excluded_keys: Sequence[str]
+) -> Optional[Dict[str, Any]]:
+    """The plan header's record of the PD smoke verdict it was built against
+    (None on a session without a pd cell, never absent)."""
+    if rec is None:
+        return None
+    transfer = rec.get("transfer")
+    delta = (transfer.get("delta") if isinstance(transfer, Mapping) else None) or {}
+    control = rec.get("control")
+    return {
+        "verdict": rec["verdict"],
+        "accepted_fail": bool(excluded),
+        "blocked_on": PD_SMOKE_BLOCKED_ON if excluded else None,
+        "excluded_row_keys": list(excluded_keys) if excluded else [],
+        "path": rec["path"],
+        "sha256": rec["sha256"],
+        "session": rec.get("session"),
+        "model": rec.get("model"),
+        "requests": len(rec.get("requests") or []),
+        "transfer": None if not isinstance(transfer, Mapping) else {
+            "verified": transfer.get("verified"),
+            "n_served_rows": transfer.get("n_served_rows"),
+            **{k: delta.get(k) for k in ("bytes_sum", "transfer_count", "failed_transfers", "external_kv_tokens")},
+        },
+        "control_no_transfer": control.get("no_transfer") if isinstance(control, Mapping) else None,
+        "reasons": list(rec.get("reasons") or []),
+        "adr": PD_SMOKE_ADR,
+    }
+
+
+def _pd_rate_source(grid: SessionGrid, spec: "CellSpec", lambda_star: float) -> Dict[str, Any]:
+    """S2 block D DEC-D5 (a): the rate note of an executable pd cell (its TP
+    twin's lambda* off the vLLM TP ladder, and the limitation that names)."""
+    tp = int(grid.serving_tp)
+    return {
+        "kind": PD_RATE_SOURCE_KIND, "engine": spec.engine, "ladder_tp": tp, "r": float(spec.budget_r),
+        "lambda_star_qps": float(lambda_star), "limitation": PD_RATE_LIMITATION_FMT.format(tp=tp),
+    }
+
+
 def build_plan(
     session: str,
     floor: FloorTable,
@@ -7932,6 +8187,8 @@ def build_plan(
     class_ceilings: Optional[Mapping[str, Path]] = None,
     identity_gate: Optional[Mapping[str, Any]] = None,
     accept_identity_fail: bool = False,
+    pd_smoke: Optional[Mapping[str, Any]] = None,
+    accept_pd_fail: bool = False,
 ) -> Dict[str, Any]:
     """PURE plan builder: registered grid -> ordered step list + counts.
 
@@ -7946,6 +8203,17 @@ def build_plan(
     cell of the session is blocked_on IDENTITY_GATE_BLOCKED_ON before the
     relaunches and dry windows are enumerated. The header ``identity_gate``
     records the verdict, its sha256 and the excluded keys (None when ungated).
+
+    ``pd_smoke`` (S2 block D DEC-D2 and DEC-D6, ADR-0182) is the loaded
+    stage 4 PD smoke verdict (``load_pd_smoke``; ``plan --pd-smoke PATH``):
+    REQUIRED on a session with an executable pd cell, refused on any other,
+    and refused when it names another session or model. PASS keeps every pd
+    cell; FAIL plans only with ``accept_pd_fail`` (``--accept-pd-fail``, the
+    owner's PD_FAIL_ACCEPTED=1), under which every executable pd cell is
+    blocked_on PD_SMOKE_BLOCKED_ON after the identity exclusion. The header
+    ``pd_smoke`` records the verdict, its sha256 and the excluded keys (None
+    without pd cells); ``pd_rates`` records the DEC-D5 (a) rate provenance
+    of the pd cells (None when no cell carries it).
 
     ``class_ceilings`` (ADR-0177) maps engine -> class ceilings artifact
     (``plan --class-ceilings ENGINE=PATH``): the interpolated classes of that
@@ -8064,6 +8332,43 @@ def build_plan(
         else c
         for c in cells
     ]
+    # S2 block D (DEC-D2, DEC-D6, ADR-0182): a session with an executable pd
+    # cell plans only against the stage 4 PD smoke verdict of its own session
+    # and model (read before the identity exclusion, so the smoke stays
+    # required whatever that verdict did); one without refuses a verdict.
+    # FAIL plans only under the owner's written acceptance, which excludes
+    # every still-executable pd cell below, after the identity exclusion.
+    pd_rows = any(c.spec.topology == "pd" and c.blocked_on is None for c in cells)
+    if pd_rows:
+        if pd_smoke is None:
+            raise PlanError(
+                f"session {session!r} plans pd cells: plan with --pd-smoke <verdict> (the stage 4 record of "
+                "scripts/checks/pd_smoke.py, fetched by the master); no pd cell runs without the proof that "
+                f"the prefill/decode stack moves KV bytes (S2 block D, {PD_SMOKE_ADR})"
+            )
+        if pd_smoke.get("session") != session:
+            raise PlanError(
+                f"the PD smoke verdict {pd_smoke.get('path')} is for session "
+                f"{pd_smoke.get('session')!r}, not {session!r}"
+            )
+        pd_model_id = HF_ID_OF_SLUG[grid.model]
+        if pd_smoke.get("model") not in (pd_model_id, grid.model):
+            raise PlanError(
+                f"the PD smoke verdict {pd_smoke.get('path')} is for model "
+                f"{pd_smoke.get('model')!r}, not the session's {pd_model_id!r}"
+            )
+        if pd_smoke.get("verdict") == "FAIL" and not accept_pd_fail:
+            raise PlanError(
+                f"PD smoke FAIL for session {session!r} ({pd_smoke.get('path')}): "
+                + "; ".join(str(r) for r in (pd_smoke.get("reasons") or [])[:3])
+                + "; the plan runs only with --accept-pd-fail (the owner's PD_FAIL_ACCEPTED=1), which "
+                f"excludes every pd cell of the session ({PD_SMOKE_ADR})"
+            )
+    elif pd_smoke is not None:
+        raise PlanError(
+            f"session {session!r} plans no pd cell: --pd-smoke is refused (no cell reads the verdict)"
+        )
+    pd_fail = bool(pd_rows and pd_smoke is not None and pd_smoke.get("verdict") == "FAIL")
     # S2 block C (A-7, DEC-C5, ADR-0181): an accepted FAIL excludes every
     # executable prefix-on vLLM cell of the gated session here, before the
     # relaunches and dry windows are enumerated: the rows stay in the plan as
@@ -8073,6 +8378,18 @@ def build_plan(
         cells = [
             replace(c, blocked_on=IDENTITY_GATE_BLOCKED_ON)
             if c.blocked_on is None and c.spec.engine == "vllm" and not _prefix_off(c.spec)
+            else c
+            for c in cells
+        ]
+    pd_excluded: List[str] = []
+    if pd_fail:
+        # S2 block D DEC-D6 (ADR-0182): an accepted smoke FAIL excludes every
+        # still-executable pd cell (the Z1 cells and the no-load pd references)
+        # the same way; a cell the identity verdict blocked keeps that reason
+        pd_excluded = sorted(c.spec.to_row_key() for c in cells if c.blocked_on is None and c.spec.topology == "pd")
+        cells = [
+            replace(c, blocked_on=PD_SMOKE_BLOCKED_ON)
+            if c.blocked_on is None and c.spec.topology == "pd"
             else c
             for c in cells
         ]
@@ -8251,6 +8568,13 @@ def build_plan(
         if grid.identity_gated and s["blocked_on"] in (None, IDENTITY_GATE_BLOCKED_ON) and s["serving"] is not None
         and s["serving"]["engine"] == "vllm" and s["serving"]["prefix_mode"] == "ON"
     })
+    # S2 block D DEC-D5 (a): the executable pd cells, every one offered its
+    # TP twin's rate off the vLLM TP ladder (the header's pd_rates; None when
+    # no cell carries the note, as under an accepted smoke FAIL)
+    pd_rated = sorted(
+        s["row_key"] for s in unique_cells
+        if isinstance(s.get("rate_source"), Mapping) and s["rate_source"].get("kind") == PD_RATE_SOURCE_KIND
+    )
     cells_by_class: Dict[str, int] = {}
     for s in unique_cells:
         cells_by_class[s["row_class"]] = cells_by_class.get(s["row_class"], 0) + 1
@@ -8536,6 +8860,16 @@ def build_plan(
         # S2 block C (A-7): the stage 4 identity verdict the plan was built
         # against (None on an ungated session, never absent)
         "identity_gate": _identity_gate_header(identity_gate, identity_fail, identity_gated),
+        # S2 block D: the stage 4 PD smoke verdict the plan was built against
+        # (None on a session without a pd cell, never absent) and the rate
+        # provenance of the pd cells (DEC-D5 (a); pd rides vLLM only by the
+        # registry; None when no cell carries the note)
+        "pd_smoke": _pd_smoke_header(pd_smoke, pd_fail, pd_excluded),
+        "pd_rates": None if not pd_rated else {
+            "kind": PD_RATE_SOURCE_KIND, "engine": "vllm", "ladder_tp": int(grid.serving_tp),
+            "cells": pd_rated, "limitation": PD_RATE_LIMITATION_FMT.format(tp=int(grid.serving_tp)),
+            "adr": PD_SMOKE_ADR,
+        },
         "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "charter_refs": ["6.1", "6.4", "6.8", "7.6", "7.6.1", "D5#5", "P6"],
         "steps": steps,
@@ -9819,6 +10153,18 @@ def run_plan(
                 f"only the plan's value ({SLO_FLOORS_FINDING}); unset it before "
                 "'run'"
             )
+    # S2 block D review 2026-11-01 LOW 5: the role pins are pd step facts
+    # (DEC-D1): the plan writes them on every pd relaunch whose roles partition
+    # the pod and on none other, so an exported pair would reach the launcher
+    # of a grid that emits none. Refused on PRESENCE like the cell pins.
+    for name in PD_ROLE_GPU_ENVS:
+        if name in os.environ:
+            raise RunError(
+                f"{name} is set in the environment ({os.environ[name]!r}); the "
+                "plan pins the pd roles on every pd relaunch step (S2 block D "
+                "DEC-D1, ADR-0182) and the launcher reads only the step's value; "
+                "unset it before 'run'"
+            )
     steps: List[Dict[str, Any]] = list(plan["steps"])
     cell_steps = [s for s in steps if s["kind"] == "cell"]
 
@@ -10752,6 +11098,8 @@ def _cmd_plan(args: argparse.Namespace) -> int:
         class_ceilings=parse_calibration_args(args.class_ceilings, flag="--class-ceilings") or None,
         identity_gate=load_identity_gate(Path(args.identity_gate)) if args.identity_gate else None,
         accept_identity_fail=args.accept_identity_fail,
+        pd_smoke=load_pd_smoke(Path(args.pd_smoke)) if args.pd_smoke else None,
+        accept_pd_fail=args.accept_pd_fail,
     )
     plan["last_block"] = args.last_block
     if args.frontier_loads:
@@ -10783,6 +11131,16 @@ def _cmd_plan(args: argparse.Namespace) -> int:
                 + (f"{len(plan['identity_gated_row_keys'])} gated cells labeled {ig['label_on_pass']}"
                    if ig["verdict"] == "PASS"
                    else f"{len(ig['excluded_row_keys'])} prefix-on vLLM cells excluded under the owner's acceptance")
+            )
+        ps = plan.get("pd_smoke")
+        if ps is not None:
+            # S2 block D: the smoke this plan stands on, and what it did to the pd rows
+            rated = (plan.get("pd_rates") or {}).get("cells") or []
+            print(
+                f"[run_campaign] PD smoke ({PD_SMOKE_ADR}): {ps['verdict']}; "
+                + (f"{len(rated)} pd cells at their TP twin's rate (DEC-D5)"
+                   if ps["verdict"] == "PASS"
+                   else f"{len(ps['excluded_row_keys'])} pd cells excluded under the owner's acceptance")
             )
         ws = plan["window_spans"]
         if ws["executable_pressure_cells"]:
@@ -12450,6 +12808,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--accept-identity-fail", action="store_true",
         help="the owner's written acceptance of a FAIL verdict (the profile's IDENTITY_FAIL_ACCEPTED=1): every "
         "executable prefix-on vLLM cell of the session is excluded (blocked_on) and the rest of the plan runs",
+    )
+    p_plan.add_argument(
+        "--pd-smoke", default=None, metavar="PATH",
+        help=f"S2 block D ({PD_SMOKE_ADR}): the stage 4 PD smoke verdict (scripts/checks/pd_smoke.py --out) of "
+        "this landing; REQUIRED on a session with an executable pd cell, refused on any other. FAIL refuses "
+        "unless --accept-pd-fail; ERROR refuses",
+    )
+    p_plan.add_argument(
+        "--accept-pd-fail", action="store_true",
+        help="the owner's written acceptance of a PD smoke FAIL (the profile's PD_FAIL_ACCEPTED=1): every "
+        "executable pd cell of the session is excluded (blocked_on) and the rest of the plan runs",
     )
     p_plan.add_argument("--out", default=None, help="write the plan JSON here (else stdout)")
     p_plan.set_defaults(func=_cmd_plan)

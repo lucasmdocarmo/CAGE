@@ -358,6 +358,46 @@ def _read_journal(path: Path, expected_lines: int) -> List[str]:
     raise AssertionError(f"vllm stub journal never reached {expected_lines} lines: {path}")
 
 
+# S2 block D (review MEDIUM 2 of block C, owner 2026-11-01): the single
+# launcher's rule mirrored on the pd stack. vLLM 0.19.1 serves Qwen3-Next with
+# prefix caching only under --mamba-cache-mode align (the "all" mode raises
+# NotImplementedError), so a prefix-on start of the hybrid names the mode on
+# BOTH role instances and the per-role capture records it; a prefix-off start
+# and a dense model pass no mode (the engine default stands, recorded absent).
+HYBRID_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+
+
+def test_start_prefix_on_hybrid_carries_mamba_align_on_both_roles(stub_bin: Path, tmp_path: Path) -> None:
+    proc = _run_pd(stub_bin, "start", HYBRID_MODEL, CAGE_RUN_ROOT=str(tmp_path), **GOOD_BUDGETS)
+    for role in ("prefill", "decode"):
+        line = _args_line(proc.stdout, role)
+        assert "--enable-prefix-caching" in line
+        assert "--mamba-cache-mode align" in line
+    cfg_dir = tmp_path / "observability" / "serving_configs"
+    for role in ("prefill", "decode"):
+        cap = json.loads(next(cfg_dir.glob(f"*_pd-{role}.json")).read_text(encoding="utf-8"))
+        assert cap["enable_prefix_caching"] is True
+        assert "--mamba-cache-mode align" in cap["args"]
+
+
+def test_start_prefix_off_hybrid_passes_no_mamba_cache_mode(stub_bin: Path, tmp_path: Path) -> None:
+    proc = _run_pd(stub_bin, "start", HYBRID_MODEL, "--no-prefix-cache", CAGE_RUN_ROOT=str(tmp_path), **GOOD_BUDGETS)
+    for role in ("prefill", "decode"):
+        line = _args_line(proc.stdout, role)
+        assert "--no-enable-prefix-caching" in line
+        assert "--mamba-cache-mode" not in line
+    cfg_dir = tmp_path / "observability" / "serving_configs"
+    cap = json.loads(next(cfg_dir.glob("*_pd-prefill.json")).read_text(encoding="utf-8"))
+    assert "--mamba-cache-mode" not in cap["args"]
+
+
+def test_start_dense_model_passes_no_mamba_cache_mode(stub_bin: Path) -> None:
+    proc = _run_pd(stub_bin, "start", "fake/test-model", **GOOD_BUDGETS)
+    assert "--mamba-cache-mode" not in proc.stdout
+    proc = _run_pd(stub_bin, "start", "Qwen/Qwen3-14B", **GOOD_BUDGETS)
+    assert "--mamba-cache-mode" not in proc.stdout
+
+
 def test_start_distinct_role_pins_keep_0_90_and_ride_cuda_visible_devices(
     stub_bin: Path, tmp_path: Path
 ) -> None:
@@ -1477,16 +1517,28 @@ def _calibrations_for(grid, directory: Path) -> Dict[str, Path]:
     return out
 
 
+def _pd_smoke_pass(directory: Path, grid) -> Path:
+    """S2 block D (DEC-D2): a session with an executable pd cell plans only
+    against the stage 4 PD smoke verdict; the fixture's is a minimal PASS."""
+    path = Path(directory) / "pd_smoke.json"
+    path.write_text(json.dumps({"schema": rc.PD_SMOKE_SCHEMA, "verdict": "PASS", "session": grid.session,
+                                "model": rc.HF_ID_OF_SLUG[grid.model]}), encoding="utf-8")
+    return path
+
+
 def _plan_for(grid, floor_path: Path, launcher_cmds=None, runner_cmd=("stub",)):
     floor = rc.load_floor_table(floor_path)
     calibrations = _calibrations_for(grid, Path(floor_path).parent / "cal")
+    pd_smoke = None
+    if any(c.spec.topology == "pd" and c.blocked_on is None for c in rc.enumerate_cells(grid)):
+        pd_smoke = rc.load_pd_smoke(_pd_smoke_pass(Path(floor_path).parent, grid))
     orig = rc.SESSION_GRIDS
     rc.SESSION_GRIDS = {grid.session: grid}
     try:
         return rc.build_plan(
             grid.session, floor, window_duration_s=60.0,
             runner_cmd=runner_cmd, launcher_cmds=launcher_cmds,
-            calibrations=calibrations,
+            calibrations=calibrations, pd_smoke=pd_smoke,
         )
     finally:
         rc.SESSION_GRIDS = orig
@@ -1548,6 +1600,15 @@ class TestPdPlanEmission:
             "prefill_bytes": _EXPECT_PREFILL,
             "decode_bytes": _EXPECT_DECODE,
         }
+
+    def test_a_one_gpu_per_role_grid_emits_no_pins(self, tmp_path):
+        # S2 block D DEC-D1 (a): pins ride the env only when the role counts
+        # partition the serving GPUs at role TP >= 2; the (1, 1) fixture grid
+        # keeps its pre-block-D env (the launcher's shared-GPU rule applies)
+        plan = _plan_for(_pd_grid(), _floor_table(tmp_path))
+        step = [s for s in _relaunches(plan) if s["topology"] == "pd"][0]
+        assert not any(k.endswith("_GPUS") for k in step["env"]), step["env"]
+        assert "CAGE_VLLM_TENSOR_PARALLEL" not in step["env"]
 
     def test_pd_cell_runs_under_its_pd_relaunch_boundary(self, tmp_path):
         plan = _plan_for(_pd_grid(), _floor_table(tmp_path))

@@ -290,6 +290,11 @@ def world(tmp_path: Path) -> Dict[str, Path]:
                     "largest_helper_pools": helpers, "tp_env": tp_env, "gpu_count_needed": int(gc) if gc else None,
                     # S2 block C (A-7): the identity gate rides the report like NEEDS_LMCACHE
                     "identity_gated": os.environ.get("CAGE_TEST_IDENTITY_GATED") == "1",
+                    # S2 block D (DEC-D2, DEC-D3): the pd cells flag and the control-rung PD stack env
+                    "pd_cells": os.environ.get("CAGE_TEST_PD_CELLS") == "1",
+                    "pd_env": None if os.environ.get("CAGE_TEST_PD_CELLS") != "1" or os.environ.get("CAGE_TEST_PD_ENV", "1") != "1" else {
+                        "engine": "vllm", "budget_r": 1.0, "seq_tokens": 4779, "tp": 2, "planned_bytes": 2651340800,
+                        "env": __import__("json").loads('__PD_ENV_JSON__')},
                     "problems": problems}
         if __name__ == "__main__":
             a = sys.argv[1:]
@@ -298,7 +303,7 @@ def world(tmp_path: Path) -> Dict[str, Path]:
             if a and a[0] == "classes":  # B4: the demand classes the class floors run on
                 print("348,4779"); sys.exit(0)
             print("REFUSED: fake Mac planner knows only 'rungs' and 'classes'", file=sys.stderr); sys.exit(2)
-        ''', exe=False)
+        '''.replace("__PD_ENV_JSON__", json.dumps(_PD_ENV, sort_keys=True)), exe=False)
     _w(fake_scripts / "4_analysis" / "build_floor_table.py", r'''
         import json, sys
         from pathlib import Path
@@ -436,9 +441,36 @@ def world(tmp_path: Path) -> Dict[str, Path]:
             print("IDENTITY_GATE_RUN_ERROR phase=" + a[a.index("--phase") + 1] + " reason=HTTP 500 at prompt 3", file=sys.stderr); sys.exit(1)
         if a[0] in ("prompts", "run"):
             out.write_text(json.dumps({"phase": a[0], "argv": a}), encoding="utf-8"); sys.exit(0)
+        if os.environ.get("CAGE_TEST_IDENTITY_NO_WRITE") == "1":
+            print("IDENTITY_GATE CRASH before the verdict"); sys.exit(1)
         verdict = os.environ.get("CAGE_TEST_IDENTITY_VERDICT", "PASS")
         out.write_text(json.dumps({"schema": "cage.identity_gate/1", "verdict": verdict, "session": "a", "argv": a}), encoding="utf-8")
         print(f"IDENTITY_GATE {verdict}")
+        sys.exit(1 if verdict == "ERROR" else 0)
+        ''', exe=False)
+    # S2 block D (DEC-D3): the PD stack launcher and the smoke; the launcher logs the pins,
+    # the degree and the role budgets its start carried (CAGE_TEST_PD_START_RC=1 fails the
+    # start), the smoke writes --out with the verdict from CAGE_TEST_PD_SMOKE_VERDICT (PASS
+    # default) and prints the one marker; its exit is 1 on ERROR only
+    _w(pr / "scripts" / "2_serving" / "manage_vllm_pd.sh", r'''
+        #!/bin/bash
+        echo "launcher pd $* pins=${CAGE_PD_PREFILL_GPUS:-}/${CAGE_PD_DECODE_GPUS:-} tp=${CAGE_VLLM_TENSOR_PARALLEL:-} budgets=${CAGE_KV_BUDGET_BYTES_PREFILL:-}/${CAGE_KV_BUDGET_BYTES_DECODE:-}" >> "$CAGE_TEST_LOG"
+        if [ "$1" = "start" ] && [ "${CAGE_TEST_PD_START_RC:-0}" = "1" ]; then echo "pd start failed"; exit 1; fi
+        echo "pd $1 ok"; exit 0
+        ''')
+    _w(pr / "scripts" / "checks" / "pd_smoke.py", r'''
+        import json, os, sys
+        from pathlib import Path
+        a = sys.argv[1:]
+        with open(os.environ["CAGE_TEST_LOG"], "a", encoding="utf-8") as fh:
+            fh.write("pd_smoke " + " ".join(a) + "\n")
+        out = Path(a[a.index("--out") + 1]); out.parent.mkdir(parents=True, exist_ok=True)
+        if os.environ.get("CAGE_TEST_PD_SMOKE_NO_WRITE") == "1":
+            print("PD_SMOKE CRASH before the verdict"); sys.exit(1)
+        verdict = os.environ.get("CAGE_TEST_PD_SMOKE_VERDICT", "PASS")
+        out.write_text(json.dumps({"schema": "cage.pd_smoke/1", "verdict": verdict, "session": a[a.index("--session") + 1],
+                                   "model": a[a.index("--model") + 1], "argv": a}), encoding="utf-8")
+        print(f"PD_SMOKE {verdict} requests=8")
         sys.exit(1 if verdict == "ERROR" else 0)
         ''', exe=False)
     # S1 audit 2026-10-23 (MEDIUM 4): the offline dataset probe, before any engine starts
@@ -677,6 +709,17 @@ def world(tmp_path: Path) -> Dict[str, Path]:
 # key; the fake world keeps only the process basics (2026-10-07: an inherited
 # POD_RESULTS_DIR=/root/... failed the unpack step under the exported profile).
 _ENV_KEEP = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "USER", "LOGNAME", "SHELL", "CAGE_LOG_ROOT")
+
+#: S2 block D (DEC-D3): the control-rung PD stack env the fake Mac planner reports
+#: under CAGE_TEST_PD_CELLS=1 and stage 0 records for the stage 4 smoke (the pins,
+#: the degree, the role budgets, the ports, the telemetry pair; values carry commas)
+_PD_ENV = {
+    "CAGE_KV_BUDGET_BYTES_PREFILL": "1325670400", "CAGE_KV_BUDGET_BYTES_DECODE": "1325670400",
+    "CAGE_PD_PREFILL_GPUS": "0,1", "CAGE_PD_DECODE_GPUS": "2,3", "CAGE_VLLM_TENSOR_PARALLEL": "2",
+    "VLLM_MAX_MODEL_LEN": "32768", "CAGE_PD_PROXY_PORT": "8000", "CAGE_PD_PREFILL_PORT": "8100",
+    "CAGE_PD_DECODE_PORT": "8200", "CAGE_TELEMETRY_ENDPOINTS": "prefill=http://localhost:8100,decode=http://localhost:8200",
+}
+_PD_ENV_SORTED = " ".join(f"{k}={v}" for k, v in sorted(_PD_ENV.items()))
 
 
 def _env(w: Dict[str, Path], **extra: str) -> Dict[str, str]:
@@ -2515,11 +2558,12 @@ def test_every_engine_start_carries_the_tp_env_and_the_gate_accepts_tp_s2_b1(wor
     # every launcher start the fakes saw carried the degree
     starts = [c for c in _calls(world) if c.startswith("launcher ") and (" start " in c or " restart " in c)]
     assert len(starts) >= 7 and all(" tp=4" in c for c in starts), starts
-    # the pd stack is still a separate Spec: stage 4 refuses it by name
+    # S2 block D: the pd stack validation is built (the stage 4 smoke runs on a session
+    # whose stage 0 recorded pd cells); a TOPOLOGY=pd profile is no longer refused by name
     _four_gpu_profile(world, tmp_path, topology="pd")
     proc = _master(world, "--from", "validate", "--redo", "--to", "validate", CAGE_TEST_TP_ENV="1")
-    assert proc.returncode == 1, proc.stdout[-2500:]
-    assert "TOPOLOGY=pd: single-instance and tensor-parallel validation are built (S2 Block B-1); the pd stack validation is a separate Spec" in proc.stdout
+    assert proc.returncode == 0, proc.stdout[-2500:]
+    assert "the pd stack validation is a separate Spec" not in proc.stdout and "TOPOLOGY=pd" not in proc.stdout
 
 
 def test_the_largest_pool_start_carries_the_tp_env_and_the_check_records_the_degree_s2_b2(world: Dict[str, Path], tmp_path: Path) -> None:
@@ -2966,23 +3010,43 @@ def test_a_vllm_only_gated_profile_runs_two_starts_and_records_sglang_absent(wor
     assert sorted(p.name for p in extras.iterdir()) == ["identity_gate.json", "prompts.json", "vllm_off.json", "vllm_on.json"]
 
 
-def test_a_fail_verdict_is_a_result_at_stage_4_and_the_plan_waits_for_the_owner_acceptance(world: Dict[str, Path], tmp_path: Path) -> None:
+def test_an_identity_fail_stops_stage_4_before_stage_5_bills_until_the_owner_accepts_dec_d7(world: Dict[str, Path], tmp_path: Path) -> None:
+    """S2 block D DEC-D7 (a) (block C review MEDIUM 3): a FAIL is recorded as a
+    result at stage 4 and the stage fails right after, so stage 5 never bills
+    before the owner's written acceptance (DEC-C7 let it calibrate first)."""
     _gated_profile(world, tmp_path)
     proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_IDENTITY_GATED="1", CAGE_TEST_IDENTITY_VERDICT="FAIL")
     assert proc.returncode == 1, proc.stdout[-3000:]
     st = _state(world)
-    assert st["stages"]["validate"]["status"] == "passed" and st["stages"]["validate"]["identity_gate"] == "FAIL"
-    assert st["stages"]["calibrate"]["status"] == "passed", "FAIL is a result: stage 5 runs"
-    assert st["stages"]["plan"]["status"] == "failed"
-    assert "IDENTITY_GATE FAIL" in proc.stdout and "IDENTITY_FAIL_ACCEPTED" in proc.stdout
-    assert not (world["home"] / ".cage_jobs" / "plan.cmd").exists(), "the plan job never ran"
-    # the owner's acceptance in the profile: the resumed master plans the rest with both flags
+    assert st["stages"]["validate"]["status"] == "failed" and st["stages"]["validate"]["identity_gate"] == "FAIL"
+    assert not (world["home"] / ".cage_jobs" / "calibrate_vllm.cmd").exists(), "DEC-D7: stage 5 never bills on an unaccepted FAIL"
+    assert not (world["home"] / ".cage_jobs" / "plan.cmd").exists()
+    assert "IDENTITY_GATE FAIL" in proc.stdout and "IDENTITY_FAIL_ACCEPTED" in proc.stdout and "stage validate FAILED" in proc.stdout
+    extras = world["exp_root"] / "S1" / DATE / "extras" / "identity_gate"
+    assert json.loads((extras / "identity_gate.json").read_text(encoding="utf-8"))["verdict"] == "FAIL", "the verdict is on the Mac"
+
+
+def test_the_rerun_under_the_acceptance_skips_the_gate_job_and_plans_with_both_flags_dec_d7(world: Dict[str, Path], tmp_path: Path) -> None:
+    _gated_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_IDENTITY_GATED="1", CAGE_TEST_IDENTITY_VERDICT="FAIL")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    # the owner's acceptance in the profile: the resumed master re-records the fetched
+    # verdict, skips the gate job, calibrates, and plans the rest with both flags
     _profile_with(world, "S1_gated_accept.env", "IDENTITY_FAIL_ACCEPTED=1")
     proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_IDENTITY_GATED="1", CAGE_TEST_IDENTITY_VERDICT="FAIL")
     assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
-    plan_cmd = _job_cmd(world, "plan")
-    assert " --identity-gate logs/identity_gate.json --accept-identity-fail" in plan_cmd
-    assert _state(world)["stages"]["plan"]["status"] == "passed"
+    assert sum(1 for c in _calls(world) if c.startswith("identity_gate verdict")) == 1, "the gate job is not rerun once accepted"
+    assert "not rerun" in proc.stdout
+    st = _state(world)
+    assert st["stages"]["validate"]["identity_gate"] == "FAIL" and st["stages"]["calibrate"]["status"] == "passed"
+    assert " --identity-gate logs/identity_gate.json --accept-identity-fail" in _job_cmd(world, "plan")
+    assert st["stages"]["plan"]["status"] == "passed"
+    # without the acceptance a rerun of stage 4 runs the gate again (the owner may have changed the pin)
+    _profile_with(world, "S1_gated_unaccept.env", "IDENTITY_FAIL_ACCEPTED=0")
+    proc = _master(world, "--only", "validate", "--redo", CAGE_TEST_IDENTITY_GATED="1", CAGE_TEST_IDENTITY_VERDICT="PASS")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    assert sum(1 for c in _calls(world) if c.startswith("identity_gate verdict")) == 2
+    assert _state(world)["stages"]["validate"]["identity_gate"] == "PASS"
 
 
 def test_an_error_verdict_fails_stage_4_before_anything_bills_at_stage_5(world: Dict[str, Path], tmp_path: Path) -> None:
@@ -3046,3 +3110,193 @@ def test_a_gated_session_without_the_gate_manifest_or_the_revision_pin_refuses_a
     assert proc.returncode == 1, proc.stdout[-3000:]
     assert "IDENTITY_GATE_DATASET=musique" in proc.stdout and "MODEL_REVISION" in proc.stdout
     assert not any("provision_pod" in c and "--yes" in c for c in _calls(world)), "nothing bills on a refused stage 0"
+
+
+
+# ---------------------------------------------------------------------------
+# S2 block D (MyDocs/RunPod/S2_BLOCK_D_SPEC_2026-11-01.md, ADR-0182): the PD
+# preflight smoke. Stage 0 records whether the session plans pd cells and the
+# control-rung PD stack env (DEC-D3); stage 4 starts that stack, runs
+# scripts/checks/pd_smoke.py and stops it, after the identity gate and before
+# the start check; PASS and FAIL are results the plan reads (DEC-D6), an
+# unaccepted FAIL stops the stage (DEC-D7), ERROR fails it; the run consents
+# to the pd cells (--allow-pd) only on PASS (DEC-D2).
+# ---------------------------------------------------------------------------
+
+
+def _pd_profile(world: Dict[str, Path], tmp_path: Path) -> None:
+    # the smoke adds 40 min to the validate bound: the world's 12 h seatbelt no longer covers it
+    p = tmp_path / "S1_pd.env"
+    p.write_text(world["profile"].read_text(encoding="utf-8").replace("SEATBELT=12h", "SEATBELT=14h"), encoding="utf-8")
+    world["profile"] = p
+
+
+def test_stage_4_runs_the_pd_smoke_after_the_identity_gate_and_the_plan_reads_it_s2_d3(world: Dict[str, Path], tmp_path: Path) -> None:
+    _gated_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_IDENTITY_GATED="1", CAGE_TEST_LARGEST_POOL="1", CAGE_TEST_PD_CELLS="1")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    st = _state(world)
+    # stage 0 prints and records the pd cells like IDENTITY_GATED, with the stack env, and the stage 4 bound grows by the smoke bound
+    assert "PD_CELLS=1" in proc.stdout and st["registration"]["pd_cells"] in ("1", 1)
+    assert st["registration"]["pd_env"] == ";".join(f"{k}={v}" for k, v in sorted(_PD_ENV.items()))
+    assert "validate 210," in proc.stdout, [ln for ln in proc.stdout.splitlines() if "seatbelt" in ln]
+    assert "PD smoke (S2 block D)" in proc.stdout
+    assert _job_names(world) == ["setup", "load_gate", "datasets_offline", "validate_vllm", "validate_sglang", "identity_gate",
+                                 "pd_smoke", "start_check", "calibrate_vllm", "calibrate_rungs_vllm", "plan"]
+    cmd = _job_cmd(world, "pd_smoke")
+    pr = world["pod_repo"]
+    assert cmd.startswith(f"cd {pr} && export PATH={pr}/cage-env/bin:$PATH VLLM_START_TIMEOUT=600"), cmd[:200]
+    # the stack starts at the recorded env, the smoke runs against it, the stack stops, the GPUs are checked free
+    start = f"env {_PD_ENV_SORTED} bash scripts/2_serving/manage_vllm_pd.sh start 'Qwen/Qwen3-14B' && "
+    assert start in cmd, cmd
+    smoke = "cage-env/bin/python scripts/checks/pd_smoke.py --session a --model 'Qwen/Qwen3-14B' --out logs/pd_smoke.json"
+    assert smoke in cmd and cmd.count("bash scripts/2_serving/manage_vllm_pd.sh stop") == 1
+    assert cmd.index(start) < cmd.index(smoke) < cmd.index("manage_vllm_pd.sh stop")
+    assert cmd.rstrip().endswith("echo COMPUTE_APPS=$n; exit $rc")
+    assert "launcher pd start Qwen/Qwen3-14B pins=0,1/2,3 tp=2 budgets=1325670400/1325670400" in _calls(world)
+    assert "launcher pd stop pins=/ tp= budgets=/" in _calls(world)
+    # the verdict is pulled beside the landing's extras, recorded, and the plan reads it after the identity verdict
+    extras = world["exp_root"] / "S1" / DATE / "extras" / "pd_smoke"
+    assert json.loads((extras / "pd_smoke.json").read_text(encoding="utf-8"))["verdict"] == "PASS"
+    assert st["stages"]["validate"]["pd_smoke"] == "PASS" and "PD_SMOKE PASS" in proc.stdout
+    plan_cmd = _job_cmd(world, "plan")
+    assert " --identity-gate logs/identity_gate.json --pd-smoke logs/pd_smoke.json" in plan_cmd and "--accept-pd-fail" not in plan_cmd
+
+
+def test_the_run_consents_to_the_pd_cells_on_a_smoke_pass_s2_d2(world: Dict[str, Path], tmp_path: Path) -> None:
+    _pd_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "run", CAGE_TEST_PD_CELLS="1")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert "validate 125," in proc.stdout, [ln for ln in proc.stdout.splitlines() if "seatbelt" in ln]
+    assert "pd_smoke" in _job_names(world) and _state(world)["stages"]["validate"]["pd_smoke"] == "PASS"
+    assert " --pd-smoke logs/pd_smoke.json" in _job_cmd(world, "plan") and "--identity-gate" not in _job_cmd(world, "plan")
+    log = (world["exp_root"] / "S1" / DATE / "logs" / "runner" / "run.log").read_text(encoding="utf-8")
+    assert "run argv:" in log and " --allow-pd" in log
+    # the run job's env unsets the role pins beside the other per-step launcher variables
+    run_cmd = _job_cmd(world, "run")
+    assert "-u CAGE_PD_PREFILL_GPUS -u CAGE_PD_DECODE_GPUS" in run_cmd
+
+
+def test_a_pd_smoke_fail_stops_stage_4_until_the_owner_accepts_and_withholds_the_run_consent_s2_d6(world: Dict[str, Path], tmp_path: Path) -> None:
+    _pd_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "run", CAGE_TEST_PD_CELLS="1", CAGE_TEST_PD_SMOKE_VERDICT="FAIL")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    st = _state(world)
+    assert st["stages"]["validate"]["status"] == "failed" and st["stages"]["validate"]["pd_smoke"] == "FAIL"
+    assert not (world["home"] / ".cage_jobs" / "calibrate_vllm.cmd").exists(), "stage 5 never bills before the acceptance"
+    assert "PD_SMOKE FAIL" in proc.stdout and "PD_FAIL_ACCEPTED" in proc.stdout and "stage validate FAILED" in proc.stdout
+    extras = world["exp_root"] / "S1" / DATE / "extras" / "pd_smoke"
+    assert json.loads((extras / "pd_smoke.json").read_text(encoding="utf-8"))["verdict"] == "FAIL"
+    # the owner's acceptance: the rerun skips the smoke job, plans with --accept-pd-fail, runs without --allow-pd
+    _profile_with(world, "S1_pd_accept.env", "PD_FAIL_ACCEPTED=1")
+    proc = _master(world, "--yes", "provision", "--to", "run", CAGE_TEST_PD_CELLS="1", CAGE_TEST_PD_SMOKE_VERDICT="FAIL")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert sum(1 for c in _calls(world) if c.startswith("pd_smoke ")) == 1, "the smoke job is not rerun once accepted (DEC-D7)"
+    assert "not rerun" in proc.stdout
+    assert _state(world)["stages"]["validate"]["pd_smoke"] == "FAIL"
+    assert " --pd-smoke logs/pd_smoke.json --accept-pd-fail" in _job_cmd(world, "plan")
+    log = (world["exp_root"] / "S1" / DATE / "logs" / "runner" / "run.log").read_text(encoding="utf-8")
+    assert "run argv:" in log and "--allow-pd" not in log
+
+
+def test_a_pd_smoke_error_fails_stage_4_before_anything_bills_at_stage_5(world: Dict[str, Path], tmp_path: Path) -> None:
+    _pd_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_PD_CELLS="1", CAGE_TEST_PD_SMOKE_VERDICT="ERROR")
+    assert proc.returncode == 1 and "stage validate FAILED" in proc.stdout, proc.stdout[-3000:]
+    assert "pd_smoke" not in _state(world)["stages"]["validate"]
+    assert not (world["home"] / ".cage_jobs" / "calibrate_vllm.cmd").exists(), "stage 5 must not run"
+    log = (world["exp_root"] / "S1" / DATE / "logs" / "setup" / "pd_smoke.log").read_text(encoding="utf-8")
+    assert "PD_SMOKE ERROR" in log
+    assert "launcher pd stop pins=/ tp= budgets=/" in _calls(world), "the stack is stopped whatever the verdict"
+
+
+def test_a_pd_stack_that_does_not_come_up_fails_stage_4_before_any_request(world: Dict[str, Path], tmp_path: Path) -> None:
+    _pd_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_PD_CELLS="1", CAGE_TEST_PD_START_RC="1")
+    assert proc.returncode == 1 and "the PD smoke job ended before a verdict" in proc.stdout, proc.stdout[-3000:]
+    assert "pd_smoke" not in _state(world)["stages"]["validate"]
+    assert not any(c.startswith("pd_smoke ") for c in _calls(world)), "no request is sent to a stack that did not start"
+    assert "launcher pd stop pins=/ tp= budgets=/" in _calls(world)
+    assert not (world["home"] / ".cage_jobs" / "calibrate_vllm.cmd").exists()
+
+
+def test_a_session_without_pd_cells_runs_no_smoke_and_passes_no_flag(world: Dict[str, Path], tmp_path: Path) -> None:
+    proc = _master(world, "--yes", "provision", "--to", "run")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert "PD_CELLS=0" in proc.stdout and _state(world)["registration"]["pd_cells"] in ("0", 0)
+    assert "pd_smoke" not in _job_names(world) and "pd_smoke" not in _state(world)["stages"]["validate"]
+    assert "--pd-smoke" not in _job_cmd(world, "plan")
+    log = (world["exp_root"] / "S1" / DATE / "logs" / "runner" / "run.log").read_text(encoding="utf-8")
+    assert "run argv:" in log and "--allow-pd" not in log
+    assert not (world["exp_root"] / "S1" / DATE / "extras" / "pd_smoke").exists()
+
+
+def test_stage_0_refuses_pd_cells_without_a_recorded_stack_env(world: Dict[str, Path], tmp_path: Path) -> None:
+    proc = _master(world)
+    assert proc.returncode == 10, proc.stdout[-2500:]
+    proc = _master(world, "--only", "preflight-mac", "--redo", CAGE_TEST_PD_CELLS="1", CAGE_TEST_PD_ENV="0")
+    assert proc.returncode == 1, proc.stdout[-2500:]
+    assert "no PD_ENV line" in proc.stdout
+    assert not any("provision_pod" in c and "--yes" in c for c in _calls(world)), "nothing bills on a refused stage 0"
+
+
+# review 2026-11-01 (fresh Fable 5.1) MEDIUM 1 and MEDIUM 4: the job removes the
+# previous attempt's pod-side verdict before the start, so a gate or smoke that
+# dies without writing leaves nothing to fetch; and the accepted-FAIL skip puts
+# the Mac copy of the verdict back on the pod, so a landing resumed on a new pod
+# still plans against it.
+
+
+def test_a_stale_pod_verdict_is_not_judged_after_a_smoke_crash(world: Dict[str, Path], tmp_path: Path) -> None:
+    _pd_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "validate", CAGE_TEST_PD_CELLS="1")
+    assert proc.returncode == 0 and _state(world)["stages"]["validate"]["pd_smoke"] == "PASS", proc.stdout[-2000:]
+    pod_verdict = world["pod_repo"] / "logs" / "pd_smoke.json"
+    assert pod_verdict.exists(), "attempt 1 left its verdict on the pod"
+    # attempt 2 dies before writing: attempt 1's PASS must not be fetched and recorded
+    proc = _master(world, "--only", "validate", "--redo", CAGE_TEST_PD_CELLS="1", CAGE_TEST_PD_SMOKE_NO_WRITE="1")
+    assert proc.returncode == 1 and "stage validate FAILED" in proc.stdout, proc.stdout[-3000:]
+    assert "pd_smoke" not in _state(world)["stages"]["validate"]
+    assert not pod_verdict.exists(), "the job removed the stale verdict before the start"
+    assert "launcher pd stop pins=/ tp= budgets=/" in _calls(world)
+
+
+def test_a_stale_pod_identity_verdict_is_not_judged_after_a_gate_crash(world: Dict[str, Path], tmp_path: Path) -> None:
+    _gated_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "validate", CAGE_TEST_IDENTITY_GATED="1")
+    assert proc.returncode == 0 and _state(world)["stages"]["validate"]["identity_gate"] == "PASS", proc.stdout[-2000:]
+    pod_verdict = world["pod_repo"] / "logs" / "identity_gate.json"
+    assert pod_verdict.exists()
+    proc = _master(world, "--only", "validate", "--redo", CAGE_TEST_IDENTITY_GATED="1", CAGE_TEST_IDENTITY_NO_WRITE="1")
+    assert proc.returncode == 1 and "stage validate FAILED" in proc.stdout, proc.stdout[-3000:]
+    assert "identity_gate" not in _state(world)["stages"]["validate"]
+    assert not pod_verdict.exists(), "the job removed the stale verdict before the prompts step"
+
+
+def test_the_accepted_pd_fail_skip_restores_the_verdict_on_the_pod(world: Dict[str, Path], tmp_path: Path) -> None:
+    _pd_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "run", CAGE_TEST_PD_CELLS="1", CAGE_TEST_PD_SMOKE_VERDICT="FAIL")
+    assert proc.returncode == 1, proc.stdout[-2000:]
+    pod_verdict = world["pod_repo"] / "logs" / "pd_smoke.json"
+    pod_verdict.unlink()  # the owner deleted the pod while deciding; the resumed landing provisions a new one
+    _profile_with(world, "S1_pd_accept.env", "PD_FAIL_ACCEPTED=1")
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_PD_CELLS="1", CAGE_TEST_PD_SMOKE_VERDICT="FAIL")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert sum(1 for c in _calls(world) if c.startswith("pd_smoke ")) == 1, "the smoke is still not rerun"
+    assert json.loads(pod_verdict.read_text(encoding="utf-8"))["verdict"] == "FAIL", "the Mac copy is back where the plan job reads it"
+    assert " --pd-smoke logs/pd_smoke.json --accept-pd-fail" in _job_cmd(world, "plan")
+
+
+def test_the_accepted_identity_fail_skip_restores_the_verdict_on_the_pod(world: Dict[str, Path], tmp_path: Path) -> None:
+    _gated_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_IDENTITY_GATED="1", CAGE_TEST_IDENTITY_VERDICT="FAIL")
+    assert proc.returncode == 1, proc.stdout[-2000:]
+    pod_verdict = world["pod_repo"] / "logs" / "identity_gate.json"
+    pod_verdict.unlink()
+    _profile_with(world, "S1_gated_accept.env", "IDENTITY_FAIL_ACCEPTED=1")
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_IDENTITY_GATED="1", CAGE_TEST_IDENTITY_VERDICT="FAIL")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert sum(1 for c in _calls(world) if c.startswith("identity_gate verdict")) == 1
+    assert json.loads(pod_verdict.read_text(encoding="utf-8"))["verdict"] == "FAIL"
+    assert " --identity-gate logs/identity_gate.json --accept-identity-fail" in _job_cmd(world, "plan")
+

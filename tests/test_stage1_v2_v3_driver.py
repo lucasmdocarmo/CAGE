@@ -196,6 +196,14 @@ def _plan_for(grid, floor_path: Path, stub_cmd, *, launcher_cmds=None) -> Dict[s
     floor = rc.load_floor_table(floor_path)
     calibrations = _calibrations_for(grid, floor_path.parent / "cal")
     rungs = _rungs_for(grid, floor_path.parent / "cal")
+    # S2 block D (DEC-D2): a grid with an executable pd cell plans only against
+    # the stage 4 PD smoke verdict; the fixture's is a minimal PASS
+    pd_smoke = None
+    if any(c.spec.topology == "pd" and c.blocked_on is None for c in rc.enumerate_cells(grid)):
+        smoke = floor_path.parent / "pd_smoke.json"
+        smoke.write_text(json.dumps({"schema": rc.PD_SMOKE_SCHEMA, "verdict": "PASS", "session": grid.session,
+                                     "model": rc.HF_ID_OF_SLUG[grid.model]}), encoding="utf-8")
+        pd_smoke = rc.load_pd_smoke(smoke)
     orig = rc.SESSION_GRIDS
     rc.SESSION_GRIDS = {grid.session: grid}
     try:
@@ -209,6 +217,7 @@ def _plan_for(grid, floor_path: Path, stub_cmd, *, launcher_cmds=None) -> Dict[s
             },
             calibrations=calibrations,
             rung_calibrations=rungs,
+            pd_smoke=pd_smoke,
         )
     finally:
         rc.SESSION_GRIDS = orig

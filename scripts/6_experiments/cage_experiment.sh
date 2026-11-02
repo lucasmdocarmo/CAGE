@@ -199,6 +199,11 @@ SEAL_BOUND_S=600; START_CHECK_BOUND_S=2400
 # gated session (profile key, default in _common.env): two or three engine starts
 # (SGLang when the profile serves it) and up to 1,000 greedy requests of 32 tokens.
 : "${IDENTITY_GATE_BOUND_S:=3600}"
+# S2 block D (2026-11-01, ADR-0182): the stage 4 PD smoke job bound on a session
+# that plans pd cells (profile key, default in _common.env): one prefill/decode
+# stack start at the control-rung env stage 0 recorded, eight requests through
+# the proxy, one straight to the decode, one stop.
+: "${PD_SMOKE_BOUND_S:=2400}"
 
 seatbelt_minutes() { # "24h" | "90m" -> minutes, or empty when malformed
   # Audit 2026-10-17 (G30): "<n>d" is refused here; provision_pod.sh accepts h,
@@ -222,9 +227,11 @@ stage_bound_minutes() { # G16: the pod-side bound of ONE stage, in minutes (one 
       [ "${START_CHECK:-1}" = "1" ] && start_min=$(( START_CHECK_BOUND_S / 60 ))
       # S1 audit 2026-10-23: the load gate (600 s) and the offline dataset probe (600 s)
       # S2 block C: the identity gate (stage 0 recorded the session as gated)
-      local ig_min=0
+      local ig_min=0 pd_min=0
       [ "$(state get registration.identity_gated 2>/dev/null || echo 0)" = "1" ] && ig_min=$(( IDENTITY_GATE_BOUND_S / 60 ))
-      printf '%s' "$(( 20 + suite_min + n_srv * VALIDATE_BOUND_S / 60 + start_min + ig_min ))" ;;
+      # S2 block D: the PD smoke (stage 0 recorded the session as planning pd cells)
+      [ "$(state get registration.pd_cells 2>/dev/null || echo 0)" = "1" ] && pd_min=$(( PD_SMOKE_BOUND_S / 60 ))
+      printf '%s' "$(( 20 + suite_min + n_srv * VALIDATE_BOUND_S / 60 + start_min + ig_min + pd_min ))" ;;
     calibrate) printf '%s' "$(( n_cal * CALIBRATE_BOUND_S / 60 + n_cal * CALIBRATE_RUNGS_BOUND_S / 60 ))" ;;
     plan)
       # ADR-0177: CLASS_CEILINGS=1 adds the ceiling-only ladders (one bound per
@@ -594,7 +601,7 @@ server_engines()  { local e; for e in $ENGINES; do [ "$e" = "hf" ] || echo "$e";
 gate_manifest()   { local item; for item in $QUERY_MANIFESTS; do [ "${item%%=*}" = "$IDENTITY_GATE_DATASET" ] || continue; printf '%s' "${item#*=}"; return 0; done; return 0; }
 
 # env pins run_campaign.py refuses on presence or on a mismatch (drift sweep 2026-10-06, 8e)
-RUN_ENV_UNSET="-u CAGE_SLO_FLOORS_JSON -u CAGE_BUDGET_PLAN_JSON -u CAGE_KV_CEILING -u CAGE_TELEMETRY_ENDPOINTS -u CAGE_ALLOW_STALE_INDEX -u CAGE_SGLANG_API_BASE -u CAGE_LMDEPLOY_API_BASE -u VLLM_PORT -u SGLANG_PORT -u CAGE_PD_PROXY_PORT -u CAGE_PD_PREFILL_PORT -u CAGE_PD_DECODE_PORT"
+RUN_ENV_UNSET="-u CAGE_SLO_FLOORS_JSON -u CAGE_BUDGET_PLAN_JSON -u CAGE_KV_CEILING -u CAGE_TELEMETRY_ENDPOINTS -u CAGE_ALLOW_STALE_INDEX -u CAGE_SGLANG_API_BASE -u CAGE_LMDEPLOY_API_BASE -u VLLM_PORT -u SGLANG_PORT -u CAGE_PD_PROXY_PORT -u CAGE_PD_PREFILL_PORT -u CAGE_PD_DECODE_PORT -u CAGE_PD_PREFILL_GPUS -u CAGE_PD_DECODE_GPUS"
 
 portal_block() {
   pod_env
@@ -774,7 +781,7 @@ except Exception as exc:
 print(f"session {session!r}: anchor shape {report['anchor_seq_tokens']} served tokens; {report['cells']} cells, "
       f"{report['executable_cells']} executable; NEEDS_LMCACHE={1 if report['needs_lmcache'] else 0}; "
       f"LMCACHE_STORE_GIB={report.get('lmcache_store_gib') or 0}; "
-      f"IDENTITY_GATED={1 if report.get('identity_gated') else 0}")
+      f"IDENTITY_GATED={1 if report.get('identity_gated') else 0}; PD_CELLS={1 if report.get('pd_cells') else 0}")
 # A11 item 4: the largest planned pool per engine, which stage 4 starts and checks
 for key, tag in (("largest_pools", "LARGEST_POOL"), ("largest_helper_pools", "LARGEST_HELPER_POOL")):
     for e, p in sorted((report.get(key) or {}).items()):
@@ -785,6 +792,12 @@ for e, env in sorted((report.get("tp_env") or {}).items()):
     print(f"TP_ENV engine={e} env=" + ",".join(f"{k}={v}" for k, v in sorted(env.items())))
 need = report.get("gpu_count_needed")
 print(f"GPU_COUNT_NEEDED={'' if need is None else need}")
+# S2 block D (DEC-D3): the control-rung PD stack env the stage 4 smoke starts with
+# (the values carry commas, so the record is ';'-joined)
+pd = report.get("pd_env")
+if pd:
+    print(f"PD_ENV engine={pd['engine']} tp={pd['tp']} seq_tokens={pd['seq_tokens']} planned_bytes={pd['planned_bytes']} env="
+          + ";".join(f"{k}={v}" for k, v in sorted(pd["env"].items())))
 for p in report["problems"]:
     print(f"REFUSED: {p}")
 sys.exit(1 if report["problems"] else 0)
@@ -803,6 +816,19 @@ PY
     [ -z "$ig_bad" ] || { printf '  [FAIL] session %s is identity gated (charter 5.2) but the gate inputs are missing:%s fix the profile before anything bills (S2 block C-1)\n' "$SESSION" "$ig_bad"; return 1; }
     ig_starts="two"; case " $ENGINES " in *" sglang "*) ig_starts="three" ;; esac
     say "identity gate (charter 5.2): $IDENTITY_GATE_PROMPTS $IDENTITY_GATE_DATASET prompts from $ig_manifest at revision $MODEL_REVISION; $ig_starts engine starts at stage 4 (+$((IDENTITY_GATE_BOUND_S / 60)) min on the validate bound)"
+  fi
+  # S2 block D (2026-11-01, DEC-D2, DEC-D3, ADR-0182): the registered grid says
+  # whether an executable cell runs on the pd stack; stage 0 records the flag and
+  # the control-rung PD stack env the stage 4 smoke starts (the values carry
+  # commas, so the record is ';'-joined), and the stage 4 bound grows by the
+  # smoke's. A pd session without a stack env is refused before anything bills.
+  plan_only || { if step_has "PD_CELLS=1"; then state put registration.pd_cells 1; else state put registration.pd_cells 0; fi; }
+  if ! plan_only && [ "$(state get registration.pd_cells 2>/dev/null || echo 0)" = "1" ]; then
+    local pd_line
+    pd_line="$(grep '^PD_ENV engine=' "$STEP_LOG" | tail -1 || true)"
+    [ -n "$pd_line" ] || { printf '  [FAIL] session %s plans pd cells but the preflight printed no PD_ENV line (no pd relaunch of the anchor class at the control rung): fix the registration before anything bills (S2 block D)\n' "$SESSION"; return 1; }
+    state put registration.pd_env "${pd_line#* env=}"
+    say "PD smoke (S2 block D): stage 4 starts the prefill/decode stack once at the control-rung env (${pd_line% env=*}) and proves the KV transfer live (+$((PD_SMOKE_BOUND_S / 60)) min on the validate bound)"
   fi
   # S0F-88 U2: the largest LMCache CPU store the plan will size (GiB, 0 = none)
   plan_only || state put registration.lmcache_store_gib "$(grep -o 'LMCACHE_STORE_GIB=[0-9]*' "$STEP_LOG" | tail -1 | cut -d= -f2)"
@@ -1192,10 +1218,9 @@ stage_setup() {
 stage_validate() {
   pod_env
   [ "${NEGATIVE_CONTROLS:-0}" = "1" ] && { printf '  [FAIL] NEGATIVE_CONTROLS=1: the S0 refusal controls are not built into this stage yet (profile default 6, 2026-10-06); set 0 or build them\n'; return 1; }
-  [ "${PD_PROBES:-0}" = "1" ] && { printf '  [FAIL] PD_PROBES=1: the S0 pd probes are not built into this stage yet; set 0 or build them\n'; return 1; }
   case "$TOPOLOGY" in
-    single|tp) ;;
-    *) printf '  [FAIL] TOPOLOGY=%s: single-instance and tensor-parallel validation are built (S2 Block B-1); the pd stack validation is a separate Spec\n' "$TOPOLOGY"; return 1 ;;
+    single|tp|pd) ;;
+    *) printf '  [FAIL] TOPOLOGY=%s: single-instance, tensor-parallel and pd validation are built (S2 Block B-1, block D); nothing else is\n' "$TOPOLOGY"; return 1 ;;
   esac
   if [ "${SUITE_ON_POD:-0}" = "1" ]; then
     # A stage 4 retry on the same shipped code does not rerun the pod suite
@@ -1386,38 +1411,103 @@ stage_validate() {
     ig_manifest="$(gate_manifest)"
     [ -n "$ig_manifest" ] || { printf '  [FAIL] no QUERY_MANIFESTS entry for IDENTITY_GATE_DATASET=%s (stage 0 checks this; the profile changed since)\n' "$IDENTITY_GATE_DATASET"; return 1; }
     [ -n "$MODEL_REVISION" ] || { printf '  [FAIL] MODEL_REVISION is empty on an identity-gated session (stage 0 checks this; the freeze file changed since)\n'; return 1; }
-    ig_vapi="$(engine_api vllm)"; ig_sapi="$(engine_api sglang)"
-    ig_cmd="rc=0; $POD_PYTHON scripts/checks/identity_gate.py prompts --manifest $ig_manifest --dataset $IDENTITY_GATE_DATASET --trial 1 --count $IDENTITY_GATE_PROMPTS --model '$MODEL' --revision $MODEL_REVISION --session $SESSION --out $ig_p || rc=1"
-    ig_cmd="$ig_cmd; if [ \$rc -eq 0 ]; then env$ig_env_vllm bash scripts/2_serving/manage_vllm_server.sh start '$MODEL' && $POD_PYTHON scripts/checks/identity_gate.py run --engine vllm --phase vllm_on --api-base $ig_vapi --model '$MODEL' --prompts $ig_p --passes 2 --out logs/identity_gate/vllm_on.json || rc=1; bash scripts/2_serving/manage_vllm_server.sh stop; fi"
-    ig_cmd="$ig_cmd; if [ \$rc -eq 0 ]; then env$ig_env_vllm bash scripts/2_serving/manage_vllm_server.sh start '$MODEL' --no-prefix-cache && $POD_PYTHON scripts/checks/identity_gate.py run --engine vllm --phase vllm_off --api-base $ig_vapi --model '$MODEL' --prompts $ig_p --passes 1 --out logs/identity_gate/vllm_off.json || rc=1; bash scripts/2_serving/manage_vllm_server.sh stop; fi"
-    case " $ENGINES " in
-      *" sglang "*) ig_cmd="$ig_cmd; if [ \$rc -eq 0 ]; then env$ig_env_sglang bash scripts/2_serving/manage_sglang_server.sh start '$MODEL' && $POD_PYTHON scripts/checks/identity_gate.py run --engine sglang --phase sglang --api-base $ig_sapi --model '$MODEL' --prompts $ig_p --passes 2 --out logs/identity_gate/sglang.json || rc=1; bash scripts/2_serving/manage_sglang_server.sh stop; fi" ;;
-      *) ig_nosgl=" --no-sglang" ;;
-    esac
-    ig_cmd="$ig_cmd; if [ \$rc -eq 0 ]; then $POD_PYTHON scripts/checks/identity_gate.py verdict --phases logs/identity_gate --out logs/identity_gate.json$ig_nosgl || true; fi"
-    ig_cmd="$ig_cmd; n=1; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do n=\$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . || true); [ \"\$n\" -eq 0 ] && break; sleep 2; done; echo COMPUTE_APPS=\$n; exit \$rc"
-    local ig_job=0
-    job_run identity_gate "$IDENTITY_GATE_BOUND_S" "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT$POD_ENGINE_ENV && $ig_cmd" "$LAND/logs/setup" || ig_job=1
-    plan_only || mkdir -p "$EXTRAS/identity_gate"
-    # review 2026-11-01 LOW 1: the record (prompts.json and each phase file, with
-    # its error reason and every request up to it) is fetched before the job's
-    # exit is judged, so a phase that died still leaves its evidence in extras
-    if ! run_step 0 "fetch the identity gate record (prompts and phases)" -- pscp_from "$POD_REPO/logs/identity_gate/." "$EXTRAS/identity_gate"; then
-      [ "$ig_job" -ne 0 ] || return 1
-    fi
-    [ "$ig_job" -eq 0 ] || { printf '  [FAIL] the identity gate job ended before a verdict (a prompt build refusal, a launcher start that did not come up, or a run phase that errored; the tail above names it): nothing bills at stage 5 on a session whose gate did not run (charter 5.2)\n'; return 1; }
-    run_step 0 "fetch the identity gate verdict" -- pscp_from "$POD_REPO/logs/identity_gate.json" "$EXTRAS/identity_gate/identity_gate.json" || return 1
-    if ! plan_only; then
-      grep -q "COMPUTE_APPS=0" "$JOB_LOG" || { printf '  [FAIL] identity gate: compute apps remain after stop\n'; return 1; }
-      { grep -E '^(comparisons:|error:|IDENTITY_GATE )' "$JOB_LOG" || true; } | sed 's/^/  /'
-      ig_verdict="$("$PY3" -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("verdict") or "")' "$EXTRAS/identity_gate/identity_gate.json" 2>/dev/null || true)"
-      case "$ig_verdict" in
-        PASS) state put stages.validate.identity_gate PASS
-              say "IDENTITY_GATE PASS: the aligned prefix cache changed no generated token on $IDENTITY_GATE_PROMPTS prompts; the gated cells run labeled experimental-align-mode (charter 5.2)" ;;
-        FAIL) state put stages.validate.identity_gate FAIL
-              say "IDENTITY_GATE FAIL: the aligned prefix cache changed generated tokens (the first divergence is in $EXTRAS/identity_gate/identity_gate.json). This IS a result (charter 5.2): the plan stage excludes the vLLM prefix-on cells of session $SESSION once the owner writes IDENTITY_FAIL_ACCEPTED=1 in the profile, and refuses until then" ;;
-        *)    printf '  [FAIL] identity gate verdict %s (charter 5.2: neither PASS nor FAIL): the gate did not run to a verdict; see the error line above and %s; nothing bills at stage 5\n' "${ig_verdict:-missing}" "$EXTRAS/identity_gate/identity_gate.json"; return 1 ;;
+    # S2 block D DEC-D7 (a): a FAIL already fetched to the Mac and accepted by the
+    # owner (IDENTITY_FAIL_ACCEPTED=1) is re-recorded, not rerun; without the
+    # acceptance the gate runs again (the owner may have changed the pin)
+    ig_verdict=""
+    [ ! -s "$EXTRAS/identity_gate/identity_gate.json" ] || ig_verdict="$("$PY3" -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("verdict") or "")' "$EXTRAS/identity_gate/identity_gate.json" 2>/dev/null || true)"
+    if [ "$ig_verdict" = "FAIL" ] && [ "${IDENTITY_FAIL_ACCEPTED:-0}" = "1" ]; then
+      plan_only || state put stages.validate.identity_gate FAIL
+      say "IDENTITY_GATE FAIL recorded at $EXTRAS/identity_gate/identity_gate.json and accepted (IDENTITY_FAIL_ACCEPTED=1): the gate job is not rerun (DEC-D7); the plan excludes the vLLM prefix-on cells of session $SESSION"
+      # review 2026-11-01 MEDIUM 4: stage 6 reads the verdict on the pod; a landing
+      # resumed on a new pod has none, so the Mac copy goes back before stage 5 bills
+      run_step 0 "the pod's logs directory for the accepted identity verdict" -- pssh "mkdir -p $POD_REPO/logs" || return 1
+      run_step 0 "restore the accepted identity verdict on the pod (stage 6 reads logs/identity_gate.json)" -- pscp_to "$EXTRAS/identity_gate/identity_gate.json" "$POD_REPO/logs/identity_gate.json" || return 1
+    else
+      ig_vapi="$(engine_api vllm)"; ig_sapi="$(engine_api sglang)"
+      ig_cmd="rc=0; rm -f logs/identity_gate.json; $POD_PYTHON scripts/checks/identity_gate.py prompts --manifest $ig_manifest --dataset $IDENTITY_GATE_DATASET --trial 1 --count $IDENTITY_GATE_PROMPTS --model '$MODEL' --revision $MODEL_REVISION --session $SESSION --out $ig_p || rc=1"
+      ig_cmd="$ig_cmd; if [ \$rc -eq 0 ]; then env$ig_env_vllm bash scripts/2_serving/manage_vllm_server.sh start '$MODEL' && $POD_PYTHON scripts/checks/identity_gate.py run --engine vllm --phase vllm_on --api-base $ig_vapi --model '$MODEL' --prompts $ig_p --passes 2 --out logs/identity_gate/vllm_on.json || rc=1; bash scripts/2_serving/manage_vllm_server.sh stop; fi"
+      ig_cmd="$ig_cmd; if [ \$rc -eq 0 ]; then env$ig_env_vllm bash scripts/2_serving/manage_vllm_server.sh start '$MODEL' --no-prefix-cache && $POD_PYTHON scripts/checks/identity_gate.py run --engine vllm --phase vllm_off --api-base $ig_vapi --model '$MODEL' --prompts $ig_p --passes 1 --out logs/identity_gate/vllm_off.json || rc=1; bash scripts/2_serving/manage_vllm_server.sh stop; fi"
+      case " $ENGINES " in
+        *" sglang "*) ig_cmd="$ig_cmd; if [ \$rc -eq 0 ]; then env$ig_env_sglang bash scripts/2_serving/manage_sglang_server.sh start '$MODEL' && $POD_PYTHON scripts/checks/identity_gate.py run --engine sglang --phase sglang --api-base $ig_sapi --model '$MODEL' --prompts $ig_p --passes 2 --out logs/identity_gate/sglang.json || rc=1; bash scripts/2_serving/manage_sglang_server.sh stop; fi" ;;
+        *) ig_nosgl=" --no-sglang" ;;
       esac
+      ig_cmd="$ig_cmd; if [ \$rc -eq 0 ]; then $POD_PYTHON scripts/checks/identity_gate.py verdict --phases logs/identity_gate --out logs/identity_gate.json$ig_nosgl || true; fi"
+      ig_cmd="$ig_cmd; n=1; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do n=\$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . || true); [ \"\$n\" -eq 0 ] && break; sleep 2; done; echo COMPUTE_APPS=\$n; exit \$rc"
+      local ig_job=0
+      job_run identity_gate "$IDENTITY_GATE_BOUND_S" "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT$POD_ENGINE_ENV && $ig_cmd" "$LAND/logs/setup" || ig_job=1
+      plan_only || mkdir -p "$EXTRAS/identity_gate"
+      # review 2026-11-01 LOW 1: the record (prompts.json and each phase file, with
+      # its error reason and every request up to it) is fetched before the job's
+      # exit is judged, so a phase that died still leaves its evidence in extras
+      if ! run_step 0 "fetch the identity gate record (prompts and phases)" -- pscp_from "$POD_REPO/logs/identity_gate/." "$EXTRAS/identity_gate"; then
+        [ "$ig_job" -ne 0 ] || return 1
+      fi
+      [ "$ig_job" -eq 0 ] || { printf '  [FAIL] the identity gate job ended before a verdict (a prompt build refusal, a launcher start that did not come up, or a run phase that errored; the tail above names it): nothing bills at stage 5 on a session whose gate did not run (charter 5.2)\n'; return 1; }
+      run_step 0 "fetch the identity gate verdict" -- pscp_from "$POD_REPO/logs/identity_gate.json" "$EXTRAS/identity_gate/identity_gate.json" || return 1
+      if ! plan_only; then
+        grep -q "COMPUTE_APPS=0" "$JOB_LOG" || { printf '  [FAIL] identity gate: compute apps remain after stop\n'; return 1; }
+        { grep -E '^(comparisons:|error:|IDENTITY_GATE )' "$JOB_LOG" || true; } | sed 's/^/  /'
+        ig_verdict="$("$PY3" -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("verdict") or "")' "$EXTRAS/identity_gate/identity_gate.json" 2>/dev/null || true)"
+        case "$ig_verdict" in
+          PASS) state put stages.validate.identity_gate PASS
+                say "IDENTITY_GATE PASS: the aligned prefix cache changed no generated token on $IDENTITY_GATE_PROMPTS prompts; the gated cells run labeled experimental-align-mode (charter 5.2)" ;;
+          FAIL) state put stages.validate.identity_gate FAIL
+                say "IDENTITY_GATE FAIL: the aligned prefix cache changed generated tokens (the first divergence is in $EXTRAS/identity_gate/identity_gate.json). This IS a result (charter 5.2): the plan stage excludes the vLLM prefix-on cells of session $SESSION once the owner writes IDENTITY_FAIL_ACCEPTED=1 in the profile, and this stage stops until then (DEC-D7)"
+                # S2 block D DEC-D7 (a): stage 5 does not bill before the owner's written acceptance
+                [ "${IDENTITY_FAIL_ACCEPTED:-0}" = "1" ] || { printf '  [FAIL] identity gate FAIL and IDENTITY_FAIL_ACCEPTED is not 1: stage 5 does not bill before the owner accepts (DEC-D7); write IDENTITY_FAIL_ACCEPTED=1 in the profile and resume with --from validate (the gate job is not rerun)\n'; return 1; } ;;
+          *)    printf '  [FAIL] identity gate verdict %s (charter 5.2: neither PASS nor FAIL): the gate did not run to a verdict; see the error line above and %s; nothing bills at stage 5\n' "${ig_verdict:-missing}" "$EXTRAS/identity_gate/identity_gate.json"; return 1 ;;
+        esac
+      fi
+    fi
+  fi
+  # S2 block D (2026-11-01, DEC-D3, DEC-D6, DEC-D7, ADR-0182): on a session whose
+  # stage 0 recorded pd cells, the prefill/decode stack is started once at the
+  # control-rung env stage 0 recorded (registration.pd_env), scripts/checks/
+  # pd_smoke.py sends eight requests through the proxy and one straight to the
+  # decode, and the stack is stopped. PASS and FAIL are results the plan stage
+  # reads; a FAIL stops this stage until the owner writes PD_FAIL_ACCEPTED=1
+  # (then the plan excludes every pd cell and the run gets no --allow-pd);
+  # ERROR fails this stage before stage 5 bills. The verdict's own exit (1 on
+  # ERROR) is not the job's: the fetched verdict is judged on the Mac. A fetched
+  # FAIL the owner accepted is re-recorded, not rerun.
+  if [ "$(state get registration.pd_cells 2>/dev/null || echo 0)" = "1" ]; then
+    local pd_env pd_cmd pd_verdict="" pd_job=0
+    pd_env="$(state get registration.pd_env 2>/dev/null | tr ';' ' ' || true)"
+    [ -n "$pd_env" ] || { printf '  [FAIL] session %s plans pd cells but stage 0 recorded no PD stack env (registration.pd_env): rerun stage 0 (--only preflight-mac --redo)\n' "$SESSION"; return 1; }
+    [ ! -s "$EXTRAS/pd_smoke/pd_smoke.json" ] || pd_verdict="$("$PY3" -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("verdict") or "")' "$EXTRAS/pd_smoke/pd_smoke.json" 2>/dev/null || true)"
+    if [ "$pd_verdict" = "FAIL" ] && [ "${PD_FAIL_ACCEPTED:-0}" = "1" ]; then
+      plan_only || state put stages.validate.pd_smoke FAIL
+      say "PD_SMOKE FAIL recorded at $EXTRAS/pd_smoke/pd_smoke.json and accepted (PD_FAIL_ACCEPTED=1): the smoke job is not rerun (DEC-D7); the plan excludes every pd cell of session $SESSION and the run gets no --allow-pd"
+      # review 2026-11-01 MEDIUM 4: stage 6 reads the verdict on the pod; a landing
+      # resumed on a new pod has none, so the Mac copy goes back before stage 5 bills
+      run_step 0 "the pod's logs directory for the accepted PD smoke verdict" -- pssh "mkdir -p $POD_REPO/logs" || return 1
+      run_step 0 "restore the accepted PD smoke verdict on the pod (stage 6 reads logs/pd_smoke.json)" -- pscp_to "$EXTRAS/pd_smoke/pd_smoke.json" "$POD_REPO/logs/pd_smoke.json" || return 1
+    else
+      # review 2026-11-01 MEDIUM 1: the previous attempt's verdict goes before the
+      # start, so a smoke that dies without writing leaves nothing to fetch
+      pd_cmd="rc=0; rm -f logs/pd_smoke.json; env $pd_env bash scripts/2_serving/manage_vllm_pd.sh start '$MODEL' && { $POD_PYTHON scripts/checks/pd_smoke.py --session $SESSION --model '$MODEL' --out logs/pd_smoke.json || true; } || rc=1; bash scripts/2_serving/manage_vllm_pd.sh stop"
+      pd_cmd="$pd_cmd; n=1; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do n=\$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . || true); [ \"\$n\" -eq 0 ] && break; sleep 2; done; echo COMPUTE_APPS=\$n; exit \$rc"
+      job_run pd_smoke "$PD_SMOKE_BOUND_S" "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT$POD_ENGINE_ENV && $pd_cmd" "$LAND/logs/setup" || pd_job=1
+      plan_only || mkdir -p "$EXTRAS/pd_smoke"
+      # the verdict is fetched before the job's exit is judged, so an ERROR's reasons land in extras
+      if ! run_step 0 "fetch the PD smoke verdict" -- pscp_from "$POD_REPO/logs/pd_smoke.json" "$EXTRAS/pd_smoke/pd_smoke.json"; then
+        [ "$pd_job" -ne 0 ] || return 1
+      fi
+      [ "$pd_job" -eq 0 ] || { printf '  [FAIL] the PD smoke job ended before a verdict (the PD stack did not come up at the recorded env, or the job hit its bound; the tail above names it): nothing bills at stage 5 on a session whose pd cells were not smoked (ADR-0182)\n'; return 1; }
+      if ! plan_only; then
+        grep -q "COMPUTE_APPS=0" "$JOB_LOG" || { printf '  [FAIL] PD smoke: compute apps remain after stop\n'; return 1; }
+        { grep -E '^PD_SMOKE ' "$JOB_LOG" || true; } | sed 's/^/  /'
+        pd_verdict="$("$PY3" -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("verdict") or "")' "$EXTRAS/pd_smoke/pd_smoke.json" 2>/dev/null || true)"
+        case "$pd_verdict" in
+          PASS) state put stages.validate.pd_smoke PASS
+                say "PD_SMOKE PASS: the prefill/decode stack moved KV bytes through the proxy on every request and none on the request straight to the decode; the pd cells of session $SESSION run at their TP twin's rate (DEC-D5) under --allow-pd" ;;
+          FAIL) state put stages.validate.pd_smoke FAIL
+                say "PD_SMOKE FAIL: the proxy refused a request (HTTP 502: no usable ticket from the prefill, or a prefill or decode that stopped answering), or the stack moved no KV bytes through the proxy, or the request straight to the decode moved some (the reasons, refusals first, are in $EXTRAS/pd_smoke/pd_smoke.json). This IS a result (ADR-0182): the plan excludes every pd cell of session $SESSION once the owner writes PD_FAIL_ACCEPTED=1 in the profile, and this stage stops until then"
+                [ "${PD_FAIL_ACCEPTED:-0}" = "1" ] || { printf '  [FAIL] PD smoke FAIL and PD_FAIL_ACCEPTED is not 1: stage 5 does not bill before the owner accepts (DEC-D6, DEC-D7); write PD_FAIL_ACCEPTED=1 in the profile and resume with --from validate (the smoke job is not rerun)\n'; return 1; } ;;
+          *)    printf '  [FAIL] PD smoke verdict %s (ADR-0182: neither PASS nor FAIL): the smoke did not run to a verdict; see the PD_SMOKE line above and %s; nothing bills at stage 5\n' "${pd_verdict:-missing}" "$EXTRAS/pd_smoke/pd_smoke.json"; return 1 ;;
+        esac
+      fi
     fi
   fi
   # Review 2026-10-13 (Part 8 option A1, items 29 and 32): the serving
@@ -1711,7 +1801,28 @@ stage_plan() {
     igf=" --identity-gate logs/identity_gate.json"
     [ "$igv" != "FAIL" ] || [ "${IDENTITY_FAIL_ACCEPTED:-0}" != "1" ] || igf="$igf --accept-identity-fail"
   fi
-  job_run plan 900 "cd $POD_REPO && $POD_PYTHON scripts/3_run/run_campaign.py plan --session $SESSION --floor-table results/calibration/floor_table.json --window-duration-s $WINDOW_DURATION_S --seed $SEED$qm$cal$reh --calibration-budget-fraction $CALIBRATION_BUDGET_FRACTION --freeze-file $POD_FREEZE_FILE$front${LAST_BLOCK:+ --last-block $LAST_BLOCK}$ceil$igf --out $pout" "$LAND/logs/setup" || return 1
+  # S2 block D (DEC-D2, DEC-D6, ADR-0182): on a session with pd cells the plan
+  # reads the stage 4 PD smoke verdict; a FAIL plans only under the owner's
+  # written acceptance (PD_FAIL_ACCEPTED=1), which excludes every pd cell.
+  local pdf="" pdv=""
+  if [ "$(state get registration.pd_cells 2>/dev/null || echo 0)" = "1" ]; then
+    pdv="$(state get stages.validate.pd_smoke 2>/dev/null || true)"
+    if ! plan_only; then
+      [ -n "$pdv" ] || { printf '  [FAIL] session %s plans pd cells but stage 4 recorded no PD smoke verdict (stages.validate.pd_smoke): rerun stage 4 (--only validate --redo)\n' "$SESSION"; return 1; }
+      if [ "$pdv" = "FAIL" ] && [ "${PD_FAIL_ACCEPTED:-0}" != "1" ]; then
+        hr
+        printf 'PD SMOKE FAIL (ADR-0182): the prefill/decode stack did not prove its KV transfer at stage 4\n'
+        printf '  verdict:  %s/pd_smoke/pd_smoke.json (the failed clauses are listed under reasons)\n' "$EXTRAS"
+        printf '  meaning:  the pd cells of session %s cannot run on an unproven stack; the plan excludes them (blocked_on) once you accept\n' "$SESSION"
+        printf '  action:   write PD_FAIL_ACCEPTED=1 in the profile (the written acceptance) and resume with --from plan; the pod keeps billing until then\n'
+        hr
+        return 1
+      fi
+    fi
+    pdf=" --pd-smoke logs/pd_smoke.json"
+    [ "$pdv" != "FAIL" ] || [ "${PD_FAIL_ACCEPTED:-0}" != "1" ] || pdf="$pdf --accept-pd-fail"
+  fi
+  job_run plan 900 "cd $POD_REPO && $POD_PYTHON scripts/3_run/run_campaign.py plan --session $SESSION --floor-table results/calibration/floor_table.json --window-duration-s $WINDOW_DURATION_S --seed $SEED$qm$cal$reh --calibration-budget-fraction $CALIBRATION_BUDGET_FRACTION --freeze-file $POD_FREEZE_FILE$front${LAST_BLOCK:+ --last-block $LAST_BLOCK}$ceil$igf$pdf --out $pout" "$LAND/logs/setup" || return 1
   if [ "$replan" -eq 1 ]; then
     run_step 0 "fetch the re-plan candidate" -- pscp_from "$POD_REPO/$pout" "$EXTRAS/plan_candidate.json" || return 1
     run_step 0 "plan diff: only the ceiling fields moved (ADR-0177)" -- "$PY" "$SCRIPTS/3_run/run_campaign.py" plan-diff --old "$EXTRAS/plan_registered.json" --new "$EXTRAS/plan_candidate.json" || return 1
@@ -1875,7 +1986,11 @@ stage_run() {
   # would refuse); the charter roster stands in when the plan names none
   local roster; roster="$("$PY3" -c 'import json,sys; p=json.load(open(sys.argv[1], encoding="utf-8")); print(" ".join(sorted({str(s["dataset"]) for s in p.get("steps", []) if s.get("kind") == "cell" and s.get("dataset")})))' "$EXTRAS/plan.json" 2>/dev/null || true)"
   [ -n "$roster" ] || roster="$CHARTER_DATASETS"
-  job_attach_or_submit "$name" "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH$POD_ENGINE_ENV && env $RUN_ENV_UNSET CAGE_RUN_ROOT=$POD_RUN_ROOT VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT CAGE_PROVIDER=runpod CAGE_HARDWARE='$GPU_ID x $GPU_COUNT' CAGE_CAMPAIGN_DATASETS='$roster'$run_to $POD_PYTHON scripts/3_run/run_campaign.py run --plan results/calibration/plan_$RUN_ID.json --campaign-root $POD_RUN_ROOT --seal$partial$dry_rerun" "$bound" || return 1
+  # S2 block D (DEC-D2, ADR-0182): the run consents to the pd cells only on a
+  # stage 4 PD smoke PASS; under an accepted FAIL the plan carries none
+  local allow_pd=""
+  [ "$(state get registration.pd_cells 2>/dev/null || echo 0)" != "1" ] || [ "$(state get stages.validate.pd_smoke 2>/dev/null || true)" != "PASS" ] || allow_pd=" --allow-pd"
+  job_attach_or_submit "$name" "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH$POD_ENGINE_ENV && env $RUN_ENV_UNSET CAGE_RUN_ROOT=$POD_RUN_ROOT VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT CAGE_PROVIDER=runpod CAGE_HARDWARE='$GPU_ID x $GPU_COUNT' CAGE_CAMPAIGN_DATASETS='$roster'$run_to $POD_PYTHON scripts/3_run/run_campaign.py run --plan results/calibration/plan_$RUN_ID.json --campaign-root $POD_RUN_ROOT --seal$partial$dry_rerun$allow_pd" "$bound" || return 1
   if plan_only; then
     printf '  [plan] %-28s expect DONE(0), STOP FAILED(2) or BUDGET STOP(4); DRY WINDOW FAILED(3) fails the stage: bash %s wait run %s\n' "job run: wait" "$PODJOB" "$bound"
     return 0

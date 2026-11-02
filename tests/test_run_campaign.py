@@ -553,7 +553,7 @@ def stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("STUB_FAIL_MARKER", raising=False)
     # Hermetic endpoint env (Batch 2 W2): 'run' refuses a runner override or
     # a differing launcher port, so the developer's shell must not leak in.
-    for name in (*rc.API_BASE_OVERRIDE_ENVS, *rc.SHELL_PORT_ENVS, *rc.CELL_PIN_ENVS):
+    for name in (*rc.API_BASE_OVERRIDE_ENVS, *rc.SHELL_PORT_ENVS, *rc.CELL_PIN_ENVS, *rc.PD_ROLE_GPU_ENVS):
         monkeypatch.delenv(name, raising=False)
 
     class Stub:
@@ -2393,6 +2393,9 @@ class TestGpuCountProducer:
                     rc.PD_LAUNCHER_KEY: stub.cmd,
                 },
                 calibrations=_write_calibrations(tmp_path / "cal", ("vllm",)),
+                # S2 block D (DEC-D2): a pd cell plans only against a PD smoke verdict
+                pd_smoke=rc.load_pd_smoke(_pd_smoke_verdict(tmp_path, "PASS", session=grid.session,
+                                                            model=rc.HF_ID_OF_SLUG[grid.model])),
             )
         finally:
             rc.SESSION_GRIDS = orig
@@ -2433,9 +2436,14 @@ def calibrations_b(tmp_path: Path) -> Dict[str, Path]:
 
 @pytest.fixture()
 def plan_b(floor_table_b: Path, calibrations_b: Dict[str, Path]) -> Dict[str, Any]:
+    # S2 block D (DEC-D2): session b holds two pd references, so it plans
+    # only against a PD smoke verdict; the fixture's is a PASS
+    smoke = _pd_smoke_verdict(floor_table_b.parent, "PASS", session="b",
+                              model=rc.HF_ID_OF_SLUG[rc.get_session_grid("b").model])
     return rc.build_plan(
         "b", rc.load_floor_table(floor_table_b), window_duration_s=300.0,
         calibrations=calibrations_b, rung_calibrations=_rungs_for(calibrations_b, "b"),
+        pd_smoke=rc.load_pd_smoke(smoke),
     )
 
 
@@ -5718,14 +5726,37 @@ _S2_MUSIQUE_MANIFEST = (
 _S2_SGLANG_B8_REFERENCE = "retr-store|rerank|none|single|sglang|qwen3-next-80b|F1"
 
 
-def _s2_plan(session: str, tmp_path: Path, *, anchor: Optional[int] = None, **overrides: Any) -> Dict[str, Any]:
+_KEEP = object()
+
+
+def _hybrid_class_demand(d_floor: int, seq_tokens: int, anchor: int, concurrency: int, model: str) -> int:
+    """S2 block D DEC-D4 (ADR-0155 amended): D_class = (D_floor - F) x s // s_anchor + F,
+    F = concurrency x the model's fixed recurrent-state bytes per sequence
+    (zero on a dense model, where the rule is the linear one)."""
+    fixed = concurrency * rc.MODEL_KV[model].fixed_state_bytes_per_seq
+    return (d_floor - fixed) * seq_tokens // anchor + fixed
+
+
+def _s2_plan(session: str, tmp_path: Path, *, anchor: Optional[int] = None, floor_demand_bytes: Optional[int] = None,
+             floor_concurrency_target: Any = _KEEP, **overrides: Any) -> Dict[str, Any]:
     """A full plan of one S2 session through the fixture stack: a reduced
     floor table at the session's anchor shape, cal-v1 artifacts on both
-    engines at the control rung with every class floor (B4), and the ladders."""
+    engines at the control rung with every class floor (B4), and the ladders.
+    ``floor_demand_bytes`` replaces the fixture's demand on every row (the
+    budgets follow); ``floor_concurrency_target`` replaces the table's
+    concurrency (None drops the key)."""
     grid = rc.get_session_grid(session)
     anchor = _S2_ANCHOR_SEQ_TOKENS[session] if anchor is None else anchor
     doc = _floor_table_doc(model=grid.model, grid="reduced", r_values=(1.0, 0.5, 0.25))
     doc["generated_inputs"]["avg_seq_tokens"] = anchor
+    if floor_demand_bytes is not None:
+        for row in doc["rows"]:
+            row["demand_bytes"] = floor_demand_bytes
+            row["budget_bytes"] = int(row["r"] * floor_demand_bytes)
+    if floor_concurrency_target is None:
+        del doc["generated_inputs"]["concurrency_target"]
+    elif floor_concurrency_target is not _KEEP:
+        doc["generated_inputs"]["concurrency_target"] = floor_concurrency_target
     floor = tmp_path / f"floor_{session}.json"
     floor.write_text(json.dumps(doc), encoding="utf-8")
     cal = _write_calibrations(
@@ -5746,6 +5777,13 @@ def _s2_plan(session: str, tmp_path: Path, *, anchor: Optional[int] = None, **ov
     # the refusal, or a FAIL verdict with accept_identity_fail=True)
     if grid.identity_gated and "identity_gate" not in overrides:
         kwargs["identity_gate"] = rc.load_identity_gate(_identity_verdict(tmp_path, "PASS"))
+    # S2 block D (DEC-D2, DEC-D6): a session with an executable pd cell plans
+    # only against the stage 4 PD smoke verdict; the fixture default is a PASS
+    if "pd_smoke" not in overrides and any(
+        c.spec.topology == "pd" and c.blocked_on is None for c in rc.enumerate_cells(grid)
+    ):
+        kwargs["pd_smoke"] = rc.load_pd_smoke(_pd_smoke_verdict(tmp_path, "PASS", session=session,
+                                                                 model=rc.HF_ID_OF_SLUG[grid.model]))
     kwargs.update(overrides)
     return rc.build_plan(session, rc.load_floor_table(floor), **kwargs)
 
@@ -5982,7 +6020,11 @@ class TestS2RegisterBlockA:
             cls = s["demand_class"]
             r = grid.dist_budget_r if s["budget_r"] is None else s["budget_r"]
             assert cls["anchor_seq_tokens"] == 2694
-            assert abs(cls["demand_bytes"] - _ANCHOR_DEMAND * cls["seq_tokens"] / 2694) <= 1
+            # S2 block D DEC-D4 (owner 2026-11-01): the fixture table's demand
+            # scaled per class with the hybrid's fixed state unscaled (the
+            # fixture's concurrency_target 32); before block D the whole
+            # demand was scaled linearly
+            assert cls["demand_bytes"] == _hybrid_class_demand(_ANCHOR_DEMAND, cls["seq_tokens"], 2694, 32, "qwen3-next-80b")
             bp = s["budget_plan"]
             assert bp["r"] == r and bp["topology"] == "pd" and bp["pd_split"] == 0.5
             assert bp["budget_bytes_total"] == s["budget_bytes"] and abs(s["budget_bytes"] - r * cls["demand_bytes"]) < 1
@@ -6303,3 +6345,333 @@ class TestS2BlockCIdentityGate:
         assert code == 2 and not out.exists()
         err = capsys.readouterr().err
         assert "REFUSED" in err and "--identity-gate" in err
+
+
+def _pd_smoke_verdict(tmp_path: Path, verdict: str, *, session: str = "cd-act1", model: str = _IG_MODEL,
+                      name: str = "pd_smoke.json", **extra: Any) -> Path:
+    """A verdict file in the shape scripts/checks/pd_smoke.py writes."""
+    moved = verdict == "PASS"
+    delta = {"bytes_sum": 8 * 1_048_576 if moved else 0, "transfer_count": 8 if moved else 0, "failed_transfers": 0,
+             "failed_notifications": 0, "external_kv_tokens": 12_800 if moved else 0, "local_compute_tokens": 8,
+             "local_cache_hit_tokens": 0, "recomputed_tokens": 8, "preemptions": 0}
+    reasons = [] if moved else ["bytes_sum > 0 violated: 0 bytes moved", "transfer_count >= 8 violated: 0 transfer(s)"]
+    doc: Dict[str, Any] = {
+        "schema": rc.PD_SMOKE_SCHEMA, "adr": rc.PD_SMOKE_ADR, "verdict": verdict,
+        "error": "scrape of the decode at http://localhost:8200 failed" if verdict == "ERROR" else None,
+        "session": session, "model": model, "proxy_url": "http://localhost:8000",
+        "prefill_url": "http://localhost:8100", "decode_url": "http://localhost:8200",
+        "requests": [{"index": i, "stream": i % 2 == 1, "status": 200, "prompt_tokens": 1_601,
+                      "cached_tokens": 1_600 if moved else 0, "completion_tokens": 4, "ticket_ok": True,
+                      "ticket": {"do_remote_prefill": True, "remote_block_ids": [[1]]}} for i in range(8)],
+        "transfer": None if verdict == "ERROR" else {
+            "adr": "ADR-0134", "n_served_rows": 8, "prompt_tokens_sum": 8 * 1_601, "delta": delta,
+            "prefill_delta": {"kv_expired_reqs": 0}, "identities_hold": moved, "reasons": reasons, "verified": moved,
+        },
+        "control": None if verdict == "ERROR" else {"index": 8, "prompt_tokens": 1_601, "cached_tokens": 0,
+                                                     "no_transfer": True, "reasons": []},
+        "reasons": reasons, "generated_at_utc": "2026-11-01T00:00:00+00:00",
+    }
+    doc.update(extra)
+    p = tmp_path / name
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    return p
+
+
+class TestS2BlockDPdStack:
+    """S2 block D (MyDocs/RunPod/S2_BLOCK_D_SPEC_2026-11-01.md, approved as
+    recommended 2026-11-01): the PD stack's pins, the stage 0 PD env record,
+    the smoke verdict in the plan and the hybrid demand scaling."""
+
+    def test_pd_relaunches_pin_the_roles_to_consecutive_gpu_ranges(self, plan_cd_act1):
+        # DEC-D1 (a): roles (2, 2) partition the session's four serving GPUs,
+        # so every pd relaunch pins the prefill to 0,1 and the decode to 2,3;
+        # the launcher refuses one pinned role or an overlap, so both ride
+        # together, and the pins never reach a single-instance relaunch
+        rel = _relaunches(plan_cd_act1)
+        pd = [s for s in rel if s["topology"] == "pd"]
+        assert len(pd) == 20
+        for s in pd:
+            assert s["tp"] == 2 and s["env"]["CAGE_VLLM_TENSOR_PARALLEL"] == "2"
+            assert s["env"]["CAGE_PD_PREFILL_GPUS"] == "0,1"
+            assert s["env"]["CAGE_PD_DECODE_GPUS"] == "2,3"
+        for s in rel:
+            if s["topology"] != "pd":
+                assert not any(k.startswith("CAGE_PD_") for k in s["env"])
+
+    def test_roles_that_do_not_partition_the_serving_gpus_emit_no_pins(self, plan_b):
+        # session b registers roles (4, 4) on serving_tp 4: the roles do not
+        # partition the pod, so its pd env stays as before block D (the W4.6
+        # byte-identity of pre-S2 plans) and the launcher's shared rule stands
+        pd = [s for s in _relaunches(plan_b) if s["topology"] == "pd"]
+        assert len(pd) == 2
+        for s in pd:
+            assert s["env"]["CAGE_VLLM_TENSOR_PARALLEL"] == "4"
+            assert "CAGE_PD_PREFILL_GPUS" not in s["env"] and "CAGE_PD_DECODE_GPUS" not in s["env"]
+
+    def test_the_registration_report_carries_the_control_rung_pd_env(self):
+        # DEC-D3: stage 0 records the env the stage 4 smoke starts the stack
+        # with: the pd record of the anchor class at the registered control
+        # rung, exactly what that class's pd relaunch carries (one derivation)
+        kw: Dict[str, Any] = dict(query_manifests={"musique": str(_S2_MUSIQUE_MANIFEST)}, charter_datasets=("musique",),
+                                  floor_concurrency=50, gpu_id="NVIDIA H200")
+        cd = rc.preflight_registration_check("cd-act1", floor_avg_seq_tokens="2694", **kw)
+        s2a = rc.preflight_registration_check("s2a", floor_avg_seq_tokens=str(_S2_ANCHOR_SEQ_TOKENS["s2a"]), **kw)
+        assert cd["pd_cells"] is True
+        assert s2a["pd_cells"] is False and s2a["pd_env"] is None
+        rec = cd["pd_env"]
+        assert (rec["engine"], rec["budget_r"], rec["seq_tokens"], rec["tp"]) == ("vllm", 1.0, 2694, 2)
+        env = rec["env"]
+        # the anchor class at r = 1.0 is the floor demand itself (ADR-0155:
+        # ratio 1), split 0.5 exact-sum, per-rank slices at role TP 2
+        d = rc.demand_bytes("qwen3-next-80b", concurrency=50, avg_seq_tokens=2694)
+        assert rec["planned_bytes"] == d == 5_302_681_600
+        assert int(env["CAGE_KV_BUDGET_BYTES_PREFILL"]) == (d // 2) // 2 == 1_325_670_400
+        assert int(env["CAGE_KV_BUDGET_BYTES_DECODE"]) == (d - d // 2) // 2 == 1_325_670_400
+        assert env["CAGE_TELEMETRY_ENDPOINTS"] == rc.PD_TELEMETRY_ENDPOINTS
+        assert env["CAGE_VLLM_TENSOR_PARALLEL"] == "2"
+        assert env["CAGE_PD_PREFILL_GPUS"] == "0,1" and env["CAGE_PD_DECODE_GPUS"] == "2,3"
+        grid = rc.get_session_grid("cd-act1")
+        assert env["VLLM_MAX_MODEL_LEN"] == str(rc.request_cap_tokens(grid, 2694))
+        assert (env["CAGE_PD_PROXY_PORT"], env["CAGE_PD_PREFILL_PORT"], env["CAGE_PD_DECODE_PORT"]) == ("8000", "8100", "8200")
+        assert cd["problems"] == [p for p in cd["problems"] if "smoke" not in p]
+        # without the floor concurrency no Mac-side record exists: the env is
+        # absent, never half-derived
+        bare = rc.preflight_registration_check("cd-act1", floor_avg_seq_tokens="2694",
+                                               query_manifests=kw["query_manifests"], charter_datasets=("musique",))
+        assert bare["pd_cells"] is True and bare["pd_env"] is None
+
+    # -- DEC-D4 (a): the hybrid's fixed recurrent state is not scaled by length --
+
+    def test_class_demand_carries_the_fixed_state_unscaled(self):
+        # ADR-0155 amended (ADR-0182): D_class = (D_floor - F) x s // s_anchor + F,
+        # F = concurrency x fixed_state_bytes_per_seq (the 38 MiB recurrent
+        # slot of Qwen3-Next); the exact demand at the class length is the oracle
+        d_floor = rc.demand_bytes("qwen3-next-80b", concurrency=50, avg_seq_tokens=2694)
+        fixed = 50 * rc.MODEL_KV["qwen3-next-80b"].fixed_state_bytes_per_seq
+        assert (d_floor, fixed) == (5_302_681_600, 1_992_294_400)
+        want = {2694: 5_302_681_600, 2387: 4_925_440_000, 2386: 4_924_211_200, 517: 2_627_584_000, 506: 2_614_067_200}
+        for s, exact in want.items():
+            got = rc._class_demand_bytes(d_floor, s, 2694, fixed)
+            assert got == exact == rc.demand_bytes("qwen3-next-80b", concurrency=50, avg_seq_tokens=s)
+        # the linear rule as coded before block D understated the short classes
+        assert rc._class_demand_bytes(d_floor, 517, 2694) == 1_017_626_721
+        # a dense model has no fixed part: the linear rule, unchanged
+        d14 = rc.demand_bytes("qwen3-14b", concurrency=50, avg_seq_tokens=4779)
+        assert rc._class_demand_bytes(d14, 348, 4779, 0) == d14 * 348 // 4779
+        assert rc._class_demand_bytes(d14, 348, 4779, 0) == rc.demand_bytes("qwen3-14b", concurrency=50, avg_seq_tokens=348)
+
+    def test_the_hybrid_plan_sizes_every_class_on_its_exact_demand(self, tmp_path):
+        # a cd-act1 floor table at the hybrid's own D_floor: every budgeted
+        # relaunch and cell records the exact demand of its class. Measured
+        # here at concurrency 400: the real c = 50 table refuses in build_plan
+        # on the anchor class at r = 0.25 (each PD role pool holds 26,970
+        # tokens against the 32,768 cap: owner item G10, unchanged by D-4)
+        c = 400
+        d_floor = rc.demand_bytes("qwen3-next-80b", concurrency=c, avg_seq_tokens=2694)
+        plan = _s2_plan("cd-act1", tmp_path, floor_demand_bytes=d_floor, floor_concurrency_target=c)
+        seen = set()
+        for s in _relaunches(plan) + _cells(plan):
+            cls = s.get("demand_class")
+            if not cls or cls["demand_bytes"] is None:
+                continue
+            assert cls["demand_bytes"] == rc.demand_bytes("qwen3-next-80b", concurrency=c, avg_seq_tokens=cls["seq_tokens"])
+            seen.add(cls["seq_tokens"])
+        assert seen == {2694, 2387, 2386, 517, 506}
+        # the control rung of a short class now holds that class's whole demand
+        short = [s for s in _relaunches(plan) if s["topology"] == "pd" and s["budget_r"] == 1.0
+                 and s["demand_class"]["seq_tokens"] == 517]
+        assert len(short) == 1
+        assert short[0]["budget_bytes"] == rc.demand_bytes("qwen3-next-80b", concurrency=c, avg_seq_tokens=517)
+        assert short[0]["budget_bytes"] == 21_020_672_000
+
+    def test_a_hybrid_floor_table_without_the_concurrency_is_refused(self, tmp_path):
+        with pytest.raises(rc.PlanError, match="concurrency_target"):
+            _s2_plan("cd-act1", tmp_path, floor_concurrency_target=None)
+        # the dense 70B session scales linearly and needs no concurrency: unchanged
+        plan = _s2_plan("s2a", tmp_path, floor_concurrency_target=None)
+        assert plan["counts"]["cells"] > 0
+
+    # ---- DEC-D2 / DEC-D6: the plan reads the stage 4 PD smoke verdict ----
+
+    def test_a_pd_session_plans_only_against_its_own_smoke_verdict(self, tmp_path):
+        with pytest.raises(rc.PlanError, match="--pd-smoke"):
+            _s2_plan("cd-act1", tmp_path, pd_smoke=None)
+        with pytest.raises(rc.PlanError, match="not cd-act1|for session 's2a'"):
+            _s2_plan("cd-act1", tmp_path, pd_smoke=rc.load_pd_smoke(_pd_smoke_verdict(tmp_path, "PASS", session="s2a")))
+        with pytest.raises(rc.PlanError, match="model"):
+            _s2_plan("cd-act1", tmp_path, pd_smoke=rc.load_pd_smoke(
+                _pd_smoke_verdict(tmp_path, "PASS", model="Qwen/Qwen3-14B")))
+        # a session without a pd cell refuses a verdict: no cell reads it
+        s2a_model = rc.HF_ID_OF_SLUG[rc.get_session_grid("s2a").model]
+        with pytest.raises(rc.PlanError, match="--pd-smoke is refused"):
+            _s2_plan("s2a", tmp_path, pd_smoke=rc.load_pd_smoke(
+                _pd_smoke_verdict(tmp_path, "PASS", session="s2a", model=s2a_model)))
+
+    def test_a_fail_smoke_refuses_without_the_owner_acceptance(self, tmp_path):
+        with pytest.raises(rc.PlanError, match="--accept-pd-fail"):
+            _s2_plan("cd-act1", tmp_path, pd_smoke=rc.load_pd_smoke(_pd_smoke_verdict(tmp_path, "FAIL")))
+
+    def test_load_pd_smoke_is_fail_closed(self, tmp_path):
+        with pytest.raises(rc.PlanError, match="ERROR"):
+            rc.load_pd_smoke(_pd_smoke_verdict(tmp_path, "ERROR"))
+        with pytest.raises(rc.PlanError, match="not found"):
+            rc.load_pd_smoke(tmp_path / "absent.json")
+        bad = tmp_path / "bad.json"
+        bad.write_text("{not json", encoding="utf-8")
+        with pytest.raises(rc.PlanError, match="not valid JSON"):
+            rc.load_pd_smoke(bad)
+        with pytest.raises(rc.PlanError, match="schema"):
+            rc.load_pd_smoke(_pd_smoke_verdict(tmp_path, "PASS", name="other.json", schema="something-else"))
+        with pytest.raises(rc.PlanError, match="not PASS or FAIL"):
+            rc.load_pd_smoke(_pd_smoke_verdict(tmp_path, "MAYBE", name="maybe.json"))
+        rec = rc.load_pd_smoke(_pd_smoke_verdict(tmp_path, "PASS"))
+        raw = (tmp_path / "pd_smoke.json").read_bytes()
+        assert rec["path"] == str(tmp_path / "pd_smoke.json")
+        assert rec["sha256"] == hashlib.sha256(raw).hexdigest() and rec["verdict"] == "PASS"
+
+    def test_the_smoke_script_and_the_plan_share_the_schema(self):
+        spec = importlib.util.spec_from_file_location("cage_pd_smoke_for_plan", REPO_ROOT / "scripts" / "checks" / "pd_smoke.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        assert mod.SCHEMA == rc.PD_SMOKE_SCHEMA and mod.ADR == rc.PD_SMOKE_ADR
+        # the smoke's default urls are the planner's port table (manage_vllm_pd.sh serves them)
+        assert (mod.DEFAULT_PROXY_URL, mod.DEFAULT_PREFILL_URL, mod.DEFAULT_DECODE_URL) == (
+            f"http://localhost:{rc.PD_PROXY_PORT}", f"http://localhost:{rc.PD_PREFILL_PORT}",
+            f"http://localhost:{rc.PD_DECODE_PORT}")
+
+    def test_a_pass_smoke_keeps_every_pd_cell_and_records_the_header(self, plan_cd_act1, plan_s2a):
+        ps = plan_cd_act1["pd_smoke"]
+        assert ps["verdict"] == "PASS" and ps["accepted_fail"] is False and ps["blocked_on"] is None
+        assert ps["excluded_row_keys"] == [] and ps["adr"] == "ADR-0182"
+        assert ps["path"].endswith("pd_smoke.json") and re.fullmatch(r"[0-9a-f]{64}", ps["sha256"])
+        assert ps["session"] == "cd-act1" and ps["model"] == _IG_MODEL
+        assert ps["requests"] == 8 and ps["control_no_transfer"] is True and ps["reasons"] == []
+        assert ps["transfer"] == {"verified": True, "n_served_rows": 8, "bytes_sum": 8 * 1_048_576,
+                                  "transfer_count": 8, "failed_transfers": 0, "external_kv_tokens": 12_800}
+        pd_rows = [s for s in _s2_rows(plan_cd_act1) if s["cellspec"]["topology"] == "pd"]
+        assert len(pd_rows) == 35 and all(s["blocked_on"] is None for s in pd_rows)
+        assert not any(s["blocked_on"] == rc.PD_SMOKE_BLOCKED_ON for s in _cells(plan_cd_act1))
+        # a session without a pd cell carries the key as None, never absent
+        assert "pd_smoke" in plan_s2a and plan_s2a["pd_smoke"] is None
+
+    def test_an_accepted_fail_excludes_every_pd_cell(self, tmp_path, plan_cd_act1):
+        plan = _s2_plan("cd-act1", tmp_path, pd_smoke=rc.load_pd_smoke(_pd_smoke_verdict(tmp_path, "FAIL")),
+                        accept_pd_fail=True)
+        rows = _s2_rows(plan)
+        pd_keys = sorted(s["row_key"] for s in rows if s["cellspec"]["topology"] == "pd")
+        assert len(pd_keys) == 35, "the 30 Z1 cells (5 arms x 3 rungs x 2 loads) and the 5 no-load pd references"
+        blocked = {s["row_key"]: s["blocked_on"] for s in rows}
+        assert {blocked[k] for k in pd_keys} == {rc.PD_SMOKE_BLOCKED_ON}
+        # every other row keeps the reason it had under the PASS plan
+        before = {s["row_key"]: s["blocked_on"] for s in _s2_rows(plan_cd_act1)}
+        assert all(blocked[k] == before[k] for k in blocked if k not in pd_keys)
+        assert plan["counts"]["blocked"] == plan_cd_act1["counts"]["blocked"] + 35
+        assert sorted(plan["blocked_row_keys"]) == sorted(plan_cd_act1["blocked_row_keys"] + pd_keys)
+        # no pd relaunch is planned any more: the stack never starts
+        assert not any(r["topology"] == "pd" for r in _relaunches(plan))
+        assert any(r["topology"] == "pd" for r in _relaunches(plan_cd_act1))
+        ps = plan["pd_smoke"]
+        assert ps["verdict"] == "FAIL" and ps["accepted_fail"] is True and ps["blocked_on"] == rc.PD_SMOKE_BLOCKED_ON
+        assert ps["excluded_row_keys"] == pd_keys and ps["transfer"]["verified"] is False
+        assert ps["reasons"] == ["bytes_sum > 0 violated: 0 bytes moved", "transfer_count >= 8 violated: 0 transfer(s)"]
+        # the blocked pd rows leave the identity-gated list (they no longer run)
+        gone = set(plan_cd_act1["identity_gated_row_keys"]) - set(plan["identity_gated_row_keys"])
+        assert gone == {k for k in pd_keys if k in plan_cd_act1["identity_gated_row_keys"]} and gone
+        # no pd cell carries the twin-rate note: the header's pd_rates is None
+        assert plan["pd_rates"] is None
+        out = tmp_path / "plan_pd_fail.json"
+        out.write_text(json.dumps(plan), encoding="utf-8")
+        loaded = rc.load_plan(out)
+        assert loaded["pd_smoke"] == plan["pd_smoke"] and loaded["blocked_row_keys"] == plan["blocked_row_keys"]
+
+    def test_the_cli_refuses_a_pd_session_without_the_smoke_verdict(self, tmp_path, capsys):
+        grid = rc.get_session_grid("cd-act1")
+        doc = _floor_table_doc(model=grid.model, grid="reduced", r_values=(1.0, 0.5, 0.25))
+        doc["generated_inputs"]["avg_seq_tokens"] = _S2_ANCHOR_SEQ_TOKENS["cd-act1"]
+        floor = tmp_path / "floor.json"
+        floor.write_text(json.dumps(doc), encoding="utf-8")
+        out = tmp_path / "plan.json"
+        base = ["plan", "--session", "cd-act1", "--floor-table", str(floor), "--window-duration-s", "300",
+                "--out", str(out), "--identity-gate", str(_identity_verdict(tmp_path, "PASS"))]
+        code = rc.main([*base, "--pd-smoke", str(tmp_path / "absent.json")])
+        assert code == 2 and not out.exists()
+        assert "REFUSED" in capsys.readouterr().err
+        code = rc.main(base)
+        assert code == 2 and not out.exists()
+        err = capsys.readouterr().err
+        assert "REFUSED" in err and "--pd-smoke" in err
+
+    # ---- DEC-D5 (a): the pd cells ride the vLLM TP=4 twin's rate, recorded ----
+
+    @pytest.mark.parametrize("name", rc.PD_ROLE_GPU_ENVS)
+    def test_run_refuses_ambient_pd_role_pins(self, tmp_path, floor_table, stub, monkeypatch, name):
+        # review 2026-11-01 LOW 5: the role pins are pd step facts (DEC-D1); an
+        # exported pair would reach the launcher of a grid that emits none
+        # (session b's (4, 4) roles), so run refuses them on presence like the
+        # cell pins, before anything executes
+        monkeypatch.setenv(name, "0")
+        plan = _stub_plan(_tiny_grid(), floor_table, stub.cmd)
+        with pytest.raises(rc.RunError, match=name):
+            rc.run_plan(plan, _run_root(tmp_path))
+        assert stub.calls() == [], "nothing may execute under an exported role pin"
+
+    def test_both_accepted_fails_block_every_pd_row_and_record_the_split(self, tmp_path):
+        # review 2026-11-01 LOW 7, pinned as designed: the identity exclusion runs
+        # first, so under both acceptances the PD header lists only the pd rows the
+        # identity verdict had not already blocked; every pd row is blocked either way
+        plan = _s2_plan("cd-act1", tmp_path,
+                        identity_gate=rc.load_identity_gate(_identity_verdict(tmp_path, "FAIL")),
+                        accept_identity_fail=True,
+                        pd_smoke=rc.load_pd_smoke(_pd_smoke_verdict(tmp_path, "FAIL")), accept_pd_fail=True)
+        rows = _s2_rows(plan)
+        pd_keys = {s["row_key"] for s in rows if s["cellspec"]["topology"] == "pd"}
+        blocked = {s["row_key"]: s["blocked_on"] for s in rows}
+        assert len(pd_keys) == 35 and all(blocked[k] for k in pd_keys)
+        ig_keys = set(plan["identity_gate"]["excluded_row_keys"])
+        ps_keys = set(plan["pd_smoke"]["excluded_row_keys"])
+        assert pd_keys & ig_keys, "some pd rows are identity gated (the prefix-on arms)"
+        assert ps_keys == pd_keys - ig_keys and ps_keys
+        assert {blocked[k] for k in ps_keys} == {rc.PD_SMOKE_BLOCKED_ON}
+        assert {blocked[k] for k in pd_keys & ig_keys} == {rc.IDENTITY_GATE_BLOCKED_ON}
+        assert not any(r["topology"] == "pd" for r in _relaunches(plan))
+
+    def test_a_pd_session_without_a_control_rung_pd_record_is_refused_at_stage_0(self, monkeypatch):
+        # the planner side of the master's "no PD_ENV line" refusal: the Mac-side
+        # derivation found no pd relaunch of the anchor class at the control rung
+        # (review 2026-11-01 LOW 9: the problem string had no test)
+        monkeypatch.setattr(rc, "pd_smoke_env", lambda grid, steps: None)
+        kw: Dict[str, Any] = dict(query_manifests={"musique": str(_S2_MUSIQUE_MANIFEST)}, charter_datasets=("musique",),
+                                  floor_concurrency=50, gpu_id="NVIDIA H200")
+        cd = rc.preflight_registration_check("cd-act1", floor_avg_seq_tokens="2694", **kw)
+        assert cd["pd_cells"] is True and cd["pd_env"] is None
+        assert any("no pd relaunch of the anchor class" in p for p in cd["problems"]), cd["problems"]
+
+    def test_pd_cells_record_the_tp_twin_ladder_as_their_rate_source(self, plan_cd_act1, plan_s2a):
+        rows = _s2_rows(plan_cd_act1)
+        pd_all = [s for s in rows if s["cellspec"]["topology"] == "pd" and s["blocked_on"] is None]
+        # the 5 no-load references offer no rate and carry no note; the 30
+        # Z1 pressure cells (5 arms x 3 rungs x 2 loads) carry it
+        refs = [s for s in pd_all if s["cellspec"]["rate_frac"] is None]
+        pd_rows = [s for s in pd_all if s["cellspec"]["rate_frac"] is not None]
+        assert (len(refs), len(pd_rows)) == (5, 30)
+        assert all(s["rate_source"] is None for s in refs)
+        twins = {}
+        for s in rows:
+            c = s["cellspec"]
+            if c["topology"] != "pd" and c["engine"] == "vllm":
+                twins[(s["baseline"], s["dataset"], c["budget_r"], c["rate_frac"], s["serving"]["prefix_mode"])] = s
+        for s in pd_rows:
+            c = s["cellspec"]
+            src = s["rate_source"]
+            assert src["kind"] == "tp-twin-ladder" and src["engine"] == "vllm" and src["ladder_tp"] == 4
+            assert src["r"] == c["budget_r"] and src["lambda_star_qps"] == s["lambda_star_rps"]
+            assert "TP=4" in src["limitation"] and "ADR-0182" in src["limitation"]
+            twin = twins[(s["baseline"], s["dataset"], c["budget_r"], c["rate_frac"], s["serving"]["prefix_mode"])]
+            assert s["offered_rate_rps"] == twin["offered_rate_rps"], "the pd cell is offered its TP=4 twin's rate"
+            assert twin["rate_source"] is None
+        pr = plan_cd_act1["pd_rates"]
+        assert pr["kind"] == "tp-twin-ladder" and pr["engine"] == "vllm" and pr["ladder_tp"] == 4
+        assert pr["cells"] == sorted(s["row_key"] for s in pd_rows) and pr["adr"] == "ADR-0182"
+        assert pr["limitation"] == pd_rows[0]["rate_source"]["limitation"]
+        assert "pd_rates" in plan_s2a and plan_s2a["pd_rates"] is None
+

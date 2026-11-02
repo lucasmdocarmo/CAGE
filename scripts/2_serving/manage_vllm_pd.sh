@@ -14,6 +14,8 @@
 #
 # Usage:
 #   ./scripts/2_serving/manage_vllm_pd.sh start <model> [--no-prefix-cache]
+#   (a prefix-on start of a Qwen/Qwen3-Next-* model adds `--mamba-cache-mode
+#    align` to both role instances: the single launcher's rule, S2 block D)
 #   ./scripts/2_serving/manage_vllm_pd.sh stop
 #   ./scripts/2_serving/manage_vllm_pd.sh status
 #   (no restart verb: `start` is self-cleaning — it tears down any prior pd
@@ -504,11 +506,23 @@ wait_for_roles() {
 
 compose_role_args() {
     # $1 = role (prefill|decode), $2 = port, $3 = kv-transfer JSON, $4 = byte
-    # budget, $5 = cache flag. Emits the argv into the global array ROLE_ARGS.
-    # Mirrors manage_vllm_server.sh's composition (uniform regime, array form
-    # so the connector JSON is never word-split).
-    local role="$1" port="$2" kv_cfg="$3" budget="$4" cache_flag="$5"
+    # budget, $5 = cache flag, $6 = model. Emits the argv into the global
+    # array ROLE_ARGS. Mirrors manage_vllm_server.sh's composition (uniform
+    # regime, array form so the connector JSON is never word-split).
+    local role="$1" port="$2" kv_cfg="$3" budget="$4" cache_flag="$5" model="$6"
     ROLE_ARGS=( --port "$port" "$cache_flag" --trust-remote-code )
+    # S2 block D (block C review MEDIUM 2, owner 2026-11-01): the single
+    # launcher's rule on both role instances. vLLM 0.19.1 serves Qwen3-Next
+    # (the hybrid Gated DeltaNet + attention 80B of cd-act1) with prefix
+    # caching only under --mamba-cache-mode align (the "all" mode raises
+    # NotImplementedError); emitted here, never left to an engine fallback, so
+    # the per-role capture names the mode the gated PD rows ran in. A
+    # prefix-off start and a dense model pass no mode.
+    if [ "$cache_flag" = "--enable-prefix-caching" ]; then
+        case "$model" in
+            Qwen/Qwen3-Next-*) ROLE_ARGS+=( --mamba-cache-mode align ) ;;
+        esac
+    fi
     # W29 (live L40S 2026-09-27): vLLM 0.19.1 has no --disable-log-requests; request
     # logging is off unless --enable-log-requests (mirrors manage_vllm_server.sh:
     # VLLM_DISABLE_LOG_REQUESTS=0 keeps the logs, anything else passes no flag).
@@ -683,7 +697,7 @@ start_stack() {
     local -a ROLE_ARGS
 
     compose_role_args prefill "$PREFILL_PORT" "$PREFILL_KV_TRANSFER_CONFIG" \
-        "$CAGE_KV_BUDGET_BYTES_PREFILL" "$cache_flag"
+        "$CAGE_KV_BUDGET_BYTES_PREFILL" "$cache_flag" "$model"
     local -a prefill_args=( "${ROLE_ARGS[@]}" )
     echo "Server args [prefill]: vllm serve $model ${prefill_args[*]}"
     capture_role_config prefill "$model" "$PREFILL_PORT" "$PREFILL_KV_TRANSFER_CONFIG" \
@@ -694,7 +708,7 @@ start_stack() {
     echo "Prefill PID: $(cat "$PREFILL_PID_FILE") (pidfile: $PREFILL_PID_FILE)"
 
     compose_role_args decode "$DECODE_PORT" "$DECODE_KV_TRANSFER_CONFIG" \
-        "$CAGE_KV_BUDGET_BYTES_DECODE" "$cache_flag"
+        "$CAGE_KV_BUDGET_BYTES_DECODE" "$cache_flag" "$model"
     local -a decode_args=( "${ROLE_ARGS[@]}" )
     echo "Server args [decode]: vllm serve $model ${decode_args[*]}"
     capture_role_config decode "$model" "$DECODE_PORT" "$DECODE_KV_TRANSFER_CONFIG" \
