@@ -1844,6 +1844,53 @@ def select_manifest_prefix(
     return list(selected[:num_queries])
 
 
+def select_manifest_union(
+    manifest: Dict[str, Any],
+    *,
+    examples: Sequence[CAGExample],
+) -> List[CAGExample]:
+    """Every id of EVERY manifest trial, once, in manifest order (trials in
+    numeric order, each trial's ids in its listed order, first sighting wins).
+
+    S2 block F row F-6 (2026-11-03): the retrieval corpus is built over this
+    union, not over the measured prefix, so every cell of a dataset searches
+    ONE document set whatever its registered N or its trial (S1 served two
+    corpora per dataset because the corpus followed each window's N). The
+    measured set stays ``select_manifest_prefix``. Refuses
+    (``QueryCountError``) when the manifest carries no trial or a trial lists
+    an id the loaded split lacks (dataset/split mismatch, via
+    ``select_examples``).
+    """
+    from src.data.manifest import ManifestError, select_examples
+
+    trials = manifest.get("trials") or {}
+    if not trials:
+        raise QueryCountError("query manifest has no trial (empty 'trials')")
+    try:
+        order = sorted(trials, key=int)
+    except ValueError as exc:
+        raise QueryCountError(
+            f"query manifest trial keys must be integers, got {sorted(trials)}"
+        ) from exc
+    seen: set = set()
+    union: List[CAGExample] = []
+    for trial in order:
+        if not isinstance(trials[trial], list):
+            raise QueryCountError(
+                f"query manifest trial {trial} must be a list of ids, "
+                f"got {type(trials[trial]).__name__}"
+            )
+        try:
+            selected = select_examples(manifest, int(trial), examples)
+        except ManifestError as exc:
+            raise QueryCountError(f"query manifest trial {trial}: {exc}") from exc
+        for ex in selected:
+            if ex.id not in seen:
+                seen.add(ex.id)
+                union.append(ex)
+    return union
+
+
 def resolve_corpus_serving(
     *,
     corpus_budget: int,
@@ -3492,25 +3539,42 @@ def run_experiment(
         else:
             print(f"\nBuilding/loading IR index(es) for retriever={retriever}...")
         base_dir = Path(baseline_config.ir_index_dir)
-        corpus_docs = build_corpus_from_contexts(base_examples, dataset_name=dataset)
+        # S2 block F row F-6 (2026-11-03): in manifest mode the corpus is
+        # built over the UNION of every trial's ids, so every cell of a
+        # dataset searches ONE document set whatever its N or trial (S1
+        # served two corpora per dataset, Qasper 3,587 documents at N 300
+        # against 4,068 at N >= 500, S1 report section 14). The measured set
+        # (base_examples) stays the A9 prefix. Without a manifest the pilot
+        # path keeps its corpus over the measured set. One ad hoc pilot
+        # combination changes with the union: a manifest run that pairs
+        # --corpus-prefix-budget with a retrieval arm now indexes the union's
+        # raw paragraphs, not the budgeted block texts (no S2 cell reaches
+        # it: corpus arms carry no retriever; review LOW 2, 2026-11-03).
+        if _manifest is None:
+            _corpus_examples, _corpus_source = base_examples, "measured-set"
+        else:
+            _corpus_examples = select_manifest_union(_manifest, examples=pool)
+            _corpus_source = "manifest-union"
+        corpus_docs = build_corpus_from_contexts(_corpus_examples, dataset_name=dataset)
         # Decision 3B (approved pre-run package, 2026-07-16): widen the retrieval corpus
         # with a deterministic distractor pool so retrieval is a real search problem, not
         # a near-oracle lookup over only the trial's own gold paragraphs. Manifest mode
         # only (the uniform-yardstick path): `pool` above is already the FULL split loaded
         # in stable order, so distractor selection is seed-stable by construction. The
         # first CAGE_DISTRACTOR_DOCS (default 1000) content-deduped paragraphs are added,
-        # EXCLUDING the trial's gold paragraphs (both ex.context and the corpus-mode
-        # metadata gold_paragraphs). 0 disables (old behavior). The IR index content-hash
+        # EXCLUDING the corpus examples' gold paragraphs (the trial union since F-6; both
+        # ex.context and the corpus-mode metadata gold_paragraphs). 0 disables (old
+        # behavior). The IR index content-hash
         # (src/orchestration/ir.py corpus_doc_ids_sha1, checked by ensure_ir_index)
         # triggers the rebuild automatically when the corpus changes.
         _n_distractors = int(os.getenv("CAGE_DISTRACTOR_DOCS", "1000") or "0")
         if _manifest is not None and _n_distractors > 0:
             _gold_texts: List[str] = [
-                c for ex in base_examples for c in (ex.context or []) if c
+                c for ex in _corpus_examples for c in (ex.context or []) if c
             ]
             _gold_texts += [
                 g
-                for ex in base_examples
+                for ex in _corpus_examples
                 for g in ((ex.metadata or {}).get("gold_paragraphs") or [])
                 if g
             ]
@@ -3564,6 +3628,11 @@ def run_experiment(
                 "built": _build_s is not None,
                 "build_s": _build_s,
                 "device": encoder_device,
+                # F-6: which examples the corpus was built over, and how many
+                # ("manifest-union" = every trial's ids; "measured-set" = the
+                # pilot path without a manifest).
+                "corpus_source": _corpus_source,
+                "corpus_example_count": len(_corpus_examples),
             }
             print(f"IR index ready at: {index_dir}"
                   + (f" (built in {_build_s:.1f} s on {encoder_device})" if _build_s is not None else " (loaded)"))

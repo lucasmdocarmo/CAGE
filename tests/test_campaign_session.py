@@ -1375,3 +1375,53 @@ def test_from_cli_checks_a_new_runs_manifest_inputs_before_serving_o4(tmp_path: 
     # A run whose manifest exists needs none of them.
     _emit(_session(tmp_path, env=MANIFEST_ENV), tmp_path, 1)
     assert cs.CampaignCellSession.from_cli(_pressure_args(root), env=PRESSURE_ENV) is not None
+
+
+# ---------------------------------------------------------------------------
+# S2 block F row F-4: emit_window writes the window-bounded prefix-hit share
+# into engine_metrics.json beside the lifetime snapshot, from the same staged
+# telemetry series the regime referee reads.
+# ---------------------------------------------------------------------------
+
+
+def _counter_series(kv: float = 0.95) -> list[dict[str, Any]]:
+    """The canonical regime series plus cumulative prefix-cache counters:
+    queries 10, 20, 30, 40 and hits 4, 8, 12, 16 at ts 0..3, all inside the
+    [0, 4) test window, so the in-window delta is 30 queries and 12 hits."""
+    rows = [
+        {**rec, "prefix_cache_queries_total": 10 * (i + 1), "prefix_cache_hits_total": 4 * (i + 1)}
+        for i, rec in enumerate(_regime_series(kv))
+    ]
+    # one tick AT t_end (4.0, outside the half-open window): never an endpoint
+    rows.append({**rows[-1], "ts_s": 4.0, "prefix_cache_queries_total": 50, "prefix_cache_hits_total": 40})
+    return rows
+
+
+def _engine_metrics(handle: Any) -> dict[str, Any]:
+    return json.loads((handle.window_dir / "engine_metrics.json").read_text(encoding="utf-8"))
+
+
+def test_emit_window_records_the_window_bounded_prefix_hit_share(tmp_path: Path) -> None:
+    session = _session(tmp_path, env=MANIFEST_ENV, num_trials=2)
+    doc = _engine_metrics(_emit_regime(session, tmp_path, 1, series=_counter_series()))
+    assert doc["backend"] == {"server_version": "0.0-test"} and doc["vllm_telemetry"] is None
+    # review LOW 4: the key is NOT "prefix_hit_window", which cage-stats already
+    # uses for its own rolling rate on every tick and in the final snapshot
+    assert "prefix_hit_window" not in doc
+    single = doc["prefix_hit_window_delta"]["single"]
+    assert single["share"] == pytest.approx(12 / 30)
+    assert (single["delta_queries"], single["delta_hits"]) == (30, 12)
+    assert (single["first_ts_s"], single["last_ts_s"]) == (0.0, 3.0)
+    assert single["reason"] is None
+    # no staged series (hf, LMDeploy): the key is present, null, with the reason
+    doc = _engine_metrics(_emit_regime(session, tmp_path, 2))
+    assert doc["prefix_hit_window_delta"] == {
+        "single": {
+            "share": None, "delta_hits": None, "delta_queries": None,
+            "n_ticks_in_window": 0, "n_ticks_carrying": 0,
+            "first_ts_s": None, "last_ts_s": None,
+            "counters": ["prefix_cache_queries_total", "prefix_cache_hits_total"],
+            "reason": "no telemetry series",
+        }
+    }
+    assert cs.seal_campaign_run(session.run_root).is_file()

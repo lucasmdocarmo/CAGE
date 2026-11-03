@@ -344,6 +344,8 @@ def test_a_capped_retrieval_cell_keeps_its_uncapped_documents_and_frees_the_gpu_
     assert exp["ir_index"] == {
         "dir": str(built["dir"]), "corpus_sha1": exp["ir_index"]["corpus_sha1"],
         "num_documents": exp["ir_index"]["num_documents"], "built": True, "build_s": 0.25, "device": "cuda",
+        # S2 block F row F-6: no manifest, so the corpus is the measured set
+        "corpus_source": "measured-set", "corpus_example_count": layout.N_QUERIES,
     }
     assert built["dir"].name.endswith(exp["ir_index"]["corpus_sha1"][:12])
     # released once, after the measured preparation and before the first measured send

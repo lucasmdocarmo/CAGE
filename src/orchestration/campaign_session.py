@@ -114,6 +114,7 @@ from src.analysis.cellspec import (
 from typing import get_args as _get_args
 
 from src.analysis.stats.ledger import hash_artifacts
+from src.monitoring.vllm_telemetry import window_prefix_hit_delta
 from src.orchestration.cache_budget import KV_DTYPE_FACTOR
 
 __all__ = [
@@ -1560,6 +1561,18 @@ class CampaignCellSession:
                 "backend": dict(backend_metadata),
                 "vllm_telemetry": (
                     dict(telemetry_snapshot) if telemetry_snapshot is not None else None
+                ),
+                # S2 block F row F-4: the engine-side prefix-cache hit share
+                # bounded to THIS window, per instance role, from the same
+                # staged series the regime referee reads below. The lifetime
+                # quotient in the snapshot above counts the warm-up pool and
+                # every earlier window of the process; this one counts the
+                # window. Null with a named reason when uncomputable. Named
+                # "_delta" because cage-stats already writes a
+                # "prefix_hit_window" (its rolling rate) on every tick and in
+                # the final snapshot of this same file.
+                "prefix_hit_window_delta": window_prefix_hit_delta(
+                    cage_stats_rows, float(t_start), float(t_end)
                 ),
             }
         )

@@ -617,6 +617,97 @@ def save_merged_series(samplers: "list[VllmTelemetrySampler]", path: str) -> Opt
     return path
 
 
+#: S2 block F row F-4 (2026-11-03): the raw cumulative prefix-cache counters
+#: the sampler records on every tick (None when the engine's metrics dialect
+#: maps no prefix-cache counter family, as SGLang's does). The names are the
+#: ones src/analysis/dist_contrasts reads (QUERIES_FIELD / HITS_FIELD); a test
+#: pins the two modules together so this one stays free of pandas.
+PREFIX_QUERIES_FIELD = "prefix_cache_queries_total"
+PREFIX_HITS_FIELD = "prefix_cache_hits_total"
+
+
+def _prefix_hit_null(reason: str, **fields) -> dict:
+    out = {
+        "share": None, "delta_hits": None, "delta_queries": None,
+        "n_ticks_in_window": 0, "n_ticks_carrying": 0,
+        "first_ts_s": None, "last_ts_s": None,
+        "counters": [PREFIX_QUERIES_FIELD, PREFIX_HITS_FIELD],
+        "reason": reason,
+    }
+    out.update(fields)
+    return out
+
+
+def window_prefix_hit_delta(records, t_start: float, t_end: float) -> "dict[str, dict]":
+    """The engine-side prefix-cache hit share of ONE window, per instance role.
+
+    share = (hits_last - hits_first) / (queries_last - queries_first) between
+    the first and last sampler tick INSIDE [t_start, t_end) (the regime
+    bridge's half-open window on the sampler's ``ts_s`` clock) that carries
+    both raw cumulative counters, ticks ordered by ``ts_s``. The lifetime
+    quotient in the sampler's final snapshot counts the warm-up pool and every
+    earlier window of the engine process; this delta counts the window only.
+
+    Written at emission time, so it NEVER raises: every case it cannot
+    compute is a null share with a named ``reason`` (no series at all under
+    the reserved role "single"; no tick inside the window; no in-window tick
+    carrying both counters, the SGLang dialect; a single carrying tick; a
+    counter running backwards; hits above queries; a zero query delta). A
+    non-finite or non-numeric counter value is a tick that carries nothing.
+    A record without ``instance`` is a legacy single-instance record.
+    """
+    by_role: "dict[str, list]" = {}
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        role = rec.get("instance")
+        role = role if isinstance(role, str) and role else "single"
+        by_role.setdefault(role, []).append(rec)
+    if not by_role:
+        return {"single": _prefix_hit_null("no telemetry series")}
+    out: "dict[str, dict]" = {}
+    for role, ticks in by_role.items():
+        inside = sorted(
+            (r for r in ticks if _is_number(r.get("ts_s")) and t_start <= r["ts_s"] < t_end),
+            key=lambda r: r["ts_s"],
+        )
+        if not inside:
+            out[role] = _prefix_hit_null("no telemetry tick inside [t_start, t_end)")
+            continue
+        carrying = [
+            r for r in inside
+            if _is_number(r.get(PREFIX_QUERIES_FIELD)) and _is_number(r.get(PREFIX_HITS_FIELD))
+        ]
+        counts = {"n_ticks_in_window": len(inside), "n_ticks_carrying": len(carrying)}
+        if not carrying:
+            out[role] = _prefix_hit_null(
+                "no in-window tick carries both counters (the engine's metrics "
+                "dialect maps no prefix-cache counter family)", **counts,
+            )
+            continue
+        if len(carrying) < 2:
+            out[role] = _prefix_hit_null("a single carrying tick has no delta", **counts)
+            continue
+        first, last = carrying[0], carrying[-1]
+        dq = last[PREFIX_QUERIES_FIELD] - first[PREFIX_QUERIES_FIELD]
+        dh = last[PREFIX_HITS_FIELD] - first[PREFIX_HITS_FIELD]
+        span = {
+            **counts, "delta_hits": dh, "delta_queries": dq,
+            "first_ts_s": first["ts_s"], "last_ts_s": last["ts_s"],
+        }
+        if dq < 0 or dh < 0:
+            out[role] = _prefix_hit_null(
+                "a cumulative counter ran backwards (engine restart or series mis-order)", **span,
+            )
+        elif dh > dq:
+            out[role] = _prefix_hit_null("hits exceed queries (a share above 1 is unphysical)", **span)
+        elif dq == 0:
+            out[role] = _prefix_hit_null("zero query delta (no counted traffic inside the window)", **span)
+        else:
+            out[role] = {**_prefix_hit_null(None, **span), "share": dh / dq}
+    return out
+
+
 def dashboard_text(
     url: str,
     *,
@@ -784,7 +875,12 @@ _PD_GATE_KEYS = ("failed_transfers", "failed_notifications", "bytes_sum", "trans
 
 
 def _is_number(value) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:  # an int beyond the float range: not a usable counter
+        return False
 
 
 def read_counter_series(text: str, series: "dict[str, tuple[str, dict[str, str]]]") -> "dict[str, Optional[float]]":
