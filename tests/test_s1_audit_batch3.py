@@ -137,12 +137,16 @@ def test_the_gate_counts_in_regime_and_not_transient_per_group(tmp_path: Path) -
     res = regime_gate.evaluate(root, 2)
     assert res["n_windows"] == 8
     groups = res["groups"]
-    v = groups["vllm|retr-rerank|qasper|1.0|1.0"]
-    assert v == {"n_windows": 3, "n_qualifying": 2, "n_in_regime_transient": 1, "n_in_regime_stationarity_unknown": 1}
-    assert "vllm|retr-rerank|qasper|1.0|0.9" not in groups  # below the rate rung floor
-    s = groups["sglang|retr-rerank|qasper|1.0|1.0"]
+    # S2 block F row F-10 (2026-11-03): the key carries the retriever, policy and
+    # topology (B5 and B6 share an arm); the record names the cell's baseline
+    # (no cell.json in this tree), the mode, the gated load and the floor
+    v = groups["vllm|retr-rerank|rerank|none|single|qasper|1.0|1.0"]
+    assert v == {"n_windows": 3, "n_qualifying": 2, "n_in_regime_transient": 1, "n_in_regime_stationarity_unknown": 1,
+                 "baseline": None, "mode": "BLOCKING", "load": "1.0+", "need": 2}
+    assert "vllm|retr-rerank|rerank|none|single|qasper|1.0|0.9" not in groups  # below the rate rung floor
+    s = groups["sglang|retr-rerank|rerank|none|single|qasper|1.0|1.0"]
     assert s["n_qualifying"] == 1 and s["n_windows"] == 3
-    assert res["short"] == {"sglang|retr-rerank|qasper|1.0|1.0": 1} and res["ok"] is False
+    assert res["short"] == {"sglang|retr-rerank|rerank|none|single|qasper|1.0|1.0": 1} and res["ok"] is False
     assert res["by_pair"]["vllm F2"] == {"IN_REGIME": 3, "UNPRESSURED": 1}
     # the old per-engine count (3 IN_REGIME on vllm) would have passed need=2; E12 judges the group
     assert regime_gate.evaluate(root, 1)["ok"] is True
@@ -153,7 +157,7 @@ def test_an_engine_without_a_rung_at_the_floor_fails_when_the_criterion_is_set(t
     root = tmp_path / "run"
     _write_regime(root, _row_key("vllm", lam=0.9), "qasper", 1, "IN_REGIME", "stationary")
     res = regime_gate.evaluate(root, 2)
-    assert res["groups"] == {} and res["engines_without_a_rate_rung_at_or_above_floor"] == ["vllm"] and res["ok"] is False
+    assert res["groups"] == {} and res["engines_without_a_gated_load"] == ["vllm"] and res["ok"] is False
 
 
 def test_the_cli_exit_codes_and_table(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -164,7 +168,7 @@ def test_the_cli_exit_codes_and_table(tmp_path: Path, capsys: pytest.CaptureFixt
     assert "report only" in out
     assert regime_gate.main(["regime_gate.py", str(root), "2"]) == 1
     out = capsys.readouterr().out
-    assert "[FAIL] MIN_IN_REGIME_WINDOWS=2: group(s) below it: {'sglang|retr-rerank|qasper|1.0|1.0': 1}" in out
+    assert "[FAIL] MIN_IN_REGIME_WINDOWS=2: group(s) below it: {'sglang|retr-rerank|rerank|none|single|qasper|1.0|1.0': 1}" in out
     assert "qualifying=2/3 (in-regime but transient=1)" in out
     assert regime_gate.main(["regime_gate.py", str(root), "1"]) == 0
     assert regime_gate.main(["regime_gate.py", str(root), "x"]) == 2

@@ -302,7 +302,17 @@ def world(tmp_path: Path) -> Dict[str, Path]:
                 print("1 0.5"); sys.exit(0)
             if a and a[0] == "classes":  # B4: the demand classes the class floors run on
                 print("348,4779"); sys.exit(0)
-            print("REFUSED: fake Mac planner knows only 'rungs' and 'classes'", file=sys.stderr); sys.exit(2)
+            if a and a[0] == "regime-gate-projection":  # S2 block F row F-10: stage 0's $0 projection, under --plan too
+                import os as _os
+                def _opt(flag, default=""):
+                    return a[a.index(flag) + 1] if flag in a else default
+                if _os.environ.get("CAGE_TEST_PROJECTION_REFUSE"):
+                    print("REFUSED: MIN_IN_REGIME_WINDOWS=6 exceeds the 2 registered windows of vllm|gold-fresh|none|none|single|qasper|1.0|0.95 "
+                          "(BLOCKING; 30 such group(s)): the gate would fail the landing by construction", file=sys.stderr); sys.exit(2)
+                print(f"regime-gate projection session={_opt('--session')} loads={_opt('--loads', '1.0+')!r} floor={_opt('--min')!r} "
+                      f"roster={_opt('--confirmatory-arms') or '(empty: every group blocks)'} gated groups=0 blocking=0 descriptive=0 unresolved_load_cells=0")
+                sys.exit(0)
+            print("REFUSED: fake Mac planner knows only 'rungs', 'classes' and 'regime-gate-projection'", file=sys.stderr); sys.exit(2)
         '''.replace("__PD_ENV_JSON__", json.dumps(_PD_ENV, sort_keys=True)), exe=False)
     _w(fake_scripts / "4_analysis" / "build_floor_table.py", r'''
         import json, sys
@@ -363,6 +373,20 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         (out / "yield_table.csv").write_text("row_key,window_dir,goodput_frac\nk1,window_squad_v2-01,1.0\n", encoding="utf-8")
         (out / "yield_summary.md").write_text("# yield\n", encoding="utf-8")
         print("[yield_table] windows=1 records=1 skips=0", args); sys.exit(0)
+        ''', exe=False)
+    # S2 block F row F-7 (2026-11-03): the retrieval-stage sidebar, the same "0|3"
+    # contract as the yield table; the fake writes the two files and exits 0.
+    _w(fake_scripts / "4_analysis" / "retrieval_stage.py", r'''
+        import os, sys
+        from pathlib import Path
+        args = sys.argv[1:]
+        knob = int(os.environ.get("CAGE_TEST_RETRIEVAL_STAGE_RC", "0"))   # review L8: drive the "0|3" contract
+        if knob:
+            print(f"[retrieval_stage] {'REFUSED' if knob == 3 else 'ERROR'}: fake rc {knob}", file=sys.stderr); sys.exit(knob)
+        out = Path(args[args.index("--out") + 1]); out.mkdir(parents=True, exist_ok=True)
+        (out / "retrieval_stage.md").write_text("# Retrieval stage\n", encoding="utf-8")
+        (out / "retrieval_stage.json").write_text("{}", encoding="utf-8")
+        print("[retrieval_stage] groups=1 pairs=0 skipped_cells=0", args); sys.exit(0)
         ''', exe=False)
 
     # --- the fake pod repo (run by the fake ssh, locally) -------------------
@@ -3490,3 +3514,70 @@ def test_no_teardown_path_deletes_the_network_volume_static_contract() -> None:
     teardown = (root / "scripts/runpod/teardown_pod.sh").read_text(encoding="utf-8")
     assert 'runpodctl pod delete "$POD_ID"' in teardown
     assert "network-volume list" in teardown
+
+
+def test_stage_14_runs_the_retrieval_stage_sidebar_after_the_yield_table(world: Dict[str, Path]) -> None:
+    """S2 block F row F-7 (2026-11-03): stage 14 writes the retrieval-stage
+    sidebar right after the yield table, with the yield table's "0|3" contract
+    (the named refusal of a tree without an F1 retrieval window is printed and
+    does not fail the stage; rc 2 does)."""
+    proc = _master(world, "--plan")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "[plan] retrieval stage (F-7)" in proc.stdout
+    line = next(ln for ln in proc.stdout.splitlines() if "[plan] retrieval stage (F-7)" in ln)
+    assert "expect rc=0|3" in line and "4_analysis/retrieval_stage.py" in line and "--out" in line
+    assert proc.stdout.index("yield table (A1)") < proc.stdout.index("retrieval stage (F-7)") < proc.stdout.index("[plan] organize_results")
+    assert _master(world, "--yes", "provision", "--yes", "teardown").returncode == 0
+    land = world["exp_root"] / "S1" / DATE
+    outs = list(land.glob("plots/retrieval_stage_*/retrieval_stage.md"))
+    assert len(outs) == 1, outs
+    assert _state(world)["stages"]["analyze"]["status"] == "passed"
+
+
+def test_stage_0_runs_the_regime_gate_projection_under_plan_and_refuses_an_unmeetable_floor(world: Dict[str, Path]) -> None:
+    """S2 block F row F-10 (2026-11-03): the projection is pure, so stage 0 runs
+    it under --plan too (the dry proof carries the projected windows per gated
+    group) and a floor the registered grid cannot meet fails the plan at $0."""
+    proc = _master(world, "--plan")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "[plan] regime-gate projection (F-10)" in proc.stdout
+    assert "regime-gate projection session=a loads='1.0+' floor='' roster=(empty: every group blocks)" in proc.stdout
+    proc = _master(world, "--plan", CAGE_TEST_PROJECTION_REFUSE="1")
+    assert proc.returncode == 1, proc.stdout[-1500:] + proc.stderr[-800:]
+    assert "REFUSED: MIN_IN_REGIME_WINDOWS=6 exceeds the 2 registered windows of" in proc.stdout
+    assert "[FAIL] regime-gate projection (F-10)" in proc.stdout and "stage preflight-mac FAILED" in proc.stdout
+    proc = _master(world, "--to", "preflight-mac")
+    assert proc.returncode == 0, proc.stdout[-1500:] + proc.stderr[-800:]
+    assert "[step] regime-gate projection (F-10)" in proc.stdout
+    assert _state(world)["stages"]["preflight-mac"]["status"] == "passed"
+
+
+def test_stage_14_passes_the_loads_and_the_roster_to_the_gate(world: Dict[str, Path]) -> None:
+    """S2 block F row F-10 (2026-11-03): the gate and the projection read
+    REGIME_GATE_LOADS and CONFIRMATORY_ARMS from the profile (the defaults keep
+    the rule before F-10: loads "1.0+", every group blocking)."""
+    proc = _master(world, "--plan")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    line = next(ln for ln in proc.stdout.splitlines() if "[plan] regime label table (item 18, E12 rule)" in ln)
+    assert "regime_gate.py" in line and "--loads 1.0+ --confirmatory-arms ''" in line
+    with world["profile"].open("a", encoding="utf-8") as fh:
+        fh.write('\nREGIME_GATE_LOADS="0.95 1.05"\nMIN_IN_REGIME_WINDOWS="0.95:2 1.05:3"\nCONFIRMATORY_ARMS="B1 B6"\n')
+    proc = _master(world, "--plan")
+    assert proc.returncode == 0, proc.stdout[-1500:] + proc.stderr[-800:]
+    line = next(ln for ln in proc.stdout.splitlines() if "[plan] regime label table (item 18, E12 rule)" in ln)
+    assert "0.95:2\\ 1.05:3 --loads 0.95\\ 1.05 --confirmatory-arms B1\\ B6" in line
+    proj = next(ln for ln in proc.stdout.splitlines() if "regime-gate projection session=a" in ln)
+    assert "loads='0.95 1.05' floor='0.95:2 1.05:3' roster=B1 B6" in proj
+
+
+def test_stage_14_passes_the_retrieval_stage_refusal_and_fails_its_rc_2(world: Dict[str, Path]) -> None:
+    """Review L8 (2026-11-03): the "0|3" contract of the F-7 step, driven: rc 3
+    (the named refusal) leaves stage 14 passed; rc 2 fails it by name."""
+    proc = _master(world, "--yes", "provision", "--yes", "teardown", CAGE_TEST_RETRIEVAL_STAGE_RC="3")
+    assert proc.returncode == 0, proc.stdout[-1500:] + proc.stderr[-800:]
+    assert "[retrieval_stage] REFUSED: fake rc 3" in proc.stdout
+    assert _state(world)["stages"]["analyze"]["status"] == "passed"
+    proc = _master(world, "--only", "analyze", "--redo", CAGE_TEST_RETRIEVAL_STAGE_RC="2")
+    assert proc.returncode == 1, proc.stdout[-1500:] + proc.stderr[-800:]
+    assert "[FAIL] retrieval stage (F-7): rc=2, expected 0|3" in proc.stdout
+    assert _state(world)["stages"]["analyze"]["status"] == "failed"

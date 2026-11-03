@@ -887,6 +887,28 @@ PY
     # S2 Block B-5: the stock read below is per GPU id; a multi-GPU pod in one datacenter is proven only by the create
     [ "$GPU_COUNT" = "1" ] || say "NOTE: a $GPU_COUNT-GPU pod: the stock read is per GPU id, so $GPU_COUNT GPUs together in one datacenter are proven only by the create at stage 1 (S2 Block B-5)"
   fi
+  # S2 block F row F-10 (2026-11-03, ADR-0185): the regime gate's projection at
+  # $0. The registered windows of every group the stage 14 gate judges
+  # (REGIME_GATE_LOADS, default "1.0+") against the floor (MIN_IN_REGIME_WINDOWS);
+  # a floor no BLOCKING group (CONFIRMATORY_ARMS; empty = every group) can meet,
+  # or a roster id the session does not serve, refuses here, before anything
+  # bills (finding 2 of the batch 2/3 spec: the S2 grid registers 2 windows at
+  # 0.95 and 3 at 1.05). The verb is pure, so it runs under --plan too: the dry
+  # proof carries the projected count per gated group. It runs after every reader
+  # of the registration step's log above (run_step replaces that log).
+  local -a proj=("$PY" "$SCRIPTS/3_run/run_campaign.py" regime-gate-projection --session "$SESSION" --loads "${REGIME_GATE_LOADS:-1.0+}" --min "${MIN_IN_REGIME_WINDOWS:-}" --confirmatory-arms "${CONFIRMATORY_ARMS:-}")
+  local proj_item
+  [ -z "${REHEARSAL_N:-}" ] || proj+=(--rehearsal-n "$REHEARSAL_N")
+  for proj_item in $QUERY_MANIFESTS; do proj+=(--query-manifest "$proj_item"); done
+  if plan_only; then
+    printf '  [plan] %-28s expect rc=0 : runs now (pure, $0):' "regime-gate projection (F-10)"; printf ' %q' "${proj[@]}"; printf '\n'
+    if ! "${proj[@]}" 2>&1 | sed 's/^/    /'; then
+      printf '  [FAIL] regime-gate projection (F-10): the projection refused (the lines above); fix the profile before GO day\n'
+      return 1
+    fi
+  else
+    run_step 0 "regime-gate projection (F-10)" -- "${proj[@]}" || return 1
+  fi
   run_step 0 "stock read (gpu list --include-unavailable)" -- runpodctl gpu list --include-unavailable || return 1
   if ! plan_only; then
     grep -v '^#' "$STEP_LOG" > "$EXTRAS/ops/gpu_list.json"
@@ -2290,12 +2312,16 @@ stage_analyze() {
   # Review 2026-10-13 item 18 (decision 6): the regime labels of every pressure
   # window, by engine and family, printed before anything is analyzed. ADR-0173
   # amendment E12 (2026-10-17, owner option (a); audit G31): with
-  # MIN_IN_REGIME_WINDOWS set, every (engine, arm, dataset, budget rung, rate
-  # rung >= 1.0) group needs that many windows labeled IN_REGIME and not
-  # transient, or the stage fails (attempt 4: 0 of 23 measured windows were
-  # IN_REGIME and every stage passed). Empty = report only. The rule lives in
-  # scripts/6_experiments/regime_gate.py (tested), no longer in a heredoc.
-  run_step 0 "regime label table (item 18, E12 rule)" -- "$PY3" "$SCRIPT_DIR/regime_gate.py" "$RUN_LOCAL" "${MIN_IN_REGIME_WINDOWS:-}" || return 1
+  # MIN_IN_REGIME_WINDOWS set, every gated group needs that many windows labeled
+  # IN_REGIME and not transient, or the stage fails (attempt 4: 0 of 23 measured
+  # windows were IN_REGIME and every stage passed). Empty = report only. S2 block
+  # F row F-10 (2026-11-03, ADR-0185): the gated loads are REGIME_GATE_LOADS
+  # (default "1.0+", the rule before F-10), the group key carries the retriever
+  # (B5 and B6 never merge), and only a group of a CONFIRMATORY_ARMS baseline
+  # fails the stage (empty = every group); stage 0 projected the registered
+  # windows per group at $0. The rule lives in scripts/6_experiments/regime_gate.py
+  # (tested), no longer in a heredoc.
+  run_step 0 "regime label table (item 18, E12 rule)" -- "$PY3" "$SCRIPT_DIR/regime_gate.py" "$RUN_LOCAL" "${MIN_IN_REGIME_WINDOWS:-}" --loads "${REGIME_GATE_LOADS:-1.0+}" --confirmatory-arms "${CONFIRMATORY_ARMS:-}" || return 1
   # A PARTIAL tree (decision 3) verifies with FAIL findings on its failed cells
   # (R15); the report is the deliverable, so rc 1 is expected there and noted.
   local vexp=0; run_partial && vexp="0|1"
@@ -2311,6 +2337,13 @@ stage_analyze() {
   # refusal (rc 3, no calibration floors) is printed and does not fail the stage;
   # rc 2 (a Python usage error or a missing script) fails it (review 2026-10-16).
   run_step "0|3" "yield table (A1)" -- "$PY" "$SCRIPTS/4_analysis/yield_table.py" "$RUN_LOCAL" --calibration-dir "$EXTRAS/calibration" --scoring-run-id "$SCORING_RUN_ID" --out "$LAND/plots/yield_$(date -u +%H%M%S)" || return 1
+  # S2 block F row F-7 (2026-11-03): the retrieval-stage sidebar (gold-in-prompt
+  # rate per dataset, baseline and engine over the F1 windows of the retrieval
+  # arms, the paired B5 against B6) on every landing, from the sealed request
+  # rows; the S1 numbers were a hand script under a git-ignored plots folder.
+  # Same contract as the yield table: rc 3 is the named refusal (no such
+  # window, printed, the stage goes on); rc 2 fails it.
+  run_step "0|3" "retrieval stage (F-7)" -- "$PY" "$SCRIPTS/4_analysis/retrieval_stage.py" "$RUN_LOCAL" --out "$LAND/plots/retrieval_stage_$(date -u +%H%M%S)" || return 1
   run_step 0 "organize_results" -- "$PY" "$SCRIPTS/4_analysis/organize_results.py" "$RUN_LOCAL" $force || return 1
   # The driver's one-look lock refuses a second run on the same root (review
   # 2026-10-06, MEDIUM 7): on --redo the stamp this master recorded is reused.

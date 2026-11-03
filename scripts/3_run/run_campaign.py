@@ -362,6 +362,7 @@ from src.orchestration.calibration import (  # noqa: E402
 )
 from src.orchestration.campaign_session import ENGINE_OF_BACKEND, KV_CEILING_ENV  # noqa: E402
 from src.analysis.regime_inputs import REGIME_UNKNOWN  # noqa: E402  (decision 10, 2026-10-13)
+from src.analysis import regime_gate_rules as gate_rules  # noqa: E402  (S2 block F row F-10, 2026-11-03)
 from src.orchestration.load_generator import (  # noqa: E402
     D6_RATE_FRACTIONS,
     D6_REDUCED_RATE_FRACTIONS,
@@ -12566,6 +12567,132 @@ def _cmd_pool_check(args: argparse.Namespace) -> int:
     return 1
 
 
+def regime_gate_projection(
+    session: str,
+    *,
+    loads: str = gate_rules.DEFAULT_LOADS,
+    need: Any = "",
+    confirmatory_arms: str = "",
+    rehearsal_n: Optional[int] = None,
+    query_manifests: Sequence[str] = (),
+) -> Dict[str, Any]:
+    """S2 block F row F-10 (2026-11-03, ADR-0185): the stage 14 regime gate's
+    projection at $0, from the registered grid.
+
+    A group's in-regime count is unknown until the run; its registered window
+    count is known here. So a floor (MIN_IN_REGIME_WINDOWS) above the registered
+    windows of a BLOCKING group (CONFIRMATORY_ARMS; empty = every group) would
+    fail the landing by construction and refuses now, at stage 0 (finding 2 of
+    the batch 2/3 spec: the S2 grid registers 2 windows at 0.95 and 3 at 1.05).
+    Groups and modes are keyed as the gate keys them (GROUP_KEY_FIELDS), over
+    the executable cells of the pressure families; a cell whose load the plan
+    resolves later (a frontier or slower load) is counted, not projected. A
+    roster id that is not an executable pressure baseline of the session refuses
+    by name (a typo would silently make a leg descriptive). A grammar refusal
+    of the three profile strings is a PlanError too. A gated load no registered
+    cell carries refuses when a floor is set and every load is resolved (review
+    H1: a mistyped token would otherwise pass the stage 14 gate unjudged); it is
+    reported otherwise.
+    """
+    try:
+        gated = gate_rules.parse_loads(loads)
+        floors = gate_rules.parse_floor(need, gated)
+        roster = gate_rules.parse_roster(confirmatory_arms)
+    except gate_rules.RulesError as exc:
+        raise PlanError(str(exc)) from None
+    grid = get_session_grid(session)
+    if rehearsal_n is not None:
+        grid = rehearsal_grid(
+            grid, n=rehearsal_n, datasets=frozenset(parse_query_manifest_args(query_manifests)),
+        )
+    pressure = [
+        c for c in enumerate_cells(grid)
+        if c.spec.family in gate_rules.PRESSURE_FAMILIES and c.blocked_on is None
+    ]
+    registered = {c.baseline_id for c in pressure}
+    unknown = sorted(roster - registered)
+    if unknown:
+        raise PlanError(
+            f"CONFIRMATORY_ARMS names {unknown}: not an executable pressure baseline of session "
+            f"{session!r} (registered: {_ordered(frozenset(registered))})"
+        )
+    groups: Dict[str, Dict[str, Any]] = {}
+    unresolved = 0
+    for cell in pressure:
+        s = cell.spec
+        if s.rate_frac is None:
+            unresolved += 1
+            continue
+        token = gate_rules.load_token_for(s.rate_frac, gated)
+        if token is None:
+            continue
+        key = "|".join(str(v) for v in (
+            s.engine, s.arm, s.retriever, s.policy, s.topology, cell.dataset, s.budget_r, s.rate_frac,
+        ))
+        g = groups.setdefault(key, {
+            "registered": 0,
+            "baseline": cell.baseline_id,
+            "mode": gate_rules.mode_for(cell.baseline_id, roster),
+            "load": token,
+            "need": floors[token] if floors else None,
+        })
+        g["registered"] += cell.windows if cell.windows is not None else grid.replications
+    no_group = [g.token for g in gated if g.token not in {x["load"] for x in groups.values()}]
+    if no_group and floors is not None and unresolved == 0:   # review H1
+        rates = sorted({c.spec.rate_frac for c in pressure if c.spec.rate_frac is not None})
+        raise PlanError(
+            f"REGIME_GATE_LOADS token(s) {no_group} gate no registered pressure cell of session {session!r} "
+            f"(registered rates: {rates}): the stage 14 gate would judge nothing at them"
+        )
+    short = {
+        k: g["registered"] for k, g in sorted(groups.items())
+        if g["need"] is not None and g["registered"] < g["need"]
+    }
+    short_blocking = {k: n for k, n in short.items() if groups[k]["mode"] == gate_rules.BLOCKING}
+    if short_blocking:
+        first, n = min(short_blocking.items(), key=lambda kv: (kv[1], kv[0]))   # the tightest shortfall, then the key
+        raise PlanError(
+            f"MIN_IN_REGIME_WINDOWS={str(need).strip()} exceeds the {n} registered windows of {first} "
+            f"(BLOCKING; {len(short_blocking)} such group(s)): the gate would fail the landing by construction"
+        )
+    return {
+        "session": session,
+        "loads": loads,
+        "need": "" if floors is None else str(need).strip(),
+        "roster": _ordered(roster),
+        "groups": dict(sorted(groups.items())),
+        "unresolved_load_cells": unresolved,
+        "short_descriptive": {k: n for k, n in short.items() if k not in short_blocking},
+        "loads_without_a_group": no_group,
+    }
+
+
+def _cmd_regime_gate_projection(args: argparse.Namespace) -> int:
+    doc = regime_gate_projection(
+        args.session, loads=args.loads, need=args.min, confirmatory_arms=args.confirmatory_arms,
+        rehearsal_n=args.rehearsal_n, query_manifests=args.query_manifest,
+    )
+    n_blocking = sum(g["mode"] == gate_rules.BLOCKING for g in doc["groups"].values())
+    print(
+        f"regime-gate projection session={doc['session']} loads={doc['loads']!r} floor={doc['need']!r} "
+        f"roster={' '.join(doc['roster']) or '(empty: every group blocks)'} "
+        f"gated groups={len(doc['groups'])} blocking={n_blocking} "
+        f"descriptive={len(doc['groups']) - n_blocking} unresolved_load_cells={doc['unresolved_load_cells']}"
+    )
+    for key, g in doc["groups"].items():
+        print(f"  {key}: registered={g['registered']}"
+              + (f" need={g['need']}" if g["need"] is not None else "") + f" {g['mode']}")
+    if doc["short_descriptive"]:
+        print(f"  NOTE: descriptive group(s) below the floor (no refusal): {doc['short_descriptive']}")
+    if doc["unresolved_load_cells"]:
+        print(f"  NOTE: {doc['unresolved_load_cells']} pressure cell(s) take a load the plan resolves "
+              "(frontier or slower): not projected")
+    if doc["loads_without_a_group"]:
+        print(f"  NOTE: gated load(s) with no registered cell: {doc['loads_without_a_group']} "
+              "(no refusal: no floor is set, or a load the plan resolves may carry them)")
+    return 0
+
+
 def _cmd_classes(args: argparse.Namespace) -> int:
     print(",".join(str(c) for c in session_demand_classes(get_session_grid(args.session))))
     return 0
@@ -12840,6 +12967,31 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     p_classes.add_argument("--session", required=True)
     p_classes.set_defaults(func=_cmd_classes)
+    p_proj = sub.add_parser(
+        "regime-gate-projection",
+        help="S2 block F row F-10: the registered windows of every group the stage 14 regime "
+        "gate judges, against the floor (pure, $0, stage 0); refuses a floor no blocking "
+        "group can meet and a roster id the session does not serve",
+    )
+    p_proj.add_argument("--session", required=True, help=f"one of {sorted(SESSIONS)}")
+    p_proj.add_argument(
+        "--loads", default=gate_rules.DEFAULT_LOADS,
+        help="REGIME_GATE_LOADS ('1.0+' = at or above 1.0; '0.95 1.05' = exactly those)",
+    )
+    p_proj.add_argument(
+        "--min", default="",
+        help="MIN_IN_REGIME_WINDOWS: one integer or 'load:N' per gated load; empty = report only",
+    )
+    p_proj.add_argument(
+        "--confirmatory-arms", default="",
+        help="CONFIRMATORY_ARMS: the baselines whose groups block; empty = every group",
+    )
+    p_proj.add_argument("--rehearsal-n", type=int, default=None, metavar="N")
+    p_proj.add_argument(
+        "--query-manifest", action="append", default=[], metavar="DATASET=PATH",
+        help="the registered manifests (only the rehearsal derivation reads them)",
+    )
+    p_proj.set_defaults(func=_cmd_regime_gate_projection)
     p_pool = sub.add_parser(
         "pool-check",
         help="A11 item 4: check the engine's realized KV pool record against a planned token count",
