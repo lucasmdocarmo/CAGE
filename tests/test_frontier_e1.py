@@ -170,7 +170,8 @@ def _build_run(tmp_path: Path, cells: list[tuple[CellSpec, float]], *, with_f1: 
 
 def _plan(tmp_path: Path, targets: dict[str, float] | None = None) -> Path:
     path = tmp_path / "plan_registered.json"
-    path.write_text(json.dumps({"class_first_token_targets_s": targets or {str(CLASS_TOKENS): TARGET_S}}),
+    path.write_text(json.dumps({"class_first_token_targets_s": targets or {str(CLASS_TOKENS): TARGET_S},
+                                "calibration": {"budget_fraction": 1.25}}),  # the registered control rung (row F-13)
                     encoding="utf-8")
     return path
 

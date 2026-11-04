@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Order:     stage 10 (score), once, on the pod before the full scoring pass
-Objective: Prove live that the cross-row batched scoring path grades exactly as the row-by-row path, and measure both rates (ADR-0176 Group D; fix-list B13, G19)
+Objective: Prove live that the cross-row batched scoring path grades as the row-by-row path within the profile's stated per-row bounds, every predicate input exact, and measure both rates (ADR-0176 Group D; fix-list B13, G19; S2 block F row F-11)
 Cloud:     both
 
 The rescorer (scripts/4_analysis/rescore_quality.py) grades every answer one
@@ -14,9 +14,13 @@ writes them to a scratch evidence file OUTSIDE the run tree, grades them twice
 with the real instruments (row by row, then batched at the profile's batch
 size, after an untimed warm-up pass over the same sample so every lazy model
 load sits outside the timed passes, review 2026-10-23 M1), compares every
-emitted row byte for byte, and prints ONE line the master greps:
-SCORING_BATCH_OK with both per-row rates, or SCORING_BATCH_FAILED naming the
-first differing row and field and the largest difference per field. A third,
+emitted row byte for byte (S2 block F row F-11, owner 2026-11-04, option (a):
+faithfulness and completeness_bertscore may differ per row within the bounds
+the profile states as --tol-faithfulness and --tol-bertscore, 0 = exact, while
+every field the predicate reads stays exact), and prints ONE line the master
+greps: SCORING_BATCH_OK with both per-row rates, the bounds and the largest
+difference per field, or SCORING_BATCH_FAILED naming the first row and field
+outside the bounds and the largest difference per field. A third,
 untimed row-by-row pass is compared with the first as a control (review M2):
 a device that is not call-to-call deterministic shows there, so a failure can
 never be mistaken for a batching effect. The master passes --batch-size to
@@ -29,6 +33,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -44,6 +49,12 @@ OK_LINE = "SCORING_BATCH_OK"
 FAIL_LINE = "SCORING_BATCH_FAILED"
 EXIT_OK, EXIT_FAILED, EXIT_REFUSED = 0, 1, 2
 DEFAULT_SCRATCH = _REPO_ROOT / "logs" / "scoring_batch_probe"
+# S2 block F row F-11 (owner 2026-11-04, option (a)): the two continuous
+# exploratory fields a profile may bound per row (flag -> field), and the
+# predicate's inputs, which no bound may cover (the S1 probe measured them
+# identical on 50 rows; MyDocs/RunPod/S2_F11_SCORING_TOLERANCE_EVIDENCE_2026-11-04.md)
+TOLERATED = {"--tol-faithfulness": "faithfulness", "--tol-bertscore": "completeness_bertscore"}
+PREDICATE_INPUTS = ("grounding_score", "exact_match", "predicted_no_answer", "hallucination_detected")
 
 
 def load_rescorer() -> Any:
@@ -64,21 +75,58 @@ def _numeric(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def _check_tolerances(tolerances: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    """The per-row bounds as floats (row F-11): each a non-negative finite
+    number on a field the predicate never reads; anything else is refused."""
+    out: Dict[str, float] = {}
+    for key, value in (tolerances or {}).items():
+        if key in PREDICATE_INPUTS:
+            raise ValueError(f"tolerance on {key}: the predicate reads it, so it stays exact (row F-11)")
+        # copysign reads the sign bit, so -0.0 is refused with the negatives (review 2026-11-04 LOW 2)
+        if not _numeric(value) or not math.isfinite(float(value)) or math.copysign(1.0, float(value)) < 0:
+            raise ValueError(f"tolerance for {key} must be a non-negative finite number, got {value!r}")
+        out[key] = float(value)
+    return out
+
+
+def _field_within(a: Dict[str, Any], b: Dict[str, Any], key: str, tol: Optional[float], default: Callable[[Any], Any]) -> bool:
+    """One field of one row: identical as canonical text, or, on a bounded
+    field, two finite numbers at most ``tol`` apart. A key present on one side
+    only, a None against a number, a NaN against a number, or a bool, is a
+    difference whatever the bound."""
+    if (key in a) != (key in b):
+        return False
+    va, vb = a.get(key), b.get(key)
+    if _canonical(va, default) == _canonical(vb, default):
+        return True
+    if tol is None or not (_numeric(va) and _numeric(vb)):
+        return False
+    da, db = float(va), float(vb)
+    return math.isfinite(da) and math.isfinite(db) and abs(da - db) <= tol
+
+
 def compare_rows(
     sequential: Sequence[Dict[str, Any]],
     batched: Sequence[Dict[str, Any]],
     *,
+    tolerances: Optional[Dict[str, Any]] = None,
     default: Callable[[Any], Any] = str,
 ) -> Dict[str, Any]:
     """Byte-for-byte comparison of the two emitted row lists (canonical JSON
-    per row, the form qa_scores.jsonl is written in). The record counts the
-    identical rows, names the first differing row and field with both values,
-    and keeps the largest numeric difference per field, so a failure from
-    float noise reads as such instead of as a silent pass or a bare fail."""
+    per row, the form qa_scores.jsonl is written in), except that a field named
+    in ``tolerances`` may differ per row by at most its bound (row F-11; empty =
+    exact everywhere, today's rule). The record counts the identical rows and
+    the rows within the bounds, names the first row and field outside them with
+    both values, and keeps the largest numeric difference per field, so a
+    failure from float noise reads as such instead of as a silent pass or a
+    bare fail, and a pass shows what it tolerated."""
+    tol = _check_tolerances(tolerances)
     record: Dict[str, Any] = {
         "rows": len(sequential),
         "rows_batched": len(batched),
         "identical": 0,
+        "within_tolerance": 0,
+        "tolerances": tol,
         "first_difference": None,
         "max_abs_numeric_diff": {},
     }
@@ -99,11 +147,12 @@ def compare_rows(
         if _canonical(a, default) == _canonical(b, default):
             record["identical"] += 1
             continue
+        failing = [k for k in keys if not _field_within(a, b, k, tol.get(k), default)]
+        if not failing:
+            record["within_tolerance"] += 1
+            continue
         if record["first_difference"] is None:
-            field = next(
-                (k for k in keys if _canonical(a.get(k), default) != _canonical(b.get(k), default)),
-                None,
-            )
+            field = failing[0]
             record["first_difference"] = {
                 "row": i,
                 "example_id": a.get("example_id"),
@@ -111,7 +160,7 @@ def compare_rows(
                 "row_by_row": a.get(field),
                 "batched": b.get(field),
             }
-    record["ok"] = record["identical"] == len(sequential)
+    record["ok"] = record["identical"] + record["within_tolerance"] == len(sequential)
     return record
 
 
@@ -160,6 +209,10 @@ def run_probe(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
     try:
         if args.batch_size < 1 or args.rows < 1:
             raise ValueError("--batch-size and --rows must be >= 1")
+        # row F-11: the bounds the profile states, checked before any pass runs
+        given = {"faithfulness": args.tol_faithfulness, "completeness_bertscore": args.tol_bertscore}
+        record["tolerances"] = {k: v for k, v in given.items() if v is not None}
+        tol = _check_tolerances(record["tolerances"])
         rq = load_rescorer()
         native = rq._native_only_set(argparse.Namespace(native_only_datasets=args.native_only_datasets))
         ev_path, ok_lines = pick_window(
@@ -175,6 +228,9 @@ def run_probe(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
         if not args.fast:
             if args.freeze_file is None:
                 raise ValueError("--freeze-file is required with the full instruments (their revision pins)")
+            for flag, field in TOLERATED.items():
+                if field not in tol:
+                    raise ValueError(f"{flag} is required with the full instruments (row F-11: the profile states the bound; 0 = exact)")
             record["revision_pins"] = rq.apply_revision_pins(rq.revision_pins_from_freeze(args.freeze_file))
         evaluator = rq._build_evaluator(argparse.Namespace(full=not args.fast, device=args.device))
         scratch = args.scratch_dir / time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
@@ -197,7 +253,8 @@ def run_probe(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
         # review M2: the control, row by row again, untimed; a difference HERE is
         # the device's own call-to-call variation, not batching
         control, _ = rq._score_evidence_file(sample, evaluator, batch_size=None, **kw)
-        record.update(compare_rows(sequential, batched, default=rq._json_default))
+        record.update(compare_rows(sequential, batched, tolerances=tol, default=rq._json_default))
+        # the control stays exact: a tolerated drift here could hide inside the same margin as a batching effect
         same_path = compare_rows(sequential, control, default=rq._json_default)
         record["control_identical"] = same_path["ok"]
         record["control_max_abs_numeric_diff"] = same_path["max_abs_numeric_diff"]
@@ -216,28 +273,43 @@ def run_probe(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
         return record, EXIT_FAILED
 
 
+def _bounds_tail(record: Dict[str, Any]) -> str:
+    """The bounds the proof ran under (row F-11) and, review 2026-10-23 L1, the
+    largest difference per field, on the line the state keeps."""
+    tol = record.get("tolerances") or {}
+    tail = " tol=" + ",".join(f"{k}:{v:g}" for k, v in sorted(tol.items())) if tol else ""
+    diffs = record.get("max_abs_numeric_diff") or {}
+    if diffs:
+        tail += " max_diff=" + ",".join(f"{k}:{v:.3g}" for k, v in sorted(diffs.items()))
+    return tail
+
+
 def verdict_line(record: Dict[str, Any]) -> str:
     if record.get("ok"):
-        return (
+        line = (
             f"{OK_LINE} rows={record['rows']} batch_size={record['batch_size']} "
             f"row_by_row_s_per_row={record['row_by_row_s_per_row']:.4f} "
             f"batched_s_per_row={record['batched_s_per_row']:.4f} "
             f"speedup={(record.get('speedup') or 0.0):.2f} window={record['window']}"
         )
+        # row F-11: under stated bounds the line also says what passed exactly, what
+        # passed within them, the bounds and the largest differences; exact mode prints today's line
+        if record.get("tolerances"):
+            line += f" identical={record.get('identical', 0)} within_tol={record.get('within_tolerance', 0)}" + _bounds_tail(record)
+        return line
     reason = record.get("reason")
     if reason is None:
         first = record.get("first_difference") or {}
         if "reason" in first:
             reason = first["reason"]
         else:
+            outside = record.get("rows", 0) - record.get("identical", 0) - record.get("within_tolerance", 0)
             reason = (
-                f"{record.get('rows', 0) - record.get('identical', 0)} of {record.get('rows', 0)} rows differ; "
+                f"{outside} of {record.get('rows', 0)} rows differ; "
                 f"first: row {first.get('row')} ({first.get('example_id')}) field {first.get('field')}: "
                 f"{first.get('row_by_row')!r} row by row vs {first.get('batched')!r} batched"
             )
-    # review 2026-10-23 L1: the largest difference per field on the line the state keeps
-    diffs = record.get("max_abs_numeric_diff") or {}
-    tail = " max_diff=" + ",".join(f"{k}:{v:.3g}" for k, v in sorted(diffs.items())) if diffs else ""
+    tail = _bounds_tail(record)
     control = record.get("control_identical")
     if control is not None:
         tail += f" control_identical={'yes' if control else 'no'}"
@@ -251,6 +323,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--rows", type=int, default=N_ROWS, help=f"completed answers graded both ways (default {N_ROWS})")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--freeze-file", type=Path, default=None, help="the freeze artifact whose INSTRUMENT_REVISIONS pin the instruments")
+    parser.add_argument("--tol-faithfulness", type=float, default=None,
+                        help="row F-11: the per-row bound on faithfulness (the profile's SCORING_TOL_FAITHFULNESS; required with the full instruments; 0 = exact)")
+    parser.add_argument("--tol-bertscore", type=float, default=None,
+                        help="row F-11: the per-row bound on completeness_bertscore (the profile's SCORING_TOL_BERTSCORE; required with the full instruments; 0 = exact)")
     parser.add_argument("--native-only-datasets", default=None, help="windows skipped as the pass skips them (default: the rescorer's)")
     parser.add_argument("--scratch-dir", type=Path, default=DEFAULT_SCRATCH, help="where the sample files land (never the run tree)")
     parser.add_argument("--out", type=Path, default=None, help="evidence JSON record")

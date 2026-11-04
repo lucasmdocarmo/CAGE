@@ -436,6 +436,10 @@ def plot03_pressure_map(L: Landing, out: Path) -> Tuple[str, str]:
     columns, table = _pressure_map_table(c, blocks)
     if table.empty:
         raise PlotSkip("no pressured window carries a rate fraction")
+    frontier_rates = _frontier_rates(c, blocks)
+    # the pooled column holds the frontier block's control rung: the driver's
+    # frontier.control_budget_r (row F-13), read before anything is drawn
+    control_r = _control_budget_r(L) if frontier_rates else None
     engines = _engines_in(table["engine"])
     budgets = sorted(table["budget_r"].unique())
     cmap = plt.get_cmap("Blues")
@@ -465,9 +469,8 @@ def plot03_pressure_map(L: Landing, out: Path) -> Tuple[str, str]:
     fig.colorbar(plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, 1)), ax=list(axes[0]), shrink=0.8,
                  label="share of windows in regime")
     fig.suptitle("Pressure map: windows in the pressure regime per cache rung and load cell, per engine", fontsize=9)
-    frontier_rates = _frontier_rates(c, blocks)
     pooled = (f"the frontier block (plan block field K1) pools its ladder loads {', '.join(frontier_rates)} into the one column "
-              f"\"{FRONTIER_COLUMN}\", which therefore holds the block's control rung 1.25 as well as its constrained rungs"
+              f"\"{FRONTIER_COLUMN}\", which therefore holds the block's control rung {control_r:g} as well as its constrained rungs"
               if frontier_rates else "no plan block field: one column per rounded rate")
     stem = "p03_pressure_map"
     _write_caption(out, stem, f"""
@@ -662,8 +665,26 @@ def plot18_prompt_vs_answer(L: Landing, out: Path) -> Tuple[str, str]:
 # no registered p is recomputed here, and the per-window shares of a01 and the
 # clock of a02 come from the driver's own functions.
 
-CONTROL_LABEL = "control (cache rung 1.25)"
 CONSTRAINED_LABEL = "constrained"
+
+
+def _control_budget_r(L: Landing) -> float:
+    """The control rung the frontier figures print: the driver's
+    frontier.control_budget_r, which compute_frontier_drop reads from the
+    registered plan (calibration.budget_fraction; S2 block F row F-13: 1.25 on
+    S1, 1.0 on S2), never a constant here. A section without it, or with a
+    value that is not a positive finite number, refuses by name."""
+    st = L.stats()
+    value = (st.get("frontier") or {}).get("control_budget_r")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) <= 0.0:
+        raise PlotSkip(f"{st.get('_path')}: frontier.control_budget_r = {value!r} is not the registered control rung "
+                       "(a positive number); run the driver with --contrasts 12 --plan (row F-13)")
+    return float(value)
+
+
+def control_label(control_r: float) -> str:
+    """The control side's label in the frontier figures (a01, a02, a06)."""
+    return f"control (cache rung {control_r:g})"
 #: the per-question fingerprint pairs (strategy, its registered partner), by
 #: baseline code and B12 cut (PUBLICATION section 7.8; the E4 design input)
 FINGERPRINT_PAIRS: Tuple[Tuple[Tuple[str, Optional[int]], Tuple[str, Optional[int]]], ...] = (
@@ -733,6 +754,7 @@ def plot_a01_frontier_drop(L: Landing, out: Path) -> Tuple[str, str]:
     rca = _rca()
     st = L.stats()
     fr = st["frontier"]
+    control_r = _control_budget_r(L)
     verdicts: Dict[str, Dict[str, Any]] = {}
     for d in fr.get("per_dataset_intersection", []):
         verdicts[d["dataset"]] = d
@@ -751,7 +773,7 @@ def plot_a01_frontier_drop(L: Landing, out: Path) -> Tuple[str, str]:
                           key=lambda l: (_bnum(l["baseline"]), -float(l["budget_r"])))
             for leg in rows:
                 sides = (
-                    (CONTROL_LABEL, leg["control_row_keys"], leg["yield"]["mean_control"], leg["timely"]["mean_control"], "#0173b2"),
+                    (control_label(control_r), leg["control_row_keys"], leg["yield"]["mean_control"], leg["timely"]["mean_control"], "#0173b2"),
                     (f"{CONSTRAINED_LABEL} r={float(leg['budget_r']):g}", _constrained_keys(leg),
                      leg["yield"]["mean_constrained"], leg["timely"]["mean_constrained"], "#d55e00"),
                 )
@@ -770,7 +792,7 @@ def plot_a01_frontier_drop(L: Landing, out: Path) -> Tuple[str, str]:
                     ax.scatter([x + k], [y_mean], marker="o", s=42, color=color, zorder=4,
                                label="yield share (timely and accepted, mean)" if x == 0 and k == 0 else None)
                     ticks.append(x + k)
-                    labels.append("control\nr=1.25" if k == 0 else f"constrained\nr={float(leg['budget_r']):g}")
+                    labels.append(f"control\nr={control_r:g}" if k == 0 else f"constrained\nr={float(leg['budget_r']):g}")
                 y = leg["yield"]
                 ax.annotate(
                     f"{blabel(leg['baseline'])}\nΔ yield {y['delta']:+.3f} [{y['ci95_low_bootstrap']:+.2f}, {y['ci95_high_bootstrap']:+.2f}]\n"
@@ -809,6 +831,7 @@ def plot_a02_ttft_cdf(L: Landing, out: Path) -> Tuple[str, str]:
     constrained, with the class-target line, per engine."""
     legs = _frontier_legs(L)
     rca = _rca()
+    control_r = _control_budget_r(L)
     engines = _engines_in({leg["engine"] for leg in legs})
     fig, axes = plt.subplots(1, len(engines), figsize=(ps.FULL_WIDTH_IN, 3.2), sharey=True, squeeze=False, layout="constrained")
     baselines = sorted({leg["baseline"] for leg in legs}, key=_bnum)
@@ -818,7 +841,7 @@ def plot_a02_ttft_cdf(L: Landing, out: Path) -> Tuple[str, str]:
         targets_drawn: set = set()
         sides_drawn: set = set()
         for leg in sorted((l for l in legs if l["engine"] == engine), key=lambda l: (_bnum(l["baseline"]), -float(l["budget_r"]))):
-            for side, keys, ls in ((CONTROL_LABEL, leg["control_row_keys"], "-"),
+            for side, keys, ls in ((control_label(control_r), leg["control_row_keys"], "-"),
                                    (f"{CONSTRAINED_LABEL} r={float(leg['budget_r']):g}", _constrained_keys(leg), "--")):
                 if (tuple(keys), leg["dataset"]) in sides_drawn:
                     continue  # a control shared by two legs is drawn and counted once
@@ -858,12 +881,12 @@ def plot_a02_ttft_cdf(L: Landing, out: Path) -> Tuple[str, str]:
     axes[0][0].set_ylabel("share of completed requests")
     fig.suptitle("First-token time on the registered clock: control against constrained cache rung, with the class target")
     stem = "a02_ttft_cdf"
-    _write_caption(out, stem, """
+    _write_caption(out, stem, f"""
 A2. Empirical CDF of the first-token time of every completed request of the K1 cells, measured from the scheduled
 (intended) arrival, the section 6.3 coordinated-omission clock the registration grades on (driver rule _slo_ttft_ms,
 W16). The dotted line is the registered class target shared by both engines (plan_registered.json
 class_first_token_targets_s). The curve is over completed requests; E1's timely share is over issued requests, so the
-two agree only where every request completed. Solid: the control rung 1.25; dashed: the constrained rung at the same
+two agree only where every request completed. Solid: the control rung {control_r:g}; dashed: the constrained rung at the same
 offered rate. A control cell shared by two legs is drawn once.
 """)
     return _out(fig, out, stem), f"{n_rows} completed requests"
@@ -1159,14 +1182,15 @@ def _k1_cells(L: Landing) -> List[Dict[str, Any]]:
     """The K1 cells of the frontier legs: (engine, baseline, side, row keys,
     dataset); a control shared by two legs is listed once."""
     legs = _frontier_legs(L)
+    control_r = _control_budget_r(L)
     out: List[Dict[str, Any]] = []
     seen_controls: set = set()
     for leg in legs:
         ctl = (leg["engine"], leg["baseline"], leg["dataset"], tuple(leg["control_row_keys"]))
         if ctl not in seen_controls:
             seen_controls.add(ctl)
-            out.append({"engine": leg["engine"], "baseline": leg["baseline"], "budget_r": 1.25,
-                        "dataset": leg["dataset"], "side": f"{CONTROL_LABEL} at {float(leg['rate_qps']):.2f} rps",
+            out.append({"engine": leg["engine"], "baseline": leg["baseline"], "budget_r": control_r,
+                        "dataset": leg["dataset"], "side": f"{control_label(control_r)} at {float(leg['rate_qps']):.2f} rps",
                         "keys": list(leg["control_row_keys"])})
         out.append({"engine": leg["engine"], "baseline": leg["baseline"], "budget_r": float(leg["budget_r"]),
                     "dataset": leg["dataset"], "side": f"{CONSTRAINED_LABEL} r={float(leg['budget_r']):g}",
@@ -1190,6 +1214,8 @@ def plot_a06_preemption_kv(L: Landing, out: Path) -> Tuple[str, str]:
     """A6: KV occupancy over the window and preemptions per window for the
     K1 cells, control against constrained, per engine."""
     cells = _k1_cells(L)
+    control_r = _control_budget_r(L)
+    ctl = control_label(control_r)
     engines = _engines_in({c["engine"] for c in cells})
     fig, axes = plt.subplots(2, len(engines), figsize=(ps.FULL_WIDTH_IN, 5.6), squeeze=False, layout="constrained")
     baselines = sorted({c["baseline"] for c in cells}, key=_bnum)
@@ -1200,7 +1226,7 @@ def plot_a06_preemption_kv(L: Landing, out: Path) -> Tuple[str, str]:
         x = 0
         ticks: List[int] = []
         labels: List[str] = []
-        for c in sorted((c for c in cells if c["engine"] == engine), key=lambda c: (_bnum(c["baseline"]), c["side"] != CONTROL_LABEL, -c["budget_r"])):
+        for c in sorted((c for c in cells if c["engine"] == engine), key=lambda c: (_bnum(c["baseline"]), c["side"] != ctl, -c["budget_r"])):
             windows = L.cells[L.cells["row_key"].isin(c["keys"]) & (L.cells["dataset"] == c["dataset"])]
             pre_per_window: List[float] = []
             counter_seen = False
@@ -1220,13 +1246,13 @@ def plot_a06_preemption_kv(L: Landing, out: Path) -> Tuple[str, str]:
                     pre_per_window.append(float(inside["pre"].max() - inside["pre"].min()))
                     counter_seen = counter_seen or bool((inside["pre"] != 0).any())
                 if not drawn_trace and inside["kv"].notna().any():
-                    ls = "-" if c["side"].startswith(CONTROL_LABEL) else "--"
+                    ls = "-" if c["side"].startswith(ctl) else "--"
                     ax_t.plot(inside["t"] - float(t0), inside["kv"] * (100 if inside["kv"].max() <= 1.0 else 1), ls,
                               color=colors[c["baseline"]], lw=0.9, label=f"{blabel(c['baseline'])}, {c['side']}")
                     drawn_trace = True
             if pre_per_window and counter_seen:
                 ax_p.scatter(x + np.linspace(-0.15, 0.15, len(pre_per_window)), pre_per_window, s=12, color=colors[c["baseline"]],
-                             marker="o" if c["side"].startswith(CONTROL_LABEL) else "^")
+                             marker="o" if c["side"].startswith(ctl) else "^")
                 ax_p.hlines(float(np.mean(pre_per_window)), x - 0.3, x + 0.3, color=colors[c["baseline"]], lw=1.2)
             else:
                 # a counter that is absent or reads zero on every sample of the
@@ -1247,9 +1273,9 @@ def plot_a06_preemption_kv(L: Landing, out: Path) -> Tuple[str, str]:
     axes[1][0].set_ylabel("preemptions per window\n(dots) and mean")
     fig.suptitle("Cache occupancy within the window and preemptions per window, control against constrained (K1 cells)")
     stem = "a06_preemption_kv"
-    _write_caption(out, stem, """
+    _write_caption(out, stem, f"""
 A6. Top: the engine's KV cache usage gauge (cage_stats.jsonl, about 0.4 s samples) over the regime window of one window
-per K1 cell, solid for the control rung 1.25 and dashed for the constrained rung at the same offered rate. Bottom: the
+per K1 cell, solid for the control rung {control_r:g} and dashed for the constrained rung at the same offered rate. Bottom: the
 number of preemptions the engine recorded inside each window (the increase of the cumulative preemptions_total counter
 over the regime window), one dot per window, the bar at the mean; a cell whose counter is absent or zero on every sample
 is marked "no preemption counter" rather than drawn as zeros. The figure shows occupancy and preemptions side by side;

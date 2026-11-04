@@ -407,12 +407,16 @@ LAMBDA_STAR_MIN_GRID_POINTS: int = 3
 _LAMBDA_STAR_REQUIRED_COLUMNS: tuple[str, ...] = ("goodput_frac", "latency_ms")
 
 #: ADR-0178 (D10, D12): the E1 executor's registered inputs. The control
-#: rung every class shares (ruling A2); the relative tolerance under which
-#: a constrained cell's offered rate equals a control cell's (the K1 points
-#: are found by data, never by name); the window bootstrap of the interval;
-#: the plan key holding the class first-token targets (ten times the class
-#: floor, one target per demand class shared by both engines).
-FRONTIER_CONTROL_BUDGET_R: float = 1.25
+#: rung every class shares (ruling A2) is registration content read from the
+#: plan key below, never a constant (S2 block F row F-13: S1 served 1.25, S2
+#: registers 1.0; run_campaign.py writes the key from the grid's
+#: floor_budget_r and refuses a calibration artifact at any other rung); the
+#: relative tolerance under which a constrained cell's offered rate equals a
+#: control cell's (the K1 points are found by data, never by name); the
+#: window bootstrap of the interval; the plan key holding the class
+#: first-token targets (ten times the class floor, one target per demand
+#: class shared by both engines).
+FRONTIER_CONTROL_KEY: tuple[str, str] = ("calibration", "budget_fraction")
 FRONTIER_RATE_RTOL: float = 1e-3
 FRONTIER_BOOTSTRAP_REPS: int = 2000
 #: The alpha E1's per-arm verdicts are read against: its family's share.
@@ -4233,6 +4237,40 @@ def load_class_targets(plan_path: Path) -> dict[str, float]:
     return out
 
 
+def load_control_budget_r(plan_path: Path) -> float:
+    """The plan's control rung, ``calibration.budget_fraction``: the budget_r
+    the floors were measured at and every pressure point's control cells
+    share (ruling A2; run_campaign.py writes it from the grid's floor_budget_r
+    and refuses a calibration artifact at any other rung). A plan without the
+    key, or with a value that is not a positive finite number, refuses naming
+    it (S2 block F row F-13: the rung was a 1.25 constant, S1's)."""
+    try:
+        plan = json.loads(Path(plan_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AnalysisError(f"--plan {plan_path}: {exc}") from exc
+    block_key, value_key = FRONTIER_CONTROL_KEY
+    key = f"{block_key}.{value_key}"
+    block = plan.get(block_key) if isinstance(plan, dict) else None
+    if not isinstance(block, dict) or value_key not in block:
+        raise AnalysisError(
+            f"--plan {plan_path}: MISSING ARTIFACT: no {key} (run_campaign.py "
+            "writes it from the grid's floor_budget_r); E1 reads the control "
+            "rung from the registered plan, never from a constant (block F row F-13)"
+        )
+    value = block[value_key]
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or float(value) <= 0.0
+    ):
+        raise AnalysisError(
+            f"--plan {plan_path}: {key} = {value!r} is not a positive finite "
+            "budget fraction (the control rung)"
+        )
+    return float(value)
+
+
 #: plan_registered.json: behavior_knobs.corpus_trunc_budgets, the registered
 #: B12 corpus cuts (ADR-0106 rungs; run_campaign.py writes [1400, 700]).
 CUT_ROSTER_KEY = "corpus_trunc_budgets"
@@ -4466,7 +4504,8 @@ def compute_frontier_drop(
     """#12 executor: the E1 estimand (ADR-0178 D10, D11, D12).
 
     A confirmatory point is a constrained cell (budget_r below the control
-    rung) whose offered rate equals a control cell's (budget_r 1.25) on the
+    rung) whose offered rate equals a control cell's (budget_r = the plan's
+    registered control rung, row F-13) on the
     same engine, model, arm, retriever, policy, topology and dataset, within
     ``FRONTIER_RATE_RTOL``; every control cell at that rate contributes its
     windows (D2); the constrained cells of one rung that each match a control
@@ -4497,6 +4536,7 @@ def compute_frontier_drop(
             f"{FRONTIER_CLASS_TARGETS_KEY}) grade timeliness (ADR-0178 D12)"
         )
     targets = load_class_targets(plan_path)
+    control_r = load_control_budget_r(plan_path)
     pressure = index[index["family"].isin(sorted(PRESSURE_FAMILIES))].copy()
     pressure["_r"] = pd.to_numeric(pressure["budget_r"], errors="coerce")
     pressure = pressure[pressure["_r"].notna()]
@@ -4504,7 +4544,7 @@ def compute_frontier_drop(
         raise AnalysisError(
             f"contrast #12 ({FRONTIER_METRIC}): MISSING ARTIFACT: no F2/F3 "
             "rows with a budget_r in this run's index; the K1 block (control "
-            "rung 1.25 and the constrained rungs at the frontier load) has not "
+            f"rung {control_r:g} and the constrained rungs at the frontier load) has not "
             "been served"
         )
     section: dict[str, Any] = {
@@ -4515,13 +4555,13 @@ def compute_frontier_drop(
             "ADR-0178 D10: yield share = requests timely (first token within "
             "the class target on the section 6.3 clock) and accepted (section "
             "8.5 predicate true) over every issued request; E1 = the share at "
-            "a constrained rung minus the control rung 1.25 at the matched "
+            f"a constrained rung minus the control rung {control_r:g} at the matched "
             "absolute offered rate; registered direction: a drop (one-sided)"
         ),
         "higher_is_better": ESTIMAND_HIGHER_IS_BETTER[FRONTIER_METRIC],
         "registered_sidedness": "one-sided",
         "executed_alternative": "less",
-        "control_budget_r": FRONTIER_CONTROL_BUDGET_R,
+        "control_budget_r": control_r,
         "rate_match_rtol": FRONTIER_RATE_RTOL,
         "bootstrap": {
             "unit": "window",
@@ -4584,19 +4624,19 @@ def compute_frontier_drop(
     for axes_key, grp in pressure.groupby(list(_FRONTIER_MATCH_AXES), dropna=False):
         axes = {k: str(v) for k, v in zip(_FRONTIER_MATCH_AXES, axes_key)}
         dataset = axes["dataset"]
-        controls = grp[grp["_r"] == FRONTIER_CONTROL_BUDGET_R]
+        controls = grp[grp["_r"] == control_r]
         # Review M4: a constrained rung is BELOW the control rung; a rung
         # above it (none on S1) is listed, never tested as a drop.
-        for above_key in sorted(grp.loc[grp["_r"] > FRONTIER_CONTROL_BUDGET_R, "row_key"].unique()):
+        for above_key in sorted(grp.loc[grp["_r"] > control_r, "row_key"].unique()):
             section["not_confirmatory_points"].append(
                 {
                     "row_key": str(above_key),
                     "rate_qps": cell_rate[str(above_key)],
-                    "reason": f"budget_r above the control rung {FRONTIER_CONTROL_BUDGET_R:g}: "
+                    "reason": f"budget_r above the control rung {control_r:g}: "
                     "E1 is registered as a drop below the control rung",
                 }
             )
-        constrained = grp[grp["_r"] < FRONTIER_CONTROL_BUDGET_R]
+        constrained = grp[grp["_r"] < control_r]
         for rung_value, rung_grp in constrained.groupby("_r"):
             # Block F row F-8 (S2 register T4, DEC-6 item 5): the constrained
             # cells of one rung that each match a control at their rate pool
@@ -4619,7 +4659,7 @@ def compute_frontier_drop(
                         {
                             "row_key": cell_key,
                             "rate_qps": cell_qps,
-                            "reason": "no control cell (budget_r 1.25) at this "
+                            "reason": f"no control cell (budget_r {control_r:g}) at this "
                             "offered rate on the same axes: not a K1 point",
                         }
                     )
@@ -4821,7 +4861,7 @@ def compute_frontier_drop(
             "point: no constrained cell shares an offered rate "
             f"({'.'.join(_FRONTIER_RATE_METRICS_PATH)}, relative tolerance "
             f"{FRONTIER_RATE_RTOL:g}) with a control cell (budget_r "
-            f"{FRONTIER_CONTROL_BUDGET_R:g}) on the same engine, arm and dataset "
+            f"{control_r:g}) on the same engine, arm and dataset "
             f"({len(section['not_confirmatory_points'])} constrained cell(s) listed)"
         )
     return section, primaries

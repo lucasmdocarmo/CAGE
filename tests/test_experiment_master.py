@@ -2464,8 +2464,10 @@ def test_a_dead_channel_during_the_calibration_report_probe_fails_the_pull(world
 
 
 def _batched_profile(world: Dict[str, Path], tmp_path: Path) -> None:
+    # S2 block F row F-11 (owner 2026-11-04): a batch size comes with the two stated per-row bounds
     prof = tmp_path / "S1_batched.env"
-    prof.write_text(world["profile"].read_text(encoding="utf-8") + "\nSCORING_BATCH_SIZE=32\n", encoding="utf-8")
+    prof.write_text(world["profile"].read_text(encoding="utf-8")
+                    + "\nSCORING_BATCH_SIZE=32\nSCORING_TOL_FAITHFULNESS=0.005\nSCORING_TOL_BERTSCORE=1e-5\n", encoding="utf-8")
     world["profile"] = prof
 
 
@@ -2507,6 +2509,75 @@ def test_without_a_batch_size_no_probe_runs(world: Dict[str, Path]) -> None:
     assert not any(c.startswith("scoring_probe ") for c in _calls(world))
     assert not (world["home"] / ".cage_jobs" / "score_probe.cmd").exists()
     assert "scoring" not in _state(world)
+
+
+def test_a_batch_size_without_both_stated_bounds_is_refused_at_stage_0_s2_f11(world: Dict[str, Path], tmp_path: Path) -> None:
+    """S2 block F row F-11 (owner 2026-11-04, option (a)): a profile that batches the
+    scoring pass states the two per-row bounds the stage 10 proof allows (0 = exact);
+    an empty or non-numeric one is refused at stage 0, under --plan too, before the
+    suite or any pod, naming the bad key."""
+    base = world["profile"].read_text(encoding="utf-8")
+    both = ("SCORING_TOL_FAITHFULNESS", "SCORING_TOL_BERTSCORE")
+    cases = {"empty": ("SCORING_BATCH_SIZE=32\n", both),
+             "text": ("SCORING_BATCH_SIZE=32\nSCORING_TOL_FAITHFULNESS=abc\nSCORING_TOL_BERTSCORE=1e-5\n", both[:1]),
+             "negative": ("SCORING_BATCH_SIZE=32\nSCORING_TOL_FAITHFULNESS=0.005\nSCORING_TOL_BERTSCORE=-1e-5\n", both[1:]),
+             # review LOW 1: an overflow literal reads as inf on the pod; review gap 6: a signed form is not stated plainly
+             "overflow": ("SCORING_BATCH_SIZE=32\nSCORING_TOL_FAITHFULNESS=0.005\nSCORING_TOL_BERTSCORE=1e400\n", both[1:]),
+             "plus": ("SCORING_BATCH_SIZE=32\nSCORING_TOL_FAITHFULNESS=+0.5\nSCORING_TOL_BERTSCORE=1e-5\n", both[:1])}
+    marker = "needs the stage 10 proof bounds stated (S2 block F row F-11"
+    for case, (extra, bad_keys) in cases.items():
+        prof = tmp_path / f"S1_{case}.env"
+        prof.write_text(base + "\n" + extra, encoding="utf-8")
+        world["profile"] = prof
+        for argv in ((), ("--plan",)):
+            proc = _master(world, *argv)
+            assert proc.returncode == 1, (case, argv, proc.stdout[-2000:])
+            assert marker in proc.stdout, (case, argv, proc.stdout[-2000:])
+            named = proc.stdout.split(marker)[1].splitlines()[0]
+            for key in both:
+                assert (key in named) is (key in bad_keys), (case, argv, key, named)
+            assert not any("provision_pod" in c for c in _calls(world))
+    # both stated (0 is a statement: exact): stage 0 passes under --plan and prints them
+    good = tmp_path / "S1_bounds.env"
+    good.write_text(base + "\nSCORING_BATCH_SIZE=32\nSCORING_TOL_FAITHFULNESS=0\nSCORING_TOL_BERTSCORE=1e-5\n", encoding="utf-8")
+    world["profile"] = good
+    proc = _master(world, "--plan")
+    assert proc.returncode == 0, proc.stdout[-2000:]
+    assert "scoring proof bounds (F-11): faithfulness 0, completeness_bertscore 1e-5 (batch size 32)" in proc.stdout
+
+
+def test_the_stage_10_probe_carries_the_profiles_bounds_after_the_freeze_file_s2_f11(world: Dict[str, Path], tmp_path: Path) -> None:
+    """The master passes SCORING_TOL_FAITHFULNESS and SCORING_TOL_BERTSCORE to the probe as
+    --tol-faithfulness=X and --tol-bertscore=Y (the = form, review MEDIUM 1: a negative in any
+    notation then reaches argparse as a value and the probe answers with a verdict), after
+    the freeze file and before --out; the pass keeps its batch size on OK. A stated 0 is sent
+    (S1.env). An empty key sends no flag at all, so the probe refuses it by name with the
+    full instruments (a live run never gets there: stage 0 refuses the profile)."""
+    _batched_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "score")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    probe = [c for c in _calls(world) if c.startswith("scoring_probe ")]
+    assert len(probe) == 1
+    assert (" --device cuda --freeze-file MyDocs/registration/freeze_resolutions.json --tol-faithfulness=0.005"
+            " --tol-bertscore=1e-5 --out logs/scoring_batch_probe.json" in probe[0]), probe[0]
+    cmd = (world["home"] / ".cage_jobs" / "score_probe.cmd").read_text(encoding="utf-8")
+    assert "--tol-faithfulness=0.005 --tol-bertscore=1e-5" in cmd
+    assert "--batch-size 32" in (world["home"] / ".cage_jobs" / "score.cmd").read_text(encoding="utf-8")
+    batched = world["profile"].read_text(encoding="utf-8")
+    zero = tmp_path / "S1_zerobound.env"
+    zero.write_text(batched.replace("SCORING_TOL_FAITHFULNESS=0.005", "SCORING_TOL_FAITHFULNESS=0"), encoding="utf-8")
+    world["profile"] = zero
+    proc = _master(world, "--only", "score", "--redo")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    probe = [c for c in _calls(world) if c.startswith("scoring_probe ")]
+    assert len(probe) == 2 and "--tol-faithfulness=0 --tol-bertscore=1e-5 --out" in probe[1], probe[1]
+    prof = tmp_path / "S1_onebound.env"
+    prof.write_text(batched.replace("SCORING_TOL_BERTSCORE=1e-5", "SCORING_TOL_BERTSCORE="), encoding="utf-8")
+    world["profile"] = prof
+    proc = _master(world, "--only", "score", "--redo")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    probe = [c for c in _calls(world) if c.startswith("scoring_probe ")]
+    assert len(probe) == 3 and "--tol-faithfulness=0.005 --out" in probe[2] and "--tol-bertscore" not in probe[2], probe[2]
 
 
 # ---------------------------------------------------------------------------
@@ -2755,7 +2826,8 @@ def test_the_shipped_s2_landing_profiles_carry_every_s1_key_and_the_block_e_pick
             "FLOOR_AVG_SEQ_TOKENS", "INSTALL_LMCACHE", "LMCACHE_VERSION", "PIN_MODEL_REVISION", "RUNG_ALL_CLASSES", "CLASS_CEILINGS",
             "MIN_IN_REGIME_WINDOWS", "MAX_NULL_FRACTION", "SUITE_ON_POD", "MAC_SUITE", "FRONT_LOAD", "VOLUME_GB", "DISK_GB",
             "QUERY_MANIFESTS", "CALIBRATION_MANIFEST", "PREFETCH_MODELS", "HF_TOKEN_FILE", "SKIP_BLOCKED",
-            "CALIBRATION_BUDGET_FRACTION", "REGIME_GATE_LOADS", "CONFIRMATORY_ARMS")
+            "CALIBRATION_BUDGET_FRACTION", "REGIME_GATE_LOADS", "CONFIRMATORY_ARMS",
+            "SCORING_TOL_FAITHFULNESS", "SCORING_TOL_BERTSCORE")
     a, b = _profile_values("S2A.env", keys), _profile_values("S2B.env", keys)
     shared = {"GPU_ID": "NVIDIA H200", "GPU_COUNT": "4", "ENGINES": "vllm sglang", "CALIBRATE": "vllm sglang", "TOPOLOGY": "tp",
               "DC_PREFS": "US-CA-2 US-CO-1 CA-MTL-3 CA-MTL-4 EU-FR-1 AP-JP-1", "CALIBRATE_RUNGS_BOUND_S": "32400",
@@ -2764,7 +2836,9 @@ def test_the_shipped_s2_landing_profiles_carry_every_s1_key_and_the_block_e_pick
               # the gate at the registered count per load, the ladder bound that holds 15 triples per engine
               "CALIBRATION_BUDGET_FRACTION": "1.0", "REGIME_GATE_LOADS": "0.95 1.05", "MIN_IN_REGIME_WINDOWS": "0.95:2 1.05:3",
               "MAX_NULL_FRACTION": "0.06", "SUITE_ON_POD": "1", "MAC_SUITE": "1", "FRONT_LOAD": "0", "VOLUME_GB": "300",
-              "DISK_GB": "300", "SKIP_BLOCKED": "0"}
+              "DISK_GB": "300", "SKIP_BLOCKED": "0",
+              # S2 block F row F-11 (owner 2026-11-04, option (a)): the per-row bounds the stage 10 proof allows
+              "SCORING_TOL_FAITHFULNESS": "0.005", "SCORING_TOL_BERTSCORE": "1e-5"}
     for k, v in shared.items():
         assert a[k] == v and b[k] == v, (k, a[k], b[k])
     own = ("EXP", "SESSION", "MODEL", "MODEL_SLUG", "HOURS", "RUN_BUDGET_HOURS", "SEATBELT", "SETUP_BOUND_MIN",
@@ -3674,3 +3748,31 @@ def test_stage_5_hands_the_verb_absolute_manifest_paths_from_any_cwd_f5(world: D
     argv = (world["home"] / ".cage_ladder_cells_argv").read_text(encoding="utf-8").splitlines()
     assert argv == ["ladder-cells --session a --engine vllm --rungs 1,0.5 "
                     f"--query-manifest squad_v2={REPO_ROOT}/data/manifests/squad_v2_50x3_seed42.json --all-classes"]
+
+
+# ---------------------------------------------------------------------------
+# S2 block F batch 5 (2026-11-04, review 2026-11-03 LOW 3): the F-5 check runs
+# before the floor jobs
+# ---------------------------------------------------------------------------
+
+
+def test_stage_5_runs_the_ladder_check_before_the_floor_jobs_low3(world: Dict[str, Path]) -> None:
+    # the check needs only the session, the rungs and the manifests, none of which the floor
+    # jobs produce, so its print comes before the first calibrate_<engine> job is submitted
+    proc = _master(world, "--yes", "provision", "--to", "calibrate")
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-2000:]
+    out = proc.stdout
+    i_ladder = out.index("ladder vllm: engine=vllm triples=4 classes=2 (F-5)")
+    i_floor = out.index("[step] job calibrate_vllm: wait")
+    i_rungs = out.index("[step] job calibrate_rungs_vllm: wait")
+    assert i_ladder < i_floor < i_rungs
+
+
+def test_a_ladder_cells_refusal_fails_stage_5_before_the_floor_jobs_low3(world: Dict[str, Path]) -> None:
+    proc = _master(world, "--yes", "provision", "--to", "calibrate", CAGE_TEST_LADDER_CELLS_RC="2")
+    assert proc.returncode == 1, proc.stdout[-4000:] + proc.stderr[-2000:]
+    assert "[FAIL] ladder-cells (F-5) refused for engine vllm" in proc.stdout
+    jobs = world["home"] / ".cage_jobs"
+    assert not (jobs / "calibrate_vllm.cmd").exists(), "the floor job must not bill before the check"
+    assert not (jobs / "calibrate_rungs_vllm.cmd").exists()
+    assert _state(world)["stages"]["calibrate"]["status"] == "failed"

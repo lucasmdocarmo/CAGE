@@ -704,6 +704,28 @@ stage_preflight_mac() {
       return 1
     fi
   fi
+  # S2 block F row F-11 (owner 2026-11-04, option (a)): a profile that batches the
+  # scoring pass states the two per-row bounds the stage 10 proof allows on
+  # faithfulness and completeness_bertscore (score points; 0 = exact; every field
+  # the predicate reads stays exact). An empty or non-numeric one is refused here,
+  # before anything bills, under --plan too; stage 10 passes both to the probe.
+  if [ -n "${SCORING_BATCH_SIZE:-}" ]; then
+    local tol_re='^([0-9]+\.?[0-9]*|\.[0-9]+)([eE][-+]?[0-9]+)?$' tol_bad="" tk tv
+    for tk in SCORING_TOL_FAITHFULNESS SCORING_TOL_BERTSCORE; do
+      tv="${!tk:-}"
+      if [[ "$tv" =~ $tol_re ]]; then
+        # the regex admits an overflow literal (1e400) that reads as inf on the pod (review 2026-11-04 LOW 1)
+        "$PY3" -c 'import math, sys; sys.exit(0 if math.isfinite(float(sys.argv[1])) else 1)' "$tv" || tol_bad="$tol_bad $tk='$tv'(not finite)"
+      else
+        tol_bad="$tol_bad $tk='$tv'"
+      fi
+    done
+    if [ -n "$tol_bad" ]; then
+      printf '  [FAIL] SCORING_BATCH_SIZE=%s needs the stage 10 proof bounds stated (S2 block F row F-11: a non-negative number each, 0 = exact):%s\n' "$SCORING_BATCH_SIZE" "$tol_bad"
+      return 1
+    fi
+    say "scoring proof bounds (F-11): faithfulness $SCORING_TOL_FAITHFULNESS, completeness_bertscore $SCORING_TOL_BERTSCORE (batch size $SCORING_BATCH_SIZE)"
+  fi
   # S2 block E-2 (owner 2026-11-01): a gated served model's Hub token travels as
   # a FILE (HF_TOKEN_FILE on the Mac, outside the repo, mode 600) to
   # $POD_HF_CACHE/token at stage 2, the path the hub reads under its default
@@ -1602,6 +1624,44 @@ stage_calibrate() {
   # or ladder passed on THIS pod and build is not rerun when the stage is
   # repeated after the other engine failed (a 7 to 9 h saving per resume).
   local done_key; done_key="$(state get pod.id 2>/dev/null || true):$(state get build.sha 2>/dev/null || true)"
+  # S2 block F batch 5 (review 2026-11-03 LOW 3): the rung set and the F-5 ladder check
+  # are resolved HERE, before the floor jobs, so a refusal (an absent manifest, a grid the
+  # verb rejects) costs no pod time; the ladder jobs that consume them follow the floor table.
+  # ADR-0154 (S0F-62): lambda* per budget rung, measured on the gold-fresh F2
+  # workload under the plan's OWN relaunch for that rung (prefix OFF, the gold
+  # class budget), by the registered cal-v3 ladder through the runner. One job
+  # per engine; the rungs are the session's budgeted rungs (the rehearsal's
+  # collapsed ones under REHEARSAL_N) unless the profile names CALIBRATE_RUNGS.
+  # The job starts and stops the engines itself (its relaunches ARE the plan's).
+  local rungs qm2 reh2 item
+  qm2=""; for item in $QUERY_MANIFESTS; do qm2="$qm2 --query-manifest $item"; done
+  reh2=""; [ -z "${REHEARSAL_N:-}" ] || reh2=" --rehearsal-n $REHEARSAL_N"
+  rungs="${CALIBRATE_RUNGS:-}"
+  if [ -z "$rungs" ]; then
+    rungs="$("$PY" "$SCRIPTS/3_run/run_campaign.py" rungs --session "$SESSION"$reh2$qm2 | tr ' ' ',')" || { printf '  [FAIL] run_campaign.py rungs failed for session %s\n' "$SESSION"; return 1; }
+  fi
+  [ -n "$rungs" ] || { printf '  [FAIL] no budgeted rung for session %s (CALIBRATE_RUNGS empty and the driver lists none)\n' "$SESSION"; return 1; }
+  # S0F-88 B-9 (owner ruling R5): RUNG_ALL_CLASSES=1 ladders every class
+  # between the two anchors at its own pressure rungs (no interpolation).
+  local allc=""; [ "${RUNG_ALL_CLASSES:-0}" = "1" ] && allc=" --all-classes"
+  # S2 block F row F-5: the (engine, class, rung) triples each ladder will run, printed on
+  # the Mac before the pod bills (plan mode too); the verb shares the ladder's selection rule.
+  # Under --plan a manifest the profile names but the Mac lacks (S2A's Qasper manifest until
+  # the gated tokenizer builds it) is left out of the print and named: stage 0 refuses the
+  # live run until the file exists, and a live stage 5 hands the verb the profile's full
+  # list, whose refusal fails the stage before the ladder bills. The verb opens the files and
+  # this script never changes directory, so it gets the Mac's absolute path (review 2026-11-03
+  # MEDIUM 1); the pod ladder keeps the profile's relative path under its own repo
+  local lc_out lc_qm="" lc_absent="" item
+  for item in $QUERY_MANIFESTS; do
+    if [ "$PLAN" -eq 1 ] && [ ! -f "$PROJECT_DIR/${item#*=}" ]; then lc_absent="$lc_absent ${item%%=*}"; else lc_qm="$lc_qm --query-manifest ${item%%=*}=$PROJECT_DIR/${item#*=}"; fi
+  done
+  [ -z "$lc_absent" ] || say "ladder-cells (F-5): manifest(s) absent on the Mac, left out of this print (their corpus-trunc classes are not listed; stage 0 refuses the live run until the files exist):$lc_absent"
+  for e in $CALIBRATE; do
+    lc_out="$("$PY" "$SCRIPTS/3_run/run_campaign.py" ladder-cells --session "$SESSION" --engine "$e" --rungs "$rungs"$lc_qm$reh2$allc 2>&1)" || { printf '%s\n' "$lc_out"; printf '  [FAIL] ladder-cells (F-5) refused for engine %s: fix the grid or the profile before the ladder bills\n' "$e"; return 1; }
+    printf '%s\n' "$lc_out" | sed 's/^/    /'
+    say "ladder $e: $(printf '%s\n' "$lc_out" | tail -n 1) (F-5)"
+  done
   for e in $CALIBRATE; do
     launcher="$(engine_launcher "$e")" || { printf '  [FAIL] unknown engine %s\n' "$e"; return 1; }
     api="$(engine_api "$e")"
@@ -1647,20 +1707,6 @@ PY
     run_step 0 "byte plan $e r=$r" -- bash -c "cd '$PROJECT_DIR' && '$PY' -m src.orchestration.cache_budget --model '$MODEL_SLUG' --engine '$e' --r '$r' --concurrency '$FLOOR_CONCURRENCY' --avg-seq-tokens '$FLOOR_AVG_SEQ_TOKENS' > '$EXTRAS/calibration/budget_${e}_r${r}.json'" || return 1
   done; done
   run_step 0 "scp floor table to the pod" -- pscp_to "$EXTRAS/calibration/floor_table_$stamp.json" "$POD_REPO/results/calibration/floor_table.json" || return 1
-  # ADR-0154 (S0F-62): lambda* per budget rung, measured on the gold-fresh F2
-  # workload under the plan's OWN relaunch for that rung (prefix OFF, the gold
-  # class budget), by the registered cal-v3 ladder through the runner. One job
-  # per engine; the rungs are the session's budgeted rungs (the rehearsal's
-  # collapsed ones under REHEARSAL_N) unless the profile names CALIBRATE_RUNGS.
-  # The job starts and stops the engines itself (its relaunches ARE the plan's).
-  local rungs qm2 reh2 item
-  qm2=""; for item in $QUERY_MANIFESTS; do qm2="$qm2 --query-manifest $item"; done
-  reh2=""; [ -z "${REHEARSAL_N:-}" ] || reh2=" --rehearsal-n $REHEARSAL_N"
-  rungs="${CALIBRATE_RUNGS:-}"
-  if [ -z "$rungs" ]; then
-    rungs="$("$PY" "$SCRIPTS/3_run/run_campaign.py" rungs --session "$SESSION"$reh2$qm2 | tr ' ' ',')" || { printf '  [FAIL] run_campaign.py rungs failed for session %s\n' "$SESSION"; return 1; }
-  fi
-  [ -n "$rungs" ] || { printf '  [FAIL] no budgeted rung for session %s (CALIBRATE_RUNGS empty and the driver lists none)\n' "$SESSION"; return 1; }
   # The ladder roots are never reused (a reused root is a PROBE_FAILED rung),
   # so each attempt of this stage gets its own out-root under the run id
   # (review MEDIUM 4); stage 12 pulls the whole rung-calibration tree.
@@ -1669,9 +1715,6 @@ PY
   # drift roots; the cd-act1 run id (38) would otherwise make a 45-character root.
   local rungs_root="results/rung-calibration/${RUN_ID:0:30}-$(date -u +%H%M%S)"
   plan_only || state put calibration.rungs_out_root "$rungs_root"
-  # S0F-88 B-9 (owner ruling R5): RUNG_ALL_CLASSES=1 ladders every class
-  # between the two anchors at its own pressure rungs (no interpolation).
-  local allc=""; [ "${RUNG_ALL_CLASSES:-0}" = "1" ] && allc=" --all-classes"
   # Review 2026-10-13 item 3 (S0F-77): LADDER_FAIL_FAST=1 stops a ladder at its
   # first non-ESTIMATED rung; item 21: STEP_TIMEOUT_S bounds every window.
   local ffast=""; [ "${LADDER_FAIL_FAST:-0}" = "1" ] && ffast=" --fail-fast"
@@ -1682,24 +1725,6 @@ PY
   # floor window with an operator start (the remedy when the floor window
   # reads too few unloaded rows).
   local rstart=""; [ -z "${RULER_START_QPS:-}" ] || rstart=" --ruler-start-qps $RULER_START_QPS"
-  # S2 block F row F-5: the (engine, class, rung) triples each ladder will run, printed on
-  # the Mac before the pod bills (plan mode too); the verb shares the ladder's selection rule.
-  # Under --plan a manifest the profile names but the Mac lacks (S2A's Qasper manifest until
-  # the gated tokenizer builds it) is left out of the print and named: stage 0 refuses the
-  # live run until the file exists, and a live stage 5 hands the verb the profile's full
-  # list, whose refusal fails the stage before the ladder bills. The verb opens the files and
-  # this script never changes directory, so it gets the Mac's absolute path (review 2026-11-03
-  # MEDIUM 1); the pod ladder keeps the profile's relative path under its own repo
-  local lc_out lc_qm="" lc_absent="" item
-  for item in $QUERY_MANIFESTS; do
-    if [ "$PLAN" -eq 1 ] && [ ! -f "$PROJECT_DIR/${item#*=}" ]; then lc_absent="$lc_absent ${item%%=*}"; else lc_qm="$lc_qm --query-manifest ${item%%=*}=$PROJECT_DIR/${item#*=}"; fi
-  done
-  [ -z "$lc_absent" ] || say "ladder-cells (F-5): manifest(s) absent on the Mac, left out of this print (their corpus-trunc classes are not listed; stage 0 refuses the live run until the files exist):$lc_absent"
-  for e in $CALIBRATE; do
-    lc_out="$("$PY" "$SCRIPTS/3_run/run_campaign.py" ladder-cells --session "$SESSION" --engine "$e" --rungs "$rungs"$lc_qm$reh2$allc 2>&1)" || { printf '%s\n' "$lc_out"; printf '  [FAIL] ladder-cells (F-5) refused for engine %s: fix the grid or the profile before the ladder bills\n' "$e"; return 1; }
-    printf '%s\n' "$lc_out" | sed 's/^/    /'
-    say "ladder $e: $(printf '%s\n' "$lc_out" | tail -n 1) (F-5)"
-  done
   say "rung calibration (ADR-0154, ADR-0156, ADR-0169${allc:+, S0F-88 B-9 every class}): rungs $rungs per engine on the anchor, the RULER instrument (where registered) and the smallest class${allc:+ and every class between}, bound ${CALIBRATE_RUNGS_BOUND_S}s each, roots under $rungs_root"
   for e in $CALIBRATE; do
     out="results/calibration/rungs_${EXP}_${e}.json"
@@ -2212,7 +2237,12 @@ stage_score() {
   # verdict line decides, and a crashed probe is a failed proof, never a
   # failed stage.
   if [ -n "${SCORING_BATCH_SIZE:-}" ]; then
-    job_run score_probe 900 "cd $POD_REPO && env$(instrument_rev_env) $POD_PYTHON scripts/checks/probe_scoring_batch.py --run-root $POD_RUN_ROOT --batch-size $SCORING_BATCH_SIZE --rows 50 --device cuda --freeze-file $POD_FREEZE_FILE --out logs/scoring_batch_probe.json; exit 0" "$LAND/logs/runner" || return 1
+    # S2 block F row F-11: the profile's per-row bounds ride to the probe after the
+    # freeze file, in the --flag=value form (review 2026-11-04 MEDIUM 1: a negative in
+    # exponent form then reaches argparse as a value and the probe answers with a
+    # verdict, not a usage error). Stage 0 refused an empty one; a key emptied since
+    # sends no flag, and the probe refuses that by name with the full instruments.
+    job_run score_probe 900 "cd $POD_REPO && env$(instrument_rev_env) $POD_PYTHON scripts/checks/probe_scoring_batch.py --run-root $POD_RUN_ROOT --batch-size $SCORING_BATCH_SIZE --rows 50 --device cuda --freeze-file $POD_FREEZE_FILE${SCORING_TOL_FAITHFULNESS:+ --tol-faithfulness=$SCORING_TOL_FAITHFULNESS}${SCORING_TOL_BERTSCORE:+ --tol-bertscore=$SCORING_TOL_BERTSCORE} --out logs/scoring_batch_probe.json; exit 0" "$LAND/logs/runner" || return 1
     if ! plan_only; then
       local verdict; verdict="$(grep -E '^SCORING_BATCH_(OK|FAILED)' "$JOB_LOG" | tail -1 || true)"
       case "$verdict" in

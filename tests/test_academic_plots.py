@@ -227,6 +227,8 @@ def _write_landing(tmp_path: Path, *, with_retrieval: bool = True) -> dict:
     b6 = CellSpec.from_baseline("B6", model=MODEL).to_row_key()  # type: ignore[arg-type]
     stats = {
         "frontier": {
+            # the driver's control rung (compute_frontier_drop reads it from the registered plan; row F-13)
+            "control_budget_r": 1.25,
             "legs": [{
                 "dataset": DATASET, "leg": "B1|r0.25", "baseline": "B1", "arm": "gold-fresh", "budget_r": 0.25,
                 "engine": "vllm", "constrained_row_key": k1_con, "control_row_keys": [k1_control],
@@ -684,3 +686,82 @@ def test_frontier_readers_take_every_pooled_constrained_key_f8(tmp_path: Path) -
     assert ap.plot_a06_preemption_kv(L2, out)[1] == "9 windows"
     con = [c for c in ap._k1_cells(L2) if c["budget_r"] == 0.25]
     assert len(con) == 1 and con[0]["keys"] == [leg["constrained_row_key"], k2]
+
+
+# ---------------------------------------------------------------------------
+# S2 block F row F-13 addendum (review 2026-11-04 MEDIUM 1): the control rung
+# the frontier figures print is the driver's frontier.control_budget_r (read
+# from the registered plan by compute_frontier_drop), never a constant here.
+# ---------------------------------------------------------------------------
+
+
+def _frontier_control(parts: dict, value, *, remove: bool = False) -> None:
+    """Set frontier.control_budget_r in the fixture's stats.json (remove=True drops the key;
+    a None value is written as a JSON null, NaN and infinity as the tokens json.load reads)."""
+    stats = json.loads(parts["stats"].read_text(encoding="utf-8"))
+    if remove:
+        stats["frontier"].pop("control_budget_r", None)
+    else:
+        stats["frontier"]["control_budget_r"] = value
+    parts["stats"].write_text(json.dumps(stats), encoding="utf-8")
+
+
+def test_the_frontier_figures_print_the_sections_control_rung_f13(tmp_path: Path, monkeypatch) -> None:
+    """S2 registers control 1.0 (run_campaign.py S2_CONTROL_R): with
+    frontier.control_budget_r = 1.0 the a01 tick, the a02 legend, the K1 cell
+    record and the captions of p03, a02 and a06 say rung 1, and none says 1.25."""
+    parts = _write_landing(tmp_path)
+    _plan_with_blocks(parts)
+    _frontier_control(parts, 1.0)
+    L = _landing(parts)
+    out = tmp_path / "out"
+    out.mkdir()
+    ap.ps.apply_style()
+    figs: list = []
+    # keep the figures open (save_fig closes them) so their texts can be read
+    monkeypatch.setattr(ap, "_out", lambda fig, out_dir, stem: figs.append(fig) or f"{stem}.png")
+    assert ap._control_budget_r(L) == 1.0
+    control = [c for c in ap._k1_cells(L) if c["side"].startswith("control")]
+    assert len(control) == 1 and control[0]["budget_r"] == 1.0
+    assert control[0]["side"] == "control (cache rung 1) at 3.00 rps"
+    ap.plot_a01_frontier_drop(L, out)
+    ticks = [t.get_text() for ax in figs[-1].axes for t in ax.get_xticklabels()]
+    assert "control\nr=1" in ticks and "control\nr=1.25" not in ticks, ticks
+    ap.plot_a02_ttft_cdf(L, out)
+    legend = [t.get_text() for t in figs[-1].legends[0].get_texts()]
+    assert "Oracle context, fresh prefill, control (cache rung 1)" in legend, legend
+    ap.plot_a06_preemption_kv(L, out)
+    ap.plot03_pressure_map(L, out)
+    a02 = (out / "a02_ttft_cdf.caption.txt").read_text(encoding="utf-8")
+    a06 = (out / "a06_preemption_kv.caption.txt").read_text(encoding="utf-8")
+    p03 = (out / "p03_pressure_map.caption.txt").read_text(encoding="utf-8")
+    assert "Solid: the control rung 1;" in a02 and "1.25" not in a02
+    assert "solid for the control rung 1 and dashed" in a06 and "1.25" not in a06
+    assert "holds the block's control rung 1 as well as its constrained rungs" in p03
+    # the referee sentence of p03 is S1 regime prose (block G rewrites it): kept as is
+    assert "the control\nrung 1.25)" in p03
+    import matplotlib.pyplot as plt
+
+    plt.close("all")  # the patched _out kept the four figures open (review LOW 3)
+
+
+def test_a_frontier_section_without_the_control_rung_refuses_by_name_f13(tmp_path: Path) -> None:
+    """An older stats.json without frontier.control_budget_r, or one with a
+    value that is not a positive number, refuses the frontier figures and the
+    pooled p03 column by name; p03 without the plan's block field never needs it."""
+    parts = _write_landing(tmp_path)
+    _plan_with_blocks(parts)
+    _frontier_control(parts, None, remove=True)
+    out = tmp_path / "out"
+    out.mkdir()
+    ap.ps.apply_style()
+    L = _landing(parts)
+    for fn in (ap.plot_a01_frontier_drop, ap.plot_a02_ttft_cdf, ap.plot_a06_preemption_kv, ap.plot03_pressure_map):
+        with pytest.raises(ap.PlotSkip, match="control_budget_r"):
+            fn(L, out)
+    for bad in (None, "1.25", 0, -1.0, True, float("nan"), float("inf")):
+        _frontier_control(parts, bad)
+        with pytest.raises(ap.PlotSkip, match="control_budget_r"):
+            ap._control_budget_r(_landing(parts))
+    noplan = ap.Landing(parts["landing"], yield_table=parts["yield"], stats=parts["stats"])
+    assert ap.plot03_pressure_map(noplan, out)[1].endswith("no plan block field: one column per rounded rate")
