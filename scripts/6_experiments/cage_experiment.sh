@@ -1682,6 +1682,24 @@ PY
   # floor window with an operator start (the remedy when the floor window
   # reads too few unloaded rows).
   local rstart=""; [ -z "${RULER_START_QPS:-}" ] || rstart=" --ruler-start-qps $RULER_START_QPS"
+  # S2 block F row F-5: the (engine, class, rung) triples each ladder will run, printed on
+  # the Mac before the pod bills (plan mode too); the verb shares the ladder's selection rule.
+  # Under --plan a manifest the profile names but the Mac lacks (S2A's Qasper manifest until
+  # the gated tokenizer builds it) is left out of the print and named: stage 0 refuses the
+  # live run until the file exists, and a live stage 5 hands the verb the profile's full
+  # list, whose refusal fails the stage before the ladder bills. The verb opens the files and
+  # this script never changes directory, so it gets the Mac's absolute path (review 2026-11-03
+  # MEDIUM 1); the pod ladder keeps the profile's relative path under its own repo
+  local lc_out lc_qm="" lc_absent="" item
+  for item in $QUERY_MANIFESTS; do
+    if [ "$PLAN" -eq 1 ] && [ ! -f "$PROJECT_DIR/${item#*=}" ]; then lc_absent="$lc_absent ${item%%=*}"; else lc_qm="$lc_qm --query-manifest ${item%%=*}=$PROJECT_DIR/${item#*=}"; fi
+  done
+  [ -z "$lc_absent" ] || say "ladder-cells (F-5): manifest(s) absent on the Mac, left out of this print (their corpus-trunc classes are not listed; stage 0 refuses the live run until the files exist):$lc_absent"
+  for e in $CALIBRATE; do
+    lc_out="$("$PY" "$SCRIPTS/3_run/run_campaign.py" ladder-cells --session "$SESSION" --engine "$e" --rungs "$rungs"$lc_qm$reh2$allc 2>&1)" || { printf '%s\n' "$lc_out"; printf '  [FAIL] ladder-cells (F-5) refused for engine %s: fix the grid or the profile before the ladder bills\n' "$e"; return 1; }
+    printf '%s\n' "$lc_out" | sed 's/^/    /'
+    say "ladder $e: $(printf '%s\n' "$lc_out" | tail -n 1) (F-5)"
+  done
   say "rung calibration (ADR-0154, ADR-0156, ADR-0169${allc:+, S0F-88 B-9 every class}): rungs $rungs per engine on the anchor, the RULER instrument (where registered) and the smallest class${allc:+ and every class between}, bound ${CALIBRATE_RUNGS_BOUND_S}s each, roots under $rungs_root"
   for e in $CALIBRATE; do
     out="results/calibration/rungs_${EXP}_${e}.json"

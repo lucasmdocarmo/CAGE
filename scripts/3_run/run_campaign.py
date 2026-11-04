@@ -313,7 +313,7 @@ import time
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -11589,6 +11589,133 @@ def _set_flag(argv: List[str], flag: str, value: str) -> None:
     argv[at + 1] = value
 
 
+class LadderSelection(NamedTuple):
+    """The cells one engine's ladder runs (S2 block F row F-5): the anchor at
+    every rung, the smallest class at the rungs it carries cells at, the
+    classes between them (``all_classes``) keyed by served tokens, and the
+    RULER instrument. ``all_cells`` is the list the coverage, pool and
+    calibration checks read (order-insensitive); ``roles`` names each cell
+    with the artifact's role (anchor, ruler, smallest, measured) in the order
+    the ladder runs them: the anchor, the RULER instrument right after it
+    (ADR-0169), the smallest class, then each measured class."""
+
+    anchor_cells: List[PlannedCell]
+    small_cells: List[PlannedCell]
+    measured_cells: Dict[int, List[PlannedCell]]
+    ruler_cells: List[PlannedCell]
+
+    @property
+    def all_cells(self) -> List[PlannedCell]:
+        return (
+            self.anchor_cells + self.small_cells
+            + [c for cells_m in self.measured_cells.values() for c in cells_m] + self.ruler_cells
+        )
+
+    def roles(self) -> List[Tuple[str, PlannedCell]]:
+        return (
+            [("anchor", c) for c in self.anchor_cells] + [(RULER_ROLE, c) for c in self.ruler_cells]
+            + [("smallest", c) for c in self.small_cells]
+            + [("measured", c) for cells_m in self.measured_cells.values() for c in cells_m]
+        )
+
+
+def _resolve_rung_list(grid: SessionGrid, rungs: Optional[Sequence[float]]) -> Tuple[float, ...]:
+    """The rungs a ladder runs, descending: every budgeted rung of the grid, or
+    ``--rungs`` when each one is a budgeted rung (refused by name otherwise)."""
+    registered = budgeted_rungs(grid)
+    if rungs is None:
+        return registered
+    for r in rungs:
+        if not any(math.isclose(r, reg, rel_tol=0.0, abs_tol=1e-9) for reg in registered):
+            raise PlanError(
+                f"--rungs {r:g} is not a budgeted rung of session {grid.session!r} "
+                f"(registered: {[f'{x:g}' for x in registered]})"
+            )
+    return tuple(sorted({float(r) for r in rungs}, reverse=True))
+
+
+def ladder_cells(
+    grid: SessionGrid,
+    engine: str,
+    rung_list: Sequence[float],
+    manifests: Mapping[str, Any],
+    *,
+    all_classes: bool = False,
+    anchor_only: bool = False,
+    ceilings_only: bool = False,
+) -> LadderSelection:
+    """S2 block F row F-5: the ONE selection rule of the ladder, shared by
+    ``calibrate_rungs`` (the pod) and the ``ladder-cells`` verb (the Mac, $0),
+    so what the Mac prints is what the pod runs. Pure: no floor table, no
+    calibration artifact, no file. ``manifests`` is read for membership only
+    (a corpus-trunc class counts when its dataset has a registered manifest);
+    the coverage check against the manifests' trial sizes stays with the
+    callers, which both run it on ``all_cells`` right after this.
+    The rules: the anchor (gold-fresh) at every rung of ``rung_list`` (ADR-0154);
+    the smallest executable class below it (ADR-0156) at every rung, or under
+    ``all_classes`` at the rungs it carries cells at (S0F-88); every class
+    between them at its own pressure rungs under ``all_classes`` or
+    ``ceilings_only`` (B-9, ADR-0177); the RULER instrument at the rungs the
+    engine carries RULER pressure cells at (ADR-0169)."""
+    session = grid.session
+    if ceilings_only and (anchor_only or all_classes):
+        raise PlanError(
+            f"--ceilings-only ladders the interpolated classes alone; it takes neither --anchor-only "
+            f"nor --all-classes ({CLASS_CEILINGS_ADR})"
+        )
+    anchor_cells = [] if ceilings_only else [_gold_fresh_cell(grid, engine, r) for r in rung_list]
+    small_template = None if (anchor_only or ceilings_only) else smallest_pressure_class(grid, engine, manifests)
+    small_cells = [] if small_template is None else [_class_cell_at(small_template, r) for r in rung_list]
+    if small_template is not None and all_classes:
+        # S0F-88 audit: with every class laddered nothing is interpolated, so
+        # the smallest class ladders only the rungs it carries cells at
+        # (attempt 5 would otherwise spend about 5 windows per engine on
+        # rungs no cell uses)
+        small_seq_own = demand_seq_tokens(grid, small_template.spec)
+        own_rungs = {
+            float(c.spec.budget_r)  # type: ignore[arg-type]
+            for c in enumerate_cells(grid)
+            if c.spec.engine == engine and c.blocked_on is None
+            and _pressure_spec(c.spec)
+            and demand_seq_tokens(grid, c.spec) == small_seq_own
+            and not (c.spec.arm == CORPUS_TRUNC_ARM and c.dataset not in manifests)
+        }
+        small_cells = [
+            c for c in small_cells
+            if any(math.isclose(float(c.spec.budget_r), r, rel_tol=0.0, abs_tol=1e-9) for r in own_rungs)  # type: ignore[arg-type]
+        ]
+    # B-9 (S0F-88): with --all-classes every class between the two anchors is
+    # laddered at its own pressure rungs (within --rungs).
+    measured_cells: Dict[int, List[PlannedCell]] = {}
+    if (all_classes or ceilings_only) and not anchor_only:
+        for template, class_rungs in measured_pressure_classes(grid, engine, manifests):
+            cells_m = [
+                _class_cell_at(template, r) for r in class_rungs
+                if any(math.isclose(r, x, rel_tol=0.0, abs_tol=1e-9) for x in rung_list)
+                # ADR-0177: a ceiling is pinned only at r <= KV_CEILING_MAX_R
+                and (not ceilings_only or r <= KV_CEILING_MAX_R)
+            ]
+            if cells_m:
+                measured_cells[demand_seq_tokens(grid, template.spec)] = cells_m
+    if ceilings_only and not measured_cells:
+        raise PlanError(
+            f"--ceilings-only: engine {engine!r} of session {session!r} interpolates no class at a rung "
+            f"<= {KV_CEILING_MAX_R:g} within --rungs; nothing to ladder ({CLASS_CEILINGS_ADR})"
+        )
+    # ADR-0169 (decision 5): the RULER instrument's own ladder, at the rungs
+    # the engine carries RULER pressure cells at (within --rungs), under the
+    # anchor's relaunch (the RULER cell's serving config IS the anchor's).
+    ruler_cells: List[PlannedCell] = []
+    ruler_class = None if (anchor_only or ceilings_only) else ruler_pressure_class(grid, engine)
+    if ruler_class is not None:
+        ruler_template, ruler_rungs = ruler_class
+        ruler_cells = [
+            _ruler_cell_at(ruler_template, r) for r in ruler_rungs
+            if any(math.isclose(r, x, rel_tol=0.0, abs_tol=1e-9) for x in rung_list)
+        ]
+    return LadderSelection(anchor_cells, small_cells, measured_cells, ruler_cells)
+
+
 def calibrate_rungs(
     session: str,
     engine: str,
@@ -11685,81 +11812,19 @@ def calibrate_rungs(
         or not math.isfinite(ruler_start_qps) or ruler_start_qps <= 0
     ):
         raise PlanError(f"--ruler-start-qps {ruler_start_qps!r} must be finite and > 0")
-    registered = budgeted_rungs(grid)
-    if rungs is None:
-        rung_list: Tuple[float, ...] = registered
-    else:
-        for r in rungs:
-            if not any(math.isclose(r, reg, rel_tol=0.0, abs_tol=1e-9) for reg in registered):
-                raise PlanError(
-                    f"--rungs {r:g} is not a budgeted rung of session {session!r} "
-                    f"(registered: {[f'{x:g}' for x in registered]})"
-                )
-        rung_list = tuple(sorted({float(r) for r in rungs}, reverse=True))
+    rung_list = _resolve_rung_list(grid, rungs)
     for r in rung_list:
         floor.row(r)
     pins = resolve_retrieval_pins(freeze_file)
     manifests = _register_query_manifests(grid, query_manifests)
     launcher_cmds = dict(launcher_cmds or DEFAULT_LAUNCHER_CMDS)
     anchor_tokens = _check_floor_shape(grid, floor)
-    if ceilings_only and (anchor_only or all_classes):
-        raise PlanError(
-            f"--ceilings-only ladders the interpolated classes alone; it takes neither --anchor-only "
-            f"nor --all-classes ({CLASS_CEILINGS_ADR})"
-        )
-    anchor_cells = [] if ceilings_only else [_gold_fresh_cell(grid, engine, r) for r in rung_list]
-    small_template = None if (anchor_only or ceilings_only) else smallest_pressure_class(grid, engine, manifests)
-    small_cells = [] if small_template is None else [_class_cell_at(small_template, r) for r in rung_list]
-    if small_template is not None and all_classes:
-        # S0F-88 audit: with every class laddered nothing is interpolated, so
-        # the smallest class ladders only the rungs it carries cells at
-        # (attempt 5 would otherwise spend about 5 windows per engine on
-        # rungs no cell uses)
-        small_seq_own = demand_seq_tokens(grid, small_template.spec)
-        own_rungs = {
-            float(c.spec.budget_r)  # type: ignore[arg-type]
-            for c in enumerate_cells(grid)
-            if c.spec.engine == engine and c.blocked_on is None
-            and _pressure_spec(c.spec)
-            and demand_seq_tokens(grid, c.spec) == small_seq_own
-            and not (c.spec.arm == CORPUS_TRUNC_ARM and c.dataset not in manifests)
-        }
-        small_cells = [
-            c for c in small_cells
-            if any(math.isclose(float(c.spec.budget_r), r, rel_tol=0.0, abs_tol=1e-9) for r in own_rungs)  # type: ignore[arg-type]
-        ]
-    # B-9 (S0F-88): with --all-classes every class between the two anchors is
-    # laddered at its own pressure rungs (within --rungs).
-    measured_cells: Dict[int, List[PlannedCell]] = {}
-    if (all_classes or ceilings_only) and not anchor_only:
-        for template, class_rungs in measured_pressure_classes(grid, engine, manifests):
-            cells_m = [
-                _class_cell_at(template, r) for r in class_rungs
-                if any(math.isclose(r, x, rel_tol=0.0, abs_tol=1e-9) for x in rung_list)
-                # ADR-0177: a ceiling is pinned only at r <= KV_CEILING_MAX_R
-                and (not ceilings_only or r <= KV_CEILING_MAX_R)
-            ]
-            if cells_m:
-                measured_cells[demand_seq_tokens(grid, template.spec)] = cells_m
-    if ceilings_only and not measured_cells:
-        raise PlanError(
-            f"--ceilings-only: engine {engine!r} of session {session!r} interpolates no class at a rung "
-            f"<= {KV_CEILING_MAX_R:g} within --rungs; nothing to ladder ({CLASS_CEILINGS_ADR})"
-        )
-    # ADR-0169 (decision 5): the RULER instrument's own ladder, at the rungs
-    # the engine carries RULER pressure cells at (within --rungs), under the
-    # anchor's relaunch (the RULER cell's serving config IS the anchor's).
-    ruler_cells: List[PlannedCell] = []
-    ruler_class = None if (anchor_only or ceilings_only) else ruler_pressure_class(grid, engine)
-    if ruler_class is not None:
-        ruler_template, ruler_rungs = ruler_class
-        ruler_cells = [
-            _ruler_cell_at(ruler_template, r) for r in ruler_rungs
-            if any(math.isclose(r, x, rel_tol=0.0, abs_tol=1e-9) for x in rung_list)
-        ]
-    all_cells = (
-        anchor_cells + small_cells + [c for cells_m in measured_cells.values() for c in cells_m] + ruler_cells
+    selection = ladder_cells(
+        grid, engine, rung_list, manifests,
+        all_classes=all_classes, anchor_only=anchor_only, ceilings_only=ceilings_only,
     )
+    anchor_cells, small_cells, measured_cells, ruler_cells = selection
+    all_cells = selection.all_cells
     _check_manifest_coverage(grid, manifests, all_cells)
     # Gap triage 2026-10-09 C1: every ladder relaunch's pool is checked against
     # max_model_len BEFORE the first rung runs (a failure at the smallest
@@ -12698,6 +12763,38 @@ def _cmd_classes(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_ladder_cells(args: argparse.Namespace) -> int:
+    """S2 block F row F-5: one line per (engine, class, rung) triple the ladder
+    runs, ``engine role arm baseline topology class_tokens rung``, then
+    ``engine=E triples=N classes=M`` (M = distinct served-token classes)."""
+    grid = get_session_grid(args.session)
+    query_manifests = parse_query_manifest_args(args.query_manifest)
+    if args.rehearsal_n is not None:
+        grid = rehearsal_grid(grid, n=args.rehearsal_n, datasets=frozenset(query_manifests))
+    if args.engine not in _session_engines(grid):
+        raise PlanError(
+            f"--engine {args.engine!r} is not a server engine of session {args.session!r} "
+            f"(registered: {sorted(_session_engines(grid))})"
+        )
+    rung_list = _resolve_rung_list(grid, parse_rungs_arg(args.rungs))
+    manifests = _register_query_manifests(grid, query_manifests)
+    selection = ladder_cells(
+        grid, args.engine, rung_list, manifests,
+        all_classes=args.all_classes, anchor_only=args.anchor_only, ceilings_only=args.ceilings_only,
+    )
+    _check_manifest_coverage(grid, manifests, selection.all_cells)  # the ladder's own check, in its order
+    classes = set()
+    for role, cell in selection.roles():
+        seq = demand_seq_tokens(grid, cell.spec)
+        classes.add(seq)
+        print(
+            f"{cell.spec.engine} {role} {cell.spec.arm} {cell.baseline_id} {cell.spec.topology} "
+            f"{seq} {float(cell.spec.budget_r):g}"  # type: ignore[arg-type]
+        )
+    print(f"engine={args.engine} triples={len(selection.all_cells)} classes={len(classes)}")
+    return 0
+
+
 def _cmd_rungs(args: argparse.Namespace) -> int:
     grid = get_session_grid(args.session)
     if args.rehearsal_n is not None:
@@ -12967,6 +13064,28 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     p_classes.add_argument("--session", required=True)
     p_classes.set_defaults(func=_cmd_classes)
+    p_ladder = sub.add_parser(
+        "ladder-cells",
+        help="S2 block F row F-5: the (engine, class, rung) triples the calibrate-rungs ladder runs "
+        "for one engine, one line each plus a count line (pure, $0; stage 5 of cage_experiment.sh "
+        "prints them on the Mac before the ladder jobs, under --plan too)",
+    )
+    p_ladder.add_argument("--session", required=True, help=f"one of {sorted(SESSIONS)}")
+    p_ladder.add_argument("--engine", required=True, help="the server engine the ladder calibrates")
+    p_ladder.add_argument(
+        "--rungs", default=None,
+        help="the budget rungs, comma-separated (default: every budgeted rung of the session)",
+    )
+    p_ladder.add_argument("--query-manifest", action="append", default=[], metavar="DATASET=PATH")
+    p_ladder.add_argument("--rehearsal-n", type=int, default=None, metavar="N")
+    p_ladder.add_argument("--anchor-only", action="store_true", help="the anchor ladder alone (as calibrate-rungs)")
+    p_ladder.add_argument(
+        "--all-classes", action="store_true", help="every class between the two anchors too (as calibrate-rungs)"
+    )
+    p_ladder.add_argument(
+        "--ceilings-only", action="store_true", help="the ceiling-only ladders (as calibrate-rungs)"
+    )
+    p_ladder.set_defaults(func=_cmd_ladder_cells)
     p_proj = sub.add_parser(
         "regime-gate-projection",
         help="S2 block F row F-10: the registered windows of every group the stage 14 regime "

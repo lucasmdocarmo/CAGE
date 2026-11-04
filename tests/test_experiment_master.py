@@ -312,7 +312,20 @@ def world(tmp_path: Path) -> Dict[str, Path]:
                 print(f"regime-gate projection session={_opt('--session')} loads={_opt('--loads', '1.0+')!r} floor={_opt('--min')!r} "
                       f"roster={_opt('--confirmatory-arms') or '(empty: every group blocks)'} gated groups=0 blocking=0 descriptive=0 unresolved_load_cells=0")
                 sys.exit(0)
-            print("REFUSED: fake Mac planner knows only 'rungs', 'classes' and 'regime-gate-projection'", file=sys.stderr); sys.exit(2)
+            if a and a[0] == "ladder-cells":  # S2 block F row F-5: the (engine, class, rung) triples, on the Mac before the pod bills
+                import os as _os
+                from pathlib import Path as _Path
+                eng = a[a.index("--engine") + 1]
+                with open(_Path(_os.environ["CAGE_TEST_HOME"]) / ".cage_ladder_cells_argv", "a", encoding="utf-8") as fh:
+                    fh.write(" ".join(a) + "\n")
+                knob = int(_os.environ.get("CAGE_TEST_LADDER_CELLS_RC", "0"))
+                if knob:
+                    print(f"REFUSED: fake ladder-cells rc {knob} for engine {eng}", file=sys.stderr); sys.exit(knob)
+                for r in ("1", "0.5"):
+                    print(f"{eng} anchor gold-fresh B1 single 4779 {r}")
+                    print(f"{eng} smallest retr-trunc B5 single 348 {r}")
+                print(f"engine={eng} triples=4 classes=2"); sys.exit(0)
+            print("REFUSED: fake Mac planner knows only 'rungs', 'classes', 'regime-gate-projection' and 'ladder-cells'", file=sys.stderr); sys.exit(2)
         '''.replace("__PD_ENV_JSON__", json.dumps(_PD_ENV, sort_keys=True)), exe=False)
     _w(fake_scripts / "4_analysis" / "build_floor_table.py", r'''
         import json, sys
@@ -2741,25 +2754,32 @@ def test_the_shipped_s2_landing_profiles_carry_every_s1_key_and_the_block_e_pick
             "HOURS", "RUN_BUDGET_HOURS", "SEATBELT", "SETUP_BOUND_MIN", "CALIBRATE_RUNGS_BOUND_S", "SCORE_BOUND_MIN", "PULL_MARGIN_MIN",
             "FLOOR_AVG_SEQ_TOKENS", "INSTALL_LMCACHE", "LMCACHE_VERSION", "PIN_MODEL_REVISION", "RUNG_ALL_CLASSES", "CLASS_CEILINGS",
             "MIN_IN_REGIME_WINDOWS", "MAX_NULL_FRACTION", "SUITE_ON_POD", "MAC_SUITE", "FRONT_LOAD", "VOLUME_GB", "DISK_GB",
-            "QUERY_MANIFESTS", "CALIBRATION_MANIFEST", "PREFETCH_MODELS", "HF_TOKEN_FILE", "SKIP_BLOCKED")
+            "QUERY_MANIFESTS", "CALIBRATION_MANIFEST", "PREFETCH_MODELS", "HF_TOKEN_FILE", "SKIP_BLOCKED",
+            "CALIBRATION_BUDGET_FRACTION", "REGIME_GATE_LOADS", "CONFIRMATORY_ARMS")
     a, b = _profile_values("S2A.env", keys), _profile_values("S2B.env", keys)
     shared = {"GPU_ID": "NVIDIA H200", "GPU_COUNT": "4", "ENGINES": "vllm sglang", "CALIBRATE": "vllm sglang", "TOPOLOGY": "tp",
-              "DC_PREFS": "US-CA-2 US-CO-1 CA-MTL-3 CA-MTL-4 EU-FR-1 AP-JP-1", "CALIBRATE_RUNGS_BOUND_S": "18000",
-              "PIN_MODEL_REVISION": "1", "RUNG_ALL_CLASSES": "1", "CLASS_CEILINGS": "0", "MIN_IN_REGIME_WINDOWS": "6",
+              "DC_PREFS": "US-CA-2 US-CO-1 CA-MTL-3 CA-MTL-4 EU-FR-1 AP-JP-1", "CALIBRATE_RUNGS_BOUND_S": "32400",
+              "PIN_MODEL_REVISION": "1", "RUNG_ALL_CLASSES": "1", "CLASS_CEILINGS": "0",
+              # decisions 1 to 3 of the batch 2/3 spec (owner 2026-11-03): the floor at the grids' floor rung,
+              # the gate at the registered count per load, the ladder bound that holds 15 triples per engine
+              "CALIBRATION_BUDGET_FRACTION": "1.0", "REGIME_GATE_LOADS": "0.95 1.05", "MIN_IN_REGIME_WINDOWS": "0.95:2 1.05:3",
               "MAX_NULL_FRACTION": "0.06", "SUITE_ON_POD": "1", "MAC_SUITE": "1", "FRONT_LOAD": "0", "VOLUME_GB": "300",
               "DISK_GB": "300", "SKIP_BLOCKED": "0"}
     for k, v in shared.items():
         assert a[k] == v and b[k] == v, (k, a[k], b[k])
     own = ("EXP", "SESSION", "MODEL", "MODEL_SLUG", "HOURS", "RUN_BUDGET_HOURS", "SEATBELT", "SETUP_BOUND_MIN",
-           "SCORE_BOUND_MIN", "PULL_MARGIN_MIN", "FLOOR_AVG_SEQ_TOKENS", "INSTALL_LMCACHE", "LMCACHE_VERSION")
+           "SCORE_BOUND_MIN", "PULL_MARGIN_MIN", "FLOOR_AVG_SEQ_TOKENS", "INSTALL_LMCACHE", "LMCACHE_VERSION", "CONFIRMATORY_ARMS")
+    # the seatbelts grew with the calibrate term (2 x 240 min) under decision 3; the rosters are decision 2's
     assert {k: a[k] for k in own} == {
         "EXP": "S2A", "SESSION": "s2a", "MODEL": "meta-llama/Llama-3.3-70B-Instruct", "MODEL_SLUG": "llama-3.3-70b",
-        "HOURS": "50", "RUN_BUDGET_HOURS": "45", "SEATBELT": "75h", "SETUP_BOUND_MIN": "40", "SCORE_BOUND_MIN": "120",
-        "PULL_MARGIN_MIN": "150", "FLOOR_AVG_SEQ_TOKENS": "4779", "INSTALL_LMCACHE": "0", "LMCACHE_VERSION": ""}
+        "HOURS": "50", "RUN_BUDGET_HOURS": "45", "SEATBELT": "83h", "SETUP_BOUND_MIN": "40", "SCORE_BOUND_MIN": "120",
+        "PULL_MARGIN_MIN": "150", "FLOOR_AVG_SEQ_TOKENS": "4779", "INSTALL_LMCACHE": "0", "LMCACHE_VERSION": "",
+        "CONFIRMATORY_ARMS": "B1 B3 B4 B6 B7 B11 B12"}
     assert {k: b[k] for k in own} == {
         "EXP": "S2B", "SESSION": "cd-act1", "MODEL": "Qwen/Qwen3-Next-80B-A3B-Instruct", "MODEL_SLUG": "qwen3-next-80b",
-        "HOURS": "60", "RUN_BUDGET_HOURS": "55", "SEATBELT": "90h", "SETUP_BOUND_MIN": "50", "SCORE_BOUND_MIN": "150",
-        "PULL_MARGIN_MIN": "180", "FLOOR_AVG_SEQ_TOKENS": "2694", "INSTALL_LMCACHE": "1", "LMCACHE_VERSION": "0.4.4"}
+        "HOURS": "60", "RUN_BUDGET_HOURS": "55", "SEATBELT": "98h", "SETUP_BOUND_MIN": "50", "SCORE_BOUND_MIN": "150",
+        "PULL_MARGIN_MIN": "180", "FLOOR_AVG_SEQ_TOKENS": "2694", "INSTALL_LMCACHE": "1", "LMCACHE_VERSION": "0.4.4",
+        "CONFIRMATORY_ARMS": "B1 B3 B4 B6 B7 B8"}
     # the served model plus the seven helpers, and no Qwen3-14B (no pod reader defaults to it)
     for p in (a, b):
         assert p["PREFETCH_MODELS"].split() == [p["MODEL"], *S2_HELPERS], p["PREFETCH_MODELS"]
@@ -3581,3 +3601,76 @@ def test_stage_14_passes_the_retrieval_stage_refusal_and_fails_its_rc_2(world: D
     assert proc.returncode == 1, proc.stdout[-1500:] + proc.stderr[-800:]
     assert "[FAIL] retrieval stage (F-7): rc=2, expected 0|3" in proc.stdout
     assert _state(world)["stages"]["analyze"]["status"] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# S2 block F row F-5 (2026-11-03): the ladder triples on the Mac before the pod bills
+# ---------------------------------------------------------------------------
+
+
+def test_stage_5_prints_the_ladder_triples_per_engine_on_the_mac_f5(world: Dict[str, Path]) -> None:
+    # before the ladder jobs, stage 5 runs ladder-cells on the Mac for every CALIBRATE engine with the
+    # stage's own rung list and manifests, in plan mode too, and says the count per engine
+    world["profile"].write_text(world["profile"].read_text(encoding="utf-8") + "\nRUNG_ALL_CLASSES=1\n", encoding="utf-8")
+    proc = _master(world, "--plan")
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-2000:]
+    assert "vllm anchor gold-fresh B1 single 4779 1" in proc.stdout
+    assert "ladder vllm: engine=vllm triples=4 classes=2 (F-5)" in proc.stdout
+    argv = (world["home"] / ".cage_ladder_cells_argv").read_text(encoding="utf-8").splitlines()
+    assert argv == ["ladder-cells --session a --engine vllm --rungs 1,0.5 "
+                    f"--query-manifest squad_v2={REPO_ROOT}/data/manifests/squad_v2_50x3_seed42.json --all-classes"]
+
+
+def test_a_ladder_cells_refusal_fails_stage_5_before_the_ladder_jobs_f5(world: Dict[str, Path]) -> None:
+    proc = _master(world, "--yes", "provision", "--to", "calibrate", CAGE_TEST_LADDER_CELLS_RC="2")
+    assert proc.returncode == 1, proc.stdout[-4000:] + proc.stderr[-2000:]
+    assert "REFUSED: fake ladder-cells rc 2 for engine vllm" in proc.stdout
+    assert "[FAIL] ladder-cells (F-5) refused for engine vllm" in proc.stdout
+    assert not (world["home"] / ".cage_jobs" / "calibrate_rungs_vllm.cmd").exists()
+    assert _state(world)["stages"]["calibrate"]["status"] == "failed"
+
+
+def test_stage_5_plan_leaves_an_absent_manifest_out_of_the_ladder_print_and_says_so_f5(world: Dict[str, Path]) -> None:
+    # S2A names a Qasper manifest the Mac does not hold yet (gated tokenizer); stage 0 refuses the
+    # live run until it exists, and --plan still prints the rest of the ladder with the absence named
+    world["profile"].write_text(world["profile"].read_text(encoding="utf-8") + '\nRUNG_ALL_CLASSES=1\n'
+                                'QUERY_MANIFESTS="squad_v2=data/manifests/squad_v2_50x3_seed42.json '
+                                'musique=data/manifests/musique_absent_f5_fixture.json"\n', encoding="utf-8")
+    proc = _master(world, "--plan")
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-2000:]
+    note = [ln for ln in proc.stdout.splitlines() if "ladder-cells (F-5): manifest(s) absent on the Mac" in ln]
+    assert len(note) == 1 and note[0].endswith(" musique"), proc.stdout[-4000:]
+    assert "ladder vllm: engine=vllm triples=4 classes=2 (F-5)" in proc.stdout
+    argv = (world["home"] / ".cage_ladder_cells_argv").read_text(encoding="utf-8").splitlines()
+    assert argv == ["ladder-cells --session a --engine vllm --rungs 1,0.5 "
+                    f"--query-manifest squad_v2={REPO_ROOT}/data/manifests/squad_v2_50x3_seed42.json --all-classes"]
+
+
+def test_a_live_stage_5_passes_an_absent_manifest_through_to_the_verb_f5(world: Dict[str, Path]) -> None:
+    # only --plan leaves an absent manifest out: a live stage 5 reached by a resume hands the
+    # profile's full list to the verb, whose refusal fails the stage before the ladder bills
+    ok = _master(world, "--yes", "provision", "--to", "validate")
+    assert ok.returncode == 0, ok.stdout[-4000:] + ok.stderr[-2000:]
+    world["profile"].write_text(world["profile"].read_text(encoding="utf-8") + '\nRUNG_ALL_CLASSES=1\n'
+                                'QUERY_MANIFESTS="squad_v2=data/manifests/squad_v2_50x3_seed42.json '
+                                'musique=data/manifests/musique_absent_f5_fixture.json"\n', encoding="utf-8")
+    proc = _master(world, "--from", "calibrate", "--to", "calibrate")
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-2000:]
+    assert "absent on the Mac" not in proc.stdout
+    argv = (world["home"] / ".cage_ladder_cells_argv").read_text(encoding="utf-8").splitlines()
+    assert argv[-1] == ("ladder-cells --session a --engine vllm --rungs 1,0.5 "
+                        f"--query-manifest squad_v2={REPO_ROOT}/data/manifests/squad_v2_50x3_seed42.json "
+                        f"--query-manifest musique={REPO_ROOT}/data/manifests/musique_absent_f5_fixture.json --all-classes")
+
+
+def test_stage_5_hands_the_verb_absolute_manifest_paths_from_any_cwd_f5(world: Dict[str, Path], tmp_path: Path) -> None:
+    # review 2026-11-03 MEDIUM 1: the verb opens the manifest files and the master never changes
+    # directory, so a master launched outside the repo root must still name the Mac's own copies
+    world["profile"].write_text(world["profile"].read_text(encoding="utf-8") + "\nRUNG_ALL_CLASSES=1\n", encoding="utf-8")
+    proc = subprocess.run(["bash", str(MASTER), "S1", "--profile", str(world["profile"]), "--plan"],
+                          capture_output=True, text=True, env=_env(world), timeout=600, cwd=str(tmp_path))
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-2000:]
+    assert "ladder vllm: engine=vllm triples=4 classes=2 (F-5)" in proc.stdout
+    argv = (world["home"] / ".cage_ladder_cells_argv").read_text(encoding="utf-8").splitlines()
+    assert argv == ["ladder-cells --session a --engine vllm --rungs 1,0.5 "
+                    f"--query-manifest squad_v2={REPO_ROOT}/data/manifests/squad_v2_50x3_seed42.json --all-classes"]

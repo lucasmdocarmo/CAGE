@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -382,3 +384,44 @@ def test_the_gate_and_the_projection_key_every_s2a_pressure_cell_the_same_way(tm
     proj = rc.regime_gate_projection("s2a", loads=LOADS_S2)["groups"]
     assert set(gate) == set(proj) and len(gate) == 72
     assert all(gate[k]["baseline"] == proj[k]["baseline"] and gate[k]["load"] == proj[k]["load"] for k in gate)
+
+
+# --------------------------------------------------------------------------- #
+# decisions 1 and 2 of the batch 2/3 spec (owner 2026-11-03, "Yes, all three"):
+# the shipped S2 profiles read through bash as the master reads them
+# --------------------------------------------------------------------------- #
+
+
+def _shipped(name: str, *keys: str) -> Dict[str, str]:
+    profiles = REPO_ROOT / "scripts" / "6_experiments" / "profiles"
+    fmt = "|".join("${%s:-}" % k for k in keys)
+    proc = subprocess.run(
+        ["bash", "-c", f'set -a; source "{profiles}/_common.env"; source "{profiles}/{name}"; printf "%s" "{fmt}"'],
+        capture_output=True, text=True, env={"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "")},
+    )
+    assert proc.returncode == 0, proc.stderr
+    return dict(zip(keys, proc.stdout.split("|")))
+
+
+@pytest.mark.parametrize("profile, session, blocking, descriptive", [("S2A.env", "s2a", 64, 8), ("S2B.env", "cd-act1", 66, 0)])
+def test_the_shipped_s2_profiles_gate_values_project_at_the_registered_count(profile: str, session: str, blocking: int, descriptive: int) -> None:
+    """Decision 2 (finding 2, option (B)): the floor is the registered count per
+    load, so every gated group's need equals its registered windows; the roster
+    names served baselines only; stage 0's projection accepts both profiles."""
+    v = _shipped(profile, "SESSION", "REGIME_GATE_LOADS", "MIN_IN_REGIME_WINDOWS", "CONFIRMATORY_ARMS")
+    assert v["SESSION"] == session
+    doc = rc.regime_gate_projection(session, loads=v["REGIME_GATE_LOADS"], need=v["MIN_IN_REGIME_WINDOWS"],
+                                    confirmatory_arms=v["CONFIRMATORY_ARMS"])
+    assert doc["loads_without_a_group"] == [] and doc["short_descriptive"] == {} and doc["unresolved_load_cells"] == 0
+    assert all(g["need"] == g["registered"] for g in doc["groups"].values())
+    modes = [g["mode"] for g in doc["groups"].values()]
+    assert (modes.count(rules.BLOCKING), modes.count(rules.DESCRIPTIVE)) == (blocking, descriptive)
+    assert rules.parse_floor(v["MIN_IN_REGIME_WINDOWS"], rules.parse_loads(v["REGIME_GATE_LOADS"])) == {"0.95": 2, "1.05": 3}
+
+
+@pytest.mark.parametrize("profile, session", [("S2A.env", "s2a"), ("S2B.env", "cd-act1")])
+def test_the_shipped_s2_profiles_floor_fraction_is_the_grids_floor_rung(profile: str, session: str) -> None:
+    """Decision 1 (finding 1): the ladder registers the floor artifact at the
+    grid's floor rung and refuses any other fraction; the profile's value is that rung."""
+    v = _shipped(profile, "CALIBRATION_BUDGET_FRACTION")
+    assert float(v["CALIBRATION_BUDGET_FRACTION"]) == rc.get_session_grid(session).floor_budget_r == 1.0
