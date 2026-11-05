@@ -20,7 +20,7 @@ PROFILES = REPO_ROOT / "scripts" / "6_experiments" / "profiles"
 LEVERS: Dict[str, str] = {
     "EXP": "S2R",
     "HOURS": "3",                  # the run bound; an admitted segment can outlive the stop (review 2026-11-05 MEDIUM 1, [A])
-    "RUN_BUDGET_HOURS": "1",       # exit 4 seals the tree with sentinels and passes on a registered profile
+    "RUN_BUDGET_HOURS": "1.25",    # exit 4 seals the tree with sentinels and passes on a registered profile; 1.25 (owner 2026-11-05) admits the 3,277 s first segment with 1,223 s of spare, not 323
     "RUN_CUT_BY_BUDGET": "1",      # ADR-0190: stage 6 accepts the projection past HOURS; S2B keeps the refusal
     "SEATBELT": "33h",             # the live stage-bound sum is 1,860 min (31 h); 2 h of margin
     "SCORE_BOUND_MIN": "60",       # a one hour tree scores in minutes
