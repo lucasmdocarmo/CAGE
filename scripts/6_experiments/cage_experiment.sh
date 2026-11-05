@@ -1950,11 +1950,12 @@ stage_plan() {
   fi
   # ADR-0190 (review 2026-11-05 MEDIUM 2): the audit runs under the Mac venv python ($PY, as the
   # stage 0 preflight) because it imports the repo's run_projection for the first-segment check
-  run_step 0 "plan argv audit (S0F-26) and run projection (S0F-88 B-5)" -- "$PY" - "$EXTRAS/plan.json" "$HOURS" "${PRICE:-}" "${RUN_CUT_BY_BUDGET:-}" "${RUN_BUDGET_HOURS:-}" "$SCRIPTS/3_run/run_campaign.py" <<'PY' || return 1
+  run_step 0 "plan argv audit (S0F-26) and run projection (S0F-88 B-5)" -- "$PY" - "$EXTRAS/plan.json" "$HOURS" "${PRICE:-}" "${RUN_CUT_BY_BUDGET:-}" "${RUN_BUDGET_HOURS:-}" "$SCRIPTS/3_run/run_campaign.py" "${RUN_FAIL_FAST:-}" <<'PY' || return 1
 import json, sys
 plan = json.load(open(sys.argv[1], encoding="utf-8"))
 hours, price = float(sys.argv[2]), sys.argv[3].strip()
 cut, budget = sys.argv[4], sys.argv[5]  # ADR-0190: budget_cut_check proved 0 < budget < hours when cut == "1", lines above
+fail_fast = sys.argv[7]  # ADR-0191 (review 2026-11-05 MEDIUM 1): the runner's --fail-fast value; empty is off (stage 7's dry_rerun passthrough)
 steps = plan.get("steps", [])
 cells = [s for s in steps if s.get("kind") != "relaunch"]
 bad = []
@@ -1969,8 +1970,12 @@ for s in cells:
         bad.append(f"hf cell carries --vllm-telemetry: {s.get('row_key', '?')}")
     if eng not in (None, "hf") and n != 1:
         bad.append(f"{eng} cell carries --vllm-telemetry {n} times: {s.get('row_key', '?')}")
-    if (s.get("cellspec") or {}).get("topology") == "pd" and not any(k.startswith("CAGE_PD_") for k in (s.get("env") or {})):
-        bad.append(f"pd cell without CAGE_PD_* env: {s.get('row_key', '?')}")
+    # S2R blocker 2026-11-05: the planner writes the CAGE_PD_* pins on the pd relaunch only (block D,
+    # ADR-0182); a pd cell or dry window carries the telemetry pair (PD_TELEMETRY_ENDPOINTS_ENV), the
+    # key the runner refuses a pd cell env without. The check of 81680b0 asked for the pins here and
+    # failed every pd step of the Mac-built cd-act1 plan (S1 had no pd cell; no test covered it).
+    if (s.get("cellspec") or {}).get("topology") == "pd" and "CAGE_TELEMETRY_ENDPOINTS" not in (s.get("env") or {}):
+        bad.append(f"pd cell without CAGE_TELEMETRY_ENDPOINTS env: {s.get('row_key', '?')}")
 kinds = {}
 for s in steps: kinds[s.get("kind")] = kinds.get(s.get("kind"), 0) + 1
 print(f"plan schema={plan.get('schema')} steps={len(steps)} by kind={kinds} blocked={len(plan.get('blocked_row_keys', []))}")
@@ -1993,7 +1998,8 @@ else:
     print(f"run projection (S0F-88 B-5): {rp['total_h']:.2f} h against the {hours:g} h bound{cost} "
           f"(relaunch {rp['by_kind_s']['relaunch']:.0f} s, dry windows {rp['by_kind_s']['dry_window']:.0f} s, "
           f"cells {rp['by_kind_s']['cell']:.0f} s; {rp['source']}; {rp['note']})")
-    if rp["unmeasured_steps"]:
+    # ADR-0191: under RUN_CUT_BY_BUDGET=1 the unmeasured steps are judged against the stop below
+    if rp["unmeasured_steps"] and cut != "1":
         bad.append(f"{len(rp['unmeasured_steps'])} plan step(s) have no measured duration (e.g. {rp['unmeasured_steps'][0]}): "
                    "the run time cannot be projected; measure them or extend RUN_*_SECONDS with an ADR")
     # review 2026-10-21 M2: the whole plan counts; the owner cuts the tail with
@@ -2034,9 +2040,60 @@ if cut == "1":
                        "sentinels, measuring no cell; raise RUN_BUDGET_HOURS (HOURS and the seatbelt follow) or cut the plan")
         else:
             print("  " + line + ": the runner admits it (the later segments are admitted one at a time by the same projection)")
+    # ADR-0191 (owner 2026-11-05, "(a) now, and (b) later"): cd-act1's pd steps carry no table row
+    # and a landing of record refuses them above. Under the key they are tolerated only when the
+    # stop is proven to come first: the table projection of the plan prefix before the relaunch
+    # that starts the first unmeasured segment exceeds the stop, so the runner never admits that
+    # segment (the clock at its relaunch is past the stop) unless the pod outruns the table by the
+    # printed ratio. The criterion is the step's own (topology, n, table row), so one step at a time.
+    unm = [i for i, s in enumerate(steps) if m.run_projection([s])["unmeasured_steps"]]
+    # review 2026-11-05 LOW 2, then the six-fix review LOW 1 and 2: the plan carries the pod's list and the
+    # Mac's table must name the same steps before it judges; a missing projection is named above alone,
+    # a projection without a list is named here, never a traceback
+    pod_unm = rp.get("unmeasured_steps") if isinstance(rp, dict) else None
+    mac_unm = [m.run_projection([steps[i]])["unmeasured_steps"][0] for i in unm]
+    if isinstance(rp, dict) and not isinstance(pod_unm, list):
+        bad.append("the plan's run_projection carries no unmeasured_steps list (S0F-88 B-5): re-plan with the current code")
+    elif isinstance(pod_unm, list) and mac_unm != list(pod_unm):
+        if len(mac_unm) != len(pod_unm):
+            bad.append(f"the pod's plan lists {len(pod_unm)} unmeasured step(s) and the Mac's table {len(unm)}: the two "
+                       "run_campaign.py differ; re-plan with one code (ADR-0191)")
+        else:
+            k = next(j for j, (a, b) in enumerate(zip(mac_unm, pod_unm)) if a != b)
+            bad.append(f"the pod's plan and the Mac's table list {len(unm)} unmeasured step(s) each but differ at entry {k}: "
+                       f"pod {pod_unm[k]!r}, Mac {mac_unm[k]!r}: the two run_campaign.py differ; re-plan with one code (ADR-0191)")
+    if unm:
+        i = unm[0]
+        name = m.run_projection([steps[i]])["unmeasured_steps"][0]
+        starts = [r for r in rel if r <= i]  # empty: the step runs before any relaunch, with no budget check at all
+        prefix_s = float(m.run_projection(steps[:starts[-1]])["total_s"]) if starts else 0.0
+        if prefix_s > budget_s:
+            # review 2026-11-05 MEDIUM 1: the runner's clock meets the stop, not the table. A relaunch that
+            # fails is skipped with sentinels when fail_fast is off (the registered default, line 709) and
+            # costs its attempt only, so a prefix of failing relaunches reaches the segment under the stop
+            # too, and an all-unmeasured segment needs 0 s there (budget_segment_seconds). LOW 3: two decimals.
+            n_rel = len(starts) - 1  # the relaunches inside the prefix (the prefix ends at starts[-1])
+            # six-fix review LOW 3: a crashed cell and a failed dry window cost their attempt too (run_campaign.py's
+            # runner-exit and dry-window sentinels, the loop going on unless fail_fast stops it)
+            fails = ((f", or its {n_rel} relaunch{'es' if n_rel != 1 else ''} failing within about {budget_s / n_rel:.0f} s each "
+                      f"(a failed relaunch is skipped with sentinels, not fatal, with RUN_FAIL_FAST {fail_fast or 'empty'})"
+                      if n_rel and fail_fast in ("", "off") else "")
+                     + ", or cells and dry windows of the prefix failing early (each costs its attempt, not its table row)")
+            print(f"  [WARN] {len(unm)} plan step(s) have no measured duration (e.g. {name}), the first at step {i}; the plan "
+                  f"prefix before its segment (the relaunch at step {starts[-1]}) projects {prefix_s / 3600:.2f} h against the "
+                  f"RUN_BUDGET_HOURS={budget} h stop, so the stop ends the run before any of them unless the prefix finishes "
+                  f"under the stop: a pod {prefix_s / budget_s:.2f} times faster than the table{fails} "
+                  "(RUN_CUT_BY_BUDGET=1, ADR-0191; a landing of record refuses them)")
+        else:
+            bad.append(f"{len(unm)} plan step(s) have no measured duration (e.g. {name}): the first at step {i} is reachable "
+                       f"inside the RUN_BUDGET_HOURS={budget} h stop (the plan prefix before its segment projects {prefix_s / 3600:.2f} h); "
+                       "the run time cannot be projected; measure them or extend RUN_*_SECONDS with an ADR (ADR-0191)")
 for b in bad: print("  [FAIL] " + b)
 sys.exit(1 if bad else 0)
 PY
+  # ADR-0191 (review 2026-11-05 LOW 1): the audit judged the unmeasured steps against this stop;
+  # stage 7 refuses a different RUN_BUDGET_HOURS until the plan is re-audited
+  [ "${RUN_CUT_BY_BUDGET:-}" != "1" ] || plan_only || state put plan.audit_budget_hours "$RUN_BUDGET_HOURS"
   # Audit 2026-10-17 (G7): the bytes the run writes, projected from the plan's
   # arrivals, against the pod disk that holds the run root and its mirror (the
   # container disk when POD_RESULTS_DIR is set, else the network volume), the
@@ -2073,6 +2130,13 @@ custody_copy() {
 stage_run() {
   pod_env
   budget_cut_check || return 1  # ADR-0190 (review 2026-11-05 LOW 4): a --from run after a profile edit never arms a stop past the bound
+  if [ "${RUN_CUT_BY_BUDGET:-}" = "1" ]; then
+    # ADR-0191 (review 2026-11-05 LOW 1): the stop the stage 6 audit judged the unmeasured steps against
+    local judged; judged="$(state get plan.audit_budget_hours 2>/dev/null || true)"
+    # six-fix review LOW 4: no key means a stage 6 that never judged (or a failed put); plan mode has no state to read
+    [ -n "$judged" ] || plan_only || { printf '  [FAIL] stage 6 recorded no plan.audit_budget_hours under RUN_CUT_BY_BUDGET=1 (ADR-0191): rerun --from plan\n'; return 1; }
+    [ -z "$judged" ] || [ "$judged" = "${RUN_BUDGET_HOURS:-}" ] || { printf '  [FAIL] RUN_BUDGET_HOURS=%s differs from the %s h the stage 6 audit judged the plan against (ADR-0191): rerun --from plan\n' "${RUN_BUDGET_HOURS:-}" "$judged"; return 1; }
+  fi
   local bound=$(( HOURS * 3600 ))
   if ! plan_only; then
     mkdir -p "$EXTRAS/monitor"

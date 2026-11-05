@@ -298,10 +298,13 @@ def world(tmp_path: Path) -> Dict[str, Path]:
                     "problems": problems}
         def run_projection(steps):
             # ADR-0190 (review 2026-11-05 MEDIUM 2): the stage 6 first-segment check imports this;
-            # CAGE_TEST_STEP_S seconds per step, so a test sizes the first segment against the stop
+            # CAGE_TEST_STEP_S seconds per step, so a test sizes the first segment against the stop.
+            # ADR-0191: a pd step is unmeasured (charged nothing, named as the real function names it)
             import os
-            total = float(os.environ.get("CAGE_TEST_STEP_S", "400")) * len(steps)
-            return {"total_s": total, "total_h": round(total / 3600, 2)}
+            pd = [f"{s['kind']} {s.get('row_key') or s.get('engine')}" + ("" if s["kind"] == "relaunch" else " on topology pd")
+                  for s in steps if s.get("topology") == "pd" or (s.get("cellspec") or {}).get("topology") == "pd"]
+            total = float(os.environ.get("CAGE_TEST_STEP_S", "400")) * (len(steps) - len(pd))
+            return {"total_s": total, "total_h": round(total / 3600, 2), "unmeasured_steps": pd}
         if __name__ == "__main__":
             a = sys.argv[1:]
             if a and a[0] == "rungs":  # ADR-0154: stage 5 lists the budgeted rungs on the Mac
@@ -629,6 +632,27 @@ def world(tmp_path: Path) -> Dict[str, Path]:
                 plan["steps"][1]["argv"] = ["run_experiment.py"]
             if os.environ.get("CAGE_TEST_NO_RELAUNCH"):  # ADR-0190 review MEDIUM 2: a plan the budget stop never checks
                 plan["steps"] = plan["steps"][1:]
+            # the planner's pd shape (run_campaign.py _cell_step, PD_TELEMETRY_ENDPOINTS_ENV; block D, ADR-0182): the
+            # role pins (CAGE_PD_*) ride the pd relaunch only; a pd cell or dry window carries the telemetry pair
+            pd_tel = {"CAGE_TELEMETRY_ENDPOINTS": "prefill=http://localhost:8100,decode=http://localhost:8200"}
+            if os.environ.get("CAGE_TEST_PD_TAIL"):  # ADR-0191: a measured segment, then a pd segment the table cannot project
+                plan["steps"] += [
+                    {"kind": "relaunch", "engine": "vllm", "topology": "single", "argv": ["manage_vllm_server.sh", "start"]},
+                    {"kind": "cell", "cellspec": {"engine": "vllm", "topology": "single"}, "row_key": "k3", "dataset": "squad_v2", "argv": ["run_experiment.py", "--vllm-telemetry"]},
+                    {"kind": "relaunch", "engine": "vllm", "topology": "pd", "argv": ["manage_vllm_pd.sh", "start"], "env": {"CAGE_PD_PREFILL_GPUS": "0,1"}},
+                    {"kind": "cell", "cellspec": {"engine": "vllm", "topology": "pd"}, "row_key": "k4", "dataset": "squad_v2", "argv": ["run_experiment.py", "--vllm-telemetry"],
+                     "env": {} if os.environ.get("CAGE_TEST_PD_NO_TELEMETRY") else dict(pd_tel)}]
+                plan["run_projection"]["unmeasured_steps"] = ["relaunch vllm", "cell k4 on topology pd"]
+            if os.environ.get("CAGE_TEST_PD_FIRST"):  # ADR-0191 review LOW 4: a pd cell inside the first segment (step 0 under NO_RELAUNCH)
+                plan["steps"].insert(1 if plan["steps"][0]["kind"] == "relaunch" else 0,
+                                     {"kind": "cell", "cellspec": {"engine": "vllm", "topology": "pd"}, "row_key": "k0", "dataset": "squad_v2", "argv": ["run_experiment.py", "--vllm-telemetry"], "env": dict(pd_tel)})
+                plan["run_projection"]["unmeasured_steps"] = ["cell k0 on topology pd"]
+            if os.environ.get("CAGE_TEST_PD_NULL_LIST"):  # six-fix review LOW 1: a hand-edited projection with no list
+                plan["run_projection"]["unmeasured_steps"] = None
+            if os.environ.get("CAGE_TEST_PD_WRONG_NAMES"):  # six-fix review LOW 2: the pod's code names other steps
+                plan["run_projection"]["unmeasured_steps"] = ["x", "y"]
+            if os.environ.get("CAGE_TEST_NO_PROJECTION"):  # six-fix review LOW 1: a plan from a planner without B-5
+                del plan["run_projection"]
             out.write_text(json.dumps(plan), encoding="utf-8"); print("plan written"); sys.exit(0)
         if a[0] == "run":
             root = Path(a[a.index("--campaign-root") + 1])
@@ -3894,3 +3918,162 @@ def test_a_stray_environment_value_of_the_key_never_reaches_the_master_adr0190(w
     assert proc.returncode == 1, proc.stdout[-3000:]
     assert "the projected run (1.50 h) exceeds HOURS=1: the job would be killed" in proc.stdout
     assert "RUN_CUT_BY_BUDGET=1 (ADR-0190)" not in proc.stdout
+
+
+def test_run_cut_by_budget_tolerates_unmeasured_steps_only_past_the_stop_adr0191(world: Dict[str, Path]) -> None:
+    """ADR-0191 (owner 2026-11-05, "(a) now, and (b) later"): cd-act1's pd steps have no row in the
+    projection table and stage 6 refuses unmeasured steps. Under RUN_CUT_BY_BUDGET=1 they are
+    tolerated only when the table projection of the plan prefix before the relaunch that starts
+    the first unmeasured segment exceeds the stop (the runner then never admits that segment,
+    unless the pod outruns the table by the printed ratio); otherwise the refusal stands."""
+    _profile_with(world, "S1_cut.env", "RUN_CUT_BY_BUDGET=1\nRUN_BUDGET_HOURS=0.5")
+    # seven steps: the measured first segment (3), a measured segment (2), then a pd segment (2) the table cannot
+    # project; at 500 s per measured step the pd relaunch at step 5 sits behind a 2,500 s prefix, past the 1,800 s stop
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_PROJECTION_S="5400", CAGE_TEST_STEP_S="500", CAGE_TEST_PD_TAIL="1")
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-2000:]
+    assert ("[WARN] 2 plan step(s) have no measured duration (e.g. relaunch vllm), the first at step 5; the plan prefix "
+            "before its segment (the relaunch at step 5) projects 0.69 h against the RUN_BUDGET_HOURS=0.5 h stop, so the "
+            "stop ends the run before any of them unless the prefix finishes under the stop: a pod 1.39 times faster than "
+            "the table, or its 2 relaunches failing within about 900 s each (a failed relaunch is skipped with sentinels, "
+            "not fatal, with RUN_FAIL_FAST empty), or cells and dry windows of the prefix failing early (each costs its "
+            "attempt, not its table row) (RUN_CUT_BY_BUDGET=1, ADR-0191; a landing of record refuses them)") in proc.stdout
+    assert "the run time cannot be projected" not in proc.stdout
+    assert _state(world)["stages"]["plan"]["status"] == "passed"
+    # at 300 s per step the prefix is 1,500 s, inside the stop: the pd segment is reachable, refused
+    proc = _master(world, "--from", "plan", "--to", "plan", "--redo", CAGE_TEST_PROJECTION_S="5400", CAGE_TEST_STEP_S="300", CAGE_TEST_PD_TAIL="1")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert ("[FAIL] 2 plan step(s) have no measured duration (e.g. relaunch vllm): the first at step 5 is reachable inside "
+            "the RUN_BUDGET_HOURS=0.5 h stop (the plan prefix before its segment projects 0.42 h)") in proc.stdout
+    assert _state(world)["stages"]["plan"]["status"] == "failed"
+
+
+def test_without_the_key_unmeasured_steps_keep_the_refusal_adr0191(world: Dict[str, Path]) -> None:
+    """ADR-0191: a landing of record refuses unmeasured steps as before, whatever the budget stop says."""
+    _profile_with(world, "S1_stop_only.env", "RUN_BUDGET_HOURS=0.5")
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_STEP_S="500", CAGE_TEST_PD_TAIL="1")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert ("[FAIL] 2 plan step(s) have no measured duration (e.g. relaunch vllm): the run time cannot be projected; "
+            "measure them or extend RUN_*_SECONDS with an ADR") in proc.stdout
+    assert "ADR-0191" not in proc.stdout
+
+
+def test_a_pd_cell_without_the_telemetry_endpoints_fails_the_plan_audit_2026_11_05(world: Dict[str, Path]) -> None:
+    """S2R stage 6 blocker (2026-11-05): the audit's pd check (81680b0) demanded a CAGE_PD_* key on
+    every pd cell, a key the planner writes on the pd relaunch only (block D, ADR-0182); a pd cell
+    or dry window carries CAGE_TELEMETRY_ENDPOINTS (PD_TELEMETRY_ENDPOINTS_ENV), so the check failed
+    all 85 pd steps of the Mac-built cd-act1 plan and no test covered it. The check asks for the
+    key the planner writes: the faithful fake pd cell passes, one without the key is named."""
+    _profile_with(world, "S1_cut.env", "RUN_CUT_BY_BUDGET=1\nRUN_BUDGET_HOURS=0.5")
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_PROJECTION_S="5400", CAGE_TEST_STEP_S="500",
+                   CAGE_TEST_PD_TAIL="1", CAGE_TEST_PD_NO_TELEMETRY="1")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "[FAIL] pd cell without CAGE_TELEMETRY_ENDPOINTS env: k4" in proc.stdout
+    assert "CAGE_PD_*" not in proc.stdout
+    assert _state(world)["stages"]["plan"]["status"] == "failed"
+    proc = _master(world, "--from", "plan", "--to", "plan", "--redo", CAGE_TEST_PROJECTION_S="5400", CAGE_TEST_STEP_S="500", CAGE_TEST_PD_TAIL="1")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    assert "pd cell without" not in proc.stdout
+
+
+def test_a_budget_stop_edited_after_the_plan_audit_is_refused_at_stage_7_adr0191(world: Dict[str, Path]) -> None:
+    """Review 2026-11-05 LOW 1 (ADR-0191): the tolerance of unmeasured steps holds for the
+    RUN_BUDGET_HOURS the stage 6 audit judged; stage 6 records that value and stage 7 refuses a
+    different one (inside the range budget_cut_check proves) until the plan is re-audited."""
+    _profile_with(world, "S1_cut.env", "RUN_CUT_BY_BUDGET=1\nRUN_BUDGET_HOURS=0.5")
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_PROJECTION_S="5400", CAGE_TEST_STEP_S="500")
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-2000:]
+    assert _state(world)["plan"]["audit_budget_hours"] == "0.5"
+    _profile_with(world, "S1_cut_edited.env", "RUN_BUDGET_HOURS=0.75")  # the last statement wins; 0.75 is inside (0, HOURS=1)
+    proc = _master(world, "--from", "run", "--to", "run", "--redo", CAGE_TEST_PROJECTION_S="5400")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "[FAIL] RUN_BUDGET_HOURS=0.75 differs from the 0.5 h the stage 6 audit judged the plan against (ADR-0191): rerun --from plan" in proc.stdout
+    assert "stop_at_epoch" not in _state(world).get("run", {})
+    assert not (world["home"] / ".cage_jobs" / "run.cmd").exists(), "stage 7 must not submit"
+    proc = _master(world, "--from", "plan", "--to", "plan", "--redo", CAGE_TEST_PROJECTION_S="5400", CAGE_TEST_STEP_S="500")
+    assert proc.returncode == 0, proc.stdout[-4000:]
+    assert _state(world)["plan"]["audit_budget_hours"] == "0.75"
+
+
+def test_the_mac_table_and_the_pod_plan_must_agree_on_the_unmeasured_count_adr0191(world: Dict[str, Path]) -> None:
+    """Review 2026-11-05 LOW 2 (ADR-0191): under the key the tolerance is computed on the Mac with
+    the Mac's run_campaign.py while the plan carries the pod's list; a count mismatch (the table
+    edited on one side) is refused instead of judged on one side's table."""
+    _profile_with(world, "S1_cut.env", "RUN_CUT_BY_BUDGET=1\nRUN_BUDGET_HOURS=0.5")
+    # the fake pod plan lists one unmeasured step; the fake Mac table finds none (no pd step in the plan)
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_PROJECTION_S="5400", CAGE_TEST_STEP_S="500", CAGE_TEST_UNMEASURED="1")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert ("[FAIL] the pod's plan lists 1 unmeasured step(s) and the Mac's table 0: the two run_campaign.py differ; "
+            "re-plan with one code (ADR-0191)") in proc.stdout
+    assert _state(world)["stages"]["plan"]["status"] == "failed"
+
+
+def test_an_unmeasured_step_inside_the_first_segment_or_before_any_relaunch_is_refused_adr0191(world: Dict[str, Path]) -> None:
+    """Review 2026-11-05 LOW 4 (ADR-0191): the three branches the first test does not reach, pinned.
+    A pd cell inside the first segment has an empty prefix (0.00 h) and is reachable; one before
+    any relaunch (no relaunch at all) draws the no-relaunch refusal and the same reachable line
+    with no traceback; a plan with no unmeasured step prints nothing of ADR-0191."""
+    _profile_with(world, "S1_cut.env", "RUN_CUT_BY_BUDGET=1\nRUN_BUDGET_HOURS=0.5")
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_PROJECTION_S="5400", CAGE_TEST_STEP_S="500", CAGE_TEST_PD_FIRST="1")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert ("[FAIL] 1 plan step(s) have no measured duration (e.g. cell k0 on topology pd): the first at step 1 is reachable "
+            "inside the RUN_BUDGET_HOURS=0.5 h stop (the plan prefix before its segment projects 0.00 h)") in proc.stdout
+    proc = _master(world, "--from", "plan", "--to", "plan", "--redo", CAGE_TEST_PROJECTION_S="5400", CAGE_TEST_STEP_S="500",
+                   CAGE_TEST_PD_FIRST="1", CAGE_TEST_NO_RELAUNCH="1")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "[FAIL] RUN_CUT_BY_BUDGET=1 but the plan carries no relaunch step" in proc.stdout
+    assert "the first at step 0 is reachable inside the RUN_BUDGET_HOURS=0.5 h stop (the plan prefix before its segment projects 0.00 h)" in proc.stdout
+    assert "Traceback" not in proc.stdout + proc.stderr
+    proc = _master(world, "--from", "plan", "--to", "plan", "--redo", CAGE_TEST_PROJECTION_S="5400", CAGE_TEST_STEP_S="500")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    assert "first budget segment (ADR-0190): steps 0 to 2" in proc.stdout
+    assert "no measured duration" not in proc.stdout and "ADR-0191" not in proc.stdout
+
+
+def test_a_projection_without_a_list_or_without_a_projection_is_named_not_tracebacked_2026_11_05(world: Dict[str, Path]) -> None:
+    """Six-fix review LOW 1 (ADR-0191): the pod-list comparison guards the projection as the rest of
+    the audit does. A projection whose unmeasured_steps is null draws a named FAIL and no traceback;
+    a plan with no projection draws only the no-projection FAIL, never the mismatch line."""
+    _profile_with(world, "S1_cut.env", "RUN_CUT_BY_BUDGET=1\nRUN_BUDGET_HOURS=0.5")
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_PROJECTION_S="5400", CAGE_TEST_STEP_S="500",
+                   CAGE_TEST_PD_TAIL="1", CAGE_TEST_PD_NULL_LIST="1")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "[FAIL] the plan's run_projection carries no unmeasured_steps list (S0F-88 B-5): re-plan with the current code" in proc.stdout
+    assert "Traceback" not in proc.stdout + proc.stderr
+    proc = _master(world, "--from", "plan", "--to", "plan", "--redo", CAGE_TEST_PROJECTION_S="5400", CAGE_TEST_STEP_S="500",
+                   CAGE_TEST_PD_TAIL="1", CAGE_TEST_NO_PROJECTION="1")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "[FAIL] the plan carries no run_projection (S0F-88 B-5): re-plan with the current code" in proc.stdout
+    assert "the two run_campaign.py differ" not in proc.stdout
+    assert "Traceback" not in proc.stdout + proc.stderr
+
+
+def test_the_mac_table_and_the_pod_plan_must_name_the_same_unmeasured_steps_2026_11_05(world: Dict[str, Path]) -> None:
+    """Six-fix review LOW 2 (ADR-0191): equal counts with different step names are a mismatch too;
+    the first differing entry is named."""
+    _profile_with(world, "S1_cut.env", "RUN_CUT_BY_BUDGET=1\nRUN_BUDGET_HOURS=0.5")
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_PROJECTION_S="5400", CAGE_TEST_STEP_S="500",
+                   CAGE_TEST_PD_TAIL="1", CAGE_TEST_PD_WRONG_NAMES="1")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert ("[FAIL] the pod's plan and the Mac's table list 2 unmeasured step(s) each but differ at entry 0: pod 'x', "
+            "Mac 'relaunch vllm': the two run_campaign.py differ; re-plan with one code (ADR-0191)") in proc.stdout
+    assert _state(world)["stages"]["plan"]["status"] == "failed"
+
+
+def test_stage_7_refuses_a_cut_landing_whose_audit_recorded_no_stop_2026_11_05(world: Dict[str, Path]) -> None:
+    """Six-fix review LOW 4 (ADR-0191): a state without plan.audit_budget_hours under the switch
+    (a stage 6 from before the key, or a failed put) is refused by name at stage 7, outside plan
+    mode, with no stop armed and no job submitted."""
+    _profile_with(world, "S1_cut.env", "RUN_CUT_BY_BUDGET=1\nRUN_BUDGET_HOURS=0.5")
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_PROJECTION_S="5400", CAGE_TEST_STEP_S="500")
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-2000:]
+    sp = world["exp_root"] / "S1" / DATE / "extras" / "state.json"
+    st = json.loads(sp.read_text(encoding="utf-8"))
+    del st["plan"]["audit_budget_hours"]
+    sp.write_text(json.dumps(st), encoding="utf-8")
+    proc = _master(world, "--from", "run", "--to", "run", "--redo", CAGE_TEST_PROJECTION_S="5400")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "[FAIL] stage 6 recorded no plan.audit_budget_hours under RUN_CUT_BY_BUDGET=1 (ADR-0191): rerun --from plan" in proc.stdout
+    assert "stop_at_epoch" not in _state(world).get("run", {})
+    assert not (world["home"] / ".cage_jobs" / "run.cmd").exists(), "stage 7 must not submit"
+    proc = _master(world, "--plan", "--from", "run", "--to", "run", CAGE_TEST_PROJECTION_S="5400")
+    assert "recorded no plan.audit_budget_hours" not in proc.stdout, "plan mode has no state to read and stays exempt"
