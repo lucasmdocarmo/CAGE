@@ -2861,6 +2861,13 @@ SESSION_GRIDS["cd-act1"] = SessionGrid(
     dist_tp_size=None,
     dist_pd_role_gpus=(2, 2),
     blocks=_CD_ACT1_BLOCKS,
+    # ADR-0192 (owner 2026-11-05): the request cap at the ADR-0158 rule for the
+    # anchor's own served maximum (4,939 tokens -> 16,384), not the RULER default
+    # (this grid registers no RULER task). At 32,768 the Z1 pd rows at rung 0.25
+    # gave each P/D role 26,970 tokens, below one request, and the S2R stage 0 of
+    # 2026-11-05 refused the landing (MAX_MODEL_LEN_POOL_RULE); 16,384 holds in
+    # every pool of the session at FLOOR_CONCURRENCY=50.
+    max_model_len=16_384,
     # the pressure window pool, as Qasper's on s1 [A: the plan does not
     # restate it; the S2 MuSiQue manifest carries 2,000 x 3 for the references]
     window_pool_n={"musique": 500},

@@ -3900,7 +3900,8 @@ class TestMaxModelLenA10:
         assert rc.MAX_MODEL_LEN_ENV == "VLLM_MAX_MODEL_LEN"
         assert rc.RULER_CONTEXT_TOKENS + rc.RULER_OUTPUT_TOKENS == _SHAPE_32K_TOTAL
         for grid in rc.SESSION_GRIDS.values():
-            assert grid.max_model_len == 32_768
+            # ADR-0192: cd-act1 registers 16,384 (no RULER task; its longest request is 4,939 tokens)
+            assert grid.max_model_len == (16_384 if grid.session == "cd-act1" else 32_768), grid.session
             assert isinstance(grid.max_model_len, int)
 
     def test_env_on_every_relaunch_for_both_engines(self, plan_a, plan_b):
@@ -6133,9 +6134,10 @@ class TestS2RegisterBlockA:
         assert "Qwen/Qwen3-Next-80B-A3B-Instruct" in source and "9c7f2fbe84465e40164a94cc16cd30b6999b0cc7" in source
         assert "2026-10-23_2350" in source and "demand_tables_20261101" in source
         # the request caps: the smallest power of two at or above twice the
-        # served maximum, the anchor class at the session cap of 32,768
+        # served maximum, the anchor class at the session cap of 16,384 (ADR-0192,
+        # which the same rule gives for its served maximum of 4,939)
         caps = {c: rc.request_cap_tokens(grid, c) for c in (2694, 2387, 2386, 690, 517, 506, 320, 221)}
-        assert caps == {2694: 32768, 2387: 8192, 2386: 8192, 690: 2048, 517: 4096, 506: 4096, 320: 2048, 221: 2048}
+        assert caps == {2694: 16384, 2387: 8192, 2386: 8192, 690: 2048, 517: 4096, 506: 4096, 320: 2048, 221: 2048}
         assert plan_cd_act1["serving_shapes"]["request_caps"] == {str(c): v for c, v in caps.items()}
         assert rc.session_demand_classes(grid) == [506, 517, 2386, 2387, 2694]
         assert plan_cd_act1["demand_classes"]["anchor_seq_tokens"] == 2694
@@ -6675,3 +6677,26 @@ class TestS2BlockDPdStack:
         assert pr["limitation"] == pd_rows[0]["rate_source"]["limitation"]
         assert "pd_rates" in plan_s2a and plan_s2a["pd_rates"] is None
 
+
+def test_cd_act1_preflight_holds_one_request_in_every_pool_at_the_profile_concurrency_2026_11_05(plan_cd_act1) -> None:
+    """ADR-0192 (owner 2026-11-05, "Cap at 16,384"): the S2R stage 0 of 2026-11-05 refused
+    cd-act1 because the Z1 pd rows at rung 0.25 give each P/D role 26,970 tokens, below the
+    32,768 RULER cap the session inherited without registering a RULER task. The registered
+    cap of 16,384 (the ADR-0158 rule applied to the anchor's served maximum of 4,939) holds in
+    every pool; the exact stage 0 call of the master (S2R.env: c=50, the S2 manifest, the
+    three charter datasets, the H200) returns no problem."""
+    grid = rc.get_session_grid("cd-act1")
+    assert grid.max_model_len == 16_384 and grid.f2_ruler_tasks == ()
+    assert rc.request_cap_tokens(grid, None) == rc.request_cap_tokens(grid, 2694) == 16_384
+    r = rc.preflight_registration_check(
+        "cd-act1", floor_avg_seq_tokens="2694", query_manifests={"musique": str(_S2_MUSIQUE_MANIFEST)},
+        charter_datasets=("squad_v2", "musique", "qasper"), floor_concurrency=50, gpu_id="NVIDIA H200",
+    )
+    assert r["pool_shortfalls"] == [] and r["problems"] == [], r["problems"]
+    assert r["pd_cells"] is True and r["executable_cells"] == 112
+    assert plan_cd_act1["serving_shapes"]["max_model_len"] == 16_384
+    pd = [s for s in plan_cd_act1["steps"] if s["kind"] == "relaunch" and s["topology"] == "pd"]
+    assert pd and all(s["max_model_len"] == rc.request_cap_tokens(grid, (s.get("demand_class") or {}).get("seq_tokens")) for s in pd)
+    assert max(s["max_model_len"] for s in pd) == 16_384 and max(s["max_model_len"] for s in plan_cd_act1["steps"] if s["kind"] == "relaunch") == 16_384
+    # review 2026-11-05 LOW 1: unguarded, so a vanished grid fails by name instead of passing silently
+    assert {s: g.max_model_len for s, g in rc.SESSION_GRIDS.items() if s != "cd-act1"} == {"a": 32_768, "b": 32_768, "s1": 32_768, "s2a": 32_768}
