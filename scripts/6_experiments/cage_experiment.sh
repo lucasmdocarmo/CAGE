@@ -424,6 +424,23 @@ step_out() { cat "$STEP_LOG"; }            # the last step's captured output
 step_has() { grep -qF -- "$1" "$STEP_LOG"; } # literal substring in the last step's output (never a regex)
 
 plan_only() { [ "$PLAN" -eq 1 ]; }
+# ADR-0190 (review 2026-11-05 LOW 3 and LOW 4): the proof that the budget stop lies in
+# (0, HOURS) when RUN_CUT_BY_BUDGET=1, run at stage 0 and again by stages 6 and 7 (a
+# profile edit under --from would otherwise reach the plan audit or arm a stop past the
+# bound unchecked); HOURS is converted first and named when it is not a number. Calls
+# python directly, as the F-11 block of stage 0: run_step prints under --plan and this
+# must run there too. Prints nothing on success.
+budget_cut_check() {
+  case "${RUN_CUT_BY_BUDGET:-}" in
+    "") return 0 ;;
+    1) ;;
+    *) printf '  [FAIL] RUN_CUT_BY_BUDGET=%s: must be 1 or empty (ADR-0190)\n' "$RUN_CUT_BY_BUDGET"; return 1 ;;
+  esac
+  "$PY3" -c 'import sys; float(sys.argv[1])' "${HOURS:-}" 2>/dev/null \
+    || { printf '  [FAIL] RUN_CUT_BY_BUDGET=1 needs HOURS set to a number (got %s) (ADR-0190)\n' "${HOURS:-<empty>}"; return 1; }
+  "$PY3" -c 'import sys; b, h = sys.argv[1], float(sys.argv[2]); sys.exit(0 if b and 0 < float(b) < h else 1)' "${RUN_BUDGET_HOURS:-}" "$HOURS" 2>/dev/null \
+    || { printf '  [FAIL] RUN_CUT_BY_BUDGET=1 needs RUN_BUDGET_HOURS set to a number above 0 and below HOURS=%s (got %s): the budget stop is what ends the run before the bound (ADR-0190)\n' "$HOURS" "${RUN_BUDGET_HOURS:-<empty>}"; return 1; }
+}
 # Decision 3 (2026-10-13, S0 only): PARTIAL_TREE_OK=1 lets a run stage that
 # ended with failed cells, failed relaunches or failed dry windows pass as
 # PARTIAL (recorded in state run.partial), so the tree is still sealed, scored
@@ -726,6 +743,12 @@ stage_preflight_mac() {
     fi
     say "scoring proof bounds (F-11): faithfulness $SCORING_TOL_FAITHFULNESS, completeness_bertscore $SCORING_TOL_BERTSCORE (batch size $SCORING_BATCH_SIZE)"
   fi
+  # ADR-0190 (owner 2026-11-05, option D): RUN_CUT_BY_BUDGET=1 (a rehearsal, never a
+  # landing of record) lets stage 6 accept a plan projected past HOURS because the
+  # budget stop ends the run first; it needs that stop, a number in (0, HOURS), proven
+  # here before anything bills (budget_cut_check). Any other value than 1 or empty is refused.
+  budget_cut_check || return 1
+  [ "${RUN_CUT_BY_BUDGET:-}" != "1" ] || say "RUN_CUT_BY_BUDGET=1 (ADR-0190): stage 6 accepts a plan projected past HOURS=$HOURS; the budget stop at RUN_BUDGET_HOURS=${RUN_BUDGET_HOURS:-} h ends the run with sentinels (a rehearsal, never a landing of record)"
   # S2 block E-2 (owner 2026-11-01): a gated served model's Hub token travels as
   # a FILE (HF_TOKEN_FILE on the Mac, outside the repo, mode 600) to
   # $POD_HF_CACHE/token at stage 2, the path the hub reads under its default
@@ -1836,6 +1859,7 @@ ceiling_replan_followups() {
 
 stage_plan() {
   pod_env
+  budget_cut_check || return 1  # ADR-0190 (review 2026-11-05 LOW 4): a --from plan after a profile edit
   local qm cal e item
   qm=""; for item in $QUERY_MANIFESTS; do qm="$qm --query-manifest $item"; done
   cal=""; for e in $CALIBRATE; do cal="$cal --calibration $e=results/calibration/${EXP}_${e}.json --rung-calibration $e=results/calibration/rungs_${EXP}_${e}.json"; done
@@ -1924,10 +1948,13 @@ stage_plan() {
     [ "${CLASS_CEILINGS:-0}" != "1" ] || ceiling_replan_followups || return 1
     return 0
   fi
-  run_step 0 "plan argv audit (S0F-26) and run projection (S0F-88 B-5)" -- "$PY3" - "$EXTRAS/plan.json" "$HOURS" "${PRICE:-}" <<'PY' || return 1
+  # ADR-0190 (review 2026-11-05 MEDIUM 2): the audit runs under the Mac venv python ($PY, as the
+  # stage 0 preflight) because it imports the repo's run_projection for the first-segment check
+  run_step 0 "plan argv audit (S0F-26) and run projection (S0F-88 B-5)" -- "$PY" - "$EXTRAS/plan.json" "$HOURS" "${PRICE:-}" "${RUN_CUT_BY_BUDGET:-}" "${RUN_BUDGET_HOURS:-}" "$SCRIPTS/3_run/run_campaign.py" <<'PY' || return 1
 import json, sys
 plan = json.load(open(sys.argv[1], encoding="utf-8"))
 hours, price = float(sys.argv[2]), sys.argv[3].strip()
+cut, budget = sys.argv[4], sys.argv[5]  # ADR-0190: budget_cut_check proved 0 < budget < hours when cut == "1", lines above
 steps = plan.get("steps", [])
 cells = [s for s in steps if s.get("kind") != "relaunch"]
 bad = []
@@ -1972,8 +1999,41 @@ else:
     # review 2026-10-21 M2: the whole plan counts; the owner cuts the tail with
     # LAST_BLOCK (the plan then holds no later block), never by an exemption here
     if rp["total_s"] > hours * 3600:
-        bad.append(f"the projected run ({rp['total_h']:.2f} h) exceeds HOURS={hours:g}: the job would be killed at the "
-                   "bound while still billing; raise HOURS in the profile (the seatbelt must cover it) or cut the plan")
+        if cut == "1":
+            # ADR-0190: the budget stop, not the bound, ends this run; the unrun cells carry sentinels
+            print(f"  [WARN] the projected run ({rp['total_h']:.2f} h) exceeds HOURS={hours:g}; RUN_CUT_BY_BUDGET=1: "
+                  f"the budget stop at RUN_BUDGET_HOURS={budget} h ends the run with sentinels before the bound "
+                  "(a rehearsal, never a landing of record; ADR-0190)")
+        else:
+            bad.append(f"the projected run ({rp['total_h']:.2f} h) exceeds HOURS={hours:g}: the job would be killed at the "
+                       "bound while still billing; raise HOURS in the profile (the seatbelt must cover it) or cut the plan")
+# ADR-0190 (review 2026-11-05 MEDIUM 2): the runner fixes the stop at the submit and admits a
+# segment (a relaunch and its steps up to the next relaunch) only when the table projection
+# of the plan through it ends before the stop (run_campaign.py _past_budget), so a first
+# segment past the stop leaves a run that ends at its first relaunch with sentinels and
+# measures no cell; the same table (the 14B rows) projects it here, before the run bills
+if cut == "1":
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("cage_run_campaign_projection", sys.argv[6])
+    m = importlib.util.module_from_spec(spec); sys.modules[spec.name] = m; spec.loader.exec_module(m)
+    budget_s = float(budget) * 3600
+    rel = [i for i, s in enumerate(steps) if s.get("kind") == "relaunch"]
+    if not rel:
+        bad.append("RUN_CUT_BY_BUDGET=1 but the plan carries no relaunch step: the budget stop is checked before "
+                   "relaunches only, so nothing would cut this run before the bound (ADR-0190)")
+    else:
+        end = rel[1] if len(rel) > 1 else len(steps)
+        seg = steps[:end]
+        first_s = float(m.run_projection(seg)["total_s"])
+        kinds = [s.get("kind") for s in seg]
+        line = (f"first budget segment (ADR-0190): steps 0 to {end - 1} ({kinds.count('relaunch')} relaunch, "
+                f"{kinds.count('dry_window')} dry windows, {kinds.count('cell')} cells) project {first_s:.0f} s "
+                f"against the RUN_BUDGET_HOURS={budget} h stop ({budget_s:.0f} s)")
+        if first_s > budget_s:
+            bad.append(line + ": the runner would admit no segment and the run would end at its first relaunch with "
+                       "sentinels, measuring no cell; raise RUN_BUDGET_HOURS (HOURS and the seatbelt follow) or cut the plan")
+        else:
+            print("  " + line + ": the runner admits it (the later segments are admitted one at a time by the same projection)")
 for b in bad: print("  [FAIL] " + b)
 sys.exit(1 if bad else 0)
 PY
@@ -2012,6 +2072,7 @@ custody_copy() {
 
 stage_run() {
   pod_env
+  budget_cut_check || return 1  # ADR-0190 (review 2026-11-05 LOW 4): a --from run after a profile edit never arms a stop past the bound
   local bound=$(( HOURS * 3600 ))
   if ! plan_only; then
     mkdir -p "$EXTRAS/monitor"

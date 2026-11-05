@@ -296,6 +296,12 @@ def world(tmp_path: Path) -> Dict[str, Path]:
                         "engine": "vllm", "budget_r": 1.0, "seq_tokens": 4779, "tp": 2, "planned_bytes": 2651340800,
                         "env": __import__("json").loads('__PD_ENV_JSON__')},
                     "problems": problems}
+        def run_projection(steps):
+            # ADR-0190 (review 2026-11-05 MEDIUM 2): the stage 6 first-segment check imports this;
+            # CAGE_TEST_STEP_S seconds per step, so a test sizes the first segment against the stop
+            import os
+            total = float(os.environ.get("CAGE_TEST_STEP_S", "400")) * len(steps)
+            return {"total_s": total, "total_h": round(total / 3600, 2)}
         if __name__ == "__main__":
             a = sys.argv[1:]
             if a and a[0] == "rungs":  # ADR-0154: stage 5 lists the budgeted rungs on the Mac
@@ -621,6 +627,8 @@ def world(tmp_path: Path) -> Dict[str, Path]:
                 "note": "test"}
             if os.environ.get("CAGE_TEST_BAD_PLAN"):
                 plan["steps"][1]["argv"] = ["run_experiment.py"]
+            if os.environ.get("CAGE_TEST_NO_RELAUNCH"):  # ADR-0190 review MEDIUM 2: a plan the budget stop never checks
+                plan["steps"] = plan["steps"][1:]
             out.write_text(json.dumps(plan), encoding="utf-8"); print("plan written"); sys.exit(0)
         if a[0] == "run":
             root = Path(a[a.index("--campaign-root") + 1])
@@ -3776,3 +3784,113 @@ def test_a_ladder_cells_refusal_fails_stage_5_before_the_floor_jobs_low3(world: 
     assert not (jobs / "calibrate_vllm.cmd").exists(), "the floor job must not bill before the check"
     assert not (jobs / "calibrate_rungs_vllm.cmd").exists()
     assert _state(world)["stages"]["calibrate"]["status"] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# ADR-0190 (owner 2026-11-05, option D): RUN_CUT_BY_BUDGET, the rehearsal cut
+# ---------------------------------------------------------------------------
+
+
+def test_run_cut_by_budget_turns_the_stage_6_projection_refusal_into_a_warning_adr0190(world: Dict[str, Path]) -> None:
+    """ADR-0190: a profile that states RUN_CUT_BY_BUDGET=1 with a budget stop below HOURS
+    (stage 0 proved it) passes a plan projected past HOURS at stage 6 with a WARN line that
+    names the stop, because the budget stop ends the run with sentinels before the bound
+    (ADR-0175 item 1); the refusal text of review 2026-10-21 M2 never prints."""
+    _profile_with(world, "S1_cut.env", "RUN_CUT_BY_BUDGET=1\nRUN_BUDGET_HOURS=0.5")
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_PROJECTION_S="5400")
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-2000:]
+    assert "run projection (S0F-88 B-5): 1.50 h against the 1 h bound" in proc.stdout
+    assert ("[WARN] the projected run (1.50 h) exceeds HOURS=1; RUN_CUT_BY_BUDGET=1: the budget stop at "
+            "RUN_BUDGET_HOURS=0.5 h ends the run with sentinels before the bound") in proc.stdout
+    assert "exceeds HOURS=1: the job would be killed" not in proc.stdout
+    assert _state(world)["stages"]["plan"]["status"] == "passed"
+    # stage 0 said so too, before the pod billed
+    assert "RUN_CUT_BY_BUDGET=1 (ADR-0190): stage 6 accepts a plan projected past HOURS=1" in proc.stdout
+
+
+def test_run_cut_by_budget_needs_a_budget_stop_below_hours_and_the_refusal_stands_without_it_adr0190(
+    world: Dict[str, Path],
+) -> None:
+    """ADR-0190: the key is 1 or empty; 1 needs RUN_BUDGET_HOURS set to a number above 0 and
+    below HOURS, refused at stage 0 (under --plan too) before any pod and before the Mac suite
+    (review 2026-11-05 LOW 7); HOURS is converted first and named when it is not a number (LOW 3)."""
+    marker = "RUN_CUT_BY_BUDGET=1 needs RUN_BUDGET_HOURS set to a number above 0 and below HOURS=1"
+    cases = {"no stop": ("RUN_CUT_BY_BUDGET=1", marker),
+             "stop equals HOURS": ("RUN_CUT_BY_BUDGET=1\nRUN_BUDGET_HOURS=1", marker),
+             "stop past HOURS": ("RUN_CUT_BY_BUDGET=1\nRUN_BUDGET_HOURS=2", marker),
+             "stop at zero": ("RUN_CUT_BY_BUDGET=1\nRUN_BUDGET_HOURS=0", marker),
+             "stop not a number": ("RUN_CUT_BY_BUDGET=1\nRUN_BUDGET_HOURS=abc", marker),
+             "HOURS not a number": ("RUN_CUT_BY_BUDGET=1\nRUN_BUDGET_HOURS=0.5\nHOURS=abc",
+                                    "RUN_CUT_BY_BUDGET=1 needs HOURS set to a number (got abc)"),
+             "key not 1": ("RUN_CUT_BY_BUDGET=yes\nRUN_BUDGET_HOURS=0.5", "RUN_CUT_BY_BUDGET=yes: must be 1 or empty")}
+    base = world["profile"]
+    for case, (extra, text) in cases.items():
+        world["profile"] = base  # review 2026-11-05 LOW 6: each case is the base profile plus its own lines
+        _profile_with(world, f"S1_cut_{case.replace(' ', '_')}.env", extra)
+        assert world["profile"].read_text(encoding="utf-8").count("RUN_CUT_BY_BUDGET=") == 1, case
+        for argv in ((), ("--plan",)):
+            proc = _master(world, *argv)
+            assert proc.returncode == 1, (case, argv, proc.stdout[-2000:])
+            assert text in proc.stdout, (case, argv, proc.stdout[-2000:])
+            assert not any(c.startswith("provision_pod") or c.startswith("run_tests") for c in _calls(world)), (case, argv)
+
+
+def test_a_budget_stop_without_the_key_keeps_the_stage_6_refusal_adr0190(world: Dict[str, Path]) -> None:
+    """ADR-0190: the budget stop alone (no key) is no exemption; the M2 refusal stands at stage 6."""
+    _profile_with(world, "S1_stop_only.env", "RUN_BUDGET_HOURS=0.5")
+    proc = _master(world, "--yes", "provision", CAGE_TEST_PROJECTION_S="5400")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "the projected run (1.50 h) exceeds HOURS=1: the job would be killed" in proc.stdout
+    assert _state(world)["stages"]["plan"]["status"] == "failed"
+
+
+def test_run_cut_by_budget_proves_the_first_segment_fits_the_budget_stop_at_stage_6_adr0190(world: Dict[str, Path]) -> None:
+    """Review 2026-11-05 MEDIUM 2: the runner fixes the stop epoch at the submit and admits a
+    segment (a relaunch and its steps up to the next relaunch) only when its whole table
+    projection ends before the stop (run_campaign.py _past_budget), so a first segment past
+    RUN_BUDGET_HOURS x 3600 leaves a run that ends at its first relaunch with sentinels and
+    measures no cell. Stage 6 projects the first segment with the repo's run_projection and
+    refuses when it does not fit, or when the plan carries no relaunch for the stop to check."""
+    _profile_with(world, "S1_cut.env", "RUN_CUT_BY_BUDGET=1\nRUN_BUDGET_HOURS=0.5")
+    # the fake run_projection charges CAGE_TEST_STEP_S per step; the fake plan's three steps are one segment
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_PROJECTION_S="5400", CAGE_TEST_STEP_S="500")
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-2000:]
+    assert ("first budget segment (ADR-0190): steps 0 to 2 (1 relaunch, 0 dry windows, 2 cells) project 1500 s "
+            "against the RUN_BUDGET_HOURS=0.5 h stop (1800 s): the runner admits it") in proc.stdout
+    proc = _master(world, "--from", "plan", "--to", "plan", "--redo", CAGE_TEST_PROJECTION_S="5400", CAGE_TEST_STEP_S="700")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert ("[FAIL] first budget segment (ADR-0190): steps 0 to 2 (1 relaunch, 0 dry windows, 2 cells) project 2100 s "
+            "against the RUN_BUDGET_HOURS=0.5 h stop (1800 s): the runner would admit no segment") in proc.stdout
+    assert _state(world)["stages"]["plan"]["status"] == "failed"
+    proc = _master(world, "--from", "plan", "--to", "plan", "--redo", CAGE_TEST_PROJECTION_S="5400", CAGE_TEST_NO_RELAUNCH="1")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "[FAIL] RUN_CUT_BY_BUDGET=1 but the plan carries no relaunch step: the budget stop is checked before relaunches only" in proc.stdout
+
+
+def test_the_budget_stop_proof_is_repeated_at_stages_6_and_7_after_a_profile_edit_adr0190(world: Dict[str, Path]) -> None:
+    """Review 2026-11-05 LOW 4: stage 0's proof that the stop lies in (0, HOURS) does not survive
+    a profile edit under --from; stage 6 repeats it before the plan audit and stage 7 before
+    arming the stop, so an edited RUN_BUDGET_HOURS at or past HOURS never reaches the audit
+    or arms a stop past the bound."""
+    _profile_with(world, "S1_cut.env", "RUN_CUT_BY_BUDGET=1\nRUN_BUDGET_HOURS=0.5")
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_PROJECTION_S="5400")
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-2000:]
+    _profile_with(world, "S1_cut_edited.env", "RUN_BUDGET_HOURS=5")  # the last statement wins: 5 is past HOURS=1
+    marker = "RUN_CUT_BY_BUDGET=1 needs RUN_BUDGET_HOURS set to a number above 0 and below HOURS=1 (got 5)"
+    for argv in (("--from", "plan", "--to", "plan", "--redo"), ("--from", "run", "--to", "run", "--redo")):
+        proc = _master(world, *argv, CAGE_TEST_PROJECTION_S="5400")
+        assert proc.returncode == 1, (argv, proc.stdout[-3000:])
+        assert marker in proc.stdout, (argv, proc.stdout[-2000:])
+    assert "stop_at_epoch" not in _state(world).get("run", {})
+    assert not (world["home"] / ".cage_jobs" / "run.cmd").exists(), "stage 7 must not submit"
+
+
+def test_a_stray_environment_value_of_the_key_never_reaches_the_master_adr0190(world: Dict[str, Path]) -> None:
+    """Review 2026-11-05 LOW 5: _common.env states RUN_CUT_BY_BUDGET= (empty), so a value in the
+    environment never reaches the master (the HF_TOKEN_FILE precedent, review 2026-11-01 L2):
+    the M2 refusal stands on a profile that states only the stop."""
+    _profile_with(world, "S1_stop_only.env", "RUN_BUDGET_HOURS=0.5")
+    proc = _master(world, "--yes", "provision", CAGE_TEST_PROJECTION_S="5400", RUN_CUT_BY_BUDGET="1")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "the projected run (1.50 h) exceeds HOURS=1: the job would be killed" in proc.stdout
+    assert "RUN_CUT_BY_BUDGET=1 (ADR-0190)" not in proc.stdout
