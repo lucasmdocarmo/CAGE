@@ -5939,10 +5939,11 @@ class TestS2RegisterBlockA:
         rows = _s2_rows(plan)
         assert plan["session"] == "cd-act1" and plan["model"] == "qwen3-next-80b"
         # rows: references of the 5 core arms x 2 engines plus B8 on both (12,
-        # the SGLang B8 one blocked) and the 5 PD references; Y1: 5 x 2 x 3
-        # rungs x 2 loads (60); Y2: B8 on vLLM (6); Z1: 5 arms x 3 x 2 on the
-        # PD stack (30). Windows: one per reference, 2 + 3 per (arm, engine,
-        # rung) in every block.
+        # both B8 ones blocked since ADR-0193) and the 5 PD references; Y1: 5
+        # x 2 x 3 rungs x 2 loads (60); Y2: B8 on vLLM (6, blocked since
+        # ADR-0193); Z1: 5 arms x 3 x 2 on the PD stack (30). Windows: one per
+        # reference, 2 + 3 per (arm, engine, rung) in every block; blocked
+        # rows keep theirs in the count.
         assert plan["counts"]["cells"] == len(rows) == 12 + 5 + 60 + 6 + 30
         assert plan["counts"]["windows"] == 17 + (60 + 6 + 30) * 5 // 2 == 257
         assert Counter(s.get("block") or ("ref-" + s["family"]) for s in rows) == {
@@ -5958,8 +5959,9 @@ class TestS2RegisterBlockA:
             "DIST": {"cells": 30 + 5, "windows": 30 * 5 // 2 + 5},
         }
         blocked = {s["row_key"]: s["blocked_on"] for s in rows if s["blocked_on"]}
-        assert list(blocked) == plan["blocked_row_keys"] == [_S2_SGLANG_B8_REFERENCE]
-        assert "connector" in blocked[_S2_SGLANG_B8_REFERENCE] and plan["counts"]["blocked"] == 1
+        assert sorted(blocked) == sorted(plan["blocked_row_keys"]) == sorted(_S2_VLLM_B8_ROW_KEYS + (_S2_SGLANG_B8_REFERENCE,))
+        assert "connector" in blocked[_S2_SGLANG_B8_REFERENCE] and plan["counts"]["blocked"] == 8
+        assert {blocked[k] for k in _S2_VLLM_B8_ROW_KEYS} == {rc.VLLM_HYBRID_STORE_BLOCKED_ON}
         assert Counter(s["row_class"] for s in rows) == {"window": 96, "secondary": 10, "identity": 5, "primary": 2}
         assert sorted(s["row_key"] for s in rows if s["row_class"] == "primary") == [
             "corpus-reuse|none|none|single|vllm|qwen3-next-80b|F1",
@@ -5970,7 +5972,7 @@ class TestS2RegisterBlockA:
         assert {s["row_class"]: s["num_queries"] for s in rows if not s["blocked_on"]} == {
             "window": 500, "secondary": 800, "identity": 300, "primary": 2000,
         }
-        assert plan["counts"]["relaunches"] == 58 and plan["counts"]["dry_windows"] == 16
+        assert plan["counts"]["relaunches"] == 54 and plan["counts"]["dry_windows"] == 15   # 58 and 16 before ADR-0193 took the 4 LMCache relaunches and their dry window
         assert plan["rung_calibration"]["required_rungs"] == {"sglang": [1.0, 0.5, 0.25], "vllm": [1.0, 0.5, 0.25]}
         assert all(s["gpu_count"] == 4 for s in rows)
 
@@ -6010,7 +6012,7 @@ class TestS2RegisterBlockA:
         grid = rc.get_session_grid("cd-act1")
         rel = _relaunches(plan_cd_act1)
         pd = [s for s in rel if s["topology"] == "pd"]
-        assert len(pd) == 20 and len(rel) - len(pd) == 38
+        assert len(pd) == 20 and len(rel) - len(pd) == 34   # 38 before ADR-0193 took the 4 LMCache relaunches
         # five classes (one per arm) at the three rungs, plus the five
         # budget-free references on the registered control rung
         assert Counter(s["budget_r"] for s in pd) == {0.25: 5, 0.5: 5, 1.0: 5, None: 5}
@@ -6051,15 +6053,14 @@ class TestS2RegisterBlockA:
             and s["serving"]["prefix_mode"] == "ON" and not s["blocked_on"]
         )
         gated = plan_cd_act1["identity_gated_row_keys"]
-        assert gated == want and len(gated) == 35
+        assert gated == want and len(gated) == 28   # 35 before ADR-0193 blocked the 7 retr-store rows on vLLM
         # the prefix-on arms: corpus-reuse and retr-reuse (one reference and
-        # six Y1 rows each, the same seven again on the PD stack) and
-        # retr-store (its vLLM reference and the six Y2 rows)
+        # six Y1 rows each, the same seven again on the PD stack); retr-store
+        # (its vLLM reference and the six Y2 rows) is blocked, so not gated
         assert Counter((k.split("|")[0], k.split("|")[3]) for k in gated) == {
             ("corpus-reuse", "single"): 7, ("corpus-reuse", "pd"): 7,
             ("retr-reuse", "single"): 7, ("retr-reuse", "pd"): 7,
-            ("retr-store", "single"): 7,
-        }
+        }   # ("retr-store", "single"): 7 before ADR-0193 blocked those rows
         assert all(k.split("|")[4] == "vllm" for k in gated)
         assert plan_s2a["identity_gated_row_keys"] == []
 
@@ -6079,7 +6080,7 @@ class TestS2RegisterBlockA:
         assert not rc._pressure_step({"family": "DIST", "cellspec": {"rate_frac": None}})
 
     def test_dry_windows_are_one_per_budgeted_serving_shape(self, plan_s2a, plan_cd_act1):
-        for plan, want in ((plan_s2a, 18), (plan_cd_act1, 16)):
+        for plan, want in ((plan_s2a, 18), (plan_cd_act1, 15)):   # cd-act1 16 before ADR-0193: retr-store's shape is blocked
             dry = [s for s in plan["steps"] if s["kind"] == "dry_window"]
             shapes = {
                 _serving_shape(s, s["demand_class"]["seq_tokens"])
@@ -6088,12 +6089,13 @@ class TestS2RegisterBlockA:
             assert len(dry) == plan["counts"]["dry_windows"] == len(shapes) == want
             assert {_serving_shape(s["serving"], s["demand_class"]["seq_tokens"]) for s in dry} == shapes
         # cd-act1: the five classes once per engine (SGLang), twice on vLLM
-        # (the TP and the PD stacks), and retr-store's class once more behind
-        # the LMCache connector
+        # (the TP and the PD stacks); retr-store's class behind the LMCache
+        # connector is blocked since ADR-0193, so no dry window for it
         dry_cd = [s for s in plan_cd_act1["steps"] if s["kind"] == "dry_window"]
         assert Counter((s["serving"]["engine"], s["serving"]["topology"]) for s in dry_cd) == {
-            ("sglang", "single"): 5, ("vllm", "single"): 6, ("vllm", "pd"): 5,
+            ("sglang", "single"): 5, ("vllm", "single"): 5, ("vllm", "pd"): 5,
         }
+        assert not any(s["serving"].get("connector") for s in dry_cd)
 
     def test_s2a_relaunch_boundaries(self, plan_s2a):
         rel = _relaunches(plan_s2a)
@@ -6189,10 +6191,12 @@ class TestS2RegisterBlockA:
         assert rec["trial_sizes"] == {"1": 2000, "2": 2000, "3": 2000}
         assert rec["block_budget"] == 2640 and rec["trunc_rungs"] == [700]
         assert rec["sha256"].startswith("19a47fe1")
-        # the manifest unblocks nothing and blocks nothing: the SGLang B8
-        # reference stays the one blocked row, the counts stay the same
-        assert plan["blocked_row_keys"] == [_S2_SGLANG_B8_REFERENCE]
-        assert (plan["counts"]["cells"], plan["counts"]["windows"], plan["counts"]["relaunches"]) == (113, 257, 58)
+        # the manifest unblocks nothing and blocks nothing: the eight blocked
+        # rows (the SGLang B8 reference, the seven vLLM B8 rows of ADR-0193)
+        # and the counts stay the same (blocked cells keep their windows in
+        # the count; the 4 LMCache relaunches are gone)
+        assert len(plan["blocked_row_keys"]) == 8 and _S2_SGLANG_B8_REFERENCE in plan["blocked_row_keys"]
+        assert (plan["counts"]["cells"], plan["counts"]["windows"], plan["counts"]["relaunches"]) == (113, 257, 54)
         assert {s["num_queries"] for s in _s2_rows(plan) if s["row_class"] == "primary"} == {2000}
 
     def test_s2a_refuses_the_pre_s2_qasper_manifest(self, tmp_path):
@@ -6252,11 +6256,13 @@ class TestS2BlockCIdentityGate:
         assert ig["label_on_pass"] == "experimental-align-mode" and ig["excluded_row_keys"] == []
         assert ig["path"].endswith("identity_gate.json") and re.fullmatch(r"[0-9a-f]{64}", ig["sha256"])
         assert ig["comparisons"]["A"]["identical"] == 200 and ig["deciding"] == ["A", "B"]
-        # block A's pins hold: the one blocked row, the counts, the 35 gated rows
-        assert plan_cd_act1["blocked_row_keys"] == [_S2_SGLANG_B8_REFERENCE]
+        # block A's pins hold as ADR-0193 re-pinned them (the seven vLLM B8
+        # rows blocked: 8 blocked rows, their windows still counted, 4
+        # relaunches and 1 dry window fewer, 28 gated rows)
+        assert len(plan_cd_act1["blocked_row_keys"]) == 8 and _S2_SGLANG_B8_REFERENCE in plan_cd_act1["blocked_row_keys"]
         c = plan_cd_act1["counts"]
-        assert (c["cells"], c["windows"], c["relaunches"], c["dry_windows"], c["blocked"]) == (113, 257, 58, 16, 1)
-        assert len(plan_cd_act1["identity_gated_row_keys"]) == 35
+        assert (c["cells"], c["windows"], c["relaunches"], c["dry_windows"], c["blocked"]) == (113, 257, 54, 15, 8)
+        assert len(plan_cd_act1["identity_gated_row_keys"]) == 28
         # an ungated session carries no gate block (null, never absent)
         assert "identity_gate" in plan_s2a and plan_s2a["identity_gate"] is None
 
@@ -6264,12 +6270,14 @@ class TestS2BlockCIdentityGate:
         plan = _s2_plan("cd-act1", tmp_path, identity_gate=rc.load_identity_gate(_identity_verdict(tmp_path, "FAIL")),
                         accept_identity_fail=True)
         gated = plan["identity_gated_row_keys"]
-        assert len(gated) == 35, "the 35 rows of block A's pin stay listed, now as the excluded set"
+        assert len(gated) == 28, "the 28 rows of block A's pin (35 before ADR-0193) stay listed, now as the excluded set"
         rows = _s2_rows(plan)
         blocked = {s["row_key"]: s["blocked_on"] for s in rows if s["blocked_on"]}
-        assert set(blocked) == set(gated) | {_S2_SGLANG_B8_REFERENCE}
+        launch_blocked = set(_S2_VLLM_B8_ROW_KEYS) | {_S2_SGLANG_B8_REFERENCE}
+        assert set(blocked) == set(gated) | launch_blocked
         assert {blocked[k] for k in gated} == {rc.IDENTITY_GATE_BLOCKED_ON}
         assert blocked[_S2_SGLANG_B8_REFERENCE] != rc.IDENTITY_GATE_BLOCKED_ON, "a launch-side reason is kept"
+        assert {blocked[k] for k in _S2_VLLM_B8_ROW_KEYS} == {rc.VLLM_HYBRID_STORE_BLOCKED_ON}, "the launch-side reason wins over the gate"
         assert all(s.get("budget_plan") is None for s in _cells(plan) if s["row_key"] in gated)
         assert all(s["blocked_on"] == rc.IDENTITY_GATE_BLOCKED_ON for s in _cells(plan) if s["row_key"] in gated)
         c = plan["counts"]
@@ -6277,7 +6285,7 @@ class TestS2BlockCIdentityGate:
         # [D] spec section 8: without the 35 vLLM prefix-on rows the plan keeps
         # 39 relaunches and 11 dry windows (pinned here, measured by this test)
         assert (c["relaunches"], c["dry_windows"]) == (39, 11)
-        assert sorted(plan["blocked_row_keys"]) == sorted(gated + [_S2_SGLANG_B8_REFERENCE])
+        assert sorted(plan["blocked_row_keys"]) == sorted(gated + sorted(launch_blocked))
         # no relaunch serves vLLM with the prefix cache ON any more
         assert not any(r["engine"] == "vllm" and r["prefix_mode"] == "ON" for r in _relaunches(plan))
         # the consequence the plan text misses: the B3 vLLM F1 reference, one of
@@ -6693,10 +6701,55 @@ def test_cd_act1_preflight_holds_one_request_in_every_pool_at_the_profile_concur
         charter_datasets=("squad_v2", "musique", "qasper"), floor_concurrency=50, gpu_id="NVIDIA H200",
     )
     assert r["pool_shortfalls"] == [] and r["problems"] == [], r["problems"]
-    assert r["pd_cells"] is True and r["executable_cells"] == 112
+    assert r["pd_cells"] is True and r["executable_cells"] == 105   # 113 cells, 8 blocked (ADR-0193)
     assert plan_cd_act1["serving_shapes"]["max_model_len"] == 16_384
     pd = [s for s in plan_cd_act1["steps"] if s["kind"] == "relaunch" and s["topology"] == "pd"]
     assert pd and all(s["max_model_len"] == rc.request_cap_tokens(grid, (s.get("demand_class") or {}).get("seq_tokens")) for s in pd)
     assert max(s["max_model_len"] for s in pd) == 16_384 and max(s["max_model_len"] for s in plan_cd_act1["steps"] if s["kind"] == "relaunch") == 16_384
     # review 2026-11-05 LOW 1: unguarded, so a vanished grid fails by name instead of passing silently
     assert {s: g.max_model_len for s, g in rc.SESSION_GRIDS.items() if s != "cd-act1"} == {"a": 32_768, "b": 32_768, "s1": 32_768, "s2a": 32_768}
+
+
+# ADR-0193 (2026-11-07): the retr-store (B8) cells of cd-act1 on vLLM are
+# BLOCKED, not served. vLLM 0.19.1 starts Qwen3-Next with a KV connector only
+# with the hybrid KV cache manager kept on, and its connector factory refuses a
+# connector without SupportsHMA while the manager is on
+# (vllm/distributed/kv_transfer/kv_connector/factory.py 57 to 62);
+# LMCacheConnectorV1 lacks it, so the store arm has no serving path on the 80B
+# with the pinned fleet. Seven rows leave the executable set: the F1 reference
+# and the F3 ladder (3 rungs x 2 loads). The 4 LMCache relaunches (their
+# neighbors differ, so none merge), 1 dry window, 7 identity-gated rows and 6
+# regime-gate groups go with them. Blocked cells stay enumerated (the plan
+# shows the debt), so counts.windows still sums their 16 windows, as it did
+# the SGLang reference's. s2a (the dense 70B) is untouched.
+_S2_VLLM_B8_ROW_KEYS = ("retr-store|rerank|none|single|vllm|qwen3-next-80b|F1",) + tuple(
+    f"retr-store|rerank|none|single|vllm|qwen3-next-80b|F3|r{r}|lam{lam}"
+    for r in ("0.25", "0.5", "1") for lam in ("0.95", "1.05")
+)
+
+
+def test_cd_act1_blocks_the_vllm_store_arm_on_the_hybrid(plan_cd_act1, plan_s2a) -> None:
+    plan = plan_cd_act1
+    assert sorted(plan["blocked_row_keys"]) == sorted(_S2_VLLM_B8_ROW_KEYS + (_S2_SGLANG_B8_REFERENCE,))
+    rows = {s["row_key"]: s for s in _s2_rows(plan)}
+    for key in _S2_VLLM_B8_ROW_KEYS:
+        assert rows[key]["blocked_on"] == rc.VLLM_HYBRID_STORE_BLOCKED_ON, key
+    assert "hybrid KV cache manager" in rc.VLLM_HYBRID_STORE_BLOCKED_ON and "0.19.1" in rc.VLLM_HYBRID_STORE_BLOCKED_ON
+    assert rows[_S2_SGLANG_B8_REFERENCE]["blocked_on"] == rc.SGLANG_STORE_BLOCKED_ON
+    c = plan["counts"]
+    assert (c["cells"], c["blocked"], c["windows"], c["dry_windows"], c["relaunches"]) == (113, 8, 257, 16 - 1, 58 - 4)
+    assert len(plan["identity_gated_row_keys"]) == 35 - 7
+    assert not any(k.startswith("retr-store|") for k in plan["identity_gated_row_keys"])
+    relaunches = [s for s in plan["steps"] if s["kind"] == "relaunch"]
+    assert relaunches and all(s["connector"] is None for s in relaunches)
+    assert all("VLLM_KV_TRANSFER_CONFIG" not in (s.get("env") or {}) for s in relaunches)
+    reg = rc.preflight_registration_check(
+        "cd-act1", floor_avg_seq_tokens="2694", query_manifests={"musique": str(_S2_MUSIQUE_MANIFEST)},
+        charter_datasets=("squad_v2", "musique", "qasper"), floor_concurrency=50, gpu_id="NVIDIA H200",
+    )
+    assert reg["executable_cells"] == 113 - 8 and reg["needs_lmcache"] is False and reg["lmcache_store_gib"] is None
+    # the dense 70B session keeps every cell: the rule is model-conditional
+    # (s2a's four blocked rows are the B12 rungs waiting for the Qasper manifest, as on HEAD)
+    assert plan_s2a["counts"]["blocked"] == 4 and all(k.startswith("corpus-trunc|") for k in plan_s2a["blocked_row_keys"])
+    assert rc.regime_gate_projection("s2a", loads="0.95 1.05", need="0.95:2 1.05:3",
+                                     confirmatory_arms="B1 B3 B4 B6 B7 B11 B12")["groups"]

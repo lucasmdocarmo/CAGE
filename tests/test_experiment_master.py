@@ -2885,7 +2885,7 @@ def test_the_shipped_s2_landing_profiles_carry_every_s1_key_and_the_block_e_pick
         "EXP": "S2B", "SESSION": "cd-act1", "MODEL": "Qwen/Qwen3-Next-80B-A3B-Instruct", "MODEL_SLUG": "qwen3-next-80b",
         "HOURS": "60", "RUN_BUDGET_HOURS": "55", "SEATBELT": "98h", "SETUP_BOUND_MIN": "50", "SCORE_BOUND_MIN": "150",
         "PULL_MARGIN_MIN": "180", "FLOOR_AVG_SEQ_TOKENS": "2694", "INSTALL_LMCACHE": "1", "LMCACHE_VERSION": "0.4.4",
-        "CONFIRMATORY_ARMS": "B1 B3 B4 B6 B7 B8"}
+        "CONFIRMATORY_ARMS": "B1 B3 B4 B6 B7"}
     # the served model plus the seven helpers, and no Qwen3-14B (no pod reader defaults to it)
     for p in (a, b):
         assert p["PREFETCH_MODELS"].split() == [p["MODEL"], *S2_HELPERS], p["PREFETCH_MODELS"]

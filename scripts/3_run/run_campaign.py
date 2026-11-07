@@ -1141,6 +1141,21 @@ SGLANG_STORE_BLOCKED_ON = (
     "sglang KV-store connector wiring (manage_sglang_server.sh, Wave-3)"
 )
 
+#: ADR-0193 (2026-11-07): blocked_on text for retr-store cells on vLLM whose
+#: grid model is the hybrid 80B. vLLM 0.19.1 turns its hybrid KV cache manager
+#: off under any --kv-transfer-config (vllm/config/vllm.py 1227 to 1243) and
+#: then cannot unify Qwen3-Next's Mamba plus full-attention specs
+#: (kv_cache_utils.py 1160 to 1219); with the manager kept on, its connector
+#: factory refuses a connector without SupportsHMA (factory.py 57 to 62), and
+#: LMCacheConnectorV1 has none. Either way the store arm has no start path on
+#: the 80B with the pinned fleet, so its cells are enumerated BLOCKED and the
+#: plan's needs_lmcache is False (stage 4 skips the LMCache start check).
+VLLM_HYBRID_STORE_BLOCKED_ON = (
+    "vLLM 0.19.1 LMCacheConnectorV1 lacks SupportsHMA and Qwen3-Next needs the "
+    "hybrid KV cache manager on under any KV connector (ADR-0193)"
+)
+VLLM_HYBRID_STORE_BLOCKED_MODELS = frozenset({"qwen3-next-80b"})
+
 #: S2 block C (register A-7, charter 5.2, ADR-0181): the T=0 token-identity
 #: verdict an identity_gated session plans against (``plan --identity-gate
 #: PATH``: the file scripts/checks/identity_gate.py verdict writes at stage 4,
@@ -4229,6 +4244,8 @@ def _launch_blocked_on(spec: CellSpec) -> Optional[str]:
         if spec.engine == "sglang":
             return SGLANG_STORE_BLOCKED_ON
         return f"{spec.engine} launcher has no KV-store connector knob"
+    if connector == "lmcache" and spec.engine == "vllm" and spec.model in VLLM_HYBRID_STORE_BLOCKED_MODELS:
+        return VLLM_HYBRID_STORE_BLOCKED_ON
     if kv_dtype is not None and spec.engine not in KV_DTYPE_LAUNCH_ENV:
         return f"{spec.engine} launcher has no KV-cache dtype knob"
     return None

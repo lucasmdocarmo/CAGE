@@ -27,7 +27,7 @@ LEVERS: Dict[str, str] = {
     "PULL_MARGIN_MIN": "60",       # a one hour tree pulls in minutes
     "VOLUME_GB": "100",            # the weights live on the container disk; the owner deletes the volume by hand
     "MIN_IN_REGIME_WINDOWS": "",   # the regime counts print only; S2B's floor would fail a one hour tree
-    "SKIP_BLOCKED": "1",           # cd-act1 carries one blocked row (B8 on SGLang); the loud skip path runs
+    "SKIP_BLOCKED": "1",           # cd-act1 carries eight blocked rows (B8 on both engines, ADR-0193); the loud skip path runs
 }
 
 

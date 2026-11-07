@@ -398,6 +398,42 @@ def test_start_dense_model_passes_no_mamba_cache_mode(stub_bin: Path) -> None:
     assert "--mamba-cache-mode" not in proc.stdout
 
 
+# ADR-0193 (2026-11-07, landing 2026-11-07_1328 stopped at stage 0): vLLM
+# 0.19.1 turns its hybrid KV cache manager OFF whenever --kv-transfer-config is
+# set and no preference is given (vllm/config/vllm.py 1227 to 1243), and with
+# it off the Mamba + full-attention specs of Qwen3-Next cannot be unified
+# (vllm/v1/core/kv_cache_utils.py 1160 to 1219 raises), so every P/D start of
+# the hybrid died before serving. Both roles keep the manager on with
+# --no-disable-hybrid-kv-cache-manager (NixlConnector carries SupportsHMA) and
+# pass --no-async-scheduling (vllm issue #37285: at TP > 1 the recurrent state
+# moves before it is fully written under async scheduling). Prefix on or off
+# makes no difference; a dense model passes neither flag.
+HYBRID_PD_FLAGS = ("--no-disable-hybrid-kv-cache-manager", "--no-async-scheduling")
+
+
+def test_start_hybrid_keeps_the_hybrid_kv_manager_on_and_async_scheduling_off_on_both_roles(
+    stub_bin: Path, tmp_path: Path
+) -> None:
+    for extra in ((), ("--no-prefix-cache",)):
+        root = tmp_path / ("prefix_on" if not extra else "prefix_off")
+        root.mkdir()
+        proc = _run_pd(stub_bin, "start", HYBRID_MODEL, *extra, CAGE_RUN_ROOT=str(root), **GOOD_BUDGETS)
+        cfg_dir = root / "observability" / "serving_configs"
+        for role in ("prefill", "decode"):
+            line = _args_line(proc.stdout, role)
+            cap = json.loads(next(cfg_dir.glob(f"*_pd-{role}.json")).read_text(encoding="utf-8"))
+            for flag in HYBRID_PD_FLAGS:
+                assert flag in line, (extra, role, flag, line)
+                assert flag in cap["args"], (extra, role, flag)
+
+
+def test_start_dense_model_passes_neither_hybrid_pd_flag(stub_bin: Path) -> None:
+    for model in ("fake/test-model", "Qwen/Qwen3-14B"):
+        proc = _run_pd(stub_bin, "start", model, **GOOD_BUDGETS)
+        for flag in HYBRID_PD_FLAGS:
+            assert flag not in proc.stdout, (model, flag)
+
+
 def test_start_distinct_role_pins_keep_0_90_and_ride_cuda_visible_devices(
     stub_bin: Path, tmp_path: Path
 ) -> None:

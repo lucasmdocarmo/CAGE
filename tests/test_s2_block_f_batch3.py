@@ -249,7 +249,7 @@ def test_the_projection_counts_the_registered_windows_per_gated_group_on_both_la
     by_load = {}
     for g in cd["groups"].values():
         by_load.setdefault(g["load"], []).append((g["registered"], g["need"]))
-    assert by_load == {"0.95": [(2, 2)] * 33, "1.05": [(3, 3)] * 33}
+    assert by_load == {"0.95": [(2, 2)] * 30, "1.05": [(3, 3)] * 30}   # 33 each before ADR-0193 blocked the 3 vLLM B8 rungs per load
     assert all(k.split("|")[4] == "single" for k in cd["groups"])    # the pd block is family DIST, outside
     # the S1 grid under the default: no gated load, and its frontier cells resolve only at plan time
     s1 = rc.regime_gate_projection("s1")
@@ -273,21 +273,23 @@ def test_the_projection_refuses_an_unknown_or_absent_roster_arm() -> None:
         rc.regime_gate_projection("s2a", loads=LOADS_S2, confirmatory_arms="B1 B99")
     with pytest.raises(rc.PlanError, match="B8"):
         rc.regime_gate_projection("s2a", loads=LOADS_S2, confirmatory_arms="B8")   # no store arm on the 70B
+    with pytest.raises(rc.PlanError, match="B8"):
+        rc.regime_gate_projection("cd-act1", loads=LOADS_S2, confirmatory_arms="B8")   # ADR-0193: blocked on the 80B
     with pytest.raises(rc.PlanError, match="abc"):
         rc.regime_gate_projection("s2a", loads="abc")
 
 
 def test_the_projection_cli_prints_one_line_per_group(capsys: pytest.CaptureFixture[str]) -> None:
     code = rc.main(["regime-gate-projection", "--session", "cd-act1", "--loads", LOADS_S2, "--min", FLOOR_S2,
-                    "--confirmatory-arms", "B1 B3 B4 B6 B7 B8"])
+                    "--confirmatory-arms", "B1 B3 B4 B6 B7"])   # ADR-0193: B8 left the roster
     out = capsys.readouterr().out
     assert code == 0
     head = out.splitlines()[0]
-    assert head.startswith("regime-gate projection session=cd-act1 loads='0.95 1.05' floor='0.95:2 1.05:3' roster=B1 B3 B4 B6 B7 B8")
-    assert "gated groups=66 blocking=66 descriptive=0 unresolved_load_cells=0" in head
+    assert head.startswith("regime-gate projection session=cd-act1 loads='0.95 1.05' floor='0.95:2 1.05:3' roster=B1 B3 B4 B6 B7")
+    assert "gated groups=60 blocking=60 descriptive=0 unresolved_load_cells=0" in head   # 66 less the 6 vLLM B8 groups
     assert "  vllm|gold-fresh|none|none|single|musique|1.0|0.95: registered=2 need=2 BLOCKING" in out
     assert "  sglang|corpus-reuse|none|none|single|musique|0.25|1.05: registered=3 need=3 BLOCKING" in out
-    assert out.count("BLOCKING") == 66     # one per group line; the header counts in lower case
+    assert out.count("BLOCKING") == 60     # one per group line; the header counts in lower case
     code = rc.main(["regime-gate-projection", "--session", "s2a", "--loads", LOADS_S2, "--min", "6"])
     assert code == 2 and "REFUSED: MIN_IN_REGIME_WINDOWS=6 exceeds the 2 registered windows of" in capsys.readouterr().err   # the planner refuses with 2
 
@@ -403,7 +405,7 @@ def _shipped(name: str, *keys: str) -> Dict[str, str]:
     return dict(zip(keys, proc.stdout.split("|")))
 
 
-@pytest.mark.parametrize("profile, session, blocking, descriptive", [("S2A.env", "s2a", 64, 8), ("S2B.env", "cd-act1", 66, 0)])
+@pytest.mark.parametrize("profile, session, blocking, descriptive", [("S2A.env", "s2a", 64, 8), ("S2B.env", "cd-act1", 60, 0)])   # cd-act1: 66 before ADR-0193
 def test_the_shipped_s2_profiles_gate_values_project_at_the_registered_count(profile: str, session: str, blocking: int, descriptive: int) -> None:
     """Decision 2 (finding 2, option (B)): the floor is the registered count per
     load, so every gated group's need equals its registered windows; the roster

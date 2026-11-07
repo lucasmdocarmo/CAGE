@@ -15,7 +15,9 @@
 # Usage:
 #   ./scripts/2_serving/manage_vllm_pd.sh start <model> [--no-prefix-cache]
 #   (a prefix-on start of a Qwen/Qwen3-Next-* model adds `--mamba-cache-mode
-#    align` to both role instances: the single launcher's rule, S2 block D)
+#    align` to both role instances: the single launcher's rule, S2 block D;
+#    any start of that model adds `--no-disable-hybrid-kv-cache-manager
+#    --no-async-scheduling` to both roles: ADR-0193)
 #   ./scripts/2_serving/manage_vllm_pd.sh stop
 #   ./scripts/2_serving/manage_vllm_pd.sh status
 #   (no restart verb: `start` is self-cleaning — it tears down any prior pd
@@ -523,6 +525,19 @@ compose_role_args() {
             Qwen/Qwen3-Next-*) ROLE_ARGS+=( --mamba-cache-mode align ) ;;
         esac
     fi
+    # ADR-0193 (landing 2026-11-07_1328): vLLM 0.19.1 turns its hybrid KV cache
+    # manager OFF whenever --kv-transfer-config is set and no preference is
+    # given (vllm/config/vllm.py 1227 to 1243); with it off, the Mamba plus
+    # full-attention specs of Qwen3-Next cannot be unified and the engine
+    # raises at startup (vllm/v1/core/kv_cache_utils.py 1160 to 1219). Both
+    # roles keep the manager on (NixlConnector carries SupportsHMA, the
+    # factory's check at kv_connector/factory.py 57 to 62) and turn async
+    # scheduling off (vllm issue #37285: at TP > 1 the recurrent state is
+    # transferred before it is fully written under async scheduling). Dense
+    # models pass neither flag: their argv stays byte-identical.
+    case "$model" in
+        Qwen/Qwen3-Next-*) ROLE_ARGS+=( --no-disable-hybrid-kv-cache-manager --no-async-scheduling ) ;;
+    esac
     # W29 (live L40S 2026-09-27): vLLM 0.19.1 has no --disable-log-requests; request
     # logging is off unless --enable-log-requests (mirrors manage_vllm_server.sh:
     # VLLM_DISABLE_LOG_REQUESTS=0 keeps the logs, anything else passes no flag).
