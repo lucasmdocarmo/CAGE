@@ -170,9 +170,11 @@ def test_live_hub_route_reproduces_the_50x3_manifest_digest() -> None:
         trunc_budgets=(1400, 700),
     )
     tracked = json.loads(MANIFEST.read_text(encoding="utf-8"))
-    # The v4 format fields (2026-10-17, audit G4) that the v3 tracked file lacks;
-    # everything else the Hub route must reproduce byte for byte.
-    format_keys = {"manifest_version", "warmup_reserve", "stats"}
+    # The v4 format fields (2026-10-17, audit G4) and the v5 top-level "tokenizer"
+    # (2026-11-01, 749aced, S2 register A-6) that the v3 tracked file lacks;
+    # everything else the Hub route must reproduce byte for byte. S2R setup
+    # 2026-11-07 failed on the v5 key alone, every data section equal.
+    format_keys = {"manifest_version", "warmup_reserve", "stats", "tokenizer"}
     new_stats = {"warmup_reserve_n", "trial_pool_size"}
 
     def data(m):
@@ -184,3 +186,4 @@ def test_live_hub_route_reproduces_the_50x3_manifest_digest() -> None:
     )
     assert {k: v for k, v in manifest["stats"].items() if k not in new_stats} == tracked["stats"]
     assert manifest["stats"]["warmup_reserve_n"] == 0, "the S0 manifest reserves no warmup questions"
+    assert manifest.get("tokenizer") is None, "the S0 manifest pins no tokenizer (v5 key, 749aced)"
