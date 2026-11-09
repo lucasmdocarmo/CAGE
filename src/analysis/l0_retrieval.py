@@ -409,9 +409,13 @@ def _validate_row_key(row_key: str) -> CellSpec:
     budget_r: float | None = None
     rate_frac: float | None = None
     corpus_budget_tokens: int | None = None
+    engine_variant: str | None = None
     for coord in parts[7:]:
         try:
-            if coord.startswith("lam"):
+            if coord.startswith("variant="):
+                # ADR-0195: the engine serving variant (the SGLang extra-buffer probe).
+                engine_variant = coord[len("variant="):]
+            elif coord.startswith("lam"):
                 rate_frac = float(coord[3:])
             elif coord.startswith("cb"):
                 # ADR-0106: the B12 corpus rung (an integer token budget).
@@ -432,6 +436,7 @@ def _validate_row_key(row_key: str) -> CellSpec:
             budget_r=budget_r,
             rate_frac=rate_frac,
             corpus_budget_tokens=corpus_budget_tokens,
+            engine_variant=engine_variant,
         )
     except (CellSpecError, ValueError) as exc:
         raise RetrievalScoringError(

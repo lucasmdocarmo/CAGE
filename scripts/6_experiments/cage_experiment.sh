@@ -845,7 +845,8 @@ except Exception as exc:
 print(f"session {session!r}: anchor shape {report['anchor_seq_tokens']} served tokens; {report['cells']} cells, "
       f"{report['executable_cells']} executable; NEEDS_LMCACHE={1 if report['needs_lmcache'] else 0}; "
       f"LMCACHE_STORE_GIB={report.get('lmcache_store_gib') or 0}; "
-      f"IDENTITY_GATED={1 if report.get('identity_gated') else 0}; PD_CELLS={1 if report.get('pd_cells') else 0}")
+      f"IDENTITY_GATED={1 if report.get('identity_gated') else 0}; PD_CELLS={1 if report.get('pd_cells') else 0}; "
+      f"SGLANG_XB_PROBE={1 if report.get('sglang_xb_probe') else 0}")
 # A11 item 4: the largest planned pool per engine, which stage 4 starts and checks
 for key, tag in (("largest_pools", "LARGEST_POOL"), ("largest_helper_pools", "LARGEST_HELPER_POOL")):
     for e, p in sorted((report.get(key) or {}).items()):
@@ -856,6 +857,8 @@ for e, env in sorted((report.get("tp_env") or {}).items()):
     print(f"TP_ENV engine={e} env=" + ",".join(f"{k}={v}" for k, v in sorted(env.items())))
 need = report.get("gpu_count_needed")
 print(f"GPU_COUNT_NEEDED={'' if need is None else need}")
+# DEC-8 (2026-11-08): the serving degree the pod's floor table is built at
+print(f"SERVING_TP={report.get('serving_tp') or 1}")
 # S2 block D (DEC-D3): the control-rung PD stack env the stage 4 smoke starts with
 # (the values carry commas, so the record is ';'-joined)
 pd = report.get("pd_env")
@@ -872,13 +875,20 @@ PY
   # IDENTITY_GATE_DATASET and the pinned served-model revision, are checked
   # here, before anything bills, and the stage 4 bound grows by the gate's.
   plan_only || { if step_has "IDENTITY_GATED=1"; then state put registration.identity_gated 1; else state put registration.identity_gated 0; fi; }
+  # ADR-0195: an executable SGLang extra-buffer probe cell adds a fourth engine
+  # start to the stage 4 gate (phase sglang_xb) and one relaunch to the run
+  plan_only || { if step_has "SGLANG_XB_PROBE=1"; then state put registration.sglang_xb_probe 1; else state put registration.sglang_xb_probe 0; fi; }
   if ! plan_only && [ "$(state get registration.identity_gated 2>/dev/null || echo 0)" = "1" ]; then
     local ig_manifest ig_bad="" ig_starts
     ig_manifest="$(gate_manifest)"
     [ -n "$ig_manifest" ] || ig_bad="$ig_bad no QUERY_MANIFESTS entry for IDENTITY_GATE_DATASET=$IDENTITY_GATE_DATASET (the gate draws its $IDENTITY_GATE_PROMPTS prompts from it);"
     [ -n "$MODEL_REVISION" ] || ig_bad="$ig_bad MODEL_REVISION empty (PIN_MODEL_REVISION=${PIN_MODEL_REVISION:-0}; the gate renders its prompts with the pinned tokenizer and the verdict records the revision);"
     [ -z "$ig_bad" ] || { printf '  [FAIL] session %s is identity gated (charter 5.2) but the gate inputs are missing:%s fix the profile before anything bills (S2 block C-1)\n' "$SESSION" "$ig_bad"; return 1; }
-    ig_starts="two"; case " $ENGINES " in *" sglang "*) ig_starts="three" ;; esac
+    ig_starts="two"
+    case " $ENGINES " in *" sglang "*)
+      ig_starts="three"
+      [ "$(state get registration.sglang_xb_probe 2>/dev/null || echo 0)" != "1" ] || ig_starts="four" ;;
+    esac
     say "identity gate (charter 5.2): $IDENTITY_GATE_PROMPTS $IDENTITY_GATE_DATASET prompts from $ig_manifest at revision $MODEL_REVISION; $ig_starts engine starts at stage 4 (+$((IDENTITY_GATE_BOUND_S / 60)) min on the validate bound)"
   fi
   # S2 block D (2026-11-01, DEC-D2, DEC-D3, ADR-0182): the registered grid says
@@ -919,6 +929,9 @@ PY
     done
     need="$(grep -o '^GPU_COUNT_NEEDED=[0-9]*' "$STEP_LOG" | tail -1 | cut -d= -f2)"
     state put registration.gpu_count_needed "$need"
+    # DEC-8 (2026-11-08): the serving degree stage 5 builds the floor table at (a
+    # hybrid model's per-token cost depends on it; the plan refuses another degree)
+    state put registration.serving_tp "$(grep -o '^SERVING_TP=[0-9]*' "$STEP_LOG" | tail -1 | cut -d= -f2)"
     [ -n "$need" ] || { printf '  [FAIL] stage 0 derived no GPU count for session %s (GPU_COUNT_NEEDED empty): nothing bills on an unknown shape (S2 Block B-1)\n' "$SESSION"; return 1; }
     [ "$need" = "$GPU_COUNT" ] || { printf '  [FAIL] the profile provisions GPU_COUNT=%s but session %s needs %s GPU(s) per serving stack (serving_tp, dist legs): fix the profile before anything bills (S2 Block B-1)\n' "$GPU_COUNT" "$SESSION" "$need"; return 1; }
     # Review 2026-10-31 (G8 finding 2): on a multi-GPU pod every engine the master
@@ -1416,7 +1429,7 @@ stage_validate() {
     [ "$e" = "vllm" ] && rerank="$rerank; env$(instrument_rev_env) $POD_PYTHON scripts/checks/probe_compressor_device.py --freeze-file $POD_FREEZE_FILE --out logs/compress_device_probe.json || rc=1; $POD_PYTHON scripts/checks/probe_encoder_device.py --freeze-file $POD_FREEZE_FILE --out logs/encoder_device_probe.json || rc=1"
     # A11 item 4 (owner 2026-10-21): the start runs at the engine's largest planned
     # pool (stage 0), and the relaunch rule checks it, before calibration bills
-    local lp_tokens lp_bytes lp_tp lp_env="" lp_check=""
+    local lp_tokens lp_bytes lp_tp lp_len lp_env="" lp_check=""
     lp_tokens="$(state get "registration.largest_pool.$e.planned_tokens" 2>/dev/null || true)"
     lp_bytes="$(state get "registration.largest_pool.$e.planned_bytes" 2>/dev/null || true)"
     # S2 Block B-1 (owner 2026-10-31): the TP env stage 0 recorded rides every start
@@ -1426,14 +1439,17 @@ stage_validate() {
     if [ -n "$lp_tokens" ] && [ -n "$lp_bytes" ]; then
       lp_env=" $(state get "registration.largest_pool.$e.env" 2>/dev/null | tr ',' ' ')"
       lp_tp="$(state get "registration.largest_pool.$e.tp" 2>/dev/null || true)"
-      lp_check="; $POD_PYTHON scripts/3_run/run_campaign.py pool-check --engine $e --planned-tokens $lp_tokens --planned-bytes $lp_bytes${lp_tp:+ --tp $lp_tp} --out logs/$e/largest_pool_check.json || rc=1"
+      # DEC-8: the check names the model and the start's request cap (the env's
+      # VLLM_MAX_MODEL_LEN); a hybrid model is checked by its block geometry
+      lp_len="$(printf '%s' "$lp_env" | sed -n 's/.*VLLM_MAX_MODEL_LEN=\([0-9]*\).*/\1/p')"
+      lp_check="; $POD_PYTHON scripts/3_run/run_campaign.py pool-check --engine $e --planned-tokens $lp_tokens --planned-bytes $lp_bytes${lp_tp:+ --tp $lp_tp} --out logs/$e/largest_pool_check.json --model $MODEL_SLUG${lp_len:+ --max-model-len $lp_len} || rc=1"
     else
       lp_env="$tp_env_e"
     fi
     case "$e" in vllm) ig_env_vllm="$lp_env" ;; sglang) ig_env_sglang="$lp_env" ;; esac
     # Review 2026-10-21 H1 (owner: "Add a check"): SGLang starts a second time at the
     # largest pool a GPU-helper cell plans, and the three helper probes run beside it
-    local hp_tokens="" hp_bytes="" hp_tp="" hp_env="" helper="" vbound=1500
+    local hp_tokens="" hp_bytes="" hp_tp="" hp_len="" hp_env="" helper="" vbound=1500
     if [ "$e" = "sglang" ]; then
       hp_tokens="$(state get "registration.largest_helper_pool.$e.planned_tokens" 2>/dev/null || true)"
       hp_bytes="$(state get "registration.largest_helper_pool.$e.planned_bytes" 2>/dev/null || true)"
@@ -1441,7 +1457,8 @@ stage_validate() {
     if [ -n "$hp_tokens" ] && [ -n "$hp_bytes" ]; then
       hp_env=" $(state get "registration.largest_helper_pool.$e.env" 2>/dev/null | tr ',' ' ')"
       hp_tp="$(state get "registration.largest_helper_pool.$e.tp" 2>/dev/null || true)"
-      helper="; env$hp_env bash scripts/2_serving/$launcher start '$MODEL' && { $POD_PYTHON scripts/3_run/run_campaign.py pool-check --engine $e --planned-tokens $hp_tokens --planned-bytes $hp_bytes${hp_tp:+ --tp $hp_tp} --out logs/$e/helper_pool_check.json && env$(instrument_rev_env) $POD_PYTHON scripts/checks/probe_reranker_device.py --out logs/rerank_device_probe_beside_sglang.json && env$(instrument_rev_env) $POD_PYTHON scripts/checks/probe_compressor_device.py --freeze-file $POD_FREEZE_FILE --out logs/compress_device_probe_beside_sglang.json && $POD_PYTHON scripts/checks/probe_encoder_device.py --freeze-file $POD_FREEZE_FILE --out logs/encoder_device_probe_beside_sglang.json && echo HELPERS_FIT_OK; } || { echo HELPERS_FIT_FAILED; rc=1; }; bash scripts/2_serving/$launcher stop"
+      hp_len="$(printf '%s' "$hp_env" | sed -n 's/.*VLLM_MAX_MODEL_LEN=\([0-9]*\).*/\1/p')"
+      helper="; env$hp_env bash scripts/2_serving/$launcher start '$MODEL' && { $POD_PYTHON scripts/3_run/run_campaign.py pool-check --engine $e --planned-tokens $hp_tokens --planned-bytes $hp_bytes${hp_tp:+ --tp $hp_tp} --out logs/$e/helper_pool_check.json --model $MODEL_SLUG${hp_len:+ --max-model-len $hp_len} && env$(instrument_rev_env) $POD_PYTHON scripts/checks/probe_reranker_device.py --out logs/rerank_device_probe_beside_sglang.json && env$(instrument_rev_env) $POD_PYTHON scripts/checks/probe_compressor_device.py --freeze-file $POD_FREEZE_FILE --out logs/compress_device_probe_beside_sglang.json && $POD_PYTHON scripts/checks/probe_encoder_device.py --freeze-file $POD_FREEZE_FILE --out logs/encoder_device_probe_beside_sglang.json && echo HELPERS_FIT_OK; } || { echo HELPERS_FIT_FAILED; rc=1; }; bash scripts/2_serving/$launcher stop"
       vbound=3000
     fi
     # after `stop` the GPU process takes a few seconds to leave the compute-apps list: wait up to 60 s before reading it
@@ -1493,7 +1510,7 @@ stage_validate() {
   # ERROR) is not the job's: the fetched verdict file is judged on the Mac, so
   # the log of an ERROR lands beside the other stage logs.
   if [ "$(state get registration.identity_gated 2>/dev/null || echo 0)" = "1" ]; then
-    local ig_manifest ig_p="logs/identity_gate/prompts.json" ig_cmd ig_nosgl="" ig_vapi ig_sapi ig_verdict
+    local ig_manifest ig_p="logs/identity_gate/prompts.json" ig_cmd ig_nosgl="" ig_xb="" ig_vapi ig_sapi ig_verdict
     ig_manifest="$(gate_manifest)"
     [ -n "$ig_manifest" ] || { printf '  [FAIL] no QUERY_MANIFESTS entry for IDENTITY_GATE_DATASET=%s (stage 0 checks this; the profile changed since)\n' "$IDENTITY_GATE_DATASET"; return 1; }
     [ -n "$MODEL_REVISION" ] || { printf '  [FAIL] MODEL_REVISION is empty on an identity-gated session (stage 0 checks this; the freeze file changed since)\n'; return 1; }
@@ -1515,10 +1532,18 @@ stage_validate() {
       ig_cmd="$ig_cmd; if [ \$rc -eq 0 ]; then env$ig_env_vllm bash scripts/2_serving/manage_vllm_server.sh start '$MODEL' && $POD_PYTHON scripts/checks/identity_gate.py run --engine vllm --phase vllm_on --api-base $ig_vapi --model '$MODEL' --prompts $ig_p --passes 2 --out logs/identity_gate/vllm_on.json || rc=1; bash scripts/2_serving/manage_vllm_server.sh stop; fi"
       ig_cmd="$ig_cmd; if [ \$rc -eq 0 ]; then env$ig_env_vllm bash scripts/2_serving/manage_vllm_server.sh start '$MODEL' --no-prefix-cache && $POD_PYTHON scripts/checks/identity_gate.py run --engine vllm --phase vllm_off --api-base $ig_vapi --model '$MODEL' --prompts $ig_p --passes 1 --out logs/identity_gate/vllm_off.json || rc=1; bash scripts/2_serving/manage_vllm_server.sh stop; fi"
       case " $ENGINES " in
-        *" sglang "*) ig_cmd="$ig_cmd; if [ \$rc -eq 0 ]; then env$ig_env_sglang bash scripts/2_serving/manage_sglang_server.sh start '$MODEL' && $POD_PYTHON scripts/checks/identity_gate.py run --engine sglang --phase sglang --api-base $ig_sapi --model '$MODEL' --prompts $ig_p --passes 2 --out logs/identity_gate/sglang.json || rc=1; bash scripts/2_serving/manage_sglang_server.sh stop; fi" ;;
+        *" sglang "*)
+          ig_cmd="$ig_cmd; if [ \$rc -eq 0 ]; then env$ig_env_sglang bash scripts/2_serving/manage_sglang_server.sh start '$MODEL' && $POD_PYTHON scripts/checks/identity_gate.py run --engine sglang --phase sglang --api-base $ig_sapi --model '$MODEL' --prompts $ig_p --passes 2 --out logs/identity_gate/sglang.json || rc=1; bash scripts/2_serving/manage_sglang_server.sh stop; fi"
+          # ADR-0195: the fourth start, SGLang under the probe cell's two launcher
+          # knobs (the same env as the default start otherwise), phase sglang_xb;
+          # the verdict records comparisons F and G from it, deciding nothing
+          if [ "$(state get registration.sglang_xb_probe 2>/dev/null || echo 0)" = "1" ]; then
+            ig_cmd="$ig_cmd; if [ \$rc -eq 0 ]; then env$ig_env_sglang CAGE_SGLANG_MAMBA_SCHEDULER_STRATEGY=extra_buffer CAGE_SGLANG_DISABLE_OVERLAP_SCHEDULE=1 bash scripts/2_serving/manage_sglang_server.sh start '$MODEL' && $POD_PYTHON scripts/checks/identity_gate.py run --engine sglang --phase sglang_xb --api-base $ig_sapi --model '$MODEL' --prompts $ig_p --passes 2 --out logs/identity_gate/sglang_xb.json || rc=1; bash scripts/2_serving/manage_sglang_server.sh stop; fi"
+            ig_xb=" --sglang-xb"
+          fi ;;
         *) ig_nosgl=" --no-sglang" ;;
       esac
-      ig_cmd="$ig_cmd; if [ \$rc -eq 0 ]; then $POD_PYTHON scripts/checks/identity_gate.py verdict --phases logs/identity_gate --out logs/identity_gate.json$ig_nosgl || true; fi"
+      ig_cmd="$ig_cmd; if [ \$rc -eq 0 ]; then $POD_PYTHON scripts/checks/identity_gate.py verdict --phases logs/identity_gate --out logs/identity_gate.json$ig_nosgl$ig_xb || true; fi"
       ig_cmd="$ig_cmd; n=1; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do n=\$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . || true); [ \"\$n\" -eq 0 ] && break; sleep 2; done; echo COMPUTE_APPS=\$n; exit \$rc"
       local ig_job=0
       job_run identity_gate "$IDENTITY_GATE_BOUND_S" "cd $POD_REPO && export PATH=$POD_VENV_BIN:\$PATH VLLM_START_TIMEOUT=$VLLM_START_TIMEOUT$POD_ENGINE_ENV && $ig_cmd" "$LAND/logs/setup" || ig_job=1
@@ -1723,11 +1748,20 @@ PY
   done
   stamp="$(date -u +%H%M%S)"
   plan_only || mkdir -p "$EXTRAS/calibration"
-  run_step 0 "floor table (P6 prediction)" -- "$PY" "$SCRIPTS/4_analysis/build_floor_table.py" --model "$MODEL_SLUG" --engine "$FLOOR_ENGINE" --concurrency-target "$FLOOR_CONCURRENCY" --avg-seq-tokens "$FLOOR_AVG_SEQ_TOKENS" --grid "$FLOOR_GRID" --service-time-s "$FLOOR_SERVICE_TIME_S" --out "$EXTRAS/calibration/floor_table_$stamp.json" || return 1
+  # DEC-8 (2026-11-08): the table is sized at the serving degree stage 0 recorded
+  # (a hybrid model's per-token cost and per-request state depend on it). A live
+  # run without the record refuses (review LOW 3: a default of 1 would build a
+  # table the plan refuses only after the ladders billed); plan mode prints 1
+  local floor_tp; floor_tp="$(state get registration.serving_tp 2>/dev/null || true)"
+  if [ -z "$floor_tp" ]; then
+    plan_only || { printf '  [FAIL] no registration.serving_tp in the state: the floor table needs the serving degree stage 0 records (DEC-8); rerun stage 0\n'; return 1; }
+    floor_tp=1
+  fi
+  run_step 0 "floor table (P6 prediction)" -- "$PY" "$SCRIPTS/4_analysis/build_floor_table.py" --model "$MODEL_SLUG" --engine "$FLOOR_ENGINE" --concurrency-target "$FLOOR_CONCURRENCY" --avg-seq-tokens "$FLOOR_AVG_SEQ_TOKENS" --grid "$FLOOR_GRID" --service-time-s "$FLOOR_SERVICE_TIME_S" --tp "$floor_tp" --out "$EXTRAS/calibration/floor_table_$stamp.json" || return 1
   plan_only || state put calibration.floor_table "$EXTRAS/calibration/floor_table_$stamp.json"
   local r
   for e in $CALIBRATE; do for r in $BUDGET_RATIOS; do
-    run_step 0 "byte plan $e r=$r" -- bash -c "cd '$PROJECT_DIR' && '$PY' -m src.orchestration.cache_budget --model '$MODEL_SLUG' --engine '$e' --r '$r' --concurrency '$FLOOR_CONCURRENCY' --avg-seq-tokens '$FLOOR_AVG_SEQ_TOKENS' > '$EXTRAS/calibration/budget_${e}_r${r}.json'" || return 1
+    run_step 0 "byte plan $e r=$r" -- bash -c "cd '$PROJECT_DIR' && '$PY' -m src.orchestration.cache_budget --model '$MODEL_SLUG' --engine '$e' --r '$r' --concurrency '$FLOOR_CONCURRENCY' --avg-seq-tokens '$FLOOR_AVG_SEQ_TOKENS' --tp '$floor_tp' > '$EXTRAS/calibration/budget_${e}_r${r}.json'" || return 1
   done; done
   run_step 0 "scp floor table to the pod" -- pscp_to "$EXTRAS/calibration/floor_table_$stamp.json" "$POD_REPO/results/calibration/floor_table.json" || return 1
   # The ladder roots are never reused (a reused root is a PROBE_FAILED rung),

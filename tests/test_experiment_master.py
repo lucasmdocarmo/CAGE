@@ -288,10 +288,14 @@ def world(tmp_path: Path) -> Dict[str, Path]:
             return {"session": session, "anchor_seq_tokens": 4779, "cells": 3, "executable_cells": 3,
                     "needs_lmcache": os.environ.get("CAGE_TEST_NEEDS_LMCACHE") == "1", "largest_pools": largest,
                     "largest_helper_pools": helpers, "tp_env": tp_env, "gpu_count_needed": int(gc) if gc else None,
+                    # DEC-8: the serving degree the floor table is built at
+                    "serving_tp": 4 if tp4 else 1,
                     # S2 block C (A-7): the identity gate rides the report like NEEDS_LMCACHE
                     "identity_gated": os.environ.get("CAGE_TEST_IDENTITY_GATED") == "1",
                     # S2 block D (DEC-D2, DEC-D3): the pd cells flag and the control-rung PD stack env
                     "pd_cells": os.environ.get("CAGE_TEST_PD_CELLS") == "1",
+                    # ADR-0195: the SGLang extra-buffer probe cell (a fourth identity-gate start)
+                    "sglang_xb_probe": os.environ.get("CAGE_TEST_SGLANG_XB") == "1",
                     "pd_env": None if os.environ.get("CAGE_TEST_PD_CELLS") != "1" or os.environ.get("CAGE_TEST_PD_ENV", "1") != "1" else {
                         "engine": "vllm", "budget_r": 1.0, "seq_tokens": 4779, "tp": 2, "planned_bytes": 2651340800,
                         "env": __import__("json").loads('__PD_ENV_JSON__')},
@@ -4077,3 +4081,103 @@ def test_stage_7_refuses_a_cut_landing_whose_audit_recorded_no_stop_2026_11_05(w
     assert not (world["home"] / ".cage_jobs" / "run.cmd").exists(), "stage 7 must not submit"
     proc = _master(world, "--plan", "--from", "run", "--to", "run", CAGE_TEST_PROJECTION_S="5400")
     assert "recorded no plan.audit_budget_hours" not in proc.stdout, "plan mode has no state to read and stays exempt"
+
+
+# ---------------------------------------------------------------------------
+# DEC-8 (2026-11-08): the serving degree rides stage 0 into the floor table,
+# and the stage 4 pool check names the model and the request cap
+# ---------------------------------------------------------------------------
+
+def _floor_table_argv(world: Dict[str, Path]) -> List[str]:
+    land = world["exp_root"] / "S1" / DATE
+    tables = sorted((land / "extras" / "calibration").glob("floor_table_*.json"))
+    assert tables, "no floor table built"
+    return json.loads(tables[-1].read_text(encoding="utf-8"))["argv"]
+
+
+def test_stage_0_records_the_serving_degree_for_the_floor_table_and_the_pool_check_dec8(world: Dict[str, Path]) -> None:
+    proc = _master(world, "--yes", "provision", "--to", "calibrate", CAGE_TEST_LARGEST_POOL="1")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert _state(world)["registration"]["serving_tp"] == "1"
+    argv = _floor_table_argv(world)
+    assert argv[argv.index("--tp") + 1] == "1"
+    cmd = (world["home"] / ".cage_jobs" / "validate_vllm.cmd").read_text(encoding="utf-8")
+    assert "--tp 1 --out logs/vllm/largest_pool_check.json --model qwen3-14b --max-model-len 32768" in cmd
+    assert any(c.startswith("pool_check --engine vllm") and c.endswith("--model qwen3-14b --max-model-len 32768") for c in _calls(world))
+
+
+def test_a_four_rank_session_builds_its_floor_table_at_tp_4_dec8(world: Dict[str, Path], tmp_path: Path) -> None:
+    _four_gpu_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "calibrate", CAGE_TEST_TP_ENV="1", CAGE_TEST_LARGEST_POOL="1",
+                   CAGE_TEST_HELPER_POOL="1")
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-1500:]
+    assert _state(world)["registration"]["serving_tp"] == "4"
+    argv = _floor_table_argv(world)
+    assert argv[argv.index("--tp") + 1] == "4"
+    sgl_cmd = (world["home"] / ".cage_jobs" / "validate_sglang.cmd").read_text(encoding="utf-8")
+    assert "--tp 4 --out logs/sglang/helper_pool_check.json --model qwen3-14b --max-model-len 8192" in sgl_cmd
+    assert "--tp 4 --out logs/vllm/largest_pool_check.json --model qwen3-14b --max-model-len 32768" in (
+        world["home"] / ".cage_jobs" / "validate_vllm.cmd").read_text(encoding="utf-8")
+
+
+def test_calibrate_refuses_without_the_recorded_serving_degree_dec8(world: Dict[str, Path]) -> None:
+    # review 2026-11-08 LOW 3: a state written before DEC-8 (or a stage 0 that
+    # did not record the degree) must not build the floor table at tp 1 by
+    # default; the plan would refuse the table only after the ladders billed
+    proc = _master(world, "--yes", "provision", "--to", "calibrate")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    assert _state(world)["registration"]["serving_tp"] == "1"
+    path = world["exp_root"] / "S1" / DATE / "extras" / "state.json"
+    st = json.loads(path.read_text(encoding="utf-8"))
+    del st["registration"]["serving_tp"]
+    path.write_text(json.dumps(st, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tables_before = sorted((world["exp_root"] / "S1" / DATE / "extras" / "calibration").glob("floor_table_*.json"))
+    proc = _master(world, "--from", "calibrate", "--redo", "--to", "calibrate")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "no registration.serving_tp" in proc.stdout
+    tables_after = sorted((world["exp_root"] / "S1" / DATE / "extras" / "calibration").glob("floor_table_*.json"))
+    assert tables_after == tables_before
+    # plan mode still prints the stage with the degree 1 fallback
+    proc = _master(world, "--plan")
+    assert proc.returncode == 0 and "--tp 1 --out" in proc.stdout
+
+
+def test_a_session_with_the_sglang_extra_buffer_probe_runs_four_starts_and_asks_the_verdict_for_it_adr_0195(world: Dict[str, Path], tmp_path: Path) -> None:
+    """ADR-0195: stage 0 records the probe flag the registration report prints;
+    stage 4 starts SGLang a fourth time under the probe's two launcher knobs,
+    runs phase sglang_xb for two passes, and the verdict is asked for the
+    phase; the default three starts and their argv are unchanged."""
+    _gated_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "plan", CAGE_TEST_IDENTITY_GATED="1", CAGE_TEST_LARGEST_POOL="1",
+                   CAGE_TEST_SGLANG_XB="1")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert "SGLANG_XB_PROBE=1" in proc.stdout and _state(world)["registration"]["sglang_xb_probe"] in ("1", 1)
+    assert "four engine starts at stage 4" in proc.stdout, "vLLM on, vLLM off, SGLang and the SGLang extra-buffer probe"
+    cmd = _job_cmd(world, "identity_gate")
+    sgl_start = "bash scripts/2_serving/manage_sglang_server.sh start 'Qwen/Qwen3-14B' && "
+    xb_start = ("env CAGE_SGLANG_MAMBA_SCHEDULER_STRATEGY=extra_buffer CAGE_SGLANG_DISABLE_OVERLAP_SCHEDULE=1 "
+                "bash scripts/2_serving/manage_sglang_server.sh start 'Qwen/Qwen3-14B' && ")
+    assert cmd.count(sgl_start) == 2 and cmd.count(xb_start) == 1
+    assert cmd.index(sgl_start) < cmd.index(xb_start), "the default SGLang phase runs before the probe phase"
+    run = "cage-env/bin/python scripts/checks/identity_gate.py run --engine {e} --phase {ph} --api-base {api} --model 'Qwen/Qwen3-14B' --prompts logs/identity_gate/prompts.json --passes {n} --out logs/identity_gate/{ph}.json"
+    assert run.format(e="sglang", ph="sglang", api="http://localhost:30000", n=2) in cmd
+    assert run.format(e="sglang", ph="sglang_xb", api="http://localhost:30000", n=2) in cmd
+    assert cmd.count("identity_gate.py run ") == 4
+    assert cmd.count("bash scripts/2_serving/manage_sglang_server.sh stop") == 2
+    assert "identity_gate.py verdict --phases logs/identity_gate --out logs/identity_gate.json --sglang-xb" in cmd
+    # the knobs reach no other start: the default phases' argv is byte-identical
+    assert cmd.count("CAGE_SGLANG_MAMBA_SCHEDULER_STRATEGY") == 1 and cmd.count("CAGE_SGLANG_DISABLE_OVERLAP_SCHEDULE") == 1
+    extras = world["exp_root"] / "S1" / DATE / "extras" / "identity_gate"
+    assert sorted(p.name for p in extras.iterdir()) == ["identity_gate.json", "prompts.json", "sglang.json", "sglang_xb.json",
+                                                         "vllm_off.json", "vllm_on.json"]
+    assert json.loads((extras / "identity_gate.json").read_text(encoding="utf-8"))["verdict"] == "PASS"
+
+
+def test_without_the_probe_stage_0_records_it_off_and_stage_4_keeps_three_starts_adr_0195(world: Dict[str, Path], tmp_path: Path) -> None:
+    _gated_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--to", "validate", CAGE_TEST_IDENTITY_GATED="1")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert "SGLANG_XB_PROBE=0" in proc.stdout and _state(world)["registration"]["sglang_xb_probe"] in ("0", 0)
+    cmd = _job_cmd(world, "identity_gate")
+    assert "sglang_xb" not in cmd and "--sglang-xb" not in cmd and "CAGE_SGLANG_MAMBA_SCHEDULER_STRATEGY" not in cmd
+    assert "three engine starts at stage 4" in proc.stdout

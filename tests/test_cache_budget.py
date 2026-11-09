@@ -30,6 +30,7 @@ from src.orchestration.cache_budget import (
     CacheBudgetError,
     _main,
     demand_bytes,
+    fixed_state_bytes_per_seq,
     plan_budget,
 )
 
@@ -46,7 +47,10 @@ def test_kv_per_token_constants_are_the_charter_arithmetic() -> None:
     assert MODEL_KV["llama-3.3-70b"].kv_bytes_per_token == 2 * 80 * 8 * 128 * 2 == 327_680
     assert MODEL_KV["deepseek-v3"].kv_bytes_per_token == 61 * (512 + 64) * 2 == 70_272
     assert MODEL_KV["qwen3-next-80b"].kv_bytes_per_token == 24_576
-    assert MODEL_KV["qwen3-next-80b"].fixed_state_bytes_per_seq == 38 * 1024 * 1024
+    # DEC-8 (2026-11-08): the recurrent-state slot is derived from vLLM's block
+    # geometry (3 shared blocks per running request, 40,108,032 B = 38.25 MiB at
+    # TP 1, 2 and 4), no longer the charter's "~38 MiB" constant
+    assert fixed_state_bytes_per_seq("qwen3-next-80b", 1) == 40_108_032
     assert MODEL_KV["deepseek-v3"].mla_tp_replicated is True
     assert MODEL_KV["qwen3-14b"].mla_tp_replicated is False
 
@@ -57,7 +61,7 @@ def test_s0_shakedown_model_kv_arithmetic_is_registered() -> None:
     # 2 (K,V) x 36 layers x 8 KV heads x 128 head_dim x 2 B = 144 KiB/tok.
     s0 = MODEL_KV["qwen3-8b-fp8"]
     assert s0.kv_bytes_per_token == 2 * 36 * 8 * 128 * 2 == 147_456
-    assert s0.fixed_state_bytes_per_seq == 0
+    assert fixed_state_bytes_per_seq("qwen3-8b-fp8", 1) == 0
     assert s0.mla_tp_replicated is False
 
 
@@ -74,12 +78,15 @@ def test_demand_fp8_halves_kv_exactly() -> None:
 
 
 def test_demand_hybrid_adds_fixed_state_slots_undtyped() -> None:
+    # DEC-8 (2026-11-08): the slot is vLLM's steady 3 shared blocks per
+    # request, 40,108,032 B (was the charter's 38 MiB constant); at TP 1 the
+    # attention cost stays 24,576 B per token
     kv_part = 9 * 32768 * 24_576
     d = demand_bytes("qwen3-next-80b", concurrency=9, avg_seq_tokens=32768)
-    assert d == kv_part + 9 * 38 * 1024 * 1024
+    assert d == kv_part + 9 * 40_108_032
     # fp8 scales ONLY the KV part; the recurrent slots are model state, not KV
     d8 = demand_bytes("qwen3-next-80b", concurrency=9, avg_seq_tokens=32768, kv_dtype="fp8")
-    assert d8 == kv_part // 2 + 9 * 38 * 1024 * 1024
+    assert d8 == kv_part // 2 + 9 * 40_108_032
 
 
 # ---------------------------------------------------------------------------

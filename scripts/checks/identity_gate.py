@@ -31,7 +31,9 @@ Three subcommands, composed by scripts/6_experiments/cage_experiment.sh:
            [V SGLang 0.5.10.post1 tokenizer_manager.py 1579, 1618-1622];
            temperature 0 is greedy (top_k 1) [V sampling_params.py 98-101].
   verdict  the comparisons of charter 5.2 (A: vLLM warm vs cache-off and B:
-           vLLM cold vs warm decide; C, D, E against SGLang are recorded), the
+           vLLM cold vs warm decide; C, D, E against SGLang are recorded; F and
+           G against the SGLang extra-buffer probe phase ``sglang_xb``, run only
+           when ``--sglang-xb`` says stage 4 started it, ADR-0195), the
            telemetry that makes the test honest (every warm prompt past two
            quanta cached at or above one 528-token quantum, every cache-off
            prompt at 0; shorter prompts and pass-1 hits are recorded, not
@@ -80,8 +82,13 @@ WARM_FLOOR_MIN_PROMPT_TOKENS = 2 * WARM_CACHED_TOKENS_MIN + 1
 #: The smallest served context on the gated rows minus the generation budget.
 DEFAULT_PROMPT_TOKEN_LIMIT = 4096 - 32
 SHAPE = "corpus-reuse"
-#: Phase name -> engine; the passes the verdict needs of each.
-PHASES: Dict[str, Tuple[str, int]] = {"vllm_on": ("vllm", 2), "vllm_off": ("vllm", 1), "sglang": ("sglang", 2)}
+#: Phase name -> engine; the passes the verdict needs of each. ``sglang_xb`` is
+#: SGLang under the extra-buffer Mamba scheduler (ADR-0195), the probe cell's
+#: serving mode, started fourth at stage 4 only on a session that plans the probe.
+PHASES: Dict[str, Tuple[str, int]] = {"vllm_on": ("vllm", 2), "vllm_off": ("vllm", 1), "sglang": ("sglang", 2),
+                                      "sglang_xb": ("sglang", 2)}
+#: Phases the verdict reads only when asked for: (phase, the flag that asks).
+OPTIONAL_PHASES: Dict[str, str] = {"sglang_xb": "sglang_xb"}
 #: (key, left phase, left pass, right phase, right pass, decides)
 COMPARISONS = (
     ("A", "vllm_on", 2, "vllm_off", 1, True),
@@ -89,6 +96,8 @@ COMPARISONS = (
     ("C", "vllm_off", 1, "sglang", 1, False),
     ("D", "vllm_on", 2, "sglang", 1, False),
     ("E", "sglang", 1, "sglang", 2, False),
+    ("F", "vllm_off", 1, "sglang_xb", 1, False),
+    ("G", "sglang_xb", 1, "sglang_xb", 2, False),
 )
 DECIDING = ["A", "B"]
 
@@ -362,6 +371,7 @@ def build_verdict(args: argparse.Namespace) -> Dict[str, Any]:
                         "sha256": pdoc.get("sha256"), "max_prompt_tokens": pdoc.get("max_prompt_tokens")}
         v["request"] = pdoc.get("request")
         names = [n for n in PHASES if n != "sglang" or not args.no_sglang]
+        names = [n for n in names if n not in OPTIONAL_PHASES or getattr(args, OPTIONAL_PHASES[n], False)]
         phases: Dict[str, Dict[str, Any]] = {}
         for name in names:
             doc = _load_phase(d, name, count)
@@ -372,21 +382,30 @@ def build_verdict(args: argparse.Namespace) -> Dict[str, Any]:
                        for n, doc in phases.items()}
         if args.no_sglang:
             v["phases"]["sglang"] = "absent"
+        for name in OPTIONAL_PHASES:
+            if name not in phases:
+                v["phases"][name] = "absent"
         v["started_at"] = min(doc.get("started_at") or "" for doc in phases.values()) or None
         on1 = [r["cached_tokens"] or 0 for r in _pass(phases["vllm_on"], 1)]
         warm = [r["cached_tokens"] or 0 for r in _pass(phases["vllm_on"], 2)]
         off = [r["cached_tokens"] or 0 for r in _pass(phases["vllm_off"], 1)]
         sgl1 = [r["cached_tokens"] or 0 for r in _pass(phases["sglang"], 1)] if "sglang" in phases else None
         sgl = [r["cached_tokens"] or 0 for r in _pass(phases["sglang"], 2)] if "sglang" in phases else None
+        xb1 = [r["cached_tokens"] or 0 for r in _pass(phases["sglang_xb"], 1)] if "sglang_xb" in phases else None
+        xb = [r["cached_tokens"] or 0 for r in _pass(phases["sglang_xb"], 2)] if "sglang_xb" in phases else None
         ntok = [int(p["n_tokens"]) for p in pdoc["prompts"]]
         exempt = [{"prompt_index": i, "prompt_id": pdoc["prompts"][i]["id"], "prompt_tokens": ntok[i], "cached_tokens": warm[i]}
                   for i in range(count) if ntok[i] < WARM_FLOOR_MIN_PROMPT_TOKENS]
         hits = sum(1 for c in on1 if c > 0)
         shits = sum(1 for c in sgl1 if c > 0) if sgl1 is not None else None
+        xhits = sum(1 for c in xb1 if c > 0) if xb1 is not None else None
         v["telemetry"] = {"vllm_on_pass1_cached_tokens": _stats(on1), "vllm_on_pass1_hits": hits,
                           "vllm_on_pass2_cached_tokens": _stats(warm), "vllm_on_pass2_floor_exempt": exempt,
                           "vllm_off_cached_tokens_max": max(off), "sglang_pass1_hits": shits,
-                          "sglang_pass2_cached_tokens": _stats(sgl) if sgl is not None else None}
+                          "sglang_pass2_cached_tokens": _stats(sgl) if sgl is not None else None,
+                          # ADR-0195: the extra-buffer probe phase; None when stage 4 did not start it
+                          "sglang_xb_pass1_hits": xhits,
+                          "sglang_xb_pass2_cached_tokens": _stats(xb) if xb is not None else None}
         if exempt:
             v["limitations"].append(
                 f"the {WARM_CACHED_TOKENS_MIN}-token warm floor is not applied to {len(exempt)} of {count} prompts under "
@@ -400,11 +419,16 @@ def build_verdict(args: argparse.Namespace) -> Dict[str, Any]:
             v["limitations"].append(
                 f"pass 1 is not cold on {shits} of {count} SGLang prompts (a shared corpus block is served from the radix cache): "
                 f"comparisons C and D compare against a partly warm pass 1")
+        if xhits:
+            v["limitations"].append(
+                f"pass 1 is not cold on {xhits} of {count} prompts of the SGLang extra-buffer probe (sglang_xb; a shared "
+                f"corpus block is served from the Mamba radix cache, ADR-0195): comparison F compares against a partly warm pass 1")
         comps: Dict[str, Dict[str, Any]] = {}
         for key, ln, lk, rn, rk, decides in COMPARISONS:
             if ln not in phases or rn not in phases:
+                missing = ln if ln not in phases else rn
                 comps[key] = {"decides": False, "left": None, "right": None, "compared": 0, "identical": None,
-                              "first_divergence": None, "skipped": "sglang absent"}
+                              "first_divergence": None, "skipped": f"{missing} absent"}
                 continue
             identical, first = _divergence(_pass(phases[ln], lk), _pass(phases[rn], rk))
             comps[key] = {"decides": decides, "left": f"{ln}/{lk}", "right": f"{rn}/{rk}", "compared": count,
@@ -470,7 +494,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     r = sub.add_parser("run", help="send the prompts to one server configuration for K passes")
     r.add_argument("--engine", required=True, choices=("vllm", "sglang"))
-    r.add_argument("--phase", required=True, help="the phase name (vllm_on, vllm_off, sglang)")
+    r.add_argument("--phase", required=True, help="the phase name (vllm_on, vllm_off, sglang, sglang_xb)")
     r.add_argument("--api-base", required=True)
     r.add_argument("--model", required=True)
     r.add_argument("--prompts", required=True)
@@ -482,6 +506,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     w = sub.add_parser("verdict", help="compare the recorded phases and write the verdict")
     w.add_argument("--phases", required=True, help="the directory holding prompts.json and the phase files")
     w.add_argument("--no-sglang", action="store_true", help="SGLang is not in this landing's engines: recorded absent")
+    w.add_argument("--sglang-xb", action="store_true",
+                   help="stage 4 also started SGLang under the extra-buffer scheduler (ADR-0195): read phase sglang_xb")
     w.add_argument("--out", required=True)
     w.set_defaults(func=cmd_verdict)
 

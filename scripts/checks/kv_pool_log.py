@@ -136,6 +136,42 @@ _RULES = {
     ],
 }
 
+# DEC-8 (2026-11-08): the lines a hybrid (Qwen3-Next) start prints beside the
+# pool line, which the driver's geometry check reads (run_campaign
+# realized_pool_check): per engine, (anchor substring, full regex, the
+# record keys of the regex groups in order). Same loud rule as _RULES: an
+# anchor hit whose regex does not match raises. The anchors are chosen so
+# that SGLang's server_args dump never trips them: max_mamba_cache_size=None
+# there carries '=' not ':', and the running-request rule accepts None (the
+# dump) beside a number (the scheduler line) and records only the number.
+# Proven live on the S2R logs of 2026-11-07:
+# vLLM 0.19.1 kv_cache_utils.py:1324 and compilation.py:1323 (the blocks
+# line prints under 512 blocks only, once per rank), SGLang 0.5.10.post1
+# memory_pool and scheduler.
+_EXTRA_RULES = {
+    "vllm": [
+        ("Maximum concurrency for",
+         re.compile(rf"Maximum concurrency for\s*{_NUM}\s*tokens per request:\s*{_NUM}x"),
+         ("max_concurrency_request_tokens", "max_concurrency")),
+        ("blocks available",
+         re.compile(rf"\({_NUM}\s*blocks available\)"), ("blocks",)),
+    ],
+    "sglang": [
+        ("max_mamba_cache_size:",
+         re.compile(rf"max_mamba_cache_size:\s*{_NUM}"), ("max_mamba_cache_size",)),
+        ("max_running_requests=",
+         re.compile(rf"max_running_requests=\s*(None|{_NUM})"), ("max_running_requests",)),
+    ],
+}
+
+
+def _extra_value(key: str, text: str):
+    if text == "None":
+        return None
+    value = _num(text)
+    return value if key == "max_concurrency" else int(value)
+
+
 #: One line each engine prints exactly once per engine start, before any pool
 #: line (ADR-0130 tail rule): a log that holds several starts (the cluster
 #: manager appends every start of a replica to one file; S0 had 2 to 5) is
@@ -161,22 +197,40 @@ def last_start_tail(engine, lines):
 
 
 def parse_engine_log(engine, text):
-    """Parse one engine startup log -> {'engine', 'bytes', 'tokens', 'evidence', 'starts'}.
+    """Parse one engine startup log -> {'engine', 'bytes', 'tokens', 'evidence', 'starts', 'extra'}.
 
     'bytes'/'tokens' are ints or None (channel not present in this log); only
     the lines after the LAST engine-start marker count (last_start_tail), and
     within them the LAST occurrence of a channel wins (a re-profiled pool must
     supersede its predecessor). 'evidence' keeps every matched line verbatim
-    for the run log; 'starts' is the number of start markers in the file."""
+    for the run log; 'starts' is the number of start markers in the file.
+    'extra' holds the values of the hybrid lines of _EXTRA_RULES that the log
+    carries (DEC-8; empty on a dense start) and 'extra_evidence' those lines
+    verbatim, under the same tail and last-wins rules; neither is pool
+    evidence (the concurrency line is not a pool line)."""
     rules = _RULES.get(engine)
     if rules is None:
         raise IsoBytesError(
             f"engine {engine!r} has no KV-pool parser -- add its startup-log "
             f"rules before scoping it into the iso-bytes gate")
     found = {}
+    extra = {}
+    extra_evidence = []
     evidence = []
     lines, starts = last_start_tail(engine, text.splitlines())
     for line in lines:
+        for anchor, pattern, keys in _EXTRA_RULES.get(engine, ()):
+            if anchor in line:
+                m = pattern.search(line)
+                if not m:
+                    raise IsoBytesError(
+                        f"{engine}: corrupted KV-pool line (anchor {anchor!r} "
+                        f"present but the value did not parse): {line.strip()!r}")
+                values = {key: _extra_value(key, group) for key, group in zip(keys, m.groups())}
+                values = {key: v for key, v in values.items() if v is not None}
+                if values:
+                    extra.update(values)
+                    extra_evidence.append(line.strip())
         for anchor, pattern, channel, scale in rules:
             if anchor in line:
                 m = pattern.search(line)
@@ -213,6 +267,8 @@ def parse_engine_log(engine, text):
         "tokens": int(found["tokens"]) if "tokens" in found else None,
         "evidence": evidence,
         "starts": starts,
+        "extra": extra,
+        "extra_evidence": extra_evidence,
     }
 
 
@@ -318,6 +374,8 @@ def capture_record(
             "tokens": reading["tokens"],
             "evidence": reading["evidence"],
             "starts": reading["starts"],
+            "extra": reading["extra"],
+            "extra_evidence": reading["extra_evidence"],
             "captured_utc": now(),
         }
 

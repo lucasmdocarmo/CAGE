@@ -72,6 +72,21 @@
 #                                 stay on, unlike VLLM_ENFORCE_EAGER). A reuse
 #                                 dial and a serving-config field like the rest.
 #
+# Mamba radix-cache probe (ADR-0195, owner decision 2 option 3, 2026-11-08):
+# on a hybrid model SGLang's default MambaRadixCache strategy keeps no state
+# at a branching point, so questions over one shared corpus block reuse
+# nothing after the first; the extra_buffer strategy keeps that state and lets
+# later questions hit. One no-load B3 cell serves it as a mechanism probe:
+#   CAGE_SGLANG_MAMBA_SCHEDULER_STRATEGY  no_buffer | extra_buffer; when set the
+#                                 launch adds `--mamba-scheduler-strategy <v>`;
+#                                 unset = the flag is omitted (engine default).
+#                                 Any other value is refused at the start|restart
+#                                 gate before any server is touched.
+#   CAGE_SGLANG_DISABLE_OVERLAP_SCHEDULE=1  adds `--disable-overlap-schedule`
+#                                 (extra_buffer requires it in the pinned SGLang).
+# Both are reuse dials, memo-key inputs and serving-config fields
+# ("mamba_scheduler_strategy", "disable_overlap_schedule").
+#
 # Readiness (S0F-54, live H100 2026-10-08): /v1/models answers two seconds
 # after uvicorn comes up, while SGLang's startup warm-up generation is still
 # running; the cold-start flush posted in that window was refused (400
@@ -136,6 +151,13 @@ case "${1:-}" in
         # the healthy server it would fail to replace.
         cage_validate_sglang_tp_env \
             || die "invalid tensor-parallel environment (see refusal above) -- not touching any server"
+        # Mamba scheduler refusal gate (ADR-0195): the strategy name is an
+        # exact match against SGLang's two documented values; anything else
+        # refuses here, before any teardown, like the budget and TP gates.
+        case "${CAGE_SGLANG_MAMBA_SCHEDULER_STRATEGY:-}" in
+            ""|no_buffer|extra_buffer) ;;
+            *) die "CAGE_SGLANG_MAMBA_SCHEDULER_STRATEGY='${CAGE_SGLANG_MAMBA_SCHEDULER_STRATEGY}' is not one of no_buffer|extra_buffer -- not touching any server" ;;
+        esac
         # Interpreter gate (item 10; review 2026-09-26 MEDIUM 1): the resolved
         # interpreter must be an executable FILE (a directory passes -x alone)
         # that imports sglang; a missing or half-installed venv, or a PATH
@@ -286,6 +308,20 @@ start_server() {
         else
             [[ "$live_cmd" != *"--disable-piecewise-cuda-graph"* ]] || dials_match=false
         fi
+        # The Mamba scheduler strategy and the overlap schedule (ADR-0195) are
+        # dials too: a probe server must never be reused for a default cell,
+        # nor a default server for the probe. Set => the exact value live;
+        # unset => the flag absent.
+        if [ -n "${CAGE_SGLANG_MAMBA_SCHEDULER_STRATEGY:-}" ]; then
+            [[ " $live_cmd " == *" --mamba-scheduler-strategy ${CAGE_SGLANG_MAMBA_SCHEDULER_STRATEGY} "* ]] || dials_match=false
+        else
+            [[ "$live_cmd" != *"--mamba-scheduler-strategy"* ]] || dials_match=false
+        fi
+        if [ "${CAGE_SGLANG_DISABLE_OVERLAP_SCHEDULE:-0}" = "1" ]; then
+            [[ " $live_cmd " == *" --disable-overlap-schedule "* ]] || dials_match=false
+        else
+            [[ "$live_cmd" != *"--disable-overlap-schedule"* ]] || dials_match=false
+        fi
         # /metrics exposure (S0-23, ADR-0102) is a reuse requirement too: a
         # server started without --enable-metrics (pre-A14, or by hand) has
         # no running-requests gauge, so every window served from it would
@@ -369,8 +405,9 @@ SGLANG_FRACTION_MEMO="$LOG_DIR/fraction_memo.tsv"
 _sglang_memo_key() {
     # Every launch input the realized pool depends on [A: the radix flag is
     # included for safety, not because it is known to move the pool].
-    printf '%s|%s|%s|%s|%s|%s|%s|%s' "$1" "${CAGE_SGLANG_MAX_TOTAL_TOKENS:-}" "${CAGE_SGLANG_TP:-1}" \
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' "$1" "${CAGE_SGLANG_MAX_TOTAL_TOKENS:-}" "${CAGE_SGLANG_TP:-1}" \
         "${SGLANG_KV_CACHE_DTYPE:-auto}" "${VLLM_MAX_MODEL_LEN:-}" "${CAGE_SGLANG_DISABLE_PIECEWISE_CUDA_GRAPH:-0}" \
+        "${CAGE_SGLANG_MAMBA_SCHEDULER_STRATEGY:-}" "${CAGE_SGLANG_DISABLE_OVERLAP_SCHEDULE:-0}" \
         "$2" "$(cage_gpu_total_mib 2>/dev/null || echo unknown)"
 }
 
@@ -529,6 +566,17 @@ _sglang_launch_once() {
         echo "Piecewise CUDA graph OFF: --disable-piecewise-cuda-graph (S0F-35)"
     fi
 
+    # ADR-0195: the Mamba radix-cache probe knobs (see the header). The value
+    # was validated at the start|restart gate; unset omits the flag entirely.
+    if [ -n "${CAGE_SGLANG_MAMBA_SCHEDULER_STRATEGY:-}" ]; then
+        sglang_args+=( --mamba-scheduler-strategy "${CAGE_SGLANG_MAMBA_SCHEDULER_STRATEGY}" )
+        echo "Mamba scheduler strategy: ${CAGE_SGLANG_MAMBA_SCHEDULER_STRATEGY} (ADR-0195)"
+    fi
+    if [ "${CAGE_SGLANG_DISABLE_OVERLAP_SCHEDULE:-0}" = "1" ]; then
+        sglang_args+=( --disable-overlap-schedule )
+        echo "Overlap schedule OFF: --disable-overlap-schedule (ADR-0195)"
+    fi
+
     # Optional server-side KV-cache compression (compressed_cag analogue), e.g.
     #   SGLANG_KV_CACHE_DTYPE=fp8_e4m3 ./scripts/2_serving/manage_sglang_server.sh restart <model>
     # (the campaign serves fp8 as E4M3 on both engines, S0F-88 U8)
@@ -568,6 +616,8 @@ _sglang_launch_once() {
         SC_KV_DTYPE="${SGLANG_KV_CACHE_DTYPE:-auto}" \
         SC_EAGER="${VLLM_ENFORCE_EAGER:-0}" \
         SC_PIECEWISE_OFF="${CAGE_SGLANG_DISABLE_PIECEWISE_CUDA_GRAPH:-0}" \
+        SC_MAMBA_STRATEGY="${CAGE_SGLANG_MAMBA_SCHEDULER_STRATEGY:-}" \
+        SC_OVERLAP_OFF="${CAGE_SGLANG_DISABLE_OVERLAP_SCHEDULE:-0}" \
         SC_ARGS="$SGLANG_PYTHON -m sglang.launch_server ${sglang_args[*]}" \
         SC_FILE="$cfg_file" \
         python3 - <<'PYEOF' || echo "  (serving-config capture failed; non-fatal)"
@@ -606,6 +656,9 @@ cfg = {
     "enforce_eager": os.environ.get("SC_EAGER") == "1",
     # S0F-35: true when the piecewise CUDA-graph capture was switched off.
     "disable_piecewise_cuda_graph": os.environ.get("SC_PIECEWISE_OFF") == "1",
+    # ADR-0195: the Mamba radix-cache probe knobs; null/false on every default cell.
+    "mamba_scheduler_strategy": os.environ.get("SC_MAMBA_STRATEGY") or None,
+    "disable_overlap_schedule": os.environ.get("SC_OVERLAP_OFF") == "1",
     "args": os.environ["SC_ARGS"],
 }
 with open(os.environ["SC_FILE"], "w", encoding="utf-8") as fh:

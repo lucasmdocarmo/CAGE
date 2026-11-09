@@ -332,8 +332,9 @@ def derive_cell_spec(
     ``CAGE_CELL_POLICY`` / ``CAGE_CELL_FAMILY`` / ``CAGE_CELL_TOPOLOGY`` /
     ``CAGE_CELL_BUDGET_R`` / ``CAGE_CELL_RATE_FRAC`` override individual axes
     either way; ``CAGE_CELL_CORPUS_BUDGET`` carries the ADR-0106 B12 rung
-    (absent = no rung coordinate, never a default). ``CellSpec.__post_init__``
-    stays the one validity gate.
+    (absent = no rung coordinate, never a default); ``CAGE_CELL_ENGINE_VARIANT``
+    carries the ADR-0195 engine serving variant (absent = the engine default).
+    ``CellSpec.__post_init__`` stays the one validity gate.
     """
     env = os.environ if env is None else env
     problems: list[str] = []
@@ -383,6 +384,7 @@ def derive_cell_spec(
         env, "CAGE_CELL_CORPUS_BUDGET", problems, minimum=1,
         why="the B12 corpus-trunc rung budget in tokens (ADR-0106)",
     )
+    engine_variant = (env.get("CAGE_CELL_ENGINE_VARIANT") or "").strip() or None
 
     try:
         model_slug = resolve_model_slug(model, env)
@@ -405,6 +407,7 @@ def derive_cell_spec(
             budget_r=budget_r,
             rate_frac=rate_frac,
             corpus_budget_tokens=corpus_budget_tokens,
+            engine_variant=engine_variant,
         )
     except (CellSpecError, ValueError) as exc:
         raise CampaignSessionError(

@@ -205,22 +205,47 @@ class TestOwnOccupancy:
         assert occ.rho_own_time_avg == pytest.approx(0.25)
 
     def test_hybrid_fixed_state_term(self):
-        """qwen3-next-80b holds a 38 MiB recurrent slot PER SEQUENCE on top
-        of its 24_576 B/tok KV — the slot must ride the full in-flight
-        interval: 100 tok * 2 s * 24576 + 2 s * 38 MiB = 84_606_976 B*s."""
+        """qwen3-next-80b holds vLLM's steady recurrent state PER SEQUENCE
+        (40,108,032 B: 3 shared blocks, DEC-8; re-pinned 2026-11-08 from the
+        38 MiB constant) on top of its 24_576 B/tok attention KV at tp 1. The
+        slot must ride the full in-flight interval: 100 tok * 2 s * 24576 +
+        2 s * 40_108_032 = 85_131_264 B*s."""
         mk = MODEL_KV["qwen3-next-80b"]
         rows = [_row("h1", send=0.0, ft=None, end=2.0, prompt=100, num=0)]
         occ = compute_own_occupancy(
             rows,
             model="qwen3-next-80b",
-            budget_bytes=84_606_976,
+            budget_bytes=85_131_264,
             window_start_s=0.0,
             window_end_s=2.0,
         )
-        expected = 200 * mk.kv_bytes_per_token + 2 * mk.fixed_state_bytes_per_seq
+        expected = 200 * mk.kv_bytes_per_token + 2 * 40_108_032
         assert occ.byte_seconds == pytest.approx(expected)
         assert occ.rho_own_time_avg == pytest.approx(0.5)
-        assert occ.fixed_state_bytes_per_seq == 38 * 1024 * 1024
+        assert occ.fixed_state_bytes_per_seq == 40_108_032
+        assert occ.tp == 1
+
+    def test_hybrid_term_at_the_serving_degree(self):
+        """DEC-8: at tp 4 the two KV heads replicate, 49,152 B per token pod
+        wide; the state is 40,108,032 B at every degree."""
+        rows = [_row("h1", send=0.0, ft=None, end=2.0, prompt=100, num=0)]
+        occ = compute_own_occupancy(
+            rows, model="qwen3-next-80b", budget_bytes=90_046_464,
+            window_start_s=0.0, window_end_s=2.0, tp=4,
+        )
+        assert occ.kv_bytes_per_token_effective == 49_152
+        assert occ.byte_seconds == pytest.approx(200 * 49_152 + 2 * 40_108_032)
+        assert occ.rho_own_time_avg == pytest.approx(0.5)
+        assert occ.tp == 4
+        # a dense model is the same at every degree
+        one = compute_own_occupancy(_canonical(), model="qwen3-14b", budget_bytes=BUDGET_42_TOK,
+                                    window_start_s=0.0, window_end_s=4.0)
+        four = compute_own_occupancy(_canonical(), model="qwen3-14b", budget_bytes=BUDGET_42_TOK,
+                                     window_start_s=0.0, window_end_s=4.0, tp=4)
+        assert four.byte_seconds == one.byte_seconds and four.kv_bytes_per_token_effective == KV
+        with pytest.raises(CacheBudgetError, match="tp"):
+            compute_own_occupancy(_canonical(), model="qwen3-14b", budget_bytes=BUDGET_42_TOK,
+                                  window_start_s=0.0, window_end_s=4.0, tp=0)
 
     def test_dropped_by_cap_excluded_and_counted(self):
         """dropped_by_cap is the ONE legal exclusion (never sent -> zero

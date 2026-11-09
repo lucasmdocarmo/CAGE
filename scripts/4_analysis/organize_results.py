@@ -260,9 +260,13 @@ def parse_row_key_dir(name: str) -> CellSpec:
     budget_r: float | None = None
     rate_frac: float | None = None
     corpus_budget_tokens: int | None = None
+    engine_variant: str | None = None
     for coord in parts[7:]:
         try:
-            if coord.startswith("lam"):
+            if coord.startswith("variant="):
+                # ADR-0195: the engine serving variant (the SGLang extra-buffer probe).
+                engine_variant = coord[len("variant="):]
+            elif coord.startswith("lam"):
                 rate_frac = float(coord[3:])
             elif coord.startswith("cb"):
                 # ADR-0106: the B12 corpus rung (an integer token budget).
@@ -272,7 +276,7 @@ def parse_row_key_dir(name: str) -> CellSpec:
             else:
                 raise OrganizeError(
                     f"row key {name!r}: unrecognized coord segment {coord!r} "
-                    "(expected 'r<float>', 'lam<float>' or 'cb<int>')"
+                    "(expected 'r<float>', 'lam<float>', 'cb<int>' or 'variant=<name>')"
                 )
         except ValueError as exc:
             raise OrganizeError(
@@ -284,6 +288,7 @@ def parse_row_key_dir(name: str) -> CellSpec:
             budget_r=budget_r,
             rate_frac=rate_frac,
             corpus_budget_tokens=corpus_budget_tokens,
+            engine_variant=engine_variant,
         )
     except (CellSpecError, ValueError) as exc:
         raise OrganizeError(f"row key {name!r} is not a valid CellSpec: {exc}") from exc
@@ -676,6 +681,9 @@ INDEX_COLUMNS: tuple[str, ...] = (
     "window_dir",
     "cell_json",
     "artifacts",
+    # ADR-0195: the engine serving variant (row-key segment variant=<name>);
+    # "" on every default row, so a reader that groups by engine can key on it.
+    "engine_variant",
 )
 
 
@@ -706,6 +714,7 @@ def build_index(manifest: Mapping[str, Any], records: list[WindowRecord]) -> pd.
                 "window_dir": rec.window_dir,
                 "cell_json": rec.cell_json,
                 "artifacts": _ARTIFACT_SEP.join(rec.artifacts),
+                "engine_variant": spec.engine_variant or "",
             }
         )
     df = pd.DataFrame(rows, columns=list(INDEX_COLUMNS))

@@ -1728,7 +1728,8 @@ def test_index_missing_required_column_refuses(
 ) -> None:
     # The four columns added to _INDEX_REQUIRED_COLUMNS (task #128): the
     # matchers group on budget_r/rate_frac; cell_json/artifacts complete the
-    # 20-column INDEX_COLUMNS contract. A truncated index refuses, named.
+    # 20 required columns of the INDEX_COLUMNS contract (21 with the ADR-0195
+    # engine_variant, which load_index supplies). A truncated index refuses, named.
     index_path = organized_run / "index" / "cells_index.csv"
     index = pd.read_csv(index_path)
     index.drop(columns=[column]).to_csv(index_path, index=False)

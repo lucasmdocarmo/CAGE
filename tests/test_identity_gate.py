@@ -402,7 +402,9 @@ def test_verdict_pass_when_both_deciding_comparisons_are_identical(tmp_path, fak
     assert v["request"] == REQUEST
     assert v["phases"] == {"vllm_on": {"engine": "vllm", "passes": 2, "engine_version": "0.19.1"},
                            "vllm_off": {"engine": "vllm", "passes": 1, "engine_version": "0.19.1"},
-                           "sglang": {"engine": "sglang", "passes": 2, "engine_version": "0.5.10.post1"}}
+                           "sglang": {"engine": "sglang", "passes": 2, "engine_version": "0.5.10.post1"},
+                           # ADR-0195: the extra-buffer probe phase is recorded absent unless --sglang-xb asks for it
+                           "sglang_xb": "absent"}
     n = [len(p["token_ids"]) for p in pdoc["prompts"]]
     assert n[0] < 1057 <= n[1], "the fixture renders q2 under two quanta and q1 past them"
     warm = sorted(_warm(2, [0] * k) for k in n)
@@ -414,6 +416,8 @@ def test_verdict_pass_when_both_deciding_comparisons_are_identical(tmp_path, fak
         "vllm_off_cached_tokens_max": 0,
         "sglang_pass1_hits": 0,
         "sglang_pass2_cached_tokens": {"min": min(n) - 7, "median": (n[0] + n[1]) / 2 - 7, "max": max(n) - 7},
+        # ADR-0195: the probe phase's telemetry holds None when the phase was not started
+        "sglang_xb_pass1_hits": None, "sglang_xb_pass2_cached_tokens": None,
     }
     assert v["limitations"] == [
         "the 528-token warm floor is not applied to 1 of 2 prompts under 1057 tokens (one aligned quantum may exceed "

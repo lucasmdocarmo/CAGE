@@ -61,7 +61,10 @@ if str(REPO_ROOT) not in sys.path:
 from src.orchestration.cache_budget import (  # noqa: E402
     KV_DTYPE_FACTOR,
     MODEL_KV,
+    attention_bytes_per_token_per_rank,
     demand_bytes,
+    fixed_state_bytes_per_seq,
+    pod_attention_bytes_per_token,
 )
 from src.orchestration.load_generator import (  # noqa: E402
     D6_RATE_FRACTIONS,
@@ -160,6 +163,7 @@ def build_floor_table(
     grid: str,
     service_time_s: float,
     out: Optional[str] = None,
+    tp: int = 1,
 ) -> Dict[str, Any]:
     """Build the floor-table-v1 dict for ONE model×engine cell family.
 
@@ -197,21 +201,28 @@ def build_floor_table(
     concurrency = _require_int_ge1("concurrency_target", concurrency_target)
     seq_tokens = _require_int_ge1("avg_seq_tokens", avg_seq_tokens)
     service_s = _require_positive_finite("service_time_s", service_time_s)
+    tp = _require_int_ge1("tp", tp)
 
     mk = MODEL_KV[model]
     dtype_factor = KV_DTYPE_FACTOR[kv_dtype]
-    # Same flooring as cache_budget.plan_budget — the floor table and the
-    # budget planner must agree byte-for-byte or gate (j) chases ghosts.
-    eff_kv_per_token = math.floor(mk.kv_bytes_per_token * dtype_factor)
-    # Hybrid recurrent-state slots are per-sequence and NOT dtype-scaled
-    # (model-internal state, not KV) — mirrors demand_bytes exactly.
-    per_seq_bytes = seq_tokens * eff_kv_per_token + mk.fixed_state_bytes_per_seq
+    # The planner's own per-token figure (cache_budget): the table and the
+    # budget planner must agree byte-for-byte or gate (j) chases ghosts. On a
+    # dense model it is floor(kv x dtype factor) at every degree; on a hybrid
+    # model it is the pod-wide attention cost at the serving degree (DEC-8:
+    # the KV heads replicate when the ranks outnumber them).
+    eff_kv_per_token = pod_attention_bytes_per_token(model, tp, kv_dtype)
+    # Hybrid recurrent state is per running request, NOT dtype-scaled
+    # (model-internal state, not KV): vLLM's steady cost at the degree,
+    # mirroring demand_bytes exactly; 0 on a dense model.
+    fixed_state = fixed_state_bytes_per_seq(model, tp)
+    per_seq_bytes = seq_tokens * eff_kv_per_token + fixed_state
 
     demand = demand_bytes(
         model,
         concurrency=concurrency,
         avg_seq_tokens=seq_tokens,
         kv_dtype=kv_dtype,
+        tp=tp,
     )
 
     rows: List[Dict[str, Any]] = []
@@ -269,12 +280,22 @@ def build_floor_table(
             "kv_dtype": kv_dtype,
             "grid": grid,
             "service_time_s": service_s,
+            # DEC-8: the serving degree D was sized at; the plan refuses a
+            # hybrid table at another degree than the session registers.
+            "tp": tp,
             "out": out,
         },
         "provenance": {
             "kv_formula": mk.formula,
             "kv_bytes_per_token": mk.kv_bytes_per_token,
-            "fixed_state_bytes_per_seq": mk.fixed_state_bytes_per_seq,
+            "attention_bytes_per_token_pod": eff_kv_per_token,
+            "attention_bytes_per_token_per_rank": attention_bytes_per_token_per_rank(model, tp, kv_dtype),
+            "fixed_state_bytes_per_seq": fixed_state,
+            "fixed_state_basis": (
+                "vLLM steady state: one shared block per recurrent-state group per running "
+                "request at the serving degree (cache_budget.state_bytes_per_request, DEC-8); "
+                "0 on a dense model"
+            ),
             "kv_dtype_factor": dtype_factor,
             "service_time_basis": "operator-estimate [pre-calibration]",
             "rate_fractions_source": (
@@ -326,6 +347,11 @@ def _main(argv: Optional[List[str]] = None) -> int:
     )
     p.add_argument("--out", required=True, help="JSON artifact path")
     p.add_argument(
+        "--tp", type=int, default=1,
+        help="the serving tensor-parallel degree D is sized at (DEC-8: a hybrid model's "
+        "per-token cost depends on it; the plan refuses a hybrid table at another degree)",
+    )
+    p.add_argument(
         "--force",
         action="store_true",
         help="overwrite an existing artifact (a rewritten prediction is a "
@@ -354,6 +380,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
             grid=a.grid,
             service_time_s=a.service_time_s,
             out=str(out_path),
+            tp=a.tp,
         )
     except FloorTableError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)

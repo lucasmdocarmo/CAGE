@@ -144,7 +144,15 @@ class Landing:
         for col in ("budget_r", "rate_frac"):
             cells[col] = pd.to_numeric(cells[col].replace("", np.nan), errors="coerce")
         cells["window_name"] = cells["window_dir"].map(lambda s: Path(s).name)
-        self.cells = cells
+        # ADR-0195 amendment 1: a serving-variant probe (row-key segment
+        # variant=<name>) is its own row, read by row key; the figure block
+        # compares engines under their default serving, so the probe is set
+        # aside here, once, and counted, never pooled into an engine's bars.
+        if "engine_variant" not in cells.columns:
+            cells["engine_variant"] = ""  # an index organized before ADR-0195
+        self.cells_all = cells
+        self.cells = cells[cells["engine_variant"] == ""].reset_index(drop=True)
+        self.probe_windows = int(len(cells) - len(self.cells))
         pred_dirs = sorted(p for p in (run_root / "predicate").glob("*") if p.is_dir())
         if scoring_run_id is None:
             if len(pred_dirs) != 1:
@@ -158,6 +166,7 @@ class Landing:
         self._yield_csv = yield_table
         self._yield: Optional[pd.DataFrame] = None
         self.yield_unmatched = 0
+        self.yield_probe_rows = 0
         self.grounding_seen = False
         self._rows: Dict[str, pd.DataFrame] = {}
 
@@ -220,15 +229,20 @@ class Landing:
             # S0F-104: the table carries the row key's rung and rate as strings;
             # the cell index supplies the numeric coordinates, so the string
             # columns are dropped before the merge (pandas suffixed both and
-            # plot01 raised KeyError 'rate_frac').
-            y = y.drop(columns=[c for c in ("rung", "rate_frac") if c in y.columns])
-            y = y.merge(self.cells[["row_key", "window_name", "baseline", "budget_r", "rate_frac"]],
+            # plot01 raised KeyError 'rate_frac'). The index's engine_variant
+            # (ADR-0195) is the keyed copy for the same reason.
+            y = y.drop(columns=[c for c in ("rung", "rate_frac", "engine_variant") if c in y.columns])
+            y = y.merge(self.cells_all[["row_key", "window_name", "baseline", "budget_r", "rate_frac", "engine_variant"]],
                         left_on=["row_key", "window_dir"], right_on=["row_key", "window_name"], how="left")
             # review LOW 13: a table row the index does not know is counted, never
             # silently dropped by the plots' groupbys
             unmatched = y["baseline"].isna()
             self.yield_unmatched = int(unmatched.sum())
             y = y[~unmatched].copy()
+            # ADR-0195 amendment 1: the probe's rows are counted and set aside
+            probe = y["engine_variant"] != ""
+            self.yield_probe_rows = int(probe.sum())
+            y = y[~probe].copy()
             for col in ("n_issued", "n_timely", "n_yield"):
                 y[col] = pd.to_numeric(y[col], errors="coerce")
             y["strategy"] = [blabel(str(b), str(k)) for b, k in zip(y["baseline"], y["row_key"])]
@@ -322,7 +336,7 @@ def plot01_load_curve(L: Landing, out: Path) -> Tuple[str, str]:
     fig.suptitle(f"Load curve: on time vs on time and correct (qasper; {blabel('B1')} and {blabel('B6')}; on time = {L.yield_bar()})" + (
         f"\n{n_loads} load level in this run: points, not curves" if n_loads < 2 else ""), fontsize=8)
     axes[0][-1].legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=7)
-    return _out(fig, out, "p01_load_curve"), f"{len(y)} windows, {n_loads} load level(s); table rows unknown to the index: {L.yield_unmatched}"
+    return _out(fig, out, "p01_load_curve"), f"{len(y)} windows, {n_loads} load level(s); table rows unknown to the index: {L.yield_unmatched}{_probe_note(L)}"
 
 
 def plot02_truth_tax(L: Landing, out: Path) -> Tuple[str, str]:
@@ -348,7 +362,13 @@ def plot02_truth_tax(L: Landing, out: Path) -> Tuple[str, str]:
         ax.set_ylabel(f"{ENGINE_LABEL[engine]}\nshare of requests")
     axes[0][0].legend(fontsize=7, loc="upper right")
     fig.suptitle(f"Truth tax: answers on time but wrong, under real memory pressure (qasper, IN_REGIME windows; bar = {L.yield_bar()})", fontsize=8.5)
-    return _out(fig, out, "p02_truth_tax"), f"{len(y)} IN_REGIME windows; table rows unknown to the index: {L.yield_unmatched}"
+    return _out(fig, out, "p02_truth_tax"), f"{len(y)} IN_REGIME windows; table rows unknown to the index: {L.yield_unmatched}{_probe_note(L)}"
+
+
+def _probe_note(L: Landing) -> str:
+    """ADR-0195 amendment 1 (review LOW 2): the windows the Landing set aside as
+    a serving-variant probe, named where the unmatched count is; "" when none."""
+    return f"; probe windows set aside: {L.probe_windows}" if L.probe_windows else ""
 
 
 #: p03 (redrawn 2026-10-29, owner approval of the Spec Block): the frontier

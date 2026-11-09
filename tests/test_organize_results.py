@@ -709,7 +709,7 @@ def test_provenance_json_and_report_surface_git_sha_and_seed(run_tree: Path) -> 
     report = md_path.read_text(encoding="utf-8")
     assert "git_sha: `deadbeef`" in report
     assert "- seed: 1" in report
-    # INDEX_COLUMNS is a 20-column cross-module contract — provenance must NOT
+    # INDEX_COLUMNS is a 21-column cross-module contract — provenance must NOT
     # have leaked into the index schema.
     df = pd.read_csv(csv_path)
     assert list(df.columns) == list(org.INDEX_COLUMNS)

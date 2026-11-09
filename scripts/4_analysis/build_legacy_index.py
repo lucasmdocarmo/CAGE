@@ -279,6 +279,7 @@ def _spec_index_row(
         "window_dir": window_dir,
         "cell_json": cell_json,
         "artifacts": _ARTIFACT_SEP.join(artifacts),
+        "engine_variant": spec.engine_variant or "",  # ADR-0195; no pilot cell has one
     }
 
 

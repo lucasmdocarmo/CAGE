@@ -145,7 +145,7 @@ RATE_CHECK: Tuple[str, str] = ("0.95", "1.05")
 WINDOW_DESIGN_ADR = "ADR-0172"
 
 ID_COLUMNS: Tuple[str, ...] = (
-    "row_key", "window_dir", "engine", "family", "arm", "rung", "rate_frac", "dataset",
+    "row_key", "window_dir", "engine", "engine_variant", "family", "arm", "rung", "rate_frac", "dataset",
     "regime_label", "stationarity", "ttft_basis", "duration_basis", "baseline_source",
     "slo_ttft_ms", "slo_tpot_ms",
 )
@@ -166,7 +166,10 @@ SLICE_COLUMNS: Tuple[str, ...] = (
     "row_key", "window_dir", "slice_index", "t0_s", "t1_s", "n_issued", "n_timely",
     "goodput_frac", "running_goodput_frac", "note",
 )
-GROUP_KEYS: Tuple[str, ...] = ("engine", "family", "arm", "rung", "dataset")
+#: ADR-0195 amendment 1: the engine serving variant keys the groups too, so
+#: the SGLang extra_buffer probe is its own line (printed as engine+variant)
+#: and never pools with the default window of the same engine.
+GROUP_KEYS: Tuple[str, ...] = ("engine", "engine_variant", "family", "arm", "rung", "dataset")
 #: S0F-99: the plan keys the class target reads (run_campaign_analysis.py
 #: FRONTIER_CLASS_TARGETS_KEY and _FRONTIER_CLASS_CELL_PATH, the E1 rule).
 CLASS_TARGETS_KEY = "class_first_token_targets_s"
@@ -414,9 +417,12 @@ def _row_key_parts(row_key: str) -> Dict[str, str]:
     rate = next((p[3:] for p in parts[7:] if p.startswith("lam")), "")
     # ADR-0106: the B12 corpus cut, cb<tokens> (S0F-99 reads the class by it)
     corpus_budget = next((p[2:] for p in parts[7:] if p.startswith("cb")), "")
+    # ADR-0195: the engine serving variant, variant=<name>, the last segment
+    variant = next((p[len("variant="):] for p in parts[7:] if p.startswith("variant=")), "")
     return {
         "arm": parts[0] if parts else "",
         "engine": parts[4] if len(parts) > 4 else "",
+        "engine_variant": variant,
         "family": parts[6] if len(parts) > 6 else "",
         "rung": rung,
         "rate_frac": rate,
@@ -611,6 +617,7 @@ def evaluate_run(
                     cell = json.load(fh)
                 spec = cell.get("cellspec") or {}
                 rec["engine"] = str(spec.get("engine") or rec["engine"])
+                rec["engine_variant"] = str(spec.get("engine_variant") or rec["engine_variant"])
                 rec["family"] = str(spec.get("family") or rec["family"])
                 rec["arm"] = str(spec.get("arm") or rec["arm"])
                 gpu_count = int(cell.get("gpu_count") or 1)
@@ -757,7 +764,7 @@ def write_outputs(
     for r in rows:
         note = "" if not r["skip_reason"] else ("G only" if r["skip_reason"] == RULER_Y_SKIP else r["skip_reason"][:90])
         lines.append(
-            f"| {r['engine']} | {r['family']} | {r['arm']} | {r['rung']} | {r['rate_frac']} | {r['dataset']} | {r['window_dir']} | "
+            f"| {_engine_label(r['engine'], r.get('engine_variant', ''))} | {r['family']} | {r['arm']} | {r['rung']} | {r['rate_frac']} | {r['dataset']} | {r['window_dir']} | "
             f"{r['regime_label']} | {r['stationarity']} | {r['n_issued']} | {r['n_completed']} | {r['n_timely']} | {r['n_yield']} | "
             f"{_fmt(r['goodput_frac'])} | {_fmt(r['yield_frac'])} | {_fmt(r.get('time_to_breach_s'))} | {note} |"
         )
@@ -774,7 +781,7 @@ def write_outputs(
         ]
         for key, g in df.groupby(list(GROUP_KEYS), sort=True):
             lines.append(
-                f"| {' | '.join(str(k) for k in key)} | {len(g)} | "
+                f"| {' | '.join([_engine_label(key[0], key[1]), *map(str, key[2:])])} | {len(g)} | "
                 f"{_fmt(g['goodput_frac'].median())} | {_fmt(g['yield_frac'].median())} |"
             )
         lines += [
@@ -785,8 +792,8 @@ def write_outputs(
             "|---|---|---|---|",
         ]
         f1 = df[df["family"] == "F1"]
-        for eng, g in f1.groupby("engine", sort=True):
-            lines.append(f"| {eng} | {len(g)} | {_fmt(g['goodput_frac'].median())} | {_fmt(g['yield_frac'].median())} |")
+        for (eng, var), g in f1.groupby(["engine", "engine_variant"], sort=True):
+            lines.append(f"| {_engine_label(eng, var)} | {len(g)} | {_fmt(g['goodput_frac'].median())} | {_fmt(g['yield_frac'].median())} |")
         if f1.empty:
             lines.append("| (no F1 record) | 0 | | |")
     # B18 (ADR-0172 item 6 iii): the lambda* consistency flag per class
@@ -823,6 +830,12 @@ def write_outputs(
     tmp_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
     os.replace(tmp_md, md_path)
     return csv_path, md_path, slices_path
+
+
+def _engine_label(engine: Any, variant: Any) -> str:
+    """The summary's engine label: the engine alone by default, engine+variant
+    for a serving-variant probe (ADR-0195), so default lines never change."""
+    return f"{engine}+{variant}" if variant else str(engine)
 
 
 def _fmt(v: Any) -> str:

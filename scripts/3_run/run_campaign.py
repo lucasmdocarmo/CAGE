@@ -338,8 +338,12 @@ from src.orchestration.cache_budget import (  # noqa: E402
     POOL_TOKEN_TOLERANCE,
     BudgetPlan,
     CacheBudgetError,
+    VLLM_MAMBA_CACHE_MODE_STATE_BLOCKS,
     demand_bytes,
+    fixed_state_bytes_per_seq,
     plan_budget,
+    vllm_hybrid_geometry,
+    vllm_mamba_cache_mode,
 )
 from src.orchestration.calibration import (  # noqa: E402
     FLOOR_N_REQUESTS,
@@ -2045,6 +2049,14 @@ class SessionGrid:
     # (baseline_id, engine, topology) distributed-overlay cells — enumerated,
     # always blocked on the Wave-3 P/D launcher.
     dist_cells: Tuple[Tuple[str, str, str], ...] = ()
+    # ADR-0195 (owner decision 2 option 3, 2026-11-08): (baseline_id, engine,
+    # engine_variant) no-load F1 references served under an engine's non-default
+    # serving mode, one cell each on every f1 dataset, as a mechanism probe
+    # beside the default cell of the same arm. The variant is a relaunch
+    # boundary (ENGINE_VARIANT_LAUNCH_ENV names its launcher knobs) and a row-key
+    # coordinate, so the default rows stay byte-identical. Empty everywhere but
+    # cd-act1, which probes B3 on SGLang with the extra_buffer Mamba scheduler.
+    f1_variant_cells: Tuple[Tuple[str, str, str], ...] = ()
     replications: int = REPLICATIONS
     # Registered BEHAVIOR knobs (reviewable in the plan header — these are
     # design registrations, not measurements, so they live HERE, never as
@@ -2774,7 +2786,12 @@ S2_ONE_POINT_R: float = 0.25
 S2_ONE_POINT_LOAD: Tuple[float, int] = (1.05, 3)
 S2_CORE_ARMS: Tuple[str, ...] = ("B1", "B3", "B4", "B6", "B7")
 S2_ONE_POINT_ARMS: Tuple[str, ...] = ("B2", "B5", "B9", "B10", "B11", "B12")
-#: DEC-2 (b): five whole 528-token align quanta in the served model's tokenizer
+#: DEC-2 (b): the corpus block in the served model's tokenizer. Kept at 2,640 under
+#: DEC-8 (ADR-0194 amendment 1, 2026-11-08): the "five 528-token align quanta"
+#: rationale predates the corrected geometry (272-token blocks at TP 4, 544 at
+#: TP 2), and a re-cut to 2,720 moved the structural reusable prefix by 17 tokens
+#: per corpus request while changing the registered demand classes
+#: (MyDocs/RunPod/S2_R4_MANIFEST_RECUT_PROBE_2026-11-08.md).
 S2_CORPUS_BLOCK_TOKENS: int = 2640
 #: B12 at the 700 rung only (plan section 8, choice 24)
 S2_TRUNC_RUNGS: Tuple[int, ...] = (700,)
@@ -2867,6 +2884,9 @@ SESSION_GRIDS["cd-act1"] = SessionGrid(
     # the five no-load PD references: the #18 shape (the registered
     # dist_budget_r, no rate, the identity class) on the same stack as Z1
     dist_cells=tuple((b, "vllm", "pd") for b in S2_CORE_ARMS),
+    # ADR-0195 (decision 2 option 3): the one extra-buffer probe, B3 on SGLang
+    # at no load, read beside the default B3 reference on the same engine
+    f1_variant_cells=(("B3", "sglang", "extra_buffer"),),
     replications=1,
     corpus_prefix_budget_tokens=S2_CORPUS_BLOCK_TOKENS,
     corpus_trunc_budgets=S2_TRUNC_RUNGS,
@@ -2942,7 +2962,9 @@ def get_session_grid(session: str) -> SessionGrid:
 MAX_MODEL_LEN_POOL_RULE = (
     "every budgeted relaunch's KV pool (budget_plan.budget_tokens_total, each P/D pool "
     "on a pd stack) holds at least one request of the relaunch's request cap (its class "
-    f"cap, {REQUEST_CAP_ADR}); vLLM refuses a smaller pool at engine start (S0 2026-10-08 log)"
+    f"cap, {REQUEST_CAP_ADR}); vLLM refuses a smaller pool at engine start (S0 2026-10-08 log); "
+    "on a hybrid model (DEC-8) the pool holds the blocks vLLM's start check demands: ceil(cap / "
+    "block) attention blocks plus two per recurrent-state group (S2R 2026-11-07 log)"
 )
 
 
@@ -2953,10 +2975,30 @@ def _pool_tokens_of(record: Mapping[str, Any]) -> List[Tuple[str, int]]:
     pools = record.get("pools_bytes")
     if not pools:
         return [("pool", int(record["budget_tokens_total"]))]
+    tokens = record.get("pools_tokens")
+    if tokens:
+        # DEC-8: the planner records each role's token room (on a hybrid plan
+        # it is the block room, not a byte conversion)
+        return [(role, int(t)) for role, t in zip(("prefill", "decode"), tokens)]
     model = str(record["model"])
     kv_dtype = str(record.get("kv_dtype") or "bf16")
     eff = math.floor(MODEL_KV[model].kv_bytes_per_token * KV_DTYPE_FACTOR[kv_dtype])
     return [(role, int(b) // eff) for role, b in zip(("prefill", "decode"), pools)]
+
+
+def _vllm_estimator_mode(step: Mapping[str, Any]) -> str:
+    """The mamba cache mode the step's vLLM start runs in (DEC-8, review
+    2026-11-08 HIGH 1): "none" on a prefix-OFF relaunch, "align" otherwise;
+    a step without the key (the stage 4 validate start) is prefix-ON."""
+    return vllm_mamba_cache_mode(step.get("prefix_mode") != "OFF")
+
+
+def _hybrid_blocks_needed(cap: int, geometry: Mapping[str, Any], mode: str) -> int:
+    """Blocks vLLM's start estimator charges one request of ``cap`` tokens:
+    ceil(cap / block) attention blocks plus the mode's state pages per
+    recurrent group (two in "align", one in "none")."""
+    block = int(geometry["block_tokens"])
+    return -(-cap // block) + VLLM_MAMBA_CACHE_MODE_STATE_BLOCKS[mode] * (int(geometry["n_groups"]) - 1)
 
 
 def pool_shortfalls(
@@ -2973,6 +3015,36 @@ def pool_shortfalls(
         # ADR-0158: the relaunch's own cap (its class); the session cap when absent
         cap = step.get("max_model_len")
         cap = int(max_model_len) if not isinstance(cap, int) or isinstance(cap, bool) else cap
+        geometry = record.get("geometry")
+        if isinstance(geometry, Mapping):
+            # DEC-8: vLLM admits a request of the cap only when the pool holds
+            # ceil(cap / block) attention blocks plus the state pages per
+            # recurrent group of the start's mamba cache mode (its start
+            # estimator); the zero-load room (n - 1) x block can exceed the
+            # cap while the start still refuses, so the block count is the
+            # comparand on a hybrid plan, per role on a pd stack
+            block = int(geometry["block_tokens"])
+            mode = _vllm_estimator_mode(step)
+            need = _hybrid_blocks_needed(cap, geometry, mode)
+            counts = geometry["blocks_per_rank"]
+            counts = list(counts) if isinstance(counts, (list, tuple)) else [counts]
+            for (label, tokens), n in zip(_pool_tokens_of(record), counts):
+                if int(n) < need:
+                    out.append({
+                        "engine": step.get("engine"),
+                        "seq_tokens": (step.get("demand_class") or {}).get("seq_tokens"),
+                        "budget_r": record.get("r") if step.get("budget_r") is None else step.get("budget_r"),
+                        "kv_dtype": record.get("kv_dtype"),
+                        "topology": step.get("topology"),
+                        "pool": label,
+                        "pool_tokens": tokens,
+                        "max_model_len": cap,
+                        "shortfall_tokens": (need - int(n)) * block,
+                        "blocks": int(n),
+                        "blocks_needed": need,
+                        "mamba_cache_mode": mode,
+                    })
+            continue
         for label, tokens in _pool_tokens_of(record):
             if tokens < cap:
                 out.append({
@@ -3139,9 +3211,15 @@ def pd_smoke_env(
         if (step.get("demand_class") or {}).get("seq_tokens") != anchor:
             continue
         pools = record["pools_bytes"]
-        prefill_env, decode_env, _sharded = _pd_role_env_slices(
-            grid.model, role_tp, int(pools[0]), int(pools[1])
-        )
+        rank = record.get("pools_rank_bytes")
+        if rank:
+            # DEC-8: the planner's per-role per-rank bytes (whole vLLM blocks on
+            # a hybrid plan); a record without them keeps the W4.6 slice rule
+            prefill_env, decode_env = int(rank[0]), int(rank[1])
+        else:
+            prefill_env, decode_env, _sharded = _pd_role_env_slices(
+                grid.model, role_tp, int(pools[0]), int(pools[1])
+            )
         env = {
             "CAGE_KV_BUDGET_BYTES_PREFILL": str(prefill_env),
             "CAGE_KV_BUDGET_BYTES_DECODE": str(decode_env),
@@ -3193,13 +3271,15 @@ def _mac_relaunch_records(
     """The Mac-side (stage 0) relaunch records ``mac_pool_shortfalls`` and
     ``pool_ceiling_overruns`` check: no floor table exists yet, so the demand
     is cache_budget.demand_bytes at the profile's FLOOR_CONCURRENCY and the
-    registered anchor shape, exactly what build_floor_table.py writes
-    (demand_bytes(model, concurrency, avg_seq_tokens);
-    build_floor_table.py:210), scaled per class (_class_demand_bytes) and
+    registered anchor shape at the registered serving degree, exactly what
+    build_floor_table.py writes (demand_bytes(model, concurrency,
+    avg_seq_tokens, tp); DEC-8), scaled per class (_class_demand_bytes) and
     planned through plan_budget with each executable config's own r, kv
-    dtype, tp and topology as _relaunch_step does. One record per distinct
-    serving configuration."""
+    dtype, tp and topology as _relaunch_step does (a pd plan at the role
+    degree). One record per distinct serving configuration."""
     anchor = int(grid.demand_seq_tokens[DEMAND_ANCHOR_ARM])
+    serving_tp = int(grid.serving_tp)
+    role_tp = int(grid.dist_pd_role_gpus[0])
     seen: set = set()
     steps: List[Dict[str, Any]] = []
     for cell in cells:
@@ -3211,9 +3291,9 @@ def _mac_relaunch_records(
         seen.add(config)
         spec = cell.spec
         seq_tokens = int(config[4])
-        d_floor = demand_bytes(spec.model, concurrency=int(floor_concurrency), avg_seq_tokens=anchor)
+        d_floor = demand_bytes(spec.model, concurrency=int(floor_concurrency), avg_seq_tokens=anchor, tp=serving_tp)
         d_class = _class_demand_bytes(
-            d_floor, seq_tokens, anchor, _fixed_state_bytes(spec.model, int(floor_concurrency))
+            d_floor, seq_tokens, anchor, _fixed_state_bytes(spec.model, int(floor_concurrency), serving_tp)
         )
         kv_dtype = ARM_KV_DTYPE.get(spec.arm) or "bf16"
         if spec.topology == "tp":
@@ -3230,11 +3310,15 @@ def _mac_relaunch_records(
         plan = plan_budget(
             model=spec.model, engine=spec.engine, r=float(r), demand=d_class,
             kv_dtype=kv_dtype, tp=tp, topology=topology, pd_split=split,
+            role_tp=role_tp if topology == "pd" else None,
         )
         steps.append({
             "engine": spec.engine,
             "budget_r": float(r),
             "topology": spec.topology,
+            # review 2026-11-08 HIGH 1: the start's prefix mode decides vLLM's
+            # per-request charge (config[1] is _prefix_off)
+            "prefix_mode": "OFF" if config[1] else "ON",
             "max_model_len": request_cap_tokens(grid, seq_tokens),
             "demand_class": {"seq_tokens": seq_tokens},
             "budget_plan": json.loads(json.dumps(asdict(plan))),
@@ -3449,10 +3533,16 @@ def preflight_registration_check(
         "largest_pools": largest,
         "largest_helper_pools": largest_helpers,
         "tp_env": tp_env,
+        "serving_tp": serving_tp,  # DEC-8: the degree the pod's floor table is built at
         "gpu_count_needed": gpu_count_needed,
         "identity_gated": bool(grid.identity_gated),
         "pd_cells": pd_cells,
         "pd_env": pd_env,
+        # ADR-0195: an executable SGLang extra-buffer probe cell plans a fourth
+        # identity-gate start at stage 4 (phase sglang_xb) and one relaunch.
+        "sglang_xb_probe": any(
+            c.spec.engine == "sglang" and c.spec.engine_variant == "extra_buffer" for c in executable
+        ),
         "problems": problems,
     }
 
@@ -3604,7 +3694,9 @@ class FloorTable:
     was sized on (``generated_inputs``; None when the artifact predates the
     fields). ADR-0155: the plan refuses a budgeted cell unless
     ``avg_seq_tokens`` equals the registered anchor arm's served tokens, and
-    scales D per demand class from it.
+    scales D per demand class from it. ``tp`` is the serving degree D was
+    sized at (DEC-8; None when the artifact predates the field): a hybrid
+    model's table must carry the session's serving_tp.
     """
 
     path: Path
@@ -3616,6 +3708,7 @@ class FloorTable:
     rows: Dict[float, Dict[str, Any]]
     avg_seq_tokens: Optional[int] = None
     concurrency_target: Optional[int] = None
+    tp: Optional[int] = None
 
     def row(self, r: float) -> Dict[str, Any]:
         for key, row in self.rows.items():
@@ -3684,7 +3777,7 @@ def load_floor_table(path: Path) -> FloorTable:
                 continue
             rows[float(row["r"])] = row
     shape: Dict[str, Optional[int]] = {}
-    for key in ("avg_seq_tokens", "concurrency_target"):
+    for key in ("avg_seq_tokens", "concurrency_target", "tp"):
         value = inputs.get(key)
         if value is None:
             shape[key] = None
@@ -3704,6 +3797,7 @@ def load_floor_table(path: Path) -> FloorTable:
         rows=rows,
         avg_seq_tokens=shape.get("avg_seq_tokens"),
         concurrency_target=shape.get("concurrency_target"),
+        tp=shape.get("tp"),
     )
 
 
@@ -4222,6 +4316,18 @@ def _cell_gpu_count(grid: SessionGrid, spec: CellSpec) -> Optional[int]:
     return grid.serving_tp
 
 
+#: ADR-0195: (engine, engine_variant) -> the launcher env of that serving
+#: variant. SGLang's extra_buffer Mamba scheduler requires the overlap schedule
+#: off in the pinned release (manage_sglang_server.sh header). A grid naming a
+#: pair absent here refuses at enumeration: no silent default-mode duplicate.
+ENGINE_VARIANT_LAUNCH_ENV: Dict[Tuple[str, str], Dict[str, str]] = {
+    ("sglang", "extra_buffer"): {
+        "CAGE_SGLANG_MAMBA_SCHEDULER_STRATEGY": "extra_buffer",
+        "CAGE_SGLANG_DISABLE_OVERLAP_SCHEDULE": "1",
+    },
+}
+
+
 def _launch_blocked_on(spec: CellSpec) -> Optional[str]:
     """Non-null when the arm demands a serving lever this engine's FROZEN
     launcher cannot provide.
@@ -4348,6 +4454,20 @@ def enumerate_cells(grid: SessionGrid) -> List[PlannedCell]:
             for dataset in grid.f1_datasets:
                 for spec in _rung_specs(bid, engine=engine, family="F1"):
                     cells.append(_planned(spec, bid, dataset))
+
+    # ADR-0195: the engine-variant probes, F1 references like the loop above
+    # with the variant as one more coordinate. The launcher knobs are checked
+    # here so an unregistered pair refuses before any cell is planned.
+    for bid, engine, variant in grid.f1_variant_cells:
+        if (engine, variant) not in ENGINE_VARIANT_LAUNCH_ENV:
+            raise PlanError(
+                f"f1_variant_cells names engine variant {variant!r} on {engine!r} but "
+                f"ENGINE_VARIANT_LAUNCH_ENV registers no launcher knobs for it "
+                f"(known: {sorted(ENGINE_VARIANT_LAUNCH_ENV)})"
+            )
+        for dataset in grid.f1_datasets:
+            for spec in _rung_specs(bid, engine=engine, family="F1", engine_variant=variant):
+                cells.append(_planned(spec, bid, dataset))
 
     # F1 HF-oracle reduced slice (§7.3: hf carries family F1 only —
     # CellSpec itself refuses anything else, making the guard structural).
@@ -4578,28 +4698,35 @@ def _class_demand_bytes(
     return ((int(demand_floor) - fixed) * int(seq_tokens)) // int(anchor_tokens) + fixed
 
 
-def _fixed_state_bytes(model: str, concurrency: int) -> int:
-    """F of _class_demand_bytes for ``concurrency`` sequences of ``model``:
-    the second term of cache_budget.demand_bytes (zero on a dense model)."""
-    return int(concurrency) * int(MODEL_KV[model].fixed_state_bytes_per_seq)
+def _fixed_state_bytes(model: str, concurrency: int, tp: int = 1) -> int:
+    """F of _class_demand_bytes for ``concurrency`` sequences of ``model``
+    served at degree ``tp``: the second term of cache_budget.demand_bytes
+    (vLLM's steady recurrent-state cost per request, DEC-8; zero on a dense
+    model)."""
+    return int(concurrency) * fixed_state_bytes_per_seq(model, int(tp))
 
 
 def _floor_fixed_bytes(floor: FloorTable) -> int:
     """F of _class_demand_bytes for a floor table: its concurrency_target
-    times the model's fixed state. A hybrid table that records no
-    concurrency cannot be split into its two parts and is refused (a dense
-    model's table needs none)."""
-    per_seq = int(MODEL_KV[floor.model].fixed_state_bytes_per_seq)
-    if not per_seq:
+    times the model's per-request state at the table's serving degree. A
+    hybrid table that records no concurrency or no degree cannot be split
+    into its two parts and is refused (a dense model's table needs neither)."""
+    if not MODEL_KV[floor.model].hybrid:
         return 0
     if floor.concurrency_target is None:
         raise PlanError(
             f"floor table {floor.path} is for the hybrid model {floor.model!r} but records no "
             "generated_inputs.concurrency_target: the per-class demand scaling needs the fixed-state "
-            f"part F = concurrency x {per_seq} B (S2 block D DEC-D4, ADR-0182); rebuild the table with "
-            "build_floor_table.py"
+            "part F = concurrency x the per-request state (S2 block D DEC-D4, ADR-0182); rebuild the "
+            "table with build_floor_table.py"
         )
-    return _fixed_state_bytes(floor.model, int(floor.concurrency_target))
+    if floor.tp is None:
+        raise PlanError(
+            f"floor table {floor.path} is for the hybrid model {floor.model!r} but records no "
+            "generated_inputs.tp: the per-token cost and the per-request state depend on the serving "
+            "degree (DEC-8); rebuild the table with build_floor_table.py --tp <SERVING_TP>"
+        )
+    return _fixed_state_bytes(floor.model, int(floor.concurrency_target), int(floor.tp))
 
 
 def _check_floor_shape(grid: SessionGrid, floor: FloorTable) -> int:
@@ -4621,6 +4748,13 @@ def _check_floor_shape(grid: SessionGrid, floor: FloorTable) -> int:
             f"({DEMAND_CLASS_ADR}: {grid.demand_seq_tokens_source}); rebuild the table "
             f"with --avg-seq-tokens {anchor} (profile FLOOR_AVG_SEQ_TOKENS) or "
             "re-register the shape"
+        )
+    if MODEL_KV[grid.model].hybrid and floor.tp != int(grid.serving_tp):
+        raise PlanError(
+            f"floor table {floor.path} was built at tp={floor.tp} but session {grid.session!r} "
+            f"registers serving_tp={grid.serving_tp}: on the hybrid {grid.model!r} the demand and "
+            "vLLM's block geometry depend on the degree (DEC-8); rebuild the table with "
+            f"build_floor_table.py --tp {grid.serving_tp}"
         )
     return anchor
 
@@ -4666,6 +4800,9 @@ def _sort_key(cell: PlannedCell, grid: SessionGrid) -> Tuple[Any, ...]:
         _demand_class_key(grid, spec),
         _lever_key(ARM_KV_DTYPE.get(spec.arm)),
         _lever_key(ARM_CONNECTOR.get(spec.arm)),
+        # ADR-0195: the serving variant is a launch lever too; default cells
+        # carry "" so their order is byte-identical to pre-ADR-0195 plans.
+        _lever_key(spec.engine_variant),
         _coord_key(spec.rate_frac),
         spec.family,
         _baseline_num(cell.baseline_id),
@@ -4683,9 +4820,10 @@ def _sort_key(cell: PlannedCell, grid: SessionGrid) -> Tuple[Any, ...]:
 
 
 #: (engine, prefix_off, model, budget_r, demand-class seq_tokens, kv_dtype,
-#: connector, topology)
+#: connector, topology, engine_variant)
 _ServingConfig = Tuple[
-    str, bool, str, Optional[float], Optional[int], Optional[str], Optional[str], str
+    str, bool, str, Optional[float], Optional[int], Optional[str], Optional[str], str,
+    Optional[str],
 ]
 
 
@@ -4701,7 +4839,9 @@ def _serving_config(cell: PlannedCell, grid: SessionGrid) -> Optional[_ServingCo
     one topology's cells against the other's serving stack). ADR-0155: the
     demand class (served sequence tokens) is one too on budgeted configs: the
     byte budget at one r differs per class, so two classes cannot share a
-    server; a budget-free config carries None.
+    server; a budget-free config carries None. ADR-0195: the engine variant is
+    a server dial as well (a different scheduler is a different launch), None
+    on every default cell.
     """
     spec = cell.spec
     if spec.engine == "hf":
@@ -4715,6 +4855,7 @@ def _serving_config(cell: PlannedCell, grid: SessionGrid) -> Optional[_ServingCo
         ARM_KV_DTYPE.get(spec.arm),
         ARM_CONNECTOR.get(spec.arm),
         spec.topology,
+        spec.engine_variant,
     )
 
 
@@ -5063,6 +5204,7 @@ def _pd_budget_env(
             tp=1,
             topology="pd",
             pd_split=grid.dist_pd_split,  # §6.5: explicit, registered, exact-sum
+            role_tp=role_tp,  # DEC-8: the per-role rank slices and the role geometry
         )
     except CacheBudgetError as exc:
         raise PlanError(
@@ -5079,8 +5221,12 @@ def _pd_budget_env(
     # under topology='tp', sourced from its own model table (GQA shards:
     # pool // tp, realized sum checked by gate (j); MLA replicates: per-rank
     # == pool, the replication cost IS registered contrast #20) — never
-    # re-derived here from model arithmetic.
-    prefill_env, decode_env, sharded = _pd_role_env_slices(model, role_tp, prefill_bytes, decode_bytes)
+    # re-derived here from model arithmetic. DEC-8: the planner now records
+    # the slices itself (pools_rank_bytes: the same rule on a dense model,
+    # whole vLLM blocks at the role degree on a hybrid one).
+    assert plan.pools_rank_bytes is not None  # role_tp was given
+    prefill_env, decode_env = plan.pools_rank_bytes
+    sharded = role_tp >= 2 and not MODEL_KV[model].mla_tp_replicated
     env = {
         # The launcher REFUSES to start without both (manage_vllm_pd.sh).
         "CAGE_KV_BUDGET_BYTES_PREFILL": str(prefill_env),
@@ -5116,7 +5262,7 @@ def _relaunch_step(
     floor: FloorTable,
     launcher_cmds: Mapping[str, Sequence[str]],
 ) -> Dict[str, Any]:
-    engine, prefix_off, model, budget_r, seq_tokens, kv_dtype, connector, topology = config
+    engine, prefix_off, model, budget_r, seq_tokens, kv_dtype, connector, topology, engine_variant = config
     anchor_tokens = int(grid.demand_seq_tokens[DEMAND_ANCHOR_ARM])
     demand_class: Optional[Dict[str, Any]] = None
     if topology == "pd":
@@ -5295,6 +5441,10 @@ def _relaunch_step(
     # free F1 relaunches included (they take the session cap): a server
     # launched without it would fall back to the pilot shell default 4096 and
     # refuse every RULER request. A budgeted relaunch takes its CLASS cap.
+    # ADR-0195: the serving variant's launcher knobs (enumeration refused any
+    # pair absent from the table, so the lookup is a driver invariant).
+    if engine_variant is not None:
+        env.update(ENGINE_VARIANT_LAUNCH_ENV[(engine, engine_variant)])
     request_cap = request_cap_tokens(grid, seq_tokens)
     env[MAX_MODEL_LEN_ENV] = str(request_cap)
     # Batch 2 W2: the launcher port, from the ONE table the cells under this
@@ -5313,6 +5463,10 @@ def _relaunch_step(
         "kv_dtype": kv_dtype,
         "connector": connector,
         "topology": topology,
+        # ADR-0195: the serving variant this stack launches under, present only
+        # when set (review 2026-11-08 MEDIUM 1: a default relaunch record keeps
+        # its keys byte-identical; absence stays absence, like the cell record).
+        **({"engine_variant": engine_variant} if engine_variant is not None else {}),
         "tp": launched_tp,  # the T3.1 degree this serving stack launches with
         "pd": None,  # single/tp relaunch: no §6.5 role split
         # ADR-0155: the demand class this budget was sized on (None on a
@@ -5349,6 +5503,9 @@ def _cell_identity_env(spec: CellSpec) -> Dict[str, str]:
     if spec.corpus_budget_tokens is not None:
         # ADR-0106: the B12 rung is an identity coordinate (one row per rung).
         env["CAGE_CELL_CORPUS_BUDGET"] = str(spec.corpus_budget_tokens)
+    if spec.engine_variant is not None:
+        # ADR-0195: the serving variant is an identity coordinate (its own row).
+        env["CAGE_CELL_ENGINE_VARIANT"] = spec.engine_variant
     return env
 
 
@@ -6066,6 +6223,16 @@ def _stale_plan_problems(
                         f"({ENGINE_PORTS_FINDING}: a cell served by a boundary it "
                         "does not dial is mislabeled data)" + stale
                     )
+                # ADR-0195 (review 2026-11-08 LOW 4): the serving variant is a
+                # relaunch boundary too; a cell under a boundary of another
+                # variant is mislabeled data (absent on both sides = the default).
+                if serving.get("engine_variant") != preceding_relaunch.get("engine_variant"):
+                    problems.append(
+                        f"{label}: cell {row!r} serving.engine_variant is "
+                        f"{serving.get('engine_variant')!r} but it runs under a relaunch "
+                        f"with engine_variant {preceding_relaunch.get('engine_variant')!r} "
+                        "(ADR-0195: the serving variant is a relaunch boundary)" + stale
+                    )
                 # Batch 2 W4: the budget record IS the relaunch's.
                 problems.extend(
                     _budget_plan_problems(
@@ -6552,6 +6719,9 @@ def _cell_step(
                 # T3.2: topology is a relaunch-boundary dimension too (pd =
                 # a different process stack than a single server).
                 "topology": spec.topology,
+                # ADR-0195: the serving variant, present only when set (the
+                # default rows keep their record byte-identical).
+                **({"engine_variant": spec.engine_variant} if spec.engine_variant is not None else {}),
             }
         ),
         "offered_rate_rps": offered_rate,
@@ -6780,6 +6950,7 @@ def _session_engines(grid: SessionGrid) -> FrozenSet[str]:
     """Every server engine a grid registers cells on (hf serves no floor)."""
     engines = set(grid.f1_engines) | set(grid.f2_engines) | set(grid.f3_engines)
     engines |= {engine for _bid, engine, _topology in grid.dist_cells}
+    engines |= {engine for _bid, engine, _variant in grid.f1_variant_cells}
     return frozenset(engines - {"hf"})
 
 
@@ -9732,12 +9903,18 @@ def realized_pool_check(step: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     the pd launcher's record (KV_POOL_PD_RECORD_NAME) and sums its roles'
     tokens, since the plan's budget_tokens_total spans both role pools. A
     missing or unreadable record, or a role without a token count, fails the
-    check: an unverified pool is never served."""
+    check: an unverified pool is never served. DEC-8: a plan that carries
+    vLLM's block geometry (a hybrid model) is verified against it by
+    _hybrid_pool_reading, per role on a pd stack, with the step's
+    max_model_len as the request cap; the verdict is exact, not the 0.5
+    percent rule."""
     plan_record = step.get("budget_plan")
     if not isinstance(plan_record, Mapping):
         return None
     topology = str(step.get("topology") or "single")
     planned = int(plan_record["budget_tokens_total"])
+    geometry = plan_record.get("geometry")
+    geometry = dict(geometry) if isinstance(geometry, Mapping) else None
     name = KV_POOL_PD_RECORD_NAME if topology == "pd" else KV_POOL_RECORD_NAME
     path = Path(os.environ.get("CAGE_LOG_ROOT") or REPO_ROOT / "logs") / str(step["engine"]) / name
     out: Dict[str, Any] = {
@@ -9755,29 +9932,136 @@ def realized_pool_check(step: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         "ok": False,
         "reason": None,
     }
+    if geometry is not None:
+        out.update(geometry=geometry, realized_blocks=None, basis=None)
+    reasons: List[str] = []
+    blocks: List[Optional[int]] = []
     try:
         doc = json.loads(path.read_text(encoding="utf-8"))
         if topology == "pd":
             roles = doc["roles"]
             if not isinstance(roles, Mapping) or not roles:
                 raise ValueError("the pd record names no roles")
-            tokens = sum(int(rec["tokens"]) for rec in roles.values())
             sizes = [rec.get("bytes") for rec in roles.values()]
             realized_bytes = sum(int(b) for b in sizes) if all(b is not None for b in sizes) else None
+            if geometry is None:
+                tokens = sum(int(rec["tokens"]) for rec in roles.values())
+            else:
+                counts = geometry["blocks_per_rank"]
+                counts = list(counts) if isinstance(counts, (list, tuple)) else [counts] * len(roles)
+                room = plan_record.get("pools_tokens") or [planned]
+                parts: List[Optional[int]] = []
+                for (role, rec), n_planned, role_room in zip(roles.items(), counts, room):
+                    got, n_obs, reason, extras = _hybrid_pool_reading(
+                        str(step["engine"]), rec, geometry, int(n_planned), int(step["max_model_len"]), int(role_room),
+                        _vllm_estimator_mode(step),
+                    )
+                    parts.append(got)
+                    blocks.append(n_obs)
+                    out[role] = extras
+                    if reason is not None:
+                        reasons.append(f"{role}: {reason}")
+                tokens = sum(parts) if all(t is not None for t in parts) else None
         else:
-            tokens = int(doc["tokens"])
             realized_bytes = doc.get("bytes")
+            if geometry is None:
+                tokens = int(doc["tokens"])
+            else:
+                tokens, n_obs, reason, extras = _hybrid_pool_reading(
+                    str(step["engine"]), doc, geometry, int(geometry["blocks_per_rank"]), int(step["max_model_len"]), planned,
+                    _vllm_estimator_mode(step),
+                )
+                blocks.append(n_obs)
+                out.update(extras)
+                if reason is not None:
+                    reasons.append(reason)
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         out["reason"] = f"no readable pool record ({type(exc).__name__}: {exc})"
         return out
-    gap = (tokens - planned) / planned
-    out.update(realized_tokens=tokens, realized_bytes=realized_bytes, gap=gap, ok=abs(gap) <= POOL_TOKEN_TOLERANCE)
-    if not out["ok"]:
-        out["reason"] = (
-            f"realized {tokens} tokens is {gap:+.3%} from the planned {planned}, "
-            f"outside +/-{POOL_TOKEN_TOLERANCE:.1%}"
-        )
+    if geometry is None:
+        gap = (tokens - planned) / planned
+        out.update(realized_tokens=tokens, realized_bytes=realized_bytes, gap=gap, ok=abs(gap) <= POOL_TOKEN_TOLERANCE)
+        if not out["ok"]:
+            out["reason"] = (
+                f"realized {tokens} tokens is {gap:+.3%} from the planned {planned}, "
+                f"outside +/-{POOL_TOKEN_TOLERANCE:.1%}"
+            )
+        return out
+    block = int(geometry["block_tokens"])
+    out.update(
+        realized_tokens=tokens,
+        realized_bytes=realized_bytes,
+        realized_blocks=blocks if topology == "pd" else blocks[0],
+        gap=None if tokens is None else (tokens - planned) / planned,
+        ok=not reasons,
+        basis=(
+            f"{geometry['blocks_per_rank']} blocks of {block} tokens per rank, one null block: "
+            f"room (n - 1) x {block} per instance (DEC-8)"
+        ),
+    )
+    if reasons:
+        out["reason"] = "; ".join(reasons)
     return out
+
+
+def _hybrid_pool_reading(
+    engine: str, rec: Mapping[str, Any], geometry: Mapping[str, Any], n_planned: int, cap: int, planned_tokens: int,
+    mode: str = "align",
+) -> Tuple[Optional[int], Optional[int], Optional[str], Dict[str, Any]]:
+    """DEC-8: one engine instance's realized hybrid pool from its capture
+    record against the plan. vLLM prints the token line (n // groups) x block
+    and, for the request cap, the concurrency line n / (ceil(cap / block) +
+    the state pages per group of ``mode``: two in "align", one in "none", the
+    prefix-OFF start; review 2026-11-08 HIGH 1) at two decimals; the "blocks
+    available" line prints under 512 blocks only, so the block count is
+    recovered from the concurrency line [V S2R logs 2026-11-07: 396 blocks,
+    26,928 tokens, 5.91x for 16,384]. SGLang's token count is the knob itself
+    and is realized exactly. Returns (realized tokens, realized blocks, reason
+    or None, the figures read)."""
+    block = int(geometry["block_tokens"])
+    n_groups = int(geometry["n_groups"])
+    extra = rec.get("extra") if isinstance(rec.get("extra"), Mapping) else {}
+    tokens = int(rec["tokens"])
+    if engine == "sglang":
+        extras = {k: extra.get(k) for k in ("max_mamba_cache_size", "max_running_requests")}
+        reason = None
+        if tokens != planned_tokens:
+            reason = (
+                f"SGLang allocated {tokens} tokens; the plan's room is exactly {planned_tokens} "
+                "(DEC-8: the token cap is the knob and is realized exact)"
+            )
+        return tokens, None, reason, extras
+    need = _hybrid_blocks_needed(cap, geometry, mode)
+    conc = extra.get("max_concurrency")
+    req = extra.get("max_concurrency_request_tokens")
+    printed = extra.get("blocks")
+    extras = {"log_tokens": tokens, "max_concurrency": conc, "max_concurrency_request_tokens": req, "log_blocks": printed,
+              "mamba_cache_mode": mode, "blocks_needed": need}
+    if isinstance(conc, bool) or not isinstance(conc, (int, float)):
+        return None, None, (
+            "no 'Maximum concurrency' line captured: the block count of a hybrid vLLM pool "
+            "cannot be read without it (DEC-8)"
+        ), extras
+    n_obs = int(round(float(conc) * need))
+    realized = (n_obs - 1) * block
+    if req != cap:
+        return realized, n_obs, f"the concurrency line is for {req} tokens per request; the relaunch caps requests at {cap}", extras
+    want_line = (n_planned // n_groups) * block
+    if tokens != want_line:
+        return realized, n_obs, (
+            f"token line {tokens} != ({n_planned} // {n_groups}) x {block} = {want_line} of the planned {n_planned} blocks"
+        ), extras
+    # review 2026-11-08 LOW 2: vLLM prints "%.2f" [V kv_cache_utils.py:1325];
+    # the same two decimals of the plan's figure, exact (a tolerance of 0.01
+    # admitted a pool one block off at 67k +/- 1 blocks)
+    if f"{float(conc):.2f}" != f"{n_planned / need:.2f}":
+        return realized, n_obs, (
+            f"concurrency line {conc}x != {n_planned} / {need} = {n_planned / need:.2f}x of the planned blocks "
+            f"(mamba cache mode {mode})"
+        ), extras
+    if printed is not None and int(printed) != n_planned:
+        return realized, n_obs, f"blocks line {printed} != the planned {n_planned}", extras
+    return (n_planned - 1) * block, n_planned, None, extras
 
 
 def compression_memo_dir(campaign_root: Path) -> Path:
@@ -12640,11 +12924,28 @@ def _cmd_frontier(args: argparse.Namespace) -> int:
 def _cmd_pool_check(args: argparse.Namespace) -> int:
     """A11 item 4: the stage 4 start at the largest planned pool, checked by
     the relaunch rule (realized_pool_check: tokens, two-sided, 0.5 percent);
-    --tp records the degree the start used (S2 Block B-2)."""
-    out = realized_pool_check({
-        "engine": args.engine, "topology": "single", "tp": args.tp, "budget_r": None,
-        "budget_plan": {"budget_tokens_total": args.planned_tokens, "budget_bytes_total": args.planned_bytes},
-    })
+    --tp records the degree the start used (S2 Block B-2). DEC-8: on a hybrid
+    --model the check is the block geometry at --tp against the request cap
+    --max-model-len (the plan's blocks are the token room's plus the null)."""
+    plan: Dict[str, Any] = {"budget_tokens_total": args.planned_tokens, "budget_bytes_total": args.planned_bytes}
+    # the validate start is a plain prefix-ON start (no --no-prefix-cache), so
+    # a hybrid pool is judged at the "align" charge (review 2026-11-08 HIGH 1)
+    step: Dict[str, Any] = {"engine": args.engine, "topology": "single", "tp": args.tp, "budget_r": None,
+                            "budget_plan": plan, "prefix_mode": "ON"}
+    if args.model is not None:
+        if args.model not in MODEL_KV:
+            print(f"LARGEST_POOL_FAILED engine={args.engine} reason=unknown model {args.model!r} (MODEL_KV)")
+            return 1
+        if MODEL_KV[args.model].hybrid:
+            if args.max_model_len is None:
+                print(f"LARGEST_POOL_FAILED engine={args.engine} reason=the hybrid {args.model!r} needs "
+                      "--max-model-len (the request cap the concurrency line is read against, DEC-8)")
+                return 1
+            geo = vllm_hybrid_geometry(args.model, args.tp)
+            plan["model"] = args.model
+            plan["geometry"] = geo.record(args.planned_tokens // geo.block_tokens + 1)
+            step["max_model_len"] = args.max_model_len
+    out = realized_pool_check(step)
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).write_text(json.dumps(out, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -13143,6 +13444,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_pool.add_argument("--planned-tokens", type=int, required=True)
     p_pool.add_argument("--planned-bytes", type=int, required=True)
     p_pool.add_argument("--tp", type=int, default=1, help="S2 Block B-2: the tensor-parallel degree the start used (recorded)")
+    p_pool.add_argument("--model", default=None, help="DEC-8: the model slug; a hybrid model is checked by its block geometry")
+    p_pool.add_argument("--max-model-len", type=int, default=None, help="DEC-8: the request cap of the start (hybrid models)")
     p_pool.add_argument("--out", default=None)
     p_pool.set_defaults(func=_cmd_pool_check)
     p_front = sub.add_parser(

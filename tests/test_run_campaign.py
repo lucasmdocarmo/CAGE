@@ -73,6 +73,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.analysis.cellspec import CellSpec  # noqa: E402
 from src.orchestration.campaign_session import derive_cell_spec  # noqa: E402
+from src.orchestration.cache_budget import pod_attention_bytes_per_token as _pod_attn_bytes  # noqa: E402
 
 _SCRIPT_PATH = REPO_ROOT / "scripts" / "3_run" / "run_campaign.py"
 
@@ -131,6 +132,9 @@ def _floor_table_doc(
     # fixture default is the 7-level anchor-fine union.
     r_values=(1.5, 1.25, 1.0, 0.75, 0.5, 0.375, 0.25),
     lambda_compute: Optional[float] = None,
+    # DEC-8: the serving degree the table was built at (build_floor_table.py
+    # --tp); the hybrid session's plan refuses a table without it
+    tp: Optional[int] = None,
 ) -> Dict[str, Any]:
     rows = []
     for r in r_values:
@@ -158,6 +162,7 @@ def _floor_table_doc(
             # anchor arm's served tokens (gold-fresh, the 2026-10-08 landing).
             "avg_seq_tokens": _ANCHOR_SEQ_TOKENS,
             "concurrency_target": 32,
+            **({} if tp is None else {"tp": tp}),
         },
         "rows": rows,
     }
@@ -5730,11 +5735,12 @@ _S2_SGLANG_B8_REFERENCE = "retr-store|rerank|none|single|sglang|qwen3-next-80b|F
 _KEEP = object()
 
 
-def _hybrid_class_demand(d_floor: int, seq_tokens: int, anchor: int, concurrency: int, model: str) -> int:
+def _hybrid_class_demand(d_floor: int, seq_tokens: int, anchor: int, concurrency: int, model: str, tp: int = 1) -> int:
     """S2 block D DEC-D4 (ADR-0155 amended): D_class = (D_floor - F) x s // s_anchor + F,
-    F = concurrency x the model's fixed recurrent-state bytes per sequence
-    (zero on a dense model, where the rule is the linear one)."""
-    fixed = concurrency * rc.MODEL_KV[model].fixed_state_bytes_per_seq
+    F = concurrency x the model's per-request recurrent state at the serving
+    degree (DEC-8: vLLM's steady state, 3 shared blocks per rank; zero on a
+    dense model, where the rule is the linear one)."""
+    fixed = concurrency * rc.fixed_state_bytes_per_seq(model, tp)
     return (d_floor - fixed) * seq_tokens // anchor + fixed
 
 
@@ -5748,7 +5754,7 @@ def _s2_plan(session: str, tmp_path: Path, *, anchor: Optional[int] = None, floo
     concurrency (None drops the key)."""
     grid = rc.get_session_grid(session)
     anchor = _S2_ANCHOR_SEQ_TOKENS[session] if anchor is None else anchor
-    doc = _floor_table_doc(model=grid.model, grid="reduced", r_values=(1.0, 0.5, 0.25))
+    doc = _floor_table_doc(model=grid.model, grid="reduced", r_values=(1.0, 0.5, 0.25), tp=int(grid.serving_tp))
     doc["generated_inputs"]["avg_seq_tokens"] = anchor
     if floor_demand_bytes is not None:
         for row in doc["rows"]:
@@ -5939,21 +5945,22 @@ class TestS2RegisterBlockA:
         rows = _s2_rows(plan)
         assert plan["session"] == "cd-act1" and plan["model"] == "qwen3-next-80b"
         # rows: references of the 5 core arms x 2 engines plus B8 on both (12,
-        # both B8 ones blocked since ADR-0193) and the 5 PD references; Y1: 5
+        # both B8 ones blocked since ADR-0193) plus the ADR-0195 SGLang
+        # extra-buffer probe of B3 (1) and the 5 PD references; Y1: 5
         # x 2 x 3 rungs x 2 loads (60); Y2: B8 on vLLM (6, blocked since
         # ADR-0193); Z1: 5 arms x 3 x 2 on the PD stack (30). Windows: one per
         # reference, 2 + 3 per (arm, engine, rung) in every block; blocked
         # rows keep theirs in the count.
-        assert plan["counts"]["cells"] == len(rows) == 12 + 5 + 60 + 6 + 30
-        assert plan["counts"]["windows"] == 17 + (60 + 6 + 30) * 5 // 2 == 257
+        assert plan["counts"]["cells"] == len(rows) == 13 + 5 + 60 + 6 + 30
+        assert plan["counts"]["windows"] == 18 + (60 + 6 + 30) * 5 // 2 == 258
         assert Counter(s.get("block") or ("ref-" + s["family"]) for s in rows) == {
-            "Y1": 60, "Y2": 6, "Z1": 30, "ref-F1": 12, "ref-DIST": 5,
+            "Y1": 60, "Y2": 6, "Z1": 30, "ref-F1": 13, "ref-DIST": 5,
         }
         assert {(s["baseline"], s["family"]) for s in rows if s.get("block") in ("Y1", "Y2")} == {
             ("B1", "F2"), ("B6", "F2"), ("B3", "F3"), ("B4", "F3"), ("B7", "F3"), ("B8", "F3"),
         }
         assert plan["counts"]["by_family"] == {
-            "F1": {"cells": 12, "windows": 12},
+            "F1": {"cells": 13, "windows": 13},   # 12 before the ADR-0195 probe
             "F2": {"cells": 2 * 2 * 6, "windows": 24 * 5 // 2},
             "F3": {"cells": 3 * 2 * 6 + 6, "windows": 42 * 5 // 2},
             "DIST": {"cells": 30 + 5, "windows": 30 * 5 // 2 + 5},
@@ -5962,7 +5969,8 @@ class TestS2RegisterBlockA:
         assert sorted(blocked) == sorted(plan["blocked_row_keys"]) == sorted(_S2_VLLM_B8_ROW_KEYS + (_S2_SGLANG_B8_REFERENCE,))
         assert "connector" in blocked[_S2_SGLANG_B8_REFERENCE] and plan["counts"]["blocked"] == 8
         assert {blocked[k] for k in _S2_VLLM_B8_ROW_KEYS} == {rc.VLLM_HYBRID_STORE_BLOCKED_ON}
-        assert Counter(s["row_class"] for s in rows) == {"window": 96, "secondary": 10, "identity": 5, "primary": 2}
+        # the ADR-0195 probe (B3 on SGLang) is one more secondary row (10 before it)
+        assert Counter(s["row_class"] for s in rows) == {"window": 96, "secondary": 11, "identity": 5, "primary": 2}
         assert sorted(s["row_key"] for s in rows if s["row_class"] == "primary") == [
             "corpus-reuse|none|none|single|vllm|qwen3-next-80b|F1",
             "retr-fresh|rerank|none|single|vllm|qwen3-next-80b|F1",
@@ -5972,7 +5980,9 @@ class TestS2RegisterBlockA:
         assert {s["row_class"]: s["num_queries"] for s in rows if not s["blocked_on"]} == {
             "window": 500, "secondary": 800, "identity": 300, "primary": 2000,
         }
-        assert plan["counts"]["relaunches"] == 54 and plan["counts"]["dry_windows"] == 15   # 58 and 16 before ADR-0193 took the 4 LMCache relaunches and their dry window
+        # 58 and 16 before ADR-0193 took the 4 LMCache relaunches and their dry
+        # window; 54 before the ADR-0195 probe added its one budget-free relaunch
+        assert plan["counts"]["relaunches"] == 55 and plan["counts"]["dry_windows"] == 15
         assert plan["rung_calibration"]["required_rungs"] == {"sglang": [1.0, 0.5, 0.25], "vllm": [1.0, 0.5, 0.25]}
         assert all(s["gpu_count"] == 4 for s in rows)
 
@@ -6012,7 +6022,8 @@ class TestS2RegisterBlockA:
         grid = rc.get_session_grid("cd-act1")
         rel = _relaunches(plan_cd_act1)
         pd = [s for s in rel if s["topology"] == "pd"]
-        assert len(pd) == 20 and len(rel) - len(pd) == 34   # 38 before ADR-0193 took the 4 LMCache relaunches
+        # 38 before ADR-0193 took the 4 LMCache relaunches; 34 before the ADR-0195 probe relaunch
+        assert len(pd) == 20 and len(rel) - len(pd) == 35
         # five classes (one per arm) at the three rungs, plus the five
         # budget-free references on the registered control rung
         assert Counter(s["budget_r"] for s in pd) == {0.25: 5, 0.5: 5, 1.0: 5, None: 5}
@@ -6027,7 +6038,7 @@ class TestS2RegisterBlockA:
             # scaled per class with the hybrid's fixed state unscaled (the
             # fixture's concurrency_target 32); before block D the whole
             # demand was scaled linearly
-            assert cls["demand_bytes"] == _hybrid_class_demand(_ANCHOR_DEMAND, cls["seq_tokens"], 2694, 32, "qwen3-next-80b")
+            assert cls["demand_bytes"] == _hybrid_class_demand(_ANCHOR_DEMAND, cls["seq_tokens"], 2694, 32, "qwen3-next-80b", tp=4)
             bp = s["budget_plan"]
             assert bp["r"] == r and bp["topology"] == "pd" and bp["pd_split"] == 0.5
             assert bp["budget_bytes_total"] == s["budget_bytes"] and abs(s["budget_bytes"] - r * cls["demand_bytes"]) < 1
@@ -6036,9 +6047,16 @@ class TestS2RegisterBlockA:
             assert rec["prefill_bytes"] + rec["decode_bytes"] == s["budget_bytes"]
             assert abs(rec["prefill_bytes"] - rec["decode_bytes"]) <= 1
             assert bp["pools_bytes"] == [rec["prefill_bytes"], rec["decode_bytes"]]
-            # the launcher env carries each role's per-rank slice at role TP 2
-            assert rec["prefill_bytes_per_rank"] == rec["prefill_bytes"] // 2 == int(s["env"]["CAGE_KV_BUDGET_BYTES_PREFILL"])
-            assert rec["decode_bytes_per_rank"] == rec["decode_bytes"] // 2 == int(s["env"]["CAGE_KV_BUDGET_BYTES_DECODE"])
+            # the launcher env carries each role's per-rank bytes at role TP 2.
+            # Re-pinned 2026-11-08 (DEC-8): on the hybrid a role pool is rounded
+            # down to whole vLLM shared blocks, n = (pool // 24,576) // 544 at
+            # TP 2, and the rank gets exactly n x 6,684,672 B (half the pool
+            # before), so the per-rank bytes never exceed the sharded slice
+            geometry = rc.vllm_hybrid_geometry("qwen3-next-80b", 2)
+            for role in ("prefill", "decode"):
+                blocks = (rec[f"{role}_bytes"] // _pod_attn_bytes("qwen3-next-80b", 2)) // geometry.block_tokens
+                assert rec[f"{role}_bytes_per_rank"] == blocks * geometry.shared_block_bytes == int(s["env"][f"CAGE_KV_BUDGET_BYTES_{role.upper()}"])
+                assert rec[f"{role}_bytes_per_rank"] <= rec[f"{role}_bytes"] // 2
             assert s["max_model_len"] == rc.request_cap_tokens(grid, cls["seq_tokens"])
         # a Z1 row and a PD reference of the same arm are distinct boundaries
         # (the reference at the control rung carries no budget_r)
@@ -6194,9 +6212,10 @@ class TestS2RegisterBlockA:
         # the manifest unblocks nothing and blocks nothing: the eight blocked
         # rows (the SGLang B8 reference, the seven vLLM B8 rows of ADR-0193)
         # and the counts stay the same (blocked cells keep their windows in
-        # the count; the 4 LMCache relaunches are gone)
+        # the count; the 4 LMCache relaunches are gone; the ADR-0195 probe
+        # adds one cell, one window and one relaunch)
         assert len(plan["blocked_row_keys"]) == 8 and _S2_SGLANG_B8_REFERENCE in plan["blocked_row_keys"]
-        assert (plan["counts"]["cells"], plan["counts"]["windows"], plan["counts"]["relaunches"]) == (113, 257, 54)
+        assert (plan["counts"]["cells"], plan["counts"]["windows"], plan["counts"]["relaunches"]) == (114, 258, 55)
         assert {s["num_queries"] for s in _s2_rows(plan) if s["row_class"] == "primary"} == {2000}
 
     def test_s2a_refuses_the_pre_s2_qasper_manifest(self, tmp_path):
@@ -6258,10 +6277,11 @@ class TestS2BlockCIdentityGate:
         assert ig["comparisons"]["A"]["identical"] == 200 and ig["deciding"] == ["A", "B"]
         # block A's pins hold as ADR-0193 re-pinned them (the seven vLLM B8
         # rows blocked: 8 blocked rows, their windows still counted, 4
-        # relaunches and 1 dry window fewer, 28 gated rows)
+        # relaunches and 1 dry window fewer, 28 gated rows) plus the ADR-0195
+        # probe (one cell, window and relaunch)
         assert len(plan_cd_act1["blocked_row_keys"]) == 8 and _S2_SGLANG_B8_REFERENCE in plan_cd_act1["blocked_row_keys"]
         c = plan_cd_act1["counts"]
-        assert (c["cells"], c["windows"], c["relaunches"], c["dry_windows"], c["blocked"]) == (113, 257, 54, 15, 8)
+        assert (c["cells"], c["windows"], c["relaunches"], c["dry_windows"], c["blocked"]) == (114, 258, 55, 15, 8)
         assert len(plan_cd_act1["identity_gated_row_keys"]) == 28
         # an ungated session carries no gate block (null, never absent)
         assert "identity_gate" in plan_s2a and plan_s2a["identity_gate"] is None
@@ -6281,10 +6301,11 @@ class TestS2BlockCIdentityGate:
         assert all(s.get("budget_plan") is None for s in _cells(plan) if s["row_key"] in gated)
         assert all(s["blocked_on"] == rc.IDENTITY_GATE_BLOCKED_ON for s in _cells(plan) if s["row_key"] in gated)
         c = plan["counts"]
-        assert (c["cells"], c["windows"], c["blocked"]) == (113, 257, 36)
+        assert (c["cells"], c["windows"], c["blocked"]) == (114, 258, 36)   # 113, 257 before the ADR-0195 probe
         # [D] spec section 8: without the 35 vLLM prefix-on rows the plan keeps
-        # 39 relaunches and 11 dry windows (pinned here, measured by this test)
-        assert (c["relaunches"], c["dry_windows"]) == (39, 11)
+        # 40 relaunches (39 before the ADR-0195 SGLang probe, which the gate does
+        # not exclude) and 11 dry windows (pinned here, measured by this test)
+        assert (c["relaunches"], c["dry_windows"]) == (40, 11)
         assert sorted(plan["blocked_row_keys"]) == sorted(gated + sorted(launch_blocked))
         # no relaunch serves vLLM with the prefix cache ON any more
         assert not any(r["engine"] == "vllm" and r["prefix_mode"] == "ON" for r in _relaunches(plan))
@@ -6341,7 +6362,7 @@ class TestS2BlockCIdentityGate:
 
     def test_the_cli_refuses_a_missing_verdict_with_exit_2_and_writes_nothing(self, tmp_path, capsys):
         grid = rc.get_session_grid("cd-act1")
-        doc = _floor_table_doc(model=grid.model, grid="reduced", r_values=(1.0, 0.5, 0.25))
+        doc = _floor_table_doc(model=grid.model, grid="reduced", r_values=(1.0, 0.5, 0.25), tp=int(grid.serving_tp))
         doc["generated_inputs"]["avg_seq_tokens"] = _S2_ANCHOR_SEQ_TOKENS["cd-act1"]
         floor = tmp_path / "floor.json"
         floor.write_text(json.dumps(doc), encoding="utf-8")
@@ -6432,11 +6453,18 @@ class TestS2BlockDPdStack:
         assert (rec["engine"], rec["budget_r"], rec["seq_tokens"], rec["tp"]) == ("vllm", 1.0, 2694, 2)
         env = rec["env"]
         # the anchor class at r = 1.0 is the floor demand itself (ADR-0155:
-        # ratio 1), split 0.5 exact-sum, per-rank slices at role TP 2
-        d = rc.demand_bytes("qwen3-next-80b", concurrency=50, avg_seq_tokens=2694)
-        assert rec["planned_bytes"] == d == 5_302_681_600
-        assert int(env["CAGE_KV_BUDGET_BYTES_PREFILL"]) == (d // 2) // 2 == 1_325_670_400
-        assert int(env["CAGE_KV_BUDGET_BYTES_DECODE"]) == (d - d // 2) // 2 == 1_325_670_400
+        # ratio 1) at the registered serving degree 4 (DEC-8: 49,152 B per
+        # token pod-wide plus vLLM's steady state; 5,302,681,600 before), split
+        # 0.5 exact-sum. Re-pinned 2026-11-08: each role pool of 4,313,088,000
+        # at role TP 2 is rounded to whole shared blocks, (4,313,088,000 //
+        # 24,576) // 544 = 322 blocks of 6,684,672 B per rank, and the env
+        # carries those exact bytes (1,325,670,400 = a quarter of D before)
+        d = rc.demand_bytes("qwen3-next-80b", concurrency=50, avg_seq_tokens=2694, tp=4)
+        assert rec["planned_bytes"] == d == 8_626_176_000
+        geometry = rc.vllm_hybrid_geometry("qwen3-next-80b", 2)
+        assert (geometry.block_tokens, geometry.shared_block_bytes) == (544, 6_684_672)
+        assert int(env["CAGE_KV_BUDGET_BYTES_PREFILL"]) == 322 * 6_684_672 == 2_152_464_384
+        assert int(env["CAGE_KV_BUDGET_BYTES_DECODE"]) == 322 * 6_684_672 == 2_152_464_384
         assert env["CAGE_TELEMETRY_ENDPOINTS"] == rc.PD_TELEMETRY_ENDPOINTS
         assert env["CAGE_VLLM_TENSOR_PARALLEL"] == "2"
         assert env["CAGE_PD_PREFILL_GPUS"] == "0,1" and env["CAGE_PD_DECODE_GPUS"] == "2,3"
@@ -6454,17 +6482,20 @@ class TestS2BlockDPdStack:
 
     def test_class_demand_carries_the_fixed_state_unscaled(self):
         # ADR-0155 amended (ADR-0182): D_class = (D_floor - F) x s // s_anchor + F,
-        # F = concurrency x fixed_state_bytes_per_seq (the 38 MiB recurrent
-        # slot of Qwen3-Next); the exact demand at the class length is the oracle
-        d_floor = rc.demand_bytes("qwen3-next-80b", concurrency=50, avg_seq_tokens=2694)
-        fixed = 50 * rc.MODEL_KV["qwen3-next-80b"].fixed_state_bytes_per_seq
-        assert (d_floor, fixed) == (5_302_681_600, 1_992_294_400)
-        want = {2694: 5_302_681_600, 2387: 4_925_440_000, 2386: 4_924_211_200, 517: 2_627_584_000, 506: 2_614_067_200}
+        # F = concurrency x the per-request state at the serving degree (DEC-8:
+        # vLLM's steady 3 shared blocks per rank, 40,108,032 B over 4 ranks;
+        # the 38 MiB slot of ADR-0182 before); the exact demand at the class
+        # length is the oracle. Re-pinned 2026-11-08 from the TP 1 table
+        # (5,302,681,600 / 1,992,294,400) to the registered degree 4
+        d_floor = rc.demand_bytes("qwen3-next-80b", concurrency=50, avg_seq_tokens=2694, tp=4)
+        fixed = 50 * rc.fixed_state_bytes_per_seq("qwen3-next-80b", 4)
+        assert (d_floor, fixed) == (8_626_176_000, 2_005_401_600)
+        want = {2694: 8_626_176_000, 2387: 7_871_692_800, 2386: 7_869_235_200, 517: 3_275_980_800, 506: 3_248_947_200}
         for s, exact in want.items():
             got = rc._class_demand_bytes(d_floor, s, 2694, fixed)
-            assert got == exact == rc.demand_bytes("qwen3-next-80b", concurrency=50, avg_seq_tokens=s)
+            assert got == exact == rc.demand_bytes("qwen3-next-80b", concurrency=50, avg_seq_tokens=s, tp=4)
         # the linear rule as coded before block D understated the short classes
-        assert rc._class_demand_bytes(d_floor, 517, 2694) == 1_017_626_721
+        assert rc._class_demand_bytes(d_floor, 517, 2694) == 1_655_431_697
         # a dense model has no fixed part: the linear rule, unchanged
         d14 = rc.demand_bytes("qwen3-14b", concurrency=50, avg_seq_tokens=4779)
         assert rc._class_demand_bytes(d14, 348, 4779, 0) == d14 * 348 // 4779
@@ -6473,26 +6504,28 @@ class TestS2BlockDPdStack:
     def test_the_hybrid_plan_sizes_every_class_on_its_exact_demand(self, tmp_path):
         # a cd-act1 floor table at the hybrid's own D_floor: every budgeted
         # relaunch and cell records the exact demand of its class. Measured
-        # here at concurrency 400: the real c = 50 table refuses in build_plan
-        # on the anchor class at r = 0.25 (each PD role pool holds 26,970
-        # tokens against the 32,768 cap: owner item G10, unchanged by D-4)
+        # here at concurrency 400 (kept from block D, when the real c = 50
+        # table refused on the anchor class at r = 0.25 against the 32,768 cap;
+        # under the 16,384 cap of ADR-0192 and the DEC-8 geometry the c = 50
+        # table holds, see the 2026-11-05 preflight test below)
         c = 400
-        d_floor = rc.demand_bytes("qwen3-next-80b", concurrency=c, avg_seq_tokens=2694)
+        d_floor = rc.demand_bytes("qwen3-next-80b", concurrency=c, avg_seq_tokens=2694, tp=4)
         plan = _s2_plan("cd-act1", tmp_path, floor_demand_bytes=d_floor, floor_concurrency_target=c)
         seen = set()
         for s in _relaunches(plan) + _cells(plan):
             cls = s.get("demand_class")
             if not cls or cls["demand_bytes"] is None:
                 continue
-            assert cls["demand_bytes"] == rc.demand_bytes("qwen3-next-80b", concurrency=c, avg_seq_tokens=cls["seq_tokens"])
+            assert cls["demand_bytes"] == rc.demand_bytes("qwen3-next-80b", concurrency=c, avg_seq_tokens=cls["seq_tokens"], tp=4)
             seen.add(cls["seq_tokens"])
         assert seen == {2694, 2387, 2386, 517, 506}
         # the control rung of a short class now holds that class's whole demand
         short = [s for s in _relaunches(plan) if s["topology"] == "pd" and s["budget_r"] == 1.0
                  and s["demand_class"]["seq_tokens"] == 517]
         assert len(short) == 1
-        assert short[0]["budget_bytes"] == rc.demand_bytes("qwen3-next-80b", concurrency=c, avg_seq_tokens=517)
-        assert short[0]["budget_bytes"] == 21_020_672_000
+        assert short[0]["budget_bytes"] == rc.demand_bytes("qwen3-next-80b", concurrency=c, avg_seq_tokens=517, tp=4)
+        # re-pinned 2026-11-08 (DEC-8, degree 4): 21,020,672,000 at the TP 1 table
+        assert short[0]["budget_bytes"] == 26_207_846_400
 
     def test_a_hybrid_floor_table_without_the_concurrency_is_refused(self, tmp_path):
         with pytest.raises(rc.PlanError, match="concurrency_target"):
@@ -6596,7 +6629,7 @@ class TestS2BlockDPdStack:
 
     def test_the_cli_refuses_a_pd_session_without_the_smoke_verdict(self, tmp_path, capsys):
         grid = rc.get_session_grid("cd-act1")
-        doc = _floor_table_doc(model=grid.model, grid="reduced", r_values=(1.0, 0.5, 0.25))
+        doc = _floor_table_doc(model=grid.model, grid="reduced", r_values=(1.0, 0.5, 0.25), tp=int(grid.serving_tp))
         doc["generated_inputs"]["avg_seq_tokens"] = _S2_ANCHOR_SEQ_TOKENS["cd-act1"]
         floor = tmp_path / "floor.json"
         floor.write_text(json.dumps(doc), encoding="utf-8")
@@ -6701,7 +6734,7 @@ def test_cd_act1_preflight_holds_one_request_in_every_pool_at_the_profile_concur
         charter_datasets=("squad_v2", "musique", "qasper"), floor_concurrency=50, gpu_id="NVIDIA H200",
     )
     assert r["pool_shortfalls"] == [] and r["problems"] == [], r["problems"]
-    assert r["pd_cells"] is True and r["executable_cells"] == 105   # 113 cells, 8 blocked (ADR-0193)
+    assert r["pd_cells"] is True and r["executable_cells"] == 106   # 114 cells, 8 blocked (ADR-0193); 105 before the ADR-0195 probe
     assert plan_cd_act1["serving_shapes"]["max_model_len"] == 16_384
     pd = [s for s in plan_cd_act1["steps"] if s["kind"] == "relaunch" and s["topology"] == "pd"]
     assert pd and all(s["max_model_len"] == rc.request_cap_tokens(grid, (s.get("demand_class") or {}).get("seq_tokens")) for s in pd)
@@ -6737,7 +6770,8 @@ def test_cd_act1_blocks_the_vllm_store_arm_on_the_hybrid(plan_cd_act1, plan_s2a)
     assert "hybrid KV cache manager" in rc.VLLM_HYBRID_STORE_BLOCKED_ON and "0.19.1" in rc.VLLM_HYBRID_STORE_BLOCKED_ON
     assert rows[_S2_SGLANG_B8_REFERENCE]["blocked_on"] == rc.SGLANG_STORE_BLOCKED_ON
     c = plan["counts"]
-    assert (c["cells"], c["blocked"], c["windows"], c["dry_windows"], c["relaunches"]) == (113, 8, 257, 16 - 1, 58 - 4)
+    # the ADR-0195 probe adds one cell, one window and one relaunch to the ADR-0193 pins
+    assert (c["cells"], c["blocked"], c["windows"], c["dry_windows"], c["relaunches"]) == (113 + 1, 8, 257 + 1, 16 - 1, 58 - 4 + 1)
     assert len(plan["identity_gated_row_keys"]) == 35 - 7
     assert not any(k.startswith("retr-store|") for k in plan["identity_gated_row_keys"])
     relaunches = [s for s in plan["steps"] if s["kind"] == "relaunch"]
@@ -6747,7 +6781,8 @@ def test_cd_act1_blocks_the_vllm_store_arm_on_the_hybrid(plan_cd_act1, plan_s2a)
         "cd-act1", floor_avg_seq_tokens="2694", query_manifests={"musique": str(_S2_MUSIQUE_MANIFEST)},
         charter_datasets=("squad_v2", "musique", "qasper"), floor_concurrency=50, gpu_id="NVIDIA H200",
     )
-    assert reg["executable_cells"] == 113 - 8 and reg["needs_lmcache"] is False and reg["lmcache_store_gib"] is None
+    # 114 cells since the ADR-0195 probe (113 before), 8 blocked
+    assert reg["executable_cells"] == 114 - 8 and reg["needs_lmcache"] is False and reg["lmcache_store_gib"] is None
     # the dense 70B session keeps every cell: the rule is model-conditional
     # (s2a's four blocked rows are the B12 rungs waiting for the Qasper manifest, as on HEAD)
     assert plan_s2a["counts"]["blocked"] == 4 and all(k.startswith("corpus-trunc|") for k in plan_s2a["blocked_row_keys"])

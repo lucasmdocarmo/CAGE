@@ -208,7 +208,10 @@ def mechanism_engine_key(row_key: Any) -> str:
     into per-cell fragments; dropping the axes would pool distinct arms —
     the Simpson hazard). The corpus rung is a MECHANISM coordinate (which
     store was served), so it is KEPT: stripping it would pool the two B12
-    rungs into one curve. A key without the 7 canonical axes fails closed.
+    rungs into one curve. So is the ADR-0195 engine variant (``variant=<name>``,
+    the SGLang extra-buffer probe): it is a different cache design on the same
+    engine, so its rows form their own curve. A key without the 7 canonical
+    axes fails closed.
     """
     parts = str(row_key).split("|")
     if len(parts) < 7 or any(not part for part in parts[:7]):
@@ -218,7 +221,9 @@ def mechanism_engine_key(row_key: Any) -> str:
             "§8.12 per-mechanism×engine curve identity cannot be derived "
             "from a non-canonical key (re-run organize_results.py)"
         )
-    kept = parts[:7] + [seg for seg in parts[7:] if seg.startswith("cb")]
+    kept = parts[:7] + [
+        seg for seg in parts[7:] if seg.startswith("cb") or seg.startswith("variant=")
+    ]
     return "|".join(kept)
 
 

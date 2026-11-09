@@ -126,27 +126,62 @@ def test_fp8_dtype_halves_bytes_not_tokens():
     assert rows[1.0]["concurrency_ceiling"] == 9
 
 
+_HYBRID = dict(model="qwen3-next-80b", engine="sglang", concurrency_target=4, avg_seq_tokens=8192,
+               kv_dtype="bf16", grid="reduced", service_time_s=2.0)
+
+
 def test_hybrid_fixed_state_is_charged_per_sequence():
-    # qwen3-next-80b: 24_576 B/token KV + a 38 MiB recurrent slot per seq
-    # (NOT dtype-scaled). The slot must depress the concurrency ceiling.
-    table = ft.build_floor_table(
-        model="qwen3-next-80b",
-        engine="sglang",
-        concurrency_target=4,
-        avg_seq_tokens=8192,
-        kv_dtype="bf16",
-        grid="reduced",
-        service_time_s=2.0,
-    )
+    # qwen3-next-80b at tp 1: 24_576 B/token of attention KV + vLLM's steady
+    # recurrent state per running request, 3 shared blocks of 13,369,344 B =
+    # 40,108,032 B (NOT dtype-scaled). Re-pinned 2026-11-08 (DEC-8): the 38 MiB
+    # constant was replaced by the engine-derived figure. The slot must
+    # depress the concurrency ceiling.
+    table = ft.build_floor_table(**_HYBRID)
     rows = _rows_by_r(table)
-    per_seq = 8192 * 24_576 + 38 * 1024 * 1024  # 241_172_480
+    per_seq = 8192 * 24_576 + 40_108_032  # 241_434_624
     assert all(row["per_seq_bytes"] == per_seq for row in table["rows"])
-    assert rows[1.0]["demand_bytes"] == 964_689_920
+    assert rows[1.0]["demand_bytes"] == 965_738_496
     assert rows[1.0]["concurrency_ceiling"] == 4
-    assert rows[1.0]["kv_token_capacity"] == 39_253
-    assert rows[0.5]["budget_bytes"] == 482_344_960
+    assert rows[1.0]["kv_token_capacity"] == 39_296
+    assert rows[0.5]["budget_bytes"] == 482_869_248
     assert rows[0.5]["concurrency_ceiling"] == 2
     assert rows[0.5]["lambda_kv_rps"] == 1.0
+    assert table["generated_inputs"]["tp"] == 1
+    assert table["provenance"]["fixed_state_bytes_per_seq"] == 40_108_032
+    assert table["provenance"]["attention_bytes_per_token_pod"] == 24_576
+
+
+def test_hybrid_table_at_tp_4_charges_the_replicated_attention():
+    # DEC-8: the two KV heads replicate over four ranks, 49,152 B per token
+    # pod wide; the state stays 40,108,032 B per request at every degree
+    table = ft.build_floor_table(**{**_HYBRID, "tp": 4})
+    rows = _rows_by_r(table)
+    per_seq = 8192 * 49_152 + 40_108_032  # 442_761_216
+    assert all(row["per_seq_bytes"] == per_seq for row in table["rows"])
+    assert rows[1.0]["demand_bytes"] == 1_771_044_864
+    assert rows[1.0]["kv_token_capacity"] == 36_032
+    assert rows[1.0]["concurrency_ceiling"] == 4
+    assert table["generated_inputs"]["tp"] == 4
+    assert table["provenance"]["attention_bytes_per_token_pod"] == 49_152
+    assert table["provenance"]["attention_bytes_per_token_per_rank"] == 12_288
+    assert "DEC-8" in table["provenance"]["fixed_state_basis"]
+    # the S2B profile shape: the anchor demand the driver plans with
+    s2b = ft.build_floor_table(model="qwen3-next-80b", engine="vllm", concurrency_target=50, avg_seq_tokens=2694,
+                               kv_dtype="bf16", grid="reduced", service_time_s=2.0, tp=4)
+    assert _rows_by_r(s2b)[1.0]["demand_bytes"] == 8_626_176_000
+
+
+def test_a_dense_table_is_the_same_at_every_degree():
+    one = ft.build_floor_table(**_ANCHOR)
+    four = ft.build_floor_table(**{**_ANCHOR, "tp": 4})
+    assert four["rows"] == one["rows"]
+    assert one["generated_inputs"]["tp"] == 1 and four["generated_inputs"]["tp"] == 4
+
+
+@pytest.mark.parametrize("tp", [0, -1, 1.5, True])
+def test_a_bad_degree_is_refused(tp):
+    with pytest.raises(ft.FloorTableError, match="tp"):
+        ft.build_floor_table(**{**_ANCHOR, "tp": tp})
 
 
 def test_reduced_grid_levels_and_fractions():
@@ -262,6 +297,7 @@ def test_cli_writes_artifact_and_echoes_inputs(tmp_path, capsys):
         "kv_dtype": "bf16",
         "grid": "full",
         "service_time_s": 8.0,
+        "tp": 1,  # DEC-8 (2026-11-08): the table records the serving degree it was sized at
         "out": str(out),
     }
     assert table["provenance"]["kv_formula"] == "2*40*8*128*2"
@@ -269,6 +305,12 @@ def test_cli_writes_artifact_and_echoes_inputs(tmp_path, capsys):
     assert table["provenance"]["charter_refs"] == ["P6", "6.1", "6.4", "6.8"]
     assert len(table["rows"]) == 5
     assert table["rows"][3]["kv_token_capacity"] == 147_456
+
+
+def test_cli_passes_the_degree_through(tmp_path):
+    out = tmp_path / "floor_table.json"
+    assert ft._main(_cli_argv(out) + ["--tp", "4"]) == 0
+    assert json.loads(out.read_text())["generated_inputs"]["tp"] == 4
 
 
 def test_cli_refuses_overwrite_without_force(tmp_path, capsys):

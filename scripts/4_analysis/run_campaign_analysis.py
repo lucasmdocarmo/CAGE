@@ -564,12 +564,17 @@ PRESSURE_FAMILIES: frozenset[str] = frozenset({"F2", "F3"})
 
 #: One tuple-slot-differs discipline: a cell/reference pair must agree on every
 #: axis the baseline ids do not determine (baseline fixes arm + retriever).
-_PAIR_MATCH_AXES: tuple[str, ...] = ("engine", "model", "topology", "policy")
+#: ADR-0195 amendment 1: the engine serving variant is an axis too, so a
+#: variant probe (SGLang B3 under extra_buffer) is its own reference group and
+#: never pairs with, or makes ambiguous, the default cell of the same engine.
+_PAIR_MATCH_AXES: tuple[str, ...] = ("engine", "engine_variant", "model", "topology", "policy")
 
-#: The FULL organize_results.INDEX_COLUMNS contract (RESULTS_LAYOUT.md, 20
-#: columns): the window-pair selector and the §9.5 equivalence matcher group
-#: on budget_r/rate_frac, and cell_json/artifacts carry the provenance handoff
-#: — a truncated index must refuse, not silently degrade the pairing.
+#: The organize_results.INDEX_COLUMNS contract (RESULTS_LAYOUT.md) less the
+#: ADR-0195 engine_variant column, which load_index supplies as "" when an
+#: older index lacks it: the window-pair selector and the §9.5 equivalence
+#: matcher group on budget_r/rate_frac, and cell_json/artifacts carry the
+#: provenance handoff; a truncated index must refuse, not silently degrade
+#: the pairing.
 _INDEX_REQUIRED_COLUMNS: tuple[str, ...] = (
     "run_id", "campaign", "session", "model", "engine", "arm", "baseline",
     "retriever", "policy", "topology", "family", "dataset", "budget_r",
@@ -712,7 +717,33 @@ def load_index(run_dir: Path) -> pd.DataFrame:
         )
     if index.empty:
         raise AnalysisError(f"{index_path} has no rows — nothing to analyze")
+    index = _with_variant(index)
+    # ADR-0195 amendment 1 (review LOW 1): no serving variant is registered
+    # under pressure, and the truth-tax, frontier, lambda-star and bundle paths
+    # key pressure rows by the bare engine; a variant there is refused by name
+    # rather than pooled with the default rows of its engine.
+    pressured = index[(index["engine_variant"] != "") & index["family"].isin(sorted(PRESSURE_FAMILIES))]
+    if not pressured.empty:
+        rows = sorted(f"{r.row_key} ({r.family})" for r in pressured.itertuples(index=False))
+        raise AnalysisError(
+            f"{index_path}: engine_variant is set on pressure rows {rows}; the pressure "
+            "paths key by the bare engine (ADR-0195 amendment 1 registers the variant "
+            "on no-load F1 cells only), refusing to pool them"
+        )
     return index
+
+
+def _with_variant(frame: pd.DataFrame) -> pd.DataFrame:
+    """``frame`` with the ADR-0195 engine_variant axis present and string-keyed.
+
+    An index organized before ADR-0195 has no column, and read_csv reads the
+    empty default cells of a newer one as NaN; both read as "" here so the
+    pairing axes group the default rows together and the variant rows apart.
+    """
+    out = frame.copy()
+    col = out["engine_variant"] if "engine_variant" in out.columns else pd.Series("", index=out.index)
+    out["engine_variant"] = col.fillna("").astype(str)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -822,7 +853,8 @@ def select_contrast_pairs(index: pd.DataFrame, contrast: Contrast) -> list[Resol
     (engine/model/topology/policy) — the one-tuple-slot-differs discipline.
     """
     assert contrast.baseline_a is not None and contrast.baseline_b is not None
-    f1 = index[index["family"] == "F1"]
+    f1 = _with_variant(index)
+    f1 = f1[f1["family"] == "F1"]
     cells = f1[f1["baseline"] == contrast.baseline_a]
     refs = f1[f1["baseline"] == contrast.baseline_b]
     if cells.empty or refs.empty:
@@ -971,7 +1003,7 @@ def _coord_keyed(frame: pd.DataFrame) -> pd.DataFrame:
     not touch (row_key/dataset); ``dropna=False`` semantics elsewhere are
     unchanged.
     """
-    keyed = frame.copy()
+    keyed = _with_variant(frame)  # ADR-0195: the variant axis, "" when absent
     for axis in _PRESSURE_COORD_AXES:
         normalized: list[str] = []
         for value in keyed[axis]:
@@ -3426,13 +3458,13 @@ def run_gatekeeping(
 
 #: Non-baseline axes a policy-vs-none pressure pair must agree on.
 _POLICY_PAIR_MATCH_AXES: tuple[str, ...] = (
-    "arm", "retriever", "topology", "engine", "model", "family",
+    "arm", "retriever", "topology", "engine", "engine_variant", "model", "family",
     "budget_r", "rate_frac",
 )
 #: Axes for the #13 truncate leg (B11 vs B6): the baseline ids fix arm +
 #: retriever, so those axes are excluded (they differ by construction).
 _TRUNCATE_PAIR_MATCH_AXES: tuple[str, ...] = (
-    "policy", "topology", "engine", "model", "family", "budget_r", "rate_frac",
+    "policy", "topology", "engine", "engine_variant", "model", "family", "budget_r", "rate_frac",
 )
 
 
@@ -6267,6 +6299,25 @@ def _load_workload_manifest_prefixes(
     return str(manifest.get("dataset") or ""), prefixes
 
 
+def _plan_tp(plan: Mapping[str, Any]) -> int:
+    """DEC-8: the degree a cell's own-accounting costs are taken at: the vLLM
+    geometry's tp when the budget plan carries one (a hybrid single instance
+    at serving_tp, a pd role at its role degree), else the plan's tp, else 1
+    (a dense plan written before the field). A degree that is not an integer
+    >= 1 is refused: rho_own would apply the wrong per-token cost."""
+    geometry = plan.get("geometry")
+    value = geometry.get("tp") if isinstance(geometry, Mapping) else None
+    if value is None:
+        value = plan.get("tp")
+    if value is None:
+        return 1
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise OwnAccountingError(
+            f"budget_plan tp={value!r} must be an integer >= 1 (the geometry's tp, else the plan's; DEC-8)"
+        )
+    return value
+
+
 def run_own_accounting_pass(
     run_dir: Path,
     index: pd.DataFrame,
@@ -6364,6 +6415,7 @@ def run_own_accounting_pass(
                     window_start_s=w0,
                     window_end_s=w1,
                     kv_dtype=kv_dtype,
+                    tp=_plan_tp(plan),
                 )
             except (OwnAccountingError, CacheBudgetError) as exc:
                 legs["occupancy"] = str(exc)

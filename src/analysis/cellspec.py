@@ -33,6 +33,16 @@ cell. The rung is the optional identity coordinate ``corpus_budget_tokens``:
 legal only on arm corpus-trunc, it enters ``to_row_key()`` (``cb<tokens>``)
 and ``to_flat_dict()`` only when set, so two rungs never share a row key
 and every other cell's key is byte-identical to pre-ADR-0106 keys.
+
+Engine variant (ADR-0195, owner decision 2026-11-08, the SGLang extra-buffer
+probe): ``engine_variant`` names an engine's non-default serving mode that is
+a relaunch boundary and a mechanism of its own. The one registered value is
+``extra_buffer`` on SGLang (``--mamba-scheduler-strategy extra_buffer``, the
+Mamba radix cache that keeps a state at the branching point). It is legal on
+the engines of ``ENGINE_VARIANTS`` only, enters ``to_row_key()`` LAST as
+``variant=<name>`` and ``to_flat_dict()`` only when set, so the default cells
+of every engine keep their keys byte for byte; absence is the engine default,
+never a value.
 """
 
 from __future__ import annotations
@@ -117,6 +127,8 @@ _ARMS_BY_FAMILY: dict[str, frozenset[str]] = {
     ),
 }
 _LMDEPLOY_MODELS: frozenset[str] = frozenset({"qwen3-14b", "llama-3.3-70b"})
+#: ADR-0195: engine -> the serving variants a cell may carry (one, today).
+ENGINE_VARIANTS: dict[str, frozenset[str]] = {"sglang": frozenset({"extra_buffer"})}
 _PRESSURE_FAMILIES: frozenset[str] = frozenset({"F2", "F3"})
 
 
@@ -134,6 +146,7 @@ class CellSpec:
     budget_r: float | None = None
     rate_frac: float | None = None
     corpus_budget_tokens: int | None = None
+    engine_variant: str | None = None
 
     def __post_init__(self) -> None:
         for name, allowed in _ALLOWED.items():
@@ -215,6 +228,15 @@ class CellSpec:
                     "coordinate is legal on arm corpus-trunc only (ADR-0106: the "
                     "full budget is B3's own cell, never a coordinate)"
                 )
+        variant = self.engine_variant
+        if variant is not None:
+            allowed_variants = ENGINE_VARIANTS.get(self.engine, frozenset())
+            if not isinstance(variant, str) or variant not in allowed_variants:
+                raise InvalidCellSpecError(
+                    f"engine_variant={variant!r} is not a registered variant of engine "
+                    f"{self.engine!r} (ADR-0195: {sorted(allowed_variants) or 'none'}; the engine "
+                    "default is absence, never a value)"
+                )
 
     def to_flat_dict(self) -> dict[str, str | float | int | None]:
         """Flat mapping suitable as CSV columns (optional coords stay None).
@@ -235,6 +257,8 @@ class CellSpec:
         }
         if self.corpus_budget_tokens is not None:
             flat["corpus_budget_tokens"] = self.corpus_budget_tokens
+        if self.engine_variant is not None:
+            flat["engine_variant"] = self.engine_variant
         return flat
 
     @classmethod
@@ -278,7 +302,15 @@ class CellSpec:
                     f"corpus_budget_tokens={rung_raw!r} is not an integral token budget"
                 )
             rung = int(as_float)
-        return cls(**axes, **coords, corpus_budget_tokens=rung)  # type: ignore[arg-type]
+        variant_raw = row.get("engine_variant")
+        variant: str | None
+        if variant_raw is None or variant_raw == "":
+            variant = None
+        elif isinstance(variant_raw, float) and math.isnan(variant_raw):
+            variant = None
+        else:
+            variant = str(variant_raw)
+        return cls(**axes, **coords, corpus_budget_tokens=rung, engine_variant=variant)  # type: ignore[arg-type]
 
     def to_row_key(self) -> str:
         """Canonical results-row key: the 7 axes plus any pressure coords, plus
@@ -298,6 +330,10 @@ class CellSpec:
             parts.append(f"lam{self.rate_frac:g}")
         if self.corpus_budget_tokens is not None:
             parts.append(f"cb{self.corpus_budget_tokens}")
+        if self.engine_variant is not None:
+            # ADR-0195: last, after every coordinate, so the readers that keep
+            # or strip coordinates by prefix see one more named segment.
+            parts.append(f"variant={self.engine_variant}")
         return "|".join(parts)
 
     @classmethod
@@ -313,10 +349,12 @@ class CellSpec:
         budget_r: float | None = None,
         rate_frac: float | None = None,
         corpus_budget_tokens: int | None = None,
+        engine_variant: str | None = None,
     ) -> CellSpec:
         """Instantiate a B1-B12 presentation-layer baseline as a concrete cell.
 
-        ``corpus_budget_tokens`` is the ADR-0106 rung for B12 (one cell per rung).
+        ``corpus_budget_tokens`` is the ADR-0106 rung for B12 (one cell per rung);
+        ``engine_variant`` the ADR-0195 serving variant (absent = the default).
         """
         try:
             base = BASELINES[baseline_id]  # type: ignore[index]
@@ -335,6 +373,7 @@ class CellSpec:
             budget_r=budget_r,
             rate_frac=rate_frac,
             corpus_budget_tokens=corpus_budget_tokens,
+            engine_variant=engine_variant,
         )
 
 

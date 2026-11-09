@@ -62,6 +62,8 @@ from src.orchestration.cache_budget import (
     KV_DTYPE_FACTOR,
     MODEL_KV,
     CacheBudgetError,
+    fixed_state_bytes_per_seq,
+    pod_attention_bytes_per_token,
 )
 
 __all__ = [
@@ -355,6 +357,9 @@ class OwnOccupancyWindow:
     #: G11: error rows with neither an engine usage count nor a prepared length
     n_error_excluded: int
     series: tuple[dict[str, float], ...]
+    #: DEC-8: the serving degree the per-token and per-request costs were
+    #: taken at (a hybrid model's attention replicates past its KV heads)
+    tp: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-ready mapping (series as a list)."""
@@ -371,13 +376,15 @@ def compute_own_occupancy(
     window_start_s: float,
     window_end_s: float,
     kv_dtype: str = "bf16",
+    tp: int = 1,
 ) -> OwnOccupancyWindow:
     """T2.5: own-accounting ρ_KV over [window_start_s, window_end_s).
 
     Reconstructs each request's in-flight interval [actual_send_ts,
     completion_ts) from the recorded requests.jsonl fields and integrates
-    bytes(t) = Σ_in-flight (held tokens at t) × kv_bytes_per_token(model,
-    kv_dtype) + fixed_state_bytes_per_seq (hybrid models) exactly
+    bytes(t) = Σ_in-flight (held tokens at t) × the pod-wide attention bytes
+    per token at the serving degree ``tp`` (cache_budget, DEC-8) +
+    fixed_state_bytes_per_seq(model, tp) (hybrid models) exactly
     (piecewise-linear closed form, no sampling). The token-holding model and
     its documented approximations live in the module docstring: prompt
     tokens held from send onward, completion tokens growing linearly between
@@ -420,16 +427,20 @@ def compute_own_occupancy(
         )
 
     flights, n_dropped, n_error_excluded = _parse_in_flight(requests)
-    # floor() mirrors cache_budget.demand_bytes — the ONE bytes-per-token
-    # arithmetic, applied identically on both sides of the referee.
-    kv_per_token = math.floor(mk.kv_bytes_per_token * factor)
+    # cache_budget.demand_bytes's own two figures (the ONE arithmetic, applied
+    # identically on both sides of the referee): a dense model's floor(kv x
+    # factor) at every degree, a hybrid model's pod-wide attention cost at
+    # ``tp`` and vLLM's steady state per request (DEC-8). ``factor`` was
+    # validated above; the degree is validated by cache_budget.
+    kv_per_token = pod_attention_bytes_per_token(model, tp, kv_dtype)
+    fixed_state = fixed_state_bytes_per_seq(model, tp)
 
     in_flight = [f for f in flights if f.end > w0 and f.send < w1]
 
     byte_seconds = 0.0
     for f in in_flight:
         byte_seconds += _row_token_seconds(f, w0, w1) * kv_per_token
-        byte_seconds += _row_seq_seconds(f, w0, w1) * mk.fixed_state_bytes_per_seq
+        byte_seconds += _row_seq_seconds(f, w0, w1) * fixed_state
 
     # Event breakpoints (clipped) — bytes(t) is linear between them.
     points = {w0, w1}
@@ -445,16 +456,16 @@ def compute_own_occupancy(
         seg_int = 0.0
         for f in in_flight:
             seg_int += _row_token_seconds(f, a, b) * kv_per_token
-            seg_int += _row_seq_seconds(f, a, b) * mk.fixed_state_bytes_per_seq
+            seg_int += _row_seq_seconds(f, a, b) * fixed_state
         n_right = sum(1 for f in in_flight if f.send <= a < f.end)
         n_left = sum(1 for f in in_flight if f.send < b <= f.end)
         bytes_t0 = (
             _tokens_at(in_flight, a, side="right") * kv_per_token
-            + n_right * mk.fixed_state_bytes_per_seq
+            + n_right * fixed_state
         )
         bytes_t1 = (
             _tokens_at(in_flight, b, side="left") * kv_per_token
-            + n_left * mk.fixed_state_bytes_per_seq
+            + n_left * fixed_state
         )
         peak_bytes = max(peak_bytes, bytes_t0, bytes_t1)
         series.append(
@@ -474,8 +485,9 @@ def compute_own_occupancy(
         model=model,
         kv_dtype=kv_dtype,
         kv_bytes_per_token_effective=kv_per_token,
-        fixed_state_bytes_per_seq=mk.fixed_state_bytes_per_seq,
+        fixed_state_bytes_per_seq=fixed_state,
         budget_bytes=budget_bytes,
+        tp=tp,
         window_start_s=w0,
         window_end_s=w1,
         byte_seconds=byte_seconds,
