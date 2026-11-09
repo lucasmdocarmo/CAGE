@@ -109,9 +109,17 @@ from pathlib import Path
 
 api = (sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000").rstrip("/")
 model = sys.argv[2] if len(sys.argv) > 2 else "Qwen/Qwen3-8B"
-# Longer than one vLLM KV block (16 tokens) by a wide margin, so the warm
-# repeat has full blocks to hit.
-PROMPT = ("Cached-token channel probe. " * 24).strip()
+# vLLM hashes only FULL KV blocks and omits usage.prompt_tokens_details when
+# zero tokens were cached (0.19.1: v1/core/kv_cache_utils.py request_block_hasher,
+# entrypoints/openai/chat_completion/serving.py), so the prompt must span whole
+# blocks of the SERVED model. Dense models use 16-token blocks; the hybrid
+# Qwen3-Next gets 272 ("Setting attention block size to 272 tokens to ensure
+# that attention page size is >= mamba page size", S2R 2026-11-09 server log),
+# and the former 24 repeats (128 chat tokens) failed a correct server twice
+# (2026-11-07 23:10, 2026-11-09 20:43). 240 repeats measure 1,200 raw tokens
+# and 1,208 with the chat template on the Qwen3-Next tokenizer: 4 full blocks
+# of 272, 75 of 16 (tests/test_preflight_gates.py pins the lower bound).
+PROMPT = ("Cached-token channel probe. " * 240).strip()
 
 
 def served_prefix_cache_mode():

@@ -465,6 +465,12 @@ pod_env() {
   VOL_ID="$(state get pod.volume_id 2>/dev/null || true)"; VOL_ID="${VOL_ID:-<volume_id>}"
   RUN_ID="$(state get run_id 2>/dev/null || true)"; RUN_ID="${RUN_ID:-<run_id>}"
   PRICE="$(state get pod.price_per_hour_usd 2>/dev/null || true)"
+  # PRICE is the ledger's unit, the per-GPU list price (provision_pod.sh writes securePricePerHr;
+  # pod_status.sh and cost_report.sh multiply by gpu_count). Prints that state the POD's cost use
+  # POD_PRICE = PRICE x GPU_COUNT; the monitor keeps PRICE (it multiplies by gpuCount itself).
+  # S2R 2026-11-09 finding 5: S0 ran one GPU and both adoptions hand-set the pod price, so the
+  # quarter-cost clock and projection on a provision_pod-created multi-GPU pod never showed.
+  POD_PRICE=""; [ -z "$PRICE" ] || POD_PRICE="$(awk -v p="$PRICE" -v g="${GPU_COUNT:-1}" 'BEGIN { printf "%.2f", p * g }')"
   POD_RUN_ROOT="$POD_REPO/results/$CAMPAIGN/$SESSION/$RUN_ID"
   RUN_LOCAL="$LAND/run/$CAMPAIGN/$SESSION/$RUN_ID"
   BACKUP_RUN_REL="results/$CAMPAIGN/$SESSION/$RUN_ID"
@@ -650,9 +656,9 @@ portal_block() {
   [ "$(state status pull 2>/dev/null || echo none)" = "passed" ] && verdict="SAFE NOW (pull verified at stage 12: $RUN_LOCAL)"
   local clock="unknown" created hours
   created="$(state get pod.created_utc 2>/dev/null || true)"
-  if [ -n "$PRICE" ] && [ -n "$created" ]; then
+  if [ -n "$POD_PRICE" ] && [ -n "$created" ]; then
     hours="$("$PY3" -c 'import sys,datetime; c=datetime.datetime.strptime(sys.argv[1],"%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc); print(f"{(datetime.datetime.now(datetime.timezone.utc)-c).total_seconds()/3600:.2f}")' "$created" 2>/dev/null || echo "?")"
-    clock="$("$PY3" -c 'import sys; print(f"${float(sys.argv[1])*float(sys.argv[2]):.2f} ({sys.argv[2]} h at ${sys.argv[1]}/h)")' "$PRICE" "$hours" 2>/dev/null || echo "?")"
+    clock="$("$PY3" -c 'import sys; print(f"${float(sys.argv[1])*float(sys.argv[2]):.2f} ({sys.argv[2]} h at ${sys.argv[1]}/h)")' "$POD_PRICE" "$hours" 2>/dev/null || echo "?")"
   fi
   hr
   printf 'PORTAL ACTION\n'
@@ -1989,7 +1995,7 @@ stage_plan() {
   fi
   # ADR-0190 (review 2026-11-05 MEDIUM 2): the audit runs under the Mac venv python ($PY, as the
   # stage 0 preflight) because it imports the repo's run_projection for the first-segment check
-  run_step 0 "plan argv audit (S0F-26) and run projection (S0F-88 B-5)" -- "$PY" - "$EXTRAS/plan.json" "$HOURS" "${PRICE:-}" "${RUN_CUT_BY_BUDGET:-}" "${RUN_BUDGET_HOURS:-}" "$SCRIPTS/3_run/run_campaign.py" "${RUN_FAIL_FAST:-}" <<'PY' || return 1
+  run_step 0 "plan argv audit (S0F-26) and run projection (S0F-88 B-5)" -- "$PY" - "$EXTRAS/plan.json" "$HOURS" "${POD_PRICE:-}" "${RUN_CUT_BY_BUDGET:-}" "${RUN_BUDGET_HOURS:-}" "$SCRIPTS/3_run/run_campaign.py" "${RUN_FAIL_FAST:-}" <<'PY' || return 1
 import json, sys
 plan = json.load(open(sys.argv[1], encoding="utf-8"))
 hours, price = float(sys.argv[2]), sys.argv[3].strip()
@@ -2574,7 +2580,7 @@ stage_analyze() {
     cp "$RUN_LOCAL/analysis/$stamp/stats.json" "$RUN_LOCAL/analysis/$stamp/summary.md" "$LAND/plots/$stamp/" 2>/dev/null || true
     state put analysis.stamp "$stamp"
   fi
-  run_step 0 "window panels" -- "$PY" "$SCRIPTS/4_analysis/render_window_panels.py" "$RUN_LOCAL" --out "$LAND/plots/panels_$(date -u +%H%M%S)" ${PRICE:+--price-per-hour "$PRICE"} || return 1
+  run_step 0 "window panels" -- "$PY" "$SCRIPTS/4_analysis/render_window_panels.py" "$RUN_LOCAL" --out "$LAND/plots/panels_$(date -u +%H%M%S)" ${POD_PRICE:+--price-per-hour "$POD_PRICE"} || return 1
   run_step 0 "analysis.txt" -- "$PY" "$SCRIPT_DIR/write_analysis.py" --landing "$LAND" --run-root "$RUN_LOCAL" --out "$LAND/plots/analysis.txt" || return 1
   return 0
 }

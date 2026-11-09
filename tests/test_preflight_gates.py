@@ -2124,6 +2124,27 @@ def test_cached_tokens_probe_passes_when_the_warm_repeat_hits(chat_server: str) 
     assert body_a["model"] == "test-model"
 
 
+def test_cached_tokens_probe_prompt_spans_full_hybrid_blocks(chat_server: str) -> None:
+    """The probe prompt spans more than two 272-token KV blocks, the hybrid
+    Qwen3-Next block size on which a shorter prompt failed a correct server
+    (S2R 2026-11-09; the numbers and their provenance sit in the PROMPT comment
+    of the a2 gate in scripts/checks/preflight_check.sh). Words are a lower
+    bound on tokens for this text."""
+    _ChatStub.usages = [
+        {"prompt_tokens": 1208, "completion_tokens": 1},
+        {"prompt_tokens": 1208, "completion_tokens": 1,
+         "prompt_tokens_details": {"cached_tokens": 1088}},
+    ]
+    proc = _run_gate("CAGE-CACHED-TOKENS-PROBE", chat_server, "test-model")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    (_, body_a), _ = _ChatStub.requests
+    prompt = body_a["messages"][0]["content"]
+    words = len(prompt.split())
+    assert words > 2 * 272, (
+        f"probe prompt has {words} words: under two 272-token hybrid blocks, the warm "
+        "repeat cannot carry cached tokens on Qwen3-Next (vLLM caches full blocks only)")
+
+
 def test_cached_tokens_probe_notes_a_block_present_at_zero(chat_server: str) -> None:
     _ChatStub.usages = [
         {"prompt_tokens": 120, "completion_tokens": 1,

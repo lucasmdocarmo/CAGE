@@ -1169,6 +1169,29 @@ def test_the_plan_stage_refuses_a_run_projected_past_hours_and_prices_the_whole_
     assert provision and all("--hours 11.3 " in c for c in provision)
 
 
+def test_pod_level_cost_prints_multiply_the_per_gpu_ledger_price_by_gpu_count(world: Dict[str, Path], tmp_path: Path) -> None:
+    """S2R 2026-11-09 finding 5: the ledger's price_per_hour_usd is the per-GPU list price
+    (provision_pod.sh writes securePricePerHr; pod_status.sh and cost_report.sh multiply by
+    gpu_count), and the master copies it into pod.price_per_hour_usd. Every print that states
+    the POD's cost must multiply by GPU_COUNT: the stage 6 run projection, the panels'
+    --price-per-hour (render_window_panels.py documents it as the pod price), and the PORTAL
+    ACTION cost clock. The monitor keeps the per-GPU price (it multiplies by gpuCount itself).
+    Here the fake ledger prices 3.49 per GPU on a four-GPU profile: the pod is 13.96 USD/h."""
+    _four_gpu_profile(world, tmp_path)
+    proc = _master(world, "--yes", "provision", "--yes", "teardown", CAGE_TEST_TP_ENV="1")
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-1500:]
+    assert _state(world)["pod"]["price_per_hour_usd"] == "3.49"          # the ledger's per-GPU unit, unchanged
+    assert " USD at 13.96 USD/h" in proc.stdout, proc.stdout[-4000:]     # the run projection prices the pod
+    assert "'--price-per-hour', '13.96'" in proc.stdout, proc.stdout[-4000:]   # the panels get the pod price
+    # the monitor keeps the per-GPU PRICE (it multiplies by the pod's gpuCount itself); the real
+    # monitor_pod.sh runs here and logs no call line, so its launch is pinned at the source
+    assert '${PRICE:+--price "$PRICE"}' in MASTER.read_text(encoding="utf-8")
+    # the PORTAL ACTION cost clock after a failure past provision states the pod rate
+    proc = _master(world, "--from", "setup", "--redo", CAGE_TEST_TP_ENV="1", CAGE_TEST_SETUP_WARN="1")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "cost clock: $" in proc.stdout and " h at $13.96/h)" in proc.stdout, proc.stdout[-3000:]
+
+
 def test_the_plan_stage_refuses_a_step_without_a_measured_duration_b5(world: Dict[str, Path]) -> None:
     proc = _master(world, "--yes", "provision", CAGE_TEST_UNMEASURED="1")
     assert proc.returncode == 1
