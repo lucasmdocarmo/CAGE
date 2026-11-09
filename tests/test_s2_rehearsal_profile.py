@@ -22,7 +22,7 @@ LEVERS: Dict[str, str] = {
     "HOURS": "3",                  # the run bound; an admitted segment can outlive the stop (review 2026-11-05 MEDIUM 1, [A])
     "RUN_BUDGET_HOURS": "1.25",    # exit 4 seals the tree with sentinels and passes on a registered profile; 1.25 (owner 2026-11-05) admits the 3,277 s first segment with 1,223 s of spare, not 323
     "RUN_CUT_BY_BUDGET": "1",      # ADR-0190: stage 6 accepts the projection past HOURS; S2B keeps the refusal
-    "SEATBELT": "33h",             # the live stage-bound sum is 1,860 min (31 h); 2 h of margin
+    "SEATBELT": "35h",             # the live stage-bound sum is 1,955 min (32.6 h) since ADR-0196 (pod suite 125 min); 145 min of margin
     "SCORE_BOUND_MIN": "60",       # a one hour tree scores in minutes
     "PULL_MARGIN_MIN": "60",       # a one hour tree pulls in minutes
     "VOLUME_GB": "100",            # the weights live on the container disk; the owner deletes the volume by hand
@@ -80,22 +80,23 @@ def test_s2r_states_every_s2b_key_and_differs_only_on_the_levers() -> None:
 
 def test_s2r_stage_bounds_sum_to_thirty_one_hours_under_the_seatbelt() -> None:
     """The master's live seatbelt need (cage_experiment.sh stage_bound_minutes, lines 222 to 266):
-    readiness 15 + setup + validate (20, the pod suite 30, 25 per server engine, the start check 40,
+    readiness 15 + setup + validate (20, the pod suite POD_SUITE_BOUND_S / 60, 25 per server engine, the start check 40,
     the identity gate and the PD smoke on cd-act1) + calibrate (60 + the rung bound per engine)
     + plan 15 + run + seal 10 + score + collect 30 + pull. The money gate (line 1015) charges that
-    sum at the live H200 secure price per GPU times four plus the $50 floor: $705.96 at the
-    $5.29 read on 2026-11-04 against a $698.73 balance (an $8 top-up or more clears it)."""
+    sum at the live H200 secure price per GPU times four plus the $50 floor: $739.82 at the
+    $5.29 read on 2026-11-04 (ADR-0196 moved the pod suite from 30 to 125 min; $705.96 before)."""
     v = _shipped("S2R.env", "SETUP_BOUND_MIN", "ENGINES", "CALIBRATE", "CALIBRATE_RUNGS_BOUND_S", "HOURS",
                  "SCORE_BOUND_MIN", "PULL_MARGIN_MIN", "SEATBELT", "SUITE_ON_POD", "START_CHECK",
-                 "IDENTITY_GATE_BOUND_S", "PD_SMOKE_BOUND_S", "CLASS_CEILINGS")
+                 "IDENTITY_GATE_BOUND_S", "PD_SMOKE_BOUND_S", "CLASS_CEILINGS", "POD_SUITE_BOUND_S")
     n_srv = len([e for e in v["ENGINES"].split() if e != "hf"])
     n_cal = len(v["CALIBRATE"].split())
-    validate = 20 + (30 if v["SUITE_ON_POD"] == "1" else 0) + 25 * n_srv + (40 if v["START_CHECK"] == "1" else 0) \
+    validate = 20 + (int(v["POD_SUITE_BOUND_S"]) // 60 if v["SUITE_ON_POD"] == "1" else 0) + 25 * n_srv + (40 if v["START_CHECK"] == "1" else 0) \
         + int(v["IDENTITY_GATE_BOUND_S"]) // 60 + int(v["PD_SMOKE_BOUND_S"]) // 60
     calibrate = n_cal * 60 + n_cal * int(v["CALIBRATE_RUNGS_BOUND_S"]) // 60
     plan = 15 + (0 if v["CLASS_CEILINGS"] == "0" else 2 * 600 + 60)
     need = 15 + int(v["SETUP_BOUND_MIN"]) + validate + calibrate + plan + int(v["HOURS"]) * 60 + 10 \
         + int(v["SCORE_BOUND_MIN"]) + 30 + int(v["PULL_MARGIN_MIN"])
-    assert (validate, calibrate, plan, need) == (240, 1200, 15, 1860)
-    assert v["SEATBELT"] == "33h" and 33 * 60 >= need + 120
-    assert round(need / 60 * 4 * 5.29 + 50, 2) == 705.96
+    assert (validate, calibrate, plan, need) == (335, 1200, 15, 1955)
+    assert v["SEATBELT"] == "35h" and 35 * 60 >= need + 120
+    # review 2026-11-08 MEDIUM 1: pod_hours_bound (line 292) rounds the hours to one decimal before pricing
+    assert round(round(need / 60, 1) * 4 * 5.29 + 50, 2) == 739.82

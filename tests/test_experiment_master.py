@@ -1101,9 +1101,10 @@ def test_shipped_profiles_cover_their_stage_bounds_and_name_registered_models() 
         if p.read_text(encoding="utf-8").startswith("# SUPERSEDED"):
             continue  # a kept record (S2.env since block E-1), not a landing profile; the master's preflight refuses it on the anchor shape
         proc = subprocess.run(["bash", "-c", f'set -a; source "{EXPDIR}/profiles/_common.env"; source "{p}"; '
-                               'printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" "$MODEL_SLUG" "$SEATBELT" "$HOURS" "$SETUP_BOUND_MIN" "$ENGINES" "$CALIBRATE" "${SCORE_BOUND_MIN:-180}" "$CALIBRATE_RUNGS_BOUND_S" "$FLOOR_AVG_SEQ_TOKENS" "${SUITE_ON_POD:-0}" "${START_CHECK:-1}" "${PULL_MARGIN_MIN:-90}" "$SESSION" "$IDENTITY_GATE_BOUND_S"'],
+                               'printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" "$MODEL_SLUG" "$SEATBELT" "$HOURS" "$SETUP_BOUND_MIN" "$ENGINES" "$CALIBRATE" "${SCORE_BOUND_MIN:-180}" "$CALIBRATE_RUNGS_BOUND_S" "$FLOOR_AVG_SEQ_TOKENS" "${SUITE_ON_POD:-0}" "${START_CHECK:-1}" "${PULL_MARGIN_MIN:-90}" "$SESSION" "$IDENTITY_GATE_BOUND_S" "${POD_SUITE_BOUND_S:-}"'],
                               capture_output=True, text=True, env=PROFILE_ENV)
-        slug, seatbelt, hours, setup_min, engines, calibrate, score_min, rungs_bound_s, floor_tokens, suite_on_pod, start_check, pull_min, session, ig_bound_s = proc.stdout.split("|")
+        slug, seatbelt, hours, setup_min, engines, calibrate, score_min, rungs_bound_s, floor_tokens, suite_on_pod, start_check, pull_min, session, ig_bound_s, suite_bound_s = proc.stdout.split("|")
+        assert suite_bound_s.isdigit(), f"{p.name}: POD_SUITE_BOUND_S is unset (ADR-0196: _common.env states the default)"
         assert slug in cb.MODEL_KV, f"{p.name}: MODEL_SLUG={slug} is not in cache_budget.MODEL_KV {sorted(cb.MODEL_KV)}"
         # ADR-0155, S2 block A-5 (2026-11-01): every shipped profile sizes the floor table on ITS
         # session's anchor shape (s2a keeps the S0 shape, cd-act1 registers 2694); a placeholder
@@ -1115,11 +1116,12 @@ def test_shipped_profiles_cover_their_stage_bounds_and_name_registered_models() 
             anchor, gated = "4779", False
         assert floor_tokens == anchor, f"{p.name}: FLOOR_AVG_SEQ_TOKENS={floor_tokens} is not session {session}'s anchor shape {anchor}"
         n_srv = len([e for e in engines.split() if e != "hf"]); n_cal = len(calibrate.split())
-        # S0F-88 review L4: plus the stage 4 load gate and the offline dataset probe (20 min) and the pod suite (30 min when SUITE_ON_POD=1);
+        # S0F-88 review L4: plus the stage 4 load gate and the offline dataset probe (20 min) and the pod suite
+        # (POD_SUITE_BOUND_S / 60 when SUITE_ON_POD=1; ADR-0196: the profile key replaced the 1,800 s literal);
         # G16 (2026-10-17): plus the readiness wait (900 s), the start check (2,400 s), the seal (600 s) and a
         # the profile's pull margin (ADR-0176 Group C; the common default 90 = S0 attempt 5's 68 min)
         # S2 block C (2026-11-01): the identity gate (IDENTITY_GATE_BOUND_S) bills at stage 4 on a gated session
-        need = (15 + int(setup_min) + 20 + (30 if suite_on_pod == "1" else 0) + n_srv * 25 + (40 if start_check == "1" else 0)
+        need = (15 + int(setup_min) + 20 + (int(suite_bound_s) // 60 if suite_on_pod == "1" else 0) + n_srv * 25 + (40 if start_check == "1" else 0)
                 + (int(ig_bound_s) // 60 if gated else 0)
                 + n_cal * 60 + n_cal * int(rungs_bound_s) // 60 + 15 + int(hours) * 60 + 10 + int(score_min) + 30 + int(pull_min))
         unit = seatbelt[-1]; n = int(seatbelt.split()[0][:-1])
@@ -4181,3 +4183,28 @@ def test_without_the_probe_stage_0_records_it_off_and_stage_4_keeps_three_starts
     cmd = _job_cmd(world, "identity_gate")
     assert "sglang_xb" not in cmd and "--sglang-xb" not in cmd and "CAGE_SGLANG_MAMBA_SCHEDULER_STRATEGY" not in cmd
     assert "three engine starts at stage 4" in proc.stdout
+
+
+def test_the_pod_suite_deadline_is_the_profile_key_and_sizes_the_seatbelt_adr0196(world: Dict[str, Path], tmp_path: Path) -> None:
+    """ADR-0196: the 2026-11-07 rehearsal's pod suite took 4,821 s against the master's 1,800 s
+    literal; the waiter's deadline is hard (pod_job.sh wait returns 124, the job keeps billing).
+    One profile key sets both the suite job's deadline and its minutes in the seatbelt table."""
+    base = world["profile"].read_text(encoding="utf-8").replace("SEATBELT=12h", "SEATBELT=14h")
+    handle = world["exp_root"] / "S1" / DATE / "extras" / "jobs" / "suite_pod.json"
+    # the default: an S1-era profile without the key keeps 1,800 s and 30 min
+    prof = tmp_path / "S1_suite_default.env"
+    prof.write_text(base + "\nSUITE_ON_POD=1\n", encoding="utf-8")
+    world["profile"] = prof
+    proc = _master(world, "--yes", "provision", "--to", "validate")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert json.loads(handle.read_text(encoding="utf-8"))["deadline_s"] == 1800
+    assert "validate 115," in proc.stdout, [ln for ln in proc.stdout.splitlines() if "seatbelt" in ln]
+    # the key: the S2 profiles' 7,500 s (1.56x the one measurement) reaches the handle and adds 125 min
+    shutil.rmtree(world["exp_root"] / "S1" / DATE)
+    prof = tmp_path / "S1_suite_key.env"
+    prof.write_text(base + "\nSUITE_ON_POD=1\nPOD_SUITE_BOUND_S=7500\n", encoding="utf-8")
+    world["profile"] = prof
+    proc = _master(world, "--yes", "provision", "--to", "validate")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert json.loads(handle.read_text(encoding="utf-8"))["deadline_s"] == 7500
+    assert "validate 210," in proc.stdout, [ln for ln in proc.stdout.splitlines() if "seatbelt" in ln]

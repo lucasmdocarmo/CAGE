@@ -209,6 +209,11 @@ SEAL_BOUND_S=600; START_CHECK_BOUND_S=2400
 # stack start at the control-rung env stage 0 recorded, eight requests through
 # the proxy, one straight to the decode, one stop.
 : "${PD_SMOKE_BOUND_S:=2400}"
+# ADR-0196 (2026-11-08): the stage 4 pod suite job bound when SUITE_ON_POD=1 (profile
+# key, default in _common.env). The 2026-11-07 rehearsal's suite took 4,821 s on the
+# H200 x4 against the former 1,800 s literal; the waiter's deadline is hard (pod_job.sh
+# wait returns 124 and the job keeps billing), so the S2 profiles set 7500.
+: "${POD_SUITE_BOUND_S:=1800}"
 
 seatbelt_minutes() { # "24h" | "90m" -> minutes, or empty when malformed
   # Audit 2026-10-17 (G30): "<n>d" is refused here; provision_pod.sh accepts h,
@@ -226,9 +231,9 @@ stage_bound_minutes() { # G16: the pod-side bound of ONE stage, in minutes (one 
   case "$1" in
     setup)     printf '%s' "$SETUP_BOUND_MIN" ;;
     validate)
-      # S0F-88 review L4: stage 4's load gate (600 s) and pod suite (1,800 s when
-      # SUITE_ON_POD=1) bill too; review 2026-10-13 A1: the start check (START_CHECK=1)
-      [ "${SUITE_ON_POD:-0}" = "1" ] && suite_min=30
+      # S0F-88 review L4: stage 4's load gate (600 s) and pod suite (POD_SUITE_BOUND_S when
+      # SUITE_ON_POD=1, ADR-0196) bill too; review 2026-10-13 A1: the start check (START_CHECK=1)
+      [ "${SUITE_ON_POD:-0}" = "1" ] && suite_min=$(( POD_SUITE_BOUND_S / 60 ))
       [ "${START_CHECK:-1}" = "1" ] && start_min=$(( START_CHECK_BOUND_S / 60 ))
       # S1 audit 2026-10-23: the load gate (600 s) and the offline dataset probe (600 s)
       # S2 block C: the identity gate (stage 0 recorded the session as gated)
@@ -1330,7 +1335,7 @@ stage_validate() {
     if ! plan_only && [ -n "$build_sha" ] && [ "$suite_sha" = "$build_sha" ]; then
       say "pod suite already passed on sha $build_sha: skipped on this retry"
     else
-      job_run suite_pod 1800 "cd $POD_REPO && env $RUN_ENV_UNSET $POD_PYTHON -m pytest -q -p no:cacheprovider" "$LAND/logs/setup" || return 1
+      job_run suite_pod "$POD_SUITE_BOUND_S" "cd $POD_REPO && env $RUN_ENV_UNSET $POD_PYTHON -m pytest -q -p no:cacheprovider" "$LAND/logs/setup" || return 1
       plan_only || state put suite_pod.sha "$build_sha"
     fi
   fi
