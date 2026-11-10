@@ -28,7 +28,13 @@ stack had come up (the warm-up was served) and then could not serve a
 proxied request, so the refusal is a verdict on the stack the owner reads
 and either accepts or reruns (DEC-D3 as amended by the owner on 2026-11-01,
 review MEDIUM 3; the rule is the proxy's status, the reason carries the
-cause). The refusals lead the reasons list;
+cause). The refusals lead the reasons list. FAIL too when the decode's
+engine core died on a proxied request, the warm-up included (HTTP 500
+carrying vLLM's engine-dead message, S2R 2026-11-10; on a streamed request
+the same message arrives as an error chunk inside the 200 SSE body): the stack answered
+that it cannot serve a ticketed prompt, and nothing on the decode answers
+after the death (its API server shuts itself down), so the smoke stops and
+judges there with no scrape, no further request and no control;
 ERROR when the warm-up, a scrape, the control or the transport failed, or
 a counted request got any other HTTP error (the stack did not answer; no
 verdict on the transfer). The verdict document is written to --out in every case and the
@@ -78,6 +84,22 @@ SEED = 20261101
 #: the control's clauses: a request without a ticket must move no bytes,
 #: count no pull and take no prompt token from the wire
 CONTROL_SERIES = ("bytes_sum", "transfer_count", "external_kv_tokens")
+#: vLLM's message once the engine core is dead (0.19.1, read on the S2R pod
+#: 2026-11-10: vllm/v1/engine/exceptions.py:13 EngineDeadError; the API server
+#: answers the request HTTP 500 with it and shuts itself down,
+#: entrypoints/openai/server_utils.py:318-358 engine_error_handler). The proxy
+#: relays the decode's status and body verbatim (pd_proxy.py:635), while a
+#: prefill failure arrives wrapped in the proxy's own 502, so a 500 with this
+#: message is the decode's death on that request. On a streamed request the
+#: chat stream generator has already sent the 200 headers, catches the same
+#: exception and yields one error chunk with the same JSON (message, type,
+#: code 500; entrypoints/openai/chat_completion/serving.py:1260-1265 and
+#: entrypoints/utils.py:344-358), then [DONE]: chat_request turns that chunk
+#: into a RequestRefused carrying the chunk's code, so both forms meet here.
+#: The match is the message alone: only vLLM's EngineDeadError carries it.
+#: On the S2R pod the cause was align mode's refusal of external KV
+#: (v1/core/sched/scheduler.py:305).
+ENGINE_DEAD_MESSAGE = "EngineCore encountered an issue"
 VOCAB = (
     "the", "of", "and", "to", "in", "is", "that", "it", "was", "for", "on", "are", "as", "with",
     "his", "they", "be", "at", "one", "have", "this", "from", "or", "had", "by", "not", "word",
@@ -99,6 +121,16 @@ class RequestRefused(SmokeError):
         super().__init__(f"HTTP {status} from {url}: {detail}")
         self.status = status
         self.detail = detail
+        self.engine_dead = ENGINE_DEAD_MESSAGE in detail
+
+
+class StreamedError(SmokeError):
+    """An error chunk inside a 200 SSE stream (vLLM answers an exception raised
+    after the headers this way); chat_request re-raises it as RequestRefused."""
+
+    def __init__(self, error: Dict[str, Any]):
+        super().__init__(f"error chunk in the SSE stream: {json.dumps(error, sort_keys=True)[:300]}")
+        self.error = error
 
 
 def build_prompts(count: int, words: int, seed: int = SEED) -> List[str]:
@@ -134,6 +166,8 @@ def _usage_from_stream(raw: bytes) -> Dict[str, Any]:
         if payload == "[DONE]":
             break
         chunk = json.loads(payload)
+        if isinstance(chunk, dict) and isinstance(chunk.get("error"), dict):
+            raise StreamedError(chunk["error"])
         if isinstance(chunk, dict) and isinstance(chunk.get("usage"), dict):
             usage = chunk["usage"]
     if usage is None:
@@ -175,6 +209,9 @@ def chat_request(url: str, model: str, prompt: str, *, stream: bool, max_tokens:
     try:
         usage = _usage_from_stream(raw) if stream else _usage_from_json(raw)
         ticket = None if header is None else json.loads(header)
+    except StreamedError as exc:
+        code = exc.error.get("code")
+        raise RequestRefused(code if isinstance(code, int) else 500, url, str(exc)) from exc
     except ValueError as exc:
         raise SmokeError(f"unreadable response from {url}: {exc}") from exc
     details = usage.get("prompt_tokens_details") or {}
@@ -204,6 +241,21 @@ def _scrape(url: str, series: Dict[str, Any], role: str) -> Dict[str, Optional[f
         return scrape_counter_series(url, series)
     except (OSError, ValueError) as exc:
         raise SmokeError(f"scrape of the {role} at {url} failed: {exc}") from exc
+
+
+def refused_row(index: int, stream: bool, exc: RequestRefused) -> Dict[str, Any]:
+    """The row of a proxied request the stack answered with an error status:
+    no counts, no ticket, the status and the error text."""
+    return {
+        "index": index, "stream": stream, "status": exc.status, "error": exc.detail, "ticket": None,
+        "ticket_ok": False, "prompt_tokens": None, "cached_tokens": None, "completion_tokens": None,
+    }
+
+
+def engine_death_reason(where: str, exc: RequestRefused) -> str:
+    return (f"{where}: the decode engine died on this request (HTTP {exc.status}, vLLM EngineDeadError): "
+            f"the stack cannot serve a ticketed prompt; nothing on the decode answers after the death, "
+            f"so no transfer is measured and the smoke stops here: {exc.detail}")
 
 
 def control_record(before: Dict[str, Optional[float]], after: Dict[str, Optional[float]],
@@ -240,8 +292,16 @@ def run_smoke(a: argparse.Namespace) -> Dict[str, Any]:
         # decode's NIXL and by-source children then exist whether the engine
         # creates them at logger init or at the first observation ([?] for vLLM
         # 0.19.1 on the Mac); recorded apart under "warmup" and counted nowhere
-        warm = chat_request(a.proxy_url, a.model, prompts[a.requests + 1], stream=False,
-                            max_tokens=a.max_tokens, timeout_s=a.timeout_s)
+        try:
+            warm = chat_request(a.proxy_url, a.model, prompts[a.requests + 1], stream=False,
+                                max_tokens=a.max_tokens, timeout_s=a.timeout_s)
+        except RequestRefused as exc:
+            if not exc.engine_dead:
+                raise
+            doc["warmup"] = refused_row(-1, False, exc)
+            doc["reasons"] = [engine_death_reason("warmup", exc)]
+            doc["verdict"] = "FAIL"
+            return doc
         why = ticket_reason(warm["ticket"])
         warm.update({"index": -1, "ticket_ok": why is None})
         doc["warmup"] = warm
@@ -256,16 +316,19 @@ def run_smoke(a: argparse.Namespace) -> Dict[str, Any]:
                 row = chat_request(a.proxy_url, a.model, prompts[i], stream=stream,
                                    max_tokens=a.max_tokens, timeout_s=a.timeout_s)
             except RequestRefused as exc:
+                if exc.engine_dead:
+                    doc["requests"].append(refused_row(i, stream, exc))
+                    # the death leads: the planner prints the first three reasons
+                    doc["reasons"] = [engine_death_reason(f"request {i}", exc)] + reasons
+                    doc["verdict"] = "FAIL"
+                    return doc
                 if exc.status != 502:
                     raise
                 # the proxy's refusal (pd_proxy.py answers 502 when the prefill hands
                 # back no usable ticket): the stack was up and answered, so this is a
                 # FAIL reason, recorded as a row with no counts, and the run goes on
                 # so the scrapes and the control complete the record
-                doc["requests"].append({
-                    "index": i, "stream": stream, "status": 502, "error": exc.detail, "ticket": None,
-                    "ticket_ok": False, "prompt_tokens": None, "cached_tokens": None, "completion_tokens": None,
-                })
+                doc["requests"].append(refused_row(i, stream, exc))
                 reasons.append(f"request {i}: HTTP 502 from the proxy: {exc.detail}")
                 continue
             why = ticket_reason(row["ticket"])
@@ -315,9 +378,13 @@ def _fmt(value: Any) -> str:
 def summary_line(doc: Dict[str, Any]) -> str:
     if doc["verdict"] == "ERROR":
         return f"{MARKER} ERROR {doc['error']}"
-    delta = doc["transfer"]["delta"]
     rows = doc["requests"]
     served = sum(1 for r in rows if r["status"] == 200)
+    if doc["transfer"] is None:
+        # the decode engine died on a proxied request: no scrape followed
+        return (f"{MARKER} {doc['verdict']} requests={len(rows)} served={served} refused={len(rows) - served} "
+                f"engine_dead=1 reasons={len(doc['reasons'])}")
+    delta = doc["transfer"]["delta"]
     return (f"{MARKER} {doc['verdict']} requests={len(rows)} served={served} refused={len(rows) - served} "
             f"bytes={_fmt(delta['bytes_sum'])} transfers={_fmt(delta['transfer_count'])} "
             f"failed={_fmt(delta['failed_transfers'])} "

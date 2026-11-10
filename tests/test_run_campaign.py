@@ -6554,6 +6554,28 @@ class TestS2BlockDPdStack:
         with pytest.raises(rc.PlanError, match="--accept-pd-fail"):
             _s2_plan("cd-act1", tmp_path, pd_smoke=rc.load_pd_smoke(_pd_smoke_verdict(tmp_path, "FAIL")))
 
+    def test_an_engine_death_fail_plans_with_null_transfer_and_control(self, tmp_path, plan_cd_act1):
+        # review 2026-11-10 LOW 4 (S2R 2026-11-10): pd_smoke.py stops at the decode
+        # engine's death on the warm-up with transfer None, control None and no
+        # counted row; the loader accepts it and the header carries the nulls
+        reason = ("warmup: the decode engine died on this request (HTTP 500, vLLM EngineDeadError): "
+                  "the stack cannot serve a ticketed prompt; nothing on the decode answers after the death, "
+                  "so no transfer is measured and the smoke stops here: EngineCore encountered an issue")
+        path = _pd_smoke_verdict(tmp_path, "FAIL", requests=[], transfer=None, control=None, reasons=[reason],
+                                 warmup={"index": -1, "stream": False, "status": 500, "ticket": None, "ticket_ok": False,
+                                         "prompt_tokens": None, "cached_tokens": None, "completion_tokens": None,
+                                         "error": "EngineCore encountered an issue"})
+        plan = _s2_plan("cd-act1", tmp_path, pd_smoke=rc.load_pd_smoke(path), accept_pd_fail=True)
+        ps = plan["pd_smoke"]
+        assert ps["verdict"] == "FAIL" and ps["accepted_fail"] is True and ps["blocked_on"] == rc.PD_SMOKE_BLOCKED_ON
+        assert ps["transfer"] is None and ps["control_no_transfer"] is None and ps["requests"] == 0
+        assert ps["reasons"] == [reason]
+        pd_keys = sorted(s["row_key"] for s in _s2_rows(plan) if s["cellspec"]["topology"] == "pd")
+        assert ps["excluded_row_keys"] == pd_keys and len(pd_keys) == 35
+        out = tmp_path / "plan_pd_dead.json"
+        out.write_text(json.dumps(plan), encoding="utf-8")
+        assert rc.load_plan(out)["pd_smoke"] == ps
+
     def test_load_pd_smoke_is_fail_closed(self, tmp_path):
         with pytest.raises(rc.PlanError, match="ERROR"):
             rc.load_pd_smoke(_pd_smoke_verdict(tmp_path, "ERROR"))

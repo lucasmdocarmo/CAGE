@@ -87,6 +87,9 @@ class _Role:
         self.prefill_ticket: Any = TICKET  # _NO_TICKET omits the key (the proxy answers 502)
         self.tickets_before_refusal: Any = None  # when set, the prefill carries a ticket on its first N answers only
         self.decode_status: int = 200     # the decode's status on a proxied request (the proxy relays it verbatim)
+        self.decode_error_body: bytes = b'{"error":"engine failure"}'  # the body of that status
+        self.decode_stream_error_chunk: Any = None  # when set, a streamed proxied request past decode_ok_posts_before_status answers 200 SSE with this error chunk then [DONE]
+        self.prefill_refuse_posts: Any = frozenset()  # prefill post numbers (from 1) answered without a ticket
         self.decode_ok_posts_before_status: Any = None  # when set, the decode serves its first N proxied answers before decode_status
         self.prefill_status_after_posts: Any = None  # when set, the prefill answers 500 after its first N posts (the proxy wraps it in a 502)
         self.prefill_posts = 0
@@ -136,7 +139,8 @@ class _Role:
                                   "prompt_tokens_details": {"cached_tokens": 0}},
                     }
                     refused = (outer.tickets_before_refusal is not None
-                               and outer.prefill_posts > outer.tickets_before_refusal)
+                               and outer.prefill_posts > outer.tickets_before_refusal) \
+                        or outer.prefill_posts in outer.prefill_refuse_posts
                     if outer.prefill_ticket is not _NO_TICKET and not refused:
                         doc["kv_transfer_params"] = outer.prefill_ticket
                     self._send(200, json.dumps(doc).encode("utf-8"))
@@ -146,8 +150,12 @@ class _Role:
                     outer.decode_posts += 1
                     past_ok = (outer.decode_ok_posts_before_status is None
                                or outer.decode_posts > outer.decode_ok_posts_before_status)
+                    if outer.decode_stream_error_chunk is not None and past_ok and body.get("stream"):
+                        payload = f"data: {json.dumps(outer.decode_stream_error_chunk)}\n\ndata: [DONE]\n\n"
+                        self._send(200, payload.encode("utf-8"), "text/event-stream")
+                        return
                     if outer.decode_status != 200 and past_ok:
-                        self._send(outer.decode_status, b'{"error":"engine failure"}')
+                        self._send(outer.decode_status, outer.decode_error_body)
                         return
                 pulled = isinstance(ticket, dict) and ticket.get("do_remote_prefill") is True
                 if pulled or outer.leak_on_control:
@@ -398,6 +406,107 @@ def test_error_on_a_non_502_status_on_a_counted_request(tmp_path, stack):
     code, doc = _run(tmp_path, stack)
     assert code == 1 and doc["verdict"] == "ERROR" and "HTTP 500" in doc["error"], doc
     assert doc["warmup"]["ticket_ok"] is True and doc["requests"] == []
+
+
+#: the body vLLM 0.19.1's API server answers once the engine core is dead (the S2R
+#: pod 2026-11-10: vllm/v1/engine/exceptions.py:13 ENGINE_DEAD_MESSAGE, relayed as
+#: HTTP 500 by entrypoints/openai/server_utils.py:318-358 engine_error_handler)
+ENGINE_DEAD_BODY = (b'{"error":{"message":"EngineCore encountered an issue. See stack trace (above) '
+                    b'for the root cause.","type":"InternalServerError","param":null,"code":500}}')
+
+
+def test_fail_when_the_decode_engine_dies_on_the_warmup_s2r_2026_11_10(tmp_path, stack, capsys):
+    # S2R 2026-11-10 on the live pod: the prefill served the warm-up, the decode's
+    # engine core died on it (vLLM 0.19.1 align mode asserts no external KV on a
+    # request, v1/core/sched/scheduler.py:305) and its API server answered HTTP 500
+    # with vLLM's engine-dead message, then shut down. The stack answered: a FAIL
+    # the owner accepts (PD_FAIL_ACCEPTED=1 excludes every pd cell), not an ERROR
+    # with no path on. Nothing on the decode answers after the death, so the smoke
+    # stops and judges there: no scrape, no counted request, no control
+    _, _, decode, _ = stack
+    decode.decode_status = 500
+    decode.decode_error_body = ENGINE_DEAD_BODY
+    code, doc = _run(tmp_path, stack)
+    assert code == 0 and doc["verdict"] == "FAIL" and doc["error"] is None, doc
+    warm = doc["warmup"]
+    assert warm["index"] == -1 and warm["status"] == 500 and warm["stream"] is False
+    assert warm["ticket"] is None and warm["ticket_ok"] is False
+    assert warm["prompt_tokens"] is None and warm["cached_tokens"] is None and warm["completion_tokens"] is None
+    assert "EngineCore encountered an issue" in warm["error"]
+    assert doc["requests"] == [] and doc["transfer"] is None and doc["control"] is None
+    assert len(doc["reasons"]) == 1 and doc["reasons"][0].startswith("warmup: the decode engine died on this request")
+    assert "HTTP 500" in doc["reasons"][0] and "EngineCore encountered an issue" in doc["reasons"][0]
+    assert "PD_SMOKE FAIL requests=0 served=0 refused=0 engine_dead=1 reasons=1" in capsys.readouterr().out
+
+
+def test_fail_when_the_decode_engine_dies_on_a_counted_request_keeps_the_rows_before_it(tmp_path, stack):
+    _, _, decode, _ = stack
+    decode.decode_status = 500
+    decode.decode_error_body = ENGINE_DEAD_BODY
+    decode.decode_ok_posts_before_status = 2   # the warm-up and request 0 served; request 1 kills the engine
+    code, doc = _run(tmp_path, stack)
+    assert code == 0 and doc["verdict"] == "FAIL" and doc["error"] is None, doc
+    assert doc["warmup"]["ticket_ok"] is True
+    rows = doc["requests"]
+    assert [(r["index"], r["status"], r["stream"]) for r in rows] == [(0, 200, False), (1, 500, True)]
+    assert rows[0]["ticket_ok"] is True and rows[1]["ticket_ok"] is False and rows[1]["ticket"] is None
+    assert doc["transfer"] is None and doc["control"] is None
+    assert len(doc["reasons"]) == 1 and doc["reasons"][0].startswith("request 1: the decode engine died on this request")
+
+
+def test_fail_when_the_decode_engine_dies_inside_a_streamed_answer(tmp_path, stack):
+    # review 2026-11-10 MEDIUM 1: every odd counted request streams, and vLLM
+    # 0.19.1's chat stream generator catches any exception after the 200 headers
+    # and yields an error chunk carrying the exception's text, then [DONE]
+    # (entrypoints/openai/chat_completion/serving.py:1260-1265 and
+    # entrypoints/utils.py:344-358, read on the S2R pod): the same death arrives
+    # as a 200 SSE body with vLLM's engine-dead message inside, not as a status
+    _, _, decode, _ = stack
+    decode.decode_stream_error_chunk = json.loads(ENGINE_DEAD_BODY)
+    decode.decode_ok_posts_before_status = 2   # the warm-up and request 0 served; request 1 (streamed) carries the death
+    code, doc = _run(tmp_path, stack)
+    assert code == 0 and doc["verdict"] == "FAIL" and doc["error"] is None, doc
+    rows = doc["requests"]
+    assert [(r["index"], r["status"], r["stream"]) for r in rows] == [(0, 200, False), (1, 500, True)]
+    assert rows[1]["ticket"] is None and "EngineCore encountered an issue" in rows[1]["error"]
+    assert "error chunk" in rows[1]["error"]
+    assert doc["transfer"] is None and doc["control"] is None
+    assert len(doc["reasons"]) == 1 and doc["reasons"][0].startswith("request 1: the decode engine died on this request")
+
+
+def test_a_streamed_error_chunk_without_the_engine_dead_message_stays_error(tmp_path, stack):
+    _, _, decode, _ = stack
+    decode.decode_stream_error_chunk = {"error": {"message": "some request error", "type": "BadRequestError",
+                                                  "param": None, "code": 400}}
+    decode.decode_ok_posts_before_status = 2
+    code, doc = _run(tmp_path, stack)
+    assert code == 1 and doc["verdict"] == "ERROR" and "HTTP 400" in doc["error"] and "error chunk" in doc["error"]
+
+
+def test_the_engine_death_reason_leads_the_earlier_refusals(tmp_path, stack):
+    # review 2026-11-10 LOW 3: the planner prints the first three reasons, so the
+    # death leads the list and the earlier rows' refusals follow it
+    _, prefill, decode, _ = stack
+    prefill.prefill_refuse_posts = {2}          # request 0: the proxy refuses it (no ticket), the decode is not called
+    decode.decode_status = 500
+    decode.decode_error_body = ENGINE_DEAD_BODY
+    decode.decode_ok_posts_before_status = 1    # the warm-up served; request 1 kills the engine
+    code, doc = _run(tmp_path, stack)
+    assert code == 0 and doc["verdict"] == "FAIL", doc
+    assert [(r["index"], r["status"]) for r in doc["requests"]] == [(0, 502), (1, 500)]
+    assert len(doc["reasons"]) == 2
+    assert doc["reasons"][0].startswith("request 1: the decode engine died on this request")
+    assert doc["reasons"][1].startswith("request 0: HTTP 502 from the proxy: ")
+
+
+def test_error_on_a_500_without_the_engine_dead_message_stays_the_boundary(tmp_path, stack):
+    # the boundary of the 2026-11-10 amendment: only vLLM's engine-dead message
+    # makes a 500 a FAIL reason; any other 500 body on the warm-up stays ERROR
+    _, _, decode, _ = stack
+    decode.decode_status = 500
+    code, doc = _run(tmp_path, stack)
+    assert code == 1 and doc["verdict"] == "ERROR" and "HTTP 500" in doc["error"]
+    assert doc["warmup"] is None and doc["requests"] == []
 
 
 def test_fail_when_the_prefill_errors_after_the_warmup(tmp_path, stack):

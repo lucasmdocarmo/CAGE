@@ -1,7 +1,7 @@
 """S2 rehearsal profile S2R.env (owner 2026-11-04, option R1, "lets do the test with
 the h200 as designed"): S2B's exact shape (the 80B on four H200, both engines, every
 ladder) driven through every stage of the master once, cut short at the run, before
-landing B bills. Ten keys differ from S2B.env and nothing else does; the file is never
+landing B bills. Twelve keys differ from S2B.env and nothing else does; the file is never
 a landing of record. ADR-0190 (owner 2026-11-05, option D): RUN_CUT_BY_BUDGET=1 lets
 stage 6 accept the 38 h plan projection because the budget stop cuts the run first. Spec: MyDocs/RunPod/S2_REHEARSAL_LANDING_2026-11-05.md.
 """
@@ -29,6 +29,7 @@ LEVERS: Dict[str, str] = {
     "MIN_IN_REGIME_WINDOWS": "",   # the regime counts print only; S2B's floor would fail a one hour tree
     "SKIP_BLOCKED": "1",           # cd-act1 carries eight blocked rows (B8 on both engines, ADR-0193); the loud skip path runs
     "IDENTITY_FAIL_ACCEPTED": "1", # owner 2026-11-10: the gate FAIL (A 187/200) is accepted on the rehearsal; S2B's value is the owner's pending decision
+    "PD_FAIL_ACCEPTED": "1",       # owner 2026-11-10: the PD smoke FAIL (the decode engine died on the warm-up, align mode) is accepted on the rehearsal; S2B's value is the owner's pending decision
 }
 
 
@@ -54,7 +55,7 @@ def _stated(name: str) -> Dict[str, str]:
 
 
 def test_s2r_pins_the_rehearsal_levers_and_stays_a_registered_profile() -> None:
-    """The ten levers hold the Spec Block's values; the two keys that would relax the
+    """The twelve levers hold the Spec Block's values; the two keys that would relax the
     registered-profile block stay at their S2B values (REHEARSAL_N is refused on cd-act1
     by the driver, PARTIAL_TREE_OK=1 is refused at stage 0 without it); the plan is whole."""
     v = _shipped("S2R.env", *LEVERS, "SESSION", "REHEARSAL_N", "PARTIAL_TREE_OK", "LAST_BLOCK", "MODEL", "GPU_ID", "GPU_COUNT")
