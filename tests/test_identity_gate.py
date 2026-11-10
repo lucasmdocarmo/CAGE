@@ -366,17 +366,20 @@ def _phase_doc(pdoc: Dict[str, Any], phase: str, engine: str, passes: int, *, ou
             "results": results}
 
 
-def _phases(tmp_path: Path, **tweak: Any) -> tuple:
+#: phase -> (engine, passes, the stub's keyword arguments): the three phase files every verdict test starts from
+_PHASE_SPEC = {"vllm_on": ("vllm", 2, {}), "vllm_off": ("vllm", 1, {"cached": lambda k, ids: None}),
+               "sglang": ("sglang", 2, {"version": "0.5.10.post1", "cached": lambda k, ids: 0 if k == 1 else len(ids) - 7})}
+
+
+def _phases(tmp_path: Path, count: int = 2, **tweak: Any) -> tuple:
     """prompts.json plus the three phase files under tmp_path/phases; ``tweak``
     overrides one phase's keyword arguments (vllm_on=..., vllm_off=..., sglang=...)."""
     d = tmp_path / "phases"
     d.mkdir(exist_ok=True)
-    code, prompts = _prompts(tmp_path, name="phases/prompts.json")
+    code, prompts = _prompts(tmp_path, count=count, name="phases/prompts.json")
     assert code == 0
     pdoc = json.loads(prompts.read_text(encoding="utf-8"))
-    spec = {"vllm_on": ("vllm", 2, {}), "vllm_off": ("vllm", 1, {"cached": lambda k, ids: None}),
-            "sglang": ("sglang", 2, {"version": "0.5.10.post1", "cached": lambda k, ids: 0 if k == 1 else len(ids) - 7})}
-    for phase, (engine, passes, kw) in spec.items():
+    for phase, (engine, passes, kw) in _PHASE_SPEC.items():
         if tweak.get(phase) == "absent":
             continue
         kw = {**kw, **tweak.get(phase, {})}
@@ -413,6 +416,8 @@ def test_verdict_pass_when_both_deciding_comparisons_are_identical(tmp_path, fak
         "vllm_on_pass2_cached_tokens": {"min": warm[0], "median": (warm[0] + warm[1]) / 2, "max": warm[1]},
         "vllm_on_pass2_floor_exempt": [{"prompt_index": 0, "prompt_id": "q2", "prompt_tokens": n[0],
                                         "cached_tokens": _warm(2, [0] * n[0])}],
+        # the block measured from the warm counts: the stub caches whole 16-token blocks
+        "vllm_on_pass2_block_tokens": 16,
         "vllm_off_cached_tokens_max": 0,
         "sglang_pass1_hits": 0,
         "sglang_pass2_cached_tokens": {"min": min(n) - 7, "median": (n[0] + n[1]) / 2 - 7, "max": max(n) - 7},
@@ -505,6 +510,84 @@ def test_verdict_exempts_prompts_under_two_quanta_from_the_warm_floor_review_hig
     code, v = _verdict(tmp_path, d)
     assert code == 1 and v["verdict"] == "ERROR"
     assert "cache-on path not exercised" in v["error"] and "1 of 1 floor-checked prompts" in v["error"], v["error"]
+
+
+def _phases_padded(tmp_path: Path, lengths: Dict[str, int], count: int = 3, **tweak: Any) -> tuple:
+    """``_phases`` with the prompts of ``lengths`` padded to those token counts
+    (the fixture renders 1,149 and 689 tokens; a block multiple needs a length
+    the fixture cannot reach), the sha256 recomputed so the phases match."""
+    d, pdoc = _phases(tmp_path, count=count)
+    for p in pdoc["prompts"]:
+        if p["id"] in lengths:
+            p["token_ids"] = (p["token_ids"] * 3)[: lengths[p["id"]]]
+            p["n_tokens"] = len(p["token_ids"])
+    pdoc["sha256"] = ig.prompts_sha256(pdoc["prompts"])
+    pdoc["max_prompt_tokens"] = max(p["n_tokens"] for p in pdoc["prompts"])
+    (d / "prompts.json").write_text(json.dumps(pdoc), encoding="utf-8")
+    for phase, (engine, passes, kw) in _PHASE_SPEC.items():
+        kw = {**kw, **tweak.get(phase, {})}
+        (d / f"{phase}.json").write_text(json.dumps(_phase_doc(pdoc, phase, engine, passes, **kw)), encoding="utf-8")
+    return d, pdoc
+
+
+def _hybrid(k: int, ids: List[int]) -> Optional[int]:
+    """The warm count the S2R 2026-11-10 record showed on every one of its 200
+    prompts: whole 272-token blocks, never the last token, and 0 on a prompt
+    whose length is an exact multiple of 272."""
+    if k != 2:
+        return None
+    return 0 if len(ids) % 272 == 0 else (len(ids) - 1) // 272 * 272
+
+
+def test_verdict_exempts_an_exact_block_multiple_at_zero_cached_from_the_warm_floor_s2r_2026_11_10(tmp_path, fakes):
+    """On the hybrid model vLLM 0.19.1 keeps the Mamba state in the last block
+    and caps the prefix lookup at prompt length minus one, so a prompt whose
+    length is an exact multiple of the served block reports 0 cached tokens on
+    a correct server (S2R 2026-11-10: prompts of 2,720 and 1,904 tokens at 0,
+    every other warm count a multiple of 272). The gate measures the block as
+    the gcd of the nonzero warm counts, checks that the block explains every
+    nonzero count, and records such prompts; it does not error."""
+    # q1 padded to 5 x 272 reports 0; q2 (689 tokens, under two quanta) reports 544 = 2 x 272
+    # and q3 padded to 1,400 tokens reports 1360 = 5 x 272, so the measured block is 272
+    d, pdoc = _phases_padded(tmp_path, {"q1": 1360, "q3": 1400}, vllm_on={"cached": _hybrid})
+    n = {p["id"]: p["n_tokens"] for p in pdoc["prompts"]}
+    assert n["q1"] == 1360 and n["q2"] < 1057 <= n["q3"] == 1400
+    code, v = _verdict(tmp_path, d)
+    assert code == 0 and v["verdict"] == "PASS" and v["error"] is None, v["error"]
+    assert v["telemetry"]["vllm_on_pass2_block_tokens"] == 272
+    assert v["telemetry"]["vllm_on_pass2_floor_exempt"] == [
+        {"prompt_index": 0, "prompt_id": "q2", "prompt_tokens": n["q2"], "cached_tokens": 544},
+        {"prompt_index": 1, "prompt_id": "q1", "prompt_tokens": 1360, "cached_tokens": 0, "block_tokens": 272}]
+    assert v["limitations"][1] == (
+        "the 528-token warm floor is not applied to 1 of 3 prompts whose length is an exact multiple of the 272-token "
+        "block measured from the warm counts and that report 0 cached tokens (vLLM keeps the hybrid Mamba state in the "
+        "last block and looks up at most prompt length minus one, S2R 2026-11-10): q1 1360 tokens")
+    # a nonzero count under the floor on a multiple is still an error
+    partial = lambda k, ids: (300 if len(ids) % 272 == 0 else _hybrid(k, ids)) if k == 2 else None  # noqa: E731
+    d, _ = _phases_padded(tmp_path, {"q1": 1360, "q3": 1400}, vllm_on={"cached": partial})
+    code, v = _verdict(tmp_path, d)
+    assert code == 1 and "cache-on path not exercised" in v["error"] and "1 of 2 floor-checked" in v["error"], v["error"]
+    # every count 0 leaves no block to measure: the floor errors as before
+    nothing = lambda k, ids: 0 if k == 2 else None  # noqa: E731
+    d, _ = _phases_padded(tmp_path, {"q1": 1360, "q3": 1400}, vllm_on={"cached": nothing})
+    code, v = _verdict(tmp_path, d)
+    assert code == 1 and "cache-on path not exercised" in v["error"], v["error"]
+    # review 2026-11-10 MEDIUM 1: one count the block does not explain (q2 at 832, not 544)
+    # lowers the gcd to 64 and would exempt a 0 at 1,600 tokens (a multiple of 64, not of 272),
+    # a real miss on a 272-block server: the block must explain every nonzero count
+    misaligned = lambda k, ids: (832 if len(ids) < 1057 else (0 if len(ids) == 1600 else _hybrid(k, ids))) if k == 2 else None  # noqa: E731
+    d, _ = _phases_padded(tmp_path, {"q1": 1600}, vllm_on={"cached": misaligned})
+    code, v = _verdict(tmp_path, d)
+    assert code == 1 and "cache-on path not exercised" in v["error"] and "1 of 2 floor-checked" in v["error"], v["error"]
+    # when the exemption empties the floor set the gate still refuses a vacuous floor:
+    # q1 (1,632 = 6 x 272) and q3 (1,088 = 4 x 272) are multiples at 0, the short q2 alone measures the block
+    d, _ = _phases_padded(tmp_path, {"q1": 1632, "q3": 1088}, vllm_on={"cached": _hybrid})
+    code, v = _verdict(tmp_path, d)
+    assert code == 1 and v["verdict"] == "ERROR" and "outside the 2 exact block multiples" in v["error"], v["error"]
+    # the exempt list stays in prompt order (review 2026-11-10 LOW 3)
+    d, _ = _phases_padded(tmp_path, {"q1": 1400, "q3": 1360}, vllm_on={"cached": _hybrid})
+    code, v = _verdict(tmp_path, d)
+    assert code == 0 and [e["prompt_index"] for e in v["telemetry"]["vllm_on_pass2_floor_exempt"]] == [0, 2], v["error"]
 
 
 def test_verdict_errors_when_no_prompt_reaches_two_quanta_so_the_floor_is_never_vacuous(tmp_path, fakes, monkeypatch):

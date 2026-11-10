@@ -35,9 +35,11 @@ Three subcommands, composed by scripts/6_experiments/cage_experiment.sh:
            G against the SGLang extra-buffer probe phase ``sglang_xb``, run only
            when ``--sglang-xb`` says stage 4 started it, ADR-0195), the
            telemetry that makes the test honest (every warm prompt past two
-           quanta cached at or above one 528-token quantum, every cache-off
-           prompt at 0; shorter prompts and pass-1 hits are recorded, not
-           asserted), one
+           quanta cached at or above one 528-token quantum, except a prompt
+           whose length is an exact multiple of the block measured from the
+           warm counts and that reports 0, recorded; every cache-off prompt
+           at 0; shorter prompts and pass-1 hits are recorded, not asserted),
+           one
            marker line IDENTITY_GATE PASS|FAIL|ERROR, exit 0 on PASS or FAIL
            and 1 on ERROR.
 
@@ -49,6 +51,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import statistics
 import sys
 import time
@@ -79,6 +82,20 @@ WARM_CACHED_TOKENS_MIN = 528
 #: run from 527 tokens [V], so a shorter prompt may hold one block, or none: it is
 #: recorded in the telemetry and the limitations, never asserted.
 WARM_FLOOR_MIN_PROMPT_TOKENS = 2 * WARM_CACHED_TOKENS_MIN + 1
+#: vLLM 0.19.1 caps the prefix lookup at prompt length minus one
+#: (v1/core/kv_cache_manager.py 196-204) and, on the hybrid model, keeps the
+#: Mamba state in the request's last block alone (single_type_kv_cache_manager.py
+#: MambaManager.allocate_new_blocks, null blocks before it; block_pool.py
+#: cache_full_blocks skips null blocks), so a prompt whose length is an exact
+#: multiple of the served block reports 0 cached tokens on a correct server
+#: (S2R 2026-11-10: 2,720 and 1,904 tokens at 0, every other warm count a
+#: multiple of 272). The verdict measures the block as the gcd of the nonzero
+#: warm counts and exempts such prompts from the floor, recorded, only when
+#: that block explains every nonzero count as floor((N-1)/block)*block (the
+#: record's law on all 198 nonzero counts; review 2026-11-10 MEDIUM 1: one
+#: misaligned count would otherwise lower the gcd and widen the exemption) and
+#: is at least 16 tokens, the smallest block the gate accepts.
+BLOCK_TOKENS_MIN = 16
 #: The smallest served context on the gated rows minus the generation budget.
 DEFAULT_PROMPT_TOKEN_LIMIT = 4096 - 32
 SHAPE = "corpus-reuse"
@@ -396,21 +413,37 @@ def build_verdict(args: argparse.Namespace) -> Dict[str, Any]:
         ntok = [int(p["n_tokens"]) for p in pdoc["prompts"]]
         exempt = [{"prompt_index": i, "prompt_id": pdoc["prompts"][i]["id"], "prompt_tokens": ntok[i], "cached_tokens": warm[i]}
                   for i in range(count) if ntok[i] < WARM_FLOOR_MIN_PROMPT_TOKENS]
+        block = math.gcd(*[int(c) for c in warm if c > 0]) if any(c > 0 for c in warm) else 0
+        lawful = block >= BLOCK_TOKENS_MIN and all(
+            warm[j] == (ntok[j] - 1) // block * block for j in range(count) if warm[j] > 0)
+        multiples = [i for i in range(count)
+                     if lawful and ntok[i] >= WARM_FLOOR_MIN_PROMPT_TOKENS and warm[i] == 0 and ntok[i] % block == 0]
+        exempt.extend({"prompt_index": i, "prompt_id": pdoc["prompts"][i]["id"], "prompt_tokens": ntok[i],
+                       "cached_tokens": 0, "block_tokens": block} for i in multiples)
+        exempt.sort(key=lambda e: e["prompt_index"])
         hits = sum(1 for c in on1 if c > 0)
         shits = sum(1 for c in sgl1 if c > 0) if sgl1 is not None else None
         xhits = sum(1 for c in xb1 if c > 0) if xb1 is not None else None
         v["telemetry"] = {"vllm_on_pass1_cached_tokens": _stats(on1), "vllm_on_pass1_hits": hits,
                           "vllm_on_pass2_cached_tokens": _stats(warm), "vllm_on_pass2_floor_exempt": exempt,
+                          "vllm_on_pass2_block_tokens": block,
                           "vllm_off_cached_tokens_max": max(off), "sglang_pass1_hits": shits,
                           "sglang_pass2_cached_tokens": _stats(sgl) if sgl is not None else None,
                           # ADR-0195: the extra-buffer probe phase; None when stage 4 did not start it
                           "sglang_xb_pass1_hits": xhits,
                           "sglang_xb_pass2_cached_tokens": _stats(xb) if xb is not None else None}
-        if exempt:
+        short = [e for e in exempt if "block_tokens" not in e]
+        if short:
             v["limitations"].append(
-                f"the {WARM_CACHED_TOKENS_MIN}-token warm floor is not applied to {len(exempt)} of {count} prompts under "
+                f"the {WARM_CACHED_TOKENS_MIN}-token warm floor is not applied to {len(short)} of {count} prompts under "
                 f"{WARM_FLOOR_MIN_PROMPT_TOKENS} tokens (one aligned quantum may exceed their length, review 2026-11-01 HIGH 1): "
-                + "; ".join(f"{e['prompt_id']} {e['prompt_tokens']} tokens, {e['cached_tokens']} cached on pass 2" for e in exempt))
+                + "; ".join(f"{e['prompt_id']} {e['prompt_tokens']} tokens, {e['cached_tokens']} cached on pass 2" for e in short))
+        if multiples:
+            v["limitations"].append(
+                f"the {WARM_CACHED_TOKENS_MIN}-token warm floor is not applied to {len(multiples)} of {count} prompts whose "
+                f"length is an exact multiple of the {block}-token block measured from the warm counts and that report 0 "
+                "cached tokens (vLLM keeps the hybrid Mamba state in the last block and looks up at most prompt length "
+                "minus one, S2R 2026-11-10): " + "; ".join(f"{pdoc['prompts'][i]['id']} {ntok[i]} tokens" for i in multiples))
         if hits:
             v["limitations"].append(
                 f"pass 1 is not cold on {hits} of {count} vLLM prompts (a corpus block shared with an earlier prompt of the trial "
@@ -434,9 +467,11 @@ def build_verdict(args: argparse.Namespace) -> Dict[str, Any]:
             comps[key] = {"decides": decides, "left": f"{ln}/{lk}", "right": f"{rn}/{rk}", "compared": count,
                           "identical": identical, "first_divergence": first}
         v["comparisons"] = comps
-        checked = [i for i in range(count) if ntok[i] >= WARM_FLOOR_MIN_PROMPT_TOKENS]
+        checked = [i for i in range(count) if ntok[i] >= WARM_FLOOR_MIN_PROMPT_TOKENS and i not in multiples]
         if not checked:
-            raise GateError(f"no prompt past two quanta ({WARM_FLOOR_MIN_PROMPT_TOKENS} tokens): the warm floor cannot be checked")
+            raise GateError(f"no prompt past two quanta ({WARM_FLOOR_MIN_PROMPT_TOKENS} tokens)"
+                            + (f" outside the {len(multiples)} exact block multiples" if multiples else "")
+                            + ": the warm floor cannot be checked")
         low = [(i, warm[i]) for i in checked if warm[i] < WARM_CACHED_TOKENS_MIN]
         if low:
             raise GateError(f"cache-on path not exercised: the warm pass reports cached_tokens under {WARM_CACHED_TOKENS_MIN} "
