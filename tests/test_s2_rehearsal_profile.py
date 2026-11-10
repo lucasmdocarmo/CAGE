@@ -28,6 +28,7 @@ LEVERS: Dict[str, str] = {
     "VOLUME_GB": "100",            # the weights live on the container disk; the owner deletes the volume by hand
     "MIN_IN_REGIME_WINDOWS": "",   # the regime counts print only; S2B's floor would fail a one hour tree
     "SKIP_BLOCKED": "1",           # cd-act1 carries eight blocked rows (B8 on both engines, ADR-0193); the loud skip path runs
+    "IDENTITY_FAIL_ACCEPTED": "1", # owner 2026-11-10: the gate FAIL (A 187/200) is accepted on the rehearsal; S2B's value is the owner's pending decision
 }
 
 
@@ -53,7 +54,7 @@ def _stated(name: str) -> Dict[str, str]:
 
 
 def test_s2r_pins_the_rehearsal_levers_and_stays_a_registered_profile() -> None:
-    """The nine levers hold the Spec Block's values; the two keys that would relax the
+    """The ten levers hold the Spec Block's values; the two keys that would relax the
     registered-profile block stay at their S2B values (REHEARSAL_N is refused on cd-act1
     by the driver, PARTIAL_TREE_OK=1 is refused at stage 0 without it); the plan is whole."""
     v = _shipped("S2R.env", *LEVERS, "SESSION", "REHEARSAL_N", "PARTIAL_TREE_OK", "LAST_BLOCK", "MODEL", "GPU_ID", "GPU_COUNT")
