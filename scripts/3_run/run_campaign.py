@@ -1303,6 +1303,17 @@ LADDER_START_DECODE_TOKENS: int = 32
 #: Tighter rungs start the climb below the looser rung's lambda* (lambda*
 #: cannot rise as the budget shrinks): two ladder steps below it.
 LADDER_CHAIN_DIVISOR: float = PROBE_LADDER_FACTOR ** 2
+#: S2R 2026-11-10 (owner: "Step-down ladder"): the chain assumes lambda* falls by
+#: at most LADDER_CHAIN_DIVISOR (1.69) per rung; under the registered KV-bound
+#: limit (alpha = 1, the log-log line of ADR-0156) it halves when the budget
+#: halves, and the smallest class of cd-act1 fell from 78.75 rps at r=1 to below
+#: its chained start of 46.6 qps at r=0.5 on the live pod [V]. A chained rung
+#: whose first window is unsustainable descends one ladder factor per window,
+#: at most this many windows (1.3^4 = 2.86 below the start, 4.8 below the
+#: previous lambda*: the KV-bound ratio 2 with margin), until a sustainable
+#: window brackets lambda* from below. A start from a floor rule keeps its
+#: remedy (--start-qps); the bound keeps a dead rung loud (NONE_SUSTAINABLE).
+LADDER_DESCENT_MAX_STEPS: int = 4
 #: Calibration windows replay the measured pool past W arrivals when the
 #: ladder rate x PROBE_WINDOW_S exceeds the pool; calibration data never
 #: enters confirmatory analysis (calibration.py doctrine), so the runner's
@@ -12081,7 +12092,11 @@ def calibrate_rungs(
     (``_relaunch_step``: prefix mode per the arm, the budget sized on the
     class's shape), then the registered ladder (``geometric_rate_ladder``
     from the start rate, climb until the first unsustainable window or
-    PROBE_MAX_STEPS, then PROBE_BISECT_STEPS arithmetic midpoints), every
+    PROBE_MAX_STEPS, then PROBE_BISECT_STEPS arithmetic midpoints; S2R
+    2026-11-10: a rung whose start came from a chain rule and whose first
+    window is unsustainable first descends one factor per window, at most
+    LADDER_DESCENT_MAX_STEPS windows, and the midpoints then bracket the
+    highest sustainable window followed by an unsustainable one), every
     window one runner invocation of the class cell (``_cell_step(ladder=True)``)
     at that rate into its own §1 run root under ``out_root``; the decision is
     ``decide_lambda_star`` over the steps sorted by rate. The anchor's first
@@ -12267,6 +12282,7 @@ def calibrate_rungs(
                     "first_unsustainable_qps": None,
                     "start_qps": None,
                     "steps": [],
+                    "descent_steps": 0,  # S2R 2026-11-10: one record shape for every label
                 }
                 _flush_partial()
                 previous_lambda = None
@@ -12302,11 +12318,13 @@ def calibrate_rungs(
                         Path(f2_rec["path"]).read_bytes()
                     ).hexdigest()
             candidates: List[Tuple[float, str]] = []
+            chained_bases: List[str] = []  # the chain rules among the candidates (the descent applies)
             if previous_lambda is not None:
                 candidates.append((
                     previous_lambda / LADDER_CHAIN_DIVISOR,
                     f"previous rung lambda* {previous_lambda:.4g} / {LADDER_CHAIN_DIVISOR:g}",
                 ))
+                chained_bases.append(candidates[-1][1])
             own_start = (
                 _class_floor_start(cells)
                 if grid.blocks and previous_lambda is None and role not in ("anchor", RULER_ROLE)
@@ -12333,10 +12351,13 @@ def calibrate_rungs(
                         "(a shorter sequence sustains at least the anchor's rate; one chain "
                         "step below it so a same-capacity class is not read unsustainable)",
                     ))
+                    chained_bases.append(candidates[-1][1])
             start: Optional[float]
             start_basis: Optional[str]
+            chained = False
             if candidates:
                 start, start_basis = max(candidates)
+                chained = start_basis in chained_bases
             elif role == RULER_ROLE:
                 # ADR-0169: from the RULER floor window (or the operator's
                 # start), measured below inside the rung's own try block so a
@@ -12516,8 +12537,27 @@ def calibrate_rungs(
                     steps.append(step)
                     if not step.sustainable:  # cal-v3 (B-2)
                         break
-                if len(steps) >= 2 and not steps[-1].sustainable:
-                    lo, hi = steps[-2].rate_qps, steps[-1].rate_qps
+                # S2R 2026-11-10: a chained start past the rung's capacity (its
+                # first window unsustainable) descends, see LADDER_DESCENT_MAX_STEPS
+                if chained and len(steps) == 1 and not steps[0].sustainable:
+                    log(
+                        f"[calibrate-rungs]   chained start {start:.4g} qps unsustainable at its first window: "
+                        f"descending by {PROBE_LADDER_FACTOR:g} per window, at most {LADDER_DESCENT_MAX_STEPS} windows"
+                    )
+                    rate = float(start)
+                    for _ in range(LADDER_DESCENT_MAX_STEPS):
+                        rate /= PROBE_LADDER_FACTOR
+                        step = _probe_retry(rate, "descent")
+                        steps.append(step)
+                        if step.sustainable:
+                            break
+                # the bisection brackets the highest sustainable rate followed by an
+                # unsustainable one in rate order: the climb's last two windows, or
+                # the descent's sustainable window and the one above it
+                ordered = sorted(steps, key=lambda s: s.rate_qps)
+                brackets = [(a, b) for a, b in zip(ordered, ordered[1:]) if a.sustainable and not b.sustainable]
+                if brackets:
+                    lo, hi = brackets[-1][0].rate_qps, brackets[-1][1].rate_qps
                     for _ in range(PROBE_BISECT_STEPS):
                         mid = (lo + hi) / 2.0
                         step = _probe_retry(mid, "bisect")
@@ -12539,6 +12579,7 @@ def calibrate_rungs(
                     "start_basis": start_basis,
                     "error": str(exc),
                     "steps": step_records,
+                    "descent_steps": sum(1 for s in step_records if s.get("phase") == "descent"),
                 }
                 _flush_partial()
                 previous_lambda = None
@@ -12577,6 +12618,7 @@ def calibrate_rungs(
                 "start_qps": start,
                 "start_basis": start_basis,
                 "steps": step_records,
+                "descent_steps": sum(1 for s in step_records if s.get("phase") == "descent"),  # S2R 2026-11-10
                 "kv_ceiling": kv_ceiling,  # S0F-88 B-11
                 "kv_ceiling_windows": kv_ceiling_windows,
                 "confirm": confirm,  # A16, record only (None off a block session)
@@ -12706,6 +12748,7 @@ def calibrate_rungs(
                 "start_rule": START_QPS_RULE,
                 "start_decode_tokens": LADDER_START_DECODE_TOKENS,
                 "chain_divisor": LADDER_CHAIN_DIVISOR,
+                "descent_max_steps": LADDER_DESCENT_MAX_STEPS,  # S2R 2026-11-10 (review MEDIUM 1)
                 "floor_start_qps": floor_start,
                 "first_start_qps": first_start,
                 "floor": dict(floors),
@@ -12771,6 +12814,7 @@ def calibrate_rungs(
                 "start_rule": START_QPS_RULE,
                 "start_decode_tokens": LADDER_START_DECODE_TOKENS,
                 "chain_divisor": LADDER_CHAIN_DIVISOR,
+                "descent_max_steps": LADDER_DESCENT_MAX_STEPS,  # S2R 2026-11-10 (review MEDIUM 1)
                 "floor_start_qps": floor_start,
                 "first_start_qps": first_start,
                 "floor": dict(floors),
@@ -13205,7 +13249,8 @@ def _cmd_calibrate_rungs(args: argparse.Namespace) -> int:
         print(
             f"[calibrate-rungs] NOT ESTIMATED: {not_estimated}; plan --rung-calibration "
             f"refuses these rungs (LADDER_EXHAUSTED: raise --start-qps or the rung is "
-            "beyond PROBE_MAX_STEPS windows; NONE_SUSTAINABLE: lower --start-qps; "
+            "beyond PROBE_MAX_STEPS windows; NONE_SUSTAINABLE: lower --start-qps (a chained rung "
+            f"already descended up to {LADDER_DESCENT_MAX_STEPS} windows below its start); "
             "RELAUNCH_FAILED / PROBE_FAILED: read the runner and launcher output)",
             file=sys.stderr,
         )

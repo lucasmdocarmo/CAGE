@@ -422,10 +422,13 @@ def test_cell_calibration_validates_identity_fields():
 # --------------------------------------------------------------------------- #
 
 
-def test_probe_step_phase_is_ladder_or_bisect():
+def test_probe_step_phase_is_ladder_bisect_or_descent():
     assert _step(1.0).phase == "ladder"
     bis = ProbeStep(rate_qps=1.5, n_scheduled=10, n_completed=10, throughput_rps=0.1, phase="bisect")
     assert bis.to_manifest()["phase"] == "bisect"
+    # S2R 2026-11-10: a chained rung's step-down windows (run_campaign.LADDER_DESCENT_MAX_STEPS)
+    desc = ProbeStep(rate_qps=1.5, n_scheduled=10, n_completed=10, throughput_rps=0.1, phase="descent")
+    assert desc.to_manifest()["phase"] == "descent"
     with pytest.raises(CalibrationError):
         ProbeStep(rate_qps=1.5, n_scheduled=10, n_completed=10, throughput_rps=0.1, phase="guess")
 

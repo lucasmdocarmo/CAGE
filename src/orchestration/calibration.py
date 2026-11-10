@@ -34,7 +34,10 @@ PRE_REGISTRATION.md; the constants below ARE the registered values):
    says whether the start came from that rule or from the operator, and the
    procedure manifest names the rule as ``start_qps_rule``. Once bracketed, the bracket is
    refined by ``PROBE_BISECT_STEPS`` = 2 midpoint windows (each rung's
-   ``phase`` records "ladder" or "bisect"); the decision rule runs over the
+   ``phase`` records "ladder", "bisect" or, on a chained rung whose first
+   window was unsustainable, "descent": S2R 2026-11-10, one step-down window
+   per ladder factor below the start, bounded by the driver's
+   ``run_campaign.LADDER_DESCENT_MAX_STEPS``); the decision rule runs over the
    rate-sorted steps. Each window is ``PROBE_WINDOW_S`` = 75 s long (inside the charter's
    60–90 s band) with the first ``PROBE_WARMUP_S`` = 10 s trimmed (Jain
    warmup removal, D6 §6.3). A ladder step is SUSTAINABLE iff its completed
@@ -260,9 +263,11 @@ class ProbeStep:
     n_scheduled: int
     n_completed: int
     throughput_rps: float
-    # ADR-0122: which stage probed this rate; "ladder" (the geometric climb)
-    # or "bisect" (a midpoint window inside the bracket). Provenance only:
-    # the decision rule treats every step alike.
+    # ADR-0122: which stage probed this rate; "ladder" (the geometric climb),
+    # "bisect" (a midpoint window inside the bracket) or "descent" (S2R
+    # 2026-11-10: a step-down window below a chained start that was past the
+    # rung's capacity). Provenance only: the decision rule treats every step
+    # alike.
     phase: str = "ladder"
     # B-2 (S0F-88, cal-v3): requests that completed (without error) INSIDE
     # the trimmed window [PROBE_WARMUP_S, PROBE_WINDOW_S), whatever their
@@ -283,8 +288,8 @@ class ProbeStep:
 
     def __post_init__(self) -> None:
         _require_positive_finite("rate_qps", self.rate_qps)
-        if self.phase not in ("ladder", "bisect"):
-            raise CalibrationError("phase", self.phase, "must be 'ladder' or 'bisect'")
+        if self.phase not in ("ladder", "bisect", "descent"):
+            raise CalibrationError("phase", self.phase, "must be 'ladder', 'bisect' or 'descent'")
         n_sched = _require_int("n_scheduled", self.n_scheduled)
         if n_sched <= 0:
             raise CalibrationError("n_scheduled", self.n_scheduled, "must be > 0")

@@ -20,7 +20,7 @@ import math
 import statistics
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pytest
 
@@ -1077,7 +1077,13 @@ class FakeWorld:
         cap_by_arm: Optional[Dict[str, float]] = None, ruler_cap: Optional[float] = None,
         ruler_floor: Tuple[float, float] = (2.3, 0.018), ruler_floor_loaded: bool = False,
         ruler_floor_unloaded_rows: Optional[int] = None, ruler_floor_refusals: int = 0,
+        caps_by_relaunch: Optional[Sequence[float]] = None,
     ):
+        # S2R 2026-11-10: the capacity after the n-th engine relaunch (a rung's
+        # budget changes what the server sustains); the list is consumed in
+        # relaunch order, the last value holds afterwards; None keeps ``cap``
+        self.caps_by_relaunch = list(caps_by_relaunch or [])
+        self.relaunches = 0
         # review 2026-10-13 (ADR-0169 LOW 4): exactly this many unloaded rows in a
         # floor window (the rest loaded), and this many floor windows that the
         # runner "refuses" (exit 1, no rows) before one succeeds
@@ -1102,6 +1108,9 @@ class FakeWorld:
         if "--campaign-root" not in argv:
             if "restart" in argv and self.relaunch_rc == 0:
                 _write_pool_record(env)  # A11: the record the real launchers' capture writes
+                if self.caps_by_relaunch:
+                    self.cap = self.caps_by_relaunch[min(self.relaunches, len(self.caps_by_relaunch) - 1)]
+                self.relaunches += 1
             return self.relaunch_rc if "restart" in argv else 0
         if "--open-loop-warmup-s" in argv and argv[argv.index("--open-loop-warmup-s") + 1] != "0":
             # the real runner refuses the Jain trim in campaign mode (ADR-0055
@@ -1322,6 +1331,7 @@ class TestCalibrateRungs:
         assert {rec["label"] for rec in doc["rungs"].values()} == {rc.RUNG_LABEL_RELAUNCH_FAILED}
         assert world.runner_calls() == []
         assert all(rec["lambda_star_qps"] is None and rec["steps"] == [] for rec in doc["rungs"].values())
+        assert all(rec["descent_steps"] == 0 for rec in doc["rungs"].values())  # review 2026-11-10 LOW 3
         assert world.verbs()[-1] == "stop"
         # the artifact loads (labels are honest) and the plan refuses the rungs
         path = _write_doc(tmp_path, doc, "rungs_vllm.json")
@@ -1388,6 +1398,64 @@ class TestCalibrateRungs:
             len(r["steps"]) for r in doc["rungs"].values())
         roots = {s["root"] for s in doc["rungs"]["1"]["steps"]}
         assert len(roots) == len(doc["rungs"]["1"]["steps"])  # the retry took a fresh root
+
+    def test_a_chained_rung_whose_start_is_past_capacity_descends_and_estimates_s2r_2026_11_10(self, tmp_path):
+        # S2R 2026-11-10 on the live pod: the smallest class read lambda* 78.75 rps
+        # at r=1 and its r=0.5 ladder started chained at 46.6 qps (the previous
+        # lambda* over two ladder steps), past the rung's capacity; one window,
+        # NONE_SUSTAINABLE, fail-fast, stage 5 lost. The chain rule assumes lambda*
+        # falls by at most 1.69 per rung; the KV-bound limit halves it. A chained
+        # rung whose first window is unsustainable now descends one factor per
+        # window, at most LADDER_DESCENT_MAX_STEPS, until a sustainable window
+        # brackets lambda* from below. Here the capacity falls 4x at the r=0.5
+        # relaunch (6 -> 1.5 rps): the chained start 6.67/1.69 = 3.9 qps is past
+        # 1.5/0.9 = 1.67; the descent reaches 1.37 qps on its fourth window
+        world = FakeWorld(cap=6.0, caps_by_relaunch=[6.0, 1.5])
+        doc = _calibrate(tmp_path, world, _pressure_grid())
+        first, second = doc["rungs"]["1"], doc["rungs"]["0.5"]
+        assert first["label"] == "ESTIMATED" and [s["phase"] for s in first["steps"]].count("descent") == 0
+        assert second["label"] == "ESTIMATED", second
+        assert second["start_qps"] == pytest.approx(first["lambda_star_qps"] / PROBE_LADDER_FACTOR ** 2)
+        phases = [s["phase"] for s in second["steps"]]
+        assert phases[:5] == ["ladder", "descent", "descent", "descent", "descent"]
+        assert phases.count("bisect") == PROBE_BISECT_STEPS and len(phases) == 5 + PROBE_BISECT_STEPS
+        rates = [s["rate_qps"] for s in second["steps"][:5]]
+        assert rates == pytest.approx([second["start_qps"] / PROBE_LADDER_FACTOR ** k for k in range(5)])
+        assert [s["attainment"] >= PROBE_ATTAINMENT_MIN for s in second["steps"][:5]] == [False, False, False, False, True]
+        # the bracket: the sustainable descent window below, the lowest unsustainable one above
+        unsustainable_above = 1.5 / PROBE_ATTAINMENT_MIN
+        assert second["sustained_rate_qps"] <= unsustainable_above * 1.01
+        assert second["first_unsustainable_qps"] >= unsustainable_above * 0.99
+        assert rates[4] <= second["sustained_rate_qps"] < second["first_unsustainable_qps"] <= rates[3]
+        bisect = [s["rate_qps"] for s in second["steps"] if s["phase"] == "bisect"]
+        assert all(rates[4] < b < rates[3] for b in bisect)
+        assert second["first_unsustainable_qps"] - second["sustained_rate_qps"] == pytest.approx((rates[3] - rates[4]) / 4, rel=1e-6)
+        assert second["descent_steps"] == 4 and first["descent_steps"] == 0
+        assert doc["complete"] is True
+
+    def test_the_ladder_header_records_the_descent_bound_review_2026_11_10_m1(self, tmp_path):
+        doc = _calibrate(tmp_path, FakeWorld(cap=6.0), _pressure_grid())
+        assert doc["ladder"]["descent_max_steps"] == rc.LADDER_DESCENT_MAX_STEPS == 4
+        assert doc["ladder"]["chain_divisor"] == rc.LADDER_CHAIN_DIVISOR
+
+    def test_a_chained_rung_still_unsustainable_after_the_descent_bound_reads_none_sustainable(self, tmp_path):
+        # the bound keeps a dead rung loud: four descent windows, no sustainable
+        # one, NONE_SUSTAINABLE with the five windows recorded
+        world = FakeWorld(cap=6.0, caps_by_relaunch=[6.0, 0.1])
+        doc = _calibrate(tmp_path, world, _pressure_grid())
+        second = doc["rungs"]["0.5"]
+        assert second["label"] == "NONE_SUSTAINABLE" and second["lambda_star_qps"] is None
+        assert [s["phase"] for s in second["steps"]] == ["ladder"] + ["descent"] * rc.LADDER_DESCENT_MAX_STEPS
+        assert second["descent_steps"] == rc.LADDER_DESCENT_MAX_STEPS
+        assert second["steps"][-1]["rate_qps"] == pytest.approx(second["start_qps"] / PROBE_LADDER_FACTOR ** rc.LADDER_DESCENT_MAX_STEPS)
+
+    def test_a_floor_derived_start_past_capacity_does_not_descend(self, tmp_path):
+        # the first rung starts from the floor rule, not a chain: its remedy stays
+        # --start-qps (test_none_sustainable_and_ladder_exhausted pins the one window)
+        doc = _calibrate(tmp_path, FakeWorld(cap=0.01), _pressure_grid(), rungs=(1.0,))
+        rec = doc["rungs"]["1"]
+        assert rec["label"] == "NONE_SUSTAINABLE" and [s["phase"] for s in rec["steps"]] == ["ladder"]
+        assert rec["descent_steps"] == 0
 
     def test_none_sustainable_and_ladder_exhausted(self, tmp_path):
         tiny = _calibrate(tmp_path / "tiny", FakeWorld(cap=0.01), _pressure_grid(), rungs=(1.0,))
@@ -2204,6 +2272,14 @@ class TestA16ClassFloorStart:
             assert confirm["rate_qps"] == pytest.approx(rec["lambda_star_qps"])
             assert confirm["root"] not in {s["root"] for s in rec["steps"]}  # never in the decision
         assert all(r.get("confirm") is None for r in small["rungs"].values())
+
+    def test_a_class_floor_start_past_capacity_does_not_descend_review_2026_11_10_l1(self, tmp_path):
+        # the A16 own-floor start is a floor rule, not a chain rule: no step-down, the loud label stays
+        doc = self._run(tmp_path, FakeWorld(cap=6.0, cap_by_arm={"retr-trunc": 0.01}))
+        small = next(c for c in doc["classes"].values() if c["role"] == "smallest")
+        first = small["rungs"]["1"]
+        assert first["start_basis"].startswith("A16") and first["label"] == "NONE_SUSTAINABLE"
+        assert [s["phase"] for s in first["steps"]] == ["ladder"] and first["descent_steps"] == 0
 
 
 def test_a_launcher_pool_refusal_stops_the_run_m2(tmp_path, floor_table, stub, monkeypatch, capsys):
