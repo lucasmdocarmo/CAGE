@@ -23,8 +23,19 @@
 # alarm); no ledger -> live listing with unknown age/spend. Never mutates.
 #
 # Usage: scripts/runpod/pod_status.sh [--max-age-hours <n>]
+#        scripts/runpod/pod_status.sh close <pod_id> [--ended-at <RFC3339Z>] --reason <text>
+#   close (item 7, 2026-11-11): the ONE write this script makes. It closes a ledger
+#   create row whose pod is gone without a delete event (a console delete, a pod
+#   that vanished): appends {"event":"delete","by":"owner","closed_late":true,...}
+#   with ts_utc = --ended-at (the instant from the console's billing page) or the
+#   record time (then cost_report.sh calls the hours an upper bound). Fail-closed:
+#   refuses unless `pod_watchdog.sh listed` says NOT LISTED (exit 1; an UNKNOWN
+#   listing judges nothing), refuses a row that already has a delete event, a pod
+#   with no create row, an empty reason, and an --ended-at that is malformed, not
+#   calendar-valid, before the create or in the future. Append-only: no line is
+#   edited. A pod that is still listed is torn down (teardown_pod.sh), not closed.
 # Env:   CAGE_POD_LEDGER  ledger path override (default results/ops/pod_ledger.jsonl)
-# Exit:  0 ok · 1 ALARM (age > --max-age-hours) · nonzero on usage/internal error
+# Exit:  0 ok · 1 ALARM (age > --max-age-hours) or a refused close · nonzero on usage/internal error
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -38,17 +49,103 @@ cleanup() { rm -rf "${TMP:?}"; }
 trap 'rc=$?; cleanup; exit $rc' EXIT
 trap 'exit 130' INT TERM
 
+LEDGER="${CAGE_POD_LEDGER:-$CAGE_ROOT/results/ops/pod_ledger.jsonl}"
+require_cmd python3
+usage() {
+  printf 'usage: %s [--max-age-hours <n>]\n       %s close <pod_id> [--ended-at <RFC3339Z>] --reason <text>\n' "$0" "$0" >&2
+  exit 2
+}
+
+# cmd_close <pod_id> [--ended-at <RFC3339Z>] --reason <text>  (item 7, 2026-11-11)
+# Order: input checks, then the ledger (create row present, no delete row), then
+# ONE listing through pod_watchdog.sh listed (the fail-closed parser, reused and
+# not copied), then one appended line. Every refusal happens before the append.
+cmd_close() {
+  local pod="${1:-}" ended="" reason="" rc=0 now
+  [ -n "$pod" ] || usage
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --ended-at) [ $# -ge 2 ] || die "close: --ended-at requires a value"; ended="$2"; shift 2 ;;
+      --reason)   [ $# -ge 2 ] || die "close: --reason requires a value"; reason="$2"; shift 2 ;;
+      *) printf 'close: unknown argument: %s\n' "$1" >&2; usage ;;
+    esac
+  done
+  printf '%s' "$pod" | grep -qE '^[A-Za-z0-9-]{6,64}$' || die "close: pod_id must match [A-Za-z0-9-]{6,64}: '$pod'"
+  [ -n "$(printf '%s' "$reason" | tr -d '[:space:]')" ] || die "close: --reason <text> is required and may not be blank (it becomes the row's note)"
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  # Ledger checks and the --ended-at checks in one pass (the create's instant is needed for both).
+  CAGE_CLOSE_POD="$pod" CAGE_CLOSE_ENDED="$ended" CAGE_CLOSE_NOW="$now" python3 - "$LEDGER" <<'PY' || rc=$?
+import datetime, json, os, sys
+path = sys.argv[1]; pod = os.environ["CAGE_CLOSE_POD"]; ended = os.environ["CAGE_CLOSE_ENDED"]
+def ts(s):
+    return datetime.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp()
+def refuse(msg):
+    print(f"[cage] FATAL: close: {msg}", file=sys.stderr); sys.exit(1)
+if ended:
+    try:
+        e_ts = ts(ended)
+    except ValueError:
+        refuse(f"--ended-at must be a calendar-valid RFC3339 UTC instant (YYYY-MM-DDTHH:MM:SSZ): '{ended}'")
+    if e_ts > ts(os.environ["CAGE_CLOSE_NOW"]):
+        refuse(f"--ended-at {ended} is in the future (now {os.environ['CAGE_CLOSE_NOW']})")
+create, delete = None, None
+if os.path.isfile(path):
+    for n, raw in enumerate(open(path, encoding="utf-8"), 1):
+        if not raw.strip():
+            continue
+        try:
+            e = json.loads(raw)
+        except ValueError:
+            continue   # cost_report.sh refuses malformed lines loudly; the close judges the well-formed rows
+        if not isinstance(e, dict) or e.get("pod_id") != pod:
+            continue
+        if e.get("event") == "create" and create is None:
+            create = (n, e)
+        elif e.get("event") == "delete" and delete is None:
+            delete = (n, e)
+if create is None:
+    refuse(f"no create event for {pod} in {path}: nothing to close (a delete without a create would be an ORPHAN-DELETE row)")
+if delete is not None:
+    refuse(f"{pod} is already closed by the delete event at line {delete[0]} ({delete[1].get('ts_utc')}, by {delete[1].get('by') or 'teardown'})")
+if ended and e_ts < ts(create[1]["ts_utc"]):
+    refuse(f"--ended-at {ended} is before the create at line {create[0]} ({create[1]['ts_utc']})")
+PY
+  [ "$rc" -eq 0 ] || exit 1
+  # ONE live read, through the watchdog's parser: 0 listed, 1 not listed, 2 unknown.
+  bash "$SCRIPT_DIR/pod_watchdog.sh" listed "$pod" && rc=0 || rc=$?
+  case "$rc" in
+    1) ;;
+    0) die "close: $pod is still listed by 'runpodctl pod list --all': a live pod is torn down (teardown_pod.sh), never closed on paper" ;;
+    *) die "close: the listing is UNKNOWN (pod_watchdog.sh listed rc=$rc: CLI failed, empty, or not a JSON list of pods): nothing is judged; retry when the listing answers" ;;
+  esac
+  mkdir -p "$(dirname "$LEDGER")"
+  CAGE_CLOSE_POD="$pod" CAGE_CLOSE_ENDED="$ended" CAGE_CLOSE_NOW="$now" CAGE_CLOSE_REASON="$reason" python3 - >> "$LEDGER" <<'PY'
+import json, os
+ended, now = os.environ["CAGE_CLOSE_ENDED"], os.environ["CAGE_CLOSE_NOW"]
+print(json.dumps({"ts_utc": ended or now, "pod_id": os.environ["CAGE_CLOSE_POD"], "event": "delete",
+                  "by": "owner", "note": os.environ["CAGE_CLOSE_REASON"], "closed_late": True,
+                  "ended_at_given": bool(ended), "recorded_utc": now}))
+PY
+  if [ -n "$ended" ]; then
+    log "ledger: $pod closed late (delete event by owner, ts_utc $ended from --ended-at) -> $LEDGER"
+  else
+    log "ledger: $pod closed late (delete event by owner, ts_utc $now, the record time: cost_report.sh calls its hours an upper bound) -> $LEDGER"
+  fi
+  exit 0
+}
+
+[ "${1:-}" != close ] || { shift; cmd_close "$@"; }
+
 MAX_AGE_HOURS="24"
 while [ $# -gt 0 ]; do
   case "$1" in
     --max-age-hours) [ $# -ge 2 ] || die "--max-age-hours requires a value"; MAX_AGE_HOURS="$2"; shift 2 ;;
-    -h|--help) printf 'usage: %s [--max-age-hours <n>]\n' "$0" >&2; exit 2 ;;
-    *) printf 'unknown argument: %s\n' "$1" >&2; exit 2 ;;
+    -h|--help) usage ;;
+    *) printf 'unknown argument: %s\n' "$1" >&2; usage ;;
   esac
 done
 printf '%s' "$MAX_AGE_HOURS" | grep -qE '^[0-9]+(\.[0-9]+)?$' || die "--max-age-hours must be numeric: $MAX_AGE_HOURS"
-LEDGER="${CAGE_POD_LEDGER:-$CAGE_ROOT/results/ops/pod_ledger.jsonl}"
-require_cmd python3
 
 # --- live listing (read-only; degrade LOUDLY, never silently) ----------------
 LIVE_OK=0
@@ -152,7 +249,7 @@ for pid, c in creates.items():
     if pid in deletes or pid in live:
         continue
     if live_ok:
-        rows.append((pid, c.get("name", "?"), "-", "-", "ledger-OPEN but not listed — verify, then close via teardown's delete event"))
+        rows.append((pid, c.get("name", "?"), "-", "-", f"ledger-OPEN but not listed: verify in the console, then `pod_status.sh close {pid} --ended-at <billing-page instant> --reason <why>` (item 7)"))
     else:  # offline watchdog: open ledger pods are assumed live and alarmed
         up, spend = describe(pid, c)
         rows.append((pid, c.get("name", "?"), up, spend, "OPEN in ledger (live listing unavailable)"))

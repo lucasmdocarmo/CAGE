@@ -292,3 +292,40 @@ cage_kv_pool_capture_pd() {
         --role "prefill=$prefill_log" --role "decode=$decode_log" \
         --out "$log_dir/CURRENT.pd.kvpool.json" ${extra[@]+"${extra[@]}"}
 }
+
+# item 4 (2026-11-11, S2R pre-restart specs L2, option (a)): the launchers'
+# readiness loops end in the tick that shows a fatal start line or a dead
+# launch pid instead of waiting out *_START_TIMEOUT (ADR-0198's port
+# collision cost two 600 s timeouts on the H200 pod). Shared by both
+# launchers; neither helper decides anything, the loops do.
+#
+# $1 = the start log, $2.. = fixed strings (each read in a live log, see the
+# launcher's *_FATAL_PATTERNS). Prints the first log line holding any of them,
+# matched case-insensitively (uvicorn writes "address already in use", the
+# OSError form is capitalized); exit 1 when none, or when the log is empty.
+cage_start_fatal_line() {
+    local log="$1"; shift
+    local -a pats=()
+    local p
+    for p in "$@"; do pats+=( -e "$p" ); done
+    [ "${#pats[@]}" -gt 0 ] && [ -s "$log" ] || return 1
+    grep -m1 -iF "${pats[@]}" -- "$log" 2>/dev/null
+}
+
+# The evidence a failed start leaves on the console: the last 40 lines of the
+# start log ($1) and whatever holds the port ($2): ss when present (the Linux
+# pods), else lsof (the Mac), else one line saying neither exists.
+cage_start_failure_dump() {
+    local log="$1" port="$2"
+    echo "---- last 40 lines of $log ----"
+    tail -n 40 -- "$log" 2>/dev/null || echo "(no log)"
+    echo "---- sockets on port $port ----"
+    if command -v ss >/dev/null 2>&1; then
+        ss -tanp 2>/dev/null | grep -F -- ":$port " || echo "(nothing on :$port)"
+    elif command -v lsof >/dev/null 2>&1; then
+        lsof -nP -iTCP:"$port" 2>/dev/null || echo "(nothing on :$port)"
+    else
+        echo "(neither ss nor lsof on this host)"
+    fi
+    echo "----"
+}

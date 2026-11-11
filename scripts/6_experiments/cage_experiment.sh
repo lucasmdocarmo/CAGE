@@ -60,6 +60,13 @@ BILLABLE_STAGES="provision teardown"
 # whose entry checks the watchdog (ship through pull; teardown deletes the pod).
 POD_STAGES="ship setup validate calibrate plan run monitor seal score collect pull"
 pod_stage() { case " $POD_STAGES " in *" $1 "*) return 0 ;; esac; return 1; }
+# Item 6 (2026-11-11, S2R_PRE_RESTART_SPECS, option (a)): the stages whose entry
+# proves the container disk still holds the venv python and the model cache (a
+# stop erases that disk; block B-4 option a keeps the weights and the venvs on it).
+# Setup is the repair, not a guarded stage; monitor touches no pod; pull rescues the
+# tree from the volume and needs no venv, so a cleared disk must not refuse it.
+DISK_GUARD_STAGES="validate calibrate plan run seal score collect"
+disk_guard_stage() { case " $DISK_GUARD_STAGES " in *" $1 "*) return 0 ;; esac; return 1; }
 
 usage() {
   sed -n '6,8p' "$0" >&2
@@ -257,20 +264,32 @@ stage_bound_minutes() { # G16: the pod-side bound of ONE stage, in minutes (one 
     *)         printf '%s' 0 ;;   # ship and monitor: minutes inside the neighbors' slack
   esac
 }
-remaining_bound_minutes() { # G16: the pod-side bounds from stage $1 (inclusive) through pull
+remaining_bound_minutes() { # G16: the pod-side bounds from stage $1 through stage ${2:-pull}, both inclusive
   local total=0 s seen=0
   for s in $POD_STAGES; do
     [ "$s" = "$1" ] && seen=1
     [ "$seen" -eq 1 ] || continue
     total=$(( total + $(stage_bound_minutes "$s") ))
+    [ "$s" != "${2:-pull}" ] || break
   done
   printf '%s' "$total"
+}
+guard_last_stage() { # item 2 (2026-11-11, S2R_PRE_RESTART_SPECS): the last pod stage THIS invocation runs
+  # The watchdog guard's need ends here: --only names it; --to names it when it is a pod
+  # stage (a Mac stage past pull leaves pull); a run to the end needs through pull. On the
+  # S2R pod (2026-11-10) `--only ship --redo` was refused with 29 h left because the need
+  # summed ship through pull (32.6 h) for a 0 min stage. The stage 0 seatbelt sum and the
+  # G17 money gate keep the full sum (seatbelt_need_minutes): the pod bills through it.
+  local last="pull"
+  if [ -n "$ONLY" ]; then last="$ONLY"; elif [ -n "$TO" ] && pod_stage "$TO"; then last="$TO"; fi
+  printf '%s' "$last"
 }
 seatbelt_need_minutes() { # the readiness wait plus every pod-side stage bound, in minutes
   printf '%s' "$(( POD_READY_TIMEOUT_S / 60 + $(remaining_bound_minutes ship) ))"
 }
 watchdog_guard() { # G16: before a pod-side stage, the seatbelt is ALIVE and its deadline covers the remaining bounds
-  local out dl left need
+  local out dl left need last
+  last="$(guard_last_stage)"
   out="$(bash "$SCRIPTS/runpod/pod_watchdog.sh" status "$POD_ID" 2>&1)" || true
   if ! printf '%s\n' "$out" | grep -q "watchdog=ALIVE"; then
     printf '  [FAIL] the seatbelt is not ALIVE for %s before stage %s (a Mac reboot or a disarm leaves the pod unguarded): re-arm it (bash %s/runpod/pod_watchdog.sh arm %s <deadline>) and resume\n' "$POD_ID" "$1" "$SCRIPTS" "$POD_ID"
@@ -280,14 +299,27 @@ watchdog_guard() { # G16: before a pod-side stage, the seatbelt is ALIVE and its
   dl="$(printf '%s\n' "$out" | sed -nE 's/.*deadline=([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z).*/\1/p' | head -1)"
   [ -n "$dl" ] || { say "watchdog ALIVE for $POD_ID (no deadline field in its status: the time left is not judged)"; state note "$1" "watchdog ALIVE, deadline not judged (no deadline field)"; return 0; }
   left="$("$PY3" -c 'import sys, datetime; d = datetime.datetime.strptime(sys.argv[1], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc); print(int((d - datetime.datetime.now(datetime.timezone.utc)).total_seconds() // 60))' "$dl" 2>/dev/null || echo "")"
-  need="$(remaining_bound_minutes "$1")"
+  need="$(remaining_bound_minutes "$1" "$last")"
   [ -n "$left" ] || state note "$1" "watchdog ALIVE, deadline $dl unparsed: the time left was not judged (review batch 4, L2)"
   if [ -n "$left" ] && [ "$left" -lt "$need" ]; then
-    printf '  [FAIL] the seatbelt fires in %s min (deadline %s) but the stages from %s through pull need %s min (G16): re-arm the watchdog with a later deadline, then resume\n' "$left" "$dl" "$1" "$need"
+    printf '  [FAIL] the seatbelt fires in %s min (deadline %s) but the stages from %s through %s need %s min (G16): re-arm the watchdog with a later deadline, then resume\n' "$left" "$dl" "$1" "$last" "$need"
     return 1
   fi
-  say "watchdog ALIVE for $POD_ID: ${left:-?} min left, the stages from $1 through pull need $need min"
+  say "watchdog ALIVE for $POD_ID: ${left:-?} min left, the stages from $1 through $last need $need min"
   return 0
+}
+container_disk_guard() { # item 6: one ssh probe before a post-setup pod stage submits anything
+  # The 2026-11-11 stop (04:15Z) of pod nho3bc3xhdgs6v ended in a deleted pod: RunPod
+  # erases the container disk on stop and restarts a stopped pod only on its own machine
+  # [V, concept docs 2026-11-11]. The venv python (POD_VENV_BIN, a link into the container
+  # disk) and the model cache (POD_HF_CACHE) are what every later job needs first.
+  local rc=0
+  pssh "test -x $POD_VENV_BIN/python && test -d $POD_HF_CACHE" >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    0) say "container disk guard: $POD_VENV_BIN/python and $POD_HF_CACHE present (item 6)"; return 0 ;;
+    255) printf '  [FAIL] the container disk guard could not reach the pod (ssh rc=255): nothing is judged on a dead channel; retry when ssh answers (item 6)\n'; return 1 ;;
+    *) printf '  [FAIL] container disk cleared (a stop?): the pod has no %s/python or no %s (probe rc=%s). A stopped pod loses its container disk, the weights and the venvs with it (item 6, 2026-11-11): never stop a pod, delete and re-provision; here, resume with --from setup --redo\n' "$POD_VENV_BIN" "$POD_HF_CACHE" "$rc"; return 1 ;;
+  esac
 }
 pod_hours_bound() { # S0F-88 P-4: the pod bills through every stage bound, not the run (HOURS) alone
   awk -v m="$(seatbelt_need_minutes)" 'BEGIN { printf "%.1f", m / 60 }'
@@ -666,6 +698,7 @@ portal_block() {
   printf '  resource: network volume   id: %s   (KEPT: never deleted by a script, owner rule 2026-10-22)\n' "$VOL_ID"
   printf '  verdict:  %s\n' "$verdict"
   printf '  watchdog: bash %s/runpod/pod_watchdog.sh status %s\n' "$SCRIPTS" "$POD_ID"
+  printf '  rule:     never STOP this pod from the console: a stop erases the container disk (the weights, the venvs) and the pod restarts only on its own machine, if at all; delete and re-provision instead (item 6, 2026-11-11)\n'
   # stage 8 (monitor) only reads alerts.log, which is append-only: its resume is the next stage
   local from="${CUR_STAGE:-preflight-mac}"; [ "$from" = "monitor" ] && from="seal"
   printf '  resume:   bash %s %s --date %s --from %s%s\n' "$0" "$EXP" "$DATE" "$from" "$( is_billable "$from" && printf ' --yes %s' "$from" || true)"
@@ -685,6 +718,42 @@ stop_monitor() {
     say "monitor stopped (pid $pid)"
   fi
   state put monitor.pid ""
+}
+
+# Item 3 (2026-11-11, S2R_PRE_RESTART_SPECS): a measurement stage (5, 6) runs only on
+# a tree whose pod suite passed on THIS sha and THIS pod (stage 4 records both), or
+# under a profile waiver that names the shipped sha and a reason (printed loud, noted
+# in state). Before this, suite_pod.sha lived inside stage 4 alone and carried no pod:
+# a re-shipped tree reached calibrate and plan unproven, and a new pod inherited the
+# old pod's proof. SUITE_ON_POD=0 opts out (the Mac suite at stage 0 is the gate). A
+# legacy state without suite_pod.pod is not a proof (fail closed). Plan mode prints only.
+pod_suite_proof() {
+  [ "${SUITE_ON_POD:-0}" = "1" ] || { say "pod suite proof: SUITE_ON_POD=${SUITE_ON_POD:-0}, the profile opted out (the Mac suite at stage 0 is the gate; item 3)"; return 0; }
+  local ssha spod bsha
+  ssha="$(state get suite_pod.sha 2>/dev/null || true)"; spod="$(state get suite_pod.pod 2>/dev/null || true)"; bsha="$(state get build.sha 2>/dev/null || true)"
+  if [ -n "$bsha" ] && [ "$ssha" = "$bsha" ] && [ -n "$spod" ] && [ "$spod" = "$POD_ID" ]; then
+    say "pod suite proof: passed on $bsha/$POD_ID (item 3)"; return 0
+  fi
+  if [ -n "${POD_SUITE_WAIVER_SHA:-}" ] && [ "$POD_SUITE_WAIVER_SHA" = "$bsha" ] && [ -n "$(printf '%s' "${POD_SUITE_WAIVER_REASON:-}" | tr -d '[:space:]')" ]; then
+    say "pod suite proof WAIVED for $bsha/$POD_ID by the profile: POD_SUITE_WAIVER_REASON=\"$POD_SUITE_WAIVER_REASON\" (item 3; the suite's last pass was ${ssha:-none}/${spod:-none})"
+    plan_only || state note "$CUR_STAGE" "pod suite proof waived for $bsha/$POD_ID: $POD_SUITE_WAIVER_REASON (item 3, $(utc))"
+    return 0
+  fi
+  [ -z "${POD_SUITE_WAIVER_SHA:-}" ] || [ "$POD_SUITE_WAIVER_SHA" = "$bsha" ] || say "POD_SUITE_WAIVER_SHA=$POD_SUITE_WAIVER_SHA is not the shipped sha $bsha: the waiver does not apply (item 3)"
+  if plan_only; then
+    printf '  [plan] %-28s the pod suite passed on the shipped sha and this pod (state suite_pod), or the profile waives that sha (POD_SUITE_WAIVER_SHA with POD_SUITE_WAIVER_REASON)\n' "pod suite proof (item 3)"
+    return 0
+  fi
+  printf '  [FAIL] the pod suite passed on %s/%s but the tree is %s/%s: run `--only validate --redo`, or write POD_SUITE_WAIVER_SHA=%s and POD_SUITE_WAIVER_REASON in the profile (item 3, 2026-11-11)\n' "${ssha:-none}" "${spod:-none}" "$bsha" "$POD_ID" "$bsha"
+  return 1
+}
+
+# Item 5 (2026-11-11): the key the three calibration skip marks compare,
+# pod.id:build.calib_hash. A state packaged before item 5 has no hash and reads
+# "unhashed": never equal to a pod:sha mark, so it remeasures once on that pod.
+calib_done_key() {
+  local h; h="$(state get build.calib_hash 2>/dev/null || true)"
+  printf '%s:%s' "$(state get pod.id 2>/dev/null || true)" "${h:-unhashed}"
 }
 
 # ---------------------------------------------------------------------------
@@ -820,6 +889,12 @@ PY
     printf '%s' "$build" | grep -q '^dirty=0$' || { printf '  [FAIL] BUILD_INFO is not dirty=0 (commit first):\n%s\n' "$build"; return 1; }
     state put build.sha "$(printf '%s' "$build" | sed -n 's/^sha=//p')"
     state put build.tarball "$tarball"
+    # Item 5 (2026-11-11, option (a)): the calibration skip keys compare this
+    # content hash (shipped scripts/, src/, configs/, data/manifests/ and the
+    # resolved profile sans comments), not build.sha, so a doc-only or test-only
+    # re-ship keeps every measurement and any code or profile change remeasures.
+    local chash; chash="$("$PY" "$SCRIPT_DIR/calib_hash.py" --tarball "$tarball" --profile "$EXTRAS/profile.env")" || { printf '  [FAIL] calib_hash.py could not hash %s (item 5)\n' "$tarball"; return 1; }
+    state put build.calib_hash "$chash"
   fi
   run_step 0 "freeze file present" -- test -f "$FREEZE_FILE" || return 1
   # Every manifest the plan and the calibration will name must exist in the
@@ -1336,13 +1411,16 @@ stage_validate() {
     # A stage 4 retry on the same shipped code does not rerun the pod suite
     # (2026-10-07: six retries reran the 7-minute suite every time); the sha it
     # passed on is recorded, and a re-ship (a new build.sha) runs it again.
-    local suite_sha build_sha
-    suite_sha="$(state get suite_pod.sha 2>/dev/null || true)"; build_sha="$(state get build.sha 2>/dev/null || true)"
-    if ! plan_only && [ -n "$build_sha" ] && [ "$suite_sha" = "$build_sha" ]; then
-      say "pod suite already passed on sha $build_sha: skipped on this retry"
+    # Item 3 (2026-11-11, S2R_PRE_RESTART_SPECS): the pod it passed on is recorded
+    # too, and the skip needs both: a new pod with the same sha reruns the suite
+    # (the proof stages 5 and 6 demand, pod_suite_proof, is on this sha AND this pod).
+    local suite_sha suite_pod build_sha
+    suite_sha="$(state get suite_pod.sha 2>/dev/null || true)"; suite_pod="$(state get suite_pod.pod 2>/dev/null || true)"; build_sha="$(state get build.sha 2>/dev/null || true)"
+    if ! plan_only && [ -n "$build_sha" ] && [ "$suite_sha" = "$build_sha" ] && [ "$suite_pod" = "$POD_ID" ]; then
+      say "pod suite already passed on sha $build_sha and pod $POD_ID: skipped on this retry"
     else
       job_run suite_pod "$POD_SUITE_BOUND_S" "cd $POD_REPO && env $RUN_ENV_UNSET $POD_PYTHON -m pytest -q -p no:cacheprovider" "$LAND/logs/setup" || return 1
-      plan_only || state put suite_pod.sha "$build_sha"
+      plan_only || { state put suite_pod.sha "$build_sha"; state put suite_pod.pod "$POD_ID"; }
     fi
   fi
   # P-1 (S0F-88, R17): the live-load gate once more on the pod, where the
@@ -1678,11 +1756,12 @@ stage_validate() {
 
 stage_calibrate() {
   pod_env
+  pod_suite_proof || return 1   # item 3: the pod suite passed on this sha and pod, or a named waiver
   local e launcher api out stamp
   # Review 2026-10-13 item 3: per-engine resume. An engine whose calibration
   # or ladder passed on THIS pod and build is not rerun when the stage is
   # repeated after the other engine failed (a 7 to 9 h saving per resume).
-  local done_key; done_key="$(state get pod.id 2>/dev/null || true):$(state get build.sha 2>/dev/null || true)"
+  local done_key; done_key="$(calib_done_key)"   # item 5: pod:calib_hash, not pod:sha
   # S2 block F batch 5 (review 2026-11-03 LOW 3): the rung set and the F-5 ladder check
   # are resolved HERE, before the floor jobs, so a refusal (an absent manifest, a grid the
   # verb rejects) costs no pod time; the ladder jobs that consume them follow the floor table.
@@ -1852,7 +1931,7 @@ class_ceiling_ladders() {
   # --fail-fast: a lambda* label never gates a ceiling, and a rung with no
   # queued window leaves its class on the absolute bar, recorded.
   local done_key e out item qm2="" reh2="" rungs root step_to=""
-  done_key="$(state get pod.id 2>/dev/null || true):$(state get build.sha 2>/dev/null || true)"
+  done_key="$(calib_done_key)"   # item 5: pod:calib_hash, not pod:sha
   # review 2026-10-25 M4: these jobs start and stop engines; never beside a live run job
   if ! plan_only && [ -f "$JOBS/run.json" ] && [ "$(bash "$PODJOB" status run 2>/dev/null || true)" = "RUNNING" ]; then
     printf '  [FAIL] the run job is RUNNING on the pod: the ceiling ladders, the re-label and the drift window would run beside it (ADR-0177); wait for it to end\n'
@@ -1904,6 +1983,7 @@ ceiling_replan_followups() {
 
 stage_plan() {
   pod_env
+  pod_suite_proof || return 1   # item 3: the pod suite passed on this sha and pod, or a named waiver
   budget_cut_check || return 1  # ADR-0190 (review 2026-11-05 LOW 4): a --from plan after a profile edit
   local qm cal e item
   qm=""; for item in $QUERY_MANIFESTS; do qm="$qm --query-manifest $item"; done
@@ -2646,6 +2726,13 @@ run_stage() {
     set +e; watchdog_guard "$name"; rc=$?; set -e
     if [ "$rc" -ne 0 ]; then
       state end "$name" "$rc"; say "stage $name FAILED (rc=$rc): the seatbelt check refused it"; portal_block; return 1
+    fi
+    # item 6: the container disk still holds what the stage's jobs need
+    if disk_guard_stage "$name"; then
+      set +e; container_disk_guard; rc=$?; set -e
+      if [ "$rc" -ne 0 ]; then
+        state end "$name" "$rc"; say "stage $name FAILED (rc=$rc): the container disk guard refused it"; portal_block; return 1
+      fi
     fi
   fi
   set +e; "$fn"; rc=$?; set -e

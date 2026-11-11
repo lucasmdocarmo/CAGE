@@ -964,10 +964,15 @@ RERANK_POOL = 10
 #: 'rerank' = dense retrieval + the pinned cross-encoder over a RERANK_POOL
 #: pool, 'dense' = the same retrieval with ranking DISABLED ('none' is the
 #: runner's documented off switch, normalize_reranker_model) and no pool.
-#: bm25/rrf have no registered argv here yet: enumerating them refuses
+#: 'bm25' (item 9, owner 2026-11-11, ADR-0202) = lexical retrieval over the
+#: same chunk store with ranking DISABLED; the runner builds the BM25 index
+#: on the pod at the first bm25 cell (run_experiment.py ensure_bm25_index)
+#: and never loads the dense encoder for it, so the A5 embedding pins ride
+#: its argv unused. rrf has no registered argv here: enumerating it refuses
 #: (fail closed) rather than guessing.
 RETRIEVER_ARGV: Dict[str, Tuple[str, ...]] = {
     "dense": ("--retriever", "dense", "--reranker-model", "none"),
+    "bm25": ("--retriever", "bm25", "--reranker-model", "none"),
     # B-6 (S0F-88, owner ruling R8, reverses ADR-0123(b) for these cells):
     # the cross-encoder runs on the GPU. On CPU it took 6.16 h of the 9.84 h
     # S0 attempt 4 run (0.31 h of it serving) and 9 min of every 10.5 min
@@ -2068,6 +2073,14 @@ class SessionGrid:
     # coordinate, so the default rows stay byte-identical. Empty everywhere but
     # cd-act1, which probes B3 on SGLang with the extra_buffer Mamba scheduler.
     f1_variant_cells: Tuple[Tuple[str, str, str], ...] = ()
+    # Item 9 (owner 2026-11-11, ADR-0202): (baseline_id, engine, retriever)
+    # no-load F1 references of a numbered baseline's arm served under another
+    # registered retriever (RETRIEVER_ARGV), one cell each on every f1 dataset.
+    # The retriever is a row-key coordinate; the cell keeps the baseline's code
+    # and its prefix-OFF relaunch, so every other row stays byte-identical.
+    # Empty everywhere but cd-act1, which reads B5 over BM25 on both engines
+    # (B5-bm25, ADR-0101's name) beside the reranked dense B6.
+    f1_retriever_cells: Tuple[Tuple[str, str, str], ...] = ()
     replications: int = REPLICATIONS
     # Registered BEHAVIOR knobs (reviewable in the plan header — these are
     # design registrations, not measurements, so they live HERE, never as
@@ -2898,6 +2911,9 @@ SESSION_GRIDS["cd-act1"] = SessionGrid(
     # ADR-0195 (decision 2 option 3): the one extra-buffer probe, B3 on SGLang
     # at no load, read beside the default B3 reference on the same engine
     f1_variant_cells=(("B3", "sglang", "extra_buffer"),),
+    # item 9 (owner 2026-11-11, ADR-0202): B5's arm over BM25, one no-load
+    # reference per engine; this session serves no dense B5
+    f1_retriever_cells=(("B5", "vllm", "bm25"), ("B5", "sglang", "bm25")),
     replications=1,
     corpus_prefix_budget_tokens=S2_CORPUS_BLOCK_TOKENS,
     corpus_trunc_budgets=S2_TRUNC_RUNGS,
@@ -4078,6 +4094,13 @@ RUN_CELL_SECONDS: Dict[Tuple[str, str], Tuple[float, float]] = {
     ("sglang", "rerank"): (73.0, 35.1),
     ("vllm", "none"): (40.8, 17.4), ("vllm", "dense"): (43.1, 33.4),
     ("vllm", "rerank"): (52.9, 34.1),
+    # [A] item 9 (owner 2026-11-11, ADR-0202): no bm25 window is measured yet;
+    # each engine's dense row stands in for its bm25 references (the bm25 leg
+    # loads no encoder, run_experiment.py 3613; its first cell builds the BM25
+    # index on the pod, a time [?] until measured), so the plan projects the
+    # two cells instead of refusing them as unmeasured. Replace with the first
+    # measured bm25 windows.
+    ("sglang", "bm25"): (42.6, 32.2), ("vllm", "bm25"): (43.1, 33.4),
 }
 #: A9 item 3 (owner 2026-10-20): text compression per prepared request,
 #: charged on top of the retr-comp cell's rerank row (which pools every
@@ -4479,6 +4502,30 @@ def enumerate_cells(grid: SessionGrid) -> List[PlannedCell]:
         for dataset in grid.f1_datasets:
             for spec in _rung_specs(bid, engine=engine, family="F1", engine_variant=variant):
                 cells.append(_planned(spec, bid, dataset))
+
+    # Item 9 (owner 2026-11-11, ADR-0202): the retriever references, F1 cells
+    # of a numbered baseline's arm served under another registered retriever
+    # (B5 over BM25: B5-bm25, ADR-0101's name). The triple is checked here so
+    # an unregistered retriever, an unknown baseline, or the baseline's own
+    # retriever refuses before any cell is planned. The cell keeps the
+    # baseline's code (the sort, the row class and the plan record read it)
+    # and differs from the baseline's own cell by the retriever coordinate.
+    for bid, engine, retriever in grid.f1_retriever_cells:
+        if retriever not in RETRIEVER_ARGV:
+            raise PlanError(
+                f"f1_retriever_cells names retriever {retriever!r} on {bid} but "
+                f"RETRIEVER_ARGV registers no argv for it (known: {sorted(RETRIEVER_ARGV)})"
+            )
+        if bid not in BASELINES:
+            raise PlanError(f"f1_retriever_cells names unknown baseline {bid!r} (known: {list(BASELINES)})")
+        if BASELINES[bid].retriever == retriever:  # type: ignore[index]
+            raise PlanError(
+                f"f1_retriever_cells names {bid} with its own retriever {retriever!r}; "
+                "that is the baseline's F1 cell itself (f1_baselines), not a reference"
+            )
+        for dataset in grid.f1_datasets:
+            for spec in _rung_specs(bid, engine=engine, family="F1"):
+                cells.append(_planned(replace(spec, retriever=retriever), bid, dataset))
 
     # F1 HF-oracle reduced slice (§7.3: hf carries family F1 only —
     # CellSpec itself refuses anything else, making the guard structural).
@@ -6369,6 +6416,19 @@ def pass_ceiling_blocked_on(
     )
 
 
+def _baseline_label(cell: PlannedCell) -> str:
+    """The code the runner's --baseline-label (the manifest's ``baseline``
+    field) names the cell by: the numbered code, or, for a retriever
+    reference (SessionGrid.f1_retriever_cells, item 9, ADR-0202), the code
+    with its retriever (B5-bm25, ADR-0101's name). The numbered layer's maps
+    stay untouched; the plan record keeps the numbered code and the row key
+    carries the retriever either way."""
+    own = BASELINES[cell.baseline_id].retriever  # type: ignore[index]
+    if cell.spec.retriever != own:
+        return f"{cell.baseline_id}-{cell.spec.retriever}"
+    return cell.baseline_id
+
+
 def _cell_step(
     cell: PlannedCell,
     grid: SessionGrid,
@@ -6396,7 +6456,7 @@ def _cell_step(
         "--baseline",
         ARM_RUNNER_BASELINE[spec.arm],
         "--baseline-label",
-        f"{cell.baseline_id}_{spec.arm}",
+        f"{_baseline_label(cell)}_{spec.arm}",
         "--model",
         HF_ID_OF_SLUG[spec.model],
         "--backend",
@@ -6962,6 +7022,7 @@ def _session_engines(grid: SessionGrid) -> FrozenSet[str]:
     engines = set(grid.f1_engines) | set(grid.f2_engines) | set(grid.f3_engines)
     engines |= {engine for _bid, engine, _topology in grid.dist_cells}
     engines |= {engine for _bid, engine, _variant in grid.f1_variant_cells}
+    engines |= {engine for _bid, engine, _retriever in grid.f1_retriever_cells}
     return frozenset(engines - {"hf"})
 
 

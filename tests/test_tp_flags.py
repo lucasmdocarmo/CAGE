@@ -46,6 +46,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import time
@@ -104,9 +105,13 @@ def stub_bin(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return d
 
 
-def _run_launcher(script: Path, stub_bin: Path, *args: str, **env_extra: str):
+def _run_launcher(script: Path, stub_bin: Path, *args: str, _extra_bin: Path | None = None, **env_extra: str):
     env = _clean_env(**env_extra)
     env["PATH"] = f"{stub_bin}:{env.get('PATH', '/usr/bin:/bin')}"
+    # item 4 (2026-11-11): a per-test stub dir ahead of the module stubs (an
+    # engine that writes a fatal line, a curl that answers ready).
+    if _extra_bin is not None:
+        env["PATH"] = f"{_extra_bin}:{env['PATH']}"
     # item 10 (2026-09-26): the SGLang launcher fails closed unless its
     # interpreter imports sglang; the stub interpreter satisfies the probe so
     # the composed argv is reached (the vLLM launcher ignores the variable).
@@ -482,3 +487,131 @@ def test_sglang_launch_strips_the_shell_port_variable_from_the_server_env(
     # only that one variable is withheld: the rest of the environment still arrives
     assert env.get("SGLANG_START_TIMEOUT") == "0"
     assert env.get("CAGE_TEST_ENV_DUMP") == str(dump)
+
+
+# ---------------------------------------------------------------------------
+# item 4 (2026-11-11, S2R pre-restart specs L2, option (a)): the readiness
+# loops of both launchers end in the tick that shows a fatal start line or a
+# dead launch pid, with the last 40 start-log lines, the socket table of the
+# port and a stop_server, instead of waiting out *_START_TIMEOUT (600 s on the
+# pod: the ADR-0198 port collision cost two of them). Every pattern below was
+# read in a live log, never taken from memory:
+#   vLLM   experiments/S0/2026-10-08_1322/logs/engines/vllm/vllm_Qwen_Qwen3-14B_20261008_212751.log
+#          and _215604.log (both lines); the second is also the HTTP 500 body
+#          of the PD smoke of 2026-11-10 (experiments/S2R/2026-11-09_2233/extras/pd_smoke/pd_smoke.json).
+#   SGLang ADR-0198 (uvicorn's bind failure, lowercase) and the collision log
+#          of 2026-11-11 (the ZMQ XPUB bind, S2R_PRE_RESTART_SPECS item 4).
+# The ready path is accepted exactly as before (the ready check runs first, so
+# a pid that dies after the ready line still returns 0).
+# ---------------------------------------------------------------------------
+
+VLLM_FATAL_LIVE = [
+    "Engine core initialization failed. See root cause above. Failed core proc(s): {}",
+    "EngineCore encountered an issue. See stack trace (above) for the root cause.",
+]
+SGLANG_FATAL_LIVE = [
+    "[Errno 98] error while attempting to bind on address ('127.0.0.1', 30000): address already in use",
+    "zmq.error.ZMQError: Address already in use",
+]
+SGLANG_READY = "The server is fired up and ready to roll!"
+
+
+def _code_lines(text: str) -> str:
+    """The script without its comment lines (a curl named in a comment is not a call)."""
+    return "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+
+
+def _stub(d: Path, name: str, body: str) -> Path:
+    p = d / name
+    p.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+    p.chmod(0o755)
+    return p
+
+
+def _sglang_stub_body(on_launch: str) -> str:
+    # the import gate (-c) and the version probe exit 0 silently; the launch (-m) runs on_launch
+    return 'if [ "$1" = "-m" ]; then\n' + on_launch + '\nfi\nexit 0\n'
+
+
+def _run_fail_fast(script: Path, stub_bin: Path, extra_bin: Path, timeout_s: int, **env: str):
+    env = dict(env, CAGE_KV_POOL_CAPTURE_RETRIES="0", CAGE_KV_POOL_CAPTURE_INTERVAL="0")
+    if script is VLLM_SH:
+        env["VLLM_START_TIMEOUT"] = str(timeout_s)
+    else:
+        env["SGLANG_START_TIMEOUT"] = str(timeout_s)
+        env["CAGE_SGLANG_PYTHON"] = str(extra_bin / "sglang-python")
+    t0 = time.monotonic()
+    proc = _run_launcher(script, stub_bin, "start", "fake/test-model", _extra_bin=extra_bin, **env)
+    return proc, time.monotonic() - t0
+
+
+def _assert_failed_fast(proc, elapsed: float, engine: str, port: int) -> None:
+    assert proc.returncode == 1, f"rc={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    assert elapsed < 10, f"the loop must end within a tick, took {elapsed:.1f}s"
+    assert "last 40 lines of" in proc.stdout and f"sockets on port {port}" in proc.stdout, proc.stdout
+    assert f"Stopping {engine} server" in proc.stdout, "the failure path must stop the half-started server"
+    assert "Server ready" not in proc.stdout
+
+
+@pytest.mark.parametrize("line", VLLM_FATAL_LIVE, ids=["init-failed", "engine-core-issue"])
+def test_vllm_start_fails_within_a_tick_on_a_fatal_line_item4(stub_bin: Path, tmp_path: Path, line: str) -> None:
+    d = tmp_path / "bin"; d.mkdir()
+    _stub(d, "vllm", "printf '%s\\n' " + shlex.quote(line) + "\nsleep 5\nexit 0\n")
+    proc, elapsed = _run_fail_fast(VLLM_SH, stub_bin, d, 60)
+    _assert_failed_fast(proc, elapsed, "vLLM", 8000)
+    assert "fatal start line" in proc.stdout and line in proc.stdout, proc.stdout
+
+
+@pytest.mark.parametrize("line", SGLANG_FATAL_LIVE, ids=["uvicorn-bind", "zmq-bind"])
+def test_sglang_start_fails_within_a_tick_on_a_fatal_line_item4(stub_bin: Path, tmp_path: Path, line: str) -> None:
+    d = tmp_path / "bin"; d.mkdir()
+    _stub(d, "sglang-python", _sglang_stub_body("printf '%s\\n' " + shlex.quote(line) + "\nsleep 5"))
+    proc, elapsed = _run_fail_fast(SGLANG_SH, stub_bin, d, 60)
+    _assert_failed_fast(proc, elapsed, "SGLang", 30000)
+    assert "fatal start line" in proc.stdout and line in proc.stdout, proc.stdout
+
+
+def test_both_launchers_fail_within_a_tick_when_the_launch_pid_exits_item4(stub_bin: Path, tmp_path: Path) -> None:
+    d = tmp_path / "bin"; d.mkdir()
+    _stub(d, "vllm", "exit 3\n")
+    _stub(d, "sglang-python", _sglang_stub_body("exit 3"))
+    for script, engine, port in ((VLLM_SH, "vLLM", 8000), (SGLANG_SH, "SGLang", 30000)):
+        proc, elapsed = _run_fail_fast(script, stub_bin, d, 60)
+        _assert_failed_fast(proc, elapsed, engine, port)
+        assert "exited" in proc.stdout and "fatal start line" not in proc.stdout, proc.stdout
+
+
+def test_both_launchers_still_return_0_on_the_ready_path_item4(stub_bin: Path, tmp_path: Path) -> None:
+    """A ready server is accepted exactly as before: /v1/models names the model
+    (vLLM also answers /health; SGLang's log also carries its ready line). The
+    engine stubs outlive the check by a few seconds and exit on their own."""
+    d = tmp_path / "bin"; d.mkdir()
+    _stub(d, "curl", 'case "$*" in *"/v1/models"*) printf \'{"data":[{"id":"fake/test-model"}]}\\n\' ;; esac\nexit 0\n')
+    _stub(d, "vllm", "sleep 5\nexit 0\n")
+    _stub(d, "sglang-python", _sglang_stub_body("printf '%s\\n' " + shlex.quote(SGLANG_READY) + "\nsleep 5"))
+    for script in (VLLM_SH, SGLANG_SH):
+        proc, elapsed = _run_fail_fast(script, stub_bin, d, 60)
+        assert proc.returncode == 0, f"{script.name}: rc={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        assert "Server ready with model: fake/test-model" in proc.stdout
+        assert "fatal start line" not in proc.stdout and "exited" not in proc.stdout
+        assert elapsed < 15, f"{script.name}: ready path took {elapsed:.1f}s"
+
+
+def test_readiness_loops_check_ready_first_bound_by_a_wall_clock_with_bounded_curl_item4() -> None:
+    """Static pins: in each loop the ready check precedes the fatal-line check,
+    which precedes the pid check (ready wins when both hold); the bound is the
+    SECONDS wall clock, not a count of sleeps; every curl carries --max-time 5;
+    the live pattern lists are the ones the behavioral tests above exercise."""
+    for script, ready_marker, patterns in (
+        (VLLM_SH, 'if [ "$loaded" = "$model" ]; then', ("Engine core initialization failed", "EngineCore encountered an issue")),
+        (SGLANG_SH, 'grep -qF -- "$SGLANG_READY_LINE"', ("address already in use", "zmq.error.ZMQError")),
+    ):
+        text = script.read_text(encoding="utf-8")
+        loop = text[text.index("Waiting for server to start"):text.index("stop_server()")]
+        assert loop.index(ready_marker) < loop.index("cage_start_fatal_line") < loop.index('kill -0 "$server_pid"'), script.name
+        assert "SECONDS" in loop and "waited=$((waited + 2))" not in loop, script.name
+        code = _code_lines(text)
+        curls = re.findall(r"curl [^\n|]*", code)
+        assert curls and all("--max-time 5" in c for c in curls), (script.name, curls)
+        for p in patterns:
+            assert f'"{p}"' in code, (script.name, p)

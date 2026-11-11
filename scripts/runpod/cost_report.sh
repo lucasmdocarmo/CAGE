@@ -10,7 +10,11 @@
 # client-side seatbelt fired). Fully OFFLINE by default, no network, no CLI: pairs create/delete
 # per pod_id, computes runtime and cost (runtime × price_per_hour_usd ×
 # gpu_count), prints a per-pod table + total. Open pods (create without a
-# delete) use NOW as the end and are flagged LIVE/BILLING.
+# delete) use NOW as the end and are flagged LIVE/BILLING. A delete event
+# written by `pod_status.sh close` (item 7, 2026-11-11: "closed_late": true)
+# is flagged CLOSED-LATE; when it carries no --ended-at instant
+# ("ended_at_given": false) its hours ran to the record time and are an
+# upper bound, and the row says so.
 #
 # --billing additionally shells `runpodctl billing pods` and `runpodctl billing
 # network-volume` for the ACCOUNT view (JSON; `[]` = no billed usage in the
@@ -91,6 +95,9 @@ for n, raw in enumerate(open(path, encoding="utf-8"), 1):
             refuse(n, "watchdog_pid must be int|null (the client-side seatbelt's pid)", raw)
     if e["event"] == "delete" and e.get("by") is not None and not isinstance(e["by"], str):
         refuse(n, "delete event 'by' must be string|null (e.g. \"watchdog\")", raw)
+    for k in ("closed_late", "ended_at_given"):
+        if e["event"] == "delete" and e.get(k) is not None and not isinstance(e[k], bool):
+            refuse(n, f"delete event {k!r} must be true|false|absent (pod_status.sh close writes it)", raw)
     try:
         e["_ts"] = ts(e["ts_utc"])
     except ValueError:
@@ -106,7 +113,7 @@ for e in events:
     else:
         slot[e["event"]] = e
 now = time.time()
-total, unknown, live = 0.0, 0, 0
+total, unknown, live, late = 0.0, 0, 0, 0
 print(f"{'POD_ID':<20} {'NAME':<20} {'GPU':<26} {'CREATED_UTC':<20} {'END_UTC':<20} "
       f"{'HOURS':>7} {'$/H':>7} {'COST_USD':>9}  FLAGS")
 for pid, slot in sorted(pods.items(), key=lambda kv: kv[1].get("create", kv[1].get("delete"))["_ts"]):
@@ -122,6 +129,9 @@ for pid, slot in sorted(pods.items(), key=lambda kv: kv[1].get("create", kv[1].g
     flags = "" if d else "LIVE/BILLING"
     if not d:
         live += 1
+    elif d.get("closed_late") is True:
+        late += 1
+        flags = "CLOSED-LATE" if d.get("ended_at_given") else "CLOSED-LATE (hours = upper bound: no --ended-at, closed at the record time)"
     if isinstance(price, (int, float)):
         cost = hours * price * gc
         total += cost
@@ -137,6 +147,9 @@ print(f"TOTAL (known prices): ${total:.2f} across {len(pods)} pod(s); "
 if live:
     print("[cost_report] NOTE: LIVE/BILLING pods accrue until teardown_pod.sh runs — "
           "this total grows in real time.")
+if late:
+    print(f"[cost_report] NOTE: {late} row(s) CLOSED-LATE by pod_status.sh close (item 7): the pod was gone "
+          "before the delete was recorded; `runpodctl billing pods` is the authority on their real spend.")
 PY
   [ "$rc" -eq 0 ] || exit "$rc"
 fi

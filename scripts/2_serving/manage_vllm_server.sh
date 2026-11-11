@@ -88,6 +88,12 @@ case "${1:-}" in
 esac
 
 PORT="${VLLM_PORT:-8000}"
+# item 4 (2026-11-11): fatal start lines, each read in a live log, never from
+# memory: experiments/S0/2026-10-08_1322/logs/engines/vllm/vllm_Qwen_Qwen3-14B_20261008_212751.log:291
+# and _215604.log:285 (the first), the same two logs and the HTTP 500 body of
+# experiments/S2R/2026-11-09_2233/extras/pd_smoke/pd_smoke.json (the second).
+# cage_start_fatal_line matches them as fixed strings, case-insensitively.
+VLLM_FATAL_PATTERNS=( "Engine core initialization failed" "EngineCore encountered an issue" )
 LOG_DIR="${CAGE_LOG_ROOT:-$PROJECT_DIR/logs}/vllm"
 # Daemon discipline: the launched server's PID is recorded here at start and cleared
 # at stop, so status/stop have an authoritative handle instead of pgrep-guessing.
@@ -120,7 +126,7 @@ get_vllm_pid() {
 }
 
 get_loaded_model() {
-    curl -s "http://localhost:${PORT}/v1/models" 2>/dev/null | \
+    curl -s --max-time 5 "http://localhost:${PORT}/v1/models" 2>/dev/null | \
         python3 -c "import sys, json; data=json.load(sys.stdin); print(data['data'][0]['id'] if data.get('data') else '')" 2>/dev/null || echo ""
 }
 get_server_prefix_cache_mode() {
@@ -472,10 +478,14 @@ PYEOF
     # set -e. Allow 5 min by default; override with VLLM_START_TIMEOUT.
     echo "Waiting for server to start..."
     local max_wait="${VLLM_START_TIMEOUT:-300}"
-    local waited=0
-    local loaded
-    while [ "$waited" -lt "$max_wait" ]; do
-        if curl -s "http://localhost:${PORT}/health" > /dev/null 2>&1; then
+    # item 4 (2026-11-11): the bound is the SECONDS wall clock, not a count of
+    # sleeps (a curl that hung made a tick longer than 2 s and the old counter
+    # under-reported the wait). Each tick: ready check first (it wins when both
+    # hold), then a fatal start line, then the launch pid.
+    local t0=$SECONDS
+    local loaded fatal
+    while [ $((SECONDS - t0)) -lt "$max_wait" ]; do
+        if curl -s --max-time 5 "http://localhost:${PORT}/health" > /dev/null 2>&1; then
             loaded=$(get_loaded_model)
             if [ "$loaded" = "$model" ]; then
                 echo -e "${GREEN}✓ Server ready with model: $model${NC}"
@@ -487,13 +497,27 @@ PYEOF
                 return 0
             fi
         fi
+        if fatal=$(cage_start_fatal_line "$log_file" "${VLLM_FATAL_PATTERNS[@]}"); then
+            echo -e "\n${RED}✗ vLLM start failed after $((SECONDS - t0))s on a fatal start line: ${fatal}${NC}"
+            cage_start_failure_dump "$log_file" "$PORT"
+            stop_server
+            return 1
+        fi
+        if ! kill -0 "$server_pid" 2>/dev/null; then
+            echo -e "\n${RED}✗ vLLM start failed after $((SECONDS - t0))s: the launch pid $server_pid exited${NC}"
+            cage_start_failure_dump "$log_file" "$PORT"
+            stop_server
+            return 1
+        fi
         sleep 2
-        waited=$((waited + 2))
         echo -n "."
     done
-    
+
     echo -e "\n${RED}✗ Server failed to start within ${max_wait}s${NC}"
     echo "Check logs: $log_file"
+    # Fail closed (item 4, as the SGLang launcher has since 2026-10-08): a
+    # start that timed out must not leave a half-started server behind.
+    stop_server
     return 1
 }
 

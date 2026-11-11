@@ -22,6 +22,8 @@
 #   pod_watchdog.sh disarm <pod_id>
 #   pod_watchdog.sh run    <pod_id> <deadline>   the loop body; `arm` spawns it detached
 #   pod_watchdog.sh check  <deadline>            validate a deadline (format, calendar, future) without arming; exit 0 or 1
+#   pod_watchdog.sh listed <pod_id>              the fail-closed listing parser as a verb: exit 0 listed, 1 not listed,
+#                                                2 unknown (item 7, 2026-11-11; pod_status.sh close reuses it, no copy)
 #
 # State (beside the pod ledger, default results/ops/; override CAGE_POD_LEDGER):
 #   watchdog_<pod_id>.pid       the loop's PID (identity-checked on read: J8 PID-reuse guard); removing it disarms
@@ -61,7 +63,7 @@ trap 'rc=$?; cleanup; exit $rc' EXIT
 trap 'exit 130' INT TERM
 
 usage() {
-  printf 'usage: %s arm <pod_id> <deadline-RFC3339Z> | status [<pod_id>] | disarm <pod_id> | run <pod_id> <deadline-RFC3339Z> | check <deadline-RFC3339Z>\n' "$0" >&2
+  printf 'usage: %s arm <pod_id> <deadline-RFC3339Z> | status [<pod_id>] | disarm <pod_id> | run <pod_id> <deadline-RFC3339Z> | check <deadline-RFC3339Z> | listed <pod_id>\n' "$0" >&2
   exit 2
 }
 
@@ -289,6 +291,16 @@ cmd_check() {  # the one validator provision_pod.sh calls BEFORE the plan print 
   printf 'OK %s\n' "$dl_epoch"
 }
 
+cmd_listed() {  # pod_listed as a verb (item 7): the exit code IS the answer, 0 listed, 1 not listed, 2 unknown
+  local pod="$1" rc=0
+  valid_pod_id "$pod" || die "listed: bad pod_id '$pod'"
+  printf '%s' "$CLI_TIMEOUT" | grep -qE '^[1-9][0-9]*$' || die "CAGE_WATCHDOG_CLI_TIMEOUT must be a positive integer: $CLI_TIMEOUT"
+  require_cmd runpodctl "brew install runpod/runpodctl/runpodctl"
+  require_cmd python3
+  pod_listed "$pod" || rc=$?
+  exit "$rc"
+}
+
 cmd_status() {
   local want="${1:-}" pf pod pid state dl found=0
   for pf in "$STATE_DIR"/watchdog_*.pid; do
@@ -335,6 +347,7 @@ case "$1" in
   status)    [ $# -le 2 ] || usage; cmd_status "${2:-}" ;;
   disarm)    [ $# -eq 2 ] || usage; cmd_disarm "$2" ;;
   check)     [ $# -eq 2 ] || usage; cmd_check "$2" ;;
+  listed)    [ $# -eq 2 ] || usage; cmd_listed "$2" ;;
   -h|--help) usage ;;
   *) printf 'unknown subcommand: %s\n' "$1" >&2; usage ;;
 esac

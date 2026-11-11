@@ -147,14 +147,18 @@ cmd_submit() {
   # S0 attempt 4's client at about 1,005 in flight). The runners raise it
   # again themselves; this layer covers every other pod job too. A refusal
   # leaves the limit as it was and the job runs.
+  # Item 10 (2026-11-11, S2R_PRE_RESTART_SPECS): the monitor bundle reads the
+  # pid file every tick and took "present, empty, no status" for CRASHED. The
+  # previous attempt's pid file leaves with the status file, and the new one
+  # lands by rename, so a tick during a submit reads NONE, then RUNNING.
   local pid
   pid="$(rssh "
     mkdir -p $RDIR
-    rm -f $RDIR/$name.status
+    rm -f $RDIR/$name.status $RDIR/$name.pid
     : > $RDIR/$name.log
     printf '%s' '$enc' | base64 -d > $RDIR/$name.cmd
     nohup setsid bash -c '( ulimit -Sn \$(ulimit -Hn) 2>/dev/null || true; PYTHONUNBUFFERED=1 bash $RDIR/$name.cmd ) >> $RDIR/$name.log 2>&1; echo \$? > $RDIR/$name.status' >/dev/null 2>&1 &
-    echo \$! > $RDIR/$name.pid
+    echo \$! > $RDIR/$name.pid.tmp && mv -f $RDIR/$name.pid.tmp $RDIR/$name.pid
     echo \$!
   " | tr -d '\r\n ')"
   [ -n "$pid" ] || die "no remote pid for '$name' (ssh problem?)"

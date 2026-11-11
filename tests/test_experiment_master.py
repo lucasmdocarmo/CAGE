@@ -202,7 +202,8 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         echo "package_repo $*" >> "$CAGE_TEST_LOG"
         out="${1:-/tmp/x.tar.gz}"; d="$(mktemp -d)"
         printf 'sha=%s\ndirty=%s\npackaged_at=2026-10-06T00:00:00Z\n' "${CAGE_TEST_SHA:-0123456789abcdef0123456789abcdef01234567}" "${CAGE_TEST_DIRTY:-0}" > "$d/BUILD_INFO"
-        tar czf "$out" -C "$d" BUILD_INFO
+        # item 5: CAGE_TEST_TAR_DIR adds a content tree (./scripts/x members, as bsdtar names them)
+        tar czf "$out" -C "$d" BUILD_INFO ${CAGE_TEST_TAR_DIR:+-C "$CAGE_TEST_TAR_DIR" .}
         echo "PACKAGED  $out"
         ''')
     _w(fake_scripts / "runpod" / "provision_pod.sh", r'''
@@ -1389,7 +1390,9 @@ def test_stage_5_resumes_per_engine_and_carries_the_fail_fast_and_timeout_knobs(
     assert proc.returncode == 1, proc.stdout[-4000:]
     st = _state(world)
     assert st["stages"].get("calibrate", {}).get("status") == "failed", proc.stdout[-3000:] + proc.stderr[-1000:]
-    done_key = f"{st['pod']['id']}:{st['build']['sha']}"
+    # item 5 (2026-11-11): the key is pod:calib_hash (the content hash), no longer pod:sha
+    assert re.fullmatch(r"[0-9a-f]{64}", st["build"]["calib_hash"]) and st["build"]["calib_hash"] != st["build"]["sha"]
+    done_key = f"{st['pod']['id']}:{st['build']['calib_hash']}"
     assert st["calibration"]["cell_done"]["vllm"] == done_key and st["calibration"]["rungs_done"]["vllm"] == done_key
     assert "rungs_done" not in st["calibration"] or "sglang" not in st["calibration"]["rungs_done"]
     rungs_cmd = (world["home"] / ".cage_jobs" / "calibrate_rungs_vllm.cmd").read_text(encoding="utf-8")
@@ -1871,6 +1874,141 @@ def test_the_pod_suite_runs_once_per_shipped_sha_and_again_after_a_reship(world:
     assert "already passed" not in proc.stdout and submits() == 2
 
 
+def test_a_reship_with_the_same_content_keeps_the_calibration_and_a_code_change_remeasures_item5(world: Dict[str, Path], tmp_path: Path) -> None:
+    """Item 5 (2026-11-11, S2R_PRE_RESTART_SPECS L4, option (a)): the three skip keys compare
+    pod.id:build.calib_hash, a sha256 over the shipped scripts/, src/, configs/, data/manifests/
+    and the resolved profile sans comments, written beside build.sha when the repo is packaged.
+    A re-package under a new sha with the same content keeps every measurement; a changed
+    scripts/ byte remeasures. (SUITE_ON_POD is unset on this profile, so stage 5 needs no
+    new pod-suite pass after the re-ship; item 3.)"""
+    proc = _master(world, "--yes", "provision", "--to", "calibrate")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    st = _state(world)
+    h0, sha0 = st["build"]["calib_hash"], st["build"]["sha"]
+    assert re.fullmatch(r"[0-9a-f]{64}", h0) and h0 != sha0
+    key0 = f"{st['pod']['id']}:{h0}"
+    assert st["calibration"]["cell_done"]["vllm"] == key0 and st["calibration"]["rungs_done"]["vllm"] == key0
+    # one submit = one decode line writing the remote .cmd (status probes name the file too)
+    jobs = lambda: sum(1 for c in _calls(world) if c.rstrip().endswith(("base64 -d > ~/.cage_jobs/calibrate_vllm.cmd", "base64 -d > ~/.cage_jobs/calibrate_rungs_vllm.cmd")))
+    n0 = jobs()
+    assert n0 == 2
+    ours = {"CAGE_TEST_PODS": '[{"id": "pod123"}]', "CAGE_TEST_VOLUMES": '[{"id": "vol123"}]'}
+    # a doc-only commit: new sha, same content
+    sha1 = "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+    assert _master(world, "--only", "preflight-mac", "--redo", CAGE_TEST_SHA=sha1, **ours).returncode == 0
+    assert _master(world, "--only", "ship", "--redo", CAGE_TEST_SHA=sha1, **ours).returncode == 0
+    st = _state(world)
+    assert st["build"]["sha"] == sha1 and st["build"]["calib_hash"] == h0
+    proc = _master(world, "--only", "calibrate", "--redo")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert "calibrate_cell vllm already passed on this pod and build" in proc.stdout
+    assert "rung calibration vllm already passed on this pod and build" in proc.stdout
+    assert jobs() == n0
+    # a launcher byte changed: new content, remeasure
+    tree = tmp_path / "tree"; (tree / "scripts" / "2_serving").mkdir(parents=True)
+    (tree / "scripts" / "2_serving" / "manage_vllm_server.sh").write_text("#!/bin/bash\necho changed\n", encoding="utf-8")
+    sha2 = "0000000000000000000000000000000000000002"
+    assert _master(world, "--only", "preflight-mac", "--redo", CAGE_TEST_SHA=sha2, CAGE_TEST_TAR_DIR=str(tree), **ours).returncode == 0
+    assert _master(world, "--only", "ship", "--redo", CAGE_TEST_SHA=sha2, **ours).returncode == 0
+    st = _state(world)
+    h2 = st["build"]["calib_hash"]
+    assert re.fullmatch(r"[0-9a-f]{64}", h2) and h2 != h0
+    proc = _master(world, "--only", "calibrate", "--redo")
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert "already passed on this pod and build" not in proc.stdout
+    assert jobs() == n0 + 2
+    assert _state(world)["calibration"]["cell_done"]["vllm"] == f"{st['pod']['id']}:{h2}"
+
+
+def test_calibrate_and_plan_need_the_pod_suite_proof_on_this_sha_and_pod_item3(world: Dict[str, Path], tmp_path: Path) -> None:
+    """Item 3 (2026-11-11, S2R_PRE_RESTART_SPECS): suite_pod.sha was written inside stage 4 only
+    and carried no pod id, so a re-shipped tree reached calibrate and plan without the pod suite
+    having run on it, and a new pod inherited the old pod's proof. Stage 4 now records the pod
+    beside the sha, its skip rule needs both, and stages 5 and 6 open with a proof step: the
+    suite passed on this sha and this pod, or the profile waives that sha with a reason (loud,
+    noted in state). A legacy state without the pod fails closed; plan mode prints only."""
+    old = "0123456789abcdef0123456789abcdef01234567"; new = "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+    base = world["profile"].read_text(encoding="utf-8") + "\nSUITE_ON_POD=1\n"
+    prof = tmp_path / "S1_suite3.env"; prof.write_text(base, encoding="utf-8"); world["profile"] = prof
+    assert _master(world, "--yes", "provision", "--to", "validate").returncode == 0
+    assert _state(world)["suite_pod"] == {"sha": old, "pod": "pod123"}
+    ours = {"CAGE_TEST_PODS": '[{"id": "pod123"}]', "CAGE_TEST_VOLUMES": '[{"id": "vol123"}]'}
+    assert _master(world, "--only", "preflight-mac", "--redo", CAGE_TEST_SHA=new, **ours).returncode == 0
+    assert _master(world, "--only", "ship", "--redo", CAGE_TEST_SHA=new, **ours).returncode == 0
+    # the re-shipped tree: calibrate refuses before any job, naming both pairs and the two ways out
+    calib_submits = lambda: sum(1 for c in _calls(world) if c.rstrip().endswith("base64 -d > ~/.cage_jobs/calibrate_vllm.cmd"))
+    proc = _master(world, "--only", "calibrate")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert f"the pod suite passed on {old}/pod123 but the tree is {new}/pod123: run `--only validate --redo`, or write POD_SUITE_WAIVER_SHA={new} and POD_SUITE_WAIVER_REASON in the profile" in proc.stdout
+    assert calib_submits() == 0 and _state(world)["stages"]["calibrate"]["status"] == "failed"
+    # plan mode prints the proof and never fails
+    proc = _master(world, "--plan", "--only", "calibrate")
+    assert proc.returncode == 0 and "[plan] pod suite proof (item 3)" in proc.stdout
+    # a waiver for another sha does not apply; the one for the shipped sha does, loud and noted
+    prof.write_text(base + f"POD_SUITE_WAIVER_SHA={old}\nPOD_SUITE_WAIVER_REASON=\"doc-only re-ship\"\n", encoding="utf-8")
+    proc = _master(world, "--only", "calibrate")
+    assert proc.returncode == 1 and f"POD_SUITE_WAIVER_SHA={old} is not the shipped sha {new}: the waiver does not apply" in proc.stdout
+    prof.write_text(base + f"POD_SUITE_WAIVER_SHA={new}\nPOD_SUITE_WAIVER_REASON=\"doc-only re-ship\"\n", encoding="utf-8")
+    proc = _master(world, "--only", "calibrate")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    assert f"pod suite proof WAIVED for {new}/pod123 by the profile: POD_SUITE_WAIVER_REASON=\"doc-only re-ship\"" in proc.stdout
+    assert any("pod suite proof waived" in n and "doc-only re-ship" in n for n in _state(world)["stages"]["calibrate"]["notes"])
+    # the plan stage runs the same proof: without the waiver it refuses too
+    prof.write_text(base, encoding="utf-8")
+    proc = _master(world, "--only", "plan")
+    assert proc.returncode == 1 and f"the pod suite passed on {old}/pod123 but the tree is {new}/pod123" in proc.stdout
+    assert _state(world)["stages"]["plan"]["status"] == "failed"
+    # a legacy state (sha without pod) is not a proof: fail closed
+    st_path = world["exp_root"] / "S1" / DATE / "extras" / "state.json"
+    st = json.loads(st_path.read_text(encoding="utf-8")); st["suite_pod"] = {"sha": new}; st_path.write_text(json.dumps(st), encoding="utf-8")
+    proc = _master(world, "--only", "plan")
+    assert proc.returncode == 1 and f"the pod suite passed on {new}/none but the tree is {new}/pod123" in proc.stdout
+    # stage 4 on a NEW pod with the same sha reruns the suite (the skip needs the pod too) and records that pod
+    st = json.loads(st_path.read_text(encoding="utf-8")); st["suite_pod"] = {"sha": new, "pod": "pod123"}; st["pod"]["id"] = "pod999"
+    st_path.write_text(json.dumps(st), encoding="utf-8")
+    suite_submits = lambda: sum(1 for c in _calls(world) if c.rstrip().endswith("base64 -d > ~/.cage_jobs/suite_pod.cmd"))
+    before = suite_submits()
+    proc = _master(world, "--only", "validate", "--redo")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    assert "already passed" not in proc.stdout and suite_submits() == before + 1
+    assert _state(world)["suite_pod"] == {"sha": new, "pod": "pod999"}
+
+
+def test_a_cleared_container_disk_refuses_every_post_setup_pod_stage_before_any_job_item6(world: Dict[str, Path]) -> None:
+    """Item 6 (2026-11-11, S2R_PRE_RESTART_SPECS, option (a)): RunPod erases the container disk
+    on a stop, and the weights and the venvs live there (block B-4 option a); no stage after
+    setup re-proved them, so a resumed stage would submit a job onto an empty disk. Every pod
+    stage from validate through collect now opens with one ssh probe of the venv python and the
+    model cache and refuses with the never-stop rule before any job; setup itself is not guarded
+    (it is the repair) and pull is not (it rescues the tree from the volume and needs no venv).
+    The PORTAL block carries the rule on every print."""
+    assert _master(world, "--yes", "provision", "--to", "setup").returncode == 0
+    cache = world["home"] / ".cache" / "huggingface"
+    assert cache.is_dir()
+    shutil.rmtree(cache)
+    submits = lambda: sum(1 for c in _calls(world) if "base64 -d > ~/.cage_jobs/" in c)
+    before = submits()
+    proc = _master(world, "--from", "validate", "--to", "validate")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert f"[FAIL] container disk cleared (a stop?): the pod has no {world['pod_repo']}/cage-env/bin/python or no {cache}" in proc.stdout
+    assert "never stop a pod, delete and re-provision; here, resume with --from setup --redo" in proc.stdout
+    assert "never STOP this pod from the console" in proc.stdout     # the PORTAL block's rule line
+    assert submits() == before and _state(world)["stages"]["validate"]["status"] == "failed"
+    # setup is the repair: it is not guarded and recreates the cache directory
+    proc = _master(world, "--from", "setup", "--redo", "--to", "setup")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    assert "container disk guard" not in proc.stdout and cache.is_dir()
+    proc = _master(world, "--from", "validate", "--to", "validate")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    assert f"container disk guard: {world['pod_repo']}/cage-env/bin/python and {cache} present (item 6)" in proc.stdout
+    # a dead channel judges nothing: the probe's failure is named as ssh, not as a cleared disk
+    (world["home"] / ".ssh_fail").write_text("9", encoding="utf-8")
+    proc = _master(world, "--from", "validate", "--redo", "--to", "validate", CAGE_SSH_RETRY_S="0")
+    assert proc.returncode == 1 and "the container disk guard could not reach the pod (ssh rc=255)" in proc.stdout
+    assert "container disk cleared" not in proc.stdout
+    (world["home"] / ".ssh_fail").write_text("0", encoding="utf-8")
+
+
 def test_a_transient_ssh_failure_is_retried_and_a_persistent_one_fails_the_step(world: Dict[str, Path]) -> None:
     # ADR-0161 (S0 attempt 2, 2026-10-10 01:29Z): one timed-out channel ended the
     # run while the pod job ran on. Idempotent round trips (pssh, pscp_to,
@@ -2016,6 +2154,40 @@ def test_the_seatbelt_guard_refuses_a_pod_stage_when_the_deadline_is_short_g16(w
     _w(world["scripts"] / "runpod" / "pod_watchdog.sh", "#!/bin/bash\necho \"pod=$2 watchdog=DEAD pid=? deadline=? log=/dev/null\"\n")
     proc = _master(world, "--from", "ship", "--redo")
     assert proc.returncode == 1 and "the seatbelt is not ALIVE for pod123 before stage ship" in proc.stdout
+
+
+def test_the_seatbelt_guard_needs_only_the_stages_this_invocation_runs_item2(world: Dict[str, Path]) -> None:
+    """Item 2 (2026-11-11, S2R_PRE_RESTART_SPECS): the G16 guard summed the bounds from the
+    stage through pull on every invocation, so `--only ship --redo` on the S2R pod was refused
+    with 29 h left against a 0 min stage. The need now ends at the last pod stage THIS
+    invocation runs (--only names it; --to names it when it is a pod stage; else pull), and the
+    refusal names both ends. The stage 0 seatbelt sum and the G17 money gate keep the full sum."""
+    assert _master(world, "--yes", "provision", "--to", "ship").returncode == 0
+    full_need = _state(world)["cost"]["pod_bound_need_usd"]
+    # the fake watchdog now reports a deadline 20 min away
+    _w(world["scripts"] / "runpod" / "pod_watchdog.sh",
+       "#!/bin/bash\necho \"pod_watchdog $*\" >> \"$CAGE_TEST_LOG\"\n"
+       "dl=$(python3 -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=20)).strftime(\"%Y-%m-%dT%H:%M:%SZ\"))')\n"
+       "echo \"pod=$2 watchdog=ALIVE pid=1 deadline=$dl log=/dev/null\"\n")
+    # --only ship: ship bills inside its neighbors' slack (bound 0), so 20 min covers it
+    proc = _master(world, "--only", "ship", "--redo")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    assert "the stages from ship through ship need 0 min" in proc.stdout
+    # --to setup: ship and setup (1 min) are what this invocation runs; both guards pass and setup runs
+    proc = _master(world, "--from", "ship", "--redo", "--to", "setup")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    assert "the stages from ship through setup need 1 min" in proc.stdout
+    assert "the stages from setup through setup need 1 min" in proc.stdout
+    assert _state(world)["stages"]["setup"]["status"] == "passed"
+    # no --to: the remainder through pull (680 min) is refused, both ends named
+    proc = _master(world, "--from", "validate")
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert "the stages from validate through pull need 680 min (G16)" in proc.stdout
+    # --to a Mac stage past pull: the last pod stage is still pull
+    proc = _master(world, "--from", "validate", "--to", "analyze")
+    assert proc.returncode == 1 and "the stages from validate through pull need 680 min (G16)" in proc.stdout
+    # the money gate's full sum is untouched
+    assert _state(world)["cost"]["pod_bound_need_usd"] == full_need
 
 
 def test_a_resume_reuses_the_job_that_finished_while_the_master_was_gone_g5(world: Dict[str, Path]) -> None:

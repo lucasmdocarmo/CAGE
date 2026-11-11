@@ -31,7 +31,9 @@
 # MON_BLIP_TICKS ticks in a row (review 2026-10-13 item 16); watchdog not ALIVE;
 # seatbelt under --seatbelt-floor-min (60) whatever the job state, because the
 # seatbelt deletes the pod mid-score or mid-pull just the same (review
-# 2026-10-06, HIGH 4); balance under the floor; the job CRASHED; a NEW failure
+# 2026-10-06, HIGH 4); balance under the floor; the job CRASHED (a pid file that
+# is present and EMPTY is a submit in flight, STARTING, never CRASHED: item 10,
+# 2026-11-11, the pid lands by rename in pod_job.sh); a NEW failure
 # sentinel (the baseline moves only on a tick whose ssh answered); the journal
 # older than --stall-min with GPU utilization under 5 percent (the idle-cell
 # shape). SOFT: a verdict that is not healthy; a new Traceback; a sync failure
@@ -97,7 +99,7 @@ r=\$(find '$ROOT/cells' -name regime.json 2>/dev/null | head -200 | xargs ls -t 
 case \"\$r\" in */regime.json) echo \"REGIME=\$(tr -d '\n' < \"\$r\" | cut -c1-300)\" ;; *) echo REGIME= ;; esac
 echo \"GPU=\$(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)\"
 echo \"COMPUTE_APPS=\$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . || true)\"
-if [ -f ~/.cage_jobs/$JOB.status ]; then echo \"JOB_STATUS=\$(cat ~/.cage_jobs/$JOB.status)\"; elif [ -f ~/.cage_jobs/$JOB.pid ] && kill -0 \$(cat ~/.cage_jobs/$JOB.pid) 2>/dev/null; then echo JOB_STATUS=RUNNING; elif [ -f ~/.cage_jobs/$JOB.pid ]; then echo JOB_STATUS=CRASHED; else echo JOB_STATUS=NONE; fi
+if [ -f ~/.cage_jobs/$JOB.status ]; then echo \"JOB_STATUS=\$(cat ~/.cage_jobs/$JOB.status)\"; elif [ -f ~/.cage_jobs/$JOB.pid ] && [ ! -s ~/.cage_jobs/$JOB.pid ]; then echo JOB_STATUS=STARTING; elif [ -f ~/.cage_jobs/$JOB.pid ] && kill -0 \$(cat ~/.cage_jobs/$JOB.pid) 2>/dev/null; then echo JOB_STATUS=RUNNING; elif [ -f ~/.cage_jobs/$JOB.pid ]; then echo JOB_STATUS=CRASHED; else echo JOB_STATUS=NONE; fi
 echo \"SYNC_OK_MTIME=\$(stat -c %Y .agent/last_sync_ok_$BACKEND 2>/dev/null || echo 0)\"
 echo \"SYNC_FAIL_MTIME=\$(stat -c %Y .agent/last_sync_fail_$BACKEND 2>/dev/null || echo 0)\"
 echo ERRLINES_BEGIN

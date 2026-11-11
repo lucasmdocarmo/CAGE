@@ -5946,21 +5946,22 @@ class TestS2RegisterBlockA:
         assert plan["session"] == "cd-act1" and plan["model"] == "qwen3-next-80b"
         # rows: references of the 5 core arms x 2 engines plus B8 on both (12,
         # both B8 ones blocked since ADR-0193) plus the ADR-0195 SGLang
-        # extra-buffer probe of B3 (1) and the 5 PD references; Y1: 5
+        # extra-buffer probe of B3 (1), the item 9 B5-bm25 references, one per
+        # engine (2, ADR-0202), and the 5 PD references; Y1: 5
         # x 2 x 3 rungs x 2 loads (60); Y2: B8 on vLLM (6, blocked since
         # ADR-0193); Z1: 5 arms x 3 x 2 on the PD stack (30). Windows: one per
         # reference, 2 + 3 per (arm, engine, rung) in every block; blocked
         # rows keep theirs in the count.
-        assert plan["counts"]["cells"] == len(rows) == 13 + 5 + 60 + 6 + 30
-        assert plan["counts"]["windows"] == 18 + (60 + 6 + 30) * 5 // 2 == 258
+        assert plan["counts"]["cells"] == len(rows) == 15 + 5 + 60 + 6 + 30
+        assert plan["counts"]["windows"] == 20 + (60 + 6 + 30) * 5 // 2 == 260
         assert Counter(s.get("block") or ("ref-" + s["family"]) for s in rows) == {
-            "Y1": 60, "Y2": 6, "Z1": 30, "ref-F1": 13, "ref-DIST": 5,
+            "Y1": 60, "Y2": 6, "Z1": 30, "ref-F1": 15, "ref-DIST": 5,
         }
         assert {(s["baseline"], s["family"]) for s in rows if s.get("block") in ("Y1", "Y2")} == {
             ("B1", "F2"), ("B6", "F2"), ("B3", "F3"), ("B4", "F3"), ("B7", "F3"), ("B8", "F3"),
         }
         assert plan["counts"]["by_family"] == {
-            "F1": {"cells": 13, "windows": 13},   # 12 before the ADR-0195 probe
+            "F1": {"cells": 15, "windows": 15},   # 12 before the ADR-0195 probe, 13 before the item 9 references
             "F2": {"cells": 2 * 2 * 6, "windows": 24 * 5 // 2},
             "F3": {"cells": 3 * 2 * 6 + 6, "windows": 42 * 5 // 2},
             "DIST": {"cells": 30 + 5, "windows": 30 * 5 // 2 + 5},
@@ -5969,8 +5970,9 @@ class TestS2RegisterBlockA:
         assert sorted(blocked) == sorted(plan["blocked_row_keys"]) == sorted(_S2_VLLM_B8_ROW_KEYS + (_S2_SGLANG_B8_REFERENCE,))
         assert "connector" in blocked[_S2_SGLANG_B8_REFERENCE] and plan["counts"]["blocked"] == 8
         assert {blocked[k] for k in _S2_VLLM_B8_ROW_KEYS} == {rc.VLLM_HYBRID_STORE_BLOCKED_ON}
-        # the ADR-0195 probe (B3 on SGLang) is one more secondary row (10 before it)
-        assert Counter(s["row_class"] for s in rows) == {"window": 96, "secondary": 11, "identity": 5, "primary": 2}
+        # the ADR-0195 probe (B3 on SGLang) is one more secondary row (10 before it);
+        # the item 9 B5-bm25 references (ADR-0202) two more
+        assert Counter(s["row_class"] for s in rows) == {"window": 96, "secondary": 13, "identity": 5, "primary": 2}
         assert sorted(s["row_key"] for s in rows if s["row_class"] == "primary") == [
             "corpus-reuse|none|none|single|vllm|qwen3-next-80b|F1",
             "retr-fresh|rerank|none|single|vllm|qwen3-next-80b|F1",
@@ -6213,9 +6215,10 @@ class TestS2RegisterBlockA:
         # rows (the SGLang B8 reference, the seven vLLM B8 rows of ADR-0193)
         # and the counts stay the same (blocked cells keep their windows in
         # the count; the 4 LMCache relaunches are gone; the ADR-0195 probe
-        # adds one cell, one window and one relaunch)
+        # adds one cell, one window and one relaunch; the item 9 B5-bm25
+        # references (ADR-0202) add two cells and two windows, no relaunch)
         assert len(plan["blocked_row_keys"]) == 8 and _S2_SGLANG_B8_REFERENCE in plan["blocked_row_keys"]
-        assert (plan["counts"]["cells"], plan["counts"]["windows"], plan["counts"]["relaunches"]) == (114, 258, 55)
+        assert (plan["counts"]["cells"], plan["counts"]["windows"], plan["counts"]["relaunches"]) == (116, 260, 55)
         assert {s["num_queries"] for s in _s2_rows(plan) if s["row_class"] == "primary"} == {2000}
 
     def test_s2a_refuses_the_pre_s2_qasper_manifest(self, tmp_path):
@@ -6278,10 +6281,11 @@ class TestS2BlockCIdentityGate:
         # block A's pins hold as ADR-0193 re-pinned them (the seven vLLM B8
         # rows blocked: 8 blocked rows, their windows still counted, 4
         # relaunches and 1 dry window fewer, 28 gated rows) plus the ADR-0195
-        # probe (one cell, window and relaunch)
+        # probe (one cell, window and relaunch) and the item 9 B5-bm25 references
+        # (two cells and windows, no relaunch: they share B6's prefix-OFF start)
         assert len(plan_cd_act1["blocked_row_keys"]) == 8 and _S2_SGLANG_B8_REFERENCE in plan_cd_act1["blocked_row_keys"]
         c = plan_cd_act1["counts"]
-        assert (c["cells"], c["windows"], c["relaunches"], c["dry_windows"], c["blocked"]) == (114, 258, 55, 15, 8)
+        assert (c["cells"], c["windows"], c["relaunches"], c["dry_windows"], c["blocked"]) == (116, 260, 55, 15, 8)
         assert len(plan_cd_act1["identity_gated_row_keys"]) == 28
         # an ungated session carries no gate block (null, never absent)
         assert "identity_gate" in plan_s2a and plan_s2a["identity_gate"] is None
@@ -6301,7 +6305,7 @@ class TestS2BlockCIdentityGate:
         assert all(s.get("budget_plan") is None for s in _cells(plan) if s["row_key"] in gated)
         assert all(s["blocked_on"] == rc.IDENTITY_GATE_BLOCKED_ON for s in _cells(plan) if s["row_key"] in gated)
         c = plan["counts"]
-        assert (c["cells"], c["windows"], c["blocked"]) == (114, 258, 36)   # 113, 257 before the ADR-0195 probe
+        assert (c["cells"], c["windows"], c["blocked"]) == (116, 260, 36)   # 113, 257 before the ADR-0195 probe; 114, 258 before the item 9 B5-bm25 references (ADR-0202)
         # [D] spec section 8: without the 35 vLLM prefix-on rows the plan keeps
         # 40 relaunches (39 before the ADR-0195 SGLang probe, which the gate does
         # not exclude) and 11 dry windows (pinned here, measured by this test)
@@ -6756,7 +6760,7 @@ def test_cd_act1_preflight_holds_one_request_in_every_pool_at_the_profile_concur
         charter_datasets=("squad_v2", "musique", "qasper"), floor_concurrency=50, gpu_id="NVIDIA H200",
     )
     assert r["pool_shortfalls"] == [] and r["problems"] == [], r["problems"]
-    assert r["pd_cells"] is True and r["executable_cells"] == 106   # 114 cells, 8 blocked (ADR-0193); 105 before the ADR-0195 probe
+    assert r["pd_cells"] is True and r["executable_cells"] == 108   # 116 cells, 8 blocked (ADR-0193); 105 before the ADR-0195 probe, 106 before the item 9 B5-bm25 references (ADR-0202)
     assert plan_cd_act1["serving_shapes"]["max_model_len"] == 16_384
     pd = [s for s in plan_cd_act1["steps"] if s["kind"] == "relaunch" and s["topology"] == "pd"]
     assert pd and all(s["max_model_len"] == rc.request_cap_tokens(grid, (s.get("demand_class") or {}).get("seq_tokens")) for s in pd)
@@ -6792,8 +6796,9 @@ def test_cd_act1_blocks_the_vllm_store_arm_on_the_hybrid(plan_cd_act1, plan_s2a)
     assert "hybrid KV cache manager" in rc.VLLM_HYBRID_STORE_BLOCKED_ON and "0.19.1" in rc.VLLM_HYBRID_STORE_BLOCKED_ON
     assert rows[_S2_SGLANG_B8_REFERENCE]["blocked_on"] == rc.SGLANG_STORE_BLOCKED_ON
     c = plan["counts"]
-    # the ADR-0195 probe adds one cell, one window and one relaunch to the ADR-0193 pins
-    assert (c["cells"], c["blocked"], c["windows"], c["dry_windows"], c["relaunches"]) == (113 + 1, 8, 257 + 1, 16 - 1, 58 - 4 + 1)
+    # the ADR-0195 probe adds one cell, one window and one relaunch to the ADR-0193 pins;
+    # the item 9 B5-bm25 references (ADR-0202) add two cells and two windows, no relaunch
+    assert (c["cells"], c["blocked"], c["windows"], c["dry_windows"], c["relaunches"]) == (113 + 1 + 2, 8, 257 + 1 + 2, 16 - 1, 58 - 4 + 1)
     assert len(plan["identity_gated_row_keys"]) == 35 - 7
     assert not any(k.startswith("retr-store|") for k in plan["identity_gated_row_keys"])
     relaunches = [s for s in plan["steps"] if s["kind"] == "relaunch"]
@@ -6803,8 +6808,8 @@ def test_cd_act1_blocks_the_vllm_store_arm_on_the_hybrid(plan_cd_act1, plan_s2a)
         "cd-act1", floor_avg_seq_tokens="2694", query_manifests={"musique": str(_S2_MUSIQUE_MANIFEST)},
         charter_datasets=("squad_v2", "musique", "qasper"), floor_concurrency=50, gpu_id="NVIDIA H200",
     )
-    # 114 cells since the ADR-0195 probe (113 before), 8 blocked
-    assert reg["executable_cells"] == 114 - 8 and reg["needs_lmcache"] is False and reg["lmcache_store_gib"] is None
+    # 116 cells since the item 9 B5-bm25 references (ADR-0202; 114 after the ADR-0195 probe, 113 before), 8 blocked
+    assert reg["executable_cells"] == 116 - 8 and reg["needs_lmcache"] is False and reg["lmcache_store_gib"] is None
     # the dense 70B session keeps every cell: the rule is model-conditional
     # (s2a's four blocked rows are the B12 rungs waiting for the Qasper manifest, as on HEAD)
     assert plan_s2a["counts"]["blocked"] == 4 and all(k.startswith("corpus-trunc|") for k in plan_s2a["blocked_row_keys"])

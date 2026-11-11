@@ -321,9 +321,12 @@ CONTRASTS: tuple[Contrast, ...] = _validated(
                  ("A", "B", "C", "D"), "BERGEN monotone chain: B5 < B6"),
         Contrast(6, "Dense vs BM25 (data-gated)", "B5", None,
                  "retriever (dense vs bm25)", "F1", "secondary", "two-sided",
-                 "per_query", True, ("A",),
+                 "per_query", True, ("A", "C"),
                  "fires only if the §7.2 offline gate shows a ≥5pp pool-"
-                 "recall@100 gap; anchor model only"),
+                 "recall@100 gap; A: the anchor model; C (item 9, owner "
+                 "2026-11-11, ADR-0202): the gate read 17.4 pp on MuSiQue "
+                 "(ADR-0101) and cd-act1 serves the BM25 leg as the B5-bm25 "
+                 "references without a dense B5, so the row is descriptive there"),
         Contrast(7, "Text compression's price", "B9", "B6", "arm (compression)",
                  "F1", "secondary", "one-sided", "per_query", True,
                  ("A", "B", "C", "D")),

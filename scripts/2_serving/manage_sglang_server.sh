@@ -185,6 +185,12 @@ PORT="${SGLANG_PORT:-30000}"   # SGLangAdapter's default api_base port
 # it besides /v1/models (S0F-54). A version that drops the line times out
 # loudly at SGLANG_START_TIMEOUT, never ready early.
 SGLANG_READY_LINE="The server is fired up and ready to roll!"
+# item 4 (2026-11-11): fatal start lines, each read in a live log, never from
+# memory: uvicorn's bind failure quoted in ADR-0198 (lowercase; the OSError
+# form "Address already in use" sits in experiments/S0/2026-10-14_0016/logs/setup/failed/suite_pod_20261014T005250Z.log:240)
+# and the ZMQ XPUB bind of the 2026-11-11 collision (S2R pre-restart specs,
+# item 4). cage_start_fatal_line matches them as fixed strings, case-insensitively.
+SGLANG_FATAL_PATTERNS=( "address already in use" "zmq.error.ZMQError" )
 LOG_DIR="${CAGE_LOG_ROOT:-$PROJECT_DIR/logs}/sglang"
 # Daemon discipline: the launched server's PID is recorded here at start and
 # cleared at stop, so status/stop have an authoritative handle.
@@ -215,7 +221,7 @@ get_sglang_pid() {
 }
 
 get_loaded_model() {
-    curl -s "http://localhost:${PORT}/v1/models" 2>/dev/null | \
+    curl -s --max-time 5 "http://localhost:${PORT}/v1/models" 2>/dev/null | \
         python3 -c "import sys, json; data=json.load(sys.stdin); print(data['data'][0]['id'] if data.get('data') else '')" 2>/dev/null || echo ""
 }
 
@@ -708,9 +714,12 @@ PYEOF
     # override with SGLANG_START_TIMEOUT.
     echo "Waiting for server to start..."
     local max_wait="${SGLANG_START_TIMEOUT:-300}"
-    local waited=0
-    local loaded=""
-    while [ "$waited" -lt "$max_wait" ]; do
+    # item 4 (2026-11-11): the bound is the SECONDS wall clock, not a count of
+    # sleeps. Each tick: ready check first (it wins when both hold), then a
+    # fatal start line, then the launch pid.
+    local t0=$SECONDS
+    local loaded="" fatal=""
+    while [ $((SECONDS - t0)) -lt "$max_wait" ]; do
         loaded=$(get_loaded_model)
         if [ "$loaded" = "$model" ] && grep -qF -- "$SGLANG_READY_LINE" "$log_file" 2>/dev/null; then
             echo -e "${GREEN}✓ Server ready with model: $model${NC}"
@@ -721,8 +730,19 @@ PYEOF
             _sglang_kv_dtype_realized "$log_file" || { stop_server; return 1; }
             return 0
         fi
+        if fatal=$(cage_start_fatal_line "$log_file" "${SGLANG_FATAL_PATTERNS[@]}"); then
+            echo -e "\n${RED}✗ SGLang start failed after $((SECONDS - t0))s on a fatal start line: ${fatal}${NC}"
+            cage_start_failure_dump "$log_file" "$PORT"
+            stop_server
+            return 1
+        fi
+        if ! kill -0 "$server_pid" 2>/dev/null; then
+            echo -e "\n${RED}✗ SGLang start failed after $((SECONDS - t0))s: the launch pid $server_pid exited${NC}"
+            cage_start_failure_dump "$log_file" "$PORT"
+            stop_server
+            return 1
+        fi
         sleep 2
-        waited=$((waited + 2))
         echo -n "."
     done
 

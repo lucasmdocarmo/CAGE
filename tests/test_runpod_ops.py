@@ -894,6 +894,26 @@ def test_watchdog_check_validates_without_arming(tmp_path: Path, deadline: str, 
     assert _argv_lines(log) == [] and not list(tmp_path.glob("watchdog_*.pid"))
 
 
+@pytest.mark.parametrize("listing, code", [
+    ('[{"id":"podaaaa1111bbbb"}]\n', 0),
+    ('[]\n', 1),
+    ('{"pods":[{"id":"podcccc3333dddd"}]}\n', 1),
+    ('{"error":"service unavailable","code":"server_error"}\n', 2),
+    ('', 2),
+], ids=["listed", "empty-list", "other-pod", "error-object", "empty-output"])
+def test_watchdog_listed_verb_exposes_the_fail_closed_parser_item7(tmp_path: Path, listing: str, code: int) -> None:
+    """item 7 (2026-11-11, S2R pre-restart specs): `listed <pod_id>` is pod_listed as
+    a verb, so `pod_status.sh close` reuses the one fail-closed parser instead of a
+    copy: exit 0 listed, 1 not listed, 2 unknown. Host-safe: one synchronous CLI
+    call under the CLI timeout, no loop, no state file, no ledger write."""
+    fake, log = _install_fake(tmp_path, pod_list=listing)
+    proc = _bash(f'bash "{WATCHDOG}" listed podaaaa1111bbbb',
+                 env=_env(fake, CAGE_POD_LEDGER=str(tmp_path / "l.jsonl"), CAGE_WATCHDOG_CLI_TIMEOUT="2"))
+    assert proc.returncode == code, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    assert _argv_lines(log) == ["pod list --all"]
+    assert not list(tmp_path.glob("watchdog_*")) and not (tmp_path / "l.jsonl").exists()
+
+
 @_LIFECYCLE
 def test_watchdog_run_exits_when_its_pidfile_is_removed(tmp_path: Path) -> None:
     """Removing the pidfile IS a disarm: a loop whose state was wiped (pytest
@@ -1095,6 +1115,106 @@ def test_pod_status_degrades_without_ledger(tmp_path: Path) -> None:
     assert "no ledger" in proc.stderr, "the missing ledger must be announced, not silent"
     assert "unknown — pass --price-per-hour at provision" in proc.stdout
     assert "podaaaa1111bbbb" in proc.stdout
+
+
+def _close(fake: Path, ledger: Path, args: str) -> subprocess.CompletedProcess:
+    return _bash(f'bash "{POD_STATUS}" close {args}',
+                 env=_env(fake, CAGE_POD_LEDGER=str(ledger), CAGE_WATCHDOG_CLI_TIMEOUT="2"))
+
+
+def test_pod_status_close_appends_a_closed_late_delete_for_a_pod_that_is_gone_item7(tmp_path: Path) -> None:
+    """item 7 (2026-11-11): `close` appends one delete row, by owner, flagged
+    closed_late, with ts_utc = --ended-at (the console's billing page) or the
+    record time; cost_report then flags the row CLOSED-LATE instead of
+    LIVE/BILLING and calls the hours an upper bound only when --ended-at was
+    not given. Append-only: the create rows are byte-identical afterwards."""
+    fake, log = _install_fake(tmp_path, pod_list="[]\n")
+    ledger = tmp_path / "pod_ledger.jsonl"
+    _write_ledger(ledger, [
+        _create_event("podaaaa1111bbbb", "2026-10-07T16:30:29Z", price=3.49, name="cage-a"),
+        _create_event("podcccc3333dddd", "2026-10-08T11:45:51Z", price=3.49, name="cage-b"),
+    ])
+    before = ledger.read_text(encoding="utf-8")
+    proc = _close(fake, ledger, 'podaaaa1111bbbb --ended-at 2026-10-07T18:30:29Z '
+                                '--reason "S0 attempt 2: console delete, instant from the billing page"')
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    assert "closed late" in proc.stdout and "podaaaa1111bbbb" in proc.stdout
+    assert "2026-10-07T18:30:29Z from --ended-at)" in proc.stdout, proc.stdout
+    assert _argv_lines(log) == ["pod list --all"], "the listing is read once, through pod_watchdog.sh listed"
+    text = ledger.read_text(encoding="utf-8")
+    assert text.startswith(before), "append-only: no existing line may change"
+    lines = text.splitlines()
+    assert len(lines) == 3
+    e = json.loads(lines[2])
+    datetime.datetime.strptime(e["recorded_utc"], TS_FMT)
+    assert e == {"ts_utc": "2026-10-07T18:30:29Z", "pod_id": "podaaaa1111bbbb", "event": "delete",
+                 "by": "owner", "note": "S0 attempt 2: console delete, instant from the billing page",
+                 "closed_late": True, "ended_at_given": True, "recorded_utc": e["recorded_utc"]}, e
+
+    proc2 = _close(fake, ledger, 'podcccc3333dddd --reason "no billing-page instant"')
+    assert proc2.returncode == 0, f"stdout:\n{proc2.stdout}\nstderr:\n{proc2.stderr}"
+    assert "the record time" in proc2.stdout and "upper bound" in proc2.stdout and "--ended-at" not in proc2.stdout, proc2.stdout
+    e2 = json.loads(ledger.read_text(encoding="utf-8").splitlines()[3])
+    assert e2["ended_at_given"] is False and e2["ts_utc"] == e2["recorded_utc"], e2
+    assert abs(datetime.datetime.strptime(e2["ts_utc"], TS_FMT).replace(tzinfo=datetime.timezone.utc).timestamp()
+               - time.time()) < 120, "without --ended-at the row closes at the record time"
+
+    rep = _bash(f'bash "{COST_REPORT}"', env=_env(fake, CAGE_POD_LEDGER=str(ledger)))
+    assert rep.returncode == 0, f"stdout:\n{rep.stdout}\nstderr:\n{rep.stderr}"
+    assert "LIVE/BILLING" not in rep.stdout.split("TOTAL")[0], "a closed-late row is closed, not live"
+    row_a = next(l for l in rep.stdout.splitlines() if l.startswith("podaaaa1111bbbb"))
+    row_c = next(l for l in rep.stdout.splitlines() if l.startswith("podcccc3333dddd"))
+    assert re.search(r"2\.00\s+3\.49\s+6\.98\s+CLOSED-LATE$", row_a), row_a   # 2 h x 3.49 USD/h x 1 GPU
+    assert "CLOSED-LATE" in row_c and "upper bound" in row_c, row_c
+    assert "upper bound" not in row_a, "an --ended-at close is an exact end, not an upper bound"
+    assert "0 LIVE/BILLING" in rep.stdout
+
+    # the new keys are typed like the others: a non-boolean closed_late is refused by line number
+    _write_ledger(ledger, [_create_event("podaaaa1111bbbb", "2026-10-07T16:30:29Z"),
+                           {"ts_utc": "2026-10-07T18:30:29Z", "pod_id": "podaaaa1111bbbb", "event": "delete",
+                            "by": "owner", "note": "x", "closed_late": "yes"}])
+    bad = _bash(f'bash "{COST_REPORT}"', env=_env(fake, CAGE_POD_LEDGER=str(ledger)))
+    assert bad.returncode == 2 and "MALFORMED LEDGER LINE 2" in bad.stderr and "closed_late" in bad.stderr
+
+
+def test_pod_status_close_refuses_listed_unknown_double_orphan_and_bad_input_item7(tmp_path: Path) -> None:
+    """The closer fails closed: a pod the listing still shows is torn down, not
+    closed; an UNKNOWN listing (error object) judges nothing; a row with a delete
+    event is not closed twice; a pod with no create row has nothing to close; an
+    empty reason or a bad --ended-at (format, calendar, before the create, in the
+    future) is refused before the CLI is touched. The ledger never changes."""
+    fake, log = _install_fake(tmp_path, pod_list='[{"id":"podaaaa1111bbbb"}]\n')
+    ledger = tmp_path / "pod_ledger.jsonl"
+    _write_ledger(ledger, [
+        _create_event("podaaaa1111bbbb", "2026-10-07T16:30:29Z", price=3.49),
+        _create_event("podcccc3333dddd", "2026-10-08T11:45:51Z", price=3.49),
+        {"ts_utc": "2026-10-08T12:45:51Z", "pod_id": "podcccc3333dddd", "event": "delete"},
+    ])
+    before = ledger.read_text(encoding="utf-8")
+
+    listed = _close(fake, ledger, 'podaaaa1111bbbb --reason "x"')
+    assert listed.returncode != 0 and "still listed" in listed.stderr, listed.stderr
+    assert _argv_lines(log) == ["pod list --all"]
+
+    (fake / "pod_list.out").write_text('{"error":"service unavailable","code":"server_error"}\n', encoding="utf-8")
+    unknown = _close(fake, ledger, 'podaaaa1111bbbb --reason "x"')
+    assert unknown.returncode != 0 and "UNKNOWN" in unknown.stderr, unknown.stderr
+    assert _argv_lines(log) == ["pod list --all"] * 2
+
+    double = _close(fake, ledger, 'podcccc3333dddd --reason "x"')
+    assert double.returncode != 0 and "already closed" in double.stderr and "line 3" in double.stderr, double.stderr
+    orphan = _close(fake, ledger, 'podzzzz9999yyyy --reason "x"')
+    assert orphan.returncode != 0 and "no create event" in orphan.stderr, orphan.stderr
+    for args in ('podaaaa1111bbbb --reason "   "', 'podaaaa1111bbbb', 'podaaaa1111bbbb --reason',
+                 'BAD_ID --reason "x"', ''):
+        p = _close(fake, ledger, args)
+        assert p.returncode != 0, f"{args!r} must be refused; stdout:\n{p.stdout}"
+        assert "--reason" in p.stderr or "pod_id" in p.stderr or "usage" in p.stderr, (args, p.stderr)
+    for bad in ("yesterday", "2026-02-30T00:00:00Z", "2026-10-07T00:00:00Z", "2099-01-01T00:00:00Z"):
+        p = _close(fake, ledger, f'podaaaa1111bbbb --ended-at {bad} --reason "x"')
+        assert p.returncode != 0 and "--ended-at" in p.stderr, (bad, p.stderr)
+    assert _argv_lines(log) == ["pod list --all"] * 2, "the ledger and input checks come before any CLI call"
+    assert ledger.read_text(encoding="utf-8") == before, "a refused close changes nothing"
 
 
 # ---------------------------------------------------------------------------

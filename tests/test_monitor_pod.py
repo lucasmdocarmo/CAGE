@@ -251,6 +251,21 @@ def test_balance_under_the_floor_and_crashed_job_are_hard(world: Dict[str, Path]
     assert any("CRASHED" in t for t in texts)
 
 
+def test_an_empty_pid_file_reads_starting_and_raises_no_crashed_alert(world: Dict[str, Path]) -> None:
+    # 2026-11-11 (suite failure, item 10 of S2R_PRE_RESTART_SPECS): pod_job.sh
+    # submit wrote the pid file with a truncate-then-write, and a tick that read
+    # it empty saw "pid file present, no live pid, no status" and alerted HARD
+    # CRASHED on a job that was DONE(0) seconds later. An empty pid file is the
+    # submit in flight: STARTING, never CRASHED.
+    (world["jobs"] / "run.pid").write_text("", encoding="utf-8")
+    proc = _tick(world)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    st = _status(world)
+    assert st["run"]["job_status"] == "STARTING"
+    assert not any("CRASHED" in a["text"] for a in st["alerts"]), st["alerts"]
+    assert "PORTAL ACTION" not in proc.stdout
+
+
 def test_error_lines_are_deduplicated_across_ticks_and_tracebacks_are_soft(world: Dict[str, Path]) -> None:
     (world["jobs"] / "run.log").write_text("ok\nTraceback (most recent call last):\n  boom\n[run_campaign] RELAUNCH FAILED (exit 1)\n", encoding="utf-8")
     _tick(world)

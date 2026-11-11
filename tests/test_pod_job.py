@@ -386,6 +386,11 @@ def test_static_contract() -> None:
     assert proc.returncode == 0, proc.stderr
     # kills name the recorded pid's group, never a pattern
     assert 'kill -- -$pid' in text
+    # 2026-11-11 (item 10): the pid file is never observable empty or stale. It
+    # lands by rename, and the previous attempt's pid file leaves with the
+    # status file, so a monitor tick during a submit reads NONE, then RUNNING.
+    assert "rm -f $RDIR/$name.status $RDIR/$name.pid" in text
+    assert "echo \\$! > $RDIR/$name.pid.tmp && mv -f $RDIR/$name.pid.tmp $RDIR/$name.pid" in text
 
 
 def test_resubmit_keeps_the_previous_attempts_log_under_its_submit_stamp(pod: Dict[str, Path]) -> None:
