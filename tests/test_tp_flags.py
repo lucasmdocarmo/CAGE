@@ -48,6 +48,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -435,3 +436,49 @@ def test_vllm_reuse_check_reads_the_cache_mode_as_a_dial() -> None:
     reuse = vllm[vllm.index("dials_match=true"):vllm.index("Start server")]
     assert '*" --mamba-cache-mode align "*' in reuse
     assert '"$live_cmd" != *"--mamba-cache-mode"*' in reuse
+
+
+# ---------------------------------------------------------------------------
+# S2R 2026-11-11 (ADR-0198): the launcher's shell variable SGLANG_PORT never
+# reaches the server process. sglang 0.5.10.post1 reads an environment variable
+# of that same name in get_open_port() (sglang/srt/utils/network.py lines 17 to
+# 26) as the base for its internal sockets; the TP0 scheduler's shm_broadcast
+# message queue bound 127.0.0.1:30000 with it, and the HTTP server, which binds
+# last, failed with "address already in use" on both ladder relaunches of the
+# rehearsal (every relaunch exports the variable, run_campaign.py
+# PORT_LAUNCH_ENV; the anchor calibration never does and started 13 of 13
+# times on the same pod). The port itself keeps riding argv as --port.
+# ---------------------------------------------------------------------------
+
+def test_sglang_launch_strips_the_shell_port_variable_from_the_server_env(
+    stub_bin: Path, tmp_path: Path
+) -> None:
+    dump = tmp_path / "launch_env.txt"
+    stub = tmp_path / "sglang-python"
+    # Answers the import gate and the version probe like the fixture's stub;
+    # on the launch call (-m sglang.launch_server) it records its environment.
+    # review 2026-11-11 LOW 1: write to a temp name and rename, so the file's
+    # existence below implies a complete dump (the stub is read as soon as it exists)
+    stub.write_text(
+        '#!/bin/sh\nif [ "$1" = "-m" ]; then env > "$CAGE_TEST_ENV_DUMP.tmp"'
+        ' && mv "$CAGE_TEST_ENV_DUMP.tmp" "$CAGE_TEST_ENV_DUMP"; fi\nexit 0\n',
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    proc = _run_launcher(
+        SGLANG_SH, stub_bin, "start", "fake/test-model",
+        SGLANG_PORT="30000", CAGE_SGLANG_PYTHON=str(stub), CAGE_TEST_ENV_DUMP=str(dump),
+    )
+    assert "--port 30000" in _server_args_line(proc.stdout)
+    deadline = time.monotonic() + 5.0
+    while not dump.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert dump.exists(), "the backgrounded launch never ran the stub interpreter"
+    env = dict(ln.split("=", 1) for ln in dump.read_text(encoding="utf-8").splitlines() if "=" in ln)
+    assert "SGLANG_PORT" not in env, (
+        "SGLANG_PORT reached sglang.launch_server; sglang's get_open_port() would "
+        "hand the API port to an internal socket (ADR-0198)"
+    )
+    # only that one variable is withheld: the rest of the environment still arrives
+    assert env.get("SGLANG_START_TIMEOUT") == "0"
+    assert env.get("CAGE_TEST_ENV_DUMP") == str(dump)

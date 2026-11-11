@@ -94,6 +94,15 @@
 # therefore also waits for SGLang's own ready line in the start log
 # (SGLANG_READY_LINE below), the line it logs after the warm-up.
 #
+# Port variable (ADR-0198, S2R 2026-11-11): SGLANG_PORT selects the API port
+# for this launcher (PORT below) and is withheld from the server's environment
+# at the launch, because sglang 0.5.10.post1 reads the same name in
+# get_open_port() (sglang/srt/utils/network.py) as the first port for its
+# internal sockets: with it exported, the TP0 scheduler's shm_broadcast queue
+# took 127.0.0.1:30000 and the HTTP server, which binds last, failed with
+# "address already in use" (the rehearsal's ladder relaunches, which export
+# the variable; the anchor calibration never does and started 13 of 13 times).
+#
 # Interpreter contract (pre-GO item 10, 2026-09-26): SGLang lives in its OWN
 # venv (setup_runpod.sh step 3c, <repo>/sglang-env; its transformers and torch
 # pins conflict with cage-env), so this launcher never depends on the caller's
@@ -677,7 +686,12 @@ PYEOF
     rm -f "$LOG_DIR/CURRENT.kvpool.json"
 
     echo "Starting SGLang server (logging to $log_file)..."
-    nohup "$SGLANG_PYTHON" -m sglang.launch_server "${sglang_args[@]}" > "$log_file" 2>&1 &
+    # ADR-0198 (S2R 2026-11-11): the shell's SGLANG_PORT is this launcher's
+    # knob and must not reach the server; sglang reads a variable of that
+    # name in get_open_port() as the base for its internal sockets, and its
+    # TP0 scheduler bound the API port with it before the HTTP server could
+    # (both ladder relaunches on the H200 pod). The port rides argv (--port).
+    env -u SGLANG_PORT nohup "$SGLANG_PYTHON" -m sglang.launch_server "${sglang_args[@]}" > "$log_file" 2>&1 &
 
     local server_pid=$!
     printf '%s\n' "$server_pid" > "$PID_FILE"
