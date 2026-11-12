@@ -113,11 +113,14 @@ if ended and e_ts < ts(create[1]["ts_utc"]):
 PY
   [ "$rc" -eq 0 ] || exit 1
   # ONE live read, through the watchdog's parser: 0 listed, 1 not listed, 2 unknown.
-  bash "$SCRIPT_DIR/pod_watchdog.sh" listed "$pod" && rc=0 || rc=$?
-  case "$rc" in
-    1) ;;
-    0) die "close: $pod is still listed by 'runpodctl pod list --all': a live pod is torn down (teardown_pod.sh), never closed on paper" ;;
-    *) die "close: the listing is UNKNOWN (pod_watchdog.sh listed rc=$rc: CLI failed, empty, or not a JSON list of pods): nothing is judged; retry when the listing answers" ;;
+  # Review 2026-11-11 M3: only the pair (exit 1, verdict NOT_LISTED) proceeds; any
+  # other exit 1 (a `die` on a precondition, set -e) carries no verdict and refuses.
+  local verdict
+  verdict="$(bash "$SCRIPT_DIR/pod_watchdog.sh" listed "$pod")" && rc=0 || rc=$?
+  case "$rc:$verdict" in
+    1:NOT_LISTED) ;;
+    0:*) die "close: $pod is still listed by 'runpodctl pod list --all': a live pod is torn down (teardown_pod.sh), never closed on paper" ;;
+    *) die "close: the listing is UNKNOWN (pod_watchdog.sh listed rc=$rc, verdict '${verdict:-none}': CLI failed, empty, not a JSON list of pods, or a precondition failed): nothing is judged; retry when the listing answers" ;;
   esac
   mkdir -p "$(dirname "$LEDGER")"
   CAGE_CLOSE_POD="$pod" CAGE_CLOSE_ENDED="$ended" CAGE_CLOSE_NOW="$now" CAGE_CLOSE_REASON="$reason" python3 - >> "$LEDGER" <<'PY'

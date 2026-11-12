@@ -40,12 +40,15 @@ def _tarball(path: Path, files: dict, prefix: str = "") -> Path:
     return path
 
 
-def _hash(tmp_path: Path, files: dict = BASE, profile: str = PROFILE, tag: str = "a", prefix: str = "") -> str:
+def _hash(tmp_path: Path, files: dict = BASE, profile: str = PROFILE, tag: str = "a", prefix: str = "",
+          extra: list[Path] | None = None) -> str:
     tb = _tarball(tmp_path / f"{tag}.tar.gz", files, prefix)
     pf = tmp_path / f"{tag}.env"
     pf.write_text(profile, encoding="utf-8")
-    proc = subprocess.run([sys.executable, str(SCRIPT), "--tarball", str(tb), "--profile", str(pf)],
-                          capture_output=True, text=True, timeout=60)
+    argv = [sys.executable, str(SCRIPT), "--tarball", str(tb), "--profile", str(pf)]
+    for p in extra or []:
+        argv += ["--extra-file", str(p)]
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, proc.stderr
     out = proc.stdout.strip()
     assert re.fullmatch(r"[0-9a-f]{64}", out), out
@@ -100,6 +103,40 @@ def test_empty_hashed_set_still_hashes_the_profile_item5(tmp_path: Path) -> None
     h0 = _hash(tmp_path, {"BUILD_INFO": "sha=1\n"}, tag="l")
     assert _hash(tmp_path, {"BUILD_INFO": "sha=2\n"}, tag="m") == h0
     assert _hash(tmp_path, {"BUILD_INFO": "sha=1\n"}, profile=PROFILE + "X=1\n", tag="n") != h0
+
+
+def test_the_dependency_pins_at_the_tarball_root_are_inside_the_hash_review_m2(tmp_path: Path) -> None:
+    """Review 2026-11-11 M2: setup_runpod.sh builds the engine venvs from requirements.txt and
+    the four requirements.lock.*.txt files at the repo root, outside every hashed prefix, so a
+    torch or vLLM pin bump plus a setup redo kept the calibration. The five names are hashed
+    exactly; another top-level file is not (no prefix rule at the root)."""
+    pins = {**BASE, "requirements.lock.gpu.txt": "torch==2.8.0\n", "README.md": "r\n"}
+    h0 = _hash(tmp_path, pins, tag="p0")
+    assert _hash(tmp_path, {**pins, "requirements.lock.gpu.txt": "torch==2.9.0\n"}, tag="p1") != h0
+    assert _hash(tmp_path, {**pins, "README.md": "changed\n"}, tag="p2") == h0
+    assert _hash(tmp_path, {**pins, "requirements-dev.txt": "x\n"}, tag="p3") == h0, "an unlisted root file stays outside"
+    for name in ("requirements.txt", "requirements.lock.gpu.vllm-step.txt", "requirements.lock.lmdeploy-env.txt", "requirements.lock.sglang-env.txt"):
+        assert _hash(tmp_path, {**pins, name: "pin==1\n"}, tag="q" + name) != _hash(tmp_path, {**pins, name: "pin==2\n"}, tag="r" + name), name
+
+
+def test_extra_files_are_inside_the_hash_by_bytes_and_basename_review_m1(tmp_path: Path) -> None:
+    """Review 2026-11-11 M1: the freeze file (MyDocs/registration/freeze_resolutions.json) pins the
+    served weights' revision, ships by scp beside the tarball and was outside the hash, so moving
+    served_model to a new revision kept the anchors measured on the old weights. --extra-file hashes
+    its bytes under its basename (the Mac path is not a measurement input); a missing one exits 2."""
+    f1 = tmp_path / "a" / "freeze_resolutions.json"; f1.parent.mkdir(); f1.write_text('{"r": "1"}', encoding="utf-8")
+    f2 = tmp_path / "b" / "freeze_resolutions.json"; f2.parent.mkdir(); f2.write_text('{"r": "1"}', encoding="utf-8")
+    f3 = tmp_path / "c" / "freeze_resolutions.json"; f3.parent.mkdir(); f3.write_text('{"r": "2"}', encoding="utf-8")
+    plain = _hash(tmp_path, tag="e0")
+    h1 = _hash(tmp_path, tag="e1", extra=[f1])
+    assert h1 != plain
+    assert _hash(tmp_path, tag="e2", extra=[f2]) == h1, "same bytes, same basename, another directory"
+    assert _hash(tmp_path, tag="e3", extra=[f3]) != h1, "a revision change remeasures"
+    assert _hash(tmp_path, tag="e4", extra=[f1, f3]) != _hash(tmp_path, tag="e5", extra=[f3, f1]), "order is part of the digest"
+    tb = _tarball(tmp_path / "x.tar.gz", BASE); pf = tmp_path / "x.env"; pf.write_text(PROFILE, encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(SCRIPT), "--tarball", str(tb), "--profile", str(pf), "--extra-file", str(tmp_path / "none.json")],
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 2 and proc.stdout == "" and "calib_hash" in proc.stderr, (proc.stdout, proc.stderr)
 
 
 def test_missing_inputs_exit_2_with_nothing_on_stdout_item5(tmp_path: Path) -> None:

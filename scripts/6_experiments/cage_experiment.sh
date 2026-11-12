@@ -890,10 +890,14 @@ PY
     state put build.sha "$(printf '%s' "$build" | sed -n 's/^sha=//p')"
     state put build.tarball "$tarball"
     # Item 5 (2026-11-11, option (a)): the calibration skip keys compare this
-    # content hash (shipped scripts/, src/, configs/, data/manifests/ and the
-    # resolved profile sans comments), not build.sha, so a doc-only or test-only
-    # re-ship keeps every measurement and any code or profile change remeasures.
-    local chash; chash="$("$PY" "$SCRIPT_DIR/calib_hash.py" --tarball "$tarball" --profile "$EXTRAS/profile.env")" || { printf '  [FAIL] calib_hash.py could not hash %s (item 5)\n' "$tarball"; return 1; }
+    # content hash (shipped scripts/, src/, configs/, data/manifests/, the
+    # dependency pins, the live profile sans comments and the freeze file), not
+    # build.sha, so a doc-only or test-only re-ship keeps every measurement and
+    # any code, pin, profile or weights-revision change remeasures. Review
+    # 2026-11-11 M1/L1: the freeze file travels by scp (below), not in the tarball,
+    # and $EXTRAS/profile.env is frozen once per landing, so the live $PROFILE is
+    # hashed (_common.env is a tarball member).
+    local chash; chash="$("$PY" "$SCRIPT_DIR/calib_hash.py" --tarball "$tarball" --profile "$PROFILE" --extra-file "$FREEZE_FILE")" || { printf '  [FAIL] calib_hash.py could not hash %s with %s and %s (item 5)\n' "$tarball" "$PROFILE" "$FREEZE_FILE"; return 1; }
     state put build.calib_hash "$chash"
   fi
   run_step 0 "freeze file present" -- test -f "$FREEZE_FILE" || return 1

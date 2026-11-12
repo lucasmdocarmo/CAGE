@@ -125,6 +125,11 @@ def test_vllm_launcher_writes_under_the_override_and_nothing_in_the_repo(
     assert "Server args:" in proc.stdout, proc.stdout + proc.stderr
     written = sorted((log_root / "vllm").glob("vllm_fake_test-model_*.log"))
     assert len(written) == 1, f"expected one start log under {log_root}/vllm, got {written}"
-    assert (log_root / "vllm" / "vllm_server.pid").is_file()
+    # item 4 (ADR-0199): a start that times out now fails closed through
+    # stop_server, which removes the pid file it wrote, so the location is
+    # read from the launcher's own line and the removal is pinned.
+    pid_file = log_root / "vllm" / "vllm_server.pid"
+    assert f"(pidfile: {pid_file})" in proc.stdout
+    assert not pid_file.exists()
     assert f"logging to {written[0]}" in proc.stdout
     assert _repo_log_listing() == before, "a start under CAGE_LOG_ROOT must leave the repo's logs/ alone"

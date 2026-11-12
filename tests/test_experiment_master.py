@@ -1918,6 +1918,24 @@ def test_a_reship_with_the_same_content_keeps_the_calibration_and_a_code_change_
     assert "already passed on this pod and build" not in proc.stdout
     assert jobs() == n0 + 2
     assert _state(world)["calibration"]["cell_done"]["vllm"] == f"{st['pod']['id']}:{h2}"
+    # review 2026-11-11 M1: the freeze file pins the served weights' revision and ships by scp,
+    # outside the tarball; a revision move with no code change must still change the hash
+    freeze = world["tmp"] / "freeze_resolutions.json"
+    freeze.write_text(json.dumps({"QASPER_TAU": "0.5", "INSTRUMENT_REVISIONS": {}, "note": "review m1: a changed freeze file"}), encoding="utf-8")
+    sha3 = "0000000000000000000000000000000000000003"
+    assert _master(world, "--only", "preflight-mac", "--redo", CAGE_TEST_SHA=sha3, CAGE_TEST_TAR_DIR=str(tree), **ours).returncode == 0
+    assert _master(world, "--only", "ship", "--redo", CAGE_TEST_SHA=sha3, **ours).returncode == 0
+    h3 = _state(world)["build"]["calib_hash"]
+    assert re.fullmatch(r"[0-9a-f]{64}", h3) and h3 != h2, "the freeze file is a measurement input (review M1)"
+    # review 2026-11-11 L1: the live --profile (this world's is outside the repo) is hashed, not the
+    # extras copy frozen once per landing, so a value edit after the first ship still remeasures
+    with world["profile"].open("a", encoding="utf-8") as fh:
+        fh.write("CAGE_ITEM5_PROBE=1\n")
+    sha4 = "0000000000000000000000000000000000000004"
+    assert _master(world, "--only", "preflight-mac", "--redo", CAGE_TEST_SHA=sha4, CAGE_TEST_TAR_DIR=str(tree), **ours).returncode == 0
+    assert _master(world, "--only", "ship", "--redo", CAGE_TEST_SHA=sha4, **ours).returncode == 0
+    h4 = _state(world)["build"]["calib_hash"]
+    assert re.fullmatch(r"[0-9a-f]{64}", h4) and h4 != h3, "the live profile is a measurement input (review L1)"
 
 
 def test_calibrate_and_plan_need_the_pod_suite_proof_on_this_sha_and_pod_item3(world: Dict[str, Path], tmp_path: Path) -> None:

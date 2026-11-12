@@ -216,11 +216,16 @@ class TestFamilies:
         # 674-row total loses 3/4 of its 248 window rows: 674 - 186 = 488.
         # Window rows per dataset: #12 4, #13 24, #14 4, #15 F2 leg 4, #15 F3
         # leg 4, #16 4, #17 8, #18 4, #19 4, #20 2 = 62 (248 over four).
+        # item 9 (ADR-0202, 2026-11-11): contrast 6 gains group C (the B5-bm25
+        # cells on cd-act1): 12 rows, 4 datasets x (ttft_ms holm secondary,
+        # predicate holm secondary, faithfulness bh-fdr exploratory), so
+        # 488 + 12 = 500; holm 282 + 8, bh-fdr 154 + 4, secondary 270 + 8,
+        # exploratory 154 + 4; the largest Holm family stays group A's F1 (9).
         fm = compile_family_map(DATASETS)
-        assert len(fm) == 488
+        assert len(fm) == 500
         assert fm["correction"].value_counts().to_dict() == {
-            "holm": 282,  # 270 secondary + 12 fingerprint superiority
-            "bh-fdr": 154,
+            "holm": 290,  # 278 secondary + 12 fingerprint superiority
+            "bh-fdr": 158,
             "none": 40,  # #4 (32) + #14 (4) + #12 frontier (4)
             "tost": 12,
         }
@@ -228,8 +233,8 @@ class TestFamilies:
         # primary tier (the frontier estimand); the row total is unchanged.
         assert fm.groupby("tier").size().to_dict() == {
             "primary": 64,  # #4 32 + #12 4 + #13 24 + #14 4
-            "secondary": 270,
-            "exploratory": 154,
+            "secondary": 278,
+            "exploratory": 158,
         }
         holm_sizes = fm[fm["correction"] == "holm"].groupby("family_id").size()
         assert int(holm_sizes.max()) == 9  # was 12 pre-unit-split

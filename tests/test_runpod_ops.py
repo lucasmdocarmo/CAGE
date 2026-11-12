@@ -910,8 +910,22 @@ def test_watchdog_listed_verb_exposes_the_fail_closed_parser_item7(tmp_path: Pat
     proc = _bash(f'bash "{WATCHDOG}" listed podaaaa1111bbbb',
                  env=_env(fake, CAGE_POD_LEDGER=str(tmp_path / "l.jsonl"), CAGE_WATCHDOG_CLI_TIMEOUT="2"))
     assert proc.returncode == code, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    # review 2026-11-11 M3: the verdict word rides stdout beside the exit code
+    assert proc.stdout.strip() == {0: "LISTED", 1: "NOT_LISTED", 2: "UNKNOWN"}[code], proc.stdout
     assert _argv_lines(log) == ["pod list --all"]
     assert not list(tmp_path.glob("watchdog_*")) and not (tmp_path / "l.jsonl").exists()
+
+
+def test_watchdog_listed_answers_unknown_on_a_precondition_failure_review_m3(tmp_path: Path) -> None:
+    """Review 2026-11-11 M3: `die` exits 1, the code a caller reads as NOT LISTED, so a bad
+    CAGE_WATCHDOG_CLI_TIMEOUT (or a missing CLI; not exercised here, see _install_fake) made
+    `listed` answer NOT LISTED without a listing. Every precondition failure is UNKNOWN: exit 2,
+    the word on stdout, a warning on stderr, no CLI call."""
+    fake, log = _install_fake(tmp_path, pod_list="[]\n")
+    proc = _bash(f'bash "{WATCHDOG}" listed podaaaa1111bbbb',
+                 env=_env(fake, CAGE_POD_LEDGER=str(tmp_path / "l.jsonl"), CAGE_WATCHDOG_CLI_TIMEOUT="abc"))
+    assert proc.returncode == 2 and proc.stdout.strip() == "UNKNOWN", f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    assert "positive integer" in proc.stderr and _argv_lines(log) == []
 
 
 @_LIFECYCLE
@@ -1205,6 +1219,15 @@ def test_pod_status_close_refuses_listed_unknown_double_orphan_and_bad_input_ite
     assert double.returncode != 0 and "already closed" in double.stderr and "line 3" in double.stderr, double.stderr
     orphan = _close(fake, ledger, 'podzzzz9999yyyy --reason "x"')
     assert orphan.returncode != 0 and "no create event" in orphan.stderr, orphan.stderr
+    # review 2026-11-11 M3: the pod is gone from the listing, so only the watchdog precondition
+    # (a bad CLI timeout, exit 1 through `die` before this fix) stands between the row and a
+    # close: the closer must read it as UNKNOWN and append nothing
+    (fake / "pod_list.out").write_text("[]\n", encoding="utf-8")
+    precond = _bash(f'bash "{POD_STATUS}" close podaaaa1111bbbb --reason "x"',
+                    env=_env(fake, CAGE_POD_LEDGER=str(ledger), CAGE_WATCHDOG_CLI_TIMEOUT="abc"))
+    assert precond.returncode != 0 and "UNKNOWN" in precond.stderr, precond.stdout + precond.stderr
+    assert _argv_lines(log) == ["pod list --all"] * 2, "a precondition failure makes no CLI call"
+    assert ledger.read_text(encoding="utf-8") == before, "a precondition failure closes nothing"
     for args in ('podaaaa1111bbbb --reason "   "', 'podaaaa1111bbbb', 'podaaaa1111bbbb --reason',
                  'BAD_ID --reason "x"', ''):
         p = _close(fake, ledger, args)

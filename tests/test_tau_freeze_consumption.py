@@ -47,9 +47,11 @@ from src.analysis.predicate import PredicateConfig  # noqa: E402
 from src.analysis.stats.ledger import hash_artifacts, write_ledger  # noqa: E402
 
 SCORING_ID = "s01-fast"
-#: The registered decimal exactly as written in the real artifact — pinned so
-#: a freeze-file rewrite that changes the digits is caught by this module.
-REGISTERED_LITERAL = "0.9955156950672646"
+#: The registered value exactly as written in the real artifact. W10 / ADR-0204
+#: (2026-11-11): 1.0, the any-span rule (the calibrated 0.9955156950672646 of
+#: ADR-0107 sits in the same band; 0 S1 and 0 S0 verdicts differ). This module
+#: is hermetic (the autouse fixture below) and does not read the real file.
+REGISTERED_LITERAL = "1.0"
 
 
 @pytest.fixture(autouse=True)
@@ -176,6 +178,17 @@ def test_mismatched_flag_refuses_naming_both_values(tmp_path: Path) -> None:
     msg = str(exc.value)
     assert "0.995516" in msg and REGISTERED_LITERAL in msg
     assert bpt.FREEZE_TAU_KEY in msg
+
+
+def test_integer_one_mismatches_the_registered_literal_one_point_zero_w10(tmp_path: Path) -> None:
+    # W10 / ADR-0204: the compare is on the literal as written, so "1" is not
+    # "1.0" even though both parse to the same float; the message names both.
+    freeze = _freeze_file(tmp_path, REGISTERED_LITERAL)
+    with pytest.raises(bpt.BuildPredicateError) as exc:
+        bpt.resolve_qasper_tau("1", freeze)
+    msg = str(exc.value)
+    assert "'1'" in msg or " 1 " in msg or "1 " in msg
+    assert REGISTERED_LITERAL in msg and bpt.FREEZE_TAU_KEY in msg
 
 
 def test_numeric_equality_is_not_a_match(tmp_path: Path) -> None:

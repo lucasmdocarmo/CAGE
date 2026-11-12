@@ -145,6 +145,12 @@ def test_submit_writes_the_handle_and_the_remote_files(pod: Dict[str, Path]) -> 
     proc = _run(pod, "submit", "hello", "echo hi from the pod; exit 0", "60")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "submitted hello -> root@pod.test (remote pid " in proc.stdout
+    # review 2026-11-11 L3 (item 10): the remote pid file, observed through the fake ssh's
+    # HOME, holds a pid and no rename leftover remains (the race itself is a timing property;
+    # the rename is the mechanism and test_static_contract pins the line)
+    remote = pod["home"] / ".cage_jobs"
+    assert re.fullmatch(r"\d+\s*", (remote / "hello.pid").read_text(encoding="utf-8"))
+    assert not (remote / "hello.pid.tmp").exists()
     handle = json.loads((pod["jobs"] / "hello.json").read_text(encoding="utf-8"))
     assert handle["id"] == "hello" and handle["mode"] == "pod-ssh"
     assert handle["host"] == "root@pod.test" and handle["port"] == "2222"

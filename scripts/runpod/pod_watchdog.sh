@@ -23,7 +23,9 @@
 #   pod_watchdog.sh run    <pod_id> <deadline>   the loop body; `arm` spawns it detached
 #   pod_watchdog.sh check  <deadline>            validate a deadline (format, calendar, future) without arming; exit 0 or 1
 #   pod_watchdog.sh listed <pod_id>              the fail-closed listing parser as a verb: exit 0 listed, 1 not listed,
-#                                                2 unknown (item 7, 2026-11-11; pod_status.sh close reuses it, no copy)
+#                                                2 unknown (item 7, 2026-11-11; pod_status.sh close reuses it, no copy);
+#                                                stdout carries the same verdict word, LISTED, NOT_LISTED or UNKNOWN,
+#                                                and every precondition failure is UNKNOWN (review 2026-11-11 M3)
 #
 # State (beside the pod ledger, default results/ops/; override CAGE_POD_LEDGER):
 #   watchdog_<pod_id>.pid       the loop's PID (identity-checked on read: J8 PID-reuse guard); removing it disarms
@@ -292,12 +294,17 @@ cmd_check() {  # the one validator provision_pod.sh calls BEFORE the plan print 
 }
 
 cmd_listed() {  # pod_listed as a verb (item 7): the exit code IS the answer, 0 listed, 1 not listed, 2 unknown
+  # Review 2026-11-11 M3: `die` exits 1, which a caller reads as NOT LISTED, so a
+  # precondition failure here (a bad timeout, a missing CLI or python3) answers
+  # UNKNOWN (exit 2) with a warning; the verdict word on stdout lets the caller
+  # tell the parser's own exit 1 from any other exit 1 (set -e, a sourced die).
   local pod="$1" rc=0
-  valid_pod_id "$pod" || die "listed: bad pod_id '$pod'"
-  printf '%s' "$CLI_TIMEOUT" | grep -qE '^[1-9][0-9]*$' || die "CAGE_WATCHDOG_CLI_TIMEOUT must be a positive integer: $CLI_TIMEOUT"
-  require_cmd runpodctl "brew install runpod/runpodctl/runpodctl"
-  require_cmd python3
+  valid_pod_id "$pod" || { warn "listed: bad pod_id '$pod'"; echo UNKNOWN; exit 2; }
+  printf '%s' "$CLI_TIMEOUT" | grep -qE '^[1-9][0-9]*$' || { warn "listed: CAGE_WATCHDOG_CLI_TIMEOUT must be a positive integer: $CLI_TIMEOUT"; echo UNKNOWN; exit 2; }
+  command -v runpodctl >/dev/null 2>&1 || { warn "listed: required command not found: runpodctl (brew install runpod/runpodctl/runpodctl)"; echo UNKNOWN; exit 2; }
+  command -v python3 >/dev/null 2>&1 || { warn "listed: required command not found: python3"; echo UNKNOWN; exit 2; }
   pod_listed "$pod" || rc=$?
+  case "$rc" in 0) echo LISTED ;; 1) echo NOT_LISTED ;; *) rc=2; echo UNKNOWN ;; esac
   exit "$rc"
 }
 

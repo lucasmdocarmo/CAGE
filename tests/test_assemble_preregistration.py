@@ -180,10 +180,19 @@ def test_freeze_sha_grammar_refuses(
 def test_qasper_tau_range_refuses(
     workdir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    rc = _run(workdir, {**HAPPY, "QASPER_TAU": "1.7"})
-    err = capsys.readouterr().err
-    assert rc == 2
-    assert "QASPER_TAU" in err and "(0, 1)" in err
+    # W10 / ADR-0204 (2026-11-11): the registered value is 1.0 (the any-span
+    # rule), so the bound is (0, 1]; above 1 and at or below 0 still refuse.
+    for bad in ("1.7", "1.0000001", "0.0", "0"):
+        rc = _run(workdir, {**HAPPY, "QASPER_TAU": bad})
+        err = capsys.readouterr().err
+        assert rc == 2, bad
+        assert "QASPER_TAU" in err and "(0, 1]" in err, bad
+
+
+def test_qasper_tau_one_point_zero_assembles_w10(workdir: Path) -> None:
+    # W10 / ADR-0204: 1.0 is the registered Qasper tau and must render.
+    assert _run(workdir, {**HAPPY, "QASPER_TAU": "1.0"}) == 0
+    assert "1.0" in (workdir / "out.md").read_text(encoding="utf-8")
 
 
 def test_machinery_sha_line_guard_refuses_when_line_absent(

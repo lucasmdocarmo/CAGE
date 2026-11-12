@@ -47,9 +47,11 @@ freeze):
   with a missing or unknown ``answer_type`` REFUSES (typed) and never
   defaults to the grounding clause; the share and count per answer type
   are REPORTED per window. The τ decision is EXECUTED (task #120,
-  calibration run 2026-08-19): τ* = 0.995516 (registered decimal
-  0.9955156950672646), selected by rule ``max_balanced_accuracy_pooled_v1``
-  and FROZEN in the registration artifact
+  calibration run 2026-08-19): τ* = 0.995516 by rule
+  ``max_balanced_accuracy_pooled_v1``; the REGISTERED value is 1.0, the
+  any-span rule at the top edge of the band [0.978125, 1.0] (W10, ADR-0204,
+  2026-11-11; 0 S1 and 0 S0 verdicts differ between the two), FROZEN in the
+  registration artifact
   ``MyDocs/registration/freeze_resolutions.json`` (key ``QASPER_TAU``). τ
   stays an EXPLICIT config field with NO default here: the value is
   CONSUMED from the freeze artifact (``build_predicate_table.py``,
@@ -187,9 +189,10 @@ class PredicateConfig:
     not quietly feed Y). It has NO default: the caller states the bound.
 
     ``qasper_tau`` is the Instrument-A groundedness threshold for the Qasper
-    branch. The registered value (τ* = 0.9955156950672646, rule
-    max_balanced_accuracy_pooled_v1, calibrated 2026-08-19) lives in the
-    freeze artifact MyDocs/registration/freeze_resolutions.json and is
+    branch. The registered value (1.0, the any-span rule, W10 / ADR-0204
+    2026-11-11; the calibrated τ* = 0.9955156950672646 of rule
+    max_balanced_accuracy_pooled_v1, 2026-08-19, sits in the same band) lives
+    in the freeze artifact MyDocs/registration/freeze_resolutions.json and is
     resolved from there by the build_predicate_table CLI (#120 executed).
     This module keeps NO default: ``None`` is legal only for trees without
     qasper rows, and a qasper window under ``None`` refuses — the value

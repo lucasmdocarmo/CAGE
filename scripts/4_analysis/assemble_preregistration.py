@@ -46,7 +46,8 @@ FAIL-CLOSED CONTRACT (every branch refuses with exit code 2, never degrades):
   output must carry the exact ``Machinery SHA: `<sha>``` line the G1 binding
   greps for (mirrors run_campaign_analysis.py:241) — skeleton drift that
   breaks the binding line refuses HERE, not at the one look;
-- QASPER_TAU, when present, must parse as a float strictly inside (0, 1).
+- QASPER_TAU, when present, must parse as a float inside (0, 1] (W10 /
+  ADR-0204, 2026-11-11: the registered value is 1.0, the any-span rule).
 
 This script NEVER touches the network and NEVER writes to git (its only git
 use is a read-only ``git status --porcelain`` under ``--require-clean``).
@@ -228,10 +229,12 @@ def _validate_known_values(resolutions: Dict[str, str]) -> None:
             tau_f = float(tau)
         except ValueError:
             tau_f = float("nan")
-        if not (0.0 < tau_f < 1.0):
+        # W10 / ADR-0204 (2026-11-11): the registered Qasper tau is 1.0, the
+        # any-span rule, the top edge of the #146 band [0.978125, 1.0].
+        if not (0.0 < tau_f <= 1.0):
             problems.append(
-                f"QASPER_TAU {tau!r} must parse as a float strictly in (0, 1) "
-                "(the #146 Instrument-A calibrated threshold)"
+                f"QASPER_TAU {tau!r} must parse as a float in (0, 1] "
+                "(the #146 Instrument-A band; its top edge 1.0 is the registered value)"
             )
     if problems:
         raise AssemblyRefusal(" | ".join(problems))

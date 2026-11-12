@@ -32,6 +32,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -659,17 +660,27 @@ def stub_bin(tmp_path: Path) -> Path:
         "  *) exit 1 ;;\n"
         "esac\n"
     ))
-    _stub(d, "vllm", "#!/bin/sh\nprintf '%b' \"${CAGE_TEST_POOL_LINES:-}\"\nexit 0\n")
+    # CAGE_TEST_LINGER_S (default 5 s): item 4's pid check needs a ready-path
+    # fake to outlive the tick that finds it ready (full suite run 3, 2026-11-11,
+    # test_s0f88_batch3's vLLM fp8 test raced this fake); see _engine_stub.
+    _stub(d, "vllm", "#!/bin/sh\nprintf '%b' \"${CAGE_TEST_POOL_LINES:-}\"\nsleep \"${CAGE_TEST_LINGER_S:-5}\"\nexit 0\n")
     return d
 
 
 def _engine_stub(d: Path, name: str) -> Path:
     """An interpreter or entry point that answers version probes, import
-    probes, and prints the pool lines when it is asked to serve."""
+    probes, and prints the pool lines when it is asked to serve.
+    CAGE_TEST_LINGER_S keeps it alive that many seconds after printing (default
+    5): item 4 (ADR-0199) fails a start fast once the launch pid exits, so a
+    ready-path fake must outlive the tick that finds it ready (the probe can run
+    before the fake has printed and the pid check after it exited: full suite
+    run 2, 2026-11-11, test_s0f88_batch3), and a timeout-path test sets it past
+    the timeout. Both launchers' stop paths never check the pid, so a fake that
+    sleeps on after "Server stopped" is harmless."""
     return _stub(d, name, (
         "#!/bin/sh\n"
         'case "$*" in\n'
-        "  *launch_server*|*api_server*) printf '%b' \"${CAGE_TEST_POOL_LINES:-}\"; exit 0 ;;\n"
+        "  *launch_server*|*api_server*) printf '%b' \"${CAGE_TEST_POOL_LINES:-}\"; sleep \"${CAGE_TEST_LINGER_S:-5}\"; exit 0 ;;\n"
         "  *__version__*) echo 0.0-stub ;;\n"
         "  *) exit 0 ;;\n"
         "esac\n"
@@ -720,11 +731,24 @@ def test_vllm_restart_after_a_crash_never_certifies_the_earlier_start(
     proc = _run_launcher(
         "manage_vllm_server.sh", stub_bin, log_root, "start", "fake/test-model",
         VLLM_START_TIMEOUT="10", CAGE_TEST_POOL_LINES=VLLM_019_BUDGETED_LOG,
-        CAGE_TEST_READY_WHEN_LOGGED="GPU KV cache size",
+        CAGE_TEST_READY_WHEN_LOGGED="GPU KV cache size", CAGE_TEST_LINGER_S="3",
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     record = log_root / "vllm" / kp.CURRENT_NAME
     assert record.exists() and not stale_pd.exists()  # a start removes records before it spawns
+    # item 4 (ADR-0199): the fake lingers so the ready tick finds it alive; the
+    # "crash" is its exit afterwards, waited for here by its recorded pid (a
+    # live pid would make the second start an "already running" no-op).
+    pid = int((log_root / "vllm" / "vllm_server.pid").read_text(encoding="utf-8").strip())
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    else:
+        pytest.fail(f"the first fake (pid {pid}) did not exit")
     proc = _run_launcher(
         "manage_vllm_server.sh", stub_bin, log_root, "start", "fake/test-model",
         VLLM_START_TIMEOUT="10", CAGE_TEST_POOL_LINES="no pool line here\n",
@@ -801,7 +825,7 @@ def _fraction_aware_sglang(d: Path) -> Path:
     return _stub(d, "sglang-python-frac", (
         "#!/bin/sh\n"
         'case "$*" in\n'
-        '  *launch_server*) case "$*" in *"--mem-fraction-static 0.90"*) printf "%b" "${CAGE_TEST_SHORT_LINES:-}" ;; *) printf "%b" "${CAGE_TEST_FULL_LINES:-}" ;; esac; exit 0 ;;\n'
+        '  *launch_server*) case "$*" in *"--mem-fraction-static 0.90"*) printf "%b" "${CAGE_TEST_SHORT_LINES:-}" ;; *) printf "%b" "${CAGE_TEST_FULL_LINES:-}" ;; esac; sleep "${CAGE_TEST_LINGER_S:-5}"; exit 0 ;;\n'
         "  *__version__*) echo 0.0-stub ;;\n"
         "  *) exit 0 ;;\n"
         "esac\n"
@@ -932,11 +956,14 @@ def test_sglang_launcher_refuses_at_once_when_no_higher_fraction_exists(stub_bin
 def test_sglang_launcher_does_not_retry_a_start_that_never_got_ready(stub_bin: Path, tmp_path: Path) -> None:
     # A start that never gets ready has an unknown cause; it fails as before
     # (one timeout, one stop), never a blind retry at a raised fraction.
+    # item 4 (ADR-0199): the launcher fails a start fast once the launch pid
+    # exits, so the fake lingers past the timeout to keep this on the timeout
+    # path (test_tp_flags.py covers the pid-exit path).
     log_root = tmp_path / "logroot"
     python_stub = _fraction_aware_sglang(stub_bin)
     proc = _run_launcher(
         "manage_sglang_server.sh", stub_bin, log_root, "start", "fake/test-model",
-        SGLANG_START_TIMEOUT="4", CAGE_SGLANG_PYTHON=str(python_stub),
+        SGLANG_START_TIMEOUT="4", CAGE_SGLANG_PYTHON=str(python_stub), CAGE_TEST_LINGER_S="10",
         CAGE_SGLANG_MAX_TOTAL_TOKENS="298687",
         CAGE_TEST_SHORT_LINES="no pool, no ready line\n",
         CAGE_TEST_FULL_LINES=_sg_log(300000) + SGLANG_READY_LINE,
@@ -969,11 +996,12 @@ def test_sglang_launcher_is_not_ready_before_sglangs_own_ready_line(stub_bin: Pa
     # own ready line in the start log too; a log without it times out loudly,
     # names the missing line, captures nothing, and stops the server it spawned
     # (review LOW 1: a later start would otherwise reuse it unchecked).
+    # item 4 (ADR-0199): the fake lingers past the timeout (see _engine_stub).
     log_root = tmp_path / "logroot"
     python_stub = _engine_stub(stub_bin, "sglang-python")
     proc = _run_launcher(
         "manage_sglang_server.sh", stub_bin, log_root, "start", "fake/test-model",
-        SGLANG_START_TIMEOUT="6", CAGE_SGLANG_PYTHON=str(python_stub),
+        SGLANG_START_TIMEOUT="6", CAGE_SGLANG_PYTHON=str(python_stub), CAGE_TEST_LINGER_S="10",
         CAGE_TEST_POOL_LINES=SGLANG_LOG, CAGE_TEST_READY_WHEN_LOGGED="KV Cache is allocated",
     )
     assert proc.returncode == 1, proc.stdout + proc.stderr

@@ -684,6 +684,9 @@ def test_the_cell_rows_are_the_s0_attempt_5_medians_adr0176() -> None:
         ("sglang", "rerank"): (73.0, 35.1),
         ("vllm", "none"): (40.8, 17.4), ("vllm", "dense"): (43.1, 33.4),
         ("vllm", "rerank"): (52.9, 34.1),
+        # item 9 (ADR-0202, 2026-11-11): the two bm25 rows copy each engine's
+        # dense row [A] until a bm25 window is measured (run_campaign.py).
+        ("sglang", "bm25"): (42.6, 32.2), ("vllm", "bm25"): (43.1, 33.4),
     }
     assert rc.RUN_RELAUNCH_SECONDS == {"sglang": 254.8, "vllm": 55.0}
     assert "attempt 5" in rc.RUN_STEP_SECONDS_SOURCE and "attempt 4" in rc.RUN_STEP_SECONDS_SOURCE

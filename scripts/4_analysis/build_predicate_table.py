@@ -37,12 +37,14 @@ scbench; sharegpt has no evidence at all) are counted, labeled skips — they
 never feed Y by charter.
 
 Config doctrine (#120 executed → T6.1): --max-null-fraction is REQUIRED (no
-silent default on the refusal bound). The Qasper τ is REGISTERED (τ* =
-0.9955156950672646, rule max_balanced_accuracy_pooled_v1, calibrated
-2026-08-19) and is CONSUMED from the frozen registration artifact — resolved
-as --freeze-file, else $CAGE_FREEZE_RESOLUTIONS, else the repo-relative
-MyDocs/registration/freeze_resolutions.json (present on the analysis
-machine, absent on pods; scoring runs post-pull locally). Resolution is
+silent default on the refusal bound). The Qasper τ is REGISTERED (1.0, the
+any-span rule, W10 / ADR-0204 2026-11-11; the calibrated τ* =
+0.9955156950672646 of rule max_balanced_accuracy_pooled_v1, 2026-08-19, sits
+in the same band) and is CONSUMED from the frozen registration artifact,
+resolved as --freeze-file, else $CAGE_FREEZE_RESOLUTIONS, else the
+repo-relative MyDocs/registration/freeze_resolutions.json (the experiment
+master ships it to the pod beside the tarball and the pod score stage reads
+it there; a Mac rebuild reads the local copy). Resolution is
 fail-closed:
 
 - artifact present + --qasper-tau given: the hand-passed decimal must equal
@@ -93,9 +95,9 @@ PREDICATE_SCHEMA_VERSION = 1
 QA_SCORES_NAME = "qa_scores.jsonl"
 QA_EVIDENCE_NAME = "qa_evidence.jsonl"
 
-#: T6.1 — the frozen registration artifact carrying the registered Qasper τ
-#: (task #120 executed 2026-08-19, rule max_balanced_accuracy_pooled_v1).
-#: Gitignored; present on the analysis machine, absent on pods.
+#: T6.1: the frozen registration artifact carrying the registered Qasper τ
+#: (1.0, the any-span rule, W10 / ADR-0204; calibrated 2026-08-19 by rule
+#: max_balanced_accuracy_pooled_v1). Gitignored; the master scp's it to the pod.
 FREEZE_ENV_VAR = "CAGE_FREEZE_RESOLUTIONS"
 DEFAULT_FREEZE_FILE = REPO_ROOT / "MyDocs" / "registration" / "freeze_resolutions.json"
 FREEZE_TAU_KEY = "QASPER_TAU"
