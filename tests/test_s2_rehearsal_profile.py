@@ -116,3 +116,16 @@ def test_s2b_accepts_the_identity_fail_and_keeps_the_pd_smoke_fail_unaccepted_it
     assert _shipped("S2B.env", "IDENTITY_FAIL_ACCEPTED", "PD_FAIL_ACCEPTED") == {"IDENTITY_FAIL_ACCEPTED": "1", "PD_FAIL_ACCEPTED": "0"}
     stated = _stated("S2B.env")
     assert stated["IDENTITY_FAIL_ACCEPTED"] == "1" and stated["PD_FAIL_ACCEPTED"] == "0"
+
+
+def test_s2r_and_s2b_keep_the_results_and_the_backup_off_the_volume_followups_item6() -> None:
+    """Follow-ups item 6 (owner 2026-11-15, option B), as S0F-39 on S0: the US-CA-2 network
+    volume refuses "|" in file names (EINVAL 22, landing 2026-11-14 stage 11, rsync code 23)
+    and every cell directory is its row key, so both profiles put the results root and the
+    backup mirror on the container disk. The profile value of BACKUP_TARGET must win over
+    _common.env's hard-set /workspace one, so the check reads the sourced value too."""
+    want = {"POD_RESULTS_DIR": "/root/cage-results", "POD_BACKUP_DIR": "/root/backup", "BACKUP_TARGET": "file:///root/backup"}
+    for name in ("S2R.env", "S2B.env"):
+        assert _shipped(name, *want) == want, name
+        stated = _stated(name)
+        assert {k: stated.get(k) for k in want} == want, name
