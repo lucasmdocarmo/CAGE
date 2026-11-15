@@ -194,6 +194,18 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         fi
         exec /usr/bin/stat "$@"
         ''')
+    # S2R follow-ups 2026-11-15 (owner: "ok fix the tests"): stages 3 and 6 read free space
+    # with df, and the fake pod is this machine, so every test past stage 3 failed on a Mac
+    # with under the 20 GB floor free (102 failures at 14 GiB). The stand-in prints one header
+    # line and one data line whose Available column is CAGE_TEST_DF_FREE_KB (default: the S2R
+    # pod's stage 3 reading of 2026-11-14, 95,658,428 KB = 91 GiB free of 300); "none" prints
+    # a line without a number. It also answers the master's own `df -k` of the landing.
+    _w(b / "df", r'''
+        #!/bin/bash
+        echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+        if [ "${CAGE_TEST_DF_FREE_KB:-95658428}" = "none" ]; then echo "df: cannot read the mount table"; exit 0; fi
+        echo "overlay 314572800 218914372 ${CAGE_TEST_DF_FREE_KB:-95658428} 70% /"
+        ''')
 
     # --- the fake Mac-side scripts tree -----------------------------------
     _w(fake_scripts / "checks" / "run_tests.sh", "#!/bin/bash\necho \"run_tests CAGE_LOAD_GATE=${CAGE_LOAD_GATE:-} $*\" >> \"$CAGE_TEST_LOG\"; case \"$*\" in *test_load_gate_p1*) echo \"${CAGE_TEST_LOAD_GATE_OUT:-1 passed}\" ;; *) echo '4000 passed' ;; esac; exit 0\n")
@@ -3015,9 +3027,10 @@ def test_stage_3_records_the_weights_disk_free_space_and_refuses_below_the_floor
     cmd = log.read_text(encoding="utf-8").split("# cmd:")[1].splitlines()[0]  # the command is %q-escaped in the step log
     assert "df\\ -Pk" in cmd and str(cache) in cmd and str(world["pod_repo"]) not in cmd and "awk" not in cmd, cmd
     assert cache.is_dir()  # the pod-side mkdir -p ran first: a cache the prefetch has not created never fails the read
-    # the recorded figure is the POSIX "Available" column of that path's disk (within 1 GB of a second read)
-    mac = subprocess.run(["df", "-Pk", str(cache)], capture_output=True, text=True, check=True).stdout.splitlines()[-1].split()
-    assert abs(int(mac[3]) // 1024 // 1024 - int(free)) <= 1, (mac, free)
+    # the recorded figure is the POSIX "Available" column of the read: the fixture's df answers 95,658,428 KB
+    # whatever this machine holds (2026-11-15; a second read of the real disk, within 1 GB, stood here before
+    # and tied the suite to the host's free space)
+    assert free == str(95658428 // 1024 // 1024), free
     # a floor above the disk refuses, names the profile key to raise, and no engine starts
     proc = _master(world, "--from", "setup", "--redo", "--to", "setup", DISK_FREE_MIN_GB="999999999")
     assert proc.returncode == 1, proc.stdout[-3000:]
@@ -3087,24 +3100,27 @@ def test_the_shipped_s2_landing_profiles_carry_every_s1_key_and_the_block_e_pick
               # the gate at the registered count per load, the ladder bound that holds 15 triples per engine
               "CALIBRATION_BUDGET_FRACTION": "1.0", "REGIME_GATE_LOADS": "0.95 1.05", "MIN_IN_REGIME_WINDOWS": "0.95:2 1.05:3",
               "MAX_NULL_FRACTION": "0.06", "SUITE_ON_POD": "1", "MAC_SUITE": "1", "FRONT_LOAD": "0", "VOLUME_GB": "300",
-              "DISK_GB": "300", "SKIP_BLOCKED": "0",
+              # DISK_GB left the shared values on 2026-11-15 (owner: "C plus 400 GB"): S2B states 400, S2A keeps 300
+              "SKIP_BLOCKED": "0",
               # S2 block F row F-11 (owner 2026-11-04, option (a)): the per-row bounds the stage 10 proof allows
               "SCORING_TOL_FAITHFULNESS": "0.005", "SCORING_TOL_BERTSCORE": "1e-5"}
     for k, v in shared.items():
         assert a[k] == v and b[k] == v, (k, a[k], b[k])
     own = ("EXP", "SESSION", "MODEL", "MODEL_SLUG", "HOURS", "RUN_BUDGET_HOURS", "SEATBELT", "SETUP_BOUND_MIN",
-           "SCORE_BOUND_MIN", "PULL_MARGIN_MIN", "FLOOR_AVG_SEQ_TOKENS", "INSTALL_LMCACHE", "LMCACHE_VERSION", "CONFIRMATORY_ARMS")
+           "SCORE_BOUND_MIN", "PULL_MARGIN_MIN", "FLOOR_AVG_SEQ_TOKENS", "INSTALL_LMCACHE", "LMCACHE_VERSION", "CONFIRMATORY_ARMS", "DISK_GB")
     # the seatbelts grew with the calibrate term (2 x 240 min) under decision 3; the rosters are decision 2's
     assert {k: a[k] for k in own} == {
         "EXP": "S2A", "SESSION": "s2a", "MODEL": "meta-llama/Llama-3.3-70B-Instruct", "MODEL_SLUG": "llama-3.3-70b",
         "HOURS": "50", "RUN_BUDGET_HOURS": "45", "SEATBELT": "83h", "SETUP_BOUND_MIN": "40", "SCORE_BOUND_MIN": "120",
         "PULL_MARGIN_MIN": "150", "FLOOR_AVG_SEQ_TOKENS": "4779", "INSTALL_LMCACHE": "0", "LMCACHE_VERSION": "",
-        "CONFIRMATORY_ARMS": "B1 B3 B4 B6 B7 B11 B12"}
+        "CONFIRMATORY_ARMS": "B1 B3 B4 B6 B7 B11 B12", "DISK_GB": "300"}
     assert {k: b[k] for k in own} == {
         "EXP": "S2B", "SESSION": "cd-act1", "MODEL": "Qwen/Qwen3-Next-80B-A3B-Instruct", "MODEL_SLUG": "qwen3-next-80b",
         "HOURS": "60", "RUN_BUDGET_HOURS": "55", "SEATBELT": "98h", "SETUP_BOUND_MIN": "50", "SCORE_BOUND_MIN": "150",
         "PULL_MARGIN_MIN": "180", "FLOOR_AVG_SEQ_TOKENS": "2694", "INSTALL_LMCACHE": "1", "LMCACHE_VERSION": "0.4.4",
-        "CONFIRMATORY_ARMS": "B1 B3 B4 B6 B7"}
+        # S2R follow-ups (owner 2026-11-15): the S2R pod's 300 GB disk went from 91 GiB free at stage 3 to 65 GiB at
+        # stage 11 with 2.7 GB explained; 400 adds 100 GB of margin for the 60 h run until the cause is measured
+        "CONFIRMATORY_ARMS": "B1 B3 B4 B6 B7", "DISK_GB": "400"}
     # the served model plus the seven helpers, and no Qwen3-14B (no pod reader defaults to it)
     for p in (a, b):
         assert p["PREFETCH_MODELS"].split() == [p["MODEL"], *S2_HELPERS], p["PREFETCH_MODELS"]

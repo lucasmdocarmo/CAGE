@@ -457,8 +457,15 @@ run_step() {
   return 0
 }
 
-step_out() { cat "$STEP_LOG"; }            # the last step's captured output
-step_has() { grep -qF -- "$1" "$STEP_LOG"; } # literal substring in the last step's output (never a regex)
+# S2R follow-ups item 1 (2026-11-15): both read the step's OUTPUT lines only. run_step
+# writes a "# ..." header that carries the command text and a "# rc=" trailer; the ship
+# stage's name probe printed NAME_PROBE_REFUSED on pod dxc7uct8ukwniv and passed, because
+# step_has found NAME_PROBE_OK in the probe's own "# cmd:" line. No -q on the second grep:
+# under pipefail an early exit would end the first one with SIGPIPE and read as "absent".
+# -a (review 2026-11-15 L1): a NUL byte in the log makes grep print "Binary file ...
+# matches" in place of the lines, which would blind every check and the pod id parse.
+step_out() { grep -a -v '^#' "$STEP_LOG" || true; }   # the last step's captured output
+step_has() { grep -a -v '^#' "$STEP_LOG" | grep -a -F -- "$1" >/dev/null; } # literal substring in the last step's output (never a regex)
 
 plan_only() { [ "$PLAN" -eq 1 ]; }
 # ADR-0190 (review 2026-11-05 LOW 3 and LOW 4): the proof that the budget stop lies in
@@ -2227,9 +2234,24 @@ PY
   # arrivals, against the pod disk that holds the run root and its mirror (the
   # container disk when POD_RESULTS_DIR is set, else the network volume), the
   # archive when BACKUP_ARCHIVE_DIR is set, and the Mac's free space for the pull.
-  local copies=2 pod_gb="$VOLUME_GB" mac_free
+  local copies=2 pod_gb="$VOLUME_GB" mac_free free_kb
   [ -z "${BACKUP_ARCHIVE_DIR:-}" ] || copies=3
-  [ -z "$POD_RESULTS_DIR" ] || pod_gb="$DISK_GB"
+  if [ -n "$POD_RESULTS_DIR" ]; then
+    # S2R follow-ups (G7, owner 2026-11-15, option C): the container disk holds the weights
+    # and whatever the stages before this one wrote, so the bound is its free space read
+    # NOW, not the whole DISK_GB (which let through a plan the disk could not hold) and not
+    # the stage 3 record: pod dxc7uct8ukwniv read 91 GiB free at stage 3 and 65 GiB at stage
+    # 11, with 2.7 GB of that explained by the run root and its mirror. Growth during the
+    # run that the plan's arrivals do not explain stays outside this check (the projection's
+    # 0.8 headroom is all that covers it [A]). A read without a number refuses: the pod
+    # answers at stage 6, so nothing is guessed. The parse is stage 3's (POSIX -P -k columns).
+    run_step 0 "results disk free space (G7)" -- pssh "df -Pk $POD_RESULTS_DIR | tail -1" || return 1
+    free_kb="$(grep -a -v '^#' "$STEP_LOG" | awk 'NF >= 4 { print $4 }' | grep -E '^[0-9]+$' | tail -1 || true)"
+    [ -n "$free_kb" ] || { printf '  [FAIL] plan: the free-space read on %s returned no number (G7): the disk projection has no bound\n' "$POD_RESULTS_DIR"; return 1; }
+    pod_gb=$(( free_kb / 1024 / 1024 ))
+    state put pod.results_disk_free_gb "$pod_gb"
+    say "disk projection (G7): the bound is the $pod_gb GB free now on the disk holding $POD_RESULTS_DIR (DISK_GB=$DISK_GB holds the weights too)"
+  fi
   mac_free="$(df -k "$LAND" 2>/dev/null | awk 'NR == 2 { print int($4 / 1048576) }')"
   run_step 0 "disk projection (G7)" -- "$PY3" "$SCRIPT_DIR/disk_projection.py" "$EXTRAS/plan.json" --pod-gb "$pod_gb" --mac-free-gb "${mac_free:-0}" --copies "$copies" || return 1
   if [ "${CLASS_CEILINGS:-0}" = "1" ] && [ -f "$EXTRAS/plan_registered.json" ]; then
@@ -2578,7 +2600,7 @@ stage_pull() {
   # live outside the campaign root, so they are pulled here, best effort
   # (a run without pressure cells has neither).
   if plan_only; then
-    printf '  [plan] %-28s pscp_from %s/results/rung-calibration/. and every %s-dry-* sibling\n' "pull rung + dry evidence" "$POD_REPO" "$POD_RUN_ROOT"
+    printf '  [plan] %-28s pscp_from %s/results/rung-calibration/. and every %s/%s-dry-* sibling\n' "pull rung + dry evidence" "$POD_REPO" "${POD_RUN_ROOT%/*}" "${RUN_ID:0:30}"
   else
     # review 2026-10-13 item 20: a dropped copy used to WARN and teardown could
     # then delete the only copy; the pull fails the stage, and the regime.json
@@ -2594,15 +2616,47 @@ stage_pull() {
     else
       say "no rung-calibration tree on the pod (no ladder ran)"
     fi
-    local dry_root local_dry
-    for dry_root in $(pssh "ls -d ${POD_RUN_ROOT}-dry-* 2>/dev/null" 2>/dev/null || true); do
+    # S2R follow-ups item 10 (2026-11-15): the driver names a dry root with the run id's
+    # FIRST 30 characters (run_campaign.dry_window_root, DRIFT_ROOT_SUFFIX; the drift root
+    # above already cuts it), so the full-id glob matched S1's 28-character id and nothing
+    # of cd-act1's 38: landing S2R 2026-11-14 lost its dry window with the pod, silently.
+    # The listing's own exit is judged (a dead channel is never "no dry root"), and every
+    # dry root a fetched run log names must be on the Mac before the stage passes.
+    # Review 2026-11-15 M1: run.log (the latest attempt) always counts; an attempt log
+    # stamped before the last setup began belongs to an earlier container disk (the disk
+    # guard's remedy is --from setup --redo on a new pod), so the roots it names are gone
+    # with that disk: it is named and not required. L4: no run log at all is said, not
+    # read as "none named". The pod user is root, so an unreadable parent is not judged [A].
+    local dry_root local_dry dry_list="" dry_rc=0 dry_names="" want
+    local run_log run_stamp setup_at wanted="" n_run_logs=0
+    dry_list="$(pssh "ls -d ${POD_RUN_ROOT%/*}/${RUN_ID:0:30}-dry-* 2>/dev/null; true" 2>/dev/null)" || dry_rc=$?
+    [ "$dry_rc" -eq 0 ] || { printf '  [FAIL] the dry-root listing did not reach the pod (ssh rc=%s): nothing is judged absent on a dead channel\n' "$dry_rc"; return 1; }
+    for dry_root in $dry_list; do
       local_dry="$(dirname "$RUN_LOCAL")/$(basename "$dry_root")"
       mkdir -p "$local_dry"
       pscp_from "$dry_root/." "$local_dry/" || { printf '  [FAIL] dry root %s not pulled (the regime gate evidence)\n' "$dry_root"; return 1; }
       n_pod="$(pssh "find $dry_root -name regime.json 2>/dev/null | wc -l | tr -d ' '" 2>/dev/null || echo "?")"
       n_mac="$(find "$local_dry" -name regime.json 2>/dev/null | wc -l | tr -d ' ')"
       [ "$n_pod" = "$n_mac" ] || { printf '  [FAIL] dry root %s pull incomplete: %s regime.json on the pod, %s on the Mac\n' "$dry_root" "$n_pod" "$n_mac"; return 1; }
+      dry_names="$dry_names $(basename "$dry_root")"
     done
+    setup_at="$(state get stages.setup.started_utc 2>/dev/null | tr -d ':-' || true)"
+    for run_log in "$LAND"/logs/runner/run.log "$LAND"/logs/runner/run_*.log; do
+      [ -f "$run_log" ] || continue
+      run_stamp="${run_log##*/run_}"; run_stamp="${run_stamp%.log}"
+      if [ "${run_log##*/}" != "run.log" ] && [ -n "$setup_at" ] && [ "$run_stamp" \< "$setup_at" ]; then
+        say "attempt log ${run_log##*/} predates the last setup ($setup_at): the dry roots it names lived on an earlier container disk and are not required"
+        continue
+      fi
+      n_run_logs=$((n_run_logs + 1))
+      wanted="$wanted $(grep -a -oE "${RUN_ID:0:30}-dry-[a-z0-9]+" "$run_log" | sort -u | tr '\n' ' ')"
+    done
+    for want in $(printf '%s\n' $wanted | sort -u); do
+      [ -d "$(dirname "$RUN_LOCAL")/$want" ] || { printf '  [FAIL] the run log names the dry root %s but the pull did not land it (the regime gate evidence; teardown would delete the only copy): find it on the pod under %s, then resume with --from pull\n' "$want" "${POD_RUN_ROOT%/*}"; return 1; }
+    done
+    if [ -n "$dry_names" ]; then say "dry-window evidence pulled: $(printf '%s\n' $dry_names | grep -c .) root(s) (${dry_names# })"
+    elif [ "$n_run_logs" -eq 0 ]; then say "no dry-window root on the pod; no run log on the Mac to cross-check, so the pod's listing alone decided"
+    else say "no dry-window root on the pod and none named by the run log"; fi
   fi
   return 0
 }
