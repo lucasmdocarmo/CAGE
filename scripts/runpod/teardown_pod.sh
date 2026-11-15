@@ -86,7 +86,17 @@ echo "=== SAFE TEARDOWN (RunPod): pod=$POD_ID | target=$TARGET | local=$LOCAL_DI
 
 # --- [1/5] final on-pod sync (results + full logs/forensics) -----------------
 echo "[1/5] final on-pod sync (results + logs + forensics) ..."
-if [ -n "${CAGE_POD_SSH:-}" ]; then
+# S2R follow-ups item 8 (2026-11-15): the sync below runs ON the pod with this script's
+# <backup_target>. When that target is an ssh:// path on the pod itself (the master's
+# layout: the mirror on the pod's disk, pulled over ssh), the pod would have to ssh to
+# its own public address, which timed out on pod dxc7uct8ukwniv (port 22 from inside),
+# and a sync that did connect would nest a second results/ under the run's mirror. The
+# pod's last sync wrote that mirror, so the step is skipped and the pull gate decides.
+TARGET_HOST=""
+case "$TARGET" in ssh://*) TARGET_HOST="${TARGET#ssh://}"; TARGET_HOST="${TARGET_HOST%%/*}" ;; esac
+if [ -n "${CAGE_POD_SSH:-}" ] && [ -n "$TARGET_HOST" ] && [ "${TARGET_HOST#*@}" = "${CAGE_POD_SSH#*@}" ]; then
+  echo "    SKIPPED (the backup target is a path on the pod itself: a sync run on the pod cannot reach its own public address, and the pod's last sync wrote that mirror; the pull gate below is authoritative)"
+elif [ -n "${CAGE_POD_SSH:-}" ]; then
   # shellcheck disable=SC2086
   ssh ${CAGE_SSH_OPTS:-} -o StrictHostKeyChecking=no -o ConnectTimeout=60 "$CAGE_POD_SSH" \
     "cd ~/CAGE && CAGE_BACKUP_TARGET='$TARGET' bash scripts/5_observability/sync_results.sh results && CAGE_BACKUP_TARGET='$TARGET' CAGE_COLLECT_TOKEN='teardown_$(date -u +%Y%m%d_%H%M%S)_$$' bash scripts/5_observability/collect_logs.sh" \

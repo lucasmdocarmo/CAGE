@@ -206,6 +206,9 @@ def world(tmp_path: Path) -> Dict[str, Path]:
         if [ "${CAGE_TEST_DF_FREE_KB:-95658428}" = "none" ]; then echo "df: cannot read the mount table"; exit 0; fi
         echo "overlay 314572800 218914372 ${CAGE_TEST_DF_FREE_KB:-95658428} 70% /"
         ''')
+    # S2R follow-ups item 4 (2026-11-15): stages 3 and 6 record `du -x -k -d 2 /` on the
+    # pod; here that would walk this machine's whole disk on every test, so a stand-in answers
+    _w(b / "du", "#!/bin/bash\nprintf '218000000\\t/\\n172000000\\t/podhome-usage\\n'\n")
 
     # --- the fake Mac-side scripts tree -----------------------------------
     _w(fake_scripts / "checks" / "run_tests.sh", "#!/bin/bash\necho \"run_tests CAGE_LOAD_GATE=${CAGE_LOAD_GATE:-} $*\" >> \"$CAGE_TEST_LOG\"; case \"$*\" in *test_load_gate_p1*) echo \"${CAGE_TEST_LOAD_GATE_OUT:-1 passed}\" ;; *) echo '4000 passed' ;; esac; exit 0\n")

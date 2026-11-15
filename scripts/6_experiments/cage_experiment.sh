@@ -422,6 +422,7 @@ PY
 CUR_STAGE=""
 STEP_N=0
 STEP_LOG=""
+STEP_RC=""            # the last step's own exit code (review 2026-11-15 L7: read here, never parsed back from the log)
 GO_TEARDOWN_LINE=""   # block F row F-9: the honored extras/go_teardown line, set by the gate loop
 
 rc_expected() { # rc_expected <rc> <expected: "0" or "0|1">
@@ -448,6 +449,7 @@ run_step() {
   "$@" 2>&1 | tee -a "$STEP_LOG"
   rc="${PIPESTATUS[0]}"
   set -o pipefail
+  STEP_RC="$rc"
   printf '# rc=%s at %s\n' "$rc" "$(utc)" >> "$STEP_LOG"
   state evidence "$CUR_STAGE" "$STEP_LOG"
   if ! rc_expected "$rc" "$expected"; then
@@ -1368,6 +1370,19 @@ stage_ship() {
   return 0
 }
 
+disk_usage_evidence() { # disk_usage_evidence <setup|plan>: where the container disk's bytes are
+  # S2R follow-ups item 4 and the G7 note (2026-11-15): pod dxc7uct8ukwniv went from 91 GiB
+  # free at stage 3 to 65 GiB at stage 11 and nothing recorded where 23 of those 26 GB went.
+  # The largest 40 directories two levels under / (one filesystem, KB), bounded to 120 s
+  # where the pod has timeout, and the disk's own line; kept per stage, so stage 3 against
+  # stage 6 names what calibration wrote. Record only: the command always exits 0.
+  # Review 2026-11-15: L2, the walk's own exit is printed past the pipe (fd 3), so a listing
+  # cut at 120 s says so; L8, a failed record (a dead channel) is said and never fails the stage.
+  run_step 0 "container disk usage ($1)" -- pssh "{ { if command -v timeout >/dev/null 2>&1; then timeout 120 du -x -k -d 2 / 2>/dev/null; else du -x -k -d 2 / 2>/dev/null; fi; echo \"du_rc=\$? (124 = cut at 120 s: the listing is incomplete)\" >&3; } | sort -rn | head -40; } 3>&1; df -Pk / | tail -1; true" \
+    || { say "container disk usage ($1) not recorded (evidence only; the stage goes on)"; return 0; }
+  plan_only || cp "$STEP_LOG" "$LAND/logs/system/disk_usage_$1.txt"
+}
+
 stage_setup() {
   pod_env
   local bound=$(( SETUP_BOUND_MIN * 60 ))
@@ -1389,8 +1404,14 @@ stage_setup() {
   grep -q "pynvml OK" "$log" || { printf '  [FAIL] setup: pynvml not OK\n'; bad=1; }
   grep -q "cage_stats.api import OK" "$log" || { printf '  [FAIL] setup: cage_stats.api not importable\n'; bad=1; }
   [ "$bad" -eq 0 ] || return 1
-  run_step 0 "pod shape evidence" -- pssh "nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader && python3 --version && $POD_REPO/$POD_PYTHON -c 'import torch, vllm; print(\"torch\", torch.__version__, \"cuda\", torch.version.cuda, \"vllm\", vllm.__version__)' && df -h $POD_REPO | tail -1" || return 1
+  # S2R follow-ups item 4 (2026-11-15): two pods could not be compared on their host (the
+  # 2026-11-14 pod served SGLang 1.6 times slower per token than the 2026-11-10 one, with a
+  # host load of 16 to 19 while its GPUs were idle). The CPU model and socket layout, the GPU
+  # to CPU map and the host load ride the shape step, each one guarded: a missing tool prints
+  # "unavailable" and the step keeps the exit of the four original probes.
+  run_step 0 "pod shape evidence" -- pssh "{ nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader && python3 --version && $POD_REPO/$POD_PYTHON -c 'import torch, vllm; print(\"torch\", torch.__version__, \"cuda\", torch.version.cuda, \"vllm\", vllm.__version__)' && df -h $POD_REPO | tail -1; }; rc=\$?; if command -v lscpu >/dev/null 2>&1; then lscpu | grep -E '^ *(Model name|CPU\\(s\\)|Socket\\(s\\)|Core\\(s\\) per socket|Thread\\(s\\) per core|NUMA node)' | sed 's/^ */lscpu: /'; else echo 'lscpu: unavailable'; fi; if nvidia-smi topo -m >/dev/null 2>&1; then nvidia-smi topo -m; else echo 'nvidia-smi topo: unavailable'; fi; echo \"uptime: \$(uptime 2>/dev/null || echo unavailable)\"; exit \$rc" || return 1
   cp "$STEP_LOG" "$LAND/logs/system/pod_shape.txt"
+  disk_usage_evidence setup || return 1
   # S2 Block B-4 (owner 2026-10-31, option a): the weights stay on the container
   # disk (DISK_GB); a disk with less than DISK_FREE_MIN_GB free after the
   # prefetch refuses here, before stage 4 bills an engine start [A 20 GB].
@@ -2234,6 +2255,7 @@ PY
   # arrivals, against the pod disk that holds the run root and its mirror (the
   # container disk when POD_RESULTS_DIR is set, else the network volume), the
   # archive when BACKUP_ARCHIVE_DIR is set, and the Mac's free space for the pull.
+  disk_usage_evidence plan || return 1   # item 4: the second reading, beside the live free-space read below
   local copies=2 pod_gb="$VOLUME_GB" mac_free free_kb
   [ -z "${BACKUP_ARCHIVE_DIR:-}" ] || copies=3
   if [ -n "$POD_RESULTS_DIR" ]; then
@@ -2682,9 +2704,19 @@ stage_analyze() {
   # (R15); the report is the deliverable, so rc 1 is expected there and noted.
   local vexp=0; run_partial && vexp="0|1"
   run_step "$vexp" "verify_results" -- "$PY" "$SCRIPTS/4_analysis/verify_results.py" "$RUN_LOCAL" --out "$EXTRAS/verify_$(date -u +%H%M%S)" || return 1
-  if run_partial && ! plan_only && ! step_has "[verify_results] OK"; then
-    say "verify_results reports FAIL findings on the PARTIAL tree (expected: the failed cells, R15); see the step log"
-    state note analyze "verify_results reported FAIL findings on the PARTIAL tree (PARTIAL_TREE_OK=1)"
+  # S2R follow-ups item 11 (2026-11-15): verify_results.py prints "[verify_results] <verdict>:
+  # n FAIL, n WARN, n SKIP" with the verdict PASS on a clean tree; the marker tested here was
+  # "[verify_results] OK", which it never prints, so every partial tree was noted as FAIL findings;
+  # a PASS (exit 0) now leaves no note
+  # Review 2026-11-15 L6: exit 1 is the expected outcome on a partial tree only with the script's
+  # own FAIL verdict line; an exit 1 without it (an uncaught exception) is not "the failed cells"
+  if run_partial && ! plan_only && [ "$STEP_RC" = "1" ]; then
+    if step_has "[verify_results] FAIL"; then
+      say "verify_results reports FAIL findings on the PARTIAL tree (expected: the failed cells, R15); see the step log"
+      state note analyze "verify_results reported FAIL findings on the PARTIAL tree (PARTIAL_TREE_OK=1)"
+    else
+      printf '  [FAIL] verify_results: rc=1 without its FAIL verdict line on a PARTIAL tree (a crash, not the failed cells; log: %s)\n' "$STEP_LOG"; return 1
+    fi
   fi
   # shellcheck disable=SC2086
   # Spec Block A1 (2026-10-16): the section 6.1 currencies G and Y per window,
@@ -2703,14 +2735,33 @@ stage_analyze() {
   run_step 0 "organize_results" -- "$PY" "$SCRIPTS/4_analysis/organize_results.py" "$RUN_LOCAL" $force || return 1
   # The driver's one-look lock refuses a second run on the same root (review
   # 2026-10-06, MEDIUM 7): on --redo the stamp this master recorded is reused.
-  local prev_stamp; prev_stamp="$(state get analysis.stamp 2>/dev/null || true)"
+  local prev_stamp no_cells=0 aexp=0; prev_stamp="$(state get analysis.stamp 2>/dev/null || true)"
   if [ "$REDO" -eq 1 ] && [ -n "$prev_stamp" ] && [ -f "$RUN_LOCAL/analysis/$prev_stamp/stats.json" ]; then
     say "reusing analysis stamp $prev_stamp (the driver's one-look lock; a new look needs a new run root)"
   else
     # shellcheck disable=SC2086
-    run_step 0 "run_campaign_analysis (design input)" -- "$PY" "$SCRIPTS/4_analysis/run_campaign_analysis.py" "$RUN_LOCAL" --contrasts $CONTRASTS || return 1
+    # S2R follow-ups item 9 (2026-11-15): on a PARTIAL tree the driver may refuse a registered
+    # contrast whose cells the run never reached (landing 2026-11-14: the budget stop ended the
+    # run before any F1 cell, "contrast #4 ... needs F1 cells for both B6 and B3"). That named
+    # refusal (select_contrast_pairs; the text is pinned by a test on both sides) is a result:
+    # printed, noted, and the panels and analysis.txt below still run. Any other exit 1 on a
+    # partial tree, and every exit 1 on a complete tree, fails the stage as before.
+    run_partial && aexp="0|1"
+    run_step "$aexp" "run_campaign_analysis (design input)" -- "$PY" "$SCRIPTS/4_analysis/run_campaign_analysis.py" "$RUN_LOCAL" --contrasts $CONTRASTS || return 1
+    # Review 2026-11-15 L1: the three "no pair on this tree" refusals of that one function count
+    # (no cells for a side, no shared dataset, no shared axes); its "ambiguous pair" refusal is a
+    # grid defect and still fails.
+    if ! plan_only && [ "$STEP_RC" = "1" ]; then
+      if step_has "needs F1 cells for both" || step_has "share no dataset" || step_has "cells never share the same"; then
+        no_cells=1
+        say "run_campaign_analysis refused: the PARTIAL tree holds no cells for a registered contrast ($(state get run.partial)); the refusal above is the result, no look was taken, and the panels and analysis.txt still run"
+        state note analyze "run_campaign_analysis: the PARTIAL tree holds no cells for a registered contrast (--contrasts $CONTRASTS); no analysis stamp ($(utc), item 9)"
+      else
+        printf '  [FAIL] run_campaign_analysis (design input): rc=1 without the named no-cells refusal on a PARTIAL tree (log: %s)\n' "$STEP_LOG"; return 1
+      fi
+    fi
   fi
-  if ! plan_only; then
+  if ! plan_only && [ "$no_cells" -eq 0 ]; then
     local stamp; stamp="$(ls -1 "$RUN_LOCAL/analysis" 2>/dev/null | sort | tail -n 1)"
     [ -n "$stamp" ] || { printf '  [FAIL] no analysis/<stamp>/ under %s\n' "$RUN_LOCAL"; return 1; }
     mkdir -p "$LAND/plots/$stamp"
