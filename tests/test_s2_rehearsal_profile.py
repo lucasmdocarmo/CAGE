@@ -1,7 +1,7 @@
 """S2 rehearsal profile S2R.env (owner 2026-11-04, option R1, "lets do the test with
 the h200 as designed"): S2B's exact shape (the 80B on four H200, both engines, every
 ladder) driven through every stage of the master once, cut short at the run, before
-landing B bills. Eleven keys differ from S2B.env and nothing else does; the file is never
+landing B bills. Nine keys differ from S2B.env and nothing else does; the file is never
 a landing of record. ADR-0190 (owner 2026-11-05, option D): RUN_CUT_BY_BUDGET=1 lets
 stage 6 accept the 38 h plan projection because the budget stop cuts the run first. Spec: MyDocs/RunPod/S2_REHEARSAL_LANDING_2026-11-05.md.
 """
@@ -27,9 +27,9 @@ LEVERS: Dict[str, str] = {
     "PULL_MARGIN_MIN": "60",       # a one hour tree pulls in minutes
     "VOLUME_GB": "100",            # the weights live on the container disk; the owner deletes the volume by hand
     "MIN_IN_REGIME_WINDOWS": "",   # the regime counts print only; S2B's floor would fail a one hour tree
-    "SKIP_BLOCKED": "1",           # cd-act1 carries eight blocked rows (B8 on both engines, ADR-0193); the loud skip path runs
+    # SKIP_BLOCKED=1 (the loud skip of the blocked rows) is no lever since 2026-11-16: S2B.env states 1 too (owner: "ok set SKIP_BLOCKED=1 on S2B")
     # IDENTITY_FAIL_ACCEPTED=1 (owner 2026-11-10: the gate FAIL, A 187/200, accepted) is no lever since item 8 (2026-11-11): S2B.env states 1 too
-    "PD_FAIL_ACCEPTED": "1",       # owner 2026-11-10: the PD smoke FAIL (the decode engine died on the warm-up, align mode) is accepted on the rehearsal; S2B keeps 0 (item 8)
+    # PD_FAIL_ACCEPTED=1 (owner 2026-11-10 on the rehearsal) is no lever since 2026-11-16: S2B.env states 1 too ("Drop PD from S2B", option A)
     # FRONTIER_LOADS=0 (owner 2026-11-15) is no lever since S2B.env states 0 too ("ok A then": no cd-act1 block registers a frontier load); tests/test_s2r_followups_batch3.py pins it
 }
 
@@ -56,7 +56,7 @@ def _stated(name: str) -> Dict[str, str]:
 
 
 def test_s2r_pins_the_rehearsal_levers_and_stays_a_registered_profile() -> None:
-    """The eleven levers hold the Spec Block's values; the two keys that would relax the
+    """The nine levers hold the Spec Block's values; the two keys that would relax the
     registered-profile block stay at their S2B values (REHEARSAL_N is refused on cd-act1
     by the driver, PARTIAL_TREE_OK=1 is refused at stage 0 without it); the plan is whole."""
     v = _shipped("S2R.env", *LEVERS, "SESSION", "REHEARSAL_N", "PARTIAL_TREE_OK", "LAST_BLOCK", "MODEL", "GPU_ID", "GPU_COUNT")
@@ -105,17 +105,19 @@ def test_s2r_stage_bounds_sum_to_thirty_one_hours_under_the_seatbelt() -> None:
     assert round(round(need / 60, 1) * 4 * 5.29 + 50, 2) == 739.82
 
 
-def test_s2b_accepts_the_identity_fail_and_keeps_the_pd_smoke_fail_unaccepted_item8() -> None:
+def test_s2b_accepts_the_identity_fail_and_the_pd_smoke_fail_in_advance() -> None:
     """Item 8 (owner 2026-11-11, option (c)): the identity gate FAIL of 2026-11-10 (comparison A,
     187 of 200 prompts, on the pinned weights and engines S2B serves) is a result landing B
     carries, so the profile states IDENTITY_FAIL_ACCEPTED=1: the gate still runs once on the new
     pod, and a FAIL is recorded and excludes the vLLM prefix-on cells without stopping stage 4.
-    PD_FAIL_ACCEPTED stays 0, stated: a PD smoke FAIL on landing B stops stage 4 until the owner
-    decides on that landing's evidence (the 2026-11-10 FAIL was a decode engine death under
-    align mode, S2R_PRE_RESTART_SPECS item 8)."""
-    assert _shipped("S2B.env", "IDENTITY_FAIL_ACCEPTED", "PD_FAIL_ACCEPTED") == {"IDENTITY_FAIL_ACCEPTED": "1", "PD_FAIL_ACCEPTED": "0"}
+    PD_FAIL_ACCEPTED was 0 under item 8 (stage 4 stopped on a FAIL for the owner's decision);
+    since 2026-11-16 (owner: "Drop PD from S2B", option A, ADR-0208, AMD-003) it is 1, stated:
+    the smoke failed the same way on both S2R pods (vLLM 0.19.1 asserts "External KV connector is
+    not verified yet" under --mamba-cache-mode align, scheduler.py line 305), so S2B runs it once
+    on its own pod, records the FAIL, and its plan carries no pd cell."""
+    assert _shipped("S2B.env", "IDENTITY_FAIL_ACCEPTED", "PD_FAIL_ACCEPTED") == {"IDENTITY_FAIL_ACCEPTED": "1", "PD_FAIL_ACCEPTED": "1"}
     stated = _stated("S2B.env")
-    assert stated["IDENTITY_FAIL_ACCEPTED"] == "1" and stated["PD_FAIL_ACCEPTED"] == "0"
+    assert stated["IDENTITY_FAIL_ACCEPTED"] == "1" and stated["PD_FAIL_ACCEPTED"] == "1"
 
 
 def test_s2r_and_s2b_keep_the_results_and_the_backup_off_the_volume_followups_item6() -> None:

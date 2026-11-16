@@ -3103,27 +3103,30 @@ def test_the_shipped_s2_landing_profiles_carry_every_s1_key_and_the_block_e_pick
               # the gate at the registered count per load, the ladder bound that holds 15 triples per engine
               "CALIBRATION_BUDGET_FRACTION": "1.0", "REGIME_GATE_LOADS": "0.95 1.05", "MIN_IN_REGIME_WINDOWS": "0.95:2 1.05:3",
               "MAX_NULL_FRACTION": "0.06", "SUITE_ON_POD": "1", "MAC_SUITE": "1", "FRONT_LOAD": "0", "VOLUME_GB": "300",
-              # DISK_GB left the shared values on 2026-11-15 (owner: "C plus 400 GB"): S2B states 400, S2A keeps 300
-              "SKIP_BLOCKED": "0",
+              # DISK_GB left the shared values on 2026-11-15 (owner: "C plus 400 GB"): S2B states 400, S2A keeps 300;
+              # SKIP_BLOCKED left them on 2026-11-16 (owner: "ok set SKIP_BLOCKED=1 on S2B"): S2A keeps 0
               # S2 block F row F-11 (owner 2026-11-04, option (a)): the per-row bounds the stage 10 proof allows
               "SCORING_TOL_FAITHFULNESS": "0.005", "SCORING_TOL_BERTSCORE": "1e-5"}
     for k, v in shared.items():
         assert a[k] == v and b[k] == v, (k, a[k], b[k])
     own = ("EXP", "SESSION", "MODEL", "MODEL_SLUG", "HOURS", "RUN_BUDGET_HOURS", "SEATBELT", "SETUP_BOUND_MIN",
-           "SCORE_BOUND_MIN", "PULL_MARGIN_MIN", "FLOOR_AVG_SEQ_TOKENS", "INSTALL_LMCACHE", "LMCACHE_VERSION", "CONFIRMATORY_ARMS", "DISK_GB")
+           "SCORE_BOUND_MIN", "PULL_MARGIN_MIN", "FLOOR_AVG_SEQ_TOKENS", "INSTALL_LMCACHE", "LMCACHE_VERSION", "CONFIRMATORY_ARMS", "DISK_GB",
+           "SKIP_BLOCKED")
     # the seatbelts grew with the calibrate term (2 x 240 min) under decision 3; the rosters are decision 2's
     assert {k: a[k] for k in own} == {
         "EXP": "S2A", "SESSION": "s2a", "MODEL": "meta-llama/Llama-3.3-70B-Instruct", "MODEL_SLUG": "llama-3.3-70b",
         "HOURS": "50", "RUN_BUDGET_HOURS": "45", "SEATBELT": "83h", "SETUP_BOUND_MIN": "40", "SCORE_BOUND_MIN": "120",
         "PULL_MARGIN_MIN": "150", "FLOOR_AVG_SEQ_TOKENS": "4779", "INSTALL_LMCACHE": "0", "LMCACHE_VERSION": "",
-        "CONFIRMATORY_ARMS": "B1 B3 B4 B6 B7 B11 B12", "DISK_GB": "300"}
+        "CONFIRMATORY_ARMS": "B1 B3 B4 B6 B7 B11 B12", "DISK_GB": "300", "SKIP_BLOCKED": "0"}
     assert {k: b[k] for k in own} == {
         "EXP": "S2B", "SESSION": "cd-act1", "MODEL": "Qwen/Qwen3-Next-80B-A3B-Instruct", "MODEL_SLUG": "qwen3-next-80b",
         "HOURS": "60", "RUN_BUDGET_HOURS": "55", "SEATBELT": "98h", "SETUP_BOUND_MIN": "50", "SCORE_BOUND_MIN": "150",
         "PULL_MARGIN_MIN": "180", "FLOOR_AVG_SEQ_TOKENS": "2694", "INSTALL_LMCACHE": "1", "LMCACHE_VERSION": "0.4.4",
         # S2R follow-ups (owner 2026-11-15): the S2R pod's 300 GB disk went from 91 GiB free at stage 3 to 65 GiB at
         # stage 11 with 2.7 GB explained; 400 adds 100 GB of margin for the 60 h run until the cause is measured
-        "CONFIRMATORY_ARMS": "B1 B3 B4 B6 B7", "DISK_GB": "400"}
+        # SKIP_BLOCKED=1 (owner 2026-11-16): the cd-act1 plan carries 57 blocked rows once the identity and PD
+        # failures are accepted (35 pd, 14 vLLM prefix-on single, 8 B8), and stage 7 refuses a plan with any under 0
+        "CONFIRMATORY_ARMS": "B1 B3 B4 B6 B7", "DISK_GB": "400", "SKIP_BLOCKED": "1"}
     # the served model plus the seven helpers, and no Qwen3-14B (no pod reader defaults to it)
     for p in (a, b):
         assert p["PREFETCH_MODELS"].split() == [p["MODEL"], *S2_HELPERS], p["PREFETCH_MODELS"]
