@@ -271,6 +271,13 @@ from src.analysis.dist_contrasts import (  # noqa: E402
 )
 from src.analysis.predicate import PREDICATE_DATASETS  # noqa: E402
 from src.orchestration.cache_budget import CacheBudgetError  # noqa: E402
+from src.orchestration.calibration import (  # noqa: E402
+    PROBE_ATTAINMENT_MIN,
+    PROBE_SERVED_MIN,
+    PROBE_WARMUP_S,
+    CalibrationError,
+    ProbeStep,
+)
 from src.observability.provenance import (  # noqa: E402
     git_dirty as _prov_git_dirty,
     git_sha as _prov_git_sha,
@@ -433,6 +440,21 @@ _FRONTIER_RATE_METRICS_PATH: tuple[str, ...] = (
 _FRONTIER_MATCH_AXES: tuple[str, ...] = (
     "engine", "model", "arm", "retriever", "policy", "topology", "dataset",
 )
+
+#: AN-1 (ADR-0210, owner 2026-11-20): the budget comparison at a matched load
+#: fraction, a DESCRIPTIVE section (no alpha, no gate). S2 offers each cell a
+#: fraction of its own rate limit, so the K1 match of #12 (one absolute rate)
+#: finds no point there; AN-1 pairs a constrained cell with its control at the
+#: same rate_frac. Owner rulings of 2026-11-20: the Holm family is the CAG and
+#: RAG pair at the load above the limit; the reference class of the
+#: between-class block is the class baseline B6 is served in. The ladder's
+#: bracket is read from the rung calibration files (--rung-calibration), each
+#: checked against the sha256 the plan registers under the path below.
+MATCHED_LOAD_KEY = "matched_load"
+MATCHED_LOAD_HOLM_BASELINES: tuple[str, ...] = ("B3", "B6")
+MATCHED_LOAD_HOLM_RATE_FRAC: float = 1.05
+MATCHED_LOAD_REFERENCE_BASELINE = "B6"
+_RUNG_ARTIFACTS_PLAN_PATH: tuple[str, ...] = ("rung_calibration", "artifacts")
 
 #: Task #119 (§8.5): the joined predicate table — a post-seal sibling tree
 #: produced by scripts/4_analysis/build_predicate_table.py, mirroring
@@ -4900,6 +4922,742 @@ def compute_frontier_drop(
 
 
 # ---------------------------------------------------------------------------
+# AN-1 (ADR-0210): the budget comparison at a matched load fraction
+# ---------------------------------------------------------------------------
+
+
+def load_rung_brackets(
+    paths: Sequence[Path], plan_path: Path
+) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[str, str]]:
+    """AN-1g: ({(engine, class tokens) -> that class's record in the engine's
+    rung calibration file}, {engine or path -> why a file was not used}).
+
+    A file is used only when its sha256 equals the one the plan registers for
+    its engine (``rung_calibration.artifacts.<engine>.sha256``); a plan that
+    registers none accepts the file. An unreadable or foreign file is a
+    labeled reason, never a refusal: the section is descriptive.
+    """
+    try:
+        plan = json.loads(Path(plan_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AnalysisError(f"--plan {plan_path}: {exc}") from exc
+    classes: dict[tuple[str, str], dict[str, Any]] = {}
+    unused: dict[str, str] = {}
+    for path in paths:
+        try:
+            raw = Path(path).read_bytes()
+            doc = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as exc:
+            unused[str(path)] = f"--rung-calibration {path}: {exc}"
+            continue
+        engine = doc.get("engine") if isinstance(doc, dict) else None
+        table = doc.get("classes") if isinstance(doc, dict) else None
+        if not isinstance(engine, str) or not isinstance(table, dict):
+            unused[str(path)] = f"--rung-calibration {path}: no engine or classes key (not a rung calibration file)"
+            continue
+        expected = _nested(plan, (*_RUNG_ARTIFACTS_PLAN_PATH, engine, "sha256"))
+        actual = hashlib.sha256(raw).hexdigest()
+        if expected is not None and expected != actual:
+            unused[engine] = (
+                f"--rung-calibration {path}: sha256 {actual[:12]} differs from the "
+                f"{str(expected)[:12]} the plan registers for engine {engine!r}; not used"
+            )
+            continue
+        for cls, record in table.items():
+            if isinstance(record, dict):
+                classes[(engine, str(cls))] = record
+    return classes, unused
+
+
+def _rung_record(record: Mapping[str, Any], rung: float) -> Mapping[str, Any] | None:
+    """The rung's entry of a class record (keys are written as "1", "0.25")."""
+    rungs = record.get("rungs")
+    for key, value in (rungs.items() if isinstance(rungs, Mapping) else ()):
+        try:
+            if float(key) == rung and isinstance(value, Mapping):
+                return value
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _finite_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+
+
+def _window_ladder_rule(run_dir: Path, rec: Any, rate_qps: float) -> dict[str, Any]:
+    """AN-1k: the ladder's sustainable verdict (``calibration.ProbeStep``,
+    cal-v3) read on one SERVED window. The rule is the ladder's: arrivals
+    after ``PROBE_WARMUP_S``, attainment = their completed share, served ratio
+    = completions that finish inside the trimmed window over those arrivals.
+    The ladder probes a fixed duration and a served window a fixed pool, so the
+    window here is [``PROBE_WARMUP_S``, pool size / offered rate): the pool's
+    design duration (review 2026-11-20: the last Poisson arrival moved the end
+    by seconds, 79.98 s to 87.0 s for a nominal 85.03 s on the S2R landing).
+    Arrivals and completions at or past that end are outside the window, as
+    none exists past the ladder's. The end used is returned. A window whose
+    rows carry no clock returns ``sustainable: None`` with the reason."""
+    label = str(rec.window_dir)
+    rows = _read_jsonl(run_dir / label / "requests.jsonl")
+    if not rows or not all(_finite_number(r.get("arrival_s")) for r in rows):
+        return {"sustainable": None, "reason": f"{label}: a row carries no arrival_s (the intended arrival)"}
+    span = len(rows) / rate_qps
+    kept = [r for r in rows if PROBE_WARMUP_S <= float(r["arrival_s"]) < span]
+    if not kept:
+        return {"sustainable": None, "reason": (
+            f"{label}: no arrival between the {PROBE_WARMUP_S:g} s warm-up and the window end at {span:.4g} s"
+        )}
+    n_completed = sum(1 for r in kept if r.get("ok") is True)
+    clocked = [
+        r for r in rows
+        if r.get("ok") is True and _finite_number(r.get("completion_ts")) and _finite_number(r.get("scheduled_ts"))
+    ]
+    if n_completed and not clocked:
+        return {"sustainable": None, "reason": f"{label}: no completed row carries completion_ts and scheduled_ts"}
+    served = sum(
+        1 for r in clocked
+        if PROBE_WARMUP_S <= float(r["completion_ts"]) - (float(r["scheduled_ts"]) - float(r["arrival_s"])) < span
+    )
+    try:
+        step = ProbeStep(
+            rate_qps=rate_qps, n_scheduled=len(kept), n_completed=n_completed,
+            throughput_rps=n_completed / (span - PROBE_WARMUP_S),
+            n_served_in_window=served, window_s=span,
+        )
+    except CalibrationError as exc:
+        return {"sustainable": None, "reason": f"{label}: {exc}"}
+    return {"attainment": step.attainment, "served_ratio": step.served_ratio, "sustainable": step.sustainable,
+            "window_end_s": span}
+
+
+def _limit_check(by_frac: Mapping[float, Sequence[Mapping[str, Any]]]) -> dict[str, Any]:
+    """AN-1k: does the served data bracket the cell's rate limit? Confirmed
+    when every window at a load below 1.0 is sustainable and every window at a
+    load above 1.0 is not, by the ladder's own rule."""
+    windows = [w for ws in by_frac.values() for w in ws]
+    missing = next((str(w.get("reason")) for w in windows if w.get("sustainable") is None), None)
+    if missing is not None:
+        return {"verdict": "unavailable", "detail": missing}
+    below = [bool(w["sustainable"]) for f, ws in by_frac.items() if f < 1.0 for w in ws]
+    above = [bool(w["sustainable"]) for f, ws in by_frac.items() if f > 1.0 for w in ws]
+    if not below or not above:
+        return {"verdict": "unavailable", "detail": "needs served windows at a load below and a load above 1.0"}
+    bad_below, bad_above = below.count(False), above.count(True)
+    if not bad_below and not bad_above:
+        return {"verdict": "confirmed", "detail": None}
+    parts = []
+    if bad_below:
+        parts.append(f"{bad_below} of {len(below)} windows below 1.0 unsustainable (the limit sits too high)")
+    if bad_above:
+        parts.append(f"{bad_above} of {len(above)} windows above 1.0 sustainable (the limit sits too low)")
+    return {"verdict": "not confirmed", "detail": "; ".join(parts)}
+
+
+def _spread(values: Sequence[float]) -> dict[str, float] | None:
+    return None if not values else {
+        "median": float(np.median(values)), "min": float(min(values)), "max": float(max(values)),
+    }
+
+
+def _ladder_bracket(num: Mapping[str, Any] | None, den: Mapping[str, Any] | None) -> list[float] | None:
+    """The bracket of the ratio of two rate limits, from two rung entries of the
+    ladder: [sustained_num / first_unsustainable_den, first_unsustainable_num /
+    sustained_den]; None when either entry lacks a positive bracketed limit."""
+    fields = ("sustained_rate_qps", "first_unsustainable_qps")
+    if num is None or den is None or not all(
+        _finite_number(side.get(name)) and float(side[name]) > 0.0 for side in (num, den) for name in fields
+    ):
+        return None
+    return [
+        float(num["sustained_rate_qps"]) / float(den["first_unsustainable_qps"]),
+        float(num["first_unsustainable_qps"]) / float(den["sustained_rate_qps"]),
+    ]
+
+
+def _no_bracket_reason(engine: str, cls: int, unused: Mapping[str, str], engines_loaded: set[str]) -> str:
+    """Why the rung calibration holds no record of class ``cls`` on ``engine``."""
+    return unused.get(engine) or (
+        f"class {cls} was not laddered on engine {engine!r} (its rate limit is interpolated)"
+        if engine in engines_loaded
+        else f"no --rung-calibration file for engine {engine!r}: the bracket needs the ladder's "
+             "sustained and first unsustainable rates"
+    )
+
+
+def registered_arm_pairs() -> list[tuple[int, str, str]]:
+    """AN-2 (ADR-0211): (contrast id, cell baseline, reference baseline) of every
+    registered no-load contrast that names one baseline pair. The arm_pairs
+    block reads the same pairs under pressure, in the registry's own direction."""
+    return [
+        (c.id, c.baseline_a, c.baseline_b) for c in CONTRASTS
+        if c.family == "F1" and c.unit == "per_query" and c.baseline_a is not None and c.baseline_b is not None
+    ]
+
+
+class _PressureReader:
+    """One cached read of the pressure windows for the descriptive blocks of the
+    matched_load section (AN-1, ADR-0210; AN-2, ADR-0211). ``pressure`` is the
+    index's F2/F3 rows with numeric ``_r`` (budget_r), ``_f`` (rate_frac) and
+    the corpus cut ``_cut``. Every helper refusal surfaces as AnalysisError; the
+    blocks turn it into a labeled skip."""
+
+    def __init__(
+        self, run_dir: Path, pressure: pd.DataFrame, *, predicate_root: Path,
+        targets: Mapping[str, float], plan_path: Path,
+    ) -> None:
+        self.run_dir, self.pressure, self.predicate_root = run_dir, pressure, predicate_root
+        self.targets, self.plan_path = targets, plan_path
+        self._rate: dict[tuple[str, str], float] = {}
+        self._class: dict[str, int] = {}
+        self._shares: dict[str, dict[str, float]] = {}
+        self._rule: dict[str, dict[str, Any]] = {}
+        #: (row key, dataset) -> the rows of that cell at EVERY load (same axes, cut and rung).
+        #: Review 2026-11-20: one row key can hold windows of two datasets (16 of S1's 108
+        #: pressure keys), so every read below is scoped to the dataset as well.
+        self._family: dict[tuple[str, str], pd.DataFrame] = {}
+        for _key, grp in pressure.groupby([*_FRONTIER_MATCH_AXES, "_cut", "_r"], dropna=False):
+            dataset = str(grp["dataset"].iloc[0])
+            for row_key in grp["row_key"].unique():
+                self._family[(str(row_key), dataset)] = grp
+
+    def rows_of(self, row_key: str, dataset: str) -> pd.DataFrame:
+        return self.pressure[(self.pressure["row_key"] == row_key) & (self.pressure["dataset"] == dataset)]
+
+    def rate_of(self, row_key: str, dataset: str) -> float:
+        if (row_key, dataset) not in self._rate:
+            self._rate[(row_key, dataset)] = _cell_rate_qps(self.run_dir, self.rows_of(row_key, dataset))
+        return self._rate[(row_key, dataset)]
+
+    def class_of(self, row_key: str) -> int:
+        if row_key not in self._class:
+            cell_json = str(self.pressure.loc[self.pressure["row_key"] == row_key, "cell_json"].iloc[0])
+            self._class[row_key] = _cell_class_tokens(self.run_dir, cell_json)
+        return self._class[row_key]
+
+    def shares_of(self, grp: pd.DataFrame, target_s: float) -> list[dict[str, float]]:
+        out = []
+        for rec in grp.itertuples(index=False):
+            key = str(rec.window_dir)
+            if key not in self._shares:
+                self._shares[key] = _window_yield_shares(self.run_dir, rec, self.predicate_root, target_s)
+            out.append(self._shares[key])
+        return out
+
+    def rules_of(self, grp: pd.DataFrame) -> list[dict[str, Any]]:
+        out = []
+        for rec in grp.itertuples(index=False):
+            key = str(rec.window_dir)
+            if key not in self._rule:
+                # a sibling load whose rate cannot be read makes the check
+                # unavailable; it never drops the row that asked for it
+                try:
+                    self._rule[key] = _window_ladder_rule(
+                        self.run_dir, rec, self.rate_of(str(rec.row_key), str(rec.dataset))
+                    )
+                except AnalysisError as exc:
+                    self._rule[key] = {"sustainable": None, "reason": str(exc)}
+            out.append(self._rule[key])
+        return out
+
+    def labels_of(self, grp: pd.DataFrame) -> list[str | None]:
+        labels: list[str | None] = []
+        for rec in grp.itertuples(index=False):
+            try:
+                doc = json.loads((self.run_dir / str(rec.window_dir) / "regime.json").read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                doc = None
+            labels.append(str(doc["label"]) if isinstance(doc, dict) and isinstance(doc.get("label"), str) else None)
+        return labels
+
+    def limit_of(self, row_key: str, dataset: str) -> dict[str, Any]:
+        """AN-1k: the limit check of the cell ``row_key`` belongs to, over its loads."""
+        return _limit_check({float(f): self.rules_of(g) for f, g in self._family[(row_key, dataset)].groupby("_f")})
+
+    def compare(self, key_a: str, key_b: str, a: str, b: str, dataset: str) -> dict[str, Any]:
+        """Cell ``key_a`` against cell ``key_b`` on the window values of the yield
+        share: means, delta = a minus b, per-side SD and count, a two-sided Welch
+        test and interval (none on a side of one window or on two flat sides), the
+        timely and accepted decomposition, both offered rates and their ratio, the
+        yield rates, the regime labels, the ladder rule per window and both cells'
+        limit checks. ``a`` and ``b`` name the two sides in the keys. The two cells
+        must sit in one token class: one class, one first-token target. Only
+        the windows of ``dataset`` are read."""
+        grp_a, grp_b = self.rows_of(key_a, dataset), self.rows_of(key_b, dataset)
+        q_a, q_b = self.rate_of(key_a, dataset), self.rate_of(key_b, dataset)
+        classes = {self.class_of(key_a), self.class_of(key_b)}
+        if len(classes) != 1:
+            raise AnalysisError(f"the pair spans classes {sorted(classes)}; one comparison, one class")
+        (cls,) = classes
+        if str(cls) not in self.targets:
+            raise AnalysisError(
+                f"class {cls} tokens has no target in {self.plan_path} "
+                f"({FRONTIER_CLASS_TARGETS_KEY} keys {sorted(self.targets)})"
+            )
+        target_s = self.targets[str(cls)]
+        shares_a, shares_b = self.shares_of(grp_a, target_s), self.shares_of(grp_b, target_s)
+
+        def share(key: str) -> dict[str, float]:
+            ma = float(np.mean([s[key] for s in shares_a]))
+            mb = float(np.mean([s[key] for s in shares_b]))
+            return {f"mean_{a}": ma, f"mean_{b}": mb, "delta": ma - mb}
+
+        va = np.array([s["yield_frac"] for s in shares_a], dtype=float)
+        vb = np.array([s["yield_frac"] for s in shares_b], dtype=float)
+        # the range, not the computed SD, says a side is flat (review 2026-11-20: the SD of three
+        # identical shares is 1e-17, and Welch on two such sides returned p = 2e-46)
+        sd_a = (float(va.std(ddof=1)) if np.ptp(va) > 0.0 else 0.0) if len(va) >= 2 else None
+        sd_b = (float(vb.std(ddof=1)) if np.ptp(vb) > 0.0 else 0.0) if len(vb) >= 2 else None
+        test: dict[str, Any] = {"statistic": None, "df": None, "p_value": None,
+                                "ci95_low_welch": None, "ci95_high_welch": None, "test_skipped": None}
+        if sd_a is None or sd_b is None:
+            test["test_skipped"] = (
+                f"needs >= 2 windows per side for a Welch variance estimate; got {a}={len(va)}, {b}={len(vb)}"
+            )
+        elif sd_a == 0.0 and sd_b == 0.0:
+            test["test_skipped"] = "zero variance on both sides: a Welch contrast is undefined"
+        else:
+            result = batch_means_contrast(va, vb, alternative="two-sided")
+            test.update(statistic=result.statistic, df=result.df, p_value=result.p_value,
+                        ci95_low_welch=result.ci95_low, ci95_high_welch=result.ci95_high)
+        y = share("yield_frac")
+        rps_a, rps_b = q_a * y[f"mean_{a}"], q_b * y[f"mean_{b}"]
+        return {
+            "class_tokens": cls, "target_s": target_s,
+            f"rate_qps_{a}": q_a, f"rate_qps_{b}": q_b, "rate_ratio": q_a / q_b,
+            f"n_windows_{a}": int(len(va)), f"n_windows_{b}": int(len(vb)),
+            "yield": {**y, f"sd_{a}": sd_a, f"sd_{b}": sd_b, **test, "executed_alternative": "two-sided"},
+            "timely": share("timely_frac"), "accepted": share("accepted_frac"),
+            f"yield_rps_{a}": rps_a, f"yield_rps_{b}": rps_b,
+            "yield_rps_ratio": (rps_a / rps_b) if rps_b > 0.0 else None,
+            "regime_labels": {a: self.labels_of(grp_a), b: self.labels_of(grp_b)},
+            "ladder_rule": {a: self.rules_of(grp_a), b: self.rules_of(grp_b)},
+            "limit_check": {a: self.limit_of(key_a, dataset), b: self.limit_of(key_b, dataset)},
+        }
+
+
+def compute_matched_load(
+    run_dir: Path,
+    index: pd.DataFrame,
+    *,
+    predicate_root: Path | None,
+    plan_path: Path | None,
+    rung_calibration_paths: Sequence[Path] = (),
+) -> dict[str, Any]:
+    """AN-1 (ADR-0210): the constrained cell against its control at the SAME
+    load fraction. Descriptive: spends no alpha, enters no chain.
+
+    Math (plan section 16.2). For one leg, W_c are the windows of the
+    constrained cell (rung r_c below the plan's control rung r_0) and W_0 the
+    windows of the control cell on the same engine, model, arm, retriever,
+    policy, topology, dataset and corpus cut, both at load fraction f:
+
+    - y_w = the window's yield share over every issued request
+      (``_window_yield_shares``, the rule of ADR-0178 D10, unchanged);
+    - delta = mean(y_w, W_c) - mean(y_w, W_0), with a two-sided Welch test and
+      interval on the window values (AN-1f: no window bootstrap, whose 95
+      percent interval held 67 to 81 percent at 2 and 3 windows);
+    - capacity ratio kappa = q_c / q_0, the offered rates; q = f x lambda*
+      on both sides, so kappa = lambda*(r_c) / lambda*(r_0);
+    - yield rate Y = q x mean(y_w) in requests per second, and Y_c / Y_0.
+
+    Per (dataset, engine, class, rung): kappa with the ladder's bracket
+    [sustained_c / first_unsustainable_0, first_unsustainable_c / sustained_0]
+    (AN-1g) and its ratio over the reference class (AN-1h). Per (dataset,
+    engine, rung, load): the median and range over the arms (AN-1i). Holm over
+    the named family alone (AN-1j). Each cell carries the limit check of
+    ``_limit_check`` (AN-1k).
+
+    Never refuses the look: a missing plan, predicate table or pressure row is
+    one labeled skip; a pair a helper refuses is a labeled skip quoting it.
+    Complexity: O(issued requests of the pressure windows) time, each window's
+    files read once per helper; O(the largest window) space.
+    """
+    if plan_path is None:
+        return {"skipped": "no --plan supplied: the class first-token targets and the control rung "
+                           "are read from the plan the run used (the landing's extras/plan.json)"}
+    if predicate_root is None:
+        return {"skipped": f"the yield share needs the section 8.5 predicate, and {_PREDICATE_FIX_HINT}"}
+    targets = load_class_targets(plan_path)
+    control_r = load_control_budget_r(plan_path)
+    pressure = index[index["family"].isin(sorted(PRESSURE_FAMILIES))].copy()
+    pressure["_r"] = pd.to_numeric(pressure["budget_r"], errors="coerce")
+    pressure["_f"] = pd.to_numeric(pressure["rate_frac"], errors="coerce")
+    pressure = pressure[pressure["_r"].notna() & pressure["_f"].notna()]
+    if pressure.empty:
+        return {"skipped": "no F2/F3 rows with a budget_r and a rate_frac in this run's index"}
+    pressure["_cut"] = [_cut_of_key(str(k)) for k in pressure["row_key"]]
+    brackets, unused = load_rung_brackets(rung_calibration_paths, plan_path)
+    engines_loaded = {engine for engine, _cls in brackets}
+
+    section: dict[str, Any] = {
+        "label": "AN-1 (ADR-0210): descriptive and exploratory; spends no alpha, enters no chain",
+        "tier": "descriptive",
+        "estimand_text": (
+            "the yield share (timely and accepted over every issued request, ADR-0178 D10) of a "
+            f"constrained rung minus the control rung {control_r:g} at the SAME load fraction of each "
+            "cell's own rate limit; the capacity ratio is the constrained offered rate over the "
+            "control's, and the yield rate is the offered rate times the yield share"
+        ),
+        "control_budget_r": control_r,
+        "class_targets_source": str(plan_path),
+        "predicate_table": predicate_root.name,
+        "ttft_clock": TTFT_CLOCK_RULE,
+        "interval": "two-sided Welch on the window values (tests_by_unit.batch_means_contrast)",
+        "ladder_rule": {
+            "warmup_s": PROBE_WARMUP_S, "attainment_min": PROBE_ATTAINMENT_MIN,
+            "served_min": PROBE_SERVED_MIN,
+            "window": "from the warm-up to pool size / offered rate (window_end_s per window)",
+        },
+        "holm_family": {
+            "baselines": list(MATCHED_LOAD_HOLM_BASELINES), "rate_frac": MATCHED_LOAD_HOLM_RATE_FRAC,
+            "n_family_legs": 0, "n_tests": 0, "skipped": [],
+            "rule": "Holm per dataset over the legs of these baselines at this load fraction, every "
+                    "constrained rung (owner 2026-11-20); n_tests counts the family legs that carry a p; "
+                    "every other leg is unadjusted and descriptive",
+        },
+        "reference_baseline": MATCHED_LOAD_REFERENCE_BASELINE,
+        "rung_calibration": {"files": [str(p) for p in rung_calibration_paths], "unused": unused},
+        "n_pairs_found": 0,
+        "n_legs": 0,
+        "legs": [],
+        "classes": [],
+        "pooled": [],
+        "unpaired": [],
+        "above_control": [],
+        "skipped": [],
+    }
+
+    reader = _PressureReader(run_dir, pressure, predicate_root=predicate_root, targets=targets, plan_path=plan_path)
+    axes_cols = [*_FRONTIER_MATCH_AXES, "_cut"]
+    for axes_key, family_grp in pressure.groupby(axes_cols, dropna=False):
+        axes = {k: str(v) for k, v in zip(axes_cols, axes_key)}
+        for frac, frac_grp in family_grp.groupby("_f"):
+            controls = sorted(str(k) for k in frac_grp.loc[frac_grp["_r"] == control_r, "row_key"].unique())
+            for above_key in sorted(str(k) for k in frac_grp.loc[frac_grp["_r"] > control_r, "row_key"].unique()):
+                section["above_control"].append({
+                    "dataset": axes["dataset"], "row_key": above_key,
+                    "reason": f"budget_r above the control rung {control_r:g}: listed, never compared",
+                })
+            for rung, rung_grp in frac_grp[frac_grp["_r"] < control_r].groupby("_r"):
+                cons = sorted(str(k) for k in rung_grp["row_key"].unique())
+                if not controls:
+                    section["unpaired"].extend(
+                        {"dataset": axes["dataset"], "row_key": k, "rate_frac": float(frac),
+                         "reason": f"no control cell (budget_r {control_r:g}) at this load fraction on the same axes"}
+                        for k in cons
+                    )
+                    continue
+                section["n_pairs_found"] += 1
+                pair = f"{cons[0]} vs {controls[0]}"
+                try:
+                    if len(cons) != 1 or len(controls) != 1:
+                        raise AnalysisError(
+                            f"several cells on the same axes, rung and load fraction (constrained {cons}, "
+                            f"control {controls}): one leg pairs one cell with one control"
+                        )
+                    if axes["dataset"] not in PREDICATE_DATASETS:
+                        raise AnalysisError(f"dataset {axes['dataset']!r} is outside the section 8.5 predicate universe")
+                    cmp = reader.compare(cons[0], controls[0], "constrained", "control", axes["dataset"])
+                    cmp["yield"]["p_holm_family"] = None
+                    baseline = str(reader.rows_of(cons[0], axes["dataset"])["baseline"].iloc[0])
+                    section["legs"].append({
+                        "dataset": axes["dataset"],
+                        "leg": f"{baseline}|r{float(rung):g}|lam{float(frac):g}" + (f"|{axes['_cut']}" if axes["_cut"] else ""),
+                        "baseline": baseline, "arm": axes["arm"], "engine": axes["engine"],
+                        "budget_r": float(rung), "rate_frac": float(frac), "point": axes["_cut"],
+                        "constrained_row_key": cons[0], "control_row_key": controls[0],
+                        "capacity_ratio": cmp.pop("rate_ratio"), **cmp,
+                        "in_holm_family": (
+                            baseline in MATCHED_LOAD_HOLM_BASELINES
+                            and abs(float(frac) - MATCHED_LOAD_HOLM_RATE_FRAC) < 1e-9
+                        ),
+                    })
+                except (AnalysisError, ValueError) as exc:
+                    section["skipped"].append({"dataset": axes["dataset"], "pair": pair, "reason": str(exc)})
+    legs: list[dict[str, Any]] = section["legs"]
+    section["n_legs"] = len(legs)
+
+    # AN-1j: Holm over the named family alone, per dataset.
+    for dataset in sorted({leg["dataset"] for leg in legs}):
+        members = [leg for leg in legs if leg["dataset"] == dataset and leg["in_holm_family"]]
+        section["holm_family"]["n_family_legs"] += len(members)
+        family = [leg for leg in members if leg["yield"]["p_value"] is not None]
+        if family:
+            try:
+                adjusted = _holm_or_refuse([leg["yield"]["p_value"] for leg in family], f"AN-1 Holm family x {dataset}")
+            except AnalysisError as exc:
+                section["holm_family"]["skipped"].append(str(exc))
+                continue
+            for leg, p_adj in zip(family, adjusted):
+                leg["yield"]["p_holm_family"] = p_adj
+            section["holm_family"]["n_tests"] += len(family)
+
+    # AN-1g: one capacity ratio per (dataset, engine, class, rung), with the ladder's bracket.
+    by_class: dict[tuple[str, str, int, float], list[dict[str, Any]]] = {}
+    for leg in legs:
+        by_class.setdefault((leg["dataset"], leg["engine"], leg["class_tokens"], leg["budget_r"]), []).append(leg)
+    for (dataset, engine, cls, rung), members in sorted(by_class.items()):
+        ratios = [leg["capacity_ratio"] for leg in members]
+        kappa = float(np.mean(ratios))
+        row: dict[str, Any] = {
+            "dataset": dataset, "engine": engine, "class_tokens": cls, "budget_r": rung,
+            "baselines": sorted({leg["baseline"] for leg in members}),
+            "capacity_ratio": kappa, "bracket": None, "bracket_skipped": None, "ladder": None, "notes": [],
+            "limit_check_by_baseline": {
+                leg["baseline"]: {side: leg["limit_check"][side]["verdict"] for side in ("constrained", "control")}
+                for leg in members
+            },
+        }
+        if max(ratios) - min(ratios) > FRONTIER_RATE_RTOL * max(ratios):
+            row["notes"].append(
+                f"the legs of this class disagree on the capacity ratio ({min(ratios):.6g} to {max(ratios):.6g})"
+            )
+        record = brackets.get((engine, str(cls)))
+        con = _rung_record(record, rung) if record is not None else None
+        ctl = _rung_record(record, control_r) if record is not None else None
+        bracket = _ladder_bracket(con, ctl)
+        if record is None:
+            row["bracket_skipped"] = _no_bracket_reason(engine, cls, unused, engines_loaded)
+        elif bracket is None:
+            row["bracket_skipped"] = (
+                f"the rung calibration of class {cls} on engine {engine!r} carries no bracketed rate limit "
+                f"at r={rung:g} and r={control_r:g}"
+            )
+        else:
+            row["bracket"] = bracket
+            keep = ("label", "lambda_star_qps", "sustained_rate_qps", "first_unsustainable_qps", "descent_steps")
+            ladder_ratio = float(con["sustained_rate_qps"]) / float(ctl["sustained_rate_qps"])
+            row["ladder"] = {
+                "baseline_id": record.get("baseline_id"), "ladder_prefix_mode": record.get("ladder_prefix_mode"),
+                "constrained": {k: con.get(k) for k in keep}, "control": {k: ctl.get(k) for k in keep},
+                "ratio": ladder_ratio,
+            }
+            if abs(ladder_ratio - kappa) > FRONTIER_RATE_RTOL * kappa:
+                row["notes"].append(
+                    f"the ladder's ratio {ladder_ratio:.6g} differs from the offered-rate ratio {kappa:.6g}"
+                )
+        section["classes"].append(row)
+
+    # AN-1h: each class over the reference class of its dataset, engine and rung.
+    for row in section["classes"]:
+        ref = next(
+            (r for r in section["classes"]
+             if (r["dataset"], r["engine"], r["budget_r"]) == (row["dataset"], row["engine"], row["budget_r"])
+             and MATCHED_LOAD_REFERENCE_BASELINE in r["baselines"]),
+            None,
+        )
+        over: dict[str, Any] = {"is_reference": ref is row, "reference_class_tokens": None,
+                                "ratio": None, "bracket": None, "separable": None}
+        if ref is not None:
+            over["reference_class_tokens"] = ref["class_tokens"]
+            over["ratio"] = row["capacity_ratio"] / ref["capacity_ratio"]
+            if row["bracket"] is not None and ref["bracket"] is not None:
+                over["bracket"] = [row["bracket"][0] / ref["bracket"][1], row["bracket"][1] / ref["bracket"][0]]
+                over["separable"] = bool(over["bracket"][0] > 1.0 or over["bracket"][1] < 1.0)
+        row["over_reference"] = over
+
+    # AN-1i: the median and range over the arms, per dataset, engine, rung and load.
+    pooled: dict[tuple[str, str, float, float], list[dict[str, Any]]] = {}
+    for leg in legs:
+        pooled.setdefault((leg["dataset"], leg["engine"], leg["budget_r"], leg["rate_frac"]), []).append(leg)
+    for (dataset, engine, rung, frac), members in sorted(pooled.items()):
+        deltas = [leg["yield"]["delta"] for leg in members]
+        section["pooled"].append({
+            "dataset": dataset, "engine": engine, "budget_r": rung, "rate_frac": frac,
+            "n_arms": len(members), "n_negative_delta": sum(1 for d in deltas if d < 0.0),
+            "yield_delta": _spread(deltas),
+            "capacity_ratio": _spread([leg["capacity_ratio"] for leg in members]),
+            "yield_rps_ratio": _spread([leg["yield_rps_ratio"] for leg in members if leg["yield_rps_ratio"] is not None]),
+        })
+    # AN-2 (ADR-0211): two more descriptive blocks on the same windows.
+    # Each is isolated: a failure in one costs neither the legs above nor the other block.
+    for name, build in (
+        ("arm_pairs", lambda: _arm_pairs_block(reader, pressure)),
+        ("engine_pairs", lambda: _engine_pairs_block(reader, pressure, brackets, unused, engines_loaded)),
+    ):
+        try:
+            section[name] = build()
+        except Exception as exc:  # noqa: BLE001 -- a descriptive block never costs the rest of the section
+            section[name] = {
+                "rows": [], "pooled": [], "not_formed": [], "capacity": [], "note": None,
+                "anchor_engine": _TRUTH_TAX_ANCHOR_ENGINE,
+                "skipped": [{"pair": name, "reason": f"{type(exc).__name__}: {exc}"}],
+            }
+    return section
+
+
+def _arm_pairs_block(reader: _PressureReader, pressure: pd.DataFrame) -> dict[str, Any]:
+    """AN-2 (ADR-0211): the registered arm pairs (``registered_arm_pairs``) whose
+    two arms share a token class under pressure. One class means one measured
+    rate limit, so at one engine, rung and load fraction the two arms are
+    offered the SAME absolute rate: delta = mean(y_w, cell) minus mean(y_w,
+    reference) compares their yield shares at identical traffic, in the
+    direction of the no-load contrast of the same number. Descriptive: no
+    alpha, no gate, no Holm. A pair in two classes, or with an arm that is not
+    served under pressure, is listed under ``not_formed``; rates apart beyond
+    ``FRONTIER_RATE_RTOL`` are a labeled skip."""
+    block: dict[str, Any] = {
+        "label": "AN-2 (ADR-0211): the registered arm pairs that share a token class, at one offered "
+                 "rate; descriptive, no alpha, no gate",
+        "rows": [], "pooled": [], "not_formed": [], "skipped": [],
+    }
+    strata = ["engine", "model", "policy", "topology", "_r", "_f"]
+    for dataset, of_dataset in pressure.groupby("dataset"):
+        dataset = str(dataset)
+        served = {str(b) for b in of_dataset["baseline"].dropna().unique()}
+        for cid, cell_b, ref_b in registered_arm_pairs():
+            pair = f"{cell_b} vs {ref_b}"
+            absent = [b for b in (cell_b, ref_b) if b not in served]
+            if absent:
+                block["not_formed"].append({
+                    "dataset": dataset, "contrast_id": cid, "pair": pair,
+                    "reason": f"{' and '.join(absent)} {'is' if len(absent) == 1 else 'are'} not served under pressure",
+                })
+                continue
+            apart: set[tuple[int, int]] = set()
+            side_by_side = False
+            both = of_dataset[of_dataset["baseline"].isin([cell_b, ref_b])]
+            for key, grp in both.groupby(strata, dropna=False):
+                at = dict(zip(strata, key))
+                cells = sorted(str(k) for k in grp.loc[grp["baseline"] == cell_b, "row_key"].unique())
+                refs = sorted(str(k) for k in grp.loc[grp["baseline"] == ref_b, "row_key"].unique())
+                if not cells or not refs:
+                    continue   # one arm alone at this engine, rung and load: nothing to pair
+                side_by_side = True
+                where = f"#{cid} {pair} | {at['engine']} r{float(at['_r']):g} lam{float(at['_f']):g}"
+                try:
+                    if len(cells) != 1 or len(refs) != 1:
+                        raise AnalysisError(
+                            f"several cells per arm at one engine, rung and load (cell {cells}, reference {refs})"
+                        )
+                    cls_a, cls_b = reader.class_of(cells[0]), reader.class_of(refs[0])
+                    if cls_a != cls_b:
+                        apart.add((cls_a, cls_b))
+                        continue
+                    q_a, q_b = reader.rate_of(cells[0], dataset), reader.rate_of(refs[0], dataset)
+                    if abs(q_a - q_b) > FRONTIER_RATE_RTOL * max(q_a, q_b):
+                        raise AnalysisError(
+                            f"the two arms sit at offered rates {q_a:.6g} and {q_b:.6g} (relative tolerance "
+                            f"{FRONTIER_RATE_RTOL:g}): not one traffic"
+                        )
+                    cmp = reader.compare(cells[0], refs[0], "cell", "reference", dataset)
+                    cmp.pop("rate_ratio")
+                    block["rows"].append({
+                        "dataset": dataset, "contrast_id": cid, "pair": pair,
+                        "cell_baseline": cell_b, "reference_baseline": ref_b, "engine": str(at["engine"]),
+                        "budget_r": float(at["_r"]), "rate_frac": float(at["_f"]),
+                        "cell_row_key": cells[0], "reference_row_key": refs[0], **cmp,
+                    })
+                except (AnalysisError, ValueError) as exc:
+                    block["skipped"].append({"dataset": dataset, "pair": where, "reason": str(exc)})
+            if not side_by_side:
+                block["not_formed"].append({
+                    "dataset": dataset, "contrast_id": cid, "pair": pair,
+                    "reason": "the two arms are never served side by side (at one engine, model, policy, "
+                              "topology, rung and load)",
+                })
+            for cls_a, cls_b in sorted(apart):
+                block["not_formed"].append({
+                    "dataset": dataset, "contrast_id": cid, "pair": pair,
+                    "reason": f"different classes ({cls_a} and {cls_b}): the two arms are offered different rates",
+                })
+    pooled: dict[tuple[str, int, str], list[dict[str, Any]]] = {}
+    for row in block["rows"]:
+        pooled.setdefault((row["dataset"], row["contrast_id"], row["pair"]), []).append(row)
+    for (dataset, cid, pair), members in sorted(pooled.items()):
+        deltas = [row["yield"]["delta"] for row in members]
+        block["pooled"].append({
+            "dataset": dataset, "contrast_id": cid, "pair": pair, "n_rows": len(members),
+            "n_negative_delta": sum(1 for d in deltas if d < 0.0), "yield_delta": _spread(deltas),
+        })
+    return block
+
+
+def _engine_pairs_block(
+    reader: _PressureReader, pressure: pd.DataFrame,
+    brackets: Mapping[tuple[str, str], Mapping[str, Any]], unused: Mapping[str, str], engines_loaded: set[str],
+) -> dict[str, Any]:
+    """AN-2 (ADR-0211): each engine against the anchor engine (vLLM, the anchor
+    of #14) on the same arm, rung, corpus cut and load fraction. Both sides are
+    graded on the class first-token target, the rule of AN-1, so the section
+    holds one definition of timely. The two cells run at different absolute
+    rates (each engine's own limit); capacity ratio = q_engine / q_anchor =
+    lambda*(engine) / lambda*(anchor), reported per class and rung with the
+    bracket of the two ladders [sustained_e / first_unsustainable_a,
+    first_unsustainable_e / sustained_a]. Descriptive: no alpha, no gate."""
+    anchor = _TRUTH_TAX_ANCHOR_ENGINE
+    block: dict[str, Any] = {
+        "label": "AN-2 (ADR-0211): each engine against the anchor engine at one load fraction; "
+                 "descriptive, no alpha, no gate",
+        "anchor_engine": anchor, "note": None, "rows": [], "capacity": [], "pooled": [], "skipped": [],
+    }
+    if anchor not in {str(e) for e in pressure["engine"].unique()}:
+        block["note"] = f"no pressure cell on the anchor engine {anchor!r}: no engine pair forms"
+        return block
+    strata = ["dataset", "model", "arm", "retriever", "policy", "topology", "_cut", "_r", "_f"]
+    for key, grp in pressure.groupby(strata, dropna=False):
+        at = dict(zip(strata, key))
+        anchors = sorted(str(k) for k in grp.loc[grp["engine"] == anchor, "row_key"].unique())
+        if not anchors:
+            continue
+        for engine in sorted({str(e) for e in grp["engine"].unique()} - {anchor}):
+            cells = sorted(str(k) for k in grp.loc[grp["engine"] == engine, "row_key"].unique())
+            baseline = str(grp["baseline"].iloc[0])
+            where = f"{baseline} | {engine} vs {anchor} r{float(at['_r']):g} lam{float(at['_f']):g}"
+            try:
+                if len(cells) != 1 or len(anchors) != 1:
+                    raise AnalysisError(f"several cells per engine (cell {cells}, anchor {anchors})")
+                cmp = reader.compare(cells[0], anchors[0], "cell", "anchor", str(at["dataset"]))
+                block["rows"].append({
+                    "dataset": str(at["dataset"]), "baseline": baseline, "arm": str(at["arm"]),
+                    "engine": engine, "anchor_engine": anchor, "budget_r": float(at["_r"]),
+                    "rate_frac": float(at["_f"]), "point": str(at["_cut"]),
+                    "cell_row_key": cells[0], "anchor_row_key": anchors[0],
+                    "capacity_ratio": cmp.pop("rate_ratio"), **cmp,
+                })
+            except (AnalysisError, ValueError) as exc:
+                block["skipped"].append({"dataset": str(at["dataset"]), "pair": where, "reason": str(exc)})
+    by_class: dict[tuple[str, str, int, float], list[dict[str, Any]]] = {}
+    by_engine: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in block["rows"]:
+        by_class.setdefault((row["dataset"], row["engine"], row["class_tokens"], row["budget_r"]), []).append(row)
+        by_engine.setdefault((row["dataset"], row["engine"]), []).append(row)
+    for (dataset, engine, cls, rung), members in sorted(by_class.items()):
+        ratios = [row["capacity_ratio"] for row in members]
+        entry: dict[str, Any] = {
+            "dataset": dataset, "engine": engine, "anchor_engine": anchor, "class_tokens": cls, "budget_r": rung,
+            "baselines": sorted({row["baseline"] for row in members}),
+            "capacity_ratio": float(np.mean(ratios)), "bracket": None, "bracket_skipped": None, "notes": [],
+        }
+        if max(ratios) - min(ratios) > FRONTIER_RATE_RTOL * max(ratios):
+            entry["notes"].append(
+                f"the rows of this class disagree on the capacity ratio ({min(ratios):.6g} to {max(ratios):.6g})"
+            )
+        missing = next((e for e in (engine, anchor) if (e, str(cls)) not in brackets), None)
+        if missing is not None:
+            entry["bracket_skipped"] = _no_bracket_reason(missing, cls, unused, engines_loaded)
+        else:
+            entry["bracket"] = _ladder_bracket(
+                _rung_record(brackets[(engine, str(cls))], rung), _rung_record(brackets[(anchor, str(cls))], rung)
+            )
+            if entry["bracket"] is None:
+                entry["bracket_skipped"] = (
+                    f"the rung calibrations of class {cls} carry no bracketed rate limit at r={rung:g} "
+                    f"on both {engine!r} and {anchor!r}"
+                )
+        block["capacity"].append(entry)
+    for (dataset, engine), members in sorted(by_engine.items()):
+        deltas = [row["yield"]["delta"] for row in members]
+        block["pooled"].append({
+            "dataset": dataset, "engine": engine, "anchor_engine": anchor, "n_rows": len(members),
+            "n_negative_delta": sum(1 for d in deltas if d < 0.0), "yield_delta": _spread(deltas),
+            "capacity_ratio": _spread([row["capacity_ratio"] for row in members]),
+            "yield_rps_ratio": _spread([row["yield_rps_ratio"] for row in members if row["yield_rps_ratio"] is not None]),
+        })
+    return block
+
+
+# ---------------------------------------------------------------------------
 # G4c: #14 truth_tax (the §9.2 estimand executor — task #119 replaces the
 # fail-loud stub; the loud refusals for trees that predate the predicate
 # REMAIN, naming exactly which artifact is missing)
@@ -5620,6 +6378,159 @@ def _fmt_p_holm(row: Mapping[str, Any]) -> str:
     return f"{p_holm:.3g}" if p_holm is not None else "n/a (primary tier, full α)"
 
 
+def _matched_load_summary_lines(matched: Mapping[str, Any]) -> list[str]:
+    """The AN-1 block of summary.md, from the section written to stats.json."""
+
+    def num(value: Any, spec: str = ".3f") -> str:
+        return "n/a" if value is None else format(value, spec)
+
+    def interval(pair: Any, spec: str = ".3f") -> str:
+        return "n/a" if pair is None else f"[{format(pair[0], spec)}, {format(pair[1], spec)}]"
+
+    lines = ["## Budget comparison at a matched load fraction (AN-1, exploratory, ADR-0210)", ""]
+    if isinstance(matched.get("skipped"), str):
+        # the whole-section skip is a string; a computed section carries its per-pair skips as a list
+        return [*lines, f"SKIPPED (labeled): {matched['skipped']}", ""]
+    family = matched["holm_family"]
+    lines += [
+        f"- {matched['estimand_text']}",
+        f"- {matched['n_legs']} leg(s) from {matched['n_pairs_found']} pair(s); descriptive, no alpha, no gate; "
+        f"Holm over {family['n_tests']} test(s): baselines {family['baselines']} at load {family['rate_frac']:g}",
+        "",
+        "| dataset | leg | engine | windows (constr/ctrl) | yield constr | yield ctrl "
+        "| delta yield [Welch 95%] | p | p Holm (family) | delta timely | delta accepted "
+        "| capacity ratio | yield-rate ratio | limit check (constr/ctrl) |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for leg in matched["legs"]:
+        y = leg["yield"]
+        welch = None if y["ci95_low_welch"] is None else (y["ci95_low_welch"], y["ci95_high_welch"])
+        lines.append(
+            f"| {leg['dataset']} | {leg['leg']} | {leg['engine']} "
+            f"| {leg['n_windows_constrained']}/{leg['n_windows_control']} "
+            f"| {y['mean_constrained']:.3f} | {y['mean_control']:.3f} "
+            f"| {y['delta']:+.3f} {interval(welch, '+.3f')} | {num(y['p_value'], '.3g')} "
+            f"| {num(y['p_holm_family'], '.3g')} | {leg['timely']['delta']:+.3f} "
+            f"| {leg['accepted']['delta']:+.3f} | {leg['capacity_ratio']:.3f} "
+            f"| {num(leg['yield_rps_ratio'])} "
+            f"| {leg['limit_check']['constrained']['verdict']}/{leg['limit_check']['control']['verdict']} |"
+        )
+    lines += [
+        "",
+        f"| dataset | engine | class (tokens) | arms | rung | capacity ratio [ladder bracket] "
+        f"| over the class of {matched['reference_baseline']} [bracket] | separable |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for row in matched["classes"]:
+        over = row["over_reference"]
+        lines.append(
+            f"| {row['dataset']} | {row['engine']} | {row['class_tokens']} | {', '.join(row['baselines'])} "
+            f"| {row['budget_r']:g} | {row['capacity_ratio']:.3f} {interval(row['bracket'])} "
+            f"| {num(over['ratio'])} {interval(over['bracket'])} | {num(over['separable'], '')} |"
+        )
+    lines.append("")
+    for row in matched["pooled"]:
+        d, k = row["yield_delta"], row["capacity_ratio"]
+        lines.append(
+            f"- {row['dataset']} {row['engine']} r{row['budget_r']:g} load {row['rate_frac']:g}: {row['n_arms']} arm(s), "
+            f"delta yield median {d['median']:+.3f} (range {d['min']:+.3f} to {d['max']:+.3f}), "
+            f"{row['n_negative_delta']} negative; capacity ratio median {k['median']:.3f} "
+            f"(range {k['min']:.3f} to {k['max']:.3f})"
+        )
+    for name, word in (("skipped", "pair(s) skipped"), ("unpaired", "constrained cell(s) with no control at their load"),
+                       ("above_control", "cell(s) above the control rung")):
+        if matched[name]:
+            lines.append(f"- {len(matched[name])} {word} (listed in stats.json)")
+
+    def welch(y: Mapping[str, Any]) -> str:
+        return interval(None if y["ci95_low_welch"] is None else (y["ci95_low_welch"], y["ci95_high_welch"]), "+.3f")
+
+    arm = matched.get("arm_pairs") or {}
+    if arm.get("rows") or arm.get("not_formed") or arm.get("skipped"):
+        lines += ["", "### Two arms at one offered rate (AN-2: the registered arm pairs that share a token class)", ""]
+        if arm["rows"]:
+            lines += [
+                "| dataset | pair | engine | rung | load | windows (cell/ref) | yield cell | yield ref "
+                "| delta yield [Welch 95%] | p | delta timely | delta accepted | limit check (cell/ref) |",
+                "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+            ]
+            for row in arm["rows"]:
+                y = row["yield"]
+                lines.append(
+                    f"| {row['dataset']} | #{row['contrast_id']} {row['pair']} | {row['engine']} | {row['budget_r']:g} "
+                    f"| {row['rate_frac']:g} | {row['n_windows_cell']}/{row['n_windows_reference']} "
+                    f"| {y['mean_cell']:.3f} | {y['mean_reference']:.3f} | {y['delta']:+.3f} {welch(y)} "
+                    f"| {num(y['p_value'], '.3g')} | {row['timely']['delta']:+.3f} | {row['accepted']['delta']:+.3f} "
+                    f"| {row['limit_check']['cell']['verdict']}/{row['limit_check']['reference']['verdict']} |"
+                )
+            lines += [
+                "",
+                f"{len(arm['rows'])} rows, each p unadjusted and descriptive (the window counts are in the table); "
+                "pairs that name the same arm share that arm's windows, so the rows are not independent.",
+                "",
+            ]
+        for row in arm["pooled"]:
+            d = row["yield_delta"]
+            lines.append(
+                f"- {row['dataset']} #{row['contrast_id']} {row['pair']}: {row['n_rows']} row(s), delta yield median "
+                f"{d['median']:+.3f} (range {d['min']:+.3f} to {d['max']:+.3f}), {row['n_negative_delta']} negative"
+            )
+        for entry in arm["not_formed"]:
+            lines.append(
+                f"- not formed: {entry.get('dataset', '')} #{entry['contrast_id']} {entry['pair']}: {entry['reason']}"
+            )
+        if arm["skipped"]:
+            lines.append(f"- {len(arm['skipped'])} arm pair row(s) skipped (listed in stats.json)")
+
+    eng = matched.get("engine_pairs") or {}
+    if eng.get("rows") or eng.get("note") or eng.get("skipped"):
+        anchor = eng["anchor_engine"]
+        lines += ["", f"### Each engine against the anchor engine {anchor} at one load fraction (AN-2)", ""]
+        if eng.get("note"):
+            lines.append(f"- {eng['note']}")
+        if eng["rows"]:
+            lines += [
+                "| dataset | arm | engine | rung | load | windows (cell/anchor) | yield cell | yield anchor "
+                "| delta yield [Welch 95%] | p | capacity ratio | yield-rate ratio | limit check (cell/anchor) |",
+                "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+            ]
+            for row in eng["rows"]:
+                y = row["yield"]
+                lines.append(
+                    f"| {row['dataset']} | {row['baseline']} | {row['engine']} | {row['budget_r']:g} "
+                    f"| {row['rate_frac']:g} | {row['n_windows_cell']}/{row['n_windows_anchor']} "
+                    f"| {y['mean_cell']:.3f} | {y['mean_anchor']:.3f} | {y['delta']:+.3f} {welch(y)} "
+                    f"| {num(y['p_value'], '.3g')} | {row['capacity_ratio']:.3f} | {num(row['yield_rps_ratio'])} "
+                    f"| {row['limit_check']['cell']['verdict']}/{row['limit_check']['anchor']['verdict']} |"
+                )
+            lines += [
+                "",
+                f"{len(eng['rows'])} rows, each p unadjusted and descriptive (the window counts are in the table); their "
+                f"capacity ratios rest on one limit ratio per class and rung ({len(eng['capacity'])} in the table "
+                "below), so the rows are not independent.",
+                "",
+                "| dataset | engines | class (tokens) | arms | rung | limit ratio [bracket of the two ladders] |",
+                "|---|---|---|---|---|---|",
+            ]
+            for entry in eng["capacity"]:
+                lines.append(
+                    f"| {entry['dataset']} | {entry['engine']}/{entry['anchor_engine']} | {entry['class_tokens']} "
+                    f"| {', '.join(entry['baselines'])} | {entry['budget_r']:g} "
+                    f"| {entry['capacity_ratio']:.3f} {interval(entry['bracket'])} |"
+                )
+            lines.append("")
+        for row in eng["pooled"]:
+            d, k = row["yield_delta"], row["capacity_ratio"]
+            lines.append(
+                f"- {row['dataset']} {row['engine']} against {row['anchor_engine']}: {row['n_rows']} row(s), delta yield "
+                f"median {d['median']:+.3f} (range {d['min']:+.3f} to {d['max']:+.3f}), {row['n_negative_delta']} "
+                f"negative; capacity ratio median {k['median']:.3f} (range {k['min']:.3f} to {k['max']:.3f})"
+            )
+        if eng["skipped"]:
+            lines.append(f"- {len(eng['skipped'])} engine pair row(s) skipped (listed in stats.json)")
+    return [*lines, ""]
+
+
 def build_summary_md(stats: Mapping[str, Any]) -> str:
     stamp = stats["mode_stamp"]
     run = stats["run"]
@@ -5932,6 +6843,10 @@ def build_summary_md(stats: Mapping[str, Any]) -> str:
                 f"points): {len(frontier['not_confirmatory_points'])} (listed in stats.json)"
             )
         lines.append("")
+
+    matched = stats.get(MATCHED_LOAD_KEY)
+    if matched and "suppressed" not in matched:
+        lines.extend(_matched_load_summary_lines(matched))
 
     falsification = stats.get("falsification")
     if falsification:
@@ -7523,6 +8438,7 @@ def run_analysis(
     predicate_run_id: str | None = None,
     workload_manifest: Path | None = None,
     plan_path: Path | None = None,
+    rung_calibration_paths: Sequence[Path] = (),
 ) -> AnalysisResult:
     """Execute the pipeline; the CLI wraps this with the one-look flag checks.
 
@@ -7933,6 +8849,24 @@ def run_analysis(
             if plan_path is not None else None
         )
 
+        # AN-1 (ADR-0210): the budget comparison at a matched load fraction, a
+        # descriptive section. It never aborts the look (the floor suite's
+        # rule, review M3) and never reaches the chain below; under an active
+        # seal it is not computed (its rows name arms).
+        matched_load_section: dict[str, Any] = {
+            "suppressed": "section 9.8 blinding active: the AN-1 section carries row keys and "
+                          "arm-bearing axes; suppressed until the logged unblinding"
+        }
+        if not blinding_active:
+            try:
+                matched_load_section = compute_matched_load(
+                    run_dir, index, predicate_root=predicate_root, plan_path=plan_path,
+                    rung_calibration_paths=rung_calibration_paths,
+                )
+            except Exception as exc:  # noqa: BLE001 -- a descriptive section never aborts the look
+                matched_load_section = {"skipped": f"{type(exc).__name__}: {exc}"}
+                print(f"[matched-load] SKIP (descriptive, AN-1): {type(exc).__name__}: {exc}")
+
         # §9.3 wiring: the registered chains + Holm-within-family corrections.
         gatekeeping_section = run_gatekeeping(
             contrast_stats,
@@ -8088,6 +9022,7 @@ def run_analysis(
                 if blinding_active and frontier_section is not None
                 else frontier_section
             ),
+            MATCHED_LOAD_KEY: matched_load_section,
             "exploratory": exploratory_section,
             "falsification": falsification_section,
             "blinding": blinding_section,
@@ -8360,6 +9295,18 @@ def _build_parser() -> argparse.ArgumentParser:
         "estimand (ADR-0178 D12); required when --contrasts includes 12",
     )
     parser.add_argument(
+        "--rung-calibration",
+        type=Path,
+        nargs="+",
+        default=[],
+        metavar="JSON",
+        help="the rung calibration files (rungs_<profile>_<engine>.json), one per "
+        "engine: the AN-1 section (ADR-0210) reads each class's sustained and "
+        "first unsustainable rate from them, the bracket of its capacity ratio; "
+        "a file whose sha256 differs from the plan's is not used; without them "
+        "the ratio is reported with no bracket",
+    )
+    parser.add_argument(
         "--accept-step-down",
         type=int,
         default=None,
@@ -8446,6 +9393,7 @@ def main(argv: list[str] | None = None) -> int:
             predicate_run_id=args.predicate_run_id,
             workload_manifest=args.workload_manifest,
             plan_path=args.plan,
+            rung_calibration_paths=args.rung_calibration,
         )
     except AnalysisError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

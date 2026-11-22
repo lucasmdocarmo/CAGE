@@ -69,17 +69,21 @@ def _verb(*args: str) -> subprocess.CompletedProcess:
 
 
 @pytest.mark.parametrize("engine", ["vllm", "sglang"])
-def test_s2a_ladders_fifteen_triples_over_seven_classes_per_engine_with_the_qasper_manifest(engine: str) -> None:
+def test_s2a_ladders_eight_triples_over_four_classes_per_engine_with_the_qasper_manifest(engine: str) -> None:
+    # owner 2026-11-19 (experiment A as ruled, variant E3): nine arms on the rungs 1.0
+    # and 0.25, no B11 and no B12, so five classes at two rungs each. Before that day
+    # the grid laddered 15 triples over seven classes (three rungs, 348 and 480 at 0.25).
+    # The class counts are the Llama ones since 2026-11-21 (register A-5, ADR-0213;
+    # 4779, 2336, 1127, 1126 and 702 before): the same five classes, re-measured.
+    # Owner 2026-11-21: B7 left the session, and its class (1008) with it: four classes
+    # at two rungs, eight triples per engine (ten with B7).
     grid, sel = _select("s2a", engine, manifests={"qasper": {}})
     by_class = _by_class(grid, sel.all_cells)
-    assert len(sel.all_cells) == 15
-    assert by_class == {
-        4779: [0.25, 0.5, 1.0], 2336: [0.25, 0.5, 1.0], 1127: [0.25, 0.5, 1.0], 1126: [0.25, 0.5, 1.0],
-        702: [0.25], 480: [0.25], 348: [0.25],
-    }
-    assert [rc.demand_seq_tokens(grid, c.spec) for c in sel.anchor_cells] == [4779] * 3
-    assert [rc.demand_seq_tokens(grid, c.spec) for c in sel.small_cells] == [348]
-    assert sorted(sel.measured_cells) == [480, 702, 1126, 1127, 2336]
+    assert len(sel.all_cells) == 8
+    assert by_class == {seq: [0.25, 1.0] for seq in (4978, 2240, 995, 640)}
+    assert [rc.demand_seq_tokens(grid, c.spec) for c in sel.anchor_cells] == [4978] * 2
+    assert [rc.demand_seq_tokens(grid, c.spec) for c in sel.small_cells] == [640] * 2
+    assert sorted(sel.measured_cells) == [995, 2240]
     assert sel.ruler_cells == []
     # the cells are the ladder's: anchor gold-fresh on this engine, every cell executable
     assert all(c.spec.engine == engine and c.blocked_on is None for c in sel.all_cells)
@@ -87,11 +91,28 @@ def test_s2a_ladders_fifteen_triples_over_seven_classes_per_engine_with_the_qasp
 
 
 @pytest.mark.parametrize("engine", ["vllm", "sglang"])
-def test_s2a_without_the_qasper_manifest_drops_the_corpus_trunc_class(engine: str) -> None:
+def test_s2a_without_the_qasper_manifest_selects_the_same_cells(engine: str) -> None:
+    # the session carries no corpus-trunc class since 2026-11-19, so the manifest no
+    # longer changes the selection (it dropped the 480-token class before, 14 triples)
     grid, sel = _select("s2a", engine)
     by_class = _by_class(grid, sel.all_cells)
-    assert len(sel.all_cells) == 14
-    assert 480 not in by_class and sorted(by_class) == [348, 702, 1126, 1127, 2336, 4779]
+    assert len(sel.all_cells) == 8
+    assert sorted(by_class) == [640, 995, 2240, 4978]   # 702, 1126, 1127, 2336, 4779 before A-5; 1008 left with B7
+
+
+@pytest.mark.parametrize("engine", ["vllm", "sglang"])
+def test_s1_without_the_qasper_manifest_drops_the_corpus_trunc_classes(engine: str) -> None:
+    # review 2026-11-20 M3: measured_pressure_classes counts a corpus-trunc class only when
+    # its dataset has a registered manifest (the plan blocks B12 on a dataset without one).
+    # The s2a tests above pinned that rule until 2026-11-19 and cannot see it since (no
+    # corpus-trunc class there); s1 still carries B12 on Qasper at the rungs 1400 and 700
+    grid, bare = _select("s1", engine)
+    _, with_manifest = _select("s1", engine, manifests={"qasper": {}})
+    assert (len(bare.all_cells), len(with_manifest.all_cells)) == (14, 18)
+    trunc = set(grid.corpus_trunc_demand_seq_tokens.values())
+    assert trunc == {480, 1205}
+    assert set(_by_class(grid, with_manifest.all_cells)) - set(_by_class(grid, bare.all_cells)) == trunc
+    assert _by_class(grid, with_manifest.all_cells)[480] == _by_class(grid, with_manifest.all_cells)[1205] == [0.25, 0.5]
 
 
 @pytest.mark.parametrize("engine", ["vllm", "sglang"])
@@ -104,13 +125,14 @@ def test_cd_act1_ladders_fifteen_triples_over_five_classes_per_engine(engine: st
     assert [rc.demand_seq_tokens(grid, c.spec) for c in sel.small_cells] == [506] * 3
 
 
-def test_the_pairs_of_finding_4_fourteen_on_s2a_and_ten_on_cd_act1() -> None:
+def test_the_pairs_of_finding_4_eight_on_s2a_and_ten_on_cd_act1() -> None:
     pairs: Dict[str, Set[Tuple[str, int]]] = {}
     for session, name in (("s2a", "qasper"), ("cd-act1", "musique")):
         for engine in ("vllm", "sglang"):
             grid, sel = _select(session, engine, manifests={name: {}})
             pairs.setdefault(session, set()).update((engine, rc.demand_seq_tokens(grid, c.spec)) for c in sel.all_cells)
-    assert (len(pairs["s2a"]), len(pairs["cd-act1"])) == (14, 10)
+    # s2a: four classes per engine since 2026-11-21 (five with B7, 10 pairs; seven before 2026-11-19, 14 pairs)
+    assert (len(pairs["s2a"]), len(pairs["cd-act1"])) == (8, 10)
 
 
 def test_s1_without_the_all_classes_flag_ladders_the_two_anchors_six_per_engine() -> None:
@@ -153,13 +175,13 @@ def test_the_verb_prints_one_line_per_triple_and_a_count_line_s1() -> None:
     assert any(line.startswith("vllm smallest ") for line in lines)
 
 
-def test_the_verb_on_s2a_without_the_manifest_reads_fourteen_and_with_all_classes() -> None:
+def test_the_verb_on_s2a_without_the_manifest_reads_eight_with_all_classes() -> None:
     proc = _verb("--session", "s2a", "--engine", "sglang", "--all-classes")
     assert proc.returncode == 0, proc.stderr
     lines = proc.stdout.strip().splitlines()
-    assert lines[-1] == "engine=sglang triples=14 classes=6"
+    assert lines[-1] == "engine=sglang triples=8 classes=4"   # 10 and 5 with B7; 14 and 6 before 2026-11-19
     roles = [line.split()[1] for line in lines[:-1]]
-    assert roles.count("anchor") == 3 and roles.count("smallest") == 1 and roles.count("measured") == 10
+    assert roles.count("anchor") == 2 and roles.count("smallest") == 2 and roles.count("measured") == 4
 
 
 @pytest.mark.skipif(not (REPO_ROOT / MUSIQUE_80B).exists(), reason="the 80B MuSiQue manifest is not on this checkout")

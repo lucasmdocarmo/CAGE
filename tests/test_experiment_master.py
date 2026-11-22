@@ -1123,7 +1123,8 @@ def test_shipped_profiles_cover_their_stage_bounds_and_name_registered_models() 
         assert suite_bound_s.isdigit(), f"{p.name}: POD_SUITE_BOUND_S is unset (ADR-0196: _common.env states the default)"
         assert slug in cb.MODEL_KV, f"{p.name}: MODEL_SLUG={slug} is not in cache_budget.MODEL_KV {sorted(cb.MODEL_KV)}"
         # ADR-0155, S2 block A-5 (2026-11-01): every shipped profile sizes the floor table on ITS
-        # session's anchor shape (s2a keeps the S0 shape, cd-act1 registers 2694); a placeholder
+        # session's anchor shape (cd-act1 registers 2694; s2a 4978 since 2026-11-21, register A-5 in
+        # Llama tokens, ADR-0213, the S0 shape before); a placeholder
         # profile for a session the driver does not register yet (S3.env) keeps the common anchor
         try:
             grid = rc.get_session_grid(session)
@@ -3099,25 +3100,41 @@ def test_the_shipped_s2_landing_profiles_carry_every_s1_key_and_the_block_e_pick
     shared = {"GPU_ID": "NVIDIA H200", "GPU_COUNT": "4", "ENGINES": "vllm sglang", "CALIBRATE": "vllm sglang", "TOPOLOGY": "tp",
               "DC_PREFS": "US-CA-2 US-CO-1 CA-MTL-3 CA-MTL-4 EU-FR-1 AP-JP-1", "CALIBRATE_RUNGS_BOUND_S": "32400",
               "PIN_MODEL_REVISION": "1", "RUNG_ALL_CLASSES": "1", "CLASS_CEILINGS": "0",
-              # decisions 1 to 3 of the batch 2/3 spec (owner 2026-11-03): the floor at the grids' floor rung,
-              # the gate at the registered count per load, the ladder bound that holds 15 triples per engine
-              "CALIBRATION_BUDGET_FRACTION": "1.0", "REGIME_GATE_LOADS": "0.95 1.05", "MIN_IN_REGIME_WINDOWS": "0.95:2 1.05:3",
+              # decisions 1 and 3 of the batch 2/3 spec (owner 2026-11-03): the floor at the grids' floor rung
+              # and the ladder bound that held 15 triples per engine
+              "CALIBRATION_BUDGET_FRACTION": "1.0",
               "MAX_NULL_FRACTION": "0.06", "SUITE_ON_POD": "1", "MAC_SUITE": "1", "FRONT_LOAD": "0", "VOLUME_GB": "300",
-              # DISK_GB left the shared values on 2026-11-15 (owner: "C plus 400 GB"): S2B states 400, S2A keeps 300;
-              # SKIP_BLOCKED left them on 2026-11-16 (owner: "ok set SKIP_BLOCKED=1 on S2B"): S2A keeps 0
+              # DISK_GB left the shared values on 2026-11-15 (owner: "C plus 400 GB"): S2B states 400; S2A kept 300
+              # until 2026-11-21 and states 400 since (final review question 4 (b), see its own values below);
+              # SKIP_BLOCKED left them on 2026-11-16 (owner: "ok set SKIP_BLOCKED=1 on S2B"): S2A keeps 0;
+              # REGIME_GATE_LOADS and MIN_IN_REGIME_WINDOWS left them on 2026-11-19 (owner decision A-G1: S2A
+              # gates load 1.05 only; S2B keeps decision 2 of 2026-11-03, both loads at the registered count)
               # S2 block F row F-11 (owner 2026-11-04, option (a)): the per-row bounds the stage 10 proof allows
               "SCORING_TOL_FAITHFULNESS": "0.005", "SCORING_TOL_BERTSCORE": "1e-5"}
     for k, v in shared.items():
         assert a[k] == v and b[k] == v, (k, a[k], b[k])
     own = ("EXP", "SESSION", "MODEL", "MODEL_SLUG", "HOURS", "RUN_BUDGET_HOURS", "SEATBELT", "SETUP_BOUND_MIN",
            "SCORE_BOUND_MIN", "PULL_MARGIN_MIN", "FLOOR_AVG_SEQ_TOKENS", "INSTALL_LMCACHE", "LMCACHE_VERSION", "CONFIRMATORY_ARMS", "DISK_GB",
-           "SKIP_BLOCKED")
-    # the seatbelts grew with the calibrate term (2 x 240 min) under decision 3; the rosters are decision 2's
+           "SKIP_BLOCKED", "REGIME_GATE_LOADS", "MIN_IN_REGIME_WINDOWS")
+    # the seatbelts grew with the calibrate term (2 x 240 min) under decision 3; S2B's roster is decision 2's
     assert {k: a[k] for k in own} == {
         "EXP": "S2A", "SESSION": "s2a", "MODEL": "meta-llama/Llama-3.3-70B-Instruct", "MODEL_SLUG": "llama-3.3-70b",
-        "HOURS": "50", "RUN_BUDGET_HOURS": "45", "SEATBELT": "83h", "SETUP_BOUND_MIN": "40", "SCORE_BOUND_MIN": "120",
-        "PULL_MARGIN_MIN": "150", "FLOOR_AVG_SEQ_TOKENS": "4779", "INSTALL_LMCACHE": "0", "LMCACHE_VERSION": "",
-        "CONFIRMATORY_ARMS": "B1 B3 B4 B6 B7 B11 B12", "DISK_GB": "300", "SKIP_BLOCKED": "0"}
+        # owner 2026-11-20 ("Raise the limits", review M1): the grid ruled on 2026-11-19 projects 48.45 h on
+        # the fixture table, above the 45 h stop, which would have cut 16 of the 20 references; 50, 45 and 83h before.
+        # Owner 2026-11-21 ("ok drop B7 from both, 8 arms. lets go"): eight arms project 42.55 h. The limits went to
+        # 50, 45 and 83h that day (decision D1 (b)) and back on 2026-11-22 (owner: "back to 55/50/88", review M1)
+        "HOURS": "55", "RUN_BUDGET_HOURS": "50", "SEATBELT": "88h", "SETUP_BOUND_MIN": "40", "SCORE_BOUND_MIN": "120",
+        # register A-5 (owner 2026-11-21, ADR-0213): the anchor in Llama tokens, the gold arm's measured mean on
+        # Qasper (tests/test_s2a_a5_demand_tables.py); 4779, the S0 mean in Qwen3-14B tokens, before
+        "PULL_MARGIN_MIN": "150", "FLOOR_AVG_SEQ_TOKENS": "4978", "INSTALL_LMCACHE": "0", "LMCACHE_VERSION": "",
+        # owner decisions A-G1 and A-G2 (2026-11-19, experiment A as ruled, variant E3): only load 1.05 gates, at its
+        # three registered windows, and the five core arms block (B11 and B12 left the session). Before that day:
+        # "0.95 1.05", "0.95:2 1.05:3" and the roster "B1 B3 B4 B6 B7 B11 B12"
+        "REGIME_GATE_LOADS": "1.05", "MIN_IN_REGIME_WINDOWS": "1.05:3",
+        # owner 2026-11-21 (final review questions 1 (a) and 4 (b), "approve all as recomended"): the results
+        # root and the backup mirror moved to the container disk (tests/test_s2a_results_off_volume.py), so the
+        # disk is 400 GB as on S2B; 300 before. The roster is the four core arms since 2026-11-21 (B7 left the session)
+        "CONFIRMATORY_ARMS": "B1 B3 B4 B6", "DISK_GB": "400", "SKIP_BLOCKED": "0"}
     assert {k: b[k] for k in own} == {
         "EXP": "S2B", "SESSION": "cd-act1", "MODEL": "Qwen/Qwen3-Next-80B-A3B-Instruct", "MODEL_SLUG": "qwen3-next-80b",
         "HOURS": "60", "RUN_BUDGET_HOURS": "55", "SEATBELT": "98h", "SETUP_BOUND_MIN": "50", "SCORE_BOUND_MIN": "150",
@@ -3126,16 +3143,19 @@ def test_the_shipped_s2_landing_profiles_carry_every_s1_key_and_the_block_e_pick
         # stage 11 with 2.7 GB explained; 400 adds 100 GB of margin for the 60 h run until the cause is measured
         # SKIP_BLOCKED=1 (owner 2026-11-16): the cd-act1 plan carries 57 blocked rows once the identity and PD
         # failures are accepted (35 pd, 14 vLLM prefix-on single, 8 B8), and stage 7 refuses a plan with any under 0
+        # the gate of decision 2 (owner 2026-11-03): both registered loads at the count the grid registers per group
+        "REGIME_GATE_LOADS": "0.95 1.05", "MIN_IN_REGIME_WINDOWS": "0.95:2 1.05:3",
         "CONFIRMATORY_ARMS": "B1 B3 B4 B6 B7", "DISK_GB": "400", "SKIP_BLOCKED": "1"}
     # the served model plus the seven helpers, and no Qwen3-14B (no pod reader defaults to it)
     for p in (a, b):
         assert p["PREFETCH_MODELS"].split() == [p["MODEL"], *S2_HELPERS], p["PREFETCH_MODELS"]
     # S2B serves its MuSiQue questions packed in the 80B's tokens (the file exists and calibrates too);
-    # S2A names the 70B-token Qasper file, which stage 0 refuses until the gated tokenizer can be loaded (A-6)
+    # S2A names the Qasper file packed in the 70B's tokens, built on 2026-11-19 at the 846-question trial pool
+    # (owner decision D1; the profile named an unbuilt 852-question file before, which stage 0 refused, A-6)
     assert b["QUERY_MANIFESTS"] == "musique=data/manifests/musique_2000x3_seed42_wr50_tok-Qwen3-Next-80B-A3B-Instruct.json"
     assert b["CALIBRATION_MANIFEST"] == b["QUERY_MANIFESTS"].partition("=")[2] and (REPO_ROOT / b["CALIBRATION_MANIFEST"]).is_file()
-    assert a["QUERY_MANIFESTS"] == "qasper=data/manifests/qasper_852x12_seed42_wr50_tok-Llama-3.3-70B-Instruct.json"
-    assert a["CALIBRATION_MANIFEST"] == a["QUERY_MANIFESTS"].partition("=")[2]
+    assert a["QUERY_MANIFESTS"] == "qasper=data/manifests/qasper_846x12_seed42_wr50_tok-Llama-3.3-70B-Instruct.json"
+    assert a["CALIBRATION_MANIFEST"] == a["QUERY_MANIFESTS"].partition("=")[2] and (REPO_ROOT / a["CALIBRATION_MANIFEST"]).is_file()
     # E-2: the token file key is set on the gated 70B only, as an expanded path outside the repo
     assert a["HF_TOKEN_FILE"].startswith("/") and not a["HF_TOKEN_FILE"].startswith(str(REPO_ROOT)), a["HF_TOKEN_FILE"]
     assert b["HF_TOKEN_FILE"] == ""
@@ -3978,8 +3998,9 @@ def test_a_ladder_cells_refusal_fails_stage_5_before_the_ladder_jobs_f5(world: D
 
 
 def test_stage_5_plan_leaves_an_absent_manifest_out_of_the_ladder_print_and_says_so_f5(world: Dict[str, Path]) -> None:
-    # S2A names a Qasper manifest the Mac does not hold yet (gated tokenizer); stage 0 refuses the
-    # live run until it exists, and --plan still prints the rest of the ladder with the absence named
+    # A profile can name a manifest the Mac does not hold (S2A's Qasper manifest was one until it was
+    # built on 2026-11-19); stage 0 refuses the live run until it exists, and --plan still prints the
+    # rest of the ladder with the absence named
     world["profile"].write_text(world["profile"].read_text(encoding="utf-8") + '\nRUNG_ALL_CLASSES=1\n'
                                 'QUERY_MANIFESTS="squad_v2=data/manifests/squad_v2_50x3_seed42.json '
                                 'musique=data/manifests/musique_absent_f5_fixture.json"\n', encoding="utf-8")

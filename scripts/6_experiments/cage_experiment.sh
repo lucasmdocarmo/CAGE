@@ -2747,15 +2747,73 @@ stage_analyze() {
     # printed, noted, and the panels and analysis.txt below still run. Any other exit 1 on a
     # partial tree, and every exit 1 on a complete tree, fails the stage as before.
     run_partial && aexp="0|1"
-    run_step "$aexp" "run_campaign_analysis (design input)" -- "$PY" "$SCRIPTS/4_analysis/run_campaign_analysis.py" "$RUN_LOCAL" --contrasts $CONTRASTS || return 1
+    # AN-1 (ADR-0210, 2026-11-20): the look gets the plan the run used (stage 6 fetched it:
+    # the class first-token targets and the control rung) and, with it, the rung calibration
+    # files stage 5 fetched (the ladder's bracket of every class), so the driver computes its
+    # matched-load section. Each is passed only when the landing holds it (plan mode prints
+    # both); the driver labels a skip without the plan and reports no bracket without a rung
+    # file. The section is descriptive and enters no contrast or gate. Review 2026-11-20: --plan
+    # also switches on the driver's corpus cut roster note (a labeled line in stats.json and
+    # summary.md, ADR-0178 amendment 4), which refuses a plan whose roster is malformed.
+    local an1=() rung_file e_rung
+    if plan_only || [ -f "$EXTRAS/plan.json" ]; then
+      an1=(--plan "$EXTRAS/plan.json")
+      for e_rung in $CALIBRATE; do
+        rung_file="$EXTRAS/calibration/rungs_${EXP}_${e_rung}.json"
+        if plan_only || [ -f "$rung_file" ]; then
+          [ "${#an1[@]}" -ne 2 ] || an1+=(--rung-calibration)
+          an1+=("$rung_file")
+        fi
+      done
+    fi
+    # AN-2 (ADR-0211, 2026-11-20): ANALYSIS_METRICS, when the profile sets it, is the metric
+    # list the look tests (--metrics); empty or blank leaves the driver's design-input default
+    # (ttft_ms; review 2026-11-20: a blank value passed a bare --metrics, a usage error).
+    local metrics=()
+    # shellcheck disable=SC2206
+    [ -z "$(printf '%s' "${ANALYSIS_METRICS:-}" | tr -d '[:space:]')" ] || metrics=(--metrics $ANALYSIS_METRICS)
+    # shellcheck disable=SC2086
+    run_step "$aexp" "run_campaign_analysis (design input)" -- "$PY" "$SCRIPTS/4_analysis/run_campaign_analysis.py" "$RUN_LOCAL" --contrasts $CONTRASTS ${metrics[@]+"${metrics[@]}"} ${an1[@]+"${an1[@]}"} || return 1
+    if plan_only; then
+      printf '  [plan] %-28s on a PARTIAL tree whose look refuses for missing no-load cells, one more look runs with --contrasts 13 and the plan (AN-2l)\n' "pressure-only second look"
+    fi
     # Review 2026-11-15 L1: the three "no pair on this tree" refusals of that one function count
     # (no cells for a side, no shared dataset, no shared axes); its "ambiguous pair" refusal is a
     # grid defect and still fails.
     if ! plan_only && [ "$STEP_RC" = "1" ]; then
       if step_has "needs F1 cells for both" || step_has "share no dataset" || step_has "cells never share the same"; then
         no_cells=1
-        say "run_campaign_analysis refused: the PARTIAL tree holds no cells for a registered contrast ($(state get run.partial)); the refusal above is the result, no look was taken, and the panels and analysis.txt still run"
-        state note analyze "run_campaign_analysis: the PARTIAL tree holds no cells for a registered contrast (--contrasts $CONTRASTS); no analysis stamp ($(utc), item 9)"
+        say "run_campaign_analysis refused: the PARTIAL tree holds no cells for a registered contrast ($(state get run.partial)); the refusal above is the result: the requested list got no look, and the panels and analysis.txt still run"
+        state note analyze "run_campaign_analysis: the PARTIAL tree holds no cells for a registered contrast (--contrasts $CONTRASTS); the requested list got no look and no analysis stamp ($(utc), item 9)"
+        # AN-2l (ADR-0211, owner 2026-11-20: "Second look, pressure only"): the refusal above
+        # also drops the pressure sections (AN-1, the arm pairs, the engine pairs), whose
+        # windows a budget stop leaves complete (it cuts the no-load references first). With
+        # the plan in hand, one more look runs with --contrasts 13, which names no no-load
+        # cell (#13 is computed on every look). Review 2026-11-20: its stamp is recorded under
+        # its own key, never as analysis.stamp, so a later --redo still runs the requested
+        # list (M1); its exit 1 is tolerated only as the driver's own refusal ("ERROR:" and no
+        # traceback), a crash fails the stage like the first look's (M2).
+        if [ "${#an1[@]}" -gt 0 ]; then
+          say "a second look with --contrasts 13 (no no-load cell needed) writes the pressure sections of the PARTIAL tree (AN-2l)"
+          run_step "0|1" "run_campaign_analysis (design input, pressure sections only)" -- "$PY" "$SCRIPTS/4_analysis/run_campaign_analysis.py" "$RUN_LOCAL" --contrasts 13 "${an1[@]}" || return 1
+          if [ "$STEP_RC" = "0" ]; then
+            local pstamp plegs
+            pstamp="$(ls -1 "$RUN_LOCAL/analysis" 2>/dev/null | sort | tail -n 1)"
+            [ -n "$pstamp" ] || { printf '  [FAIL] the pressure-only look exited 0 but left no analysis/<stamp>/ under %s\n' "$RUN_LOCAL"; return 1; }
+            mkdir -p "$LAND/plots/$pstamp"
+            cp "$RUN_LOCAL/analysis/$pstamp/stats.json" "$RUN_LOCAL/analysis/$pstamp/summary.md" "$LAND/plots/$pstamp/" 2>/dev/null || true
+            plegs="$("$PY3" -c 'import json, sys
+m = json.load(open(sys.argv[1], encoding="utf-8")).get("matched_load") or {}
+print("%s legs" % m["n_legs"] if "n_legs" in m else "no leg (%s)" % (m.get("skipped") or m.get("suppressed") or "no matched_load section"))' "$RUN_LOCAL/analysis/$pstamp/stats.json" 2>/dev/null || echo "legs unread")"
+            state put analysis.pressure_stamp "$pstamp"
+            state note analyze "run_campaign_analysis: pressure sections only (--contrasts 13) on the PARTIAL tree: $plegs, stamp $pstamp ($(utc), AN-2l)"
+            say "pressure-only look written: $plegs (stamp $pstamp); the requested list still has no look, so a later --redo runs it again"
+          elif step_has "ERROR:" && ! step_has "Traceback"; then
+            say "the pressure-only look refused too (the lines above): the PARTIAL tree has no look"
+          else
+            printf '  [FAIL] run_campaign_analysis (design input, pressure sections only): rc=1 without the driver'"'"'s refusal line (a crash, not a refusal; log: %s)\n' "$STEP_LOG"; return 1
+          fi
+        fi
       else
         printf '  [FAIL] run_campaign_analysis (design input): rc=1 without the named no-cells refusal on a PARTIAL tree (log: %s)\n' "$STEP_LOG"; return 1
       fi

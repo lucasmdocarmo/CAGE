@@ -91,8 +91,11 @@ mint_run_id() {
 # (the §1 example shows hhmm; seconds is a stricter superset of that grammar).
 # Campaign resume NEVER re-mints: the orchestrator exports CAGE_RUN_ID once and
 # every tree + every re-run reads it back.
+# AN-4 (owner 2026-11-19): a dot in the model slug (llama-3.3-70b) is written as
+# a dash, since the grammar admits no dot and stage 0 refused the s2a id. No
+# reader parses the slug back out of the id (the session is the parent dir name).
 mint_campaign_run_id() {
-  printf '%s-%s-%s' "$(date -u +%Y%m%d-%H%M%S)" "$1" "$2"
+  printf '%s-%s-%s' "$(date -u +%Y%m%d-%H%M%S)" "$1" "${2//./-}"
 }
 
 # campaign_cell_dir <baseline> <label> <model> [backend] — print the v2 cell dir

@@ -238,8 +238,11 @@ def test_the_projection_counts_the_registered_windows_per_gated_group_on_both_la
     for key, g in s2a["groups"].items():
         sizes.setdefault(g["load"], []).append(g["registered"])
     assert sorted(sizes) == ["0.95", "1.05"]
-    assert len(sizes["0.95"]) == 30 and set(sizes["0.95"]) == {2}
-    assert len(sizes["1.05"]) == 42 and set(sizes["1.05"]) == {3}
+    # owner 2026-11-19 (experiment A as ruled): nine arms x two rungs x two engines at each
+    # load; before that day 30 groups at 0.95 and 42 at 1.05 (the one-point arms at 1.05 only).
+    # Owner 2026-11-21: eight arms (B7 left), so 32 groups at each load (36 with B7)
+    assert len(sizes["0.95"]) == 32 and set(sizes["0.95"]) == {2}
+    assert len(sizes["1.05"]) == 32 and set(sizes["1.05"]) == {3}
     for engine in ("vllm", "sglang"):
         assert s2a["groups"][K_B5.replace("vllm", engine)]["baseline"] == "B5"
         assert s2a["groups"][K_B6.replace("vllm", engine)]["baseline"] == "B6"
@@ -256,16 +259,26 @@ def test_the_projection_counts_the_registered_windows_per_gated_group_on_both_la
     assert s1["groups"] == {} and s1["unresolved_load_cells"] == 16
 
 
-def test_the_projection_refuses_a_floor_above_a_blocking_groups_registered_windows() -> None:
+def test_the_projection_refuses_a_floor_above_a_blocking_groups_registered_windows(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(rc.PlanError, match=r"MIN_IN_REGIME_WINDOWS=6 exceeds the 2 registered windows of .*BLOCKING.*by construction"):
         rc.regime_gate_projection("s2a", loads=LOADS_S2, need="6")
     with pytest.raises(rc.PlanError, match="exceeds the 3 registered windows of"):
         rc.regime_gate_projection("s2a", need="6")            # the default 1.0+ gates the 1.05 column only
     assert rc.regime_gate_projection("s2a", loads=LOADS_S2, need=FLOOR_S2)["short_descriptive"] == {}
-    # a floor only descriptive groups miss is reported, not refused: B9 has no 0.95 cell on s2a
-    doc = rc.regime_gate_projection("s2a", loads=LOADS_S2, need="0.95:3 1.05:3", confirmatory_arms="B9")
-    assert len(doc["short_descriptive"]) == 30 and set(doc["short_descriptive"].values()) == {2}
-    assert sum(g["mode"] == rules.BLOCKING for g in doc["groups"].values()) == 2    # B9 on two engines
+    # owner 2026-11-19: every arm of s2a carries a 0.95 cell now (B9 had none before), so a
+    # roster arm misses a 0.95 floor of three itself and the projection refuses by its name
+    with pytest.raises(rc.PlanError, match=r"exceeds the 2 registered windows of .*retr-comp.*0\.95 \(BLOCKING; 4 such group"):
+        rc.regime_gate_projection("s2a", loads=LOADS_S2, need="0.95:3 1.05:3", confirmatory_arms="B9")
+    # a floor only descriptive groups miss is reported, not refused. No registered grid has
+    # an arm with more windows than the others at one load, so the case is built: B1 gets
+    # three windows at 0.95 and is the roster, and the other seven arms keep two
+    # (eight with B7, before 2026-11-21).
+    grid = rc.get_session_grid("s2a")
+    extra = rc.PressurePoint("X1", ("B1",), rc._BOTH, rc.S2A_RUNGS, rc._own(0.95), dataset="qasper", windows=3)
+    monkeypatch.setitem(rc.SESSION_GRIDS, "s2a", rc.replace(grid, blocks=grid.blocks + (extra,)))
+    doc = rc.regime_gate_projection("s2a", loads=LOADS_S2, need="0.95:3 1.05:3", confirmatory_arms="B1")
+    assert len(doc["short_descriptive"]) == 28 and set(doc["short_descriptive"].values()) == {2}   # 7 arms x 2 rungs x 2 engines
+    assert sum(g["mode"] == rules.BLOCKING for g in doc["groups"].values()) == 8    # B1: 2 rungs x 2 loads x 2 engines
 
 
 def test_the_projection_refuses_an_unknown_or_absent_roster_arm() -> None:
@@ -377,14 +390,14 @@ def test_the_gate_and_the_projection_key_every_s2a_pressure_cell_the_same_way(tm
     root = tmp_path / "run"
     grid = rc.get_session_grid("s2a")
     cells = [c for c in rc.enumerate_cells(grid) if c.spec.family in rules.PRESSURE_FAMILIES and c.blocked_on is None]
-    assert len(cells) == 72
+    assert len(cells) == 64   # 8 arms x 2 engines x 2 rungs x 2 loads (72 with B7)
     for c in cells:
         key = c.spec.to_row_key()
         _write_cell(root, key, c.baseline_id)
         _write_window(root, key, c.dataset, 1, "IN_REGIME", "stationary")
     gate = regime_gate.evaluate(root, None, loads=LOADS_S2)["groups"]
     proj = rc.regime_gate_projection("s2a", loads=LOADS_S2)["groups"]
-    assert set(gate) == set(proj) and len(gate) == 72
+    assert set(gate) == set(proj) and len(gate) == 64
     assert all(gate[k]["baseline"] == proj[k]["baseline"] and gate[k]["load"] == proj[k]["load"] for k in gate)
 
 
@@ -405,8 +418,15 @@ def _shipped(name: str, *keys: str) -> Dict[str, str]:
     return dict(zip(keys, proc.stdout.split("|")))
 
 
-@pytest.mark.parametrize("profile, session, blocking, descriptive", [("S2A.env", "s2a", 64, 8), ("S2B.env", "cd-act1", 60, 0)])   # cd-act1: 66 before ADR-0193
-def test_the_shipped_s2_profiles_gate_values_project_at_the_registered_count(profile: str, session: str, blocking: int, descriptive: int) -> None:
+@pytest.mark.parametrize("profile, session, blocking, descriptive, floor", [
+    # owner 2026-11-19 (A-G1, A-G2): S2A gates load 1.05 only and the core arms block (64 and 8 at both loads
+    # before); owner 2026-11-21: four core arms without B7 (20 blocking groups with it)
+    ("S2A.env", "s2a", 16, 16, {"1.05": 3}),
+    ("S2B.env", "cd-act1", 60, 0, {"0.95": 2, "1.05": 3}),   # cd-act1: 66 before ADR-0193
+])
+def test_the_shipped_s2_profiles_gate_values_project_at_the_registered_count(
+    profile: str, session: str, blocking: int, descriptive: int, floor: Dict[str, int],
+) -> None:
     """Decision 2 (finding 2, option (B)): the floor is the registered count per
     load, so every gated group's need equals its registered windows; the roster
     names served baselines only; stage 0's projection accepts both profiles."""
@@ -418,7 +438,7 @@ def test_the_shipped_s2_profiles_gate_values_project_at_the_registered_count(pro
     assert all(g["need"] == g["registered"] for g in doc["groups"].values())
     modes = [g["mode"] for g in doc["groups"].values()]
     assert (modes.count(rules.BLOCKING), modes.count(rules.DESCRIPTIVE)) == (blocking, descriptive)
-    assert rules.parse_floor(v["MIN_IN_REGIME_WINDOWS"], rules.parse_loads(v["REGIME_GATE_LOADS"])) == {"0.95": 2, "1.05": 3}
+    assert rules.parse_floor(v["MIN_IN_REGIME_WINDOWS"], rules.parse_loads(v["REGIME_GATE_LOADS"])) == floor
 
 
 @pytest.mark.parametrize("profile, session", [("S2A.env", "s2a"), ("S2B.env", "cd-act1")])

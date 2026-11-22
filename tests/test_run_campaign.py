@@ -3225,6 +3225,9 @@ def _n_of_class(cls: str) -> int:
 #: G4 warm-up reserve, measured on qasper_852x3_seed42_wr50.json, trials
 #: overlapping and recorded); session b registers none.
 _ACHIEVABLE_N_A: Dict[str, int] = {"qasper": 852}
+#: owner decision D1 (2026-11-19): s2a serves the trial pool of the Qasper manifest packed
+#: in the 70B's own tokens, 846 questions (the word-count manifest's 852 before that day).
+_ACHIEVABLE_N_S2A: Dict[str, int] = {"qasper": 846}
 _WINDOW_POOL_N_A = {"qasper": 500, "ruler": 300}
 
 
@@ -3249,7 +3252,10 @@ class TestPerRowN:
         assert set(rc.ROW_CLASSES) == {"primary", "secondary", "identity", "window"}
         for grid in rc.SESSION_GRIDS.values():
             assert grid.n_primary == 2000
-            assert grid.n_secondary == 800
+            # owner 2026-11-19 ("All references at 846"): s2a registers its secondary n at
+            # the primary n, so achievable_n lowers every no-load reference to the same 846
+            # questions (800 on s2a before that day, as on every other session)
+            assert grid.n_secondary == (2000 if grid.session == "s2a" else 800)
             assert grid.n_identity == 300
             assert grid.window_requests == 2000
             assert grid.primary_engine == "vllm"
@@ -3260,7 +3266,10 @@ class TestPerRowN:
             # ADR-0175: s1 (Run 2) serves session a's registrations through its blocks
             # S2 block A: s2a serves Qasper as session a; cd-act1 draws its
             # window pool from the S2 MuSiQue manifest [A: 500, as Qasper's]
-            assert dict(grid.achievable_n) == (_ACHIEVABLE_N_A if grid.session in ("a", "s1", "s2a") else {})
+            # owner decision D1 (2026-11-19): s2a registers its own 846 (852 before, as session a)
+            assert dict(grid.achievable_n) == {
+                "a": _ACHIEVABLE_N_A, "s1": _ACHIEVABLE_N_A, "s2a": _ACHIEVABLE_N_S2A,
+            }.get(grid.session, {})
             # s1 (owner 2026-10-23): Qasper as session a, SQuAD v2 at the secondary n, no RULER
             assert dict(grid.window_pool_n) == {
                 "a": _WINDOW_POOL_N_A, "s1": {"qasper": 500, "squad_v2": 800},
@@ -5704,7 +5713,8 @@ class TestSessionS1ScopeResetAdr0176:
 
 # ---------------------------------------------------------------------------
 # S2 register block A (2026-11-01, MyDocs/RunPod/S2_BUILD_REGISTER_2026-10-31.md):
-# the two S2 grids (s2a: the 70B on Qasper, blocks X1 and X2; cd-act1: the
+# the two S2 grids (s2a: the 70B on Qasper, blocks X1 and X2, block X1 alone
+# since the owner's ruling of 2026-11-19, variant E3; cd-act1: the
 # 80B on MuSiQue, blocks Y1 and Y2 plus the PD overlay Z1), the DIST
 # widening (A-3 option (a): a pd point carries its twin's rung and load),
 # the per-session pressure dataset (A-4) and the 80B demand tables (A-5)
@@ -5719,10 +5729,10 @@ import organize_results as _org  # noqa: E402
 from src.orchestration import campaign_layout as _layout  # noqa: E402
 
 #: The anchor shape each S2 fixture floor table is sized on: cd-act1's
-#: gold-fresh class measured with the 80B tokenizer (A-5, method (b)); s2a
-#: keeps session b's 2026-10-08 Qasper table, so its anchor is the registry
-#: default [A: the Llama-3.3-70B tokenizer is gated for this account].
-_S2_ANCHOR_SEQ_TOKENS: Dict[str, int] = {"cd-act1": 2694, "s2a": _ANCHOR_SEQ_TOKENS}
+#: gold-fresh class measured with the 80B tokenizer (A-5, method (b)) and
+#: s2a's measured with the Llama-3.3-70B tokenizer (A-5, owner 2026-11-21,
+#: ADR-0213; session b's 2026-10-08 Qasper table, 4779, before that day).
+_S2_ANCHOR_SEQ_TOKENS: Dict[str, int] = {"cd-act1": 2694, "s2a": 4978}
 #: The S2 MuSiQue manifest (A-6): 2,000 x 3 packed in 2,640 tokens of the 80B
 #: tokenizer, one B12 rung at 700, a 50-question warm-up reserve.
 _S2_MUSIQUE_MANIFEST = (
@@ -5849,15 +5859,23 @@ class TestS2RegisterBlockA:
         s2a = rc.get_session_grid("s2a")
         assert s2a.model == "llama-3.3-70b" and s2a.replications == 1
         assert s2a.f1_datasets == ("qasper",) and s2a.f2_dataset == s2a.f3_dataset == "qasper"
-        assert s2a.f1_baselines == tuple(b for b in rc._ALL_BASELINES if b != "B8") and len(s2a.f1_baselines) == 11
+        # owner 2026-11-19 (experiment A as ruled, variant E3): nine arms, every one on the
+        # same grid (rungs 1.0 and 0.25, loads 0.95 and 1.05) in block X1, plus B5 over BM25
+        # as a no-load reference on both engines (A-S7). Before that day the grid held
+        # eleven arms, the rungs (1.0, 0.5, 0.25), achievable n 852 and a block X2.
+        # Owner 2026-11-21 ("ok drop B7 from both, 8 arms. lets go"): eight arms, B7 left.
+        assert s2a.f1_baselines == rc.S2A_ARMS == ("B1", "B2", "B3", "B4", "B5", "B6", "B9", "B10")
+        assert s2a.f1_retriever_cells == (("B5", "vllm", "bm25"), ("B5", "sglang", "bm25"))
         assert s2a.hf_oracle_cells == () and s2a.dist_cells == ()
         assert (s2a.serving_tp, s2a.dist_tp_size, s2a.dist_pd_role_gpus) == (4, None, (1, 1))
         assert (s2a.corpus_prefix_budget_tokens, s2a.corpus_trunc_budgets) == (2640, (700,))
-        assert s2a.f2_budgets == s2a.f3_budgets == (1.0, 0.5, 0.25) and s2a.f2_rates == s2a.f3_rates == (0.95, 1.05)
+        assert s2a.f2_budgets == s2a.f3_budgets == rc.S2A_RUNGS == (1.0, 0.25) and s2a.f2_rates == s2a.f3_rates == (0.95, 1.05)
         assert s2a.floor_budget_r == 1.0 and not s2a.identity_gated and s2a.helpers_on_gpu
-        assert dict(s2a.achievable_n) == {"qasper": 852} and dict(s2a.window_pool_n) == {"qasper": 500}
-        assert [p.block for p in s2a.blocks] == ["X1", "X1", "X2"]
+        assert dict(s2a.achievable_n) == _ACHIEVABLE_N_S2A and dict(s2a.window_pool_n) == {"qasper": 500}
+        assert [p.block for p in s2a.blocks] == ["X1", "X1"]
         assert all(p.topology == "single" and p.dataset == "qasper" for p in s2a.blocks)
+        assert all(p.baselines == rc.S2A_ARMS and p.rungs == (1.0, 0.25) and p.engines == ("vllm", "sglang") for p in s2a.blocks)
+        assert [(p.loads[0].frac, p.windows) for p in s2a.blocks] == [(0.95, 2), (1.05, 3)]
 
         cd = rc.get_session_grid("cd-act1")
         assert (cd.model, cd.group, cd.replications) == ("qwen3-next-80b", "C", 1)
@@ -5902,43 +5920,47 @@ class TestS2RegisterBlockA:
         plan = plan_s2a
         rows = _s2_rows(plan)
         assert plan["session"] == "s2a" and plan["model"] == "llama-3.3-70b"
-        # rows: 11 arms x 2 engines of references (22); X1: 5 core arms x 2
-        # engines x 3 rungs x 2 loads (60); X2: 6 coping arms x 2 engines at
-        # one point (12). Windows: one per reference; 2 + 3 per (arm, engine,
-        # rung) in X1; 3 per X2 row.
-        assert plan["counts"]["cells"] == len(rows) == 22 + 60 + 12
-        assert plan["counts"]["windows"] == 22 + 60 * 5 // 2 + 12 * 3 == 208
-        assert Counter(s.get("block") or ("ref-" + s["family"]) for s in rows) == {"X1": 60, "X2": 12, "ref-F1": 22}
-        assert sum(s["windows"] for s in _cells(plan) if s.get("block") == "X1") == 150
-        assert sum(s["windows"] for s in _cells(plan) if s.get("block") == "X2") == 36
-        # families: the fresh arms (gold-fresh, retr-fresh, retr-comp,
-        # retr-trunc) are F2; the corpus, reuse and corpus-comp arms are F3
+        # owner 2026-11-19 (experiment A as ruled, variant E3). Rows: 9 arms x 2 engines of
+        # references plus B5 over BM25 on both engines (20); X1: 9 arms x 2 engines x 2
+        # rungs x 2 loads (72). Windows: one per reference; 2 + 3 per (arm, engine, rung)
+        # in X1. Before that day: 94 rows and 208 windows (11 arms of references, X1 on the
+        # five core arms at three rungs, X2 on the six coping arms at one point).
+        # Since 2026-11-21 the arms are eight (B7 left): 18 references and 64 cells in X1,
+        # 82 rows and 178 windows (92 and 200 with B7).
+        assert plan["counts"]["cells"] == len(rows) == 18 + 64
+        assert plan["counts"]["windows"] == 18 + 64 * 5 // 2 == 178
+        assert Counter(s.get("block") or ("ref-" + s["family"]) for s in rows) == {"X1": 64, "ref-F1": 18}
+        assert sum(s["windows"] for s in _cells(plan) if s.get("block") == "X1") == 160
+        # families: the fresh arms (gold-fresh, retr-fresh, retr-comp) are F2; the
+        # corpus, reuse and corpus-comp arms are F3; B11 and B12 left the session
         assert {(s["baseline"], s["family"]) for s in rows if s.get("block")} == {
-            ("B1", "F2"), ("B5", "F2"), ("B6", "F2"), ("B9", "F2"), ("B11", "F2"),
-            ("B2", "F3"), ("B3", "F3"), ("B4", "F3"), ("B7", "F3"), ("B10", "F3"), ("B12", "F3"),
+            ("B1", "F2"), ("B5", "F2"), ("B6", "F2"), ("B9", "F2"),
+            ("B2", "F3"), ("B3", "F3"), ("B4", "F3"), ("B10", "F3"),
         }
         assert plan["counts"]["by_family"] == {
-            "F1": {"cells": 22, "windows": 22},
-            "F2": {"cells": 2 * 2 * 6 + 3 * 2, "windows": 24 * 5 // 2 + 6 * 3},
-            "F3": {"cells": 3 * 2 * 6 + 3 * 2, "windows": 36 * 5 // 2 + 6 * 3},
+            "F1": {"cells": 18, "windows": 18},
+            "F2": {"cells": 4 * 2 * 4, "windows": 32 * 5 // 2},
+            "F3": {"cells": 4 * 2 * 4, "windows": 32 * 5 // 2},
         }
-        # the four B12 rung-700 rows (the X2 pair and the reference pair) wait
-        # for a Qasper manifest carrying the ladder; nothing else is blocked
-        blocked = {s["row_key"]: s["blocked_on"] for s in rows if s["blocked_on"]}
-        assert sorted(blocked) == sorted(plan["blocked_row_keys"]) and len(blocked) == plan["counts"]["blocked"] == 4
-        assert all(k.startswith("corpus-trunc|") and k.endswith("|cb700") for k in blocked)
-        assert all("query-manifest:qasper" in v for v in blocked.values())
-        assert {s.get("cell_windows") for s in rows if s["blocked_on"]} == {None}
+        # nothing is blocked: the four B12 rung-700 rows that waited for a Qasper
+        # manifest carrying the ladder (4 blocked rows before 2026-11-19) left with B12
+        assert not any(s["blocked_on"] for s in rows)
+        assert plan["blocked_row_keys"] == [] and plan["counts"]["blocked"] == 0
         # row classes: the #4 pair on vLLM is primary, the other references secondary
-        assert Counter(s["row_class"] for s in rows) == {"window": 72, "secondary": 20, "primary": 2}
+        # (the eight arms' other 14 plus the two B5-bm25 ones; 18 with B7, 20 before 2026-11-19)
+        assert Counter(s["row_class"] for s in rows) == {"window": 64, "secondary": 16, "primary": 2}
         assert sorted(s["row_key"] for s in rows if s["row_class"] == "primary") == [
             "corpus-reuse|none|none|single|vllm|llama-3.3-70b|F1",
             "retr-fresh|rerank|none|single|vllm|llama-3.3-70b|F1",
         ]
-        assert {s["row_class"]: s["num_queries"] for s in rows if not s["blocked_on"]} == {"window": 500, "secondary": 800, "primary": 852}
+        # owner 2026-11-19 (decision D1, then "All references at 846"): every no-load
+        # reference serves the manifest's 846-question trial pool (secondary 800 and
+        # primary 852 before that day)
+        assert {s["row_class"]: s["num_queries"] for s in rows} == {"window": 500, "secondary": 846, "primary": 846}
         assert plan["identity_gated_row_keys"] == []
-        assert plan["counts"]["relaunches"] == 46 and plan["counts"]["dry_windows"] == 18
-        assert plan["rung_calibration"]["required_rungs"] == {"sglang": [1.0, 0.5, 0.25], "vllm": [1.0, 0.5, 0.25]}
+        # 46 and 18 before 2026-11-19; 38 and 16 with B7 (see test_s2a_relaunch_boundaries for the 34)
+        assert plan["counts"]["relaunches"] == 34 and plan["counts"]["dry_windows"] == 14
+        assert plan["rung_calibration"]["required_rungs"] == {"sglang": [1.0, 0.25], "vllm": [1.0, 0.25]}
 
     def test_cd_act1_counts(self, plan_cd_act1):
         plan = plan_cd_act1
@@ -6100,7 +6122,10 @@ class TestS2RegisterBlockA:
         assert not rc._pressure_step({"family": "DIST", "cellspec": {"rate_frac": None}})
 
     def test_dry_windows_are_one_per_budgeted_serving_shape(self, plan_s2a, plan_cd_act1):
-        for plan, want in ((plan_s2a, 18), (plan_cd_act1, 15)):   # cd-act1 16 before ADR-0193: retr-store's shape is blocked
+        # s2a 18 before 2026-11-19 (variant E3: per engine four prefix-OFF classes, three
+        # prefix-ON ones and the fp8 lever's), 16 with B7 and 14 without (two prefix-ON classes);
+        # cd-act1 16 before ADR-0193: retr-store's shape is blocked
+        for plan, want in ((plan_s2a, 14), (plan_cd_act1, 15)):
             dry = [s for s in plan["steps"] if s["kind"] == "dry_window"]
             shapes = {
                 _serving_shape(s, s["demand_class"]["seq_tokens"])
@@ -6120,23 +6145,30 @@ class TestS2RegisterBlockA:
     def test_s2a_relaunch_boundaries(self, plan_s2a):
         rel = _relaunches(plan_s2a)
         boundaries = Counter(_relaunch_boundary(s) for s in rel)
-        # per engine: prefix OFF at the classes of each rung (five at 0.25,
-        # three at 0.5 and at 1.0), prefix ON (four at 0.25 counting the fp8
-        # lever, two at 0.5 and at 1.0), plus the three budget-free reference
-        # shapes (OFF, ON, ON fp8): 22 boundaries, 44 in all
-        assert len(rel) == 46 and len(boundaries) == 44
-        assert Counter(k[0] for k in boundaries) == {"vllm": 22, "sglang": 22}
+        # owner 2026-11-19 (experiment A as ruled, variant E3). Per engine, on each of the
+        # two rungs: prefix OFF at four classes (4978, 2240, 995, 640), prefix ON at three
+        # (4978, 2240, 1008) and the fp8 lever's 2240 class; plus the three budget-free
+        # reference shapes (OFF, ON, ON fp8): 19 boundaries, 38 in all. Before that day:
+        # 46 relaunches over 44 boundaries (three rungs, seven classes at 0.25). The class
+        # counts are the Llama ones since 2026-11-21 (A-5; 4779, 2336, 1127, 702 and 1126
+        # before); the boundaries are the same in number. Since 2026-11-21 B7 left the
+        # session, so prefix ON serves two classes (4978, 2240): 17 boundaries per
+        # engine, 34 in all.
+        assert len(rel) == 34 and len(boundaries) == 34
+        assert Counter(k[0] for k in boundaries) == {"vllm": 17, "sglang": 17}
         assert all(s["topology"] == "single" and s["tp"] == 4 and s["model"] == "llama-3.3-70b" for s in rel)
-        # one boundary per engine is served twice: block X1 leaves it and
-        # block X2's one point (r 0.25, load 1.05) returns to it
-        repeated = {k for k, n in boundaries.items() if n == 2}
-        assert repeated == {
-            ("sglang", "OFF", None, None, "single", 1127, 0.25),
-            ("vllm", "OFF", None, None, "single", 1127, 0.25),
-        }
-        for key in repeated:
-            blocks = [_next_cell_block(plan_s2a, s) for s in rel if _relaunch_boundary(s) == key]
-            assert blocks == ["X1", "X2"]
+        for engine in ("vllm", "sglang"):
+            # (prefix mode, kv dtype, rung) -> the number of demand classes served there
+            assert Counter((k[1], k[2], k[6]) for k in boundaries if k[0] == engine) == {
+                ("OFF", None, 1.0): 4, ("OFF", None, 0.25): 4,
+                ("ON", None, 1.0): 2, ("ON", None, 0.25): 2,
+                ("ON", "fp8", 1.0): 1, ("ON", "fp8", 0.25): 1,
+                ("OFF", None, None): 1, ("ON", None, None): 1, ("ON", "fp8", None): 1,
+            }
+        # no boundary is served twice: one block, so nothing returns to a shape it left
+        # (block X2's one point returned to the 1127 class at r 0.25 on each engine before)
+        assert max(boundaries.values()) == 1
+        assert {_next_cell_block(plan_s2a, s) for s in rel} == {"X1", None}
 
     def test_cd_act1_demand_tables_measured_with_the_80b_tokenizer(self, plan_cd_act1, plan_s2a, tmp_path):
         grid = rc.get_session_grid("cd-act1")
@@ -6164,16 +6196,24 @@ class TestS2RegisterBlockA:
         assert rc.session_demand_classes(grid) == [506, 517, 2386, 2387, 2694]
         assert plan_cd_act1["demand_classes"]["anchor_seq_tokens"] == 2694
         assert plan_cd_act1["demand_classes"]["source"] == source
-        # s2a keeps the 2026-10-08 Qasper table [A], named as such in its header
+        # s2a registers its own Qasper table in Llama tokens since 2026-11-21 (register A-5,
+        # ADR-0213; session b's 2026-10-08 table [A] before that day), named in its header;
+        # tests/test_s2a_a5_demand_tables.py pins its values
         s2a = rc.get_session_grid("s2a")
-        assert dict(s2a.demand_seq_tokens) == dict(rc.DEMAND_SEQ_TOKENS_2026_10_08)
-        assert s2a.demand_seq_tokens_source == rc.DEMAND_SEQ_TOKENS_SOURCE != source
-        assert plan_s2a["demand_classes"]["source"] == rc.DEMAND_SEQ_TOKENS_SOURCE
-        assert plan_s2a["demand_classes"]["anchor_seq_tokens"] == _ANCHOR_SEQ_TOKENS == 4779
-        # a floor table sized on the Qasper anchor refuses on cd-act1, naming
-        # the table the registration was measured from
+        s2a_source = rc.DEMAND_SEQ_TOKENS_SOURCE_QASPER_LLAMA_2026_11_21
+        assert dict(s2a.demand_seq_tokens) == dict(rc.DEMAND_SEQ_TOKENS_QASPER_LLAMA_2026_11_21)
+        assert s2a.demand_seq_tokens_source == s2a_source and s2a_source not in (source, rc.DEMAND_SEQ_TOKENS_SOURCE)
+        assert plan_s2a["demand_classes"]["source"] == s2a_source
+        assert plan_s2a["demand_classes"]["anchor_seq_tokens"] == _S2_ANCHOR_SEQ_TOKENS["s2a"] == 4978
+        # session b, which s2a was derived from, keeps the 2026-10-08 table
+        assert dict(rc.get_session_grid("b").demand_seq_tokens) == dict(rc.DEMAND_SEQ_TOKENS_2026_10_08)
+        assert _ANCHOR_SEQ_TOKENS == 4779
+        # a floor table sized on the 2026-10-08 Qasper anchor refuses on cd-act1 and
+        # on s2a, naming the table each registration was measured from
         with pytest.raises(rc.PlanError, match="Qwen3-Next-80B-A3B-Instruct"):
             _s2_plan("cd-act1", tmp_path, anchor=_ANCHOR_SEQ_TOKENS)
+        with pytest.raises(rc.PlanError, match="Llama-3.3-70B-Instruct"):
+            _s2_plan("s2a", tmp_path, anchor=_ANCHOR_SEQ_TOKENS)
 
     def test_a_grid_without_a_demand_table_source_refuses(self):
         with pytest.raises(rc.PlanError, match="demand_seq_tokens_source"):
@@ -6810,8 +6850,12 @@ def test_cd_act1_blocks_the_vllm_store_arm_on_the_hybrid(plan_cd_act1, plan_s2a)
     )
     # 116 cells since the item 9 B5-bm25 references (ADR-0202; 114 after the ADR-0195 probe, 113 before), 8 blocked
     assert reg["executable_cells"] == 116 - 8 and reg["needs_lmcache"] is False and reg["lmcache_store_gib"] is None
-    # the dense 70B session keeps every cell: the rule is model-conditional
-    # (s2a's four blocked rows are the B12 rungs waiting for the Qasper manifest, as on HEAD)
-    assert plan_s2a["counts"]["blocked"] == 4 and all(k.startswith("corpus-trunc|") for k in plan_s2a["blocked_row_keys"])
-    assert rc.regime_gate_projection("s2a", loads="0.95 1.05", need="0.95:2 1.05:3",
-                                     confirmatory_arms="B1 B3 B4 B6 B7 B11 B12")["groups"]
+    # the dense 70B session keeps every cell: the rule is model-conditional. Since
+    # 2026-11-19 s2a carries no blocked row at all (its four were the B12 rungs waiting
+    # for the Qasper manifest; B12 left the session), and the projection reads the
+    # shipped gate (load 1.05 at three windows, the four core arms since 2026-11-21,
+    # five with B7; the call named "0.95 1.05", "0.95:2 1.05:3" and a roster with B11
+    # and B12 before)
+    assert plan_s2a["counts"]["blocked"] == 0 and plan_s2a["blocked_row_keys"] == []
+    assert rc.regime_gate_projection("s2a", loads="1.05", need="1.05:3",
+                                     confirmatory_arms="B1 B3 B4 B6")["groups"]

@@ -127,8 +127,12 @@ def test_load_plan_ties_a_cells_variant_to_the_relaunch_it_runs_under(plan: Dict
 
 def test_the_registration_report_flags_the_probe() -> None:
     report = rc.preflight_registration_check("cd-act1", floor_avg_seq_tokens=2694, gpu_id=None)
-    assert report["sglang_xb_probe"] is True
-    assert rc.preflight_registration_check("s2a", floor_avg_seq_tokens=trc._ANCHOR_SEQ_TOKENS, gpu_id=None)["sglang_xb_probe"] is False
+    assert report["sglang_xb_probe"] is True and report["problems"] == []
+    # s2a's own anchor (4978 since register A-5, 2026-11-21). The call passed the common
+    # 4779 until then and still read False, with an anchor mismatch among its problems;
+    # the problems are pinned empty so a stale anchor fails here.
+    s2a = rc.preflight_registration_check("s2a", floor_avg_seq_tokens=trc._S2_ANCHOR_SEQ_TOKENS["s2a"], gpu_id=None)
+    assert s2a["sglang_xb_probe"] is False and s2a["problems"] == []
 
 
 def test_a_variant_on_an_engine_without_a_launch_env_refuses_at_enumeration() -> None:

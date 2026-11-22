@@ -1318,6 +1318,11 @@ LADDER_CHAIN_DIVISOR: float = PROBE_LADDER_FACTOR ** 2
 #: previous lambda*: the KV-bound ratio 2 with margin), until a sustainable
 #: window brackets lambda* from below. A start from a floor rule keeps its
 #: remedy (--start-qps); the bound keeps a dead rung loud (NONE_SUSTAINABLE).
+#: Review 2026-11-20 (M2): the margin above is for a budget that halves per
+#: rung. s2a chains r=0.25 straight from r=1.0 since 2026-11-19, a 4x step, so
+#: its KV-bound ratio is 4 and the same reach leaves 4.83 / 4 = 1.21: a class
+#: whose capacity at r=0.25 is below 0.207 of its r=1.0 lambda* reads
+#: NONE_SUSTAINABLE (tests/test_s2a_e3_registration.py pins both sides).
 LADDER_DESCENT_MAX_STEPS: int = 4
 #: Calibration windows replay the measured pool past W arrivals when the
 #: ladder rate x PROBE_WINDOW_S exceeds the pool; calibration data never
@@ -1446,6 +1451,81 @@ DEMAND_CLASS_MAX_SERVED_TOKENS_MUSIQUE_QWEN3_NEXT_2026_11_01: Dict[int, int] = {
     320: 589,    # retr-comp
     221: 587,    # retr-trunc
 }
+#: S2 register A-5 on s2a (owner 2026-11-21, ADR-0213): the Qasper demand
+#: classes of the Llama-3.3-70B-Instruct session, derived on the Mac on
+#: 2026-11-21 by the script and method of the MuSiQue tables above, in
+#: manifest mode (result files and run log:
+#: experiments/S1/2026-10-23_2350/plots/demand_tables_20261121/). The rows are
+#: the S1 no-load Qasper windows on vLLM (8,876 rows over the ten arms),
+#: rendered with meta-llama/Llama-3.3-70B-Instruct at revision
+#: 6f6073b423013f6a7d4d9f39144961bfbfbc386b; the source rendering reproduces
+#: the recorded prompt_tokens exactly on every gold and retrieval row [V]. The
+#: corpus arms serve the blocks of data/manifests/
+#: qasper_846x12_seed42_wr50_tok-Llama-3.3-70B-Instruct.json (2,640 Llama
+#: tokens; its 700-token rung for corpus-trunc). Output tokens are the S1 vLLM
+#: counts per row [A: Llama's answer lengths are not measured; S1's means are 24
+#: to 26 tokens on the arms s2a serves]. The retrieval contexts are the S1
+#: windows' [A, as above].
+#: retr-store takes retr-fresh's shape [D]. Decision A5-1 (a): corpus-fresh
+#: and corpus-comp measured 2,236 on their 793 rows and corpus-reuse 2,240 on
+#: its 845; the three serve the same prompt (the gap is the row set), so they
+#: register one class, 2,240, the count of the row set closest to the 846
+#: questions the session serves. Registered apart, the arm pairs B4 with B3
+#: and B10 with B3 share no class and the session runs 4 more ladders.
+#: Limitation (review 2026-11-21 M4; owner: "Keep, state it"): retr-fresh
+#: pools two baselines with different prompts, B5 (dense, 800 rows, about 972
+#: Llama tokens) and B6 (reranked, 852 rows, about 1,017) [D from S1's 973 and
+#: 1,019 Qwen3-14B tokens], and B6 serves B7's prompts (equal on 800 of 800
+#: shared S1 questions [V]) while B7's class is 1,008. At a nominal r = 0.25,
+#: B5 holds 0.256, B6 0.2445 and B7 0.250 of what 50 of its requests need.
+#: (B7 left session s2a later that day, see S2A_ARMS; the retr-reuse rows stay.)
+DEMAND_SEQ_TOKENS_SOURCE_QASPER_LLAMA_2026_11_21 = (
+    "mean served sequence tokens (prompt + output) over the no-load Qasper windows of "
+    "experiments/S1/2026-10-23_2350 on vLLM, prompts rebuilt and rendered with the "
+    "meta-llama/Llama-3.3-70B-Instruct tokenizer (revision "
+    "6f6073b423013f6a7d4d9f39144961bfbfbc386b), corpus arms from the blocks of "
+    "qasper_846x12_seed42_wr50_tok-Llama-3.3-70B-Instruct.json and registered as one "
+    "class (A5-1), S1 vLLM output counts [A]; retr-store takes retr-fresh's shape [D]; "
+    "plots/demand_tables_20261121 (2026-11-21)"
+)
+DEMAND_SEQ_TOKENS_QASPER_LLAMA_2026_11_21: Dict[str, int] = {
+    "gold-fresh": 4978,
+    "gold-reuse": 4978,
+    "corpus-fresh": 2240,
+    "corpus-reuse": 2240,
+    "corpus-comp": 2240,
+    "retr-fresh": 995,
+    "retr-reuse": 1008,
+    "retr-store": 995,
+    "retr-comp": 640,
+    "retr-trunc": 377,
+}
+CORPUS_TRUNC_DEMAND_SEQ_TOKENS_QASPER_LLAMA_2026_11_21: Dict[int, int] = {700: 461}
+#: ADR-0158 on s2a: served maxima (prompt + output) of the same rebuilt rows,
+#: keyed by the class's served tokens, the largest over the class's arms (the
+#: result file's own class table keeps one arm per class); no RULER rows on
+#: this session, and the anchor's maximum is the QA rows'.
+DEMAND_CLASS_MAX_SERVED_TOKENS_QASPER_LLAMA_2026_11_21: Dict[int, int] = {
+    4978: 21715,  # gold-fresh and gold-reuse
+    2240: 2818,   # corpus-reuse and corpus-fresh 2,810, corpus-comp 2,818
+    1008: 3814,   # retr-reuse
+    995: 3993,    # retr-fresh; retr-store takes the same shape [D]
+    640: 2339,    # retr-comp
+    461: 887,     # corpus-trunc, 700-token rung
+    377: 1839,    # retr-trunc
+}
+#: A5-2 (a) (owner 2026-11-21, ADR-0213): the explicit request cap of B9's
+#: class on s2a. The rule below gives 8,192 (2 x 2,339 = 4,678) and the
+#: class's cache at r = 0.25 holds floor(0.25 x 50 x 640) = 8,000 tokens at
+#: the profile's FLOOR_CONCURRENCY, 192 short of one request of that cap
+#: (the pool rule refuses at stage 0 and vLLM does not start). 4,096 admits a
+#: prompt of 3,840 tokens beside the 256 answer tokens a request reserves. The
+#: largest B9 request measured is 2,339 tokens, 0.57 of the cap (the rule
+#: keeps every request at or below half its cap), and S1's largest B9 prompt
+#: was 2,425 Qwen3-14B tokens over 800 rows [V]. A longer request is refused
+#: by the engine, which fails its cell on the campaign path (run_experiment.py
+#: record_result, ContextLengthError), never a dropped row.
+DEMAND_CLASS_REQUEST_CAP_TOKENS_QASPER_LLAMA_2026_11_21: Dict[int, int] = {640: 4096}
 REQUEST_CAP_MARGIN: float = 2.0
 REQUEST_CAP_ADR = "ADR-0158"
 REQUEST_CAP_RULE = (
@@ -1454,13 +1534,23 @@ REQUEST_CAP_RULE = (
     "on the 2026-10-08 landing, never above the session cap; the cap bounds request "
     f"length only and the pool must hold one request of it ({REQUEST_CAP_ADR})"
 )
+#: A-5 (ADR-0213): added to the header's rule text on a grid that registers an
+#: explicit cap, and on no other (their headers read as before).
+REQUEST_CAP_EXPLICIT_NOTE = (
+    "; a class listed under request_cap_explicit serves the cap its grid registers "
+    "instead (ADR-0213)"
+)
 
 
 def request_cap_tokens(grid: "SessionGrid", seq_tokens: Optional[int]) -> int:
     """The request-length cap (VLLM_MAX_MODEL_LEN: vLLM --max-model-len, SGLang
     --context-length) a relaunch of demand class ``seq_tokens`` launches with
     (ADR-0158). None (a budget-free relaunch) and the anchor class take the
-    session cap; a class absent from the maxima table refuses (PlanError)."""
+    session cap; a class absent from the maxima table refuses (PlanError).
+    A-5 (ADR-0213): a class the grid registers an explicit cap for
+    (demand_class_request_cap_tokens) takes that cap; the grid checks the
+    table when it is registered (SessionGrid.__post_init__), so every entry
+    read here names a class below the anchor and a cap inside its bounds."""
     session_cap = int(grid.max_model_len)
     if seq_tokens is None or int(seq_tokens) == int(grid.demand_seq_tokens[DEMAND_ANCHOR_ARM]):
         return session_cap
@@ -1471,6 +1561,13 @@ def request_cap_tokens(grid: "SessionGrid", seq_tokens: Optional[int]) -> int:
             f"(demand_class_max_served_tokens; {REQUEST_CAP_ADR}): register it from the "
             "landing's rows before planning this class"
         )
+    explicit = grid.demand_class_request_cap_tokens.get(int(seq_tokens))
+    return _rule_request_cap(session_cap, served_max) if explicit is None else explicit
+
+
+def _rule_request_cap(session_cap: int, served_max: int) -> int:
+    """ADR-0158: the smallest power of two at or above REQUEST_CAP_MARGIN x a
+    class's served maximum, never above the session cap."""
     cap = 1
     while cap < REQUEST_CAP_MARGIN * served_max:
         cap *= 2
@@ -1974,8 +2071,9 @@ def _grid_datasets(grid: "SessionGrid") -> FrozenSet[str]:
 #: both engines at the constrained rungs), runs right after K1; K2 to K9 and
 #: L1 to L6 keep their names for S2. MyDocs/RunPod/S1_PLAN_2026-10-22.md.
 #: S2 (owner 2026-10-31, "Keep letters"; MyDocs/RunPod/S2_PLAN_2026-10-30.md
-#: sections 2 and 8): X1 the 70B full grid and X2 its one-point arms
-#: (experiment A, session s2a); Y1 the 80B full grid and Y2 its B8 point on
+#: sections 2 and 8): X1 the 70B grid (experiment A, session s2a) and X2 its
+#: former one-point arms (no cell since 2026-11-19, when every arm joined X1;
+#: the name stays so the letter is never reused); Y1 the 80B full grid and Y2 its B8 point on
 #: vLLM (experiment B); Z1 the 80B full grid on the PD stack (experiment C);
 #: Y and Z share session cd-act1. A new block name never reuses a letter in use.
 BLOCK_ORDER: Tuple[str, ...] = (
@@ -2078,8 +2176,9 @@ class SessionGrid:
     # registered retriever (RETRIEVER_ARGV), one cell each on every f1 dataset.
     # The retriever is a row-key coordinate; the cell keeps the baseline's code
     # and its prefix-OFF relaunch, so every other row stays byte-identical.
-    # Empty everywhere but cd-act1, which reads B5 over BM25 on both engines
-    # (B5-bm25, ADR-0101's name) beside the reranked dense B6.
+    # Empty everywhere but cd-act1 and, since 2026-11-19 (owner decision A-S7),
+    # s2a: each reads B5 over BM25 on both engines (B5-bm25, ADR-0101's name)
+    # beside the reranked dense B6.
     f1_retriever_cells: Tuple[Tuple[str, str, str], ...] = ()
     replications: int = REPLICATIONS
     # Registered BEHAVIOR knobs (reviewable in the plan header — these are
@@ -2189,6 +2288,13 @@ class SessionGrid:
     # S2 register A-5: where the three tables above were measured; the plan
     # header (demand_classes.source) and the floor-shape refusal name it
     demand_seq_tokens_source: str = DEMAND_SEQ_TOKENS_SOURCE
+    # A-5 (ADR-0213): an explicit request cap per demand class (class tokens ->
+    # cap), for a class whose cache at its tightest rung cannot hold one
+    # request of the rule's cap; request_cap_tokens checks and applies it.
+    # Empty on every session but s2a. Left out of the repr: the registration
+    # pins of the other sessions are the sha256 of their repr, which reads
+    # exactly as before this field existed.
+    demand_class_request_cap_tokens: Mapping[int, int] = field(default_factory=dict, repr=False)
     # ADR-0175 (C4, Run 2): a block-registered session lists its pressure
     # cells here and the f2/f3/ruler cross products are not enumerated (the
     # f2/f3 fields then only describe the union, for the ladders and the
@@ -2265,6 +2371,43 @@ class SessionGrid:
                             f"demand_class_max_served_tokens lacks an integer >= 1 for the class of "
                             f"{seq} served tokens ({REQUEST_CAP_ADR}: the per-class request cap needs it)"
                         )
+            # A-5 (ADR-0213; review 2026-11-21 M1 and M2): an explicit request
+            # cap is checked here, so an entry that would never be read (the
+            # anchor's, an unknown class's) or that no plan could serve refuses
+            # at registration. The cap is a power of two, admits the class's
+            # largest request with its answer (served maximum +
+            # WINDOW_MAX_TOKENS: the engines admit prompt + max_tokens) and
+            # does not exceed the rule's cap.
+            explicit = self.demand_class_request_cap_tokens
+            session_cap = self.max_model_len
+            if not isinstance(explicit, Mapping):
+                problems.append(
+                    f"demand_class_request_cap_tokens={explicit!r} must be a mapping class tokens -> "
+                    f"request cap ({REQUEST_CAP_ADR})"
+                )
+            elif isinstance(table, Mapping) and isinstance(session_cap, int) and not isinstance(session_cap, bool):
+                anchor = self.demand_seq_tokens.get(DEMAND_ANCHOR_ARM)
+                for seq, cap in explicit.items():
+                    where = f"demand_class_request_cap_tokens[{seq!r}]={cap!r}"
+                    served_max = table.get(seq) if seq in classes else None
+                    if seq not in classes or seq == anchor:
+                        problems.append(
+                            f"{where}: {seq!r} is not a demand class of the grid below the anchor "
+                            "(the anchor serves the session cap)"
+                        )
+                    elif isinstance(cap, bool) or not isinstance(cap, int):
+                        problems.append(f"{where} must be an integer")
+                    elif isinstance(served_max, int) and not isinstance(served_max, bool) and served_max >= 1:
+                        floor, rule = served_max + WINDOW_MAX_TOKENS, _rule_request_cap(session_cap, served_max)
+                        if cap < floor:
+                            problems.append(
+                                f"{where} is below the class's served maximum plus the answer tokens a "
+                                f"request reserves ({served_max} + {WINDOW_MAX_TOKENS} = {floor})"
+                            )
+                        elif cap & (cap - 1):
+                            problems.append(f"{where} is not a power of two")
+                        elif cap > rule:
+                            problems.append(f"{where} is above the rule's cap {rule} ({REQUEST_CAP_ADR})")
         if not isinstance(self.demand_seq_tokens_source, str) or not self.demand_seq_tokens_source.strip():
             problems.append(
                 f"demand_seq_tokens_source={self.demand_seq_tokens_source!r} must name where the "
@@ -2796,20 +2939,33 @@ SESSION_GRIDS["s1"] = replace(
 #: S2 (owner 2026-10-31; MyDocs/RunPod/S2_PLAN_2026-10-30.md sections 2, 8
 #: and 11; the build register A-1 to A-3): every full-grid cell runs the
 #: cache rungs {1.0, 0.5, 0.25} at loads 0.95 (two windows) and 1.05 (three
-#: windows) of its own measured rate, 15 windows per cell; a one-point cell
-#: runs r 0.25 at load 1.05 with three windows; every cell has one no-load
-#: reference (its F1 row at replications 1, or on the PD stack the #18-shaped
-#: DIST row at dist_budget_r). The 0.85 load and SQuAD v2 are out; LMDeploy
-#: is not in S2 (P7). Session s2a = experiment A (the 70B, Group B re-homed);
+#: windows) of its own measured rate, 15 windows per cell; every cell has one
+#: no-load reference (its F1 row at replications 1, or on the PD stack the
+#: #18-shaped DIST row at dist_budget_r). The 0.85 load and SQuAD v2 are out;
+#: LMDeploy is not in S2 (P7). Session s2a = experiment A (the 70B, Group B
+#: re-homed; its own rungs and arms since 2026-11-19, S2A_RUNGS below);
 #: cd-act1 = experiments B and C (the 80B, Group C).
 S2_RUNGS: Tuple[float, ...] = (1.0, 0.5, 0.25)
 S2_CONTROL_R: float = 1.0
 #: (load as a fraction of lambda*, windows): plan section 8, choice 23
 S2_LOADS: Tuple[Tuple[float, int], ...] = ((0.95, 2), (1.05, 3))
-S2_ONE_POINT_R: float = 0.25
-S2_ONE_POINT_LOAD: Tuple[float, int] = (1.05, 3)
 S2_CORE_ARMS: Tuple[str, ...] = ("B1", "B3", "B4", "B6", "B7")
-S2_ONE_POINT_ARMS: Tuple[str, ...] = ("B2", "B5", "B9", "B10", "B11", "B12")
+#: Experiment A as ruled by the owner on 2026-11-19 (variant E3;
+#: MyDocs/RunPod/S2_PLAN_A_B_QWEN3_235B_2026-11-19.md sections 11 and 12):
+#: every arm of s2a runs the same grid, at the cache rungs 1.0 and 0.25 and
+#: both S2 loads. The rungs are the session's own constant (A-S1): S2_RUNGS
+#: also builds cd-act1's blocks and stays (1.0, 0.5, 0.25). The one-point
+#: block X2 and the arms B11 and B12 left the session with this ruling.
+#: Owner 2026-11-21 ("ok drop B7 from both, 8 arms. lets go"; the same plan,
+#: section 19): the owner ruled these eight baselines for both S2 experiments.
+#: This constant is experiment A's (session s2a). Experiment B has no session
+#: yet: cd-act1, the earlier B and C, is untouched and still serves B7 through
+#: S2_CORE_ARMS. B7 (retr-reuse) left s2a: no registered no-load contrast and
+#: no arm pair reads it. Its rows stay in s2a's demand tables, served by no
+#: arm, so its class (1,008 tokens) gets no ladder, no relaunch and no dry
+#: window.
+S2A_RUNGS: Tuple[float, ...] = (1.0, 0.25)
+S2A_ARMS: Tuple[str, ...] = ("B1", "B2", "B3", "B4", "B5", "B6", "B9", "B10")
 #: DEC-2 (b): the corpus block in the served model's tokenizer. Kept at 2,640 under
 #: DEC-8 (ADR-0194 amendment 1, 2026-11-08): the "five 528-token align quanta"
 #: rationale predates the corrected geometry (272-token blocks at TP 4, 544 at
@@ -2823,37 +2979,38 @@ S2_TRUNC_RUNGS: Tuple[int, ...] = (700,)
 
 def _s2_points(
     block: str, baselines: Tuple[str, ...], engines: Tuple[str, ...], dataset: str,
-    *, topology: str = "single",
+    *, topology: str = "single", rungs: Tuple[float, ...] = S2_RUNGS,
 ) -> Tuple[PressurePoint, ...]:
     """The full-grid points of one S2 block: one PressurePoint per load, so
-    the window counts differ (two at 0.95, three at 1.05)."""
+    the window counts differ (two at 0.95, three at 1.05). ``rungs`` is the
+    block's cache rungs, S2_RUNGS unless the session registers its own."""
     return tuple(
-        PressurePoint(block, baselines, engines, S2_RUNGS, _own(frac), dataset=dataset,
+        PressurePoint(block, baselines, engines, rungs, _own(frac), dataset=dataset,
                       windows=windows, topology=topology)
         for frac, windows in S2_LOADS
     )
 
 
-_S2A_BLOCKS: Tuple[PressurePoint, ...] = (
-    *_s2_points("X1", S2_CORE_ARMS, _BOTH, "qasper"),
-    # the six coping arms at the harshest point (plan section 8, choice 24)
-    PressurePoint("X2", S2_ONE_POINT_ARMS, _BOTH, (S2_ONE_POINT_R,), _own(S2_ONE_POINT_LOAD[0]),
-                  dataset="qasper", windows=S2_ONE_POINT_LOAD[1]),
-)
+# one block: every arm at both rungs and both loads (owner 2026-11-19)
+_S2A_BLOCKS: Tuple[PressurePoint, ...] = _s2_points("X1", S2A_ARMS, _BOTH, "qasper", rungs=S2A_RUNGS)
 SESSION_GRIDS["s2a"] = replace(
     SESSION_GRIDS["b"],
     session="s2a",
-    # one no-load reference window per cell: the eleven S1 arms (no B8: no
-    # store on the 70B session) on both engines, Qasper, one trial
+    # one no-load reference window per arm and engine (no B8: no store on the
+    # 70B session), Qasper, one trial
     replications=1,
-    f1_baselines=tuple(b for b in _ALL_BASELINES if b != "B8"),
+    f1_baselines=S2A_ARMS,
     f1_datasets=("qasper",),
     hf_oracle_cells=(),
+    # A-S7 (owner 2026-11-19): B5's arm over BM25, one no-load reference per
+    # engine beside the dense B5, as cd-act1 registers it (item 9, ADR-0202)
+    f1_retriever_cells=(("B5", "vllm", "bm25"), ("B5", "sglang", "bm25")),
     # the union of the blocks' coordinates, read by the ladders (budgeted_rungs)
-    # and the header; enumeration reads the blocks
-    f2_budgets=S2_RUNGS,
+    # and the header; enumeration reads the blocks. A-S2: the session's own two
+    # rungs, so no ladder runs at an unused 0.5
+    f2_budgets=S2A_RUNGS,
     f2_rates=tuple(frac for frac, _ in S2_LOADS),
-    f3_budgets=S2_RUNGS,
+    f3_budgets=S2A_RUNGS,
     f3_rates=tuple(frac for frac, _ in S2_LOADS),
     # no overlay on the 70B (experiment C runs on the 80B); the TP=8 dist leg
     # of session b leaves with it, so the node is 4 GPUs (B-1 gpu_count_needed)
@@ -2863,18 +3020,26 @@ SESSION_GRIDS["s2a"] = replace(
     corpus_prefix_budget_tokens=S2_CORPUS_BLOCK_TOKENS,
     corpus_trunc_budgets=S2_TRUNC_RUNGS,
     blocks=_S2A_BLOCKS,
-    # as session a: the Qasper dev split supplies 852 of the primary 2,000
-    # (A5) and the pressure window pool is 500 (E17)
-    achievable_n={"qasper": 852},
+    # D1 (owner 2026-11-19): 846 of the primary 2,000 (A5), the trial pool of
+    # data/manifests/qasper_846x12_seed42_wr50_tok-Llama-3.3-70B-Instruct.json
+    # (1,005 loaded, 108 excluded at the 2,640-token block in Llama tokens, a
+    # warm-up reserve of 51 by whole papers); the pressure window pool is 500 (E17)
+    achievable_n={"qasper": 846},
+    # owner 2026-11-19 ("All references at 846"): the secondary references are
+    # registered at the primary n, which achievable_n lowers to Qasper's 846, so
+    # every arm and engine is read on the same question count (800 before)
+    n_secondary=N_PRIMARY,
     window_pool_n={"qasper": 500},
     floor_budget_r=S2_CONTROL_R,
     helpers_on_gpu=True,
-    # register A-5: the demand tables stay session b's (the 2026-10-08 Qasper
-    # means with the Qwen3-14B tokenizer) [A: the Llama-3.3-70B tokenizer is
-    # gated for this account and the S2 Qasper manifest is not built; the
-    # corpus classes also still describe 2,800-word blocks, not the 2,640-token
-    # blocks S2 serves; re-measure with s2_demand_tables.py once the tokenizer
-    # is readable, before the landing A floor table]
+    # register A-5 (owner 2026-11-21, ADR-0213): the Qasper classes measured
+    # with the Llama tokenizer on 2026-11-21 (the provenance comment above the
+    # tables) and the explicit request cap of B9's class (A5-2)
+    demand_seq_tokens=dict(DEMAND_SEQ_TOKENS_QASPER_LLAMA_2026_11_21),
+    corpus_trunc_demand_seq_tokens=dict(CORPUS_TRUNC_DEMAND_SEQ_TOKENS_QASPER_LLAMA_2026_11_21),
+    demand_class_max_served_tokens=dict(DEMAND_CLASS_MAX_SERVED_TOKENS_QASPER_LLAMA_2026_11_21),
+    demand_seq_tokens_source=DEMAND_SEQ_TOKENS_SOURCE_QASPER_LLAMA_2026_11_21,
+    demand_class_request_cap_tokens=dict(DEMAND_CLASS_REQUEST_CAP_TOKENS_QASPER_LLAMA_2026_11_21),
 )
 
 _CD_ACT1_BLOCKS: Tuple[PressurePoint, ...] = (
@@ -8948,11 +9113,22 @@ def build_plan(
                 str(seq): request_cap_tokens(grid, seq)
                 for seq in sorted(set(grid.demand_seq_tokens.values()) | set(grid.corpus_trunc_demand_seq_tokens.values()), reverse=True)
             },
-            "request_cap_rule": REQUEST_CAP_RULE,
+            "request_cap_rule": REQUEST_CAP_RULE + (
+                REQUEST_CAP_EXPLICIT_NOTE if grid.demand_class_request_cap_tokens else ""
+            ),
             "request_cap_adr": REQUEST_CAP_ADR,
             "request_cap_served_max_tokens": {
                 str(k): v for k, v in sorted(grid.demand_class_max_served_tokens.items(), reverse=True)
             },
+            # A-5 (ADR-0213): the caps the grid registers itself instead of the
+            # rule's, present only when it registers one (a plan of any other
+            # session is byte-identical to one built before the field existed)
+            **(
+                {"request_cap_explicit": {
+                    str(k): v for k, v in sorted(grid.demand_class_request_cap_tokens.items(), reverse=True)
+                }}
+                if grid.demand_class_request_cap_tokens else {}
+            ),
             # Batch 2 W2: the ONE port table every relaunch's launcher env
             # and every server cell's --api-base derive from (mirrors the
             # frozen launchers' defaults); re-checked per relaunch and per

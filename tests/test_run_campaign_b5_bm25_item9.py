@@ -50,7 +50,8 @@ def _flag(argv: List[str], flag: str) -> str:
 def test_the_grid_registers_two_references_and_the_argv_table_names_bm25() -> None:
     cd = rc.get_session_grid("cd-act1")
     assert cd.f1_retriever_cells == (("B5", "vllm", "bm25"), ("B5", "sglang", "bm25"))
-    assert rc.get_session_grid("s2a").f1_retriever_cells == ()
+    # owner 2026-11-19 (A-S7): s2a reads the same two references on Qasper (none before)
+    assert rc.get_session_grid("s2a").f1_retriever_cells == cd.f1_retriever_cells
     assert rc.RETRIEVER_ARGV["bm25"] == BM25_ARGV
     # rrf stays unregistered (owner 2026-11-11: rrf out); enumerating it refuses
     assert "rrf" not in rc.RETRIEVER_ARGV and "hybrid-rrf" not in rc.RETRIEVER_ARGV
