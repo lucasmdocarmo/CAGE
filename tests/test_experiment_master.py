@@ -3108,7 +3108,8 @@ def test_the_shipped_s2_landing_profiles_carry_every_s1_key_and_the_block_e_pick
               # until 2026-11-21 and states 400 since (final review question 4 (b), see its own values below);
               # SKIP_BLOCKED left them on 2026-11-16 (owner: "ok set SKIP_BLOCKED=1 on S2B"): S2A keeps 0;
               # REGIME_GATE_LOADS and MIN_IN_REGIME_WINDOWS left them on 2026-11-19 (owner decision A-G1: S2A
-              # gates load 1.05 only; S2B keeps decision 2 of 2026-11-03, both loads at the registered count)
+              # gates load 1.05 only; S2B kept decision 2 of 2026-11-03, both loads at the registered count).
+              # Since 2026-11-22 S2B.env names session s2b and states S2A's values for all four (its own values below)
               # S2 block F row F-11 (owner 2026-11-04, option (a)): the per-row bounds the stage 10 proof allows
               "SCORING_TOL_FAITHFULNESS": "0.005", "SCORING_TOL_BERTSCORE": "1e-5"}
     for k, v in shared.items():
@@ -3116,7 +3117,7 @@ def test_the_shipped_s2_landing_profiles_carry_every_s1_key_and_the_block_e_pick
     own = ("EXP", "SESSION", "MODEL", "MODEL_SLUG", "HOURS", "RUN_BUDGET_HOURS", "SEATBELT", "SETUP_BOUND_MIN",
            "SCORE_BOUND_MIN", "PULL_MARGIN_MIN", "FLOOR_AVG_SEQ_TOKENS", "INSTALL_LMCACHE", "LMCACHE_VERSION", "CONFIRMATORY_ARMS", "DISK_GB",
            "SKIP_BLOCKED", "REGIME_GATE_LOADS", "MIN_IN_REGIME_WINDOWS")
-    # the seatbelts grew with the calibrate term (2 x 240 min) under decision 3; S2B's roster is decision 2's
+    # the seatbelts grew with the calibrate term (2 x 240 min) under decision 3
     assert {k: a[k] for k in own} == {
         "EXP": "S2A", "SESSION": "s2a", "MODEL": "meta-llama/Llama-3.3-70B-Instruct", "MODEL_SLUG": "llama-3.3-70b",
         # owner 2026-11-20 ("Raise the limits", review M1): the grid ruled on 2026-11-19 projects 48.45 h on
@@ -3133,26 +3134,34 @@ def test_the_shipped_s2_landing_profiles_carry_every_s1_key_and_the_block_e_pick
         "REGIME_GATE_LOADS": "1.05", "MIN_IN_REGIME_WINDOWS": "1.05:3",
         # owner 2026-11-21 (final review questions 1 (a) and 4 (b), "approve all as recomended"): the results
         # root and the backup mirror moved to the container disk (tests/test_s2a_results_off_volume.py), so the
-        # disk is 400 GB as on S2B; 300 before. The roster is the four core arms since 2026-11-21 (B7 left the session)
+        # disk is 400 GB (S2B stated 400 that day and states 500 since 2026-11-22); 300 before. The roster is the
+        # four core arms since 2026-11-21 (B7 left the session)
         "CONFIRMATORY_ARMS": "B1 B3 B4 B6", "DISK_GB": "400", "SKIP_BLOCKED": "0"}
     assert {k: b[k] for k in own} == {
-        "EXP": "S2B", "SESSION": "cd-act1", "MODEL": "Qwen/Qwen3-Next-80B-A3B-Instruct", "MODEL_SLUG": "qwen3-next-80b",
-        "HOURS": "60", "RUN_BUDGET_HOURS": "55", "SEATBELT": "98h", "SETUP_BOUND_MIN": "50", "SCORE_BOUND_MIN": "150",
-        "PULL_MARGIN_MIN": "180", "FLOOR_AVG_SEQ_TOKENS": "2694", "INSTALL_LMCACHE": "1", "LMCACHE_VERSION": "0.4.4",
-        # S2R follow-ups (owner 2026-11-15): the S2R pod's 300 GB disk went from 91 GiB free at stage 3 to 65 GiB at
-        # stage 11 with 2.7 GB explained; 400 adds 100 GB of margin for the 60 h run until the cause is measured
-        # SKIP_BLOCKED=1 (owner 2026-11-16): the cd-act1 plan carries 57 blocked rows once the identity and PD
-        # failures are accepted (35 pd, 14 vLLM prefix-on single, 8 B8), and stage 7 refuses a plan with any under 0
-        # the gate of decision 2 (owner 2026-11-03): both registered loads at the count the grid registers per group
-        "REGIME_GATE_LOADS": "0.95 1.05", "MIN_IN_REGIME_WINDOWS": "0.95:2 1.05:3",
-        "CONFIRMATORY_ARMS": "B1 B3 B4 B6 B7", "DISK_GB": "400", "SKIP_BLOCKED": "1"}
+        # owner 2026-11-21 ("ok drop B7 from both, 8 arms. lets go") and 2026-11-22 ("Yes, all seven", decision
+        # B-D3 (a)): S2B.env names session s2b, experiment A's grid on Qwen3-235B and MuSiQue. Until then it named
+        # cd-act1 and the 80B, with HOURS 60, the stop at 55, SEATBELT 98h, the score and pull bounds 150 and 180,
+        # LMCache 0.4.4 installed, both loads gated on the roster "B1 B3 B4 B6 B7" and SKIP_BLOCKED 1; S2R.env keeps
+        # that profile (tests/test_s2_rehearsal_profile.py). The run bound, the budget stop, the pull bound,
+        # the gate, the roster and the skip key are S2A's (tests/test_s2b_registration.py holds the two files
+        # together); the setup bound keeps 50 for the 236 GB of weights; the anchor is the gold arm's measured mean
+        # on MuSiQue in the 235B's tokens, equal to the 80B's. DISK_GB is 500 (owner 2026-11-22, "500 GB on S2B"):
+        # on 400 GB the 236 GB of weights left 116 to 123 GiB free after the download, where the 80B had 184 to 191.
+        # The scoring bound is 180 and the seatbelt 89h (owner 2026-11-22, "180 min and 89h"; S2A: 120 and 88h)
+        "EXP": "S2B", "SESSION": "s2b", "MODEL": "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8", "MODEL_SLUG": "qwen3-235b-fp8",
+        "HOURS": "55", "RUN_BUDGET_HOURS": "50", "SEATBELT": "89h", "SETUP_BOUND_MIN": "50", "SCORE_BOUND_MIN": "180",
+        "PULL_MARGIN_MIN": "150", "FLOOR_AVG_SEQ_TOKENS": "2694", "INSTALL_LMCACHE": "0", "LMCACHE_VERSION": "",
+        "REGIME_GATE_LOADS": "1.05", "MIN_IN_REGIME_WINDOWS": "1.05:3",
+        "CONFIRMATORY_ARMS": "B1 B3 B4 B6", "DISK_GB": "500", "SKIP_BLOCKED": "0"}
     # the served model plus the seven helpers, and no Qwen3-14B (no pod reader defaults to it)
     for p in (a, b):
         assert p["PREFETCH_MODELS"].split() == [p["MODEL"], *S2_HELPERS], p["PREFETCH_MODELS"]
-    # S2B serves its MuSiQue questions packed in the 80B's tokens (the file exists and calibrates too);
+    # S2B serves its MuSiQue questions packed in the 235B's tokens (the file exists and calibrates too), rebuilt on
+    # 2026-11-22 at a trial pool of 846 questions (owner: "Rebuild on 846 questions"): the first 180 blocks of the
+    # packing the 80B file holds;
     # S2A names the Qasper file packed in the 70B's tokens, built on 2026-11-19 at the 846-question trial pool
     # (owner decision D1; the profile named an unbuilt 852-question file before, which stage 0 refused, A-6)
-    assert b["QUERY_MANIFESTS"] == "musique=data/manifests/musique_2000x3_seed42_wr50_tok-Qwen3-Next-80B-A3B-Instruct.json"
+    assert b["QUERY_MANIFESTS"] == "musique=data/manifests/musique_846x3_seed42_wr52_tok-Qwen3-235B-A22B-Instruct-2507-FP8.json"
     assert b["CALIBRATION_MANIFEST"] == b["QUERY_MANIFESTS"].partition("=")[2] and (REPO_ROOT / b["CALIBRATION_MANIFEST"]).is_file()
     assert a["QUERY_MANIFESTS"] == "qasper=data/manifests/qasper_846x12_seed42_wr50_tok-Llama-3.3-70B-Instruct.json"
     assert a["CALIBRATION_MANIFEST"] == a["QUERY_MANIFESTS"].partition("=")[2] and (REPO_ROOT / a["CALIBRATION_MANIFEST"]).is_file()
@@ -3315,9 +3324,12 @@ def test_the_live_freeze_file_pins_both_s2_served_models_and_every_prefetched_mo
     slots = json.loads(freeze.read_text(encoding="utf-8"))["INSTRUMENT_REVISIONS"]
     pins = {v["model"]: v["revision"] for v in slots.values() if isinstance(v, dict) and v.get("model")}
     for name, model in (("served_model_llama33_70b", "meta-llama/Llama-3.3-70B-Instruct"),
-                        ("served_model_qwen3_next_80b", "Qwen/Qwen3-Next-80B-A3B-Instruct")):
+                        ("served_model_qwen3_next_80b", "Qwen/Qwen3-Next-80B-A3B-Instruct"),
+                        # S2 experiment B since 2026-11-22 (S2B.env); the 80B's slot stays for S2R.env
+                        ("served_model_qwen3_235b_fp8", "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8")):
+        assert name in slots, f"the freeze file has no slot {name} (added on the owner's word)"
         assert slots[name]["model"] == model and re.fullmatch(r"[0-9a-f]{40}", slots[name]["revision"]), name
-    for p in ("S2A.env", "S2B.env"):
+    for p in ("S2A.env", "S2B.env", "S2R.env"):
         for model in _profile_values(p, ("PREFETCH_MODELS",))["PREFETCH_MODELS"].split():
             assert re.fullmatch(r"[0-9a-f]{40}", pins.get(model, "")), f"{p}: {model} has no 40-hex pin in the freeze file"
 

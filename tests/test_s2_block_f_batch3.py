@@ -422,7 +422,11 @@ def _shipped(name: str, *keys: str) -> Dict[str, str]:
     # owner 2026-11-19 (A-G1, A-G2): S2A gates load 1.05 only and the core arms block (64 and 8 at both loads
     # before); owner 2026-11-21: four core arms without B7 (20 blocking groups with it)
     ("S2A.env", "s2a", 16, 16, {"1.05": 3}),
-    ("S2B.env", "cd-act1", 60, 0, {"0.95": 2, "1.05": 3}),   # cd-act1: 66 before ADR-0193
+    # owner 2026-11-21 ("ok drop B7 from both, 8 arms. lets go") and 2026-11-22 ("Yes, all seven", B-D3 (a)):
+    # S2B.env names session s2b, A's grid on the 235B and MuSiQue, and gates as S2A.env does. Until then it named
+    # cd-act1 and this row read ("S2B.env", "cd-act1", 60, 0, {"0.95": 2, "1.05": 3}) (66 before ADR-0193); that
+    # session's projection at both loads is still pinned by the two cd-act1 tests above (30 groups per load, 60 blocking)
+    ("S2B.env", "s2b", 16, 16, {"1.05": 3}),
 ])
 def test_the_shipped_s2_profiles_gate_values_project_at_the_registered_count(
     profile: str, session: str, blocking: int, descriptive: int, floor: Dict[str, int],
@@ -441,9 +445,11 @@ def test_the_shipped_s2_profiles_gate_values_project_at_the_registered_count(
     assert rules.parse_floor(v["MIN_IN_REGIME_WINDOWS"], rules.parse_loads(v["REGIME_GATE_LOADS"])) == floor
 
 
-@pytest.mark.parametrize("profile, session", [("S2A.env", "s2a"), ("S2B.env", "cd-act1")])
+@pytest.mark.parametrize("profile, session", [("S2A.env", "s2a"), ("S2B.env", "s2b"), ("S2R.env", "cd-act1")])
 def test_the_shipped_s2_profiles_floor_fraction_is_the_grids_floor_rung(profile: str, session: str) -> None:
     """Decision 1 (finding 1): the ladder registers the floor artifact at the
-    grid's floor rung and refuses any other fraction; the profile's value is that rung."""
-    v = _shipped(profile, "CALIBRATION_BUDGET_FRACTION")
+    grid's floor rung and refuses any other fraction; the profile's value is that rung.
+    Since 2026-11-22 S2B.env names session s2b; cd-act1's profile is S2R.env."""
+    v = _shipped(profile, "SESSION", "CALIBRATION_BUDGET_FRACTION")
+    assert v["SESSION"] == session
     assert float(v["CALIBRATION_BUDGET_FRACTION"]) == rc.get_session_grid(session).floor_budget_r == 1.0

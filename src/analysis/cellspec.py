@@ -68,7 +68,9 @@ Retriever = Literal["dense", "rerank", "bm25", "rrf", "none"]
 Policy = Literal["none", "recompute", "evict", "offload", "compress-fp8"]
 Topology = Literal["single", "tp", "pd"]
 Engine = Literal["vllm", "sglang", "lmdeploy", "hf"]
-Model = Literal["qwen3-14b", "llama-3.3-70b", "qwen3-next-80b", "deepseek-v3"]
+#: "qwen3-235b-fp8" (owner 2026-11-22, decision B-D1): Qwen3-235B-A22B-Instruct-2507
+#: with FP8 weights, the model of S2 experiment B (session s2b).
+Model = Literal["qwen3-14b", "llama-3.3-70b", "qwen3-next-80b", "qwen3-235b-fp8", "deepseek-v3"]
 Family = Literal["F1", "F2", "F3", "DIST"]
 Reuse = Literal["fresh", "reuse"]
 BaselineID = Literal[

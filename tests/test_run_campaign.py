@@ -2329,6 +2329,8 @@ class TestRegisteredDatasetsAgreeWithTheFamilyMap:
         # dataset the session grids run F2/F3 on; the two must never drift.
         # S2 register A-4: the registration is per session (cd-act1 runs the
         # pressure families on MuSiQue), the constant is every other session's.
+        # Owner 2026-11-21 and 2026-11-22: s2b (experiment B, the 235B) runs them
+        # on MuSiQue too (tests/test_s2b_registration.py).
         from src.analysis.stats.families import (
             KNOWN_DATASETS, PRESSURE_DATASET, pressure_dataset,
         )
@@ -2338,16 +2340,19 @@ class TestRegisteredDatasetsAgreeWithTheFamilyMap:
             assert grid.f2_dataset == pressure_dataset(name), name
             assert grid.f3_dataset == pressure_dataset(name), name
             assert set(grid.f1_datasets) <= KNOWN_DATASETS, name
-            if name != "cd-act1":
+            if name not in ("cd-act1", "s2b"):
                 assert grid.f2_dataset == PRESSURE_DATASET, name
+            else:
+                assert grid.f2_dataset == "musique", name
 
     def test_pressure_dataset_per_session_a4(self):
         from src.analysis.stats.families import (
             PRESSURE_DATASET, PRESSURE_DATASET_BY_SESSION, pressure_dataset, registered_datasets,
         )
 
-        assert PRESSURE_DATASET == "qasper" and PRESSURE_DATASET_BY_SESSION == {"cd-act1": "musique"}
-        assert pressure_dataset("cd-act1") == "musique"
+        # s2b joined on 2026-11-22 (experiment B on MuSiQue; {"cd-act1": "musique"} alone before)
+        assert PRESSURE_DATASET == "qasper" and PRESSURE_DATASET_BY_SESSION == {"cd-act1": "musique", "s2b": "musique"}
+        assert pressure_dataset("cd-act1") == pressure_dataset("s2b") == "musique"
         assert pressure_dataset("s2a") == pressure_dataset("a") == pressure_dataset(None) == "qasper"
         roster = ("squad_v2", "musique", "qasper")
         for family in ("F2", "F3", "DIST"):
@@ -3254,8 +3259,9 @@ class TestPerRowN:
             assert grid.n_primary == 2000
             # owner 2026-11-19 ("All references at 846"): s2a registers its secondary n at
             # the primary n, so achievable_n lowers every no-load reference to the same 846
-            # questions (800 on s2a before that day, as on every other session)
-            assert grid.n_secondary == (2000 if grid.session == "s2a" else 800)
+            # questions (800 on s2a before that day, as on every other session); s2b is
+            # s2a's grid on another model and dataset (owner 2026-11-22, B-D2 (a))
+            assert grid.n_secondary == (2000 if grid.session in ("s2a", "s2b") else 800)
             assert grid.n_identity == 300
             assert grid.window_requests == 2000
             assert grid.primary_engine == "vllm"
@@ -3267,13 +3273,15 @@ class TestPerRowN:
             # S2 block A: s2a serves Qasper as session a; cd-act1 draws its
             # window pool from the S2 MuSiQue manifest [A: 500, as Qasper's]
             # owner decision D1 (2026-11-19): s2a registers its own 846 (852 before, as session a)
+            # owner decision B-D2 (a) (2026-11-22): s2b serves s2a's 846, the whole trial pool of its
+            # MuSiQue manifest since the rebuild of that day (846 of a 2,000-question trial before it)
             assert dict(grid.achievable_n) == {
-                "a": _ACHIEVABLE_N_A, "s1": _ACHIEVABLE_N_A, "s2a": _ACHIEVABLE_N_S2A,
+                "a": _ACHIEVABLE_N_A, "s1": _ACHIEVABLE_N_A, "s2a": _ACHIEVABLE_N_S2A, "s2b": {"musique": 846},
             }.get(grid.session, {})
             # s1 (owner 2026-10-23): Qasper as session a, SQuAD v2 at the secondary n, no RULER
             assert dict(grid.window_pool_n) == {
                 "a": _WINDOW_POOL_N_A, "s1": {"qasper": 500, "squad_v2": 800},
-                "s2a": {"qasper": 500}, "cd-act1": {"musique": 500},
+                "s2a": {"qasper": 500}, "cd-act1": {"musique": 500}, "s2b": {"musique": 500},
             }.get(grid.session, {})
 
     def test_classifier_table_every_family_engine_baseline(self, plan_a, plan_b):
@@ -3914,8 +3922,9 @@ class TestMaxModelLenA10:
         assert rc.MAX_MODEL_LEN_ENV == "VLLM_MAX_MODEL_LEN"
         assert rc.RULER_CONTEXT_TOKENS + rc.RULER_OUTPUT_TOKENS == _SHAPE_32K_TOTAL
         for grid in rc.SESSION_GRIDS.values():
-            # ADR-0192: cd-act1 registers 16,384 (no RULER task; its longest request is 4,939 tokens)
-            assert grid.max_model_len == (16_384 if grid.session == "cd-act1" else 32_768), grid.session
+            # ADR-0192: cd-act1 registers 16,384 (no RULER task; its longest request is 4,939 tokens);
+            # s2b serves the same MuSiQue prompts and registers the same cap (2026-11-22)
+            assert grid.max_model_len == (16_384 if grid.session in ("cd-act1", "s2b") else 32_768), grid.session
             assert isinstance(grid.max_model_len, int)
 
     def test_env_on_every_relaunch_for_both_engines(self, plan_a, plan_b):
@@ -5732,7 +5741,8 @@ from src.orchestration import campaign_layout as _layout  # noqa: E402
 #: gold-fresh class measured with the 80B tokenizer (A-5, method (b)) and
 #: s2a's measured with the Llama-3.3-70B tokenizer (A-5, owner 2026-11-21,
 #: ADR-0213; session b's 2026-10-08 Qasper table, 4779, before that day).
-_S2_ANCHOR_SEQ_TOKENS: Dict[str, int] = {"cd-act1": 2694, "s2a": 4978}
+#: s2b's is measured with the Qwen3-235B tokenizer (2026-11-22), which counts as the 80B's.
+_S2_ANCHOR_SEQ_TOKENS: Dict[str, int] = {"cd-act1": 2694, "s2a": 4978, "s2b": 2694}
 #: The S2 MuSiQue manifest (A-6): 2,000 x 3 packed in 2,640 tokens of the 80B
 #: tokenizer, one B12 rung at 700, a 50-question warm-up reserve.
 _S2_MUSIQUE_MANIFEST = (
@@ -5846,7 +5856,7 @@ def plan_cd_act1(tmp_path_factory: pytest.TempPathFactory) -> Dict[str, Any]:
 
 class TestS2RegisterBlockA:
     def test_the_sessions_are_registered_in_every_vocabulary(self):
-        for name in ("s2a", "cd-act1"):
+        for name in ("s2a", "s2b", "cd-act1"):
             assert name in rc.SESSIONS and name in _layout.SESSIONS and name in _org.SESSIONS
             assert rc.get_session_grid(name).session == name
         assert rc.SESSIONS == _layout.SESSIONS == _org.SESSIONS
@@ -6806,7 +6816,8 @@ def test_cd_act1_preflight_holds_one_request_in_every_pool_at_the_profile_concur
     assert pd and all(s["max_model_len"] == rc.request_cap_tokens(grid, (s.get("demand_class") or {}).get("seq_tokens")) for s in pd)
     assert max(s["max_model_len"] for s in pd) == 16_384 and max(s["max_model_len"] for s in plan_cd_act1["steps"] if s["kind"] == "relaunch") == 16_384
     # review 2026-11-05 LOW 1: unguarded, so a vanished grid fails by name instead of passing silently
-    assert {s: g.max_model_len for s, g in rc.SESSION_GRIDS.items() if s != "cd-act1"} == {"a": 32_768, "b": 32_768, "s1": 32_768, "s2a": 32_768}
+    # s2b (registered 2026-11-22) serves cd-act1's MuSiQue prompts under the same 16,384
+    assert {s: g.max_model_len for s, g in rc.SESSION_GRIDS.items() if s != "cd-act1"} == {"a": 32_768, "b": 32_768, "s1": 32_768, "s2a": 32_768, "s2b": 16_384}
 
 
 # ADR-0193 (2026-11-07): the retr-store (B8) cells of cd-act1 on vLLM are

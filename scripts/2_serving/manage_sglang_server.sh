@@ -493,8 +493,27 @@ _sglang_kv_dtype_realized() {
     # :1927-1931), so a requested fp8 format is proven served before any window
     # runs. Only the campaign's format has a verified pattern; another one is
     # reported unchecked, never passed on a guess.
+    # Review 2026-11-22 M4 (owner: "Add the guard now"): a start that requested
+    # no format must not serve an 8-bit cache. The budget is a token cap, so the
+    # realized-pool check passes whatever precision holds the pool, and every
+    # row would carry the wrong cache precision. The default starts of
+    # 2026-11-14 logged torch.bfloat16 and the 8-bit start torch.float8_e4m3fn
+    # [V the engine logs]; every 8-bit float type torch names begins with
+    # float8 [V torch 2.13.0]. A 16-bit type, or a log without the line, passes.
+    # grep -a: a log that holds a NUL byte is read as text; without it grep
+    # prints "Binary file ... matches" in place of the match (second review L2).
+    # Not covered: a `start` that reuses a live server (the block above returns
+    # before any launch) never reads a log, so a server launched with a format
+    # and left running is reused by a later default `start`; the vLLM launcher
+    # has the same gap. No campaign flow reaches it: every planned relaunch is
+    # a `restart` and every stage job stops its engine (second review L3).
+    local chosen
     case "${SGLANG_KV_CACHE_DTYPE:-}" in
-        "") return 0 ;;
+        "")
+            chosen="$(grep -a -o -- "Using KV cache dtype: torch\.float8[A-Za-z0-9_]*" "$1" 2>/dev/null | head -1 || true)"
+            [ -n "$chosen" ] || return 0
+            echo -e "${RED}✗ no SGLANG_KV_CACHE_DTYPE was requested but the start log says '${chosen}': SGLang chose an 8-bit KV cache on its own, so the rows would carry a precision the plan does not register (review 2026-11-22 M4)${NC}"
+            return 1 ;;
         fp8_e4m3) ;;
         *) echo "  (no verified realized-dtype pattern for SGLANG_KV_CACHE_DTYPE=${SGLANG_KV_CACHE_DTYPE}; not checked)"; return 0 ;;
     esac

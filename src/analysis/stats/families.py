@@ -89,8 +89,9 @@ PRESSURE_DATASET: str = "qasper"
 #: S2 (register A-4, owner 2026-10-31): the pressure dataset per session where
 #: it differs from the constant. cd-act1 (the 80B, experiments B and C) runs
 #: F2, F3 and DIST on MuSiQue; every other session (a, b, s1, s2a) keeps
-#: Qasper, the constant.
-PRESSURE_DATASET_BY_SESSION: dict[str, str] = {"cd-act1": "musique"}
+#: Qasper, the constant. Owner 2026-11-21 and 2026-11-22: s2b (experiment B,
+#: Qwen3-235B) runs F2 and F3 on MuSiQue too.
+PRESSURE_DATASET_BY_SESSION: dict[str, str] = {"cd-act1": "musique", "s2b": "musique"}
 PRESSURE_FAMILY_SET: frozenset[str] = frozenset({"F2", "F3", "DIST"})
 
 
@@ -524,7 +525,7 @@ def compile_family_map(
     """Expand the registry into the §9.3 registered test table.
 
     ``session`` picks the pressure families' dataset (``pressure_dataset``:
-    MuSiQue on cd-act1, the constant Qasper elsewhere and when None).
+    MuSiQue on cd-act1 and s2b, the constant Qasper elsewhere and when None).
 
     One row per contrast leg × carrying group × metric × dataset. Contrast
     #11's varied slot IS the dataset axis, so it emits a single

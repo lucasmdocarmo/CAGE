@@ -119,6 +119,27 @@ MODEL_KV: dict[str, ModelKV] = {
         attn_layers=12, kv_heads_total=2, head_dim=256, state_layers=36,
         state_conv_elements=3 * 8192, state_ssm_elements=32 * 128 * 128,
     ),
+    # Dense MoE, S2 experiment B (owner 2026-11-22, decision B-D1; Qwen/
+    # Qwen3-235B-A22B-Instruct-2507-FP8): 2 (K,V) x 94 layers x 4 KV heads x
+    # 128 head_dim x 2 B (BF16) = 188 KiB/tok [V config.json at revision
+    # e156cb4e: num_hidden_layers 94, num_key_value_heads 4, head_dim 128]; the
+    # 4 heads shard one per rank at TP 4 (and evenly at TP 1 and 2). Above TP 4
+    # a rank would keep a whole head and the dense rule below (the table figure
+    # // tp) would undercount; nothing refuses that degree for this slug, and
+    # no session plans it (review 2026-11-22, L10). The weights are FP8 (e4m3);
+    # the KV cache is planned in BF16, the engines' default, and FP8 KV stays
+    # the separate factor level [A until the first live start]. vLLM takes the
+    # budget in bytes, so a cache it held in another precision would realize
+    # another token count and the realized-pool check would refuse the start;
+    # SGLang takes it in tokens, so its token pool holds either way and only
+    # the bytes behind it would differ: its launcher therefore fails a default
+    # start whose log names an 8-bit cache type (review 2026-11-22, M4).
+    # SGLang 0.5.10.post1 picks 8 bits on its own only when the checkpoint's
+    # quantization config names a KV-cache algorithm, and this checkpoint's
+    # names none [V model_runner.py configure_kv_cache_dtype at the tag;
+    # config.json quantization_config: fmt, quant_method, activation_scheme,
+    # weight_block_size, modules_to_not_convert].
+    "qwen3-235b-fp8": ModelKV(192_512, "2*94*4*128*2"),
     # S0 shakedown model only (1x L40S pod; off the D4 roster, never a campaign
     # cell). FP8 weights, BF16 KV under kv_cache_dtype=auto:
     # 2 x 36 x 8 x 128 x 2 = 144 KiB/tok. VERIFY-LIVE at S0-19 (gate (j)).

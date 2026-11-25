@@ -99,8 +99,9 @@ _ARTIFACT_SEP = ";"
 RUN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,40}$")
 
 #: §1 session vocabulary (RUNBOOK §1.1); "s1" is the Run 2 session (ADR-0175);
-#: "s2a" is the S2 70B session (experiment A, owner 2026-10-31).
-SESSIONS: frozenset[str] = frozenset({"a", "b", "cd-act1", "cd-act2", "s1", "s2a"})
+#: "s2a" is the S2 70B session (experiment A, owner 2026-10-31); "s2b" the S2
+#: Qwen3-235B session (experiment B, owner 2026-11-22).
+SESSIONS: frozenset[str] = frozenset({"a", "b", "cd-act1", "cd-act2", "s1", "s2a", "s2b"})
 
 #: §6 scoring-tree contract (offline quality passes; validated, never indexed).
 SCORING_DIRNAME = "scoring"
@@ -167,11 +168,15 @@ REQUIRED_WINDOW_ARTIFACTS: tuple[str, ...] = (
 QA_EVIDENCE_EXEMPT_DATASETS: frozenset[str] = frozenset({"sharegpt"})
 _QA_EVIDENCE_EXEMPT_DATASETS = QA_EVIDENCE_EXEMPT_DATASETS  # historical alias
 
-#: §7.6.1 group letter per D4 model (campaign roster; groups A-D).
+#: §7.6.1 group letter per D4 model (campaign roster; groups A-D). Owner
+#: 2026-11-22 (decision B-D7 (a)): Qwen3-235B, the model of S2 experiment B,
+#: joins group C beside the 80B; the map is read from model to group only, so
+#: two models may share a letter.
 GROUP_OF_MODEL: dict[str, str] = {
     "qwen3-14b": "A",
     "llama-3.3-70b": "B",
     "qwen3-next-80b": "C",
+    "qwen3-235b-fp8": "C",
     "deepseek-v3": "D",
 }
 

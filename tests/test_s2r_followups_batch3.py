@@ -57,7 +57,7 @@ def test_no_s2_block_registers_a_frontier_load_and_s1_k1_does_item5() -> None:
     """The S2 loads are 0.95 and 1.05 of the cell's own rate (plan section 8, choice 23);
     a frontier block added to an S2 session later fails here and names the profile key."""
     rc = tm._run_campaign_module()
-    for session in ("s2a", "cd-act1"):
+    for session in ("s2a", "s2b", "cd-act1"):   # s2b: experiment B on the 235B, registered 2026-11-22
         kinds = {load.kind for point in rc.get_session_grid(session).blocks for load in point.loads}
         assert kinds == {"own"}, f"session {session}: load kinds {sorted(kinds)}; a frontier load needs FRONTIER_LOADS=1 in its profile"
     k1 = [p for p in rc.get_session_grid("s1").blocks if p.block == "K1"]

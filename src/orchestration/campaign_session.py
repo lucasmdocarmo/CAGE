@@ -216,6 +216,7 @@ HF_MODEL_SLUGS: dict[str, str] = {
     "Qwen/Qwen3-14B": "qwen3-14b",
     "meta-llama/Llama-3.3-70B-Instruct": "llama-3.3-70b",
     "Qwen/Qwen3-Next-80B-A3B-Instruct": "qwen3-next-80b",
+    "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8": "qwen3-235b-fp8",
     "deepseek-ai/DeepSeek-V3": "deepseek-v3",
     "deepseek-ai/DeepSeek-V3-0324": "deepseek-v3",
 }

@@ -95,8 +95,9 @@ until their registrations land):
   registration artifact, never a second hard-coded copy; the runner loads
   the encoder AT that revision and rebuilds an index built at another) and
   --ir-index-dir (SessionGrid.ir_index_root),
-  and its env pins CAGE_DISTRACTOR_DOCS (DISTRACTOR_DOCS; behavior, not
-  identity: derive_cell_spec ignores it). The runner's argparse defaults
+  and its env pins CAGE_DISTRACTOR_DOCS (SessionGrid.distractor_docs, which
+  is DISTRACTOR_DOCS on every session but s2b; behavior, not identity:
+  derive_cell_spec ignores it). The runner's argparse defaults
   never reach a campaign cell, and load_plan refuses a plan whose retrieval
   cells lack the pins or whose header lacks the freeze pin.
 - per-cell Redis namespaces (backlog F5a): every B7 (retr-reuse) cell
@@ -909,6 +910,7 @@ HF_ID_OF_SLUG: Dict[str, str] = {
     "qwen3-14b": "Qwen/Qwen3-14B",
     "llama-3.3-70b": "meta-llama/Llama-3.3-70B-Instruct",
     "qwen3-next-80b": "Qwen/Qwen3-Next-80B-A3B-Instruct",
+    "qwen3-235b-fp8": "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8",
     "deepseek-v3": "deepseek-ai/DeepSeek-V3-0324",
 }
 
@@ -1020,7 +1022,9 @@ RETRIEVAL_TOP_K: int = 3
 #: so retrieval is a real search problem). The runner reads it from the env
 #: (CAGE_DISTRACTOR_DOCS, default 1000); the driver pins it in every
 #: retrieval cell's env. BEHAVIOR, not identity: derive_cell_spec ignores
-#: it (identity rides the CAGE_CELL_* seam and nothing else).
+#: it (identity rides the CAGE_CELL_* seam and nothing else). This is the
+#: count every session registers unless its grid states its own
+#: (SessionGrid.distractor_docs; s2b alone does, owner 2026-11-22).
 DISTRACTOR_DOCS: int = 1000
 
 #: Backlog A5: the runner's IR index root (its --ir-index-dir default). A
@@ -1526,6 +1530,105 @@ DEMAND_CLASS_MAX_SERVED_TOKENS_QASPER_LLAMA_2026_11_21: Dict[int, int] = {
 #: by the engine, which fails its cell on the campaign path (run_experiment.py
 #: record_result, ContextLengthError), never a dropped row.
 DEMAND_CLASS_REQUEST_CAP_TOKENS_QASPER_LLAMA_2026_11_21: Dict[int, int] = {640: 4096}
+#: S2 experiment B on s2b (owner 2026-11-21, "ok drop B7 from both, 8 arms.
+#: lets go", and 2026-11-22, "Yes, all seven" and "Rebuild on 846 questions"):
+#: the MuSiQue demand classes of the Qwen3-235B-A22B-Instruct-2507-FP8
+#: session, derived on the Mac on 2026-11-22 by the script and method of the
+#: 80B tables above, in manifest mode (result files, run logs and the split by
+#: retriever and by the session's questions:
+#: experiments/S1/2026-10-23_2350/plots/demand_tables_20261122_pool846/). The
+#: rows are the S1 no-load MuSiQue windows on vLLM, rendered with
+#: Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 at revision
+#: e156cb4efae43fbee1a1ab073f946a1377e6b969; the source rendering reproduces
+#: the recorded prompt_tokens exactly on every gold and retrieval row [V]. The
+#: model's tokenizer.json is the 80B's file byte for byte, so the gold and
+#: retrieval counts equal the 2026-11-01 table's [V]. The corpus arms serve
+#: the blocks of data/manifests/
+#: musique_846x3_seed42_wr52_tok-Qwen3-235B-A22B-Instruct-2507-FP8.json (2,640
+#: tokens; its 700-token rung for corpus-trunc): the first 180 blocks of the
+#: packing the 80B manifest holds, a pool of 846 questions plus a 52-question
+#: warm-up reserve (the owner's ruling of 2026-11-22). An S1 row whose
+#: question is outside that pool has no block there and is left out, so the
+#: corpus counts rest on 739 rows (corpus-reuse; 1,261 left out), on 303 rows
+#: each of corpus-fresh and corpus-comp (497 left out) and on 303 rows of the
+#: 700-token rung (1,297 of S1's 1,600 corpus-trunc rows left out, the rows of
+#: its other rung among them [A]) [V].
+#: Output tokens are the S1 vLLM counts per row [A: the 235B's answer lengths
+#: are not measured; S1's means are 5 to 9 tokens]. The retrieval contexts are
+#: the S1 windows' [A, as above]. retr-store takes retr-fresh's shape [D].
+#: Decision D3 (a) (owner 2026-11-21): the three corpus arms register one
+#: class, as on s2a. corpus-reuse measured 2,395 and corpus-fresh and
+#: corpus-comp 2,393; the three serve the same prompt, and the class takes
+#: B3's count, the larger row set. Registered apart, as cd-act1 keeps them,
+#: the session runs 4 more ladders.
+#: Limitations. (1) retr-fresh pools two baselines with different prompts, B5
+#: (dense, 800 rows, 488 tokens) and B6 (reranked, 2,000 rows, 513), as on s2a
+#: (owner 2026-11-21: "Keep, state it"); at a nominal r = 0.25, B5 holds 0.259
+#: and B6 0.247 of what 50 of its requests need. (2) The gold and retrieval
+#: counts are means over every S1 row, and S1 served another draw of the
+#: question pool: its 800-row sets hold 285 of the 846 questions s2b serves
+#: and its 2,000-row sets 693. On those rows alone the means are 2,727 (gold),
+#: 497 (B5), 523 (B6) and 331 (retr-comp), against the registered 2,694, 506
+#: and 320; the corpus class reads 2,395 either way [V the split log in the
+#: folder]. A cache at a nominal rung r therefore holds 0.99 r (B1, B2), 1.00 r
+#: (B3, B4, B10), 1.02 r (B5), 0.97 r (B6) and 0.97 r (B9) of what 50 of the
+#: session's own requests need [D, on 285 and 693 shared rows]. Only the
+#: windows are budgeted, and on the first 500 questions of trial 1 (window 1)
+#: the same rows give 0.98 r (B1, B2), 0.99 r (B3, B4, B10), 1.02 r (B5),
+#: 0.97 r (B6) and 0.96 r (B9) [V the split log; second review L6]. (3) The
+#: retrieval arms search the whole split: 21,100 documents (owner 2026-11-22,
+#: "Search whole split"; S2B_DISTRACTOR_DOCS below), the set the first
+#: manifest gave. At the common count of 1,000 extra passages the set held
+#: 10,650 [V run_experiment.py select_manifest_union; both counts computed
+#: with the runner's builders]. S1's windows recorded 19,601 documents (B6
+#: on vLLM at 2,000 questions) and 10,881 (its other MuSiQue retrieval
+#: windows) [V their metrics.json, experiment.ir_index.num_documents; S1 ran
+#: before the trial union existed]. The registered retrieval counts are of
+#: passages S1 retrieved from those sets and are kept (decision W-D3 (a)): on S1's own
+#: rows the same 800 questions, searched by B6 in 10,881 and in 19,601
+#: documents, got the same top 3 passages for 791, and the mean prompt
+#: differed by one token [V plots/demand_tables_20261122_pool846/
+#: s1_b6_two_search_sets.log]. B5's dense search without reranking was not
+#: measured on two sets [?]. A
+#: window's 500 questions touch 164 to 173 of the 180 blocks, so 65 to 67
+#: percent of a corpus arm's requests under load arrive on a block already
+#: served (57 to 58 percent on s2a's manifest) [V]. The rows of
+#: the arms s2b does not serve (retr-reuse, retr-store, retr-trunc and the
+#: 700-token rung) stay in the tables, served by no arm.
+DEMAND_SEQ_TOKENS_SOURCE_MUSIQUE_QWEN3_235B_2026_11_22 = (
+    "mean served sequence tokens (prompt + output) over the no-load MuSiQue windows of "
+    "experiments/S1/2026-10-23_2350 on vLLM, prompts rebuilt and rendered with the "
+    "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 tokenizer (revision "
+    "e156cb4efae43fbee1a1ab073f946a1377e6b969), corpus arms from the blocks of "
+    "musique_846x3_seed42_wr52_tok-Qwen3-235B-A22B-Instruct-2507-FP8.json (the S1 rows of its "
+    "pool's questions) and registered as one class (D3 (a)), S1 vLLM output counts [A]; "
+    "retr-store takes retr-fresh's shape [D]; plots/demand_tables_20261122_pool846 (2026-11-22)"
+)
+DEMAND_SEQ_TOKENS_MUSIQUE_QWEN3_235B_2026_11_22: Dict[str, int] = {
+    "gold-fresh": 2694,
+    "gold-reuse": 2694,
+    "corpus-fresh": 2395,
+    "corpus-reuse": 2395,
+    "corpus-comp": 2395,
+    "retr-fresh": 506,
+    "retr-reuse": 517,
+    "retr-store": 506,
+    "retr-comp": 320,
+    "retr-trunc": 221,
+}
+CORPUS_TRUNC_DEMAND_SEQ_TOKENS_MUSIQUE_QWEN3_235B_2026_11_22: Dict[int, int] = {700: 694}
+#: ADR-0158 on s2b: served maxima (prompt + output) of the same rebuilt rows,
+#: keyed by the class's served tokens, the largest over the class's arms (the
+#: result file's own class table keeps one arm per class).
+DEMAND_CLASS_MAX_SERVED_TOKENS_MUSIQUE_QWEN3_235B_2026_11_22: Dict[int, int] = {
+    2694: 4939,  # gold-fresh and gold-reuse
+    2395: 2777,  # corpus-reuse, corpus-fresh and corpus-comp, 2,777 each
+    694: 804,    # corpus-trunc, 700-token rung
+    517: 1092,   # retr-reuse
+    506: 1196,   # retr-fresh; retr-store takes the same shape [D]
+    320: 589,    # retr-comp
+    221: 587,    # retr-trunc
+}
 REQUEST_CAP_MARGIN: float = 2.0
 REQUEST_CAP_ADR = "ADR-0158"
 REQUEST_CAP_RULE = (
@@ -2076,6 +2179,9 @@ def _grid_datasets(grid: "SessionGrid") -> FrozenSet[str]:
 #: the name stays so the letter is never reused); Y1 the 80B full grid and Y2 its B8 point on
 #: vLLM (experiment B); Z1 the 80B full grid on the PD stack (experiment C);
 #: Y and Z share session cd-act1. A new block name never reuses a letter in use.
+#: Since 2026-11-22 (owner: both S2 experiments serve one design) X1 is also the
+#: block of session s2b, experiment B on Qwen3-235B and MuSiQue: the same arms,
+#: rungs, loads and windows as on s2a, so the same block and no new name.
 BLOCK_ORDER: Tuple[str, ...] = (
     "K1", "P1", "K2", "K3", "K4", "K5", "K6", "K7", "K8", "K9",
     "L1", "L2", "L3", "L4", "L5", "L6",
@@ -2259,6 +2365,12 @@ class SessionGrid:
     primary_engine: str = PRIMARY_ENGINE
     primary_baselines: Tuple[str, ...] = PRIMARY_BASELINES
     achievable_n: Mapping[str, int] = field(default_factory=dict)
+    # S2 experiment B (review 2026-11-22, M2): why this session lowers a class
+    # n, when the general A5 reason (the dataset's split cannot supply the
+    # registered n) is not the session's own; the header caveat states it.
+    # None on every session but s2b. Left out of the repr, as the request-cap
+    # table below: the registration pins of the other sessions hash their repr.
+    achievable_n_basis: Optional[str] = field(default=None, repr=False)
     # ADR-0172 amendment 2026-10-17 (E17 option (d)): the per-dataset pool
     # ceiling of the WINDOW class alone (the ids a pressure window cycles,
     # ADR-0172 item 1); never raises window_requests, never touches another
@@ -2295,6 +2407,16 @@ class SessionGrid:
     # pins of the other sessions are the sha256 of their repr, which reads
     # exactly as before this field existed.
     demand_class_request_cap_tokens: Mapping[int, int] = field(default_factory=dict, repr=False)
+    # S2 experiment B (owner 2026-11-22, "Search whole split", decision W-D1
+    # (a)): the count of extra passages the retrieval cells of this session
+    # add to their document set (the runner's CAGE_DISTRACTOR_DOCS, Decision
+    # 3B). _cell_step writes it into every retrieval cell and ladder window
+    # (a fill-ceiling window copies its cell's env), the plan header records
+    # it, and load_plan re-checks the header, every retrieval cell and every
+    # retrieval fill-ceiling window against it.
+    # DISTRACTOR_DOCS on every session but s2b. Left out of the repr for the
+    # same reason as the field above.
+    distractor_docs: int = field(default=DISTRACTOR_DOCS, repr=False)
     # ADR-0175 (C4, Run 2): a block-registered session lists its pressure
     # cells here and the f2/f3/ruler cross products are not enumerated (the
     # f2/f3 fields then only describe the union, for the ladders and the
@@ -2706,6 +2828,15 @@ class SessionGrid:
                 f"floor_budget_r={self.floor_budget_r} is not a rung of any block: the ladders "
                 "start there, so the control rung must be registered"
             )
+        if (
+            not isinstance(self.distractor_docs, int)
+            or isinstance(self.distractor_docs, bool)
+            or self.distractor_docs < 0
+        ):
+            problems.append(
+                f"distractor_docs={self.distractor_docs!r} must be an integer >= 0 (the count "
+                "of extra passages a retrieval cell adds to its document set; 0 adds none)"
+            )
         if problems:
             raise PlanError("; ".join(problems))
 
@@ -2944,7 +3075,9 @@ SESSION_GRIDS["s1"] = replace(
 #: #18-shaped DIST row at dist_budget_r). The 0.85 load and SQuAD v2 are out;
 #: LMDeploy is not in S2 (P7). Session s2a = experiment A (the 70B, Group B
 #: re-homed; its own rungs and arms since 2026-11-19, S2A_RUNGS below);
-#: cd-act1 = experiments B and C (the 80B, Group C).
+#: cd-act1 = experiments B and C (the 80B, Group C). Since 2026-11-22
+#: experiment B is session s2b (Qwen3-235B on MuSiQue, s2a's grid); cd-act1
+#: stays registered as the 80B's session (the rehearsals of profile S2R).
 S2_RUNGS: Tuple[float, ...] = (1.0, 0.5, 0.25)
 S2_CONTROL_R: float = 1.0
 #: (load as a fraction of lambda*, windows): plan section 8, choice 23
@@ -2958,8 +3091,9 @@ S2_CORE_ARMS: Tuple[str, ...] = ("B1", "B3", "B4", "B6", "B7")
 #: block X2 and the arms B11 and B12 left the session with this ruling.
 #: Owner 2026-11-21 ("ok drop B7 from both, 8 arms. lets go"; the same plan,
 #: section 19): the owner ruled these eight baselines for both S2 experiments.
-#: This constant is experiment A's (session s2a). Experiment B has no session
-#: yet: cd-act1, the earlier B and C, is untouched and still serves B7 through
+#: Session s2a (experiment A) reads this constant, and so does session s2b
+#: (experiment B on Qwen3-235B, registered 2026-11-22 below). cd-act1, the
+#: earlier B and C on the 80B, is untouched and still serves B7 through
 #: S2_CORE_ARMS. B7 (retr-reuse) left s2a: no registered no-load contrast and
 #: no arm pair reads it. Its rows stay in s2a's demand tables, served by no
 #: arm, so its class (1,008 tokens) gets no ladder, no relaunch and no dry
@@ -3040,6 +3174,76 @@ SESSION_GRIDS["s2a"] = replace(
     demand_class_max_served_tokens=dict(DEMAND_CLASS_MAX_SERVED_TOKENS_QASPER_LLAMA_2026_11_21),
     demand_seq_tokens_source=DEMAND_SEQ_TOKENS_SOURCE_QASPER_LLAMA_2026_11_21,
     demand_class_request_cap_tokens=dict(DEMAND_CLASS_REQUEST_CAP_TOKENS_QASPER_LLAMA_2026_11_21),
+)
+
+#: Experiment B (owner 2026-11-21, "ok drop B7 from both, 8 arms. lets go";
+#: 2026-11-22, "Yes, all seven"; MyDocs/RunPod/
+#: S2_PLAN_A_B_QWEN3_235B_2026-11-19.md section 20): experiment A's grid on
+#: Qwen3-235B-A22B-Instruct-2507-FP8 and MuSiQue. Session s2b is s2a's grid
+#: with the fields below replaced, so the arms (S2A_ARMS), the rungs
+#: (S2A_RUNGS), the loads, the block (X1), the references (B5 over BM25 among
+#: them) and the n of every reference are A's by construction, never a second
+#: list kept equal by hand. No cell is blocked: no B8 (so no LMCache), no PD
+#: cell and no identity gate (the model is a dense transformer, not the 80B's
+#: hybrid).
+#: Owner 2026-11-22 ("Search whole split"; "Yes, all three", decision W-D2
+#: (a); plan section 20.15): the count of extra passages on s2b is the number
+#: of distinct passages in the MuSiQue validation split (2,417 questions,
+#: 21,100 passages [V the runner's own builders]). The runner adds the first
+#: that many passages its document set lacks, so from 11,450 up it indexes
+#: the whole split on the session's manifest: 9,650 passages of the 846
+#: questions and 11,450 others, the set the first manifest gave and the 80B
+#: session searches. At the common 1,000 the set held 10,650.
+S2B_DISTRACTOR_DOCS: int = 21_100
+#: Review 2026-11-22 (M2): the reason the plan header gives for the session's
+#: 846 questions, in place of the general A5 text, which is false here.
+#: Second review 2026-11-22 (L1): the sentence on the references holds for
+#: the manifest it names; the planner does not check it for another file (the
+#: coverage rule compares counts per trial). The profile's manifest is pinned
+#: by name and sha256 in tests/test_s2b_registration.py.
+S2B_ACHIEVABLE_N_BASIS = (
+    'owner 2026-11-22, decision B-D2 (a) and "Rebuild on 846 questions": every no-load reference '
+    "serves 846 questions, session s2a's count, so each comparison is read on the same number of "
+    "questions on both S2 landings; on the session's question manifest "
+    "(musique_846x3_seed42_wr52_tok-Qwen3-235B-A22B-Instruct-2507-FP8.json) these are the whole trial "
+    "pool, so every question a window serves under load has a reference; MuSiQue supplies the "
+    "registered 2,000, which session cd-act1 serves, so the n is lowered by amendment "
+    "(MyDocs/RunPod/S2_PLAN_A_B_QWEN3_235B_2026-11-19.md section 20) and not for the A5 reason"
+)
+SESSION_GRIDS["s2b"] = replace(
+    SESSION_GRIDS["s2a"],
+    session="s2b",
+    # decision B-D7 (a): group C, beside the 80B (GROUP_OF_MODEL)
+    group="C",
+    # decision B-D1 (a): the slug names the 8-bit weights
+    model="qwen3-235b-fp8",
+    f1_datasets=("musique",),
+    f2_dataset="musique",
+    f3_dataset="musique",
+    blocks=_s2_points("X1", S2A_ARMS, _BOTH, "musique", rungs=S2A_RUNGS),
+    # decision B-D2 (a) and the owner's ruling of 2026-11-22 ("Rebuild on 846
+    # questions"): s2a's count, read from s2a's grid, and the whole trial pool
+    # of data/manifests/
+    # musique_846x3_seed42_wr52_tok-Qwen3-235B-A22B-Instruct-2507-FP8.json, so
+    # every question a window serves under load has a no-load reference; the
+    # pressure window pool is 500, as on cd-act1 (E17)
+    achievable_n={"musique": SESSION_GRIDS["s2a"].achievable_n["qasper"]},
+    achievable_n_basis=S2B_ACHIEVABLE_N_BASIS,
+    window_pool_n={"musique": 500},
+    # the ADR-0158 rule on the anchor's own served maximum (4,939 tokens ->
+    # 16,384), as cd-act1 registers it (ADR-0192): the session serves no RULER
+    # task, and every cache holds one request of its cap at FLOOR_CONCURRENCY=50
+    max_model_len=16_384,
+    # the MuSiQue classes measured with the model's tokenizer on 2026-11-22 (the
+    # provenance comment above the tables); no explicit request cap: every
+    # quarter cache holds one request of its rule cap (the thinnest, B9's,
+    # holds 4,000 tokens against 2,048)
+    demand_seq_tokens=dict(DEMAND_SEQ_TOKENS_MUSIQUE_QWEN3_235B_2026_11_22),
+    corpus_trunc_demand_seq_tokens=dict(CORPUS_TRUNC_DEMAND_SEQ_TOKENS_MUSIQUE_QWEN3_235B_2026_11_22),
+    demand_class_max_served_tokens=dict(DEMAND_CLASS_MAX_SERVED_TOKENS_MUSIQUE_QWEN3_235B_2026_11_22),
+    demand_seq_tokens_source=DEMAND_SEQ_TOKENS_SOURCE_MUSIQUE_QWEN3_235B_2026_11_22,
+    demand_class_request_cap_tokens={},
+    distractor_docs=S2B_DISTRACTOR_DOCS,
 )
 
 _CD_ACT1_BLOCKS: Tuple[PressurePoint, ...] = (
@@ -3300,6 +3504,18 @@ FREE_BYTES_AFTER_WEIGHTS: Dict[Tuple[str, str], int] = {
     # at the largest planned pool (stage 4, A11 item 4) refreshes both.
     ("llama-3.3-70b", "NVIDIA H200"): 75 * 1024 ** 3,
     ("qwen3-next-80b", "NVIDIA H200"): 70 * 1024 ** 3,
+    # S2 experiment B (owner 2026-11-22): the same rule for Qwen3-235B-A22B-
+    # Instruct-2507-FP8 on one H200 of a four-GPU pod, derived, not measured
+    # [D]. 118.19 GiB per rank under vLLM's 0.90; the FP8 weights are
+    # 236,426,193,880 B over 24 files (Hub, revision e156cb4e, read
+    # 2026-11-22), 55.05 GiB per rank split four ways; 63.14 GiB are left and
+    # the 10 GiB cut [A] gives 53. The largest planned pool is 6.04 GiB per
+    # rank (the anchor class at r = 1.0). The first live start refreshes it.
+    # Review 2026-11-22 (L3): the listed 141 GB understates the card. The four
+    # H200 of the 2026-11-14 pod report 143,771 MiB = 140.40 GiB each [V its
+    # logs/system/pod_shape.txt]; the same rule on that size leaves 61 GiB, so
+    # 53 is conservative by 8 GiB and no planned value moves [D].
+    ("qwen3-235b-fp8", "NVIDIA H200"): 53 * 1024 ** 3,
 }
 
 
@@ -5229,12 +5445,15 @@ def _warmup_candidates_caveat(manifests: Mapping[str, Mapping[str, Any]]) -> Opt
 
 
 def _achievable_n_caveat(grid: SessionGrid) -> Optional[str]:
-    """The header caveat naming every dataset whose class n is lowered (A5)."""
+    """The header caveat naming every dataset whose class n is lowered (A5),
+    with the session's own reason when it registers one (achievable_n_basis)."""
     if not grid.achievable_n:
         return None
     lowered = ", ".join(
         f"{ds}={n}" for ds, n in sorted(grid.achievable_n.items())
     )
+    if grid.achievable_n_basis:
+        return f"achievable_n lowers the registered class n for {lowered} ({grid.achievable_n_basis})"
     return (
         f"achievable_n lowers the registered class n for {lowered} (DECISION.md "
         "A5: the dataset's evaluation split cannot supply the registered n, so "
@@ -5925,8 +6144,10 @@ def _stale_plan_problems(
       (embedding_model, embedding_model_revision, ir_index_root): every
       retrieval cell carries --top-k RETRIEVAL_TOP_K, --embedding-model and
       --embedding-revision == the header's freeze pins, --ir-index-dir ==
-      the registered root and the env CAGE_DISTRACTOR_DOCS ==
-      DISTRACTOR_DOCS; a non-retrieval cell carries none of them.
+      the registered root and the env CAGE_DISTRACTOR_DOCS == the count
+      the plan's session registers (``retrieval["distractor_docs"]``,
+      DISTRACTOR_DOCS on every session but s2b); a non-retrieval cell
+      carries none of them.
     - F5a: a retr-reuse cell carries --redis-key-prefix ==
       redis_key_prefix_for_row(row_key) and --flush-redis-namespace; every
       other cell carries neither (a shared namespace is shared cache hits).
@@ -6494,11 +6715,12 @@ def _stale_plan_problems(
                         f"the registered pin is {want!r} (backlog A5: runner "
                         "defaults never reach a campaign cell)" + stale
                     )
+            want_docs = retrieval["distractor_docs"]
             got_env = env.get("CAGE_DISTRACTOR_DOCS")
-            if got_env != str(DISTRACTOR_DOCS):
+            if got_env != str(want_docs):
                 problems.append(
                     f"{label}: retrieval cell {row!r} env CAGE_DISTRACTOR_DOCS is "
-                    f"{got_env!r}, the registered pin is {DISTRACTOR_DOCS} "
+                    f"{got_env!r}, the registered pin is {want_docs} "
                     "(backlog A5)" + stale
                 )
         else:
@@ -6883,8 +7105,9 @@ def _cell_step(
     if spec.retriever != "none":
         # Backlog A5: the Decision 3B distractor pool size, BEHAVIOR (not
         # identity: derive_cell_spec ignores it) pinned so the runner's env
-        # default never reaches a campaign cell.
-        env["CAGE_DISTRACTOR_DOCS"] = str(DISTRACTOR_DOCS)
+        # default never reaches a campaign cell. The count is the session's
+        # registered one (owner 2026-11-22: 21,100 on s2b, the whole split).
+        env["CAGE_DISTRACTOR_DOCS"] = str(grid.distractor_docs)
     if gpu_count is not None:
         # NOT identity (derive_cell_spec ignores it): the serving-stack fact
         # the campaign writer persists into cell.json (W4.2 → §6.6b / #18).
@@ -9058,7 +9281,7 @@ def build_plan(
             # CAGE_DISTRACTOR_DOCS); the embedding model is READ from the
             # ADR-0099 freeze slot, recorded here with its revision + source.
             "retrieval_top_k": RETRIEVAL_TOP_K,
-            "distractor_docs": DISTRACTOR_DOCS,
+            "distractor_docs": grid.distractor_docs,
             "embedding_model": pins.embedding_model,
             "embedding_model_revision": pins.embedding_revision,
             "embedding_model_freeze_slot": (
@@ -9765,10 +9988,25 @@ def load_plan(path: Path) -> Dict[str, Any]:
                 "against; a pre-A5 plan would run runner defaults under "
                 "registered row keys) - stale plan, re-plan"
             )
+    # Owner 2026-11-22 ("Search whole split"): the count of extra passages is
+    # registered per session. It is read from the registration, never from
+    # the plan, so neither a stale cell nor an edited header passes.
+    try:
+        registered_docs = get_session_grid(str(plan.get("session"))).distractor_docs
+    except PlanError as exc:
+        raise RunError(f"plan {path} names no registered session: {exc}") from exc
+    if knobs.get("distractor_docs") != registered_docs:
+        raise RunError(
+            f"plan {path} behavior_knobs.distractor_docs is {knobs.get('distractor_docs')!r}; "
+            f"session {plan.get('session')!r} registers {registered_docs} (backlog A5: the "
+            "count of extra passages every retrieval cell is re-checked against) - stale "
+            "plan, re-plan"
+        )
     retrieval_knobs = {
         "embedding_model": knobs["embedding_model"],
         "embedding_model_revision": knobs["embedding_model_revision"],
         "ir_index_root": knobs["ir_index_root"],
+        "distractor_docs": registered_docs,
     }
     shapes = plan.get("serving_shapes")
     header_max_model_len = (
@@ -9953,6 +10191,22 @@ def load_plan(path: Path) -> Dict[str, Any]:
                 problems.append(
                     f"{label}: dry window carries {KV_CEILING_ENV}={dry_pin!r} but its "
                     f"lambda_star_source kv_ceiling is {dry_ceiling!r} (S0F-88 B-11)"
+                )
+            # Third review 2026-11-22 (L1): a dry window copies its cell's env
+            # and builds the same document set, so its count of extra passages
+            # is re-checked as on the cell it gates (before, a window edited to
+            # another count loaded and would have built a second index)
+            dry_spec = step["cellspec"] if isinstance(step.get("cellspec"), dict) else {}
+            dry_docs = (step["env"] if isinstance(step["env"], dict) else {}).get("CAGE_DISTRACTOR_DOCS")
+            if dry_spec.get("retriever") not in (None, "none"):
+                if dry_docs != str(registered_docs):
+                    problems.append(
+                        f"{label}: dry window env CAGE_DISTRACTOR_DOCS is {dry_docs!r}, the "
+                        f"registered pin is {registered_docs} (backlog A5)"
+                    )
+            elif dry_docs is not None:
+                problems.append(
+                    f"{label}: dry window (retriever 'none') carries CAGE_DISTRACTOR_DOCS (backlog A5)"
                 )
             try:
                 if CellSpec.from_flat_dict(step["cellspec"]).to_row_key() != step["row_key"]:
